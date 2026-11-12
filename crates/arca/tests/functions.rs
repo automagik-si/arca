@@ -816,8 +816,9 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
         "the effect journal has the length it had"
     );
     assert_eq!(after, journal);
-    // To Incus each run sent three writes, in this order: the rebuild of its root from its image, the clearing of its
-    // console log, and its start. Nothing else.
+    // To Incus the first run sent two writes, the clearing of its console log and its start: a container that has
+    // never started has its image's own root already. Each run after it sent three, in this order: the rebuild of
+    // its root from its image, the clearing of its console log, and its start. Nothing else.
     let writes: Vec<String> = rig
         .fake
         .requests()
@@ -837,14 +838,15 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
         "DELETE /1.0/instances/relay/console",
         "PUT /1.0/instances/relay/state",
     ];
-    assert_eq!(writes.len(), 30, "{writes:?}");
-    for run in writes.chunks(3) {
+    assert_eq!(writes.len(), 29, "{writes:?}");
+    assert_eq!(writes[..2], one_run[1..], "{writes:?}");
+    for run in writes[2..].chunks(3) {
         assert_eq!(run, one_run, "{writes:?}");
     }
     let image = rig.fingerprint("relay");
     assert_eq!(
         rig.fake.rebuilds(PROJECT, "relay"),
-        vec![format!("store:{image}"); 10]
+        vec![format!("store:{image}"); 9]
     );
 
     // One line a run, in the month's file, each a meter.
@@ -1469,7 +1471,38 @@ fn every_run_starts_from_its_images_own_root_or_does_not_start() {
             .filter(|request| request.method == "DELETE" && request.path.contains("/console"))
             .count()
     };
-    // The node holds the copy the record took at create: the root is rebuilt from it, and no registry is asked.
+    // A new function's container has never been started: its root is the one its create made from the image, and
+    // Incus cannot start a container that was rebuilt before it ever ran. So nothing is rebuilt before the first
+    // run. What can be checked of that root is: someone who may write the instance points it, before its first
+    // run, at another image of the store, and the run does not start.
+    let other = rig.fake.add_image(PROJECT, "another-image");
+    let own = rig.instance("relay");
+    let mut body = own.clone();
+    body["config"]["volatile.base_image"] = json!(other);
+    send(&rig, "PUT", &instance, &body);
+    let (writes, cleared) = (rig.state_writes(), clears(&rig));
+    let line = rig.run("relay");
+    assert_eq!(line["outcome"], "notStarted");
+    assert!(
+        line["why"]
+            .as_str()
+            .unwrap()
+            .contains("has never been started and does not say it was made from the image its function's record took"),
+        "{line}"
+    );
+    assert_eq!((rig.state_writes(), clears(&rig)), (writes, cleared));
+    send(&rig, "PUT", &instance, &own);
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"], &line["rootImage"]),
+        (&json!("ok"), &json!("new"), &json!(image))
+    );
+    assert!(
+        rig.fake.rebuilds(PROJECT, "relay").is_empty(),
+        "a rebuild before the first start would leave it unable to start"
+    );
+    // It has run. The node holds the copy the record took at create: from now on the root is rebuilt from it
+    // before every run, and no registry is asked.
     let line = rig.run("relay");
     assert_eq!(
         (&line["outcome"], &line["root"], &line["rootImage"]),
@@ -1477,7 +1510,6 @@ fn every_run_starts_from_its_images_own_root_or_does_not_start() {
     );
     // Someone who may write the instance points it at another image of the store. The run does not follow: it
     // rebuilds from the image its record names, and its line says which.
-    let other = rig.fake.add_image(PROJECT, "another-image");
     let mut body = rig.instance("relay");
     body["config"]["volatile.base_image"] = json!(other);
     send(&rig, "PUT", &instance, &body);

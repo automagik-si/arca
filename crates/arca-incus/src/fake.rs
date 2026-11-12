@@ -148,6 +148,9 @@ impl FakeState {
     }
 }
 
+/// The id map the fake gives a new function's container, in the text Incus keeps it in.
+const ID_MAP: &str = r#"[{"Isuid":true,"Isgid":false,"Hostid":1000000,"Nsid":0,"Maprange":1000000000},{"Isuid":false,"Isgid":true,"Hostid":1000000,"Nsid":0,"Maprange":1000000000}]"#;
+
 /// One request the fake received: its method and target as sent, and the status it answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedRequest {
@@ -1669,11 +1672,14 @@ fn create(
         store.put_image_from(&project, fingerprint.clone(), &alias, true, Some(&server));
         // A new function's instance says which image it was made from, as Incus writes it for every instance. The
         // fake writes it for a function's alone: a service's view shows the key, and the suites that compare whole
-        // views were written without it.
+        // views were written without it. The same holds for the id map Incus gives a new container to start with.
         if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut)
             && config.contains_key("user.arca.function")
         {
             config.insert("volatile.base_image".to_string(), json!(fingerprint));
+            config.insert("volatile.idmap.base".to_string(), json!("0"));
+            config.insert("volatile.idmap.next".to_string(), json!(ID_MAP));
+            config.insert("volatile.last_state.idmap".to_string(), json!("[]"));
         }
     }
     let parent = address.parent.clone();
@@ -2831,6 +2837,16 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
             |fingerprint| format!("store:{fingerprint}"),
         );
     lock(&shared.rebuilds).entry(key).or_default().push(named);
+    // A rebuild takes away the id map the container would start with next, as Incus does: one that has run starts
+    // from the map it last ran with, and one that never ran has none left.
+    if let Some(config) = store.objects[index]
+        .body
+        .get_mut("config")
+        .and_then(Value::as_object_mut)
+    {
+        config.remove("volatile.idmap.next");
+        config.remove("volatile.last_state.idmap");
+    }
     answered(shared, store, "instance", "PUT", Ok(()))
 }
 
@@ -2854,6 +2870,31 @@ fn change_state(
     match text_in(&sent, "action").as_str() {
         "start" if running => bad("The instance is already running"),
         "start" => {
+            // A container the fake gave an id map starts from the next one, or from the one it last ran with. A
+            // rebuild takes the next one away, so a container that was rebuilt before it ever started has neither:
+            // Incus refuses its start, and leaves an empty map behind.
+            if let Some(config) = store.objects[index]
+                .body
+                .get_mut("config")
+                .and_then(Value::as_object_mut)
+                && config.contains_key("volatile.idmap.base")
+            {
+                let map = ["volatile.idmap.next", "volatile.idmap.current"]
+                    .into_iter()
+                    .filter_map(|key| config.get(key).and_then(Value::as_str))
+                    .find(|map| *map != "[]")
+                    .map(str::to_string);
+                let Some(map) = map else {
+                    config.insert("volatile.idmap.current".to_string(), json!("[]"));
+                    let failure = Err((
+                        400,
+                        "No ID map found for unprivileged container".to_string(),
+                    ));
+                    return answered(shared, store, "instance", "PUT", failure);
+                };
+                config.insert("volatile.idmap.current".to_string(), json!(map));
+                config.insert("volatile.last_state.power".to_string(), json!("RUNNING"));
+            }
             store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
             let key = (address.project.clone(), address.name.clone());
             if let Some(plan) = lock(&shared.exit_plans).get(&key).cloned() {
@@ -2870,6 +2911,14 @@ fn change_state(
             }
             if let Some(body) = store.objects[index].body.as_object_mut() {
                 body.insert("status".to_string(), json!("Stopped"));
+            }
+            if let Some(config) = store.objects[index]
+                .body
+                .get_mut("config")
+                .and_then(Value::as_object_mut)
+                && config.contains_key("volatile.last_state.power")
+            {
+                config.insert("volatile.last_state.power".to_string(), json!("STOPPED"));
             }
             lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));
             answered(shared, store, "instance", "PUT", Ok(()))

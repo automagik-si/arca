@@ -781,3 +781,164 @@ fn a_real_incus_gives_a_container_its_images_root_again() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// What a rebuild does to a container that has never been started, against a REAL Incus with the public image:
+/// (1) create, rebuild from the store's copy, start; (2) create, start, stop, rebuild, start; (3) three runs in the
+/// order Arca keeps, through [`FunctionRun::fresh_root`]. Same switch and scratch project; no registry credential is
+/// needed. The id-map keys are printed at each step: a rebuild removes
+/// `volatile.idmap.next`, and a container that never started has no `volatile.idmap.current` to start from.
+#[test]
+#[ignore = "touches a real Incus; run by hand with ARCA_REAL_INCUS_PROOF=1"]
+fn a_real_incus_cannot_start_a_container_that_was_rebuilt_before_its_first_start() {
+    if env("ARCA_REAL_INCUS_PROOF").as_deref() != Some("1") {
+        eprintln!("ARCA_REAL_INCUS_PROOF is not 1; nothing was done");
+        return;
+    }
+    let socket = env("ARCA_PROOF_SOCKET").unwrap_or_else(|| "/var/lib/incus/unix.socket".into());
+    let socket = Path::new(&socket);
+    let project = env("ARCA_PROOF_PROJECT").expect("ARCA_PROOF_PROJECT");
+    let pool = env("ARCA_PROOF_POOL").expect("ARCA_PROOF_POOL");
+    assert!(
+        project.starts_with("arcak-scratch-"),
+        "the project must be a scratch project"
+    );
+    let instance = format!("/1.0/instances/{NAME}?project={project}");
+    let source = json!({ "type": "image", "mode": "pull", "protocol": "oci",
+                         "server": "https://docker.io", "alias": IMAGE });
+    let family =
+        ProjectFamily::new([project.as_str()], std::iter::empty::<&str>()).expect("family");
+    let run = FunctionRun::new(socket.to_path_buf(), family);
+    let create = || {
+        if send(socket, "GET", &instance, None).is_ok() {
+            delete(socket, &instance).expect("the container of an earlier step is deleted");
+        }
+        write(
+            socket,
+            "POST",
+            &format!("/1.0/instances?project={project}"),
+            Some(&json!({
+                "name": NAME,
+                "type": "container",
+                "source": source,
+                "config": { FUNCTION_KEY: "true", "limits.cpu": "1", "limits.memory": "128MiB" },
+                "devices": { "root": { "type": "disk", "path": "/", "pool": pool } },
+                "start": false,
+            })),
+        )
+        .expect("the container is created");
+    };
+    let config = || -> serde_json::Map<String, Value> {
+        send(socket, "GET", &instance, None).expect("the instance")["metadata"]["config"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let maps = |when: &str| {
+        let config = config();
+        let held: Vec<String> = [
+            "volatile.idmap.base",
+            "volatile.idmap.next",
+            "volatile.idmap.current",
+            "volatile.last_state.idmap",
+            "volatile.last_state.power",
+        ]
+        .into_iter()
+        .map(|key| {
+            format!(
+                "{key}: {}",
+                match config.get(key).and_then(Value::as_str) {
+                    None => "absent".to_string(),
+                    Some(text) if text.len() > 12 => "a map".to_string(),
+                    Some(text) => format!("{text:?}"),
+                }
+            )
+        })
+        .collect();
+        println!("PROOF {when}: {}", held.join("; "));
+    };
+    let rebuild = || {
+        let image = config()
+            .get("volatile.base_image")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let done = write(
+            socket,
+            "POST",
+            &format!("/1.0/instances/{NAME}/rebuild?project={project}"),
+            Some(&json!({ "source": { "type": "image", "fingerprint": image } })),
+        );
+        println!("PROOF a rebuild from the store's copy: {done:?}");
+    };
+    let start = |when: &str| -> bool {
+        let seen = run.read(&project, NAME).expect("a function's");
+        match run.start(&seen) {
+            Ok(_) => {
+                std::thread::sleep(Duration::from_millis(500));
+                let seen = run.read(&project, NAME).expect("a function's");
+                println!(
+                    "PROOF a start {when}: TAKEN; half a second later it is {}",
+                    run.status(&seen).expect("status")
+                );
+                let _ = run.stop(&seen, Duration::from_secs(1));
+                let from = Instant::now();
+                while run.read(&project, NAME).expect("a function's").status != "Stopped" {
+                    assert!(from.elapsed() < Duration::from_secs(30), "it never stopped");
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                // Incus is still putting the container away for a moment after it stops.
+                std::thread::sleep(Duration::from_secs(2));
+                true
+            }
+            Err(error) => {
+                println!("PROOF a start {when}: REFUSED: {error}");
+                false
+            }
+        }
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. Never started, rebuilt, then started.
+        create();
+        maps("1. new, never started");
+        rebuild();
+        maps("1. rebuilt, never started");
+        start("of a container rebuilt before its first start");
+        maps("1. after that start");
+
+        // 2. Started once, then rebuilt, then started.
+        create();
+        maps("2. new, never started");
+        start("of a new container");
+        maps("2. after its first start");
+        rebuild();
+        maps("2. rebuilt after a start");
+        start("of a container rebuilt after its first start");
+        maps("2. after that start");
+
+        // 3. The order Arca keeps: a root is asked for before every run, and a container that never started is
+        //    given none; after its first start it is rebuilt from the store's copy, and it starts again.
+        create();
+        let image = config()
+            .get("volatile.base_image")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let never = || false;
+        for run_number in 1..=3 {
+            let seen = run.read(&project, NAME).expect("a function's");
+            let from = Instant::now();
+            let root = run.fresh_root(&seen, Some(&image), &source, &never);
+            println!(
+                "PROOF 3. run {run_number}: fresh_root answered {root:?} in {} ms",
+                from.elapsed().as_millis()
+            );
+            maps(&format!("3. run {run_number}, before its start"));
+            start(&format!("of run {run_number} in Arca's order"));
+        }
+    }));
+    let deleted = delete(socket, &instance);
+    println!("PROOF the container is deleted: {deleted:?}");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

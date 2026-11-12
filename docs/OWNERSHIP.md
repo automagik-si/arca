@@ -1492,6 +1492,12 @@ from an image (the store's copy whose fingerprint the function's record took at 
 gone, the function's own image by digest on its registry, and no other source: never the image the instance itself
 names); its `state` (a start, a stop); and its console log, which it clears. A rebuild
 keeps the instance's config, devices and uuid, so nothing a journalled effect wrote is changed by it.
+An instance that has never been started is not rebuilt: its root is the one its create made from the image and no
+program has run in it, and Incus cannot start a container that was rebuilt before its first start. Whether it has
+started is read on the instance (`volatile.last_state.power`, which Incus writes at the first start and keeps), and
+before that first start the instance must say it was made from the image the function's record took. Whoever may
+write the instance through Incus can remove that key or write into a stopped container's root; that right already
+decides what the function runs, since the entry point and the devices are config a rebuild keeps.
 It forces a stop when a run passes its time limit, and nothing reaches it with a service's instance: the instance
 verbs and their writer still force nothing, and refuse a function's instance. (The kernel's own delete of an instance,
 and the folder and adoption writers, force a stop too, each of its own object, as before.) The kernel starts a run only for the instance whose uuid the effect
@@ -1501,10 +1507,12 @@ state directory, and nothing to the desired state or the effect journal.
 Source: `FunctionRun` and `is_function` in `crates/arca-incus/src/function_run.rs`, with the tests in
 `crates/arca-incus/tests/function_run.rs` (`a_service_is_never_read_started_or_force_stopped_from_here`,
 `a_function_outside_the_family_or_recreated_is_refused`,
-`a_root_is_rebuilt_from_the_stores_copy_and_from_the_registry_when_that_is_gone`); `FunctionRunner` in `crates/arca/src/function_run.rs`;
+`a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that_is_gone`,
+`a_container_that_never_started_is_not_rebuilt_and_one_that_has_run_is`); `FunctionRunner` in `crates/arca/src/function_run.rs`;
 `InstanceLifecycle::target` in `crates/arca/src/lifecycle.rs`. Tests in `crates/arca/tests/functions.rs`
 (`ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state`,
-`a_run_starts_only_the_instance_arca_created_for_its_function`).
+`a_run_starts_only_the_instance_arca_created_for_its_function`,
+`every_run_starts_from_its_images_own_root_or_does_not_start`).
 
 `function_create` and `function_remove` run only from a proposal the owner approved; a removal is the removal of a
 service (the instance is deleted before its ACL), after the run that is going has been stopped. A service a function

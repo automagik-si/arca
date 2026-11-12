@@ -29,9 +29,16 @@ pub const OUTPUT_MAX: usize = 1024 * 1024;
 /// The longest one start or stop operation is waited on.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// Where the image a run's root was rebuilt from came from.
+/// The key Incus writes on an instance when it starts it for the first time, and keeps from then on, across a stop
+/// and across a rebuild. An instance without it has never run: a start that Incus refused does not write it.
+pub const STARTED_KEY: &str = "volatile.last_state.power";
+
+/// Where a run's root came from: the image it was rebuilt from, or nowhere, when nothing was rebuilt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshRoot {
+    /// Nothing was rebuilt: the container has never been started, so its root is the one its create made from the
+    /// image, and no program has run in it.
+    New,
     /// The copy the project's own image store holds: no registry was asked.
     Store,
     /// The registry: the store's copy was gone, and Incus fetched the image again.
@@ -42,6 +49,7 @@ impl FreshRoot {
     /// The word a run's line carries.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::New => "new",
             Self::Store => "store",
             Self::Registry => "registry",
         }
@@ -109,6 +117,12 @@ impl FunctionRun {
     /// Gives the instance its image's own root again: Incus rebuilds the root disk from the image and keeps the config,
     /// the devices and the uuid.
     ///
+    /// An instance that has never been started is not rebuilt ([`FreshRoot::New`]): its root is the one its create
+    /// made from the image and nothing has run in it. It must not be rebuilt either: a rebuild takes away the id map
+    /// a container would start with next, a container that has run starts from the map it last ran with, and one
+    /// that never ran has none, so Incus refuses its start from then on ("No ID map found for unprivileged
+    /// container", seen on Incus 7.5.1). Whether it has started is read on the instance itself ([`STARTED_KEY`]).
+    ///
     /// `fingerprint` is the image the function was created from, as its record holds it: the copy the project's own
     /// store keeps, for which no registry is asked. The instance's own word for its image (`volatile.base_image`) is
     /// never used: whoever may write the instance could point it at another image of the store. When the store no
@@ -127,20 +141,32 @@ impl FunctionRun {
         if !fresh.is_stopped() {
             return Err(refused("the instance is not stopped"));
         }
-        if let Some(held) = fingerprint {
-            if !self::fingerprint(held) {
+        if fingerprint.is_some_and(|held| !self::fingerprint(held)) {
+            return Err(refused(
+                "the function's record names an image that is no fingerprint",
+            ));
+        }
+        if !fresh.own_config.contains_key(STARTED_KEY) {
+            // Never started: nothing has run in its root, and a rebuild would leave it unable to start. What can
+            // be checked of such a root is checked: the instance still says it was made from the image the
+            // function's record took.
+            let made_from = fresh.own_config.get("volatile.base_image");
+            if fingerprint.is_some_and(|held| made_from.map(String::as_str) != Some(held)) {
                 return Err(refused(
-                    "the function's record names an image that is no fingerprint",
+                    "the instance has never been started and does not say it was made from the image its function's record took: remove the function and create it again",
                 ));
             }
-            if self.changer.image_present(&fresh.project, held)? {
-                self.changer.rebuild(
-                    &fresh.project,
-                    &fresh.name,
-                    &json!({ "source": { "type": "image", "fingerprint": held } }),
-                )?;
-                return Ok(FreshRoot::Store);
-            }
+            return Ok(FreshRoot::New);
+        }
+        if let Some(held) = fingerprint
+            && self.changer.image_present(&fresh.project, held)?
+        {
+            self.changer.rebuild(
+                &fresh.project,
+                &fresh.name,
+                &json!({ "source": { "type": "image", "fingerprint": held } }),
+            )?;
+            return Ok(FreshRoot::Store);
         }
         if cancelled() {
             return Err(refused(
