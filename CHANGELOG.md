@@ -7,6 +7,20 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
+removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
+what to propose it now reads the tenants (with what each instance uses and the deploy it came from) and the functions
+with their newest runs. A removal of a tenant, a deploy or a function deletes data or secrets for good, so its card and
+its Approve button are drawn in the alert colour.
+
+The `automagik` image is now named after everything it is built from: `arca-automagik-<commit>-dsh-<harness>`, 12 hex
+digits of the Automagik commit and of a SHA-256 over the build's other inputs (the build script with its Node, Tailscale
+and plugin pins, the DSH package files, and the dashboard's port). Before, it was named after the commit alone, so a
+build with a newer DSH or any other new pin was refused as an image that exists, and the old one had to be deleted by
+hand. The template changed, so an installed copy nobody edited is brought up to date by the upgrade. A node's image of
+before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
+that image is built with `templates/automagik.build.sh`.
+
 ## 0.15.0 (2026-11-12)
 
 The `automagik` image is now named after the harness too: `arca-automagik-<commit>-dsh-<harness>`, 12 hex digits of the
@@ -32,11 +46,6 @@ and so is a key longer than a journal window when neither its BEGIN nor its END 
 line hides the text from its start, so a function's result that names such a line is hidden too; a stray BEGIN line
 hides everything up to the next END line. `docs/OPERATING.md` lists them all.
 
-The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
-removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
-what to propose it now reads the tenants (with what each instance uses and the deploy it came from) and the functions
-with their newest runs. A removal of a tenant, a deploy or a function deletes data or secrets for good, so its card and
-its Approve button are drawn in the alert colour.
 - Merge PR 108: the 0.14.0 notes say what 0.14.0 shipped, and the key-hiding notes say when a window inside a key is hidden and what is still shown
 - Merge dev at v0.14.0 into set F
 - Merge PR 99: a key is hidden by its shape without hiding what follows it, in one pass over any log, and the journal is read at the lines asked
@@ -44,13 +53,6 @@ its Approve button are drawn in the alert colour.
 - Merge PR 105: the guide's table says one step lets a node change things, and what that step leaves to the config
 - Merge set E fix into set F
 - Merge PR 65 commit 2: the Automagik image is built with DSH 0.2.2-rc.2
-The `automagik` image is now named after everything it is built from: `arca-automagik-<commit>-dsh-<harness>`, 12 hex
-digits of the Automagik commit and of a SHA-256 over the build's other inputs (the build script with its Node, Tailscale
-and plugin pins, the DSH package files, and the dashboard's port). Before, it was named after the commit alone, so a
-build with a newer DSH or any other new pin was refused as an image that exists, and the old one had to be deleted by
-hand. The template changed, so an installed copy nobody edited is brought up to date by the upgrade. A node's image of
-before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
-that image is built with `templates/automagik.build.sh`.
 
 ## 0.14.0 (2026-11-12)
 
