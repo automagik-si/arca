@@ -951,8 +951,7 @@ fn a_host_sample_with_nulls_conforms_to_the_result_schema() {
         "projects": [{ "project": "p", "total": 2, "running": 1 }],
         "instancesNotRead": [{ "project": "p", "name": "vm1", "why": "Incus did not answer within 2 seconds" }]
     });
-    let value =
-        json!({ "at": 1, "minutes": 1, "latest": sample, "mean": null, "instancesNotRead": [] });
+    let value = json!({ "at": 1, "minutes": 1, "latest": sample, "mean": null });
     assert!(conforms(&result, &value).is_ok());
 }
 
@@ -1189,6 +1188,7 @@ fn host_sample() -> Value {
                             "enum": [
                                 "Incus did not answer within 2 seconds",
                                 "Incus answered with an error",
+                                "Incus answered without the CPU or the memory figure",
                                 "the tick's time for state reads was spent"
                             ]
                         }

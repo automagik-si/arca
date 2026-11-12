@@ -1359,11 +1359,15 @@ Each sample lists the node's instances once, without their live state: the listi
 and memory are in its **live state**, which Incus takes from a running virtual machine's guest agent and which can take
 seconds for one busy machine. So the sampler reads each running instance's own state, one after another, never two at
 once: 2 seconds each and 4 seconds for all of them in one sample. The ones asked longest ago go first, so on a node with
-more slow machines than one sample reaches, each is still read within a few samples. A stopped instance is not asked.
+more slow machines than one sample reaches, each is still read within a few samples: a read the 4 seconds cut short
+does not count as asked, so that machine goes first in the next sample. Only a running instance is asked. A stopped
+one has no usage; a frozen one, or one in any other status, is not asked and not named either, and its CPU and memory
+are left out of the export.
 
 An instance whose state was not read keeps its row (it counts in `projects` and in `arca_instance_running`), its CPU and
-memory are left out of that sample's export, and the sample's `instancesNotRead` names it with one of three fixed reasons:
-`Incus did not answer within 2 seconds`, `Incus answered with an error`, or `the tick's time for state reads was spent`.
+memory are left out of that sample's export, and the sample's `instancesNotRead` names it with one of four fixed reasons:
+`Incus did not answer within 2 seconds`, `Incus answered with an error`, `Incus answered without the CPU or the memory
+figure` (the figure it did answer is kept), or `the tick's time for state reads was spent`.
 Incus's own text is never shown. In `mean`, `instancesNotRead` is the newest sample's. No alert reads an instance's CPU or
 memory, so a machine that was not read changes no alert.
 

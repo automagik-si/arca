@@ -21,8 +21,8 @@ pub use gpu::{
     cards_of, mean_gpu, normalize_pci, parse_processes, parse_readings, read_inventory,
 };
 pub use incus::{
-    ANSWERED_AN_ERROR, BUDGET_SPENT, InstanceKind, InstanceReading, NOT_ANSWERED, STATE_BUDGET,
-    STATE_DEADLINE,
+    ANSWERED_AN_ERROR, BUDGET_SPENT, InstanceKind, InstanceReading, NO_FIGURES, NOT_ANSWERED,
+    STATE_BUDGET, STATE_DEADLINE, state_path,
 };
 pub use mode::{
     HostMode, HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode,

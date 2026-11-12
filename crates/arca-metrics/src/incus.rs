@@ -34,10 +34,29 @@ pub const STATE_BUDGET: Duration = Duration::from_secs(4);
 pub const NOT_ANSWERED: &str = "Incus did not answer within 2 seconds";
 pub const ANSWERED_AN_ERROR: &str = "Incus answered with an error";
 pub const BUDGET_SPENT: &str = "the tick's time for state reads was spent";
+pub const NO_FIGURES: &str = "Incus answered without the CPU or the memory figure";
 
-/// The live state of one instance, which holds its usage.
+/// The live state of one instance, which holds its usage. The name and the project are percent-encoded: Incus allows
+/// `&`, `#`, `%`, `+` and letters beyond ASCII in a project's name, and none of them may change what is asked.
 pub fn state_path(project: &str, name: &str) -> String {
-    format!("/1.0/instances/{name}/state?project={project}")
+    format!(
+        "/1.0/instances/{}/state?project={}",
+        percent_encoded(name),
+        percent_encoded(project)
+    )
+}
+
+/// `text` with every byte but the unreserved ones (letters, digits, `-`, `.`, `_`, `~`) written as `%XX`.
+fn percent_encoded(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// The CPU time in seconds and the memory in bytes a state document holds, each `None` when absent.
@@ -332,6 +351,22 @@ mod tests {
         ] {
             assert_eq!(host_totals(&partial), None, "{partial}");
         }
+    }
+
+    #[test]
+    fn a_state_path_encodes_the_project_and_the_name_so_neither_changes_what_is_asked() {
+        assert_eq!(
+            state_path("a&b", "vm 1"),
+            "/1.0/instances/vm%201/state?project=a%26b"
+        );
+        assert_eq!(
+            state_path("p#x", "caf\u{e9}"),
+            "/1.0/instances/caf%C3%A9/state?project=p%23x"
+        );
+        assert_eq!(
+            state_path("default", "web-1.a_b~"),
+            "/1.0/instances/web-1.a_b~/state?project=default"
+        );
     }
 
     #[test]

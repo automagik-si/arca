@@ -272,7 +272,7 @@ struct StartTrack {
 }
 
 /// A running instance whose usage a tick did not read, and why, in fixed words ([`incus::NOT_ANSWERED`],
-/// [`incus::ANSWERED_AN_ERROR`] or [`incus::BUDGET_SPENT`]). Its row is still counted, with its CPU and memory `null`.
+/// [`incus::ANSWERED_AN_ERROR`], [`incus::NO_FIGURES`] or [`incus::BUDGET_SPENT`]). Its row is still counted, with its CPU and memory `null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotRead {
     pub project: String,
@@ -335,9 +335,10 @@ pub struct Sampler<R: IncusRead> {
     gpu_gone: Vec<GpuCard>,
     /// The ticks counted since the process began; the first is 1.
     ticks: u64,
-    /// The tick at which each running instance's state read was last started, by project and name. A tick starts with
-    /// those asked longest ago (never first), so a node with more slow machines than one tick's budget still reads each
-    /// of them within a few ticks.
+    /// The tick at which each running instance's state was last asked, by project and name: a read that answered, or
+    /// that ran out its own deadline, never one the tick's budget cut short. A tick starts with those asked longest ago
+    /// (never first), so a node with more slow machines than one tick's budget still reads each of them within a few
+    /// ticks.
     state_tried: BTreeMap<(String, String), u64>,
     /// The running instances the newest tick did not read the usage of.
     not_read: Vec<NotRead>,
@@ -421,7 +422,6 @@ impl<R: IncusRead> Sampler<R> {
             let outcome = if left.is_zero() {
                 Err(incus::BUDGET_SPENT)
             } else {
-                self.state_tried.insert(key(instance), tick);
                 incus::read_usage(
                     &self.incus,
                     &instance.project,
@@ -430,10 +430,26 @@ impl<R: IncusRead> Sampler<R> {
                     self.state_deadline,
                 )
             };
+            // A read the budget cut short does not count as asked: the instance keeps its older turn and goes first
+            // next tick, with the whole deadline. A read that ran its own deadline out does count, so a machine whose
+            // agent never answers does not hold the first place on every tick.
+            if outcome != Err(incus::BUDGET_SPENT) {
+                self.state_tried.insert(key(instance), tick);
+            }
             match outcome {
+                Ok((Some(cpu_seconds), Some(memory_bytes))) => {
+                    instance.cpu_seconds = Some(cpu_seconds);
+                    instance.memory_bytes = Some(memory_bytes);
+                }
                 Ok((cpu_seconds, memory_bytes)) => {
+                    // An answer without one of its figures: what it has is kept, and the instance is named.
                     instance.cpu_seconds = cpu_seconds;
                     instance.memory_bytes = memory_bytes;
+                    not_read.push(NotRead {
+                        project: instance.project.clone(),
+                        name: instance.name.clone(),
+                        why: incus::NO_FIGURES.to_string(),
+                    });
                 }
                 Err(why) => {
                     instance.cpu_seconds = None;

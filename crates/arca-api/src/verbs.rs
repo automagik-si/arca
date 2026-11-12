@@ -2032,6 +2032,7 @@ fn instances_not_read() -> Value {
             one_of(&[
                 "Incus did not answer within 2 seconds",
                 "Incus answered with an error",
+                "Incus answered without the CPU or the memory figure",
                 "the tick's time for state reads was spent",
             ]),
         ),

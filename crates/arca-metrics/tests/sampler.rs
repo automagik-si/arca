@@ -3000,7 +3000,8 @@ mod state_reads {
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
-    use arca_metrics::{ANSWERED_AN_ERROR, BUDGET_SPENT, NOT_ANSWERED};
+    use arca_incus::{IncusError, IncusRead};
+    use arca_metrics::{ANSWERED_AN_ERROR, BUDGET_SPENT, NO_FIGURES, NOT_ANSWERED};
 
     use super::*;
 
@@ -3130,6 +3131,92 @@ mod state_reads {
             node_metrics(&sampler, Some(1), 6_000)["latest"]["instancesNotRead"],
             json!([])
         );
+    }
+
+    #[test]
+    fn a_machine_that_answers_in_time_is_read_every_few_ticks_beside_one_that_never_answers() {
+        // The review's shape, at a fifth of the real times: A's agent never answers; B answers in 300 ms, C in 200 ms
+        // and D in 120 ms, against a deadline of 400 ms and a budget of 800 ms. A takes its whole deadline every time
+        // it is asked; what is left reaches one or two of the others, and the one the budget cuts short goes first on
+        // the next tick. Each of B, C and D is READ (has its figures) at least every other tick.
+        let names = ["a", "b", "c", "d"];
+        let scratch = Scratch::new("state-fair");
+        write_first_tree(scratch.path());
+        let fake =
+            FakeIncus::start(scratch.path(), machines(&names)).expect("start the fake Incus");
+        for name in names {
+            fake.set_instance_usage("p", name, 1_000_000_000, 512);
+        }
+        for (name, millis) in [("a", 3_000), ("b", 300), ("c", 200), ("d", 120)] {
+            fake.slow_reads(&state_of(name), 1_000, Duration::from_millis(millis));
+        }
+        let mut sampler = sampler(scratch.path(), &fake, 400, 800);
+        let mut reads = std::collections::BTreeMap::<&str, u32>::new();
+        let ticks = 6;
+        for tick in 0..ticks {
+            sampler.sample(1_000 + tick * 5_000);
+            for name in names {
+                if usage(&sampler, name) == (Some(1.0), Some(512)) {
+                    *reads.entry(name).or_default() += 1;
+                }
+            }
+        }
+        assert_eq!(reads.get("a"), None, "the dead agent is never read");
+        for name in ["b", "c", "d"] {
+            let read = reads.get(name).copied().unwrap_or(0);
+            assert!(
+                read >= 2,
+                "{name} was read {read} times in {ticks} ticks: {reads:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_state_without_one_of_its_figures_keeps_the_other_and_names_the_instance() {
+        let scratch = Scratch::new("state-figures");
+        write_first_tree(scratch.path());
+        #[derive(Clone)]
+        struct Partial;
+        impl IncusRead for Partial {
+            fn get_within(&self, path: &str, _timeout: Duration) -> Result<Value, IncusError> {
+                self.get(path)
+            }
+            fn get(&self, path: &str) -> Result<Value, IncusError> {
+                match path {
+                    "/1.0/instances?all-projects=true&recursion=1" => Ok(json!([
+                        { "name": "vm1", "project": "p", "status": "Running", "type": "virtual-machine" }
+                    ])),
+                    "/1.0/instances/vm1/state?project=p" => Ok(
+                        json!({ "cpu": { "usage": 2_000_000_000u64 }, "memory": { "usage": -1 } }),
+                    ),
+                    _ => Err(IncusError::Decode(format!("no answer for {path}"))),
+                }
+            }
+        }
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: scratch.path().join("proc"),
+                sys_root: scratch.path().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: true,
+                mode_retry: None,
+            },
+            Partial,
+        );
+        sampler.sample(1_000);
+        let reading = sampler.readings().instances.clone().expect("the list")[0].clone();
+        assert_eq!(
+            (reading.cpu_seconds, reading.memory_bytes),
+            (Some(2.0), None)
+        );
+        let named: Vec<(String, String)> = sampler
+            .instances_not_read()
+            .iter()
+            .map(|item| (item.name.clone(), item.why.clone()))
+            .collect();
+        assert_eq!(named, vec![("vm1".to_string(), NO_FIGURES.to_string())]);
     }
 
     #[test]
