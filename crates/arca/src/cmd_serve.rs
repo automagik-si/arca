@@ -559,8 +559,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     } else {
         (router.clone(), with_page(false), with_page(true))
     };
-    // The unix socket carries the page as before.
-    let router = with_page(false);
+    // The unix socket carries the page as before, and alone carries the setup code for a terminal of the node's user.
+    let router = match &page {
+        Some(page) => with_page(false).merge(page.local_router()),
+        None => router,
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

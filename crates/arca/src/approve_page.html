@@ -389,6 +389,7 @@
           <div>
             <p class="step-title">Get a setup code</p>
             <p class="step-text">Arca shows the 8 digits on the computer that runs Arca, so be at that computer for this step. The passkey itself is saved on the phone or computer you're using now.</p>
+            <p class="step-text">No screen on that computer? In a terminal there, run <code>arca setup-code --config ~/.config/arca/node.json</code> (with the path of this node's config) and type the 8 digits it prints.</p>
             <button id="get-code" class="btn btn-secondary" type="button">Get a setup code</button>
           </div>
         </li>
@@ -493,6 +494,7 @@ function plain(error) {
   }
   if (error && error.name === "NotAllowedError" && LOCAL_PAGE && !allowCredentials.length) return "No passkey was saved. If you closed the prompt, try again. If the browser offered no way to save one, it has no passkey manager: see the note under step 3.";
   if (message === "A code is already on your screen") return "A code is already showing on the computer that runs Arca. Type that one below.";
+  if (message === "No screen to show the code on") return "The computer that runs Arca has no screen to show the code on. In a terminal on that computer, run \"arca setup-code --config ~/.config/arca/node.json\" (with the path of this node's config), then type the 8 digits it prints below.";
   const answered = message.match(/answered (\d+)$/);
   if (answered) return "Arca could not do that just now (error " + answered[1] + "). Try again in a moment.";
   if (/locked/.test(message)) return message + ". This happens after too many tries, and it unlocks by itself.";

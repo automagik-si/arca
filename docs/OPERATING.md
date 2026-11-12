@@ -67,6 +67,7 @@ signal: a node reads its tokens when it starts and on SIGHUP, so a running node 
 | `arca templates install --config <file> [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
+| `arca setup-code --config <file>` | asks the running node, on its unix socket, for the setup code of the first passkey; for a machine with no screen | `{ "code", "expiresInSeconds", "page" }` as JSON on stdout, and one sentence on stderr; see "The page on this machine alone" |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
 | `arca link join [--] <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
@@ -140,7 +141,7 @@ refused without the value being echoed back.
 | `kernel.importServices` | no | `[{ "name": "<service>", "project": "<project>", "cidr": "<ipv4-network>/24" }]`: the services another manager created that `service_import` may take over where they stand. Each `project` must be listed in `kernel.droiddProjects`, and `cidr` is that project's service subnet. Empty by default: nothing is imported and nothing is written in another manager's project. See "Importing a service another manager created". |
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
-| `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`). Its host is the WebAuthn rp id; it is not the host an approval statement names. |
+| `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`); or `http://localhost:<port>` with the port of `listen.loopback`, the page of a node on its own machine with no domain and no certificate. Its host is the WebAuthn rp id; it is not the host an approval statement names. |
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
 | `approval.trustOwnerKeysFrom` | no | Absolute paths of other kernels' owner passkeys files on this machine, which this kernel also trusts, read-only, for action approvals only (never to change its own passkeys). See "Approving on another kernel of this machine". |
 | `approval.origins` | with `trustOwnerKeysFrom` | The page origins (`approvalOrigin` form) a passkey from those files may answer from. A line for any other origin is not trusted. |
@@ -150,7 +151,9 @@ The config is refused, with exit 2, when:
 
 - a key is unknown, a required key is missing, or a value has the wrong form;
 - `approvalHost` is not a host name: one letter or digit, then up to 252 letters, digits, dots or hyphens;
-- `approvalOrigin` is not `https://`, a lowercase host name, and at most a non-443 port, with no path;
+- `approvalOrigin` is not `https://`, a lowercase host name, and at most a non-443 port, with no path, nor
+  `http://localhost:<port>`; or it is `http://localhost:<port>` and `listen.loopback` is not set to `127.0.0.1` or
+  `[::1]` on that port;
 - `canvasOrigin` is not `http://`, a literal loopback IP, and a nonzero port, with no path;
 - `listen.loopback` is not a loopback address (`127.0.0.0/8` or `::1`; a wildcard, a tailnet address, any other address
   of the machine and an IPv4-mapped address are refused), or its port is 0, 80, 443, 7443 or 9443;
@@ -186,8 +189,10 @@ key takes a loopback address and nothing else. No value of it reaches another ma
 
 What the listener serves and refuses:
 
-- **The MCP routes alone.** `POST /mcp` and the read-only GET routes, each behind a bearer token: 401 without one. The
-  approval page is not on it: `/approve` and everything under it is 404, whatever `approvalOrigin` is.
+- **The MCP routes, and the page of this machine alone.** `POST /mcp` and the read-only GET routes, each behind a
+  bearer token: 401 without one. An approval page with an `https://` origin is never on this listener: `/approve`
+  and everything under it is 404. The one page it carries is the page whose origin is `http://localhost:<port>`
+  with this listener's port; see "The page on this machine alone".
 - **Loopback peers only.** A peer that is not a loopback address is closed at accept with no bytes sent.
 - **Only a request that names it.** The `Host` must be the listener's own address and port (`127.0.0.1:7471`) or
   `localhost` and that port (`localhost:7471`), compared without regard to case. Every `Host` header a request carries
@@ -1528,6 +1533,84 @@ without a cut event. `GET /approve/canvas/chat/history` is the same bounded thre
 `/arca-canvas/chat/history`. Every canvas route carries the CSP with `frame-ancestors 'none'`, `nosniff`, `no-referrer`, and
 `Cache-Control: no-store` on every canvas body, including refusals.
 
+#### The page on this machine alone, with no domain and no certificate
+
+A node on one machine can serve its approval page to a browser on that machine, with no domain name, no certificate
+and no reverse proxy. Two keys do it:
+
+```json
+"listen": { "unix": "...", "loopback": "127.0.0.1:7471" },
+"approvalOrigin": "http://localhost:7471"
+```
+
+The page is then `http://localhost:7471/approve`. Open it by that name, never by the IP address: a browser runs
+passkeys at `http://localhost` because it treats that name as a secure context without a certificate, and it refuses
+an IP address as a passkey's relying party, so the same page at `http://127.0.0.1:7471/approve` loads and cannot save
+or use a passkey.
+
+What the config must say, and what it refuses with exit 2:
+
+- `approvalOrigin` may be `http://localhost:<port>` and no other `http://` origin: not an IP address, not another
+  name, not a name under `localhost`, not `http://localhost` with no port, and nothing after the port;
+- `listen.loopback` must be set to `127.0.0.1` or `[::1]` on that same port, because that is where the page is
+  served;
+- `approval.origins` and `approval.peerKeys.origins` stay `https://` only: another kernel does not trust passkeys
+  enrolled at a localhost page.
+
+Where the page is served:
+
+| Page origin | Unix socket | Loopback listener | Tailnet listener | Proxy listener |
+|-------------|-------------|-------------------|------------------|----------------|
+| `https://<name>` | yes | no | yes | yes |
+| `http://localhost:<port>` | yes | yes | no | no |
+
+On the loopback listener the page is behind that listener's `Host` rule: a request must name `localhost:<port>` or
+`127.0.0.1:<port>`, so a web page loaded from another name that was pointed at this machine reads nothing, not even
+the waiting cards. The page's own rule still holds on top of it: a POST needs the exact origin `http://localhost:<port>`.
+
+The first passkey:
+
+1. Open `http://localhost:7471/approve` and press **Get a setup code**. On a desktop the code appears in a
+   notification. On a machine with no screen the page says so; run this in a terminal on that machine, as the node's
+   user, and type the 8 digits it prints:
+
+   ```sh
+   arca setup-code --config ~/.config/arca/node.json
+   ```
+
+   It prints `{ "code", "expiresInSeconds", "page" }` on stdout. The node gives the code only to a caller that has
+   just made a file in its state directory, which only the node's user can; nobody else on the machine, and no peer
+   on a forwarded socket, gets one. It answers with the code that is live, or a new one, and there is none once a
+   passkey is trusted.
+2. Type the code and save the passkey. **The browser must have somewhere to save it.** On a Linux desktop that is
+   Chrome or Chromium signed in to Google Password Manager, or a password manager extension that keeps passkeys;
+   where the browser offers it, a phone nearby over Bluetooth. Firefox on Linux has no passkey manager of its own.
+   Arca asks for a passkey that checks the person (a fingerprint, a face or a PIN).
+3. If the browser on that machine has nowhere to save a passkey, or the machine has no browser, open the page from
+   a computer that has one, through an SSH forward. On that computer:
+
+   ```sh
+   ssh -L 7471:127.0.0.1:7471 <the machine that runs Arca>
+   ```
+
+   and open `http://localhost:7471/approve` in its browser. Its origin is the same `http://localhost:7471`, so the
+   passkey it saves is the node's. The setup code still comes from the node's own screen or terminal.
+
+What this does not do:
+
+- **A phone cannot open this page**, and neither can another machine without the SSH forward. Approving from a
+  phone needs a name and a certificate: an `https://` origin.
+- **The passkey belongs to `http://localhost:<port>`.** Change the port, or move to an `https://` origin later, and
+  the passkey no longer answers: enrol again.
+- **Other accounts of the machine can reach the page.** They can read the waiting cards, decline a proposal or deny a
+  request (neither needs a passkey), and use up the hour's setup codes. They cannot approve anything, and they do not
+  get a setup code. As for any loopback port, another account can also take the port while the node is down (see
+  "Loopback listener").
+- **Not tested with a real passkey manager.** A browser test drives Chromium's virtual authenticator at
+  `http://localhost`. Google Password Manager, a password manager extension and a phone over Bluetooth were not
+  tried against a `localhost` page.
+- **The remote canvas** (`/approve/canvas`) keeps a `Secure` session cookie; it is not tested on this origin.
+
 #### Approving on another kernel of this machine
 
 One canvas can approve changes on every Arca kernel that runs on the same machine as the page host, with the same passkey.
@@ -1728,7 +1811,8 @@ To use it:
 2. Publish the `/approve` routes through the reverse proxy to the same `listen.proxy` upstream as `/mcp`. The page is also
    reachable on the tailnet listener, but WebAuthn needs the HTTPS proxy origin; plain HTTP is not a secure context.
 3. Open the page at that origin and press **Get a setup code**. The code appears in a desktop notification on the machine
-   running `serve`; it is never shown in the page, a log or an HTTP answer.
+   running `serve`; it is never shown in the page or a log, and no HTTP answer carries it but the unix socket's
+   answer to `arca setup-code`, for a machine with no screen.
 4. Type the 8 digits and register the passkey. `serve` writes the trusted line to `<stateDir>/owner-passkeys`, reloads the
    verifier and logs `arca: passkey trusted, 1 passkey(s) kept`; no restart and no terminal step are needed.
 5. Choose a waiting plan and approve it. The page shows each plan's target digest and expiry; the kernel's answer reports the

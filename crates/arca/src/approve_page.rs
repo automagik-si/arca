@@ -10,6 +10,20 @@
 //! `approvalOrigin` is the page origin and the WebAuthn rp id. It is not the host an approval statement names: the statement
 //! host stays `approval_host(&cfg)`. The origin is `https://` and a host name, or `http://localhost:<port>`, the page of a
 //! node on its own machine's loopback listener, whose rp id is `localhost`.
+//!
+//! The setup code reaches the owner on the machine's own screen, or on a terminal of the node's own user: the unix
+//! socket, and no other listener, carries `POST /local/setup-code` (see [`Page::local_router`]), which `arca setup-code`
+//! calls. It answers only a caller who has just made a file in the node's state directory, which nobody but the node's
+//! user can, and a peer on a forwarded socket cannot.
+//!
+//! With an owner approval request store (`Page::with_approval_requests`), the page lists the requests agents made with
+//! `owner_approval_request` in their own section, as data, and approves one with one tap: `POST /approve/requests/begin`
+//! mints the statement, the passkey signs it, and `POST /approve/requests/approve` takes the request id, that statement and
+//! the proof (see `crate::approval_requests`). `POST /approve/requests/deny` declines one without a passkey.
+//!
+//! With `approval.linkedHosts`, the page also lists the waiting action proposals of other kernels on this machine and relays
+//! the owner's signed approval or decline for one of them to that kernel over its own socket (see `crate::linked`). The page
+//! never checks or spends another kernel's approval, and never asks its own kernel about another kernel's id.
 
 use std::collections::HashMap;
 use std::fs;
@@ -123,7 +137,16 @@ struct PageState {
     requests: Option<Arc<ApprovalRequests>>,
 }
 
-/// The transient setup-code state. No code is ever persisted, logged or returned in a response.
+/// The path the unix socket alone carries for a setup code on the terminal.
+pub const LOCAL_SETUP_CODE_PATH: &str = "/local/setup-code";
+/// The prefix of the file a terminal's request makes in the state directory to show it can write there. The rest of the
+/// name is the request's own random hexadecimal.
+pub const LOCAL_PROOF_PREFIX: &str = "setup-code-request-";
+/// The length of that random part: 16 bytes in lowercase hexadecimal.
+pub const LOCAL_PROOF_LEN: usize = 32;
+
+/// The transient setup-code state. No code is ever persisted or logged. One is returned in a response only by the unix
+/// socket's [`LOCAL_SETUP_CODE_PATH`], to a caller who can write the node's state directory.
 #[derive(Default)]
 struct SetupState {
     live: Option<LiveCode>,
@@ -346,6 +369,17 @@ impl Page {
     /// The canvas state, for a sign-in test to issue a session directly.
     pub fn canvas(&self) -> &Canvas {
         &self.state.canvas
+    }
+
+    /// The router of the unix socket alone: `POST /local/setup-code`, the setup code for a terminal of the node's own
+    /// user. It shares this binding's setup state, so the code it answers with is the one the page then takes. No TCP
+    /// listener and no services socket may carry it: it has no bearer check and no `Origin` rule of the page's, only
+    /// its own proof (see [`local_setup_code`]).
+    pub fn local_router(&self) -> Router {
+        Router::new()
+            .route(LOCAL_SETUP_CODE_PATH, post(local_setup_code))
+            .layer(DefaultBodyLimit::max(1024))
+            .with_state(Arc::new(self.state.clone()))
     }
 
     /// Builds a router sharing this binding's setup state. Only the proxy listener trusts forwarded caller addresses.
@@ -1405,6 +1439,104 @@ async fn setup_code(State(state): State<Arc<PageState>>, headers: HeaderMap) -> 
         expires: now.saturating_add(CODE_TTL_MS),
     });
     Json(json!({ "issued": true })).into_response()
+}
+
+/// The setup code for a terminal: the code that is live now, or a new one, in the answer itself. It is for a machine with
+/// no screen to show a code on, and it is the unix socket's route alone.
+///
+/// The caller proves it can write the node's state directory: before it asks, it makes an empty file there named
+/// [`LOCAL_PROOF_PREFIX`] and 32 hexadecimal digits of its own choosing, and sends those digits. The handler finds that
+/// file (a regular file of this process's own user), removes it, and only then answers. The state directory is mode
+/// 0700, so the caller is the node's user on this machine. A peer that reaches the socket some other way, such as
+/// through a forward from another machine, can make no such file and gets 403; so does a request that carries an
+/// `Origin`. Whoever can write the state directory could already write the passkeys file in it, so the route gives
+/// that user nothing new.
+///
+/// No passkey may be trusted yet, as for the page's own request. A new code counts against the same hourly bound and
+/// the same lock; the 60-second spacing between requests, which keeps a page from filling a screen with notifications,
+/// does not apply to a terminal.
+async fn local_setup_code(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if headers.contains_key(header::ORIGIN) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let proof = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("proof")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let Some(proof) = proof.filter(|proof| {
+        proof.len() == LOCAL_PROOF_LEN
+            && proof
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !take_local_proof(&state.state_dir, &proof) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "The caller did not show that it can write this node's state directory" })),
+        )
+            .into_response();
+    }
+    let now = (state.clock)();
+    let mut setup = match state.setup.lock() {
+        Ok(setup) => setup,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let trusted = match state.kernel.lock() {
+        Ok(kernel) => kernel.owner_passkey_count() > 0,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if trusted {
+        return already_trusted();
+    }
+    setup.prune(now);
+    if let Some(minutes) = setup.locked_minutes(now) {
+        return locked(minutes);
+    }
+    let answer = |code: &str, expires: u64| {
+        Json(json!({
+            "code": code,
+            "expiresInSeconds": expires.saturating_sub(now).div_ceil(1000),
+        }))
+        .into_response()
+    };
+    if let Some(live) = setup.live_if_fresh(now) {
+        return answer(&live.code, live.expires);
+    }
+    if setup.requests.len() >= MAX_CODE_REQUESTS {
+        setup.lock(now);
+        return locked(setup.locked_minutes(now).unwrap_or(1));
+    }
+    setup.requests.push(now);
+    let Ok(code) = fresh_code() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let expires = now.saturating_add(CODE_TTL_MS);
+    let reply = answer(&code, expires);
+    setup.live = Some(LiveCode { code, expires });
+    reply
+}
+
+/// Takes the proof file of one terminal request: `true` when the state directory held a regular file of this process's own
+/// user under the request's name, and it was removed. A link, a directory, another user's file, a file that is not
+/// there, and a file that cannot be removed are all no proof.
+fn take_local_proof(state_dir: &Path, proof: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let path = state_dir.join(format!("{LOCAL_PROOF_PREFIX}{proof}"));
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    let own = arca_approval::effective_uid().is_ok_and(|uid| meta.uid() == uid);
+    meta.is_file() && own && fs::remove_file(&path).is_ok()
 }
 
 /// Checks a setup code before the page creates a credential, using the same wrong-try budgets as registration. A correct

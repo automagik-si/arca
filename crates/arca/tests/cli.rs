@@ -1711,9 +1711,9 @@ fn a_config_with_a_mistyped_field_names_the_field_and_the_file() {
     );
 }
 
-/// One HTTP/1.1 request to `at`, with `Connection: close`, and the reply's status line.
+/// One HTTP/1.1 request to `at`, with `Connection: close`, and the whole reply.
 #[cfg(target_os = "linux")]
-fn status_of(at: std::net::SocketAddr, head: &str, body: &str) -> String {
+fn reply_of(at: std::net::SocketAddr, head: &str, body: &str) -> String {
     let mut stream = std::net::TcpStream::connect(at).expect("connect to the listener");
     stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
     let request = format!(
@@ -1725,7 +1725,17 @@ fn status_of(at: std::net::SocketAddr, head: &str, body: &str) -> String {
         .expect("send the request");
     let mut reply = String::new();
     let _ = stream.read_to_string(&mut reply);
-    reply.lines().next().unwrap_or_default().to_string()
+    reply
+}
+
+/// The status line of [`reply_of`].
+#[cfg(target_os = "linux")]
+fn status_of(at: std::net::SocketAddr, head: &str, body: &str) -> String {
+    reply_of(at, head, body)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[test]
@@ -1930,6 +1940,153 @@ fn a_loopback_port_another_program_holds_does_not_stop_the_node_and_the_status_s
         wait_exit(&mut child).code(),
         Some(0),
         "serve exits 0 on SIGTERM"
+    );
+    let summary = rig.shim.stop().expect("stop the shim");
+    assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_page_of_this_machine_is_on_the_loopback_listener_and_its_setup_code_comes_to_the_terminal() {
+    let scratch = Scratch::new("serve-local-page");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+
+    // Without a page there is nowhere to type a code, and the command says so before it touches anything.
+    let plain = write_config(&scratch, "plain.json", &config(&scratch, rig.shim.socket()));
+    let out = arca()
+        .args(["setup-code", "--config"])
+        .arg(&plain)
+        .output()
+        .expect("run arca setup-code");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("approvalOrigin is not set"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let (mut child, at) = serve_on_a_free_port(&scratch, rig.shim.socket(), &|value, at| {
+        value["listen"]["loopback"] = json!(at.to_string());
+        value["approvalOrigin"] = json!(format!("http://localhost:{}", at.port()));
+    });
+    let port = at.port();
+    let origin = format!("http://localhost:{port}");
+    let get =
+        |path: &str, host: &str| status_of(at, &format!("GET {path} HTTP/1.1\r\nHost: {host}"), "");
+
+    // The page and its cards answer the listener's own two names, with no token, and no other name.
+    for own in [format!("localhost:{port}"), format!("127.0.0.1:{port}")] {
+        assert!(get("/approve", &own).starts_with("HTTP/1.1 200"), "{own}");
+        assert!(
+            get("/approve/plans", &own).starts_with("HTTP/1.1 200"),
+            "{own}"
+        );
+    }
+    let rebound = format!("rebound.example:{port}");
+    assert!(get("/approve", &rebound).starts_with("HTTP/1.1 403"));
+    assert!(get("/approve/plans", &rebound).starts_with("HTTP/1.1 403"));
+
+    // A POST needs the page's exact origin. The same page opened at the IP address is another origin, and so is a
+    // rebound name that sends the right Host.
+    let post = |path: &str, sent_origin: &str, body: &str| {
+        reply_of(
+            at,
+            &format!("POST {path} HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: {sent_origin}"),
+            body,
+        )
+    };
+    for other in [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://rebound.example:{port}"),
+        format!("https://localhost:{port}"),
+    ] {
+        assert!(
+            post(
+                "/approve/setup-code/verify",
+                &other,
+                r#"{"setupCode":"00000000"}"#
+            )
+            .starts_with("HTTP/1.1 403"),
+            "{other}"
+        );
+    }
+    // The terminal's route is the unix socket's alone: the TCP listener does not carry it.
+    assert!(
+        status_of(
+            at,
+            &format!("POST /local/setup-code HTTP/1.1\r\nHost: localhost:{port}"),
+            r#"{"proof":"0123456789abcdef0123456789abcdef"}"#
+        )
+        .starts_with("HTTP/1.1 404")
+    );
+
+    // The code comes to the terminal of the node's user, and it is the page's code.
+    let node = scratch.at("node.json");
+    let out = arca()
+        .args(["setup-code", "--config"])
+        .arg(&node)
+        .output()
+        .expect("run arca setup-code");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed: Value = serde_json::from_slice(&out.stdout).expect("JSON on stdout");
+    let code = printed["code"].as_str().expect("a code");
+    assert!(code.len() == 8 && code.bytes().all(|b| b.is_ascii_digit()));
+    assert_eq!(printed["page"], json!(format!("{origin}/approve")));
+    assert_eq!(printed["expiresInSeconds"], json!(600));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(code),
+        "the code is printed once, on stdout"
+    );
+    let left: Vec<String> = fs::read_dir(&state)
+        .expect("the state directory")
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with("setup-code-request-"))
+        .collect();
+    assert_eq!(left, Vec::<String>::new(), "no request file is left behind");
+    let verified = post(
+        "/approve/setup-code/verify",
+        &origin,
+        &json!({ "setupCode": code }).to_string(),
+    );
+    assert!(verified.starts_with("HTTP/1.1 200"), "{verified}");
+    assert!(verified.contains("\"verified\":true"), "{verified}");
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(
+        wait_exit(&mut child).code(),
+        Some(0),
+        "serve exits 0 on SIGTERM"
+    );
+
+    // With no node running there is no code, and the request file is not left behind either.
+    let out = arca()
+        .args(["setup-code", "--config"])
+        .arg(&node)
+        .output()
+        .expect("run arca setup-code");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        fs::read_dir(&state)
+            .expect("the state directory")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("setup-code-request-"))
+            .count(),
+        0
     );
     let summary = rig.shim.stop().expect("stop the shim");
     assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
