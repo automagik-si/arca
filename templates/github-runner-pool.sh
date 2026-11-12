@@ -590,6 +590,9 @@ slot_cycle() {
   local class=${SLOT_CLASS[$slot]} dir runner daemon slice token name body jit runner_id tries state code
   local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' home=() lines
   ABORT=''
+  # The controller's own flag is not the slot's: a slot begun as the controller is told to stop would find it set, and
+  # none of its pauses would be taken until the controller's signal reached it.
+  STOP=''
   trap 'ABORT=1; wake' TERM INT
   dir=$(slot_dir "$slot")
   runner="$POOL_NAME-s$slot-run"
@@ -1186,6 +1189,8 @@ run_pool() {
     # no other slot has reserved, and memory the machine has free now. CPU is not reserved. The search starts after
     # the slot admitted last, so every class gets its turn.
     for ((n = 0; n < SLOTS; n++)); do
+      # No slot is begun once the controller is told to stop.
+      [ -z "$STOP" ] || break
       slot=$(((next + n) % SLOTS))
       [ -z "${PIDS[$slot]:-}" ] || continue
       if [ -z "$(credential_kind)" ]; then

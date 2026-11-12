@@ -667,6 +667,9 @@ check_token() {
 check_tokens() {
   local i verdict
   for i in "${!R_NAME[@]}"; do
+    # A stop is read between two registrations: each check may take as long as GitLab is given to answer, and twelve
+    # of them are more than a stop is given.
+    [ -z "$STOP" ] || return 2
     check_token $((i + 1))
     verdict=$?
     [ "$verdict" != 2 ] || return 2
@@ -1190,6 +1193,8 @@ run_pool() {
         [ -z "$GITLAB_NOTE" ] || say "GitLab answers again"
         GITLAB_NOTE=''
       else
+        # Cut short by a stop, or failed while one came: nothing is said about GitLab, and the pool stops.
+        [ -z "$STOP" ] || break
         next_check=$((at + POOL_RECHECK))
         note="WARNING: $CHECK_WORDS. The registrations stay as they were, and GitLab is asked again"
         [ "$note" = "$GITLAB_NOTE" ] || {

@@ -2876,3 +2876,55 @@ fn a_stop_ends_the_pause_of_the_pool_at_work_and_of_its_slots() {
     assert!(github.state().runners.iter().all(|runner| runner.deleted));
     let _ = fs::remove_dir_all(scratch);
 }
+
+/// A stop that comes in a pass before the slots are looked at starts none: no runner is registered on GitHub and no
+/// container is started, where a slot was once begun and then told to stop. The pass's look at the backoff file, which
+/// comes before the slots, is kept by a stand-in `cat` until the signal has been sent.
+#[test]
+fn a_stop_that_comes_before_the_slots_are_looked_at_starts_none() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |_| {});
+    let (hold, held, ran_out) = (
+        pool.dir.join("cat-hold"),
+        pool.dir.join("cat-held"),
+        pool.dir.join("cat-ran-out"),
+    );
+    fs::write(&hold, "").expect("the hold");
+    // At most 25 seconds, and said when it ran out: the test was too slow then, not the pool.
+    executable(
+        &pool.dir.join("bin/cat"),
+        &format!(
+            "#!/bin/sh\ncase \"${{1-}}\" in */backoff-until)\n  if [ -e '{0}' ]; then\n    : >'{1}'\n    n=0\n    \
+             while [ -e '{0}' ]; do\n      [ \"$n\" -lt 500 ] || {{ : >'{2}'; break; }}\n      sleep 0.05\n      \
+             n=$((n + 1))\n    done\n  fi\n  ;;\nesac\nexec '{3}' \"$@\"\n",
+            hold.display(),
+            held.display(),
+            ran_out.display(),
+            which("cat").display()
+        ),
+    );
+    pool.start(&github);
+    wait_for(&pool, "the pass's look at the backoff file", || {
+        held.exists()
+    });
+    let sent = pool.term();
+    fs::remove_file(&hold).expect("the hold");
+    assert_eq!(pool.stopped(sent), Some(0));
+    assert!(
+        !ran_out.exists(),
+        "the look at the backoff file was held for 25 seconds before the test went on: this test was too slow, the \
+         pool was not"
+    );
+    assert!(pool.output().ends_with("arca-runner-pool: stopped\n"));
+    assert!(github.registrations().is_empty());
+    assert!(
+        !pool
+            .read("docker/calls.log")
+            .lines()
+            .any(|call| call.starts_with("run ")),
+        "{}",
+        pool.read("docker/calls.log")
+    );
+    let _ = fs::remove_dir_all(scratch);
+}

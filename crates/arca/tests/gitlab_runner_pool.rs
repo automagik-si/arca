@@ -2356,12 +2356,24 @@ fn a_stop_during_a_pause_ends_it_and_nothing_is_begun_after() {
 fn a_stop_while_gitlab_is_asked_is_obeyed_when_the_answer_comes_and_no_pause_follows() {
     let good = token("asked");
 
-    // Before the start: a token GitLab does not take. Nobody waits for the refusal now, so it is not told.
+    // Three registrations: GitLab is asked about each token in turn, and each answer may take as long as GitLab is
+    // given. A stop that comes during the first is read before the second is asked.
+    let three = settings(
+        json!([{ "name": "build" }, { "name": "test" }, { "name": "docs" }]),
+        3,
+    );
+    let secrets = |pool: &Pool, value: &str| {
+        for place in 1..=3 {
+            pool.secret(&format!("GITLAB_RUNNER_TOKEN_{place}"), value);
+        }
+    };
+
+    // Before the start: tokens GitLab does not take. Nobody waits to be told "asking again" now, so it is not said.
     let gitlab = Gitlab::start(std::slice::from_ref(&good));
     gitlab.change(|state| state.hold = true);
-    let mut pool = Pool::new(&settings(one_runner(), 4), REPORTED_32GIB);
+    let mut pool = Pool::new(&three, REPORTED_32GIB);
     long_pauses(&mut pool);
-    pool.secret("GITLAB_RUNNER_TOKEN_1", &token("stale"));
+    secrets(&pool, &token("stale"));
     pool.start(&gitlab.url);
     wait_for(&pool, "the token check on its way", || gitlab.held() == 1);
     let sent = pool.term();
@@ -2380,10 +2392,10 @@ fn a_stop_while_gitlab_is_asked_is_obeyed_when_the_answer_comes_and_no_pause_fol
     // checks of the start are let through; the first one after GitLab Runner is started is the pass's.
     let gitlab = Gitlab::start(std::slice::from_ref(&good));
     gitlab.change(|state| state.hold = true);
-    let mut pool = Pool::new(&settings(one_runner(), 4), REPORTED_32GIB);
+    let mut pool = Pool::new(&three, REPORTED_32GIB);
     pool.env.push(("POOL_TICK", "300".into()));
     pool.env.push(("POOL_VERIFY_EVERY", "0".into()));
-    pool.secret("GITLAB_RUNNER_TOKEN_1", &good);
+    secrets(&pool, &good);
     pool.start(&gitlab.url);
     let mut start = 0;
     wait_for(&pool, "the start", || {
@@ -2402,5 +2414,9 @@ fn a_stop_while_gitlab_is_asked_is_obeyed_when_the_answer_comes_and_no_pause_fol
     let sent = pool.term();
     gitlab.release();
     assert_eq!(pool.stopped(sent), Some(0));
-    assert!(pool.output().ends_with("arca-gitlab-pool: stopped\n"));
+    let output = pool.output();
+    assert!(output.ends_with("arca-gitlab-pool: stopped\n"), "{output}");
+    // The pass asked about one token and no more, and a check cut short is no failure of GitLab's.
+    assert_eq!(gitlab.seen().len(), start + 1);
+    assert!(!output.contains("WARNING: "), "{output}");
 }
