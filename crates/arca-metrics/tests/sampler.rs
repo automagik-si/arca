@@ -1363,7 +1363,6 @@ mod instance_readings {
 }
 
 mod latency_probe {
-    use std::collections::BTreeSet;
     use std::net::{SocketAddr, TcpListener};
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
@@ -3078,7 +3077,7 @@ mod state_reads {
         for name in ["fast", "slow", "broken"] {
             fake.set_instance_usage("p", name, 3_000_000_000, 4_096);
         }
-        fake.slow_reads(&state_of("slow"), 1, Duration::from_millis(600));
+        fake.unanswered_reads(&state_of("slow"), 1);
         fake.fail_reads(&state_of("broken"), 1, 500);
         let mut sampler = sampler(scratch.path(), &fake, 200, 2_000);
 
@@ -3147,7 +3146,8 @@ mod state_reads {
         for name in names {
             fake.set_instance_usage("p", name, 1_000_000_000, 512);
         }
-        for (name, millis) in [("a", 3_000), ("b", 300), ("c", 200), ("d", 120)] {
+        fake.unanswered_reads(&state_of("a"), 1_000);
+        for (name, millis) in [("b", 300), ("c", 200), ("d", 120)] {
             fake.slow_reads(&state_of(name), 1_000, Duration::from_millis(millis));
         }
         let mut sampler = sampler(scratch.path(), &fake, 400, 800);
@@ -3230,7 +3230,7 @@ mod state_reads {
         let fake =
             FakeIncus::start(scratch.path(), machines(&names)).expect("start the fake Incus");
         for name in names {
-            fake.slow_reads(&state_of(name), 100, Duration::from_millis(500));
+            fake.unanswered_reads(&state_of(name), 100);
         }
         let mut sampler = sampler(scratch.path(), &fake, 150, 400);
         let asked = |fake: &FakeIncus| -> BTreeSet<String> {

@@ -651,6 +651,18 @@ impl FakeIncus {
         ));
     }
 
+    /// Holds the next `times` GETs whose target starts with `path_prefix` for `delay`, then answers them as usual, as an
+    /// Incus that is slow to read a virtual machine's state does. Meant for an answer that comes within the client's
+    /// deadline: a read that must miss its deadline is [`Self::unanswered_reads`], since an answer sent after the
+    /// deadline can still be read by a client thread a loaded machine runs late.
+    pub fn slow_reads(&self, path_prefix: &str, times: u32, delay: Duration) {
+        lock(&self.shared.read_faults).push((
+            path_prefix.to_string(),
+            times,
+            ReadFault::Slow(delay),
+        ));
+    }
+
     pub fn set_operations_unreadable(&self, unreadable: bool) {
         self.shared
             .operations_unreadable
@@ -1136,6 +1148,8 @@ enum ReadFault {
     Status(u16),
     /// It never answers, and lets go of the request once the client has hung up.
     Unanswered,
+    /// It waits this long, then answers as usual.
+    Slow(Duration),
 }
 
 /// The fault a GET of `target` meets, when one is left for it. One read is taken from the first fault that matches.
@@ -1182,6 +1196,7 @@ fn handle(shared: &Shared, request: &Request, fault: Option<ReadFault>) -> (u16,
                     error_envelope(status, "the fake was told to fail this read"),
                 );
             }
+            Some(ReadFault::Slow(delay)) => std::thread::sleep(delay),
             Some(ReadFault::Unanswered) | None => {}
         }
     }
