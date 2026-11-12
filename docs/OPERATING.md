@@ -1853,6 +1853,11 @@ config and its own records hold is refused in the create's words, and no card is
 
 - a name a service of that tenant, or of the node, already holds (`service <name> exists`), and a name a function
   holds;
+- a name whose instance another service on the node already has. A tenant's instance is named `<service>-<tenant
+  id>` and the node's own is named as its service, so the node's `x-<tenant id>` and that tenant's `x` are one
+  instance name, and Incus takes a name once on the service network. The second is refused: `the name <name> is
+  taken on this node: ...`. The words say nothing of the service that has it. A proposed `function_create`, and a
+  proposed `postgres_create` on a node whose database is made from its template, are refused the same way;
 - a `deploy` named outside a tenant; a deploy that is closed; and a deploy a token opened. An approved create runs
   as the approval itself and not as any token, so a card can open a deploy, and a later card can add to a deploy a
   card opened while it is provisional, but no card adds to a deploy a token opened. The proposal and the create say
@@ -3483,13 +3488,14 @@ amounts and knows nothing of what they mean. The rules are asked of the settings
 template's, with the create's values in place of the defaults), when the create is proposed and again when it
 runs. The refusal has Arca's words about the two amounts and then the template's `why`: `settings:
 settings.maxSlots is 2, below the number of entries in settings.classes (3): every class is kept one place under
-the cap`. A template lists at most 16 rules, each with a `why` of 1 to 200 plain characters. A template is refused
+the cap`. A template lists at most 16 rules, each with a `why` of 1 to 200 plain characters, and a rule names a
+setting in 1 to 64 plain characters. A template is refused
 when it is read, naming the rule (`settingRules[1]: ...`), when a rule names a setting it does not have or one of
 the wrong type, when an amount has another form, or when the template's own defaults do not pass the rule. Only a
 virtual-machine template has rules. They are asked of a create only: a service that exists is not checked again.
 The machine's own script keeps its checks; the rules repeat only what it refuses. The two GitLab runner pool
-templates state six: `concurrent` and `jobCpu` of 1 or more, `memoryOvercommitPercent` from 100 to 200, and 1 to
-12 entries in `runners`.
+templates state eight: `concurrent` and `jobCpu` from 1 to 999, `memoryOvercommitPercent` from 100 to 200, and 1
+to 12 entries in `runners`.
 
 **Which image a machine was made from.** A template may name its image by an alias (`images:debian/13/cloud`), which
 does not say which build that was. `service_status` adds `baseImage`, the fingerprint (SHA-256) Incus recorded on the

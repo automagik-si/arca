@@ -196,7 +196,8 @@ fn function_not_found(name: &str) -> CallError {
     service_not_found(format!("function {name}: not found"))
 }
 
-/// Refuses a name a service or a function of this node already holds.
+/// Refuses a name a service or a function of this node already holds, and a name whose instance a tenant's service
+/// has: a function's instance has the function's own name, and Incus takes a name once on the service bridge.
 fn name_free(name: &str, entries: &[Entry]) -> Result<(), CallError> {
     match service_entries(entries)
         .into_iter()
@@ -208,6 +209,7 @@ fn name_free(name: &str, entries: &[Entry]) -> Result<(), CallError> {
         Some(_) => Err(service_refused(format!(
             "a service named {name} exists: functions and services share one name space, so a function cannot take the name"
         ))),
+        None if instance_name_taken(entries, None, name) => Err(name_taken("function", name)),
         None => Ok(()),
     }
 }

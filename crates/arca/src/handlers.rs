@@ -3761,14 +3761,14 @@ fn proposed_before_template(
     {
         return Some(service_exists(name));
     }
-    instance_name_taken(entries, tenant_id, name).then(|| name_taken(name))
+    instance_name_taken(entries, tenant_id, name).then(|| name_taken("service", name))
 }
 
 /// Whether another service record on the node, of the node's own or of any tenant, already has the instance name a
 /// create of `name` in `tenant` would take. A tenant's instance is `<name>-<tenant id>` and the node's own is its
 /// name alone, so the node's service `x-<id>` and tenant `<id>`'s service `x` are one instance name; Incus takes a
 /// name once on the service bridge, whatever the project. `entries` are all the node's records.
-fn instance_name_taken(
+pub(super) fn instance_name_taken(
     entries: &[arca_kernel::desired::Entry],
     tenant: Option<&str>,
     name: &str,
@@ -3780,11 +3780,11 @@ fn instance_name_taken(
         .any(|(entry, other)| entry.id.0 != id && other.instance == instance)
 }
 
-/// The refusal of a create whose instance name another service on the node has. It says nothing of that service:
-/// it may be another side's.
-fn name_taken(name: &str) -> CallError {
+/// The refusal of a create whose instance name another service on the node has. `what` is what is being created:
+/// a service, a function or a database. It says nothing of the service that has the name: it may be another side's.
+pub(super) fn name_taken(what: &str, name: &str) -> CallError {
     service_refused(format!(
-        "the name {name} is taken on this node: the instance this service would get has the name of another service's instance. Choose another name"
+        "the name {name} is taken on this node: the instance this {what} would get has the name of another service's instance. Choose another name"
     ))
 }
 
@@ -4331,7 +4331,8 @@ fn database_card_fact(
         .then(|| crate::action_proposal::DATABASE_PASSWORD_GENERATED.to_string())
 }
 
-/// Refuses a database made from the template under a name a database of either kind, or a service, holds already.
+/// Refuses a database made from the template under a name a database of either kind, or a service, holds already,
+/// or whose instance would have the name of another service's instance.
 fn database_name_free(
     entries: &[arca_kernel::desired::Entry],
     name: &str,
@@ -4350,6 +4351,11 @@ fn database_name_free(
             "a service named {name} exists already: a database made from this node's {} template is a service, and takes a name no service holds",
             crate::service::DATABASE_TEMPLATE
         )));
+    }
+    // The database is a service of the node's own, so its instance has its name: a name a tenant's instance has
+    // is taken. Its `service_create` asks the same, and this asks it before a card is shown.
+    if instance_name_taken(entries, None, name) {
+        return Err(name_taken("database", name));
     }
     Ok(())
 }
@@ -6870,7 +6876,7 @@ impl ToolHandler for ServiceHandler {
                 }
                 // The instance name is one name on the node, whichever side holds it: asked of every record.
                 if instance_name_taken(&all_entries, tenant_id, &name) {
-                    return Err(name_taken(&name));
+                    return Err(name_taken("service", &name));
                 }
                 let instance = crate::service::instance_name(tenant_id, &name);
                 if rows
