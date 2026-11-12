@@ -1029,8 +1029,8 @@ fn g10_from_the_installers_node_arca_init_then_the_first_passkey_and_the_first_a
     first_passkey_and_first_approved_change("browser-init", true, false);
 }
 
-/// What a device that makes only RSA keys leaves of a page's `pubKeyCredParams`: RS256 (-257). It runs before the page's
-/// own script, and records the algorithms the page offered in `window.__arcaOfferedAlgs`.
+/// What a device that makes only RSA keys leaves of a page's `pubKeyCredParams`: RS256 (-257). It runs in the loaded page
+/// before the passkey is saved, and records the algorithms the page offered in `window.__arcaOfferedAlgs`.
 const RS256_ONLY_DEVICE: &str = r#"(() => {
   const create = navigator.credentials.create.bind(navigator.credentials);
   navigator.credentials.create = (options) => {
@@ -1039,12 +1039,13 @@ const RS256_ONLY_DEVICE: &str = r#"(() => {
     const publicKey = { ...options.publicKey, pubKeyCredParams: offered.filter((param) => param.alg === -257) };
     return create({ ...options, publicKey });
   };
+  return true;
 })();"#;
 
 /// The walk the tests above make. With `by_init`, the node's config starts as the installer writes it and `arca init
 /// --enable-changes --yes` makes it one that may change things; without, the config is written whole by the test. With
-/// `rs256_only`, the device makes only RSA keys: a script the browser runs before the page's own keeps only RS256 (-257)
-/// of the algorithms the page offers, and records what the page offered.
+/// `rs256_only`, the device makes only RSA keys: a script run in the loaded page keeps only RS256 (-257) of the
+/// algorithms the page offers when it saves the passkey, and records what the page offered.
 fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only: bool) {
     let chrome_binary = std::env::var(CHROME_ENV).unwrap_or_else(|_| DEFAULT_CHROME.to_string());
     let scratch = Scratch::new(tag);
@@ -1208,12 +1209,6 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only:
         json!({ "enabled": true }),
     );
     chrome.authenticator("internal");
-    if rs256_only {
-        chrome.page(
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": RS256_ONLY_DEVICE }),
-        );
-    }
     chrome.page(
         "Page.navigate",
         json!({ "url": format!("{origin}/approve") }),
@@ -1298,6 +1293,9 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only:
     assert_eq!(printed["page"], json!(format!("{origin}/approve")));
 
     // 2. The first passkey, saved by the page's own script at http://localhost.
+    if rs256_only {
+        chrome.eval(RS256_ONLY_DEVICE);
+    }
     chrome.eval(&format!(
         "document.getElementById('setup-code').value = {code:?}; document.getElementById('passkey-label').value = 'This computer'; true"
     ));
