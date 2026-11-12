@@ -564,29 +564,72 @@ fn the_binding_holds_across_a_restart_of_the_node() {
 }
 
 #[test]
-fn an_approval_given_on_a_card_that_bound_no_content_creates_nothing() {
-    // A proposal recorded before this node bound a template's content, still inside its fifteen minutes.
+fn a_card_that_bound_no_content_is_refused_before_the_approval_is_spent() {
+    // Proposals recorded before this node bound a template's content, still inside their fifteen minutes: a create,
+    // and a database made from the node's template. Neither card can be held to what it showed.
     let rig = node();
-    let recorded = rig
-        .kernel
-        .lock()
-        .expect("kernel")
-        .propose_action(
+    arca::cmd_templates::install_into(&templates(&rig), false)
+        .unwrap_or_else(|_| panic!("the shipped templates install"));
+    let pin = arca::service::template_image(
+        &arca::service::load_template(&templates(&rig), DATABASE_TEMPLATE)
+            .unwrap_or_else(|_| panic!("the database template loads")),
+    );
+    for (action, args, template) in [
+        (
             arca::action_proposal::ActionKind::ServiceCreate,
             json!({ "name": "old", "template": "app" }),
-            rig.now(),
-            None,
-        )
-        .unwrap_or_else(|_| panic!("the proposal is recorded"));
-    let proposal = serde_json::to_value(&recorded).expect("json");
-    assert!(proposal["args"].get("templateDigest").is_none());
-    let (code, message) = refusal(approve(&rig, &proposal));
-    assert_eq!(code, "refused");
+            "app",
+        ),
+        (
+            arca::action_proposal::ActionKind::PostgresCreate,
+            json!({ "name": "old", "template": DATABASE_TEMPLATE, "image": pin }),
+            DATABASE_TEMPLATE,
+        ),
+    ] {
+        let recorded = rig
+            .kernel
+            .lock()
+            .expect("kernel")
+            .propose_action(action, args, rig.now(), None)
+            .unwrap_or_else(|_| panic!("the proposal is recorded"));
+        let proposal = serde_json::to_value(&recorded).expect("json");
+        assert!(proposal["args"].get("templateDigest").is_none());
+        let writes = rig.fake().writes().len();
+        let (code, message) = refusal(approve(&rig, &proposal));
+        assert_eq!(code, "refused", "{template}");
+        assert_eq!(
+            message,
+            format!(
+                "this card was shown before this node bound a create to the content of its template ({template}), so it cannot be approved. Nothing was created and the approval was not used; propose it again"
+            )
+        );
+        // The approval was not spent: the proposal still waits, unapproved, and no grant was armed for it.
+        let waiting = rig.call("plan_list", json!({})).expect("plans")["plans"]
+            .as_array()
+            .expect("plans")
+            .clone();
+        assert!(
+            waiting.iter().any(|plan| plan["id"] == proposal["id"]),
+            "{template}: it still waits"
+        );
+        assert!(
+            rig.kernel
+                .lock()
+                .expect("kernel")
+                .action_grant_id("anything")
+                .is_none()
+        );
+        assert!(!has_entry(&rig, "service-old"), "{template}");
+        assert_eq!(rig.fake().writes().len(), writes, "{template}");
+        rig.call("plan_decline", json!({ "plan": proposal["id"] }))
+            .expect("the card is declined");
+    }
+    // A database of the old kind is made from no template: its card binds its image, and is approved as before.
     assert_eq!(
-        message,
-        "this approval was given on a card that did not bind the content of the template app. Nothing was created; propose it again"
+        arca::action_proposal::ActionKind::PostgresCreate
+            .unbound_template(&json!({ "name": "old", "image": pin })),
+        None
     );
-    assert!(!has_entry(&rig, "service-old"));
 }
 
 #[test]

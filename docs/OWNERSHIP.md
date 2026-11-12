@@ -1572,19 +1572,37 @@ name gives when the service is created, and last a `Template content` row with t
 the template's file and its scripts once (`load_template_content`), compares what the call states with that read, and
 builds the service from that same read: its entrypoint and its first-boot script are the ones that were hashed, so
 nothing stands between the check and the create. A template that was edited, or installed again by an upgrade, since
-the card was shown creates nothing, and the refusal says to propose it again. An approved create whose proposal names
-no `templateDigest` (one recorded before the node bound it) creates nothing either. A token's own create has no card
+the card was shown creates nothing, and the refusal says to propose it again. A card that names no
+`templateDigest` (a create, or a database made from the node's template, recorded before the node bound it) is
+refused when its approval is submitted, before the approval is checked, so the owner's approval is not spent on it
+and nothing runs; the create refuses such a call too. A token's own create has no card
 and binds nothing; one that states a `templateDigest` or an `image` is held to it the same way. A proposal for a
 template that does not load, or whose script cannot be read, is refused when it is made, so no card is shown for it.
+
+What a card says of its template beyond the arguments is read from that same read: the `Start` row of a create whose
+template leaves it stopped, and a database card's words about its password. So the rows of one card describe one
+template, the one its fingerprint names.
 
 Not bound, because they are not the template's: why a service is created stopped (that is read from the stored
 secrets when the create runs), the node's own config, and what stands behind an image name that has no digest. The
 kernel access and the private destinations of a create are bound by their own arguments (Rules 69 and 70).
 
+The binding covers the create and nothing after it. The verbs that act on a service later read the template as it
+is installed then: `service_connect` reads its `provides` and the secrets it declares, the Omni verbs read it, and
+`instance_start` writes a machine's secrets by its list. A template edited after a service was created changes what
+those verbs do for that service.
+
+Known limits. A handler built without the node's config fills nothing in: it records the `image` a caller states,
+and its card shows it. `serve` always gives the config; only tests build such a handler. A proposal from it is
+either unbound, and never approved, or held by the create's own compare, so nothing is created from it. On a
+reload, the reason in a kept `Start` row is the journal's own text: whoever can write the node's private journal
+can change those words and nothing else of a card, and what runs is decided by the arguments' digest.
+
 Source: `TemplateContent`, `load_template_content`, `template_digest`, `template_image`, `entrypoint_with` and
 `first_boot_with` in `crates/arca/src/service.rs`; `enrich_service_create`, `enrich_postgres_create`,
-`database_source`, `template_not_the_one_stated`, `template_not_bound` and the compare in `service_create` in
-`crates/arca/src/handlers.rs`; `image_words`, `template_content_words` and the closing rows of
+`database_source`, `database_card_fact`, `template_not_the_one_stated`, `template_not_bound` and the compare in
+`service_create` in `crates/arca/src/handlers.rs`; `Kernel::approve_action` in `crates/arca/src/kernel.rs`;
+`ActionKind::unbound_template`, `image_words`, `template_content_words` and the closing rows of
 `ActionKind::details_with_gpu` in `crates/arca/src/action_proposal.rs`. Tests in
 `crates/arca/tests/tenants/template_binding.rs`
 (`a_proposed_create_is_given_its_templates_image_and_content_and_the_card_shows_both`,
@@ -1592,7 +1610,7 @@ Source: `TemplateContent`, `load_template_content`, `template_digest`, `template
 `a_template_changed_after_the_card_was_shown_is_not_created`,
 `a_card_that_waits_across_an_upgrade_of_the_shipped_templates_is_refused_and_proposed_again`,
 `a_database_proposal_binds_the_content_of_its_template_too`, `the_binding_holds_across_a_restart_of_the_node`,
-`an_approval_given_on_a_card_that_bound_no_content_creates_nothing`,
+`a_card_that_bound_no_content_is_refused_before_the_approval_is_spent`,
 `a_tokens_own_create_has_no_card_and_one_that_states_the_content_is_held_to_it`,
 `a_create_that_could_not_be_made_from_its_template_is_refused_when_it_is_proposed`), in
 `crates/arca/src/service.rs`

@@ -1591,6 +1591,9 @@ impl ToolHandler for ActionPropose {
             }
             _ => payload,
         };
+        // What a create's card says of its template beyond the arguments (why it is created stopped, or that a
+        // database's password is generated), read from the very template the proposal's fingerprint is of.
+        let mut card_fact: Option<String> = None;
         let payload = if is_gpu {
             let Some(gpu) = &self.gpu else {
                 return Err(gpu_refusal(GpuRefusal::Disabled));
@@ -1600,10 +1603,10 @@ impl ToolHandler for ActionPropose {
             crate::storage::enrich(storage, action, &payload, now)?
         } else if let (ActionKind::ServiceCreate, Some(node)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
-            enrich_service_create(node, &entries, &payload)?
+            enrich_service_create(node, &entries, &payload, &mut card_fact)?
         } else if let (ActionKind::PostgresCreate, Some(node)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
-            enrich_postgres_create(node, &entries, &payload)?
+            enrich_postgres_create(node, &entries, &payload, &mut card_fact)?
         } else if action == ActionKind::PostgresCreate
             && self.postgres_image.is_none()
             && payload.get("template").is_some()
@@ -1697,16 +1700,10 @@ impl ToolHandler for ActionPropose {
             .card
             .map(|card| card.product),
             // The card of a create says when its template is created stopped whatever the call says, and why.
-            ActionKind::ServiceCreate => self
-                .node
-                .as_deref()
-                .and_then(|node| service_create_stopped_reason(node, &payload)),
             // The card of a database made from the node's template says that the template generates its password
-            // only when it does, and otherwise why the database is created stopped.
-            ActionKind::PostgresCreate => self
-                .node
-                .as_deref()
-                .and_then(|node| database_card_fact(node, &payload)),
+            // only when it does, and otherwise why the database is created stopped. Both were read when the
+            // proposal was given its template's fingerprint, from that one read of the template.
+            ActionKind::ServiceCreate | ActionKind::PostgresCreate => card_fact.take(),
             // The card of a deploy's removal lists the deploy's parts as they stand now.
             ActionKind::DeployRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
@@ -2158,6 +2155,10 @@ fn action_approval_failure(error: ActionApprovalError) -> CallError {
             message: "the action proposal has expired".to_string(),
         },
         ActionApprovalError::Approval(refusal) => refusal_failure(refusal),
+        // Said before the approval is checked: the owner's approval is not spent on it.
+        ActionApprovalError::Unbound(template) => service_refused(format!(
+            "this card was shown before this node bound a create to the content of its template ({template}), so it cannot be approved. Nothing was created and the approval was not used; propose it again"
+        )),
         ActionApprovalError::Store(_) => internal(),
     }
 }
@@ -3465,6 +3466,7 @@ fn enrich_service_create(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
     payload: &Value,
+    card_fact: &mut Option<String>,
 ) -> Result<Value, CallError> {
     // A private destination comes from the node's config alone, by the service's name. The proposal names it, so the
     // owner's card says it and the approval binds it; a caller that states anything else is refused now.
@@ -3526,6 +3528,15 @@ fn enrich_service_create(
             .is_some_and(|given| given.as_str() != Some(digest.as_str()))
     {
         return Err(template_not_the_one_stated(template_name));
+    }
+    // Why this template is created stopped whatever the call's `start` says, for the card's `Start` row: from the
+    // template this fingerprint is of, and from the secrets stored for the service now.
+    if let Some(name) = payload["name"].as_str() {
+        *card_fact = crate::service::template_stopped_reason(
+            &content.template,
+            &crate::service::entry_id(payload["tenant"].as_str(), name),
+            &cfg.state_dir.join("secrets"),
+        );
     }
     let payload = &{
         let mut payload = payload.clone();
@@ -3915,18 +3926,6 @@ fn template_not_bound(name: &str) -> CallError {
     ))
 }
 
-/// Why the template a proposed `service_create` names is created stopped whatever the call's `start` says, for the
-/// owner's card. `None` when a create starts it, or when the template does not load (the create itself refuses that).
-fn service_create_stopped_reason(cfg: &NodeConfig, payload: &Value) -> Option<String> {
-    let template = crate::service::load_template(
-        &cfg.state_dir.join("templates"),
-        payload["template"].as_str()?,
-    )
-    .ok()?;
-    let owner = crate::service::entry_id(payload["tenant"].as_str(), payload["name"].as_str()?);
-    crate::service::template_stopped_reason(&template, &owner, &cfg.state_dir.join("secrets"))
-}
-
 /// The words of a create's answer for a service created stopped: the call's own `start: false`, or the template's
 /// reason, which names a secret and never shows one.
 fn stopped_because(start: bool, template: Option<String>) -> String {
@@ -4000,7 +3999,12 @@ enum DatabaseSource {
     Configured(String),
     /// The node's database template, with the image by digest it names now and the fingerprint of its content as
     /// this node holds it now: a service, fetched as every template's image is.
-    Template { image: String, digest: String },
+    Template {
+        image: String,
+        digest: String,
+        /// The template itself, from that same read: what a card says of it is said of this one.
+        template: Box<crate::service::Template>,
+    },
 }
 
 /// The source of a database this node creates now: the image its config names, or else its database template. A call
@@ -4076,7 +4080,11 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
     {
         return Err(template_not_the_one_stated(template_name));
     }
-    Ok(DatabaseSource::Template { image: pin, digest })
+    Ok(DatabaseSource::Template {
+        image: pin,
+        digest,
+        template: Box::new(content.template),
+    })
 }
 
 /// The refusal for an image that is not the one the node's database template names now, `pin`.
@@ -4087,26 +4095,23 @@ fn database_image_changed(pin: &str) -> CallError {
     ))
 }
 
-/// What the owner's card is told about a proposed database made from the node's template, read from that template
-/// and from the node's stored secrets now. In this order:
+/// What the owner's card is told about a proposed database `name` made from `template`, the node's database template
+/// as it was read for the proposal's fingerprint, and from the node's stored secrets now. In this order:
 /// - why the service is created stopped, when it is (`template_stopped_reason`: its environment names a secret that
 ///   is neither stored for this name nor generated by the template);
 /// - nothing, when a `POSTGRES_PASSWORD` is already stored for this name: the create uses the stored one and
 ///   generates none, so the card does not say "generates";
 /// - that the template generates the password, when it does.
 ///
-/// `None` also for a database of the old kind (its proposal names no template), for a template that does not load
-/// (the proposal is refused for that before any card is made) and for a template that neither generates the
-/// password nor leaves the service stopped.
-fn database_card_fact(cfg: &NodeConfig, payload: &Value) -> Option<String> {
-    let template = crate::service::load_template(
-        &cfg.state_dir.join("templates"),
-        payload["template"].as_str()?,
-    )
-    .ok()?;
-    let owner = crate::service::entry_id(None, payload["name"].as_str()?);
+/// `None` also for a template that neither generates the password nor leaves the service stopped.
+fn database_card_fact(
+    cfg: &NodeConfig,
+    template: &crate::service::Template,
+    name: &str,
+) -> Option<String> {
+    let owner = crate::service::entry_id(None, name);
     let secrets = cfg.state_dir.join("secrets");
-    if let Some(stopped) = crate::service::template_stopped_reason(&template, &owner, &secrets) {
+    if let Some(stopped) = crate::service::template_stopped_reason(template, &owner, &secrets) {
         return Some(stopped);
     }
     let stored = crate::service::secret_file(&secrets, &owner, "POSTGRES_PASSWORD")
@@ -4147,15 +4152,23 @@ fn enrich_postgres_create(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
     payload: &Value,
+    card_fact: &mut Option<String>,
 ) -> Result<Value, CallError> {
     if cfg.kernel.postgres_image.is_some() || !payload.is_object() {
         return Ok(payload.clone());
     }
-    let DatabaseSource::Template { image, digest } = database_source(cfg, payload)? else {
+    let DatabaseSource::Template {
+        image,
+        digest,
+        template,
+    } = database_source(cfg, payload)?
+    else {
         return Ok(payload.clone());
     };
     if let Some(name) = payload["name"].as_str() {
         database_name_free(entries, name)?;
+        // What the card says of the password, from the template this fingerprint is of.
+        *card_fact = database_card_fact(cfg, &template, name);
     }
     let mut payload = payload.clone();
     payload["template"] = json!(crate::service::DATABASE_TEMPLATE);
@@ -4390,7 +4403,7 @@ impl ToolHandler for PostgresHandler {
         // create is the service handler's own and takes the write gate itself.
         let configured_image = if self.verb == "postgres_create" {
             match database_source(&self.cfg, &args)? {
-                DatabaseSource::Template { image, digest } => {
+                DatabaseSource::Template { image, digest, .. } => {
                     return self.create_from_template(&args, caller, &image, &digest);
                 }
                 DatabaseSource::Configured(image) => Some(image),
