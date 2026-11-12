@@ -3242,6 +3242,55 @@ fn canvas_failure_logs_name_only_the_class_and_do_not_lock_the_next_sign_in() {
 }
 
 #[test]
+fn the_canvas_page_names_assets_that_load_whichever_way_the_page_was_asked_for() {
+    let (rig, _) = Rig::new("canvas-assets", true);
+    let cookie = rig
+        .canvas
+        .issue_session("passkey:test", NOW)
+        .expect("a session cookie");
+    let pair = cookie.split(';').next().expect("cookie pair").to_string();
+    // What a browser asks for when a page at `page` names `reference`: an absolute path as it is, and a relative one
+    // under the page's own directory, which is where the two spellings of the page differ.
+    let resolve = |page: &str, reference: &str| -> String {
+        if reference.starts_with('/') {
+            return reference.to_string();
+        }
+        let directory = &page[..=page.rfind('/').expect("a path")];
+        format!("{directory}{reference}")
+    };
+    for page in ["/approve/canvas", "/approve/canvas/"] {
+        let (status, _, body) = rig.get_with_cookie(page, &pair);
+        assert_eq!(status, 200, "{page}");
+        let html = String::from_utf8(body).expect("the page is text");
+        let named = |attribute: &str| -> Vec<String> {
+            html.split(&format!("{attribute}=\""))
+                .skip(1)
+                .map(|rest| rest.split('"').next().expect("a closing quote").to_string())
+                .collect()
+        };
+        let assets: Vec<String> = named("href").into_iter().chain(named("src")).collect();
+        assert_eq!(
+            assets.len(),
+            2,
+            "{page} names its stylesheet and its script: {assets:?}"
+        );
+        for (asset, want) in assets
+            .iter()
+            .zip(["body { color: black; }", "/* canvas */"])
+        {
+            let (status, _, body) = rig.get_with_cookie(&resolve(page, asset), &pair);
+            assert_eq!(status, 200, "{page} names {asset}, which must load");
+            assert_eq!(String::from_utf8_lossy(&body), want, "{page} names {asset}");
+        }
+        // The script reads its other addresses from this attribute, and it is not relative to the page either.
+        assert!(
+            html.contains("data-arca-base=\"/approve/canvas\""),
+            "{page}"
+        );
+    }
+}
+
+#[test]
 fn canvas_url_vectors_never_return_bytes_and_head_matches_get() {
     let (rig, _) = Rig::new("canvas-vectors", true);
     let cookie = rig
