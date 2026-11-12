@@ -7,6 +7,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The MCP server names the release it is. `serverInfo.version` said `0.1.0`, the version of the verbs' contract, on
+`initialize` and beside every `2026-07-28` result; it is now the release, the version `arca --version` prints. A
+`server/discover` answer now carries `serverInfo` too, where before the server was named only inside its `_meta`.
+
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
 what to propose it now reads the tenants (with what each instance uses and the deploy it came from) and the functions

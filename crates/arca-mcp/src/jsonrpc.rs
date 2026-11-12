@@ -10,7 +10,7 @@
 //! a string or a number; a `null` id is invalid.
 
 use arca_api::verbs::{NOT_CONFIRMED, take_confirm};
-use arca_api::{API_VERSION, Verb, conforms, may_call};
+use arca_api::{Verb, conforms, may_call};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
@@ -163,12 +163,13 @@ fn initialize_result() -> Value {
     })
 }
 
-/// The answer to `server/discover`: the versions, the capabilities and the server's name. It is the same for every
-/// caller, so any cache may keep it.
+/// The answer to `server/discover`: the versions, the capabilities and the server's name and release. It is the same
+/// for every caller, so any cache may keep it.
 fn discover_result() -> Value {
     modern_result(json!({
         "supportedVersions": SUPPORTED_VERSIONS,
         "capabilities": capabilities(),
+        "serverInfo": server_info(),
         "ttlMs": CACHE_TTL_MS,
         "cacheScope": "public"
     }))
@@ -178,8 +179,10 @@ fn capabilities() -> Value {
     json!({ "tools": { "listChanged": false } })
 }
 
+/// The server's name and the release it is: the workspace's version, which `arca --version` prints too. It is not the
+/// API's version (`arca_api::API_VERSION`), which names the contract of the verbs.
 fn server_info() -> Value {
-    json!({ "name": "arca", "version": API_VERSION })
+    json!({ "name": "arca", "version": env!("CARGO_PKG_VERSION") })
 }
 
 /// `result` with what every `2026-07-28` result carries: `resultType`, and the server's name beside any `_meta` it has.
