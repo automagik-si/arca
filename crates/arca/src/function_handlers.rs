@@ -150,6 +150,42 @@ pub(super) fn check_function_remove(entries: &[Entry], payload: &Value) -> Resul
     }
 }
 
+/// A create proposal with the registry its image is fetched from written in, when this node holds a credential for
+/// that registry: the card then says where the credential will rest. A caller that states another, or one where no
+/// credential is held, is refused.
+pub(super) fn with_registry(
+    cfg: &NodeConfig,
+    action: ActionKind,
+    payload: Value,
+) -> Result<Value, CallError> {
+    let server = match action {
+        ActionKind::FunctionCreate => payload["image"]
+            .as_str()
+            .and_then(crate::registry::server_of),
+        _ if payload.get("tenant").is_some() => None,
+        _ => payload["template"]
+            .as_str()
+            .and_then(|name| {
+                crate::service::load_template(&cfg.state_dir.join("templates"), name).ok()
+            })
+            .filter(|template| template.kind == "oci")
+            .and_then(|template| crate::registry::server_of(&template.image)),
+    };
+    let held = server.filter(|server| crate::registry::credential_set(cfg, server));
+    let mut payload = payload;
+    match (held, payload.get("registry").and_then(Value::as_str)) {
+        (Some(server), None) => {
+            payload["registry"] = json!(server);
+            Ok(payload)
+        }
+        (Some(server), Some(said)) if said == server => Ok(payload),
+        (None, None) => Ok(payload),
+        _ => Err(CallError::Invalid(
+            "args/registry: it is filled in from what this node holds: the address of the image's registry when a credential is set for it, and nothing otherwise".into(),
+        )),
+    }
+}
+
 fn no_managed_network() -> CallError {
     service_refused(
         "a function runs on the managed service network, where Arca writes the rules of what it may reach, and this node's config names none (kernel.serviceCidr)",
@@ -270,6 +306,65 @@ fn function_view(config: &ServiceConfig, runner: &crate::function_run::FunctionR
 }
 
 impl ServiceHandler {
+    /// After a removal: deletes each image of the node's store that Incus fetched for `config`'s registry and digest
+    /// with a credential in the address, when no instance was made from it any more. Incus keeps that address in the
+    /// image's record, so the credential leaves Incus with the image. An image fetched without a credential is left
+    /// to Incus's own keeping, as before. A failure is said on the log: the removal itself stands.
+    pub(super) fn drop_fetched_images(&self, read: &UnixIncus, config: &ServiceConfig) {
+        // A node where no registry credential was ever set has no such image, and asks Incus nothing.
+        if !crate::registry::ever_set(&self.cfg) {
+            return;
+        }
+        let Ok(images) = read.get(&format!(
+            "/1.0/images?project={}&recursion=1",
+            config.project
+        )) else {
+            return;
+        };
+        let (Some(alias), Some(host)) = (
+            config.source["alias"].as_str(),
+            config.source["server"]
+                .as_str()
+                .and_then(function::registry_host),
+        ) else {
+            return;
+        };
+        let Ok(family) = arca_incus::ProjectFamily::new(
+            [arca_netproject::PROJECT],
+            self.cfg.kernel.droidd_projects.iter().map(String::as_str),
+        ) else {
+            return;
+        };
+        let writer =
+            arca_incus::function_run::FunctionRun::new(self.cfg.incus.socket.clone(), family);
+        for image in images.as_array().into_iter().flatten() {
+            let from = &image["update_source"];
+            let kept = from["server"].as_str().unwrap_or_default();
+            if from["protocol"] == "oci"
+                && from["alias"].as_str() == Some(alias)
+                && function::registry_host(kept).as_deref() == Some(host.as_str())
+                && arca_incus::address_holds_credential(kept)
+                && let Some(fingerprint) = image["fingerprint"].as_str()
+            {
+                match writer.drop_unused_image(&config.project, fingerprint) {
+                    Ok(true) => crate::registry::image_line(
+                        &self.cfg,
+                        (self.clock)(),
+                        &config.project,
+                        fingerprint,
+                        "deleted",
+                        "its last function or service was removed",
+                    ),
+                    Ok(false) => {}
+                    Err(_) => eprintln!(
+                        "arca: the image {} was fetched with a registry's credential and could not be deleted after its last user was removed: Incus still holds that credential with it until the next sweep",
+                        fingerprint.chars().take(12).collect::<String>()
+                    ),
+                }
+            }
+        }
+    }
+
     fn runner(&self) -> Result<&Arc<crate::function_run::FunctionRunner>, CallError> {
         self.functions
             .as_ref()
@@ -414,6 +509,8 @@ impl ServiceHandler {
                 }
                 let _ = std::fs::remove_dir_all(self.cfg.state_dir.join("secrets").join(&id.0));
                 runner.forget(&name);
+                // The image it was fetched from with a registry's credential goes with its last user.
+                self.drop_fetched_images(read, &config);
                 Ok(json!({ "removed": true }))
             }
             "function_create" => {
@@ -455,6 +552,14 @@ impl ServiceHandler {
             )));
         }
         let providers = providers(&definition, entries)?;
+        // An image fetched with this node's credential for its registry is said on the approved card, or not run.
+        crate::registry::stated(
+            &self.cfg,
+            crate::registry::server_of(&definition.function.image).as_deref(),
+            args.get("registry"),
+            // A function is created only from an approved proposal: the check above this call.
+            true,
+        )?;
         // The private destinations are the ones this node's config names for the function now, and the approved
         // proposal states exactly those: a config that changed since the card was shown refuses the create.
         let destinations = destinations_for(

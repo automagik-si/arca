@@ -498,6 +498,19 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // CPU from this machine's cgroup tree only while the node's Incus is this machine's.
     // Nothing of it stops `serve`: a runner that cannot be made, or a timer that cannot start, is said on the log and
     // the node serves everything else, with the function verbs answering that it runs no functions.
+    // The images this node's own project fetched with a registry's credential are looked at now and every ten
+    // minutes. It asks Incus nothing on a node where no such credential was ever set, and never stops serve.
+    if kernel_mode && cfg.kernel.service_cidr.is_some() {
+        let sweep = Arc::new(crate::registry::ImageSweep::new(
+            Arc::new(cfg.clone()),
+            clock.clone(),
+        ));
+        if let Err(error) = sweep.spawn() {
+            eprintln!(
+                "arca: the sweep of images fetched with a registry's credential did not start: {error}"
+            );
+        }
+    }
     let functions = if kernel_mode && cfg.kernel.service_cidr.is_some() {
         let source = Arc::clone(&metrics_source);
         match crate::function_run::FunctionRunner::new(
@@ -565,6 +578,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             service_create,
         ))
         .chain(service_handlers)
+        .chain(crate::registry::registry_handlers(Arc::new(cfg.clone())))
         .chain(crate::handlers::tenant_handlers(
             kernel.clone(),
             clock.clone(),

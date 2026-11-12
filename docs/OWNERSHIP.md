@@ -1630,6 +1630,46 @@ Source: `TemplateContent`, `load_template_content`, `template_digest`, `template
 `crates/arca/src/action_proposal.rs`
 (`the_image_row_says_what_boots_what_its_name_leaves_open_and_what_a_machine_runs`).
 
+## A registry's credential
+
+**Rule 76.** A registry's credential is a secret of the node, not of an entry: its files stand in the secret store
+under `registry-` and 32 hex digits of the SHA-256 of the registry's host and port, a name of one length that two
+hosts do not share and no entry has, and no entry may use any secret whose name begins `registry-`. The directory
+holds the address the credential was set for, and the credential is given only when that address equals the one
+asked for, byte for byte in lower case: never to another host. Only the provider reads them, at
+the moment of an instance's create in a project of the node's own, never a tenant's, and hands them to the writer
+beside the create's body. The writer checks the body as it is, which still refuses a credential in a server address,
+and writes the credential only into the address of the body it sends. The desired state, the effect journal (whose
+digest is of the body without it), a proposal and a card never hold it. A create whose image is on a registry the
+node holds a credential for states `registry`, that registry's address, which a proposal fills in and the card says in
+words: without it the create is refused, and so is one that states it in a call with no approved proposal behind it. A function's rebuild from the registry is sent the credential the same way.
+Incus keeps the address in the fetched image's record: the writer turns `auto_update` off on such images after a
+create that was sent the credential, whatever the create answered, the narrow path does the same after a rebuild, and
+a removal deletes a cached image that was fetched with a credential once no instance of the project was made from it.
+
+A sweep (`ImageSweep`, at the start of `arca serve` and every ten minutes, in the node's own service project and no
+other) is a third path beside the effect journal, as a run is. It writes two things, each of a cached image whose own
+record holds a credential in its address, and of no other image: `auto_update`, which it turns off, and the image
+itself, which it deletes when no instance of the project is made from it and it has seen it so for fifteen minutes.
+These belong to no entry and have no inverse, so they are not effects: each is a line of `registry-images.jsonl` in
+the state directory (the project, the fingerprint, what and why), as a run is a line of the run log.
+
+Source: `RegistryCredential` and `create_with_registry` in `crates/arca-incus/src/write.rs`; `ImageSweep`, `SWEEP_EVERY_MS` and `ORPHAN_AGE_MS` in
+`crates/arca/src/registry.rs`; `fetched_with_credential` in `crates/arca-incus/src/lifecycle.rs`; `registry_credential`
+and `registry_owner` in `crates/arca-providers/src/incus.rs`; `crates/arca/src/registry.rs`; `with_registry` and
+`drop_fetched_images` in `crates/arca/src/function_handlers.rs`; `FunctionRun::fresh_root` and `drop_unused_image`
+in `crates/arca-incus/src/function_run.rs`. Tests in `crates/arca/tests/functions.rs`
+(`an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_rests_in_incus_alone`,
+`a_registrys_credential_never_reaches_another_host_or_a_functions_environment`,
+`the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_old_orphan`,
+`a_sweep_round_goes_on_past_an_image_that_incus_will_not_change`),
+`crates/arca/tests/tenants/isolation.rs` (`a_tenants_image_is_fetched_without_the_nodes_registry_credential`),
+`crates/arca-providers/tests/incus_provider.rs`
+(`a_registrys_credential_has_a_name_of_its_own_goes_to_its_own_host_and_is_no_entrys_to_name`) and
+`crates/arca-incus/tests/function_run.rs`
+(`a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_deleted`,
+`the_turn_off_after_a_rebuild_goes_on_past_an_image_that_incus_will_not_change`).
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is

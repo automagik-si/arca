@@ -1670,16 +1670,23 @@ fn create(
         let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
         let (server, alias) = (server.to_string(), alias.to_string());
         store.put_image_from(&project, fingerprint.clone(), &alias, true, Some(&server));
-        // A new function's instance says which image it was made from, as Incus writes it for every instance. The
-        // fake writes it for a function's alone: a service's view shows the key, and the suites that compare whole
-        // views were written without it. The same holds for the id map Incus gives a new container to start with.
-        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut)
-            && config.contains_key("user.arca.function")
-        {
-            config.insert("volatile.base_image".to_string(), json!(fingerprint));
-            config.insert("volatile.idmap.base".to_string(), json!("0"));
-            config.insert("volatile.idmap.next".to_string(), json!(ID_MAP));
-            config.insert("volatile.last_state.idmap".to_string(), json!("[]"));
+        // A new instance says which image it was made from, as Incus writes it for every instance. The fake writes
+        // it for a function's, and for an instance whose image was fetched with a registry's credential: a service's
+        // view shows the key, and the suites that compare whole views were written without it. The id map Incus
+        // gives a new container to start with is written for a function's alone, for the same reason.
+        let credentialed = server
+            .strip_prefix("https://")
+            .is_some_and(|rest| rest.contains('@'));
+        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut) {
+            let function = config.contains_key("user.arca.function");
+            if credentialed || function {
+                config.insert("volatile.base_image".to_string(), json!(fingerprint));
+            }
+            if function {
+                config.insert("volatile.idmap.base".to_string(), json!("0"));
+                config.insert("volatile.idmap.next".to_string(), json!(ID_MAP));
+                config.insert("volatile.last_state.idmap".to_string(), json!("[]"));
+            }
         }
     }
     let parent = address.parent.clone();
@@ -1915,6 +1922,19 @@ fn patch(
             String::new(),
             error_envelope(400, "patch rejected by test"),
         );
+    }
+    // An image takes one change here: whether Incus goes back to its registry for it by itself.
+    if address.kind == "image" {
+        let Some(index) = store.find(address) else {
+            return (404, String::new(), error_envelope(404, "not found"));
+        };
+        if let Ok(sent) = serde_json::from_slice::<Value>(&request.body)
+            && let Some(auto) = sent.get("auto_update").and_then(Value::as_bool)
+            && let Some(body) = store.objects[index].body.as_object_mut()
+        {
+            body.insert("auto_update".to_string(), json!(auto));
+        }
+        return (200, String::new(), sync_envelope(Value::Null));
     }
     let (index, changes) = match written(store, request, address) {
         Ok(found) => found,
@@ -2789,7 +2809,8 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
 
 /// Rebuilds a stopped instance's root from an image, as an operation, and records which image the request named: the
 /// store's copy by fingerprint (`store`) or a registry's by alias (`registry`). A running instance is refused, and
-/// so is what a test set with [`FakeIncus::lose_image`] or [`FakeIncus::refuse_rebuild`]. The fake keeps no root.
+/// so is what a test set with [`FakeIncus::lose_image`] or [`FakeIncus::refuse_rebuild`]. The fake keeps no root; a
+/// rebuild from a registry leaves the image's record in the store, as a fetch does.
 fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Address) -> Answer {
     let bad = |message: &str| (400, String::new(), error_envelope(400, message));
     let Some(index) = store.find(address) else {
@@ -2833,7 +2854,19 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
         .and_then(|source| source.get("fingerprint"))
         .and_then(Value::as_str)
         .map_or_else(
-            || "registry".to_string(),
+            || {
+                // A registry named with a credential in its address is told from one named without.
+                let with_credential = sent
+                    .get("source")
+                    .and_then(|source| source.get("server"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|server| server.contains('@'));
+                if with_credential {
+                    "registry+credential".to_string()
+                } else {
+                    "registry".to_string()
+                }
+            },
             |fingerprint| format!("store:{fingerprint}"),
         );
     lock(&shared.rebuilds).entry(key).or_default().push(named);
@@ -2846,6 +2879,29 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
     {
         config.remove("volatile.idmap.next");
         config.remove("volatile.last_state.idmap");
+    }
+    // A rebuild that names a registry fetches the image again: Incus makes its record anew, with the address it was
+    // asked at and `auto_update` on, and the instance names it.
+    if let Some(source) = sent.get("source").filter(|_| !local)
+        && let Some(server) = source.get("server").and_then(Value::as_str)
+    {
+        let alias = source.get("alias").and_then(Value::as_str).unwrap_or("");
+        let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
+        store.put_image_from(
+            &address.project,
+            fingerprint.clone(),
+            alias,
+            true,
+            Some(server),
+        );
+        if let Some(config) = store.objects[index]
+            .body
+            .get_mut("config")
+            .and_then(Value::as_object_mut)
+            && config.contains_key("volatile.base_image")
+        {
+            config.insert("volatile.base_image".to_string(), json!(fingerprint));
+        }
     }
     answered(shared, store, "instance", "PUT", Ok(()))
 }

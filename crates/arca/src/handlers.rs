@@ -1657,6 +1657,14 @@ impl ToolHandler for ActionPropose {
         } else {
             payload
         };
+        // A create whose image is on a registry this node holds a credential for names that registry, so the card
+        // says where the credential will rest and the approval binds it.
+        let payload = match (action, &self.node) {
+            (ActionKind::ServiceCreate | ActionKind::FunctionCreate, Some(node)) => {
+                function_handlers::with_registry(node, action, payload)?
+            }
+            _ => payload,
+        };
         let payload = action
             .prepare(&payload, self.postgres_image.as_deref())
             .map_err(CallError::Invalid)?;
@@ -5479,8 +5487,13 @@ pub(crate) fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // A registry's directory also holds the address its credential is for, which is no secret.
+        let registry = entry.file_name().to_string_lossy().starts_with("registry-");
         if let Ok(files) = std::fs::read_dir(&path) {
             for file in files.flatten() {
+                if registry && file.file_name() == "server" {
+                    continue;
+                }
                 if let Ok(text) = std::fs::read_to_string(file.path())
                     && text.len() >= 8
                     && text.len() <= 4096
@@ -5858,6 +5871,7 @@ impl ToolHandler for ServiceHandler {
             "service_create" => &[
                 "name",
                 "template",
+                "registry",
                 "bridge",
                 "mac",
                 "deploy",
@@ -5893,6 +5907,7 @@ impl ToolHandler for ServiceHandler {
                 "triggers",
                 "limits",
                 "concurrency",
+                "registry",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
             ],
@@ -6411,6 +6426,10 @@ impl ToolHandler for ServiceHandler {
                 }
                 let secrets = self.cfg.state_dir.join("secrets").join(&id.0);
                 let _ = std::fs::remove_dir_all(secrets);
+                // An image this service was fetched from with a registry's credential goes with its last user.
+                if tenant.is_none() {
+                    self.drop_fetched_images(&read, &config);
+                }
                 Ok(json!({ "removed": true }))
             }
             "service_import" => {
@@ -6758,6 +6777,20 @@ impl ToolHandler for ServiceHandler {
                 crate::service::create_settings(&template, args.get("settings"))
                     .map_err(service_template_error)?;
                 local_image_present(&read, &template, project)?;
+                // An image fetched with this node's credential for its registry is said on the card: a create that
+                // does not say it does not run. Nothing in a tenant is fetched with it.
+                if tenant.is_none() && template.kind == "oci" {
+                    crate::registry::stated(
+                        &self.cfg,
+                        crate::registry::server_of(&template.image).as_deref(),
+                        args.get("registry"),
+                        preapproved,
+                    )?;
+                } else if args.get("registry").is_some() {
+                    return Err(CallError::Invalid(
+                        "registry: only a create of the node's own project, from an image on a registry, names one".into(),
+                    ));
+                }
                 if let Some(scope) = &tenant {
                     if template.lan.is_some() || template.publishable {
                         return Err(service_refused(format!(

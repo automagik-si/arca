@@ -49,6 +49,16 @@ impl StateAction {
     }
 }
 
+/// A cached image whose record says it was fetched with a registry's credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedImage {
+    pub fingerprint: String,
+    /// Whether Incus would go back to the registry for it by itself.
+    pub auto_update: bool,
+    /// Whether an instance of the project says it was made from it.
+    pub used: bool,
+}
+
 /// One instance as the changer read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceState {
@@ -257,6 +267,124 @@ impl StateChanger {
             Err(IncusError::Status { code: 404, .. }) => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    /// Tells Incus not to go back by itself to where a cached image came from. For [`crate::function_run`] alone: an
+    /// image fetched again with a registry's credential keeps the address it was fetched from, and an image by
+    /// digest never changes.
+    pub(crate) fn image_auto_update_off(
+        &self,
+        project: &str,
+        fingerprint: &str,
+    ) -> Result<(), IncusError> {
+        self.allow(project)?;
+        if !plain_name(project) || !plain_name(fingerprint) {
+            return Err(refused("the project or the fingerprint is not plain"));
+        }
+        let url = format!("/1.0/images/{fingerprint}?project={project}");
+        let envelope =
+            checked_envelope(self.send("PATCH", &url, Some(&json!({ "auto_update": false })))?)?;
+        self.wait_for(&envelope)
+    }
+
+    /// The cached images of the store the project reads whose own record says they were fetched with a credential
+    /// (the address Incus keeps for them holds one). An image with no source address, and one from an address
+    /// without a credential, is never among them. For [`crate::function_run`] alone.
+    pub(crate) fn fetched_with_credential(
+        &self,
+        project: &str,
+    ) -> Result<Vec<FetchedImage>, IncusError> {
+        self.allow(project)?;
+        if !plain_name(project) {
+            return Err(refused("the project name is not plain"));
+        }
+        let images = checked_envelope(self.send(
+            "GET",
+            &format!("/1.0/images?project={project}&recursion=1"),
+            None,
+        )?)?;
+        let mut found: Vec<FetchedImage> = images["metadata"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|image| {
+                image["cached"] == true
+                    && image["update_source"]["protocol"] == "oci"
+                    && image["update_source"]["server"]
+                        .as_str()
+                        .is_some_and(crate::write::address_holds_credential)
+            })
+            .filter_map(|image| {
+                let fingerprint = image["fingerprint"].as_str()?;
+                plain_name(fingerprint).then(|| FetchedImage {
+                    fingerprint: fingerprint.to_string(),
+                    auto_update: image["auto_update"] != false,
+                    used: true,
+                })
+            })
+            .collect();
+        if found.is_empty() {
+            return Ok(found);
+        }
+        // Which of them an instance of the project is made from. A listing that cannot be read is an error: no
+        // image is called unused on a guess.
+        let instances = checked_envelope(self.send(
+            "GET",
+            "/1.0/instances?all-projects=true&recursion=1",
+            None,
+        )?)?;
+        let rows = instances["metadata"]
+            .as_array()
+            .ok_or_else(|| decode("the instances are not a list"))?;
+        for image in &mut found {
+            image.used = rows.iter().any(|row| {
+                row["project"].as_str() == Some(project)
+                    && row["config"]["volatile.base_image"].as_str()
+                        == Some(image.fingerprint.as_str())
+            });
+        }
+        Ok(found)
+    }
+
+    /// Deletes one cached image from the store the project reads, when no instance of the project says it was made
+    /// from it. Returns whether it was deleted. For [`crate::function_run`] alone.
+    pub(crate) fn delete_unused_image(
+        &self,
+        project: &str,
+        fingerprint: &str,
+    ) -> Result<bool, IncusError> {
+        self.allow(project)?;
+        if !plain_name(project) || !plain_name(fingerprint) {
+            return Err(refused("the project or the fingerprint is not plain"));
+        }
+        let url = format!("/1.0/images/{fingerprint}?project={project}");
+        let image = match checked_envelope(self.send("GET", &url, None)?) {
+            Ok(envelope) => envelope,
+            Err(IncusError::Status { code: 404, .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if image["metadata"]["cached"] != true {
+            return Ok(false);
+        }
+        // Every instance that reads this store counts: the listing is of all projects, and one of this project
+        // that names the image keeps it. A listing that cannot be read keeps it too.
+        let instances = checked_envelope(self.send(
+            "GET",
+            "/1.0/instances?all-projects=true&recursion=1",
+            None,
+        )?)?;
+        let used = instances["metadata"].as_array().is_none_or(|rows| {
+            rows.iter().any(|row| {
+                row["project"].as_str() == Some(project)
+                    && row["config"]["volatile.base_image"].as_str() == Some(fingerprint)
+            })
+        });
+        if used {
+            return Ok(false);
+        }
+        let envelope = checked_envelope(self.send("DELETE", &url, None)?)?;
+        self.wait_for(&envelope)?;
+        Ok(true)
     }
 
     /// Refuses a project outside the family before any request is sent, a read included.

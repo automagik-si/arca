@@ -288,6 +288,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 // image, which has no digest here, with the version it runs, and the template's content.
                 "image": format!("images:debian/13 running {TEST_PG_IMAGE}"),
                 "templateDigest": "ab".repeat(32),
+                "registry": "https://registry.example",
             }),
             ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
             ActionKind::ServiceUnpublish
@@ -335,6 +336,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "secrets": ["DATABASE_URL"],
                 "links": [{ "to": "nats", "port": 4222 }],
                 "destinations": [{ "address": "10.20.30.40", "port": 443 }],
+                "registry": "https://registry.example",
                 "triggers": [{ "timer": { "everySeconds": 30 } }],
                 "limits": { "seconds": 60, "memory": "128MiB", "cpu": 1 },
             }),
@@ -481,6 +483,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     "triggers" => ("Runs", "every 30 seconds"),
                     "concurrency" => ("Runs", "one run at a time"),
                     "limits" => ("Limits", "at most 60 seconds, 128MiB of memory and 1 CPU"),
+                    "registry" => (
+                        "Registry",
+                        "https://registry.example: the image is fetched with the credential",
+                    ),
                     other => panic!("function_create field {other} has no owner label"),
                 };
                 assert!(row(label).contains(holds), "{label}: {}", row(label));
@@ -573,12 +579,27 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (ActionKind::ServiceCreate, "kernelAccess") => "Kernel access",
                 (ActionKind::ServiceCreate, "destinations") => "Private network",
                 (_, "templateDigest") => "Template content",
+                (ActionKind::ServiceCreate, "registry") => "Registry",
                 _ => panic!("{action:?} field {field} has no owner label"),
             };
             let row = details
                 .iter()
                 .find(|row| row.label == label)
                 .unwrap_or_else(|| panic!("{action:?} details lack {label}"));
+            // The registry is said in a sentence that names it: where its credential then rests.
+            if field == "registry" {
+                assert!(
+                    row.value.starts_with(
+                        "https://registry.example: the image is fetched with the credential"
+                    ) && row
+                        .value
+                        .contains("whoever may use Incus on this machine can read it there"),
+                    "{}",
+                    row.value
+                );
+                seen += 1;
+                continue;
+            }
             // The fields that are not strings are shown in words.
             let access: String;
             let expected = match &prepared[field.as_str()] {

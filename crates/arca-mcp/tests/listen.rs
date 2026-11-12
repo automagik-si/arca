@@ -272,7 +272,8 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "tenant_status",
             "tenant_usage",
             "function_list",
-            "function_runs"
+            "function_runs",
+            "registry_list"
         ]
     );
 }

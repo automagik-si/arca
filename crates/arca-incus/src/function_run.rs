@@ -135,6 +135,7 @@ impl FunctionRun {
         seen: &InstanceState,
         fingerprint: Option<&str>,
         source: &Value,
+        registry: Option<&crate::write::RegistryCredential>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<FreshRoot, IncusError> {
         let fresh = self.fresh(seen)?;
@@ -178,15 +179,79 @@ impl FunctionRun {
                 "the function's record names no image by digest on a registry to rebuild its root from",
             ));
         }
-        match self
+        // A registry that asks for a credential is named with it, in the address that is sent and nowhere else.
+        let mut sent = source.clone();
+        let address = registry
+            .and_then(|registry| registry.address(source["server"].as_str().unwrap_or_default()));
+        let with_credential = address.is_some();
+        if let Some(address) = address {
+            sent["server"] = json!(address);
+        }
+        let rebuilt = self
             .changer
-            .rebuild(&fresh.project, &fresh.name, &json!({ "source": source }))
-        {
+            .rebuild(&fresh.project, &fresh.name, &json!({ "source": sent }));
+        if with_credential {
+            self.fetched_images_stay_put(&fresh);
+        }
+        match rebuilt {
             Ok(()) => Ok(FreshRoot::Registry),
             Err(remote) => Err(refused(&format!(
                 "the node's own copy of the image is gone, and the registry did not give it again: {remote}"
             ))),
         }
+    }
+
+    /// After a rebuild that was sent a registry's credential, done or not: Incus makes a record for the image it
+    /// fetched, with the address it was fetched from and `auto_update` on, as it does for every image it fetches.
+    /// It is turned off on every such image of the project, so Incus does not go back to the registry with that
+    /// address by itself. A failure is said on the log: the periodic sweep tries again.
+    fn fetched_images_stay_put(&self, rebuilt: &InstanceState) {
+        // Every one of them is tried: one that Incus will not change does not leave the others on.
+        let settled = self
+            .fetched_with_credential(&rebuilt.project)
+            .map(|images| {
+                images
+                    .iter()
+                    .filter(|image| image.auto_update)
+                    .filter(|image| {
+                        self.auto_update_off(&rebuilt.project, &image.fingerprint)
+                            .is_err()
+                    })
+                    .count()
+            });
+        if settled != Ok(0) {
+            eprintln!(
+                "arca: auto_update could not be turned off on the image {} was rebuilt from: Incus may ask its registry again by itself until the next sweep",
+                rebuilt.name
+            );
+        }
+    }
+
+    /// The cached images of the project's store whose own record says they were fetched with a credential, each
+    /// with whether Incus would fetch it again by itself and whether an instance of the project is made from it.
+    pub fn fetched_with_credential(
+        &self,
+        project: &str,
+    ) -> Result<Vec<crate::lifecycle::FetchedImage>, IncusError> {
+        self.changer.fetched_with_credential(project)
+    }
+
+    /// Tells Incus not to go back by itself to where the cached image `fingerprint` came from.
+    pub fn auto_update_off(&self, project: &str, fingerprint: &str) -> Result<(), IncusError> {
+        if !self::fingerprint(fingerprint) {
+            return Err(refused("not an image fingerprint"));
+        }
+        self.changer.image_auto_update_off(project, fingerprint)
+    }
+
+    /// Deletes a cached image the project's store holds, when no instance of the project was made from it any more.
+    /// Incus keeps, with an image it fetched, the address it fetched it from, a registry's credential included: the
+    /// image goes with its last user, and the credential with it. Returns whether it was deleted.
+    pub fn drop_unused_image(&self, project: &str, fingerprint: &str) -> Result<bool, IncusError> {
+        if !self::fingerprint(fingerprint) {
+            return Err(refused("not an image fingerprint"));
+        }
+        self.changer.delete_unused_image(project, fingerprint)
     }
 
     /// Stops the instance: a graceful stop that Incus gives `grace` to finish, then a forced one. With no grace the stop
