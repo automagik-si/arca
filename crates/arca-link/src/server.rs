@@ -53,9 +53,7 @@ pub struct Link {
 impl Link {
     pub async fn start(state: State, config: Config, network: Network) -> Result<Self> {
         config.check()?;
-        let lock = state.open_lock(".link-serve.lock")?;
-        lock.try_lock()
-            .map_err(|_| Error::Runtime("link serve is already running"))?;
+        let lock = state.hold_serve()?;
         let cleanup = Cleanup {
             state: state.clone(),
             _lock: lock,
