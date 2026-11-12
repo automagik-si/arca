@@ -752,6 +752,25 @@ instance's delete as its inverse). The service's record holds `start: false`. On
 created stopped, and instance_start starts it later", and the summary ends "and leave it stopped"), and for a
 template that is created stopped whatever the call says ("No: it is created stopped because ...", with the reason).
 
+A new Automagik starts from Automagik's published image, and nothing is built on the node. Two templates run it, both
+pinned to Automagik's release 3.136.4 by its digest (`ghcr.io/automagik-si/automagik-server@sha256:49e997e3…`, one
+linux/amd64 image, about 190 MiB to pull): `automagik-server`, a container on the node reachable on its LAN address at
+port 3081, and `automagik-workspace`, a virtual machine of its own reached through a Cloudflare Tunnel or the tailnet
+(see "An Automagik workspace in its own virtual machine"). Incus pulls the image from the registry by that digest at
+the create. Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
+that loses the plugin. They come through the welcome once Automagik's fixed release is pinned here. The hand-built
+`automagik` template below stays as it is for what the published image does not give today: the Omni channels plugin
+until then, and being published on the tailnet with `service_publish`, which an OCI service cannot be. Build
+`automagik` when you need either.
+
+A node that installed `automagik-server` or `automagik-workspace` up to Arca 0.14.0 (the server template pinned
+Automagik 3.95.0, the workspace a build of Automagik's commit `5fe0be6`) gets both brought up to 3.136.4 by the
+upgrade, as any shipped template nobody edited. A service made before keeps running the image it was created with: it
+is its own instance, and the upgrade does not touch it. Its `service_status` shows the newer release under `update`
+(`"state": "differs"`, the new digest as `templatePin`). A new service pulls 3.136.4. Moving a service made before to
+3.136.4 is today a `service_remove` and a `service_create`, and a remove deletes the service's data with it (the
+server's `/data` volume, the workspace's whole machine): take a snapshot first, or keep it on the release it has.
+
 The `automagik` image is built from a checkout with `bash templates/automagik.build.sh PROJECT PROFILE
 local:BASE_FINGERPRINT`, which publishes it in `PROJECT` under the alias the template names. `PROFILE` must carry a
 root disk and a NIC with internet access and DNS, because the builder downloads Node, Tailscale and the plugins. The
@@ -813,8 +832,8 @@ from the host; LAN traffic on `lan.port` therefore bypasses the service NIC ingr
 bind exposes the port on every host IPv4 interface, including a tailnet interface when present. The service project
 remains restricted; Arca sets and reconciles only `restricted.devices.proxy=allow` to permit these proxy devices. Disk
 restrictions retain Incus' managed default.
-The `automagik-server` template pins the OCI server image, mounts `/data` owned by uid/gid 1000, overrides the profile to
-4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
+The `automagik-server` template pins the OCI server image (Automagik's release 3.136.4, by digest), mounts `/data` owned
+by uid/gid 1000, overrides the profile to 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
 
 ### A database
 
@@ -3918,10 +3937,14 @@ What to know about this reach:
 
 What to know:
 
-- **The pinned server image.** `settings.serverImage` is the build of the Automagik server from the Automagik
-  repository's commit `5fe0be6`. It has the gate, its Cloudflare Access sign-in, and the gate's own sign-in with
-  passkeys, which the tailnet reach uses; both reaches run it. Nothing of the Access sign-in changed between the
-  build pinned before (`8fb2e6f`) and this one. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
+- **The pinned server image.** `settings.serverImage` is Automagik's published release 3.136.4 (the Automagik
+  repository's commit `7aaa512`), the same image the `automagik-server` template pins. It has the gate, its
+  Cloudflare Access sign-in, and the gate's own sign-in with passkeys, which the tailnet reach uses; both reaches run
+  it. The gate's files (`compose.gate.yml`, `gate-entrypoint.mjs`, `gate-access.mjs`, `gate-claim.mjs`) are the same
+  as at commit `5fe0be6`, the build pinned up to Arca 0.14.0. The image's health check was rewritten since; it still
+  prints the code of the port it asks (the gate's in the gate's container, the server's in the server's), which is
+  all the keeper reads. Nothing of the Access sign-in changed between the build pinned before that (`8fb2e6f`) and
+  `5fe0be6`. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
   tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
   (three paths, the two ports, the claim code's place and the seven variable names) is in one block at the top of
   `automagik-workspace.sh`, as that commit has them; check the block when you move the pin to a later build.

@@ -3167,16 +3167,146 @@ fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
     }
 }
 
+/// Automagik's published release 3.136.4 (tag 3.136.4-7aaa5121, commit 7aaa512): the image a new Automagik starts from.
+const AUTOMAGIK_3_136_4: &str =
+    "sha256:49e997e36dc35b79b704fac45f2f14cc07cbe7cf3c943e0a5ceebb5a4c1d5dcc";
+
+/// A new Automagik starts from Automagik's own published image, pulled by its digest: the server template and the
+/// workspace's server name the same release, and neither names an image built on the node.
+#[test]
+fn the_server_and_the_workspace_pin_automagiks_published_release_by_one_digest() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let server = service::load_template(&dir, "automagik-server").unwrap();
+    assert_eq!(server.digest.as_deref(), Some(AUTOMAGIK_3_136_4));
+    assert!(!server.image.starts_with("local:"), "{}", server.image);
+    let source = service::source(&server).unwrap();
+    assert_eq!(
+        (&source["server"], &source["mode"], &source["protocol"]),
+        (&json!("https://ghcr.io"), &json!("pull"), &json!("oci"))
+    );
+    assert_eq!(
+        source["alias"],
+        format!("automagik-si/automagik-server@{AUTOMAGIK_3_136_4}")
+    );
+    let workspace = service::load_template(&dir, "automagik-workspace").unwrap();
+    assert_eq!(
+        workspace.settings.as_ref().unwrap()["serverImage"],
+        format!("{}@{AUTOMAGIK_3_136_4}", server.image)
+    );
+    assert!(
+        server
+            .description
+            .as_deref()
+            .is_some_and(|text| text.contains("Automagik server 3.136.4"))
+    );
+}
+
+/// A node that installed `automagik-server` as 0.1.0-alpha.7 to 0.14.0 shipped it (Automagik 3.95.0) and runs a
+/// service from it. The upgrade replaces the template, since nobody edited it; the service keeps its own instance and
+/// is offered the newer release, which the owner takes or leaves. A new service pulls 3.136.4 by its digest.
+#[test]
+fn a_node_with_the_automagik_server_of_before_keeps_its_service_and_a_new_one_pulls_the_release_by_digest()
+ {
+    use sha2::{Digest as _, Sha256};
+    const BEFORE: &str = "sha256:671cdd101bc48863974c22b8331c4e390bbfaca3de4d2cd7f51491068105e450";
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+    );
+    let templates = rig.dir.join("templates");
+    assert!(arca::cmd_templates::install_into(&templates, false).is_ok());
+    // The template as it shipped before: another description and another digest.
+    let text = fs::read_to_string(templates.join("automagik-server.json")).unwrap();
+    let old_text = text
+        .replace(AUTOMAGIK_3_136_4, BEFORE)
+        .replace(
+            "Automagik server 3.136.4 (ghcr.io/automagik-si/automagik-server pinned by digest; Automagik's published image, the default way to run a new Automagik)",
+            "Automagik server 3.95.0 (ghcr.io/automagik-si/automagik-server pinned by digest)",
+        );
+    let hash: String = Sha256::digest(old_text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert!(
+        arca::cmd_templates::EARLIER.contains(&("automagik-server.json", hash.as_str())),
+        "{hash}"
+    );
+    fs::write(templates.join("automagik-server.json"), &old_text).unwrap();
+    rig.call(
+        "service_create",
+        json!({"name":"server1","template":"automagik-server"}),
+    )
+    .expect("the service made from the template of before");
+    let read = |rig: &Rig| {
+        rig.get(&format!("/1.0/instances/server1?project={PROJECT}"))
+            .expect("the instance of the service from before")
+    };
+    let instance_before = read(&rig);
+
+    // The upgrade: no flag, and the report names the template.
+    let report = arca::cmd_templates::install_into(&templates, false).expect("install");
+    assert_eq!(
+        report["replaced"],
+        json!(["automagik-server.json"]),
+        "{report}"
+    );
+
+    // The service from before is the same instance, and its status offers the newer release.
+    assert_eq!(read(&rig), instance_before);
+    let status = rig
+        .call("service_status", json!({"name":"server1"}))
+        .expect("status");
+    let update = &status["update"];
+    assert_eq!(update["state"], "differs", "{status}");
+    assert!(
+        update["pin"].as_str().unwrap().ends_with(BEFORE),
+        "{update}"
+    );
+    assert!(
+        update["templatePin"]
+            .as_str()
+            .unwrap()
+            .ends_with(AUTOMAGIK_3_136_4),
+        "{update}"
+    );
+
+    // A new service pulls the published release from its registry by digest: nothing is built on the node.
+    rig.call(
+        "service_create",
+        json!({"name":"server2","template":"automagik-server"}),
+    )
+    .expect("the new service");
+    let images = rig
+        .get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+        .expect("the images");
+    let pulled: Vec<&Value> = images
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|image| &image["update_source"]["alias"])
+        .collect();
+    assert!(
+        pulled.contains(&&json!(format!(
+            "automagik-si/automagik-server@{AUTOMAGIK_3_136_4}"
+        ))),
+        "{pulled:?}"
+    );
+}
+
 #[test]
 fn automagik_server_runtime_shape_and_owned_volume_survive_retry_and_are_removed_together() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let template = service::load_template(&dir, "automagik-server").unwrap();
     assert_eq!(template.kind, "oci");
     assert_eq!(template.image, "ghcr.io/automagik-si/automagik-server");
-    assert_eq!(
-        template.digest.as_deref(),
-        Some("sha256:671cdd101bc48863974c22b8331c4e390bbfaca3de4d2cd7f51491068105e450")
-    );
+    assert_eq!(template.digest.as_deref(), Some(AUTOMAGIK_3_136_4));
     assert_eq!(
         template.entrypoint,
         Some(vec![

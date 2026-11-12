@@ -7,6 +7,14 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A new Automagik starts from Automagik's published image: `automagik-server` and `automagik-workspace` now pin
+Automagik's release 3.136.4 by its digest (they pinned 3.95.0 and a build of commit `5fe0be6`), pulled by Incus at the
+create with nothing built on the node. Omni channels are not in 3.136.4; they come through Automagik's welcome once
+Automagik's fixed release is pinned. The hand-built `automagik` template and its build script stay as they were, for
+the Omni channels plugin until then and for publishing on the tailnet. An installed
+copy nobody edited is brought up to date by the upgrade; a service made before keeps running its own image, and
+`service_status` shows the newer release under `update`.
+
 The `automagik` image is now named after the harness too: `arca-automagik-<commit>-dsh-<harness>`, 12 hex digits of the
 Automagik commit and of the SHA-256 of the DSH lockfile. Before, it was named after the commit alone, so a build with a
 newer DSH was refused as an image that exists, and the old one had to be deleted by hand. The template changed, so an
