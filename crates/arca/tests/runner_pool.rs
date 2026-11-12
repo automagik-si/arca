@@ -223,6 +223,15 @@ impl Github {
 const HELPER_SECONDS: u64 = 60;
 const FILE_SECONDS: u64 = 600;
 
+/// The seconds a controller is given to stop after SIGTERM. It is a bound and no judgement of speed: the controller
+/// ends the pass it is in before it reads the signal, and a pass starts many programs, so on a loaded machine a stop
+/// that is in order took longer than the twenty seconds this once was. A controller that never stops still fails here.
+const STOP_SECONDS: u64 = 120;
+
+/// The seconds a killed controller is given to be gone, and an ended helper's output to end. Bounds as well: each
+/// was ten seconds.
+const GONE_SECONDS: u64 = 60;
+
 /// The controllers that are running, by process id, so the bound on the whole file can end them.
 static CONTROLLERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
@@ -268,7 +277,7 @@ fn try_finish(command: &mut Command, seconds: u64) -> Result<Output, String> {
         stderr: Vec::new(),
     };
     for _ in 0..2 {
-        match receiver.recv_timeout(Duration::from_secs(10)) {
+        match receiver.recv_timeout(Duration::from_secs(GONE_SECONDS)) {
             Ok((true, bytes)) => output.stdout = bytes,
             Ok((false, bytes)) => output.stderr = bytes,
             Err(_) => {
@@ -317,11 +326,11 @@ fn end_controller(child: &mut Child) {
     let id = child.id();
     signal("KILL", -i64::from(id));
     let _ = child.kill();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(GONE_SECONDS);
     while matches!(child.try_wait(), Ok(None)) {
         if Instant::now() >= deadline {
             eprintln!(
-                "the controller {id} was still there 10 seconds after it was killed; it is left behind"
+                "the controller {id} was still there {GONE_SECONDS} seconds after it was killed; it is left behind"
             );
             break;
         }
@@ -889,7 +898,10 @@ impl Pool {
             .env("POOL_STATUS_EVERY", "1")
             .env("POOL_READY_WAIT", "5")
             .env("POOL_BACKOFF_MAX", "1")
-            .env("POOL_STOP_WAIT", "10")
+            // What the controller gives its slots to clean up when it stops. It goes on as soon as they have, so the
+            // sixty seconds are a bound. With ten, slots that are slow on a loaded machine are left half cleaned, and
+            // a test that looks at what a stop leaves then fails with nothing wrong.
+            .env("POOL_STOP_WAIT", "60")
             .env("POOL_REFUSE_EVERY", "1")
             .env("POOL_GROUP_EVERY", "1")
             .envs(report_missing_programs(&self.dir.join("not-found.log")))
@@ -917,7 +929,7 @@ impl Pool {
     fn stop(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
         let sent = signal("TERM", i64::from(child.id()));
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(STOP_SECONDS);
         let code = loop {
             if let Some(status) = child.try_wait().expect("the controller's status") {
                 break status.code();
@@ -926,7 +938,7 @@ impl Pool {
                 // It is not left behind, and the test does not wait for it any longer.
                 end_controller(&mut child);
                 panic!(
-                    "the controller did not stop within 20 seconds of SIGTERM (signal sent: {sent}):\n{}",
+                    "the controller did not stop within {STOP_SECONDS} seconds of SIGTERM (signal sent: {sent}):\n{}",
                     self.output()
                 );
             }
