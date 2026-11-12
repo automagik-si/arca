@@ -2746,8 +2746,18 @@ pub fn service_view_schema() -> Value {
                 "type": "string"
             },
             "ipv4": {
-                "description": "Its fixed address on the service bridge.",
+                "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: it has none now.",
                 "maxLength": 15,
+                "type": "string"
+            },
+            "ipv4In": {
+                "const": "state",
+                "description": "service_list only, on a virtual machine on a host bridge: its address is not in its record and exists only in its live state, which the list does not read. service_status of it reads it.",
+                "type": "string"
+            },
+            "ipv4Problem": {
+                "description": "service_status only, on a running virtual machine on a host bridge whose live state could not be read: why, in words. ipv4 is then empty because it was not read, and every other field is as usual.",
+                "maxLength": 400,
                 "type": "string"
             },
             "links": {

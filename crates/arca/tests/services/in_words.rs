@@ -155,7 +155,10 @@ fn shape(value: &str) -> (usize, String) {
     (value.len(), Digest::of(value.as_bytes()).to_hex())
 }
 
-const LISTING: &str = "/1.0/instances?all-projects=true&recursion=2";
+/// The listing every service call reads: the instances, without their live state.
+const LISTING: &str = "/1.0/instances?all-projects=true&recursion=1";
+/// The listing only a create reads: each instance with its live state, slow where a guest's agent is slow.
+const LISTING_WITH_STATE: &str = "/1.0/instances?all-projects=true&recursion=2";
 const MACHINE: &str = "a virtual machine's secret is 8 to 4096 characters, not counting one line break at its end; it may have line breaks, and no other control character";
 const CONTAINER: &str =
     "a container's secret is one line of 8 to 4096 characters without control characters";
@@ -388,15 +391,24 @@ fn every_value_a_caller_may_choose_is_stored_or_refused_in_words_that_name_the_r
     }
 }
 
+/// How many reads of `path` the fake was asked for.
+fn reads_of(rig: &Rig, path: &str) -> usize {
+    rig.fake
+        .requests()
+        .iter()
+        .filter(|request| request.method == "GET" && request.path.starts_with(path))
+        .count()
+}
+
 #[test]
-fn a_read_of_incus_that_fails_once_is_refused_in_words_with_its_own_code_and_the_next_call_answers()
+fn a_read_of_incus_that_fails_fast_is_made_once_more_and_one_that_fails_twice_is_refused_in_words()
 {
     let rig = machine_and_container();
     let door = Door::over(&rig);
     let value = key_file(1679, true);
     let failed = |subject: &str, changed: &str| {
         format!(
-            "error -32000: Incus answered with its own error (status 500) when this node read the instances and their state for {subject}. {changed}{AGAIN}"
+            "error -32000: Incus answered with its own error (status 500) when this node read the instances for {subject}. {changed}{AGAIN}"
         )
     };
     for (verb, arguments, said) in [
@@ -421,35 +433,49 @@ fn a_read_of_incus_that_fails_once_is_refused_in_words_with_its_own_code_and_the
             failed("service p1", "Nothing was changed. "),
         ),
     ] {
-        rig.fake.fail_reads(LISTING, 1, 500);
+        // Twice in a row: the read and its one second try. Refused in words, and nothing was done.
+        rig.fake.fail_reads(LISTING, 2, 500);
+        let before = reads_of(&rig, LISTING);
         let reply = door.call(verb, arguments.clone());
         assert_eq!(answer(&reply), said, "{verb}");
         assert_eq!(refusal_code(&reply), "incus_unavailable", "{verb}");
+        assert_eq!(
+            reads_of(&rig, LISTING),
+            before + 2,
+            "{verb}: two reads, no more"
+        );
         assert_eq!(
             stored(&rig, "p1", "SIGNING_KEY"),
             None,
             "{verb}: nothing was stored"
         );
-        // The read after the failed one is answered, so the same call is no longer refused for it.
+        // Once: the second try is answered, and the caller never hears of the first.
+        rig.fake.fail_reads(LISTING, 1, 500);
         let reply = door.call(verb, arguments);
-        assert_ne!(refusal_code(&reply), "incus_unavailable", "{verb}, again");
+        assert_ne!(
+            refusal_code(&reply),
+            "incus_unavailable",
+            "{verb}, failing once"
+        );
         if verb != "service_logs" {
-            assert_eq!(answer(&reply), "ok", "{verb}, again");
+            assert_eq!(answer(&reply), "ok", "{verb}, failing once");
         }
     }
     assert_eq!(stored(&rig, "p1", "SIGNING_KEY"), Some(shape(&value)));
-    // An answer of Incus that is no server error is not "ask again": it has its own code.
+    // An answer of Incus that is no server error is not "ask again": it has its own code, and is read once.
     rig.fake.fail_reads(LISTING, 1, 403);
+    let before = reads_of(&rig, LISTING);
     let reply = door.call("service_status", json!({"name":"p1"}));
     assert_eq!(
         answer(&reply),
-        "error -32000: Incus answered with status 403 when this node read the instances and their state for service p1. The same request is likely to be answered the same until Incus answers that read."
+        "error -32000: Incus answered with status 403 when this node read the instances for service p1. The same request is likely to be answered the same until Incus answers that read."
     );
     assert_eq!(refusal_code(&reply), "incus_answer");
+    assert_eq!(reads_of(&rig, LISTING), before + 1);
 }
 
 #[test]
-fn a_read_of_incus_slower_than_its_deadline_is_refused_in_words_and_the_next_call_answers() {
+fn a_read_of_incus_slower_than_its_deadline_is_refused_in_words_and_is_not_made_again() {
     let rig = machine_and_container();
     let door = Door::over(&rig);
     // Slower than the ten seconds a read is given: this test waits them out once.
@@ -458,14 +484,17 @@ fn a_read_of_incus_slower_than_its_deadline_is_refused_in_words_and_the_next_cal
         1,
         arca_incus::read::TIMEOUT + Duration::from_millis(500),
     );
+    let before = reads_of(&rig, LISTING);
     let reply = door.call("service_status", json!({"name":"p1"}));
     assert_eq!(
         answer(&reply),
         format!(
-            "error -32000: Incus did not answer within 10 seconds when this node read the instances and their state for service p1. {AGAIN}"
+            "error -32000: Incus did not answer within 10 seconds when this node read the instances for service p1. {AGAIN}"
         )
     );
     assert_eq!(refusal_code(&reply), "incus_unavailable");
+    // A second read would double the wait: after a deadline there is none.
+    assert!(reads_of(&rig, LISTING) <= before + 1);
     assert_eq!(
         answer(&door.call("service_status", json!({"name":"p1"}))),
         "ok"
@@ -522,6 +551,103 @@ fn the_longest_secret_and_one_of_many_bytes_are_taken_out_of_a_services_log() {
             "{service}: the answer shows the secret"
         );
     }
+}
+
+#[test]
+fn one_machine_whose_live_state_is_slow_holds_up_only_its_own_status_and_that_still_answers() {
+    let rig = machine_and_container();
+    // A machine on a host bridge: its address is given by that network, and is only in its live state.
+    let mac = "02:aa:bb:00:00:07";
+    rig.call(
+        "service_create",
+        json!({"name":"p2","template":"pool","bridge":"br0","mac":mac}),
+    )
+    .expect("a machine on the host bridge");
+    let life = life(&rig, Duration::from_millis(200));
+    start(&life, "p2").expect("start");
+    rig.fake.set_lease("br0", mac, "198.51.100.7");
+    let door = Door::over(&rig);
+    let structured = |reply: &Value| reply["result"]["structuredContent"].clone();
+
+    // With nothing slow, its status reads its one state and shows the address; the list reads no state and says
+    // where the address is.
+    let status = door.call("service_status", json!({"name":"p2"}));
+    assert_eq!(answer(&status), "ok");
+    assert_eq!(structured(&status)["ipv4"], "198.51.100.7");
+    assert!(structured(&status).get("ipv4Problem").is_none());
+    let state_of_p2 = format!("/1.0/instances/p2/state?project={PROJECT}");
+
+    // Now its guest is slow: its own state, and so the listing with every instance's state, take longer than a
+    // read is given.
+    let slow = arca_incus::read::TIMEOUT + Duration::from_millis(500);
+    rig.fake.slow_reads(LISTING_WITH_STATE, 100, slow);
+    rig.fake.slow_reads(&state_of_p2, 1, slow);
+    let with_state = reads_of(&rig, LISTING_WITH_STATE);
+    let states = reads_of(&rig, "/1.0/instances/p2/state");
+    let value = key_file(1679, true);
+    let began = Instant::now();
+    let list = door.call("service_list", json!({}));
+    assert_eq!(answer(&list), "ok");
+    let rows = structured(&list)["services"].clone();
+    let row = |name: &str| {
+        rows.as_array()
+            .expect("the rows")
+            .iter()
+            .find(|row| row["name"] == name)
+            .cloned()
+            .expect("a row")
+    };
+    // The list: the bridged machine's address is said to be in its state, and no other row carries the key.
+    assert_eq!(row("p2")["state"], "running");
+    assert_eq!(row("p2")["ipv4"], "");
+    assert_eq!(row("p2")["ipv4In"], "state");
+    assert!(row("p1").get("ipv4In").is_none());
+    assert_ne!(row("p1")["ipv4"], "");
+    for (verb, arguments) in [
+        ("service_status", json!({"name":"p1"})),
+        ("service_status", json!({"name":"tok"})),
+        (
+            "service_secret_set",
+            json!({"name":"p1","key":"SIGNING_KEY","value":value}),
+        ),
+        (
+            "service_secret_set",
+            json!({"name":"p2","key":"SIGNING_KEY","value":value}),
+        ),
+    ] {
+        assert_eq!(answer(&door.call(verb, arguments)), "ok", "{verb}");
+    }
+    assert_eq!(
+        answer(&door.call("service_logs", json!({"name":"tok"}))),
+        "error -32000: service tok: no log"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "six calls beside a slow machine took {:?}",
+        began.elapsed()
+    );
+    // None of them read any state: not the listing with it, and not that machine's.
+    assert_eq!(reads_of(&rig, LISTING_WITH_STATE), with_state);
+    assert_eq!(reads_of(&rig, "/1.0/instances/p2/state"), states);
+
+    // Its own status waits for its state, as long as a read is given, and still answers: everything but the
+    // address, and why the address is missing.
+    let began = Instant::now();
+    let status = door.call("service_status", json!({"name":"p2"}));
+    assert!(began.elapsed() >= arca_incus::read::TIMEOUT);
+    assert_eq!(answer(&status), "ok");
+    let view = structured(&status);
+    assert_eq!(view["state"], "running");
+    assert_eq!(view["ipv4"], "");
+    assert_eq!(
+        view["ipv4Problem"],
+        "Incus did not answer within 10 seconds when this node read the live state of service p2, which is where the address of a machine on a host bridge is: the address was not read. Every other field is as usual; ask again for the address"
+    );
+    assert_eq!(view["settings"]["slots"], 2);
+    // The state answers again: so does the address.
+    let status = door.call("service_status", json!({"name":"p2"}));
+    assert_eq!(structured(&status)["ipv4"], "198.51.100.7");
+    assert!(structured(&status).get("ipv4Problem").is_none());
 }
 
 #[test]

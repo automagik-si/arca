@@ -1165,15 +1165,27 @@ its request is read.
 
 ### When Incus does not answer, and when the answer is "internal"
 
-Every service verb, a read too, first asks Incus for the node's instances with their state, and gives that read 10
-seconds. For a running virtual machine Incus gets the state from the machine's guest agent, so a busy guest, or
-several such reads at once, can make it late. When that read fails, and when one of the reads a create makes for an
-address, for its project or for its new instance fails, the call is refused in words, with a code of its own in
-`data.refusal`:
+Every service verb, a read too, first asks Incus for the node's instances. That listing holds each instance's status,
+config and devices and is answered at once. It does not ask for an instance's **live state**, which for a running
+virtual machine Incus takes from the machine's guest agent: a machine that runs many containers of its own can take
+most of the 10 seconds a read is given, and a listing with every instance's state is as slow as the slowest of them.
+Only three things read live state:
+
+- `service_status` of a virtual machine **on a host bridge**, which runs: its address is given by that network and
+  is in no record, so this one call reads the state of that one instance. When Incus does not answer in time the
+  call still answers, with `ipv4` empty and `ipv4Problem` saying why. `service_list` reads no state: such a machine's
+  row has `ipv4` empty and `ipv4In: "state"`, which says the address is there to be read and is not "none".
+- `service_create` and `function_create`, and `tenant_create`: a new instance's address, MAC or block must not be one
+  that an instance holds live without a record of it.
+
+A read that failed fast (the socket was not reached, or Incus answered with a server error) is made once more after a
+fifth of a second, inside the same 10 seconds. One that got no answer by its deadline is not made again. When the
+listing still fails, and when one of the reads a create makes for an address, for its project or for its new instance
+fails, the call is refused in words, with a code of its own in `data.refusal`:
 
 | Code | What happened | What to do |
 |---|---|---|
-| `incus_unavailable` | Incus did not answer within the 10 seconds, could not be reached on its socket, or answered with a server error (status 500 and above). | Nothing is wrong with the request. Make it again; an approved action is proposed again, since its approval was used. |
+| `incus_unavailable` | Incus did not answer within the 10 seconds, could not be reached on its socket, or answered with a server error (status 500 and above). | Read the sentence. When it says nothing was changed, nothing is wrong with the request: make it again (an approved action is proposed again, since its approval was used). When it says a create or an import went through, or that an instance may exist, do NOT make it again: look with `service_status`, `service_list` or `function_list`, which the sentence names. |
 | `incus_answer` | Incus answered with another status, with more than this node reads, or with something that is not the JSON it expects. | Asking again is likely to answer the same: look at Incus. |
 | `state_not_saved` | The kernel could not save the change as the node's next state. The service's record is as it was. | The node's log has the reason; make the request again once it is fixed. |
 
@@ -3325,8 +3337,10 @@ the agent's config drive (see "What every virtual machine carries"). It carries 
 kernel's mark and `user.arca.template`. It gets its address from the bridge's own network; Arca
 neither assigns nor filters it. A bridge whose network hands out no addresses by DHCP (one where another hypervisor
 assigns them itself) gives the guest none: put such a virtual machine on the managed service network of a mixed node,
-or configure its address inside the guest. `service_list` and `service_status` show the address the guest reports, or an empty
-`ipv4` when the guest reports none.
+or configure its address inside the guest. `service_status` of the running machine reads its live state and shows the
+address its own network card holds, or an empty `ipv4` when it holds none; an address of a bridge the guest made for
+its own containers is never shown. `service_list` reads no live state: the machine's row has an empty `ipv4` and
+`ipv4In: "state"` (see "When Incus does not answer").
 
 Ownership, the journal and approvals are the same as for a container. `service_create` needs a doctor token, can be
 proposed with `action_propose`, and writes the same journal records. A proposal is checked when it is made, so the

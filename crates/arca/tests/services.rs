@@ -1060,16 +1060,23 @@ fn lists_the_service_project_with_each_instances_own_config_and_devices_none_whe
         rows[0]["template"], "",
         "an unmarked instance config is not a service record"
     );
+    // The list reads the instances without their live state: a guest's agent is never waited for.
     assert!(rig.fake.requests().iter().any(|request| request.path
-        == "/1.0/instances?all-projects=true&recursion=2"
+        == "/1.0/instances?all-projects=true&recursion=1"
         && request.status == 200));
+    assert!(
+        !rig.fake
+            .requests()
+            .iter()
+            .any(|request| request.path == "/1.0/instances?all-projects=true&recursion=2")
+    );
     let empty = Rig::new();
     assert_eq!(
         empty.call("service_list", json!({})).expect("empty"),
         json!({"services":[]})
     );
     assert!(empty.fake.requests().iter().any(|request| request.path
-        == "/1.0/instances?all-projects=true&recursion=2"
+        == "/1.0/instances?all-projects=true&recursion=1"
         && request.status == 200));
 }
 

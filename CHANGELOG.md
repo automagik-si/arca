@@ -53,6 +53,17 @@ card was shown, the approval was accepted and used up, and only then did the cre
 caps on virtual machines (`kernel.vmLimits`, `kernel.bridged.limits`) and a tenant's caps. The approved create still
 checks them, because the node can fill up while a card waits. One refusal for room can still follow an approval: no
 free address in the service subnet.
+Every service call read the live state of every instance on the node before it did anything, and Incus takes a
+running virtual machine's state from its guest agent: on a node with a machine full of containers (a runner pool) that
+one read took about ten seconds, the whole time it is given, so calls failed. Service calls no longer read live state:
+`service_list`, `service_status`, `service_logs`, a secret, a link and the tenant reads answer at once whatever a
+guest is doing. One thing works now that the guide promised and the node never did: `service_status` of a running
+virtual machine on a host bridge shows the address its own network card holds (until now `ipv4` was always empty for
+such a machine, in the list and in the status). It reads that one machine's state for it and, when Incus does not
+answer, still answers, with `ipv4Problem` saying why. `service_list` reads no state, so such a machine's row has an
+empty `ipv4` and the new `ipv4In: "state"`, which says the address is there to be read and is not "none". A create still reads live state, to pick an
+address nothing holds. A read of Incus that fails fast is made once more.
+
 A service call that failed because Incus was slow or did not answer said only `internal: the tool failed`, and the
 node's log had no line for it. Such a call is now refused in words that say Incus did not answer, for which service,
 and that the same request may be made again, under the code `incus_unavailable` (`incus_answer` when Incus answered
@@ -61,7 +72,8 @@ something this node cannot use, `state_not_saved` when the kernel could not save
 characters and one line break at its end (a key file read whole). Such a value needs 8 characters that are not line
 breaks: one of only line breaks is refused, and so is one that was accepted before, of fewer than 8 characters and
 line breaks to make up the count (seven characters and a line break). A stored secret that long, or one of many
-bytes a character, is taken out of logs and outputs like any other. A
+bytes a character, is taken out of logs and outputs like any other when it is one line; a secret of several lines is
+not taken out by its value yet. A
 container's or a function's secret that ends with a line break is refused in words that name the line break. A text
 that is too short or too long for its field is refused in words that name the limit. See "When Incus does not answer,
 and when the answer is internal" in docs/OPERATING.md.
