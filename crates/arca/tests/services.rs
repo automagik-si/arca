@@ -3456,7 +3456,21 @@ fn every_file_an_earlier_release_shipped_is_this_builds_or_is_on_the_list() {
         }
     }
     if checked == 0 {
-        eprintln!("no release tag in this checkout: the list was checked for form only");
+        // Without the tags nothing above compared a single file, and a check that did not run must not look like one
+        // that passed: a release once changed two shipped scripts with no entry here, and the gate, whose checkout
+        // had no tags, stayed green. In CI that is a failure. Elsewhere (a source archive, a shallow clone) it is
+        // said on standard error, past the harness's capture.
+        let words = "no release tag (v*) in this checkout, so no file an earlier release shipped was compared with \
+                     cmd_templates::EARLIER: the list was checked for form only";
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{words}. The gate must fetch the release tags before it runs the tests"
+        );
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "every_file_an_earlier_release_shipped_is_this_builds_or_is_on_the_list: {words}"
+        );
     }
 }
 

@@ -4311,6 +4311,9 @@ arca-gitlab-pool: totals jobs_now=3 of 6 jobs_done=161 jobs_failed=12 runners=2 
   an `image:` fails, since the pool has no default one.
 - **Stopping.** `instance_stop` and `instance_restart` need your approval. GitLab Runner is told to take no new job
   and the jobs that run get a minute to finish; a job still running then is lost, and GitLab reports it as failed.
+  The pool's service holds its stop open through one `sleep infinity` process inside the machine: should that process
+  end by itself (killed by hand, or by the machine when it is out of memory), the pool stops in the same order
+  without being asked, and its service starts it again ten seconds later.
 - **Pins.** GitLab Runner is `registry.gitlab.com/gitlab-org/gitlab-runner` 19.5.3 and its helper is
   `gitlab-runner-helper` `x86_64-v19.5.3`, both by digest, read from GitLab's registry when the template was written;
   the tailnet node is `tailscale/tailscale` 1.104.4, the digest the workspace template pins. A pool keeps what it was

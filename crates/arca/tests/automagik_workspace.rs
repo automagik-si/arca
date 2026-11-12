@@ -744,6 +744,68 @@ fn one_sigterm_stops_the_keeper_at_whatever_moment_it_comes() {
     }
 }
 
+/// The processes whose parent is `parent`, as /proc lists them now.
+fn children_of(parent: u32) -> Vec<u32> {
+    let parent = parent.to_string();
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            // "pid (name) state parent ...": the name may hold anything, so the fields are read from its end.
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let (_, rest) = stat.rsplit_once(") ")?;
+            (rest.split(' ').nth(1) == Some(parent.as_str()))
+                .then(|| entry.file_name().to_string_lossy().parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// A stop that reaches the keeper's child before the keeper is still a stop.
+///
+/// The keeper's service has no KillMode of its own, so systemd sends SIGTERM to every process of it, in no order it
+/// promises. When the child is ended first, the keeper finds it gone before its own signal has come. It then says its
+/// last line and ends with code 0, as for its own signal: ending with the child's code (143) would have systemd
+/// record a stop that was asked for as a failure.
+#[test]
+fn a_stop_that_reaches_the_keepers_child_first_is_still_a_stop() {
+    let mut workspace = Workspace::new(&settings_with_access(URL));
+    workspace.secret(TOKEN);
+    // The keeper's own signal follows at once, a moment later, and long after the keeper has ended by itself.
+    for gap in [0, 2, 10, 300] {
+        workspace.start();
+        says(&workspace, "status: the server is healthy");
+        let keeper = workspace.child.as_ref().expect("the keeper").id();
+        let children = children_of(keeper);
+        assert_eq!(
+            children.len(),
+            1,
+            "the keeper has one child, the keeping: {children:?}"
+        );
+        let sent = Command::new(which("bash"))
+            .arg("-c")
+            .arg(format!("kill -TERM {}", children[0]))
+            .status()
+            .expect("bash");
+        assert!(sent.success(), "the keeper's child was sent SIGTERM");
+        std::thread::sleep(Duration::from_millis(gap));
+        let code = workspace.stop();
+        let output = workspace.output();
+        assert_eq!(
+            code,
+            Some(0),
+            "the child was signalled {gap} ms before the keeper, which said:\n{output}"
+        );
+        assert!(
+            output.ends_with(
+                "the keeper stops; the three containers run on until the machine stops them\n"
+            ),
+            "the child was signalled {gap} ms before the keeper, which said:\n{output}"
+        );
+    }
+}
+
 /// The functions of a shell script that is written as the shipped ones are: `name() {` on a line of its own, down to
 /// the `}` in the first column, or the whole function on one line. Each with its lines, in order.
 fn shell_functions(text: &str) -> std::collections::BTreeMap<String, Vec<String>> {
@@ -778,46 +840,105 @@ fn shell_functions(text: &str) -> std::collections::BTreeMap<String, Vec<String>
     functions
 }
 
-/// Whether a line of shell runs a command substitution or a process substitution. A comment does not, and neither
-/// does arithmetic alone.
-fn substitutes(line: &str) -> bool {
-    let code = line.trim_start();
-    if code.starts_with('#') {
-        return false;
+/// The lines of a piece of shell with what bash does not expand taken out: the text between single quotes, also when
+/// it runs over several lines, and comments. What stands between double quotes stays, since bash expands it.
+fn expanded_text(lines: &[String]) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum In {
+        Plain,
+        Single,
+        Double,
     }
+    let mut state = In::Plain;
+    let mut out = Vec::new();
+    for line in lines {
+        let mut kept = String::new();
+        let mut chars = line.chars();
+        let mut before = ' ';
+        while let Some(c) = chars.next() {
+            match state {
+                In::Single => {
+                    if c == '\'' {
+                        state = In::Plain;
+                    }
+                }
+                In::Double => {
+                    kept.push(c);
+                    if c == '\\' {
+                        kept.extend(chars.next());
+                    } else if c == '"' {
+                        state = In::Plain;
+                    }
+                }
+                In::Plain => {
+                    if c == '#' && before.is_whitespace() {
+                        break;
+                    }
+                    match c {
+                        '\'' => state = In::Single,
+                        '"' => {
+                            kept.push(c);
+                            state = In::Double;
+                        }
+                        '\\' => {
+                            kept.push(c);
+                            kept.extend(chars.next());
+                        }
+                        _ => kept.push(c),
+                    }
+                }
+            }
+            before = c;
+        }
+        out.push(kept);
+    }
+    out
+}
+
+/// Whether a line of shell, as [`expanded_text`] leaves it, runs a command substitution or a process substitution.
+/// Arithmetic alone does not.
+fn substitutes(code: &str) -> bool {
     code.replace("$((", "").contains("$(")
         || code.contains('`')
         || code.contains("<(")
         || code.contains(">(")
 }
 
-/// Whether a line sets a trap that runs a command when a signal comes. A trap on EXIT alone is not one: it is run as
-/// the shell ends. Neither is one that ignores a signal or puts its trap down: there is no text to read.
-fn traps_a_signal(line: &str) -> bool {
-    let Some(rest) = line.trim_start().strip_prefix("trap ") else {
-        return false;
-    };
+/// The command of a trap that runs one when a signal comes, or nothing for a line that sets no such trap. A trap on
+/// EXIT alone is not one: it is run as the shell ends. Neither is one that ignores a signal or puts its trap down:
+/// there is no text to read.
+fn trap_command(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("trap ")?;
     let (command, signals) = match rest.strip_prefix('\'') {
         Some(quoted) => quoted.split_once('\'').unwrap_or((quoted, "")),
         None => rest.split_once(' ').unwrap_or((rest, "")),
     };
-    !command.is_empty()
+    (!command.is_empty()
         && command != "-"
-        && signals.split_whitespace().any(|signal| signal != "EXIT")
+        && signals.split_whitespace().any(|signal| signal != "EXIT"))
+    .then_some(command)
 }
 
 /// Why a script's traps are not safe from the fault of bash 5.2 that
 /// `one_sigterm_stops_the_keeper_at_whatever_moment_it_comes` describes, one sentence for each place; empty when they
-/// are. The rule: a trap that runs a command for a signal is set inside a function, and from that line to the
-/// function's end neither the function nor any function it calls runs a substitution. A function it starts as a
-/// child (`name &`) is another process, which the rule does not reach: it must set no such trap of its own, and then
-/// it has none, because a child puts down the traps it was born with.
+/// are. The rule: a trap that runs a command for a signal is set inside a function, its command runs no substitution,
+/// and from that line to the function's end neither the function nor any function it calls runs one. A function it
+/// starts as a child (`name &`) is another process, which the rule does not reach: it must set no such trap of its
+/// own, and then it has none, because a child puts down the traps it was born with.
+///
+/// It reads the scripts as text, the way the shipped ones are written, and it can be fooled. It does not see:
+/// - a function written `function name {`, or one whose closing `}` is not in the first column;
+/// - a trap set in the middle of a line (`condition && trap ...`);
+/// - what runs after the function that set the trap has returned to its caller, or in a loop that goes back above
+///   the trap's line;
+/// - what `source` and `eval` run, and a function called through a variable;
+/// - a here-document, which it reads as ordinary lines, and `$'...'`, which it reads as plain single quotes.
 fn unsafe_traps(file: &str, text: &str) -> Vec<String> {
     let functions = shell_functions(text);
     let mut found = Vec::new();
     let inside: Vec<&String> = functions.values().flatten().collect();
     for line in text.lines() {
-        if traps_a_signal(line) && !inside.contains(&&line.to_string()) {
+        if trap_command(line).is_some() && !inside.contains(&&line.to_string()) {
             found.push(format!(
                 "{file}: `{}` is set outside every function",
                 line.trim()
@@ -826,23 +947,31 @@ fn unsafe_traps(file: &str, text: &str) -> Vec<String> {
     }
     for (name, lines) in &functions {
         for (at, line) in lines.iter().enumerate() {
-            if !traps_a_signal(line) {
+            let Some(command) = trap_command(line) else {
                 continue;
+            };
+            if substitutes(command) {
+                found.push(format!(
+                    "{file}: {name} sets `{}`, whose own command runs a substitution",
+                    line.trim()
+                ));
             }
             // The function's own lines after the trap, then every function those lines call, and theirs.
             let mut read = vec![name.clone()];
             let mut waiting: Vec<(String, Vec<String>)> =
                 vec![(name.clone(), lines[at + 1..].to_vec())];
             while let Some((from, body)) = waiting.pop() {
-                for code in &body {
+                for (code, written) in expanded_text(&body).iter().zip(&body) {
                     if substitutes(code) {
                         found.push(format!(
                             "{file}: {name} sets `{}` and then, in {from}, runs `{}`",
                             line.trim(),
-                            code.trim()
+                            written.trim()
                         ));
                     }
-                    if code.trim_start().starts_with('#') || code.trim_end().ends_with('&') {
+                    // `name &` starts a child, which is another process. `name &&` does not.
+                    let ends = code.trim_end();
+                    if ends.ends_with('&') && !ends.ends_with("&&") {
                         continue;
                     }
                     for word in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
@@ -892,13 +1021,20 @@ fn no_shipped_script_takes_a_signal_in_a_process_that_runs_a_substitution() {
     }
     let mut found = Vec::new();
     for (path, name) in scripts.iter().zip(&names) {
+        let faults = unsafe_traps(name, &fs::read_to_string(path).expect("the script"));
         if NOT_YET.contains(&name.as_str()) {
+            // The exception ends with the fault: a script that is listed and no longer has it fails here.
+            assert!(
+                !faults.is_empty(),
+                "{name} is left out of this test as a script that still has the fault, and it has it no more: take \
+                 its name out of NOT_YET"
+            );
             continue;
         }
-        found.extend(unsafe_traps(
-            name,
-            &fs::read_to_string(path).expect("the script"),
-        ));
+        found.extend(faults);
+    }
+    for name in NOT_YET {
+        assert!(names.contains(&name.to_string()), "{name} is read");
     }
     assert!(
         found.is_empty(),
@@ -916,6 +1052,18 @@ fn no_shipped_script_takes_a_signal_in_a_process_that_runs_a_substitution() {
     assert_eq!(unsafe_traps("called.sh", called).len(), 1);
     let outside = "trap 'exit 143' TERM\nx=$(date)\n";
     assert_eq!(unsafe_traps("outside.sh", outside).len(), 1);
+    // A function called on a line that ends `&&` is followed, and a trap whose own command substitutes is found.
+    let and_then =
+        "look() {\n  at=$(date)\n}\nrun() {\n  trap 'STOP=1' TERM\n  look &&\n    true\n}\n";
+    assert_eq!(unsafe_traps("and.sh", and_then).len(), 1);
+    let in_trap = "run() {\n  trap 'AT=$(date)' TERM\n  wait\n}\n";
+    assert_eq!(unsafe_traps("in-trap.sh", in_trap).len(), 1);
+    // What bash does not expand is no substitution: single quotes, on one line or over several, and a comment after
+    // a command. What stands between double quotes is one.
+    let quoted = "run() {\n  trap 'STOP=1' TERM\n  jq '.a | $(b)' file # not $(this) either\n  awk '\n    { print $(NF) }\n  ' file\n  wait # `no`\n}\n";
+    assert_eq!(unsafe_traps("quoted.sh", quoted), Vec::<String>::new());
+    let double = "run() {\n  trap 'STOP=1' TERM\n  say \"it's $(date)\"\n}\n";
+    assert_eq!(unsafe_traps("double.sh", double).len(), 1);
     // And it lets pass what is safe: a child started with `&`, arithmetic, an EXIT trap, a trap put down.
     let safe = "keep() {\n  trap - TERM\n  state=$(look)\n}\nrun() {\n  name=$(hostname)\n  trap 'STOP=1' TERM\n  keep &\n  n=$((n + 1))\n  wait \"$!\"\n}\ntrap cleanup EXIT\n";
     assert_eq!(unsafe_traps("safe.sh", safe), Vec::<String>::new());

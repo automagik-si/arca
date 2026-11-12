@@ -122,8 +122,13 @@ jobs:
     env:
       CI_SLOT_CPUS: 6
     steps:
+      # With the release tags: one test compares every file an earlier release shipped with the list of them in
+      # crates/arca/src/cmd_templates.rs, and reads those files from the tags. Without the tags it has nothing to
+      # compare and, in CI, fails. The whole history comes with them, about half a second more than a shallow checkout.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
       - name: Toolchain, C compiler and test programs
         run: scripts/ci-setup.sh test

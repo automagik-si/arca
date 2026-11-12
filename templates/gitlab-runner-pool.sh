@@ -1080,7 +1080,11 @@ hold() {
 }
 
 # The controller: everything the pool does, as a child of run_pool. It takes no signal. It learns of a stop from the
-# line, and then stops in its own order.
+# line, and then stops in its own order. A SIGTERM sent to this process itself ends it at once with no stop; nothing
+# sends one under the unit's KillMode=mixed. It does not ignore the signal instead, because everything it starts
+# would then ignore it too. GNU's `timeout`, which Debian ships, still ends its program then (it sets its own handler
+# first), but the `timeout` of uutils does not: on a machine that has that one, as the machines these scripts are
+# tested on do, a program under a time limit would run on.
 pool() {
   trap - TERM INT
   load_settings || {
