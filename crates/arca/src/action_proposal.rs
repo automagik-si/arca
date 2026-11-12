@@ -175,7 +175,7 @@ impl ActionKind {
             Self::GpuAttach => "Ask your assistant to detach the card.",
             Self::GpuDetach => "Ask your assistant to attach the card again.",
             Self::StorageAdd => {
-                "The storage stays added. A disk that was erased for it cannot be brought back."
+                "If a disk was erased for it, what was on that disk cannot be brought back. A folder added as storage keeps what it holds."
             }
             Self::SnapshotCreate => "Ask your assistant to delete the snapshot.",
             Self::SnapshotDelete => "It cannot be undone: the snapshot is deleted.",
@@ -194,6 +194,11 @@ impl ActionKind {
                 "It cannot be undone: the function is deleted with its secrets."
             }
         }
+    }
+
+    /// Whether the card says what the action takes of the node: a create from a template does.
+    pub fn says_uses(self) -> bool {
+        matches!(self, Self::ServiceCreate | Self::PostgresCreate)
     }
 
     /// The verb name this action runs.
@@ -969,9 +974,11 @@ pub fn template_content_words(digest: &str) -> String {
 const USES_MAX: usize = 512;
 
 /// The card's `Uses` line for a create from `template`: what the new service takes of this node, read from the template
-/// the proposal's fingerprint binds. A share the template does not set is said to be unset: the service then uses what
-/// it needs of the node's.
-pub fn uses_words(template: &crate::service::Template, _in_tenant: bool) -> String {
+/// the proposal's fingerprint binds. A container runs at Arca's service profile's share of CPUs and memory where its
+/// template sets no limit of its own, so the line names that share and says it is the default. A container's root disk
+/// has no size of its own on the node; in a tenant (`in_tenant`) it has the tenant profile's fixed size.
+pub fn uses_words(template: &crate::service::Template, in_tenant: bool) -> String {
+    use arca_netproject::tenant::{CONTAINER_ROOT_SIZE, PROFILE_CPU, PROFILE_MEMORY};
     let limits = template.limits.as_ref();
     let cpu = limits.and_then(|limits| limits.cpu.as_deref());
     let memory = limits.and_then(|limits| limits.memory.as_deref());
@@ -982,36 +989,47 @@ pub fn uses_words(template: &crate::service::Template, _in_tenant: bool) -> Stri
             format!("{count} CPUs")
         }
     };
-    let disk = match template.data.as_ref().and_then(|data| data.size.as_deref()) {
-        Some(size) => format!("a {size} disk for its data"),
-        None => "the disk its files take".to_string(),
-    };
+    let data = template
+        .data
+        .as_ref()
+        .map(|data| match data.size.as_deref() {
+            Some(size) => format!("a {size} disk for its data"),
+            None => "the disk its data takes".to_string(),
+        });
     if template.is_vm() {
         let cpu = cpu.map_or_else(|| "what it needs of this node's CPUs".to_string(), cpus);
         let memory = memory.map_or_else(
             || "what it needs of this node's memory".to_string(),
             |memory| format!("{memory} of memory"),
         );
-        let root = template
-            .root_size
-            .as_deref()
-            .map_or_else(|| disk.clone(), |size| format!("a {size} disk"));
+        let root = template.root_size.as_deref().map_or_else(
+            || "the disk its files take".to_string(),
+            |size| format!("a {size} disk"),
+        );
         return format!("{cpu}, {memory} and {root}.");
     }
-    match (cpu, memory) {
-        (None, None) => format!(
-            "No set share: it uses what it needs of this node's CPUs and memory, and {disk}."
-        ),
-        (Some(cpu), Some(memory)) => {
-            format!("Up to {} and {memory} of memory, and {disk}.", cpus(cpu))
-        }
-        (Some(cpu), None) => format!(
-            "Up to {} and what it needs of this node's memory, and {disk}.",
-            cpus(cpu)
-        ),
-        (None, Some(memory)) => {
-            format!("Up to {memory} of memory and what it needs of this node's CPUs, and {disk}.")
-        }
+    // The service profile's share, which a container takes where its template states none: the node's own profile and
+    // a tenant's state the same.
+    let default_cpu = PROFILE_CPU.to_string();
+    let note = match (cpu, memory) {
+        (None, None) => " (Arca's default for a service)",
+        (None, Some(_)) => " (the CPUs are Arca's default for a service)",
+        (Some(_), None) => " (the memory is Arca's default for a service)",
+        (Some(_), Some(_)) => "",
+    };
+    let share = format!(
+        "Up to {} and {} of memory{note}",
+        cpus(cpu.unwrap_or(&default_cpu)),
+        memory.unwrap_or(PROFILE_MEMORY)
+    );
+    let root = if in_tenant {
+        format!("a {CONTAINER_ROOT_SIZE} disk")
+    } else {
+        "the disk its files take".to_string()
+    };
+    match data {
+        Some(data) => format!("{share}, {root}, and {data}."),
+        None => format!("{share}, and {root}."),
     }
 }
 
@@ -1343,7 +1361,9 @@ impl ActionProposalStore {
             action: action.as_str().to_string(),
             summary: action.summary_with(&args, gpu_product),
             details: action.details_with_gpu(&args, gpu_product),
-            uses: uses.map(|words| shown(&words, USES_MAX)),
+            uses: uses
+                .filter(|_| action.says_uses())
+                .map(|words| shown(&words, USES_MAX)),
             args,
             args_digest: digest,
             created_ms: now,
@@ -1469,7 +1489,10 @@ impl ActionProposalStore {
                         summary,
                         details,
                         // The kernel's own words from when it was proposed, as a card shows them.
-                        uses: proposal.uses.map(|words| shown(&words, USES_MAX)),
+                        uses: proposal
+                            .uses
+                            .filter(|_| action.says_uses())
+                            .map(|words| shown(&words, USES_MAX)),
                         args,
                         args_digest: digest,
                         created_ms: proposal.created_ms,
@@ -2534,12 +2557,17 @@ mod tests {
             "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), and the disk its files take."
         );
         assert_eq!(
-            uses_words(&template(json!({ "limits": { "cpu": "2", "memory": "4GiB" } })), node),
+            uses_words(
+                &template(json!({ "limits": { "cpu": "2", "memory": "4GiB" } })),
+                node
+            ),
             "Up to 2 CPUs and 4GiB of memory, and the disk its files take."
         );
         assert_eq!(
             uses_words(
-                &template(json!({ "limits": { "cpu": "1" }, "data": { "path": "/data", "size": "10GiB" } })),
+                &template(
+                    json!({ "limits": { "cpu": "1" }, "data": { "path": "/data", "size": "10GiB" } })
+                ),
                 node
             ),
             "Up to 1 CPU and 2GiB of memory (the memory is Arca's default for a service), the disk its files take, and a 10GiB disk for its data."
@@ -2553,7 +2581,10 @@ mod tests {
             "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), and a 16GiB disk."
         );
         assert_eq!(
-            uses_words(&template(json!({ "data": { "path": "/data", "size": "10GiB" } })), tenant),
+            uses_words(
+                &template(json!({ "data": { "path": "/data", "size": "10GiB" } })),
+                tenant
+            ),
             "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), a 16GiB disk, and a 10GiB disk for its data."
         );
         assert_eq!(
@@ -2590,7 +2621,8 @@ mod tests {
         assert_eq!(proposed.uses, None);
         let other = Temp::new("uses-planted");
         let mut line: Value =
-            serde_json::from_str(&proposed_line("instance_restart", &restart, 1_000)).expect("JSON");
+            serde_json::from_str(&proposed_line("instance_restart", &restart, 1_000))
+                .expect("JSON");
         line["proposal"]["uses"] = json!("Planted words");
         write_journal(&other.0, &format!("{line}\n"));
         let reopened = ActionProposalStore::open(&other.0, 1_001, None);

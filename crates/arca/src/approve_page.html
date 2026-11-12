@@ -589,10 +589,18 @@ function toSetup() {
 // The rows of an action card kept for an audit and not for the decision: they go in the card's Details.
 const AUDIT_ROWS = new Set(["Image", "Template content"]);
 
-// A card's Details: a disclosure that starts closed, and a way to add a row to it.
-function moreDetails() {
+// Whether a row of an action card goes in its Details. An image with no digest stays up front: its row says that what
+// runs is not held to the approval, and the owner reads that before approving.
+function folded(detail) {
+  return AUDIT_ROWS.has(detail.label) && !detail.value.includes("(no digest:");
+}
+
+// A card's Details: a disclosure that starts closed, named for its card, and a way to add a row to it.
+function moreDetails(name) {
   const box = el("details", "more");
-  box.append(el("summary", "", "Details"));
+  const summary = el("summary", "", "Details");
+  summary.setAttribute("aria-label", "Details: " + name);
+  box.append(summary);
   const facts = el("dl", "action-facts");
   box.append(facts);
   const add = (label, value, code) => {
@@ -673,7 +681,7 @@ function planCard(plan) {
 
   const button = approveButton(title, (button) => approve(plan, button));
 
-  const more = moreDetails();
+  const more = moreDetails(title);
   more.box.append(digest);
 
   card.append(meta, heading);
@@ -703,10 +711,10 @@ function actionCard(plan) {
     row.append(detail);
     facts.append(row);
   };
-  const more = moreDetails();
+  const more = moreDetails(plan.summary);
   const audit = more.add;
   const details = Array.isArray(plan.details) ? plan.details : [];
-  for (const detail of details) (AUDIT_ROWS.has(detail.label) ? audit : fact)(detail.label, detail.value);
+  for (const detail of details) (folded(detail) ? audit : fact)(detail.label, detail.value);
   if (plan.uses) fact("Uses", plan.uses);
   if (plan.undo) fact("To undo", plan.undo);
   audit("Action", plan.action, true);
@@ -807,7 +815,7 @@ function requestCard(request) {
   for (const [key, value] of Object.entries(args)) {
     fact(key, typeof value === "string" ? value : JSON.stringify(value), true);
   }
-  const more = moreDetails();
+  const more = moreDetails(title);
   more.add("Fingerprint", String(fields.paramsDigest || ""), true);
 
   const buttons = el("div", "actions");

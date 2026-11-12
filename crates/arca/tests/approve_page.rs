@@ -4013,7 +4013,10 @@ fn the_cards_lead_with_plain_words_and_fold_the_audit_rows_into_details() {
         .nth(1)
         .and_then(|rest| rest.split("\n}").next())
         .expect("the folding rule");
-    assert!(folded.contains(r#"!detail.value.includes("(no digest:")"#), "{folded}");
+    assert!(
+        folded.contains(r#"!detail.value.includes("(no digest:")"#),
+        "{folded}"
+    );
     // Each card's Details names its card, so a screen reader's list of disclosures tells them apart.
     assert!(html.contains(r#"summary.setAttribute("aria-label", "Details: " + name);"#));
     for call in [

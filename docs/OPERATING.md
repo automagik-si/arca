@@ -879,7 +879,8 @@ is the service that `service_create` makes from the node's `postgres-autopg` tem
 A proposal is given the template's name, the image it pins and the fingerprint of the template's content when it is
 made. The card leads with "Your assistant wants to create a Postgres database called NAME.", then shows the template,
 a `Made as` row, which says that the template generates the password only when it does, a `Uses` row (what the
-database takes of the node, read from its template) and a `To undo` row. The image by digest and the `Template
+database takes of the node: the CPUs and memory its template sets, or Arca's default share for a service, 2 CPUs and
+2GiB, and in a tenant a 16GiB disk) and a `To undo` row. The image by digest and the `Template
 content` row are in the card's Details, with the verb, the target and the fingerprint. The approval binds all of it: if the template on the
 node is another one when the owner approves (another image, or an edit of the script that opens the database), the
 create is refused and nothing is made; propose it again. See "What the owner saw is what is created".
