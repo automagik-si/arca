@@ -1333,12 +1333,18 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
         assert_eq!(
             said.report(5)[2],
             format!(
-                "Next: ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config {config} --token-file <the file of one of its tokens>. It then says what comes next."
+                "Next: ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config {config} --token-file TOKEN_FILE, with the path of one of this node's token files in place of TOKEN_FILE. It then says what comes next."
             ),
             "{}",
             said.all()
         );
         assert_eq!(said.out.matches("Next: ").count(), 1, "{}", said.all());
+        // The step is a line a person may paste: nothing in it is a redirect to a shell.
+        assert!(
+            !said.report(5)[2].contains('<') && !said.report(5)[2].contains('>'),
+            "{}",
+            said.all()
+        );
     }
     assert_eq!(calls().lines().count(), 3, "one restart per run");
 }

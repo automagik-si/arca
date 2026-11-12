@@ -679,9 +679,10 @@ fn enabled_report(
         )
     } else if matches!(restarted, Restart::Unasked) {
         // Nobody has seen that the node holds its page: init had no token to ask with. A setup code is typed, and
-        // an approval is signed, only at a page the node says is open, so asking the node comes first.
+        // an approval is signed, only at a page the node says is open, so asking the node comes first. The token's
+        // file is named by a plain word: a shell reads `<...>` as a redirect when the line is pasted.
         format!(
-            "ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config {path} --token-file <the file of one of its tokens>. It then says what comes next."
+            "ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config {path} --token-file TOKEN_FILE, with the path of one of this node's token files in place of TOKEN_FILE. It then says what comes next."
         )
     } else if passkey {
         format!(
@@ -1490,7 +1491,7 @@ mod tests {
             ));
             assert_eq!(
                 lines[2],
-                "Next: ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config /home/u/.config/arca/node.json --token-file <the file of one of its tokens>. It then says what comes next."
+                "Next: ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config /home/u/.config/arca/node.json --token-file TOKEN_FILE, with the path of one of this node's token files in place of TOKEN_FILE. It then says what comes next."
             );
             let text = lines.join("\n");
             assert!(
