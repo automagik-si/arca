@@ -33,7 +33,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arca_approval::passkey::{STATE_PASSKEYS_FILE, format_passkey_line};
-use arca_approval::{ARCA_NAMESPACE, ArcaAction, PasskeyLine, load_state_passkeys, parse_passkeys};
+use arca_approval::{
+    ARCA_NAMESPACE, ArcaAction, PasskeyAlg, PasskeyLine, load_state_passkeys, parse_passkeys,
+};
 use arca_kernel::canon::canonical_json;
 use arca_mcp::CallError;
 use axum::body::{Body, Bytes, to_bytes};
@@ -44,7 +46,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, any, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio_stream::StreamExt as _;
@@ -1705,7 +1707,19 @@ async fn register(
     let Some(public_key) = value.get("publicKey").and_then(Value::as_str) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if value.get("publicKeyAlgorithm").and_then(Value::as_i64) != Some(-7) {
+    // ES256 (-7) or RS256 (-257), and the key the browser sent must be one of that algorithm.
+    let Some(alg) = value
+        .get("publicKeyAlgorithm")
+        .and_then(Value::as_i64)
+        .and_then(PasskeyAlg::from_cose)
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let key_alg = STANDARD
+        .decode(public_key)
+        .ok()
+        .and_then(|spki| PasskeyAlg::of_key(&spki));
+    if key_alg != Some(alg) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Ok(line) = format_passkey_line(&state.rp_id, &state.origin, credential_id, public_key)

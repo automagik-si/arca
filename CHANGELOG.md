@@ -21,6 +21,10 @@ hand. The template changed, so an installed copy nobody edited is brought up to 
 before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
 that image is built with `templates/automagik.build.sh`.
 
+Passkeys can now be RSA keys (RS256) as well as P-256 keys (ES256). Some Windows Hello and TPM authenticators make only
+RSA keys, and setting up such a passkey failed at its last step. The page now offers both, enrols either, and checks
+either's signature on every approval and sign-in. A passkeys line names its key's `alg`, `ES256` or `RS256`.
+
 ## 0.15.0 (2026-11-12)
 
 The `automagik` image is now named after the harness too: `arca-automagik-<commit>-dsh-<harness>`, 12 hex digits of the

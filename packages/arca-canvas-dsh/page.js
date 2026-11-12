@@ -768,6 +768,9 @@
   function b64url(bytes) {
     return b64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
+  function passkeyProofAlg(signature) {
+    return signature.byteLength > 72 ? "RS256" : "ES256";
+  }
   function fromB64url(value) {
     const text3 = String(value).replace(/-/g, "+").replace(/_/g, "/");
     const padded = text3 + "=".repeat((4 - text3.length % 4) % 4);
@@ -2171,7 +2174,7 @@ ${statement}`)
       if (!credential) throw new Error("No passkey was selected.");
       const response = credential.response;
       return {
-        alg: "ES256",
+        alg: passkeyProofAlg(response.signature),
         authenticatorData: b64url(new Uint8Array(response.authenticatorData)),
         clientDataJSON: b64url(new Uint8Array(response.clientDataJSON)),
         credentialId: b64url(new Uint8Array(credential.rawId)),

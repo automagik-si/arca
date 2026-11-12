@@ -37,6 +37,8 @@
   const status = document.getElementById("status");
   const enc = new TextEncoder();
   const NO_PASSKEY = "No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows.";
+  // An ES256 signature is DER of at most 72 bytes; an RS256 one is as long as its RSA modulus, 256 bytes or more.
+  const passkeyProofAlg = (signature) => (signature.byteLength > 72 ? "RS256" : "ES256");
   const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const fromB64url = (value) => Uint8Array.from(
     atob(value.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0),
@@ -69,7 +71,7 @@
     if (!credential) throw new Error("no passkey");
     const response = credential.response;
     const proof = {
-      alg: "ES256",
+      alg: passkeyProofAlg(response.signature),
       authenticatorData: b64url(new Uint8Array(response.authenticatorData)),
       clientDataJSON: b64url(new Uint8Array(response.clientDataJSON)),
       credentialId: b64url(new Uint8Array(credential.rawId)),
