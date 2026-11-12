@@ -4043,8 +4043,8 @@ What this is not:
 
 - It is not a cap on running jobs, and it promises no job a start time. A just-in-time runner cannot be told to wait:
   every registered runner may take a job at any moment. A runner that has a job is never retired, and neither is a
-  class's only runner, nor one that is updating itself. So when every runner that could give its place up is at
-  work, the class waits until a job ends.
+  class's only runner; one that is updating itself is not retired before its update is over. So when every runner
+  that could give its place up is at work, the class waits until a job ends, or until an update is over.
 - A place is not memory. A slot still starts only when its whole memory fits (above), and the pool retires nothing
   for a class whose slot would still lack its memory.
 - It is one place a class, not a share. Beyond that one place, the busiest classes can hold all the others.
@@ -4134,11 +4134,13 @@ runner is one line of its own (`slot 0 (standard): its idle runner is retired an
 ...`), and so is a runner that GitHub kept because it had a job. If GitHub answers the request to take a runner off
 with anything but its yes or that refusal (a 5xx, 401, 403 or 404), or not at all, nothing is retired: the pool says
 GitHub's answer once, keeps it in the class's line, and asks again after a pause that starts at five seconds and
-doubles up to five minutes. If GitHub answered with an error and that runner then stops before it took a job, the
-pool takes it as retired, says so and counts no failure: it cannot tell why the runner stopped, and GitHub having
-taken it off after all is the likely cause. It does not read a stop so when no answer came at all, or when GitHub
-has told the runner to update itself since. A runner that was updating itself when it was asked is asked again once
-its update is over. The last ten
+doubles up to five minutes. If GitHub can have taken the runner off though no yes came (it answered with a
+5xx, or the request went out and its answer was lost: the connection closed, or the time ran out) and that runner
+then stops before it took a job, the pool takes it as retired, says so and counts no failure: it cannot tell why
+the runner stopped, and GitHub having taken it off after all is the likely cause. It does not read a stop so after
+a 401, 403 or 404, which say GitHub did not act, nor when the request never went out (the connection was refused),
+nor when GitHub has told the runner to update itself since the request. A runner that was updating itself when it
+was asked is asked again once its update is over. The last ten
 finished jobs are repeated in every block (`recent job`), so `service_logs` still reaches them after many blocks. All
 job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish
 time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name. Past 4MiB (some

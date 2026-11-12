@@ -388,16 +388,24 @@ api() {
   local method=$1 path=$2 token=$3 body=${4-}
   API_OUT="$POOL_RUN/tmp/api.$BASHPID"
   API_ERROR=''
+  # API_SENT is how many bytes of the request went out. With no answer (000) it tells a request GitHub never had (a
+  # refused connection, curl's exit 7: 0) from one whose answer was lost (the connection closed after it, exit 52, or
+  # the time ran out, exit 28: the whole request).
+  API_SENT=0
   case $token in *[!A-Za-z0-9._~+/=-]* | '')
     API_CODE=000
     API_ERROR='the credential has a character no GitHub token has'
     return 1
     ;;
   esac
-  local args=(-sS -X "$method" -o "$API_OUT" -w '%{http_code}' --max-time 30 --connect-timeout 10 -K -)
+  local written args=(-sS -X "$method" -o "$API_OUT" -w '%{http_code} %{size_request}' --max-time 30 --connect-timeout 10 -K -)
   [ -n "$body" ] && args+=(--data-binary "$body" -H 'Content-Type: application/json')
-  API_CODE=$(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\nheader = "X-GitHub-Api-Version: 2022-11-28"\nheader = "User-Agent: arca-runner-pool"\n' "$token" |
-    curl "${args[@]}" "$API_URL$path" 2>/dev/null) || API_CODE=000
+  written=$(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\nheader = "X-GitHub-Api-Version: 2022-11-28"\nheader = "User-Agent: arca-runner-pool"\n' "$token" |
+    curl "${args[@]}" "$API_URL$path" 2>/dev/null) || written="000 ${written#* }"
+  API_CODE=${written%% *}
+  API_SENT=${written##* }
+  case $API_CODE in [0-9][0-9][0-9]) ;; *) API_CODE=000 ;; esac
+  case $API_SENT in '' | *[!0-9]*) API_SENT=0 ;; esac
   case $API_CODE in 2??) return 0 ;; esac
   if [ "$API_CODE" = 000 ]; then
     API_ERROR="GitHub could not be reached at $API_URL"
@@ -723,6 +731,8 @@ slot_cycle() {
     # its own container; the pool says it once per runner, because every fresh runner will until the pin moves.
     if [ -z "$updating" ] && [ -z "$busy_since" ] && [[ $lines == *'Runner update in progress'* ]]; then
       updating=1
+      # GitHub still has this runner: a request to take it off made before now did not.
+      asked=''
       printf x >>"$POOL_RUN/updates"
       set_state "$slot" updating "$name"
       say "slot $slot: GitHub told this runner to update itself, because the pool's pinned runner is older than GitHub's newest. It updates inside its own container and then takes its job; every new runner of this pool does the same, at the cost of a download each, until a pool is created with a newer runnerImage"
@@ -784,12 +794,13 @@ slot_cycle() {
   else
     slot_reap "$slot"
     slot_abandon "$slot" "$runner_id"
-    if [ -n "$asked" ] && [ -z "$updating" ]; then
-      # GitHub was asked to take this runner off and its answer was lost or said nothing (slot_retire). GitHub can
-      # have taken it off all the same, and the runner then stops like this. That is no failure of the pool: nothing
-      # is counted, no slot pauses, and the runners keep their layered files. Why it stopped is not known: this is
-      # the likely cause, not a seen one. A runner GitHub has since told to update itself is not read so: that word
-      # is proof GitHub still had it, and its stop is the failure it would be for any runner.
+    if [ -n "$asked" ]; then
+      # GitHub was asked to take this runner off and can have done so though no yes came: it answered with a server
+      # error, or its answer was lost (slot_retire). The runner then stops like this. That is no failure of the pool:
+      # nothing is counted, no slot pauses, and the runners keep their layered files. Why it stopped is not known:
+      # this is the likely cause, not a seen one. A runner GitHub has told to update itself since the request is not
+      # read so ($asked is cleared then): that word is proof GitHub still had it, and its stop is the failure it would
+      # be for any runner. One that had updated before it was asked is read so like any other.
       say "slot $slot ($class): its runner stopped (exit $code) before it took a job, after GitHub was asked to take it off and gave no clear answer. It is taken as retired: its place is free, and it is not counted as a failure"
       return 0
     fi
@@ -834,8 +845,10 @@ slot_cycle() {
 # - `kept`: GitHub is not asked, and the runner is not asked again: GitHub gave no id for it, and a request without
 #   one names no runner.
 # - `error` and words: GitHub could not be asked, or answered something else. The runner is kept and may be asked
-#   again. When GitHub answered, $asked is set for the slot: it can have acted on a request it then answered with an
-#   error. It is not set when no answer came at all (no request went out, or GitHub could not be reached).
+#   again. $asked is set for the slot when GitHub can have acted on the request all the same: it answered with a
+#   server error (5xx), or the request went out and no answer came (the connection closed after it, or the time ran
+#   out). It is not set when GitHub said it did not act (401, 403, 404), nor when the request never went out (a
+#   refused connection, a credential with a character no token has).
 slot_retire() {
   local slot=$1 runner_id=$2 runner=$3 busy=$4 updating=$5 class=${SLOT_CLASS[$1]} for_class answer
   for_class=$(cat "$POOL_RUN/retire/$slot" 2>/dev/null)
@@ -860,7 +873,10 @@ slot_retire() {
   else
     # A token GitHub no longer takes is not kept.
     [ "$API_CODE" != 401 ] || rm -f "$POOL_RUN/token"
-    [ "$API_CODE" = 000 ] || asked=1
+    case $API_CODE in
+      5??) asked=1 ;;
+      000) [ "$API_SENT" = 0 ] || asked=1 ;;
+    esac
     answer="error $API_ERROR"
   fi
   TOKEN=''
@@ -1293,7 +1309,7 @@ give_a_place() {
     done
   done
   if [ -z "$give" ]; then
-    CLASS_NOTE="WARNING: $names, and no class that holds two or more has a runner that can be asked to give its place up. A runner that has a job, that is starting or updating itself, or that GitHub gave no id for, is never retired: the class waits until a job ends"
+    CLASS_NOTE="WARNING: $names, and no class that holds two or more has a runner that can be asked to give its place up. A runner that has a job, that is starting, or that GitHub gave no id for, is never retired, and one that is updating itself not before its update is over: the class waits until a job ends or an update is over"
     return 0
   fi
   # The class the place is asked for: the first of those without a runner whose slot would have its memory.
