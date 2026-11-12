@@ -1611,35 +1611,19 @@ fn a_slot_starts_only_with_memory_for_its_whole_size_and_under_the_cap() {
         pool.read("logs/status.txt")
             .contains("queued (waiting for a place: 3 slots is the cap)")
     });
+    // Eight jobs, and no more yet: what follows about the job file is exact for eight. A line is some 120 bytes, so
+    // the file passes its 600 bytes at the fifth and is set aside once; the three that can follow do not fill it
+    // again. With more jobs it is set aside a second time and the pool, which keeps one file, drops the first batch:
+    // that is why nothing below counts finished jobs from these files once more than eight have run.
     for n in 0..8 {
         github.queue(&["arca"], &format!("job-{n}"), 0.2);
     }
     wait_for(&pool, "eight finished jobs", || pool.jobs().len() == 8);
-    // The slot that waited gets the place a finished job frees. Whether its runner is ready before the other three
-    // have taken all eight jobs is a matter of timing, so jobs are given one at a time until it has had one.
-    let mut more = 0;
-    wait_for(&pool, "every slot to take its turn under the cap", || {
-        let mut slots: Vec<String> = pool.jobs().iter().map(|job| job[1].clone()).collect();
-        slots.sort();
-        slots.dedup();
-        if slots == ["0", "1", "2", "3"] {
-            return true;
-        }
-        if pool.jobs().len() == 8 + more {
-            github.queue(&["arca"], &format!("more-{more}"), 0.2);
-            more += 1;
-        }
-        false
-    });
-    wait_for(&pool, "the jobs that were given", || {
-        pool.jobs().len() == 8 + more
-    });
-    assert_eq!(github.state().live_max, 3);
     // The job file is bounded: past its limit it is set aside once, with its header written again, and the summary
     // still counts the jobs in both.
-    let counted = format!("class small last {} jobs:", 8 + more);
     wait_for(&pool, "the summary over both job files", || {
-        pool.read("logs/status.txt").contains(&counted)
+        pool.read("logs/status.txt")
+            .contains("class small last 8 jobs:")
     });
     let aside = pool.read("logs/jobs.tsv.1");
     assert!(
@@ -1649,6 +1633,40 @@ fn a_slot_starts_only_with_memory_for_its_whole_size_and_under_the_cap() {
     assert!(pool.read("logs/jobs.tsv").contains("finished\tslot\t"));
     assert!(pool.read("logs/jobs.tsv").len() < 1200);
     assert!(!pool.dir.join("logs/jobs.tsv.2").exists());
+    // The slot that waited gets the place the first finished job frees. Whether its runner is ready before the other
+    // three have taken all eight jobs is a matter of timing, so jobs are given one at a time until it has had one.
+    // What has finished is read from GitHub's side, where every runner says when its job is done: the pool's job
+    // files are bounded and lose lines, and the test once counted from them and waited for a number they could no
+    // longer show.
+    let finished = || github.state().finished.clone();
+    let mut more = 0;
+    wait_for(&pool, "every slot to take its turn under the cap", || {
+        let finished = finished();
+        // A runner is named after its pool, its class and its slot, with a few random characters behind.
+        let mut slots: Vec<&str> = finished
+            .iter()
+            .filter_map(|name| name.rsplit('-').nth(1))
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        if slots == ["0", "1", "2", "3"] {
+            return true;
+        }
+        if finished.len() == 8 + more {
+            github.queue(&["arca"], &format!("more-{more}"), 0.2);
+            more += 1;
+        }
+        false
+    });
+    wait_for(&pool, "the jobs that were given", || {
+        finished().len() == 8 + more
+    });
+    // The pool counted every one of them, whatever its job files still hold.
+    let done = format!(" jobs_done={} ", 8 + more);
+    wait_for(&pool, "the pool's own count of the jobs", || {
+        totals(&pool).contains(&done)
+    });
+    assert_eq!(github.state().live_max, 3);
     assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
 }
@@ -2926,5 +2944,96 @@ fn a_stop_that_comes_before_the_slots_are_looked_at_starts_none() {
         "{}",
         pool.read("docker/calls.log")
     );
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// Under the cap, the place a finished job frees goes to the slot that waited, not back to the slot that has just
+/// ended. Four classes of one slot each, with labels of their own, and three places: a job can be sent to one slot, so
+/// the order is forced and not hoped for.
+///
+/// The pass that hands out places once moved its own starting point while it walked. It then left slots out: the
+/// fourth slot was not looked at in the first pass at all, and when the third slot's job ended, the third slot took
+/// its place again and the fourth went on waiting, with its job.
+#[test]
+fn the_place_a_finished_job_frees_goes_to_the_slot_that_waited() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    let class = |name: &str| {
+        json!({ "name": name, "labels": ["self-hosted", "linux", "x64", format!("arca-{name}")],
+            "cpu": 2, "memory": "4GiB", "slots": 1 })
+    };
+    let mut pool = Pool::new(
+        &settings(
+            json!([class("a"), class("b"), class("c"), class("d")]),
+            3,
+            &format!("https://github.com/{ORG}"),
+        ),
+        64 * GIB,
+        60 * GIB,
+    );
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    // The slots of the runners that wait for a job or run one, read from their names.
+    let live_slots = || {
+        let mut slots: Vec<String> = github
+            .live()
+            .iter()
+            .filter_map(|runner| runner.name.rsplit('-').nth(1).map(str::to_string))
+            .collect();
+        slots.sort();
+        slots
+    };
+    wait_for(&pool, "three idle runners", || github.live().len() == 3);
+    assert_eq!(live_slots(), ["0", "1", "2"]);
+    let waits = "arca-runner-pool: slot 3 d 4096MiB/2cpu queued (waiting for a place: 3 slots is the cap)\n";
+    wait_for(&pool, "the status of the slot that waits", || {
+        pool.read("logs/status.txt").contains(waits)
+    });
+    // What the pool has said while no job had come: read at the end, for how the fourth slot was shown.
+    let before_any_job = pool.output();
+
+    // A job for the third class, so the third slot is the one that ends.
+    github.queue(&["arca-c"], "for the third", 0.2);
+    wait_for(&pool, "the third slot's job", || {
+        github.state().finished.len() == 1
+    });
+    wait_for(&pool, "three runners again", || github.live().len() == 3);
+    // The place went to the slot that waited; the one that ended waits now.
+    assert_eq!(live_slots(), ["0", "1", "3"], "{}", pool.output());
+    wait_for(&pool, "the third slot waiting in its turn", || {
+        pool.read("logs/status.txt")
+            .contains("arca-runner-pool: slot 2 c 4096MiB/2cpu queued (waiting for a place: 3 slots is the cap)\n")
+    });
+
+    // And a job for the fourth class is taken at once: its slot has a runner.
+    github.queue(&["arca-d"], "for the one that waited", 0.2);
+    wait_for(&pool, "the fourth slot's job", || {
+        github.state().finished.len() == 2
+    });
+    wait_for(&pool, "both jobs in the pool's record", || {
+        pool.jobs().len() == 2
+    });
+    let ran: Vec<(String, String)> = pool
+        .jobs()
+        .iter()
+        .map(|job| (job[1].clone(), job[4].clone()))
+        .collect();
+    assert_eq!(
+        ran,
+        [
+            ("2".to_string(), "for the third".to_string()),
+            ("3".to_string(), "for the one that waited".to_string())
+        ]
+    );
+    assert_eq!(github.state().live_max, 3);
+    // Every slot is looked at in every pass: before any job, the fourth slot said what it waited for from the
+    // first status on, and was never shown as merely not started. (A slot that has just been given a place may be
+    // shown so for a moment; the fourth had none yet.)
+    assert!(
+        !before_any_job.contains("slot 3 d 4096MiB/2cpu queued (waiting to start)"),
+        "{before_any_job}"
+    );
+    assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
 }
