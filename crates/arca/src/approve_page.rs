@@ -35,7 +35,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{MethodRouter, any, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -358,27 +358,40 @@ impl Page {
             trust_forwarded_for,
             ..self.state.clone()
         });
-        Router::new()
-            .route("/approve", get(page))
-            .route("/approve/plans", get(plans))
-            .route("/approve/approve", post(approve))
-            .route("/approve/decline", post(decline))
-            .route("/approve/requests/begin", post(request_begin))
-            .route("/approve/requests/approve", post(request_approve))
-            .route("/approve/requests/deny", post(request_deny))
-            .route("/approve/peer-keys", post(peer_keys_trust))
-            .route("/approve/peer-keys/sync", post(peer_keys_sync))
-            .route("/approve/setup-code", post(setup_code))
-            .route("/approve/setup-code/verify", post(verify_setup_code))
-            .route("/approve/register", post(register))
-            .route("/approve/passkeys", get(passkeys))
-            .route("/approve/passkeys/change", post(passkey_change))
-            .route(canvas::PAGE_PATH, get(canvas_page).post(canvas_sign_in))
-            .route(canvas::CSS_PATH, get(canvas_css))
-            .route(canvas::JS_PATH, get(canvas_js))
-            .route(canvas::SNAPSHOT_PATH, get(canvas_snapshot))
-            .route(canvas::CHAT_PATH, post(canvas_chat))
-            .route(canvas::CHAT_HISTORY_PATH, get(canvas_history))
+        // Every page route answers with and without a trailing slash: the same handler, behind the same Origin rule.
+        // A browser, a bookmark or a proxy that adds the slash reaches the page it asked for, and a POST stays a POST.
+        let both =
+            |router: Router<Arc<PageState>>, path: &str, route: MethodRouter<Arc<PageState>>| {
+                router
+                    .route(path, route.clone())
+                    .route(&format!("{path}/"), route)
+            };
+        let mut router = Router::new();
+        for (path, route) in [
+            ("/approve", get(page)),
+            ("/approve/plans", get(plans)),
+            ("/approve/approve", post(approve)),
+            ("/approve/decline", post(decline)),
+            ("/approve/requests/begin", post(request_begin)),
+            ("/approve/requests/approve", post(request_approve)),
+            ("/approve/requests/deny", post(request_deny)),
+            ("/approve/peer-keys", post(peer_keys_trust)),
+            ("/approve/peer-keys/sync", post(peer_keys_sync)),
+            ("/approve/setup-code", post(setup_code)),
+            ("/approve/setup-code/verify", post(verify_setup_code)),
+            ("/approve/register", post(register)),
+            ("/approve/passkeys", get(passkeys)),
+            ("/approve/passkeys/change", post(passkey_change)),
+            (canvas::PAGE_PATH, get(canvas_page).post(canvas_sign_in)),
+            (canvas::CSS_PATH, get(canvas_css)),
+            (canvas::JS_PATH, get(canvas_js)),
+            (canvas::SNAPSHOT_PATH, get(canvas_snapshot)),
+            (canvas::CHAT_PATH, post(canvas_chat)),
+            (canvas::CHAT_HISTORY_PATH, get(canvas_history)),
+        ] {
+            router = both(router, path, route);
+        }
+        router
             .route("/approve/{*rest}", any(not_found))
             .layer(DefaultBodyLimit::max(PAGE_BODY_BYTES))
             .layer(middleware::from_fn_with_state(
@@ -428,7 +441,8 @@ async fn origin_rule(
         .get("sec-fetch-site")
         .and_then(|value| value.to_str().ok())
         == Some("same-origin");
-    let chat = request.uri().path() == canvas::CHAT_PATH;
+    let path = request.uri().path();
+    let chat = path.strip_suffix('/').unwrap_or(path) == canvas::CHAT_PATH;
     let allowed = if request.method() == Method::POST {
         origin_valid || (chat && !origin_present && same_origin_fetch)
     } else {
