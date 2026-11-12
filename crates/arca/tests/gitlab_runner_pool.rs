@@ -321,6 +321,31 @@ fn signal(name: &str, target: i64) -> bool {
     .is_ok_and(|output| output.status.success())
 }
 
+/// Whether a controller still holds its stop line open: whether the one program it holds the line through, a `sleep`
+/// that is the controller's own child, is still running. The controller's work is a child of it too, and starts no
+/// `sleep` of its own: its pauses are reads of the line.
+fn holds_the_stop_line(controller: u32) -> bool {
+    let parent = controller.to_string();
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            // "pid (name) state parent ...": the name may hold anything, so the fields are read from its end.
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                return false;
+            };
+            let Some((head, rest)) = stat.rsplit_once(") ") else {
+                return false;
+            };
+            let name = head.split_once('(').map_or("", |(_, name)| name);
+            let mut fields = rest.split(' ');
+            let state = fields.next();
+            // One that has ended and is not yet collected has let go already.
+            name == "sleep" && state != Some("Z") && fields.next() == Some(parent.as_str())
+        })
+}
+
 /// Ends a controller with everything in its process group, and waits for it, but not for ever.
 fn end_controller(child: &mut Child) {
     let id = child.id();
@@ -654,10 +679,23 @@ impl Pool {
         self.stopped(sent)
     }
 
-    /// Sends the controller SIGTERM, as systemd does, and says whether it was sent.
+    /// Sends the controller SIGTERM, as systemd does, says whether it was sent, and returns once the stop has reached
+    /// the pool. The process that takes the signal is not the one that does the pool's work: it lets go of the line
+    /// the work reads its stop from, and that is one step after the signal. A test that goes on the moment the signal
+    /// is sent would race that step, so the step itself is waited for, with a bound.
     fn term(&self) -> bool {
         let child = self.child.as_ref().expect("a controller that runs");
-        signal("TERM", i64::from(child.id()))
+        let sent = signal("TERM", i64::from(child.id()));
+        let deadline = Instant::now() + Duration::from_secs(GONE_SECONDS);
+        while sent && holds_the_stop_line(child.id()) {
+            assert!(
+                Instant::now() < deadline,
+                "the controller was sent SIGTERM and still held its stop line open {GONE_SECONDS} seconds later:\n{}",
+                self.output()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        sent
     }
 
     /// Waits for a controller that was sent SIGTERM, and returns its exit code.

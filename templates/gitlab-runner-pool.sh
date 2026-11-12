@@ -86,19 +86,21 @@ POOL_PACKAGES='docker.io docker-cli curl jq ca-certificates coreutils libc-bin h
 
 say() { printf 'arca-gitlab-pool: %s\n' "$*"; }
 now() { date +%s; }
-# A pause a stop ends at once, wherever the signal lands. bash runs a trap only between two commands, so a signal that
-# comes while a command runs is read after it: the pause that follows is then not begun. One that comes while the pause
-# is being started, or while it runs, ends it: the trap calls wake. Without both, a signal that came during a command
-# was followed by the whole pause, five minutes of it where GitLab or the machine refuses the pool.
-NAP=''
-wake() { [ -z "$NAP" ] || kill "$NAP" 2>/dev/null; }
+# The stop is a line that is read, not a flag that a trap sets. The process that takes the signal (run_pool) holds the
+# line open through one program and ends that program when it is told to stop; from then on whoever reads the line
+# finds its end. So `stopping` is true from that moment, in the controller and in everything it starts, and a pause,
+# which is a read of the line with a limit of time, ends at once, wherever the signal landed: one that comes while a
+# command runs is found when the pause after it is begun.
+#
+# The controller itself has no trap, because bash 5.2 can lose the signal a trap with a command in it was to take.
+# When the signal comes just before bash looks for the end of a $( ) in a word, bash runs the trap there and reads the
+# trap's own text as if it stood inside that $( ): the text does not parse, its command is not run, and the script
+# runs on as if nothing had been sent, or ends at once without its stop. The controller is full of $( ).
+STOP_LINE=''
+stopping() { read -r -t 0 -u "$STOP_LINE"; }
 nap() {
-  [ -z "${STOP-}" ] || return 0
-  sleep "$1" &
-  NAP=$!
-  [ -z "${STOP-}" ] || wake
-  wait "$NAP" 2>/dev/null
-  NAP=''
+  read -r -t "$1" -u "$STOP_LINE" _
+  return 0
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -669,7 +671,7 @@ check_tokens() {
   for i in "${!R_NAME[@]}"; do
     # A stop is read between two registrations: each check may take as long as GitLab is given to answer, and twelve
     # of them are more than a stop is given.
-    [ -z "$STOP" ] || return 2
+    ! stopping || return 2
     check_token $((i + 1))
     verdict=$?
     [ "$verdict" != 2 ] || return 2
@@ -762,10 +764,10 @@ prepare_images() {
   [ "$REACH" != tailnet ] || images+=("$TAILNET_IMAGE")
   for image in "${images[@]}"; do
     until docker image inspect "$image" >/dev/null 2>&1 || docker pull -q "$image" >/dev/null 2>&1; do
-      [ -z "$STOP" ] || return 1
+      ! stopping || return 1
       say "the image $image could not be pulled; trying again in 30 seconds"
       nap 30
-      [ -z "$STOP" ] || return 1
+      ! stopping || return 1
     done
   done
 }
@@ -884,16 +886,16 @@ tailnet_locate() {
 # node is started again when another key is set. Returns 1 only when the controller is stopping.
 tailnet_wait() {
   local waited backend state status pause=0
-  while [ -z "$STOP" ]; do
+  while ! stopping; do
     if ! tailnet_start; then
-      [ -z "$STOP" ] || return 1
+      ! stopping || return 1
       say "the tailnet node could not be started; trying again in 30 seconds"
       nap 30
       continue
     fi
     waited=0
     backend=''
-    while [ -z "$STOP" ] && [ "$waited" -lt "$POOL_READY_WAIT" ]; do
+    while ! stopping && [ "$waited" -lt "$POOL_READY_WAIT" ]; do
       state=$(container_state "$TAILNET")
       [ "${state%% *}" = true ] || break
       status=$(tailnet_cli status --json)
@@ -902,10 +904,10 @@ tailnet_wait() {
       nap 1
       waited=$((waited + 1))
     done
-    [ -z "$STOP" ] || return 1
+    ! stopping || return 1
     if [ "$backend" = Running ]; then
       # The node stays up while a node the settings name is looked for: it may only not have been shown yet.
-      while [ -z "$STOP" ]; do
+      while ! stopping; do
         if tailnet_locate "$status"; then
           say "$LOCATE_WORDS"
           return 0
@@ -915,12 +917,12 @@ tailnet_wait() {
         [ "$pause" -gt "$POOL_BACKOFF_MAX" ] && pause=$POOL_BACKOFF_MAX
         say "$LOCATE_WORDS. Looking again in $pause seconds"
         nap "$pause"
-        [ -z "$STOP" ] || return 1
+        ! stopping || return 1
         state=$(container_state "$TAILNET")
         [ "${state%% *}" = true ] || break
         status=$(tailnet_cli status --json)
       done
-      [ -z "$STOP" ] || return 1
+      ! stopping || return 1
       continue
     fi
     printf x >>"$POOL_RUN/failures"
@@ -1071,18 +1073,19 @@ print_status() {
 # Says why the pool does not start, again every POOL_REFUSE_EVERY seconds, until the controller is stopped: the
 # reason stays on the console instead of a restart loop.
 hold() {
-  while [ -z "$STOP" ]; do
+  while ! stopping; do
     say "$1"
     nap "$POOL_REFUSE_EVERY"
   done
 }
 
-run_pool() {
-  STOP=''
-  trap 'STOP=1; wake' TERM INT
+# The controller: everything the pool does, as a child of run_pool. It takes no signal. It learns of a stop from the
+# line, and then stops in its own order.
+pool() {
+  trap - TERM INT
   load_settings || {
     say "the pool does not start until its settings are right: they were fixed when the machine was created, so create the pool again with the right ones"
-    while [ -z "$STOP" ]; do nap 300; done
+    while ! stopping; do nap 300; done
     return 1
   }
   mkdir -p "$POOL_STATE" "$POOL_LOGS" "$POOL_RUN/tmp" "$POOL_RUN/count"
@@ -1105,7 +1108,7 @@ run_pool() {
 
   # Nothing starts before every registration has its token: a pool that ran some of them would look whole.
   local waited=0 missing unused i
-  while [ -z "$STOP" ]; do
+  while ! stopping; do
     missing=$(missing_secrets)
     [ -n "$missing" ] || break
     if [ $((waited % 60)) = 0 ]; then
@@ -1114,7 +1117,7 @@ run_pool() {
     nap 5
     waited=$((waited + 5))
   done
-  [ -z "$STOP" ] || return 0
+  ! stopping || return 0
   unused=''
   for ((i = ${#R_NAME[@]} + 1; i <= MAX_RUNNERS; i++)); do
     [ ! -s "$(token_file "$i")" ] || unused="${unused:+$unused, }GITLAB_RUNNER_TOKEN_$i"
@@ -1123,7 +1126,7 @@ run_pool() {
 
   prepare_images || return 0
   # A stop is read after every wait and every pause, before anything else is begun.
-  [ -z "$STOP" ] || return 0
+  ! stopping || return 0
   clean_leftovers
   if [ "$REACH" = tailnet ]; then
     tailnet_wait || return 0
@@ -1132,11 +1135,11 @@ run_pool() {
   # GitLab Runner is not started before GitLab has answered for the tokens: what stands between the machine and
   # GitLab is said here in one sentence, not left to GitLab Runner's own output.
   local pause=0 verdict secrets
-  while [ -z "$STOP" ]; do
+  while ! stopping; do
     secrets=$(secrets_tag)
     check_tokens
     verdict=$?
-    [ -z "$STOP" ] || return 0
+    ! stopping || return 0
     if [ "$verdict" = 0 ] && [ "$(accepted)" -gt 0 ]; then break; fi
     pause=$((pause == 0 ? 5 : pause * 2))
     [ "$pause" -gt "$POOL_BACKOFF_MAX" ] && pause=$POOL_BACKOFF_MAX
@@ -1148,7 +1151,7 @@ run_pool() {
     fi
     nap "$pause"
   done
-  [ -z "$STOP" ] || return 0
+  ! stopping || return 0
   if ! write_config; then
     hold "the pool does not start: GitLab Runner's configuration could not be written to $POOL_CONFIG"
     return 1
@@ -1159,7 +1162,7 @@ run_pool() {
   local at state last_status=0 last_verify fresh restart_at=0 restart_pause=0 written next_check=0 note
   last_verify=$(now)
   written="$secrets ${R_STATE[*]}"
-  while [ -z "$STOP" ]; do
+  while ! stopping; do
     at=$(now)
     if [ "$REACH" = tailnet ]; then
       state=$(container_state "$TAILNET")
@@ -1194,7 +1197,7 @@ run_pool() {
         GITLAB_NOTE=''
       else
         # Cut short by a stop, or failed while one came: nothing is said about GitLab, and the pool stops.
-        [ -z "$STOP" ] || break
+        ! stopping || break
         next_check=$((at + POOL_RECHECK))
         note="WARNING: $CHECK_WORDS. The registrations stay as they were, and GitLab is asked again"
         [ "$note" = "$GITLAB_NOTE" ] || {
@@ -1226,6 +1229,35 @@ run_pool() {
   docker rm -f "$RUNNER" >/dev/null 2>&1
   clean_leftovers_of_jobs
   say "stopped"
+}
+
+# The process systemd stops. From the line that sets its trap on it runs NO command substitution, so its trap is
+# always read as it is written: it only starts the controller, waits for it, and lets go of the line when it is told to
+# stop. The controller then stops in its own order, and this process ends with the controller's code.
+run_pool() {
+  local code again ended=''
+  exec {STOP_LINE}< <(exec sleep infinity)
+  STOP_HOLD=$!
+  LET_GO=''
+  # Once only: a second signal must not reach whatever has the holder's process number by then.
+  trap '[ -n "$LET_GO" ] || { LET_GO=1; kill "$STOP_HOLD" 2>/dev/null; }' TERM INT
+  pool &
+  POOL=$!
+  while [ -z "$ended" ]; do
+    wait "$POOL"
+    code=$?
+    # wait also returns when the trap ran. The controller's code is the one wait gives once the controller is gone;
+    # a wait that the trap cut short just as the controller ended is asked again.
+    if ! kill -0 "$POOL" 2>/dev/null; then
+      wait "$POOL"
+      again=$?
+      [ "$again" = 127 ] || code=$again
+      ended=$code
+    fi
+  done
+  # A controller that ended by itself leaves the line held.
+  [ -n "$LET_GO" ] || kill "$STOP_HOLD" 2>/dev/null
+  return "$ended"
 }
 
 # The containers, volumes and networks of jobs whose GitLab Runner has gone.
