@@ -30,11 +30,11 @@ With those versions the call gives this file byte for byte.
 
 ### Checked on every pull request
 
-`rebuild/` holds the call as a script: `rebuild.mjs`, the characters in `text.txt`, and the four pinned packages in `package.json` and `package-lock.json`. CI's "Brand font rebuild" job downloads the source file at the commit above, checks its sha256, runs the script and fails unless the result is `fredoka-latin.woff2`, byte for byte. To run it yourself:
+`scripts/brand-font/` in Automagik's repository holds the call as a script: `rebuild.mjs`, the characters in `text.txt`, and the four pinned packages in `package.json` and `bun.lock`. It is tooling, so it is outside this folder, which is copied whole into other repositories. CI's "Brand font rebuild" job downloads the source file at the commit above, checks its sha256, runs the script and fails unless the result is `fredoka-latin.woff2`, byte for byte. To run it yourself:
 
 ```
-cd docs/brand/fonts/rebuild
-npm ci --ignore-scripts
+cd scripts/brand-font
+bun install --frozen-lockfile --ignore-scripts
 node rebuild.mjs "<path>/Fredoka[wdth,wght].ttf"
 ```
 

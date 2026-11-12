@@ -1,10 +1,11 @@
 {
   "note": "A copy of the Automagik brand. Do not edit these files here: change them in the source and run scripts/brand-sync.mjs --write.",
   "source": "https://github.com/automagik-si/automagik",
-  "commit": "6ba09b59e100236bf7ccc8d2b503b89f86f94b5b",
+  "commit": "8ff30182c39875bcc7339765eb2dd02652c1460d",
+  "into": "docs/brand",
   "files": {
-    ".claude/skills/automagik-brand/SKILL.md": "e9efa39b682f85fd0a7a7a7b1a16894e99ae18dcf10670f76b9ed50a43cab3e0",
-    "docs/brand/README.md": "362e49ee038bd5e3fb63c8bfe3f6f838d4eb638640d2ceef79c81692bf2fa854",
+    ".claude/skills/automagik-brand/SKILL.md": "57e51e8ad82566eb905c7d001fa5ef6660e44931e6ded7f084f480eb51e4a543",
+    "docs/brand/README.md": "56fd0fd807581f68f4e441d91199750cd876ba7df5fdef191a958cd91d93920c",
     "docs/brand/components/Button/README.md": "2038c6431992a41762a982a8a0e13786f74891593478b0c250779c554f64e5e4",
     "docs/brand/components/Button/preview.html": "d288ec3060381631fc9914230931f8409ccaa52e4c9620724e830c590d3bd5e5",
     "docs/brand/components/Crumbs/README.md": "d6228f15603eafdbe32f3e43a2cfbba6bde83525646827afbcbde5c90201c547",
@@ -29,7 +30,7 @@
     "docs/brand/components/SoonPill/preview.html": "8d66656e4ece7f1991c40681117634ab40c68b9caa79df0aceafa741bcdc0a2e",
     "docs/brand/components/WaitlistForm/README.md": "94a2a329fc40d4d21ddfc386d3a09ab1f894a1e4be03525d816d9da6221ac5d8",
     "docs/brand/components/WaitlistForm/preview.html": "c6b5fa1162cca64894769930cbf4022c6b09b93824edc0deeaea297c95b1d699",
-    "docs/brand/components/bundle.css": "bf19cef3764c5e9287789ae7573d14c8f66d185ac6a0dd0a6c37439db71c58b9",
+    "docs/brand/components/bundle.css": "f7fcfb5949924f0d2455af529ee2b0bc7852f19a402ba4ffb4ef5702eef64bc1",
     "docs/brand/export-png.mjs": "304e4f707d8da6dab287eb12bba7f7110249f4220d14e1bec6d08d203ebe2e4d",
     "docs/brand/favicon/README.md": "8fc12dd04c3194302c89f79a0da605b5b55751690e2f02d55f1598cb257d52b3",
     "docs/brand/favicon/alternates/apple-touch-icon-on-cream.png": "17662473a4eedc4fdcd9ec2bd4212eb93dcd7509aa413394cf6f17b54f39cf5d",
@@ -59,12 +60,8 @@
     "docs/brand/favicon/icon-192.png": "a312e3087539ef7828577813c531a285565dc5e5ed6c6103586e84e983efd5c7",
     "docs/brand/favicon/icon-512.png": "4b5093fda26231b81851e579600bcf811bb67ea98135aa84b20651c53440b6e1",
     "docs/brand/fonts/OFL-Fredoka.txt": "5c9e7eee5c6b25f4b05b8d53b2e470ea4962f9ced742d044a98f7d95d1375bab",
-    "docs/brand/fonts/README.md": "9004003704b1b3cee4baf175c3c19f92a94b5e1d29592dc2c24822d7ef1165a3",
+    "docs/brand/fonts/README.md": "f7f9cab1f41e27794960ace494de9747958dacc07229d561dce8ee63eec09f3c",
     "docs/brand/fonts/fredoka-latin.woff2": "d1ceb16007127919aa1900fb85e4b5d612a4f242404a4068d43f3bc628b2aeca",
-    "docs/brand/fonts/rebuild/package-lock.json": "002bb23c3aee3bc2984e70d3967e769c9cff7a20f7779aa2a1b06eed01b326f0",
-    "docs/brand/fonts/rebuild/package.json": "c17767f89bf325222896ff037066e9996b1355994dce82b79eb727c95c7f7919",
-    "docs/brand/fonts/rebuild/rebuild.mjs": "e657d9c4a7fd64079c5f26beb4d29ab7cc8365448d61efcd27a9cc8adcd2174e",
-    "docs/brand/fonts/rebuild/text.txt": "c7224eaa525b085e4152125d5ad531bff915b4e24015089e7e598032cc09a8b3",
     "docs/brand/genie/README.md": "b4d820d5bdcbbd87482b3a86460dce193faefac464edbac1bb03bd17ec4bf54b",
     "docs/brand/genie/genie-avatar-256.webp": "3b29de1d9fa0c0cd6a9e9ea53a726c95d9cd8ce563bf8ba643d291bcfb290142",
     "docs/brand/genie/genie-full-body.png": "4d34a8d97aee68b04dc4b217f1a39176d205eddb8e0a9ba51c9906de73aa3674",
@@ -118,7 +115,7 @@
     "docs/brand/logo/wordmark/omni-wordmark-cream.svg": "e930250e3797750d6ad118b8a5f7639e2604db3a78d68645666177f69191b5d2",
     "docs/brand/logo/wordmark/omni-wordmark-ink.svg": "e8c21842b9c280fddacfbf20e8ce998a1ea4be5069b47a43002ebf7db40e8e37",
     "docs/brand/tokens/tokens.css": "404e9372bb0278bc3b68cf501a41b21dfeeb2add94e319d7f6c6038a45ec4b92",
-    "docs/brand/tokens/tokens.json": "87831dcab932fe677731a7a9e18a65e476df6c3ee9a01f0402f41b82a87b3172",
-    "scripts/brand-sync.mjs": "ce8c61ec5bb70f568ac0f0792d0e8a0fe54a07aae21b90b20f2d471d60334b2e"
+    "docs/brand/tokens/tokens.json": "89f9b9349d48c289212e116b367010e787ffee5bd4062015b9d5b414d2329b2a",
+    "scripts/brand-sync.mjs": "c25456917675556d364699d2f0ab2e95f4e88bb2fcd56a71fd3399952ae4e6cf"
   }
 }

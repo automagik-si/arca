@@ -99,7 +99,7 @@ jobs:
         run: cargo fmt --all --check
 
   # docs/brand/, .claude/skills/automagik-brand/ and scripts/brand-sync.mjs are a byte copy of Automagik's brand
-  # (docs/brand/SOURCE.json names the commit). The check fails when a copied file was edited, removed or added here.
+  # (.claude/skills/automagik-brand/SOURCE.json names the commit). The check fails when a copied file was edited, removed or added here.
   # It then asks Automagik's repository whether its dev branch has a newer brand: that only warns, and without network
   # it says so and passes. It needs Node 22.7 or later and git, nothing installed.
   brand:

@@ -1,7 +1,7 @@
 /* automagik.si on the app's Stage theme (theme.css, generated from the app): cream by day,
    plum at night, the cyan/lilac/pink stage, paper surfaces, hairlines, clay lift and the
    magenta focus ring. Each building block gets its own visual; art is Automagik's own. */
-/* Automagik: the site's components. This is the site's own stylesheet (apps/landing/styles.css, dev@90e9f85f) with its token
+/* Automagik: the site's components. This is the site's own stylesheet (apps/landing/styles.css, dev@6ba09b59) with its token
    declarations taken out: colours, shadows, radii and fonts come from tokens.css. What a token cannot hold stays here:
    the stage gradient, the tile colour mixes and the font short names. Dark values apply under data-theme="dark", and under
    the reader's dark system setting when no data-theme is set. */
@@ -226,6 +226,8 @@ body:has(.drawer:popover-open) :is(main,.site-footer,.skip){visibility:hidden}
 [data-block="mobile"] .tile-art{flex:1;display:flex;justify-content:center;align-items:flex-end;padding:0 24px}
 .tile-phone.phone{--pw:216px;margin-bottom:clamp(24px,2.6vw,36px)}
 [data-block="omni"]{grid-column:span 3;display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr);align-items:center;background:var(--tile-cyan)}
+h1 .product-logo{display:block;width:auto;height:min(128px,11.8vw);object-fit:contain;object-position:left}
+.product-card h3 .product-logo{display:block;width:auto;height:44px}
 .tile-omni{width:min(220px,92%);margin:12px auto;filter:drop-shadow(0 18px 24px rgba(20,60,80,.28))}
 [data-block="genie"]{grid-column:span 3;display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr);align-items:center;background:radial-gradient(120% 90% at 85% 40%,var(--plum-2),var(--plum) 62%);border-color:transparent;color:var(--on-plum)}
 [data-block="genie"] h3,[data-block="genie"] h3 a{color:var(--on-plum)}
@@ -488,6 +490,7 @@ input:focus,textarea:focus,select:focus{outline:0;border-color:var(--ring);box-s
   [data-block="omni"] .tile-art,[data-block="genie"] .tile-art{padding-bottom:24px}
 }
 @media (max-width:860px){
+  h1 .product-logo{height:min(128px,23vw)}
   .main-nav{display:none}
   .top{--top-h:64px}
   .top-cta{margin-left:auto}

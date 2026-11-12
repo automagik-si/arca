@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // The brand's copy tool. Automagik's repository is the source of the brand: docs/brand/ (start at its
-// README.md). Genie, Omni and Arca carry a byte copy of that folder at the same path, with the agents'
-// skill (.claude/skills/automagik-brand/) and this file, so an agent working there finds the brand as
-// it does here. A copy also holds docs/brand/SOURCE.json: the Automagik commit it was made from and
-// the sha256 of every copied file. The copy is never edited: a change is made in Automagik's
-// repository and copied again.
+// README.md). Genie, Omni and Arca carry a byte copy of that folder, with the agents' skill
+// (.claude/skills/automagik-brand/) and this file, so an agent working there finds the brand as it
+// does here. The folder goes to docs/brand in a copy too, or to the folder --into names, for a
+// repository whose docs/ is not its own. A copy also holds SOURCE.json beside the skill: the folder
+// the brand is in (`into`), the Automagik commit it was made from and the sha256 of every copied
+// file. Its place is fixed, so a later run and the skill find the folder from it with no flag. The
+// copy is never edited: a change is made in Automagik's repository and copied again.
 //
-//   node scripts/brand-sync.mjs --write --from <an Automagik checkout, or a commit>
+//   node scripts/brand-sync.mjs --write --from <an Automagik checkout, or a commit> [--into <folder>]
 //   node scripts/brand-sync.mjs --check
 //
 // --write copies the files as committed at that commit, removes the files the source no longer has
@@ -31,14 +33,24 @@ import { fileURLToPath } from 'node:url';
 /** Automagik's repository, as SOURCE.json names it; with `.git`, the remote the look at dev reads. */
 export const SOURCE = 'https://github.com/automagik-si/automagik';
 export const BRANCH = 'dev';
-/** The copy's record. It exists only in a copy, never in Automagik's repository. */
-export const RECORD = 'docs/brand/SOURCE.json';
-/** Copied whole: in a copy, a file under these that the record does not list is stale. */
-export const FOLDERS = ['docs/brand', '.claude/skills/automagik-brand'];
+/** The brand's folder in Automagik's repository, and in a copy unless --into named another. */
+export const BRAND = 'docs/brand';
+/** The agents' skill: at this path in every repository, because that is where an agent looks. */
+export const SKILL_FOLDER = '.claude/skills/automagik-brand';
+/** The copy's record, beside the skill. It exists only in a copy, never in Automagik's repository. */
+export const RECORD = `${SKILL_FOLDER}/SOURCE.json`;
+/**
+ * Where the record was before the folder could be chosen. A copy runs the tool it carries, so one
+ * made by that tool has its record here: it is read as a copy in docs/brand, and the next --write
+ * moves it.
+ */
+export const OLD_RECORD = `${BRAND}/SOURCE.json`;
+/** Copied whole from the source. In a copy the first is the folder `into` names (`foldersOf`). */
+export const FOLDERS = [BRAND, SKILL_FOLDER];
 /** This file, copied alone, so the other repository's CI can run --check. */
 export const TOOL = 'scripts/brand-sync.mjs';
 export const WRITE = 'node scripts/brand-sync.mjs --write --from <an Automagik checkout, or a commit>';
-const REQUIRED = ['docs/brand/README.md', '.claude/skills/automagik-brand/SKILL.md', TOOL];
+const REQUIRED = [`${BRAND}/README.md`, `${SKILL_FOLDER}/SKILL.md`, TOOL];
 const NOTE = 'A copy of the Automagik brand. Do not edit these files here: change them in the source and run scripts/brand-sync.mjs --write.';
 // A network read gets this long before the look at dev is skipped.
 const NETWORK_MS = 30_000;
@@ -47,6 +59,8 @@ const USAGE = `Usage:
   node scripts/brand-sync.mjs --check
 
 Options:
+  --into <folder>  with --write: the brand's folder in the repository that carries the copy
+                   (default: the folder the copy is in already, else ${BRAND})
   --to <folder>    the repository that carries the copy (default: the one you are in)
   --remote <url>   Automagik's repository, for a commit and for the look at dev
                    (default: ${SOURCE}.git)`;
@@ -94,12 +108,33 @@ function scratchRepo(remote) {
 const lstatOf = path => { try { return lstatSync(path, { throwIfNoEntry: false }); } catch { return undefined; } };
 const isFolder = path => lstatOf(path)?.isDirectory() === true;
 
-/** Whether a recorded path is one the copy may hold: inside the brand's folders, or the tool. */
-const inScope = path => path !== RECORD && !path.split('/').some(part => part === '' || part === '.' || part === '..') && !path.includes('\\')
-  && (path === TOOL || FOLDERS.some(folder => path.startsWith(`${folder}/`)));
+/** The copy's two folders: the brand, in the folder `into` names, and the skill. */
+const foldersOf = into => [into, SKILL_FOLDER];
+const plain = path => typeof path === 'string' && path !== '' && !path.includes('\\') && !path.split('/').some(part => part === '' || part === '.' || part === '..');
+const within = (path, folder) => path === folder || path.startsWith(`${folder}/`);
+
+/**
+ * Why `into` cannot be the brand's folder in a copy, or undefined when it can. A folder inside
+ * the repository, named from its root, that is not git's, not the skill's or one around it, and
+ * not one around the tool: --write removes what it did not copy from the folders it owns.
+ */
+function refusedInto(into) {
+  if (!plain(into) || into.startsWith('-')) return 'it must be a folder inside the repository, named from its root (for example brand, or docs/brand)';
+  if (into.split('/').some(part => part.toLowerCase() === '.git')) return 'it is inside .git';
+  if (within(into, SKILL_FOLDER) || within(SKILL_FOLDER, into)) return `it overlaps the skill's folder (${SKILL_FOLDER})`;
+  if (within(TOOL, into)) return `it holds the tool (${TOOL})`;
+  return undefined;
+}
+
+/** A source path as the copy holds it: the brand's files go under `into`, the rest keep their path. */
+const placed = (path, into) => (path.startsWith(`${BRAND}/`) ? `${into}/${path.slice(BRAND.length + 1)}` : path);
+
+/** Whether a recorded path is one the copy may hold: inside the copy's folders, or the tool. */
+const inScope = (path, into) => path !== RECORD && plain(path)
+  && (path === TOOL || foldersOf(into).some(folder => path.startsWith(`${folder}/`)));
 
 /** Every file (and link) now under the copy's folders, as repository paths. `.DS_Store` is the Finder's. */
-function present(root) {
+function present(root, into) {
   const found = [];
   const walk = folder => {
     for (const entry of readdirSync(join(root, folder), { withFileTypes: true })) {
@@ -108,7 +143,7 @@ function present(root) {
       else if (entry.name !== '.DS_Store') found.push(path);
     }
   };
-  for (const folder of FOLDERS) if (isFolder(join(root, folder))) walk(folder);
+  for (const folder of foldersOf(into)) if (isFolder(join(root, folder))) walk(folder);
   return found.sort();
 }
 
@@ -220,7 +255,8 @@ export function sourceFiles({ where, commit }) {
     const [mode, type, oid] = line.slice(0, tab).split(' ');
     return { path: line.slice(tab + 1), mode, type, oid };
   });
-  if (listed.some(file => file.path === RECORD)) throw new Error(`commit ${short(commit)} holds ${RECORD}: it is a copy itself. Copy from Automagik's repository.`);
+  const record = listed.find(file => file.path === RECORD || file.path === OLD_RECORD);
+  if (record) throw new Error(`commit ${short(commit)} holds ${record.path}: it is a copy itself. Copy from Automagik's repository.`);
   for (const path of REQUIRED) {
     if (!listed.some(file => file.path === path)) throw new Error(`commit ${short(commit)} holds no ${path}: it is not Automagik's repository, or it is older than the brand's copy tool`);
   }
@@ -231,20 +267,61 @@ export function sourceFiles({ where, commit }) {
 }
 
 /**
- * Copies the brand, the skill and this tool from `from` into the repository at `to`, removes the
- * files the source no longer has, and writes the record. Returns what it did.
+ * The copy's record as it is on disk, for --write: `{ into, files }`, or undefined when there is
+ * none it can use (no record, one behind a link, one that is not a record). The record beside the
+ * skill first; else the one in docs/brand, which a copy made before the folder could be chosen has.
  */
-export function write({ to, from, remote }) {
+function recordBefore(root) {
+  for (const at of [RECORD, OLD_RECORD]) {
+    if (linkOn(root, at) || !lstatOf(join(root, at))?.isFile()) continue;
+    let record;
+    try { record = JSON.parse(readFileSync(join(root, at), 'utf8')); } catch { return undefined; }
+    const into = at === OLD_RECORD ? BRAND : record?.into ?? BRAND;
+    const files = record?.files;
+    if (refusedInto(into) || files === null || typeof files !== 'object' || Array.isArray(files)) return undefined;
+    return { at, into, files: Object.keys(files).filter(path => inScope(path, into)) };
+  }
+  return undefined;
+}
+
+/**
+ * Copies the brand, the skill and this tool from `from` into the repository at `to`, removes the
+ * files the source no longer has, and writes the record. The brand goes into the folder `into`
+ * names: when it is not given, the folder the copy is in already, else docs/brand. Returns what it did.
+ */
+export function write({ to, from, remote, into: asked }) {
   if (!statSync(to, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${to} is not a folder`);
   const root = realpathSync(resolve(to));
+  if (asked !== undefined && refusedInto(asked)) throw new Error(`--into ${asked}: ${refusedInto(asked)}. Nothing was changed.`);
   const source = openSource(from, remote);
   try {
     if (source.top && realpathSync(source.top) === root) throw new Error("this is the source: Automagik's own repository carries no copy. Run it in the repository that does (or pass --to).");
-    const files = sourceFiles(source);
+    const files = sourceFiles(source).map(file => ({ ...file, source: file.path }));
+    // The skill's folder, the tool and the record first: the record is read, and never through a link.
+    refuseUnsafe(root, [SKILL_FOLDER, TOOL, RECORD], []);
+    const before = recordBefore(root);
+    const into = asked ?? before?.into ?? BRAND;
+    for (const file of files) file.path = placed(file.source, into);
     const kept = new Set(files.map(file => file.path));
-    // The folders and the record first: `present` walks the folders, and must not walk through a link.
-    refuseUnsafe(root, [...FOLDERS, TOOL, RECORD], []);
-    const removed = present(root).filter(path => path !== RECORD && !kept.has(path));
+    // The folders next: `present` walks them, and must not walk through a link.
+    try {
+      refuseUnsafe(root, [...foldersOf(into), TOOL, RECORD], []);
+    } catch (error) {
+      throw new Error(`${error.message}${asked === undefined ? ' Or put the brand in another folder: --into <folder>.' : ''}`);
+    }
+    const here = present(root, into);
+    // A folder chosen for the first time is the copy's alone from then on: it may not hold other files now.
+    if (into !== before?.into && into !== BRAND) {
+      const others = here.filter(path => within(path, into) && !kept.has(path) && !before?.files.includes(path));
+      if (others.length) throw new Error(`${into} holds files that are not a brand copy (${others[0]}${others.length > 1 ? ` and ${others.length - 1} more` : ''}). Nothing was changed: choose a folder of the copy's own with --into.`);
+    }
+    const removed = here.filter(path => path !== RECORD && !kept.has(path));
+    // The folder the copy was in, when this run moves it: the files that copy recorded, and its record.
+    const left = before && before.into !== into ? before.into : undefined;
+    if (left || before?.at === OLD_RECORD) {
+      const moved = [...(left ? before.files.filter(path => within(path, left)) : []), ...(before.at === OLD_RECORD ? [OLD_RECORD] : [])];
+      for (const path of moved) if (!kept.has(path) && !removed.includes(path) && lstatOf(join(root, path)) && !isFolder(join(root, path))) removed.push(path);
+    }
     refuseUnsafe(root, [...kept, RECORD], removed);
     for (const path of removed) rmSync(join(root, path));
     const hashes = {};
@@ -253,49 +330,62 @@ export function write({ to, from, remote }) {
       replaceFile(root, file.path, bytes, file.mode === '100755' ? 0o755 : 0o644);
       hashes[file.path] = sha256(bytes);
     }
-    for (const folder of FOLDERS) pruneEmpty(join(root, folder));
-    replaceFile(root, RECORD, `${JSON.stringify({ note: NOTE, source: SOURCE, commit: source.commit, files: hashes }, null, 2)}\n`);
-    return { commit: source.commit, files: files.length, removed, dirty: source.dirty };
+    for (const folder of [...foldersOf(into), ...(left ? [left] : [])]) if (isFolder(join(root, folder))) pruneEmpty(join(root, folder));
+    replaceFile(root, RECORD, `${JSON.stringify({ note: NOTE, source: SOURCE, commit: source.commit, into, files: hashes }, null, 2)}\n`);
+    return { commit: source.commit, files: files.length, removed, dirty: source.dirty, into, from: left };
   } finally {
     source.close();
   }
 }
 
-/** Compares the copy at `to` with its record. Returns `{ commit, files, problems }`; no problems is a pass. */
+/**
+ * Compares the copy at `to` with its record. Returns `{ commit, files, into, record, problems }`;
+ * no problems is a pass. `record` is where the record was found, `into` the folder it names.
+ */
 export function check({ to }) {
   if (!statSync(to, { throwIfNoEntry: false })?.isDirectory()) return { problems: [`${to} is not a folder`] };
   const root = realpathSync(resolve(to));
   // Links first, and nothing is read through one: a linked record or folder can show any bytes.
-  const links = new Set([RECORD, ...FOLDERS, TOOL].map(path => linkOn(root, path)).filter(Boolean));
-  if (links.size) return { problems: [...links].sort().map(link => `${link} ${LINK}`) };
+  const fixed = new Set([RECORD, SKILL_FOLDER, TOOL].map(path => linkOn(root, path)).filter(Boolean));
+  if (fixed.size) return { problems: [...fixed].sort().map(link => `${link} ${LINK}`) };
+  // The record beside the skill; with none there, the one in docs/brand (a copy made before the
+  // folder could be chosen). The second is looked for only then, so a repository whose docs/ is a
+  // link, with its copy in another folder, is never asked about docs/.
+  const at = !lstatOf(join(root, RECORD)) && !linkOn(root, BRAND) && lstatOf(join(root, OLD_RECORD)) ? OLD_RECORD : RECORD;
+  if (at === OLD_RECORD && linkOn(root, OLD_RECORD)) return { problems: [`${OLD_RECORD} ${LINK}`] };
   let record;
   try {
-    record = JSON.parse(readFileSync(join(root, RECORD), 'utf8'));
+    record = JSON.parse(readFileSync(join(root, at), 'utf8'));
   } catch (error) {
-    if (existsSync(join(root, RECORD))) return { problems: [`${RECORD} is not JSON (${reason(error)})`] };
+    if (existsSync(join(root, at))) return { problems: [`${at} is not JSON (${reason(error)})`] };
     return { problems: [`${RECORD} is missing: nothing here says which Automagik commit this copy is`] };
   }
   const files = record?.files;
   const recorded = files !== null && typeof files === 'object' && !Array.isArray(files) && Object.values(files).every(hash => typeof hash === 'string');
-  if (!recorded || typeof record.commit !== 'string' || !/^[0-9a-f]{40}$/.test(record.commit)) return { problems: [`${RECORD} does not record a commit and its files`] };
+  if (!recorded || typeof record.commit !== 'string' || !/^[0-9a-f]{40}$/.test(record.commit)) return { problems: [`${at} does not record a commit and its files`] };
+  const into = record.into ?? BRAND;
+  if (refusedInto(into)) return { problems: [`${at} names ${JSON.stringify(into)} as the brand's folder: ${refusedInto(into)}`] };
+  if (at === OLD_RECORD && into !== BRAND) return { problems: [`${at} names ${into} as the brand's folder, but a record in ${BRAND} is a copy in ${BRAND}`] };
+  const links = new Set(foldersOf(into).map(path => linkOn(root, path)).filter(Boolean));
+  if (links.size) return { problems: [...links].sort().map(link => `${link} ${LINK}`) };
   const problems = [];
   for (const path of Object.keys(files).sort()) {
-    if (!inScope(path)) { problems.push(`${RECORD} lists ${path}, which is outside the brand's folders`); continue; }
+    if (!inScope(path, into)) { problems.push(`${at} lists ${path}, which is outside the brand's folders`); continue; }
     const link = linkOn(root, path);
     if (link) { links.add(link); continue; }
     const now = lstatOf(join(root, path));
     if (!now) problems.push(`${path} is missing`);
     else if (!now.isFile()) problems.push(`${path} is not a plain file`);
-    else if (sha256(readFileSync(join(root, path))) !== files[path]) problems.push(`${path} differs from ${RECORD}`);
+    else if (sha256(readFileSync(join(root, path))) !== files[path]) problems.push(`${path} differs from ${at}`);
   }
-  for (const path of REQUIRED) if (!Object.hasOwn(files, path)) problems.push(`${RECORD} does not list ${path}`);
-  for (const path of present(root)) {
-    if (path === RECORD || Object.hasOwn(files, path)) continue;
+  for (const path of REQUIRED) if (!Object.hasOwn(files, placed(path, into))) problems.push(`${at} does not list ${placed(path, into)}`);
+  for (const path of present(root, into)) {
+    if (path === at || Object.hasOwn(files, path)) continue;
     if (lstatOf(join(root, path))?.isSymbolicLink()) links.add(path);
-    else problems.push(`${path} is not in ${RECORD}: a stale or added file`);
+    else problems.push(`${path} is not in ${at}: a stale or added file`);
   }
   for (const link of [...links].sort()) problems.push(`${link} ${LINK}`);
-  return { commit: record.commit, files: Object.keys(files).length, problems };
+  return { commit: record.commit, files: Object.keys(files).length, into, record: at, problems };
 }
 
 /**
@@ -359,11 +449,11 @@ function parse(argv) {
   for (let at = 0; at < argv.length; at += 1) {
     const flag = argv[at];
     if (flag === '--write' || flag === '--check' || flag === '--help') options[flag.slice(2)] = true;
-    else if ((flag === '--from' || flag === '--to' || flag === '--remote') && argv[at + 1] !== undefined) options[flag.slice(2)] = argv[at += 1];
+    else if ((flag === '--from' || flag === '--to' || flag === '--remote' || flag === '--into') && argv[at + 1] !== undefined) options[flag.slice(2)] = argv[at += 1];
     else return null;
   }
   if (options.help) return options;
-  if (options.write === options.check || (options.write && !options.from) || (options.check && options.from)) return null;
+  if (options.write === options.check || (options.write && !options.from) || (options.check && (options.from || options.into !== undefined))) return null;
   return options;
 }
 
@@ -384,9 +474,13 @@ export function main(argv, { out = console.log, err = console.error, cwd = proce
   };
   try {
     if (options.write) {
-      const done = write({ to, from: options.from, remote: options.remote });
-      out(`brand-sync: copied ${done.files} files from Automagik ${done.commit} and wrote ${RECORD}`);
-      for (const path of done.removed) out(`brand-sync: removed ${path}: the source no longer has it`);
+      const done = write({ to, from: options.from, remote: options.remote, into: options.into });
+      out(`brand-sync: copied ${done.files} files from Automagik ${done.commit}, the brand into ${done.into}, and wrote ${RECORD}`);
+      for (const path of done.removed) {
+        if (path === OLD_RECORD) out(`brand-sync: removed ${path}: the record is ${RECORD} now`);
+        else if (done.from && within(path, done.from)) out(`brand-sync: removed ${path}: the brand is in ${done.into} now`);
+        else out(`brand-sync: removed ${path}: the source no longer has it`);
+      }
       if (done.dirty) out('brand-sync: note: that checkout has brand changes that are not committed. They were not copied: the copy is the commit.');
       lookAtDev(done.commit);
       return 0;
@@ -396,7 +490,7 @@ export function main(argv, { out = console.log, err = console.error, cwd = proce
       for (const problem of found.problems) err(`brand-sync: ${problem}`);
       err(`brand-sync: the copy is never edited here. Change the files in Automagik's repository, then run: ${WRITE}`);
     } else {
-      out(`brand-sync: ${found.files} files match ${RECORD} (Automagik ${short(found.commit)})`);
+      out(`brand-sync: ${found.files} files match ${found.record} (Automagik ${short(found.commit)}); the brand is in ${found.into}`);
     }
     if (found.commit) lookAtDev(found.commit);
     return found.problems.length ? 1 : 0;
