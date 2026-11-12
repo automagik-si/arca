@@ -2675,6 +2675,16 @@ impl Store {
     /// Starts the instance at `index`. Each NIC on a network gets its MAC (a new one is kept in `volatile.<dev>.hwaddr`) and
     /// its IPv4: a device's `ipv4.address` pins its lease, and a MAC without a lease is leased a free address.
     fn start(&mut self, index: usize, seed: u64) {
+        // Incus records that the instance has run, as it does at every start.
+        if let Some(config) = self.objects[index]
+            .body
+            .get_mut("config")
+            .and_then(Value::as_object_mut)
+        {
+            config
+                .entry("volatile.last_state.power")
+                .or_insert_with(|| json!("RUNNING"));
+        }
         for (name, device) in nics(&self.objects[index].body) {
             let Some(network) = device.get("network").and_then(Value::as_str) else {
                 continue;

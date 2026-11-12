@@ -4330,6 +4330,14 @@
           }
         },
         {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        },
+        {
           "name": "tenant",
           "required": false,
           "schema": {
@@ -4365,7 +4373,7 @@
               "type": "string"
             },
             "snapshot": {
-              "description": "The snapshot of the old version taken before the rebuild, or null when the service's project does not allow snapshots. Absent when nothing was changed.",
+              "description": "The snapshot of the old version taken before the rebuild, or null when the service's project does not allow snapshots (no project Arca makes does). Absent when nothing was changed.",
               "type": [
                 "string",
                 "null"
@@ -4385,7 +4393,7 @@
           "type": "object"
         }
       },
-      "summary": "Move a running container service made from an image by digest to another digest of that image in one call: it is stopped, snapshotted, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept), started, and its first port must answer TCP within the timeout (120 seconds unless timeoutSeconds says otherwise). The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
+      "summary": "Move a running container service made from an image by digest to another digest of that image in one call: it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
