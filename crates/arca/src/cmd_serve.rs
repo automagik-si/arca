@@ -608,6 +608,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         let reload_tokens = tokens.clone();
         let reload_dir = cfg.tokens.hash_dir.clone();
         let reload_record = reload_path.clone();
+        // This process holds the state directory alone by now, so a reload record in it is an older node's. It goes
+        // here, before the task below can record a reload of this node: a hangup that arrived during the start is
+        // answered the moment that task runs, and its record must not be taken for an older node's and removed.
+        clear_reload_record(&reload_record);
         tokio::spawn(async move {
             // Each reload is numbered and recorded, so `arca token reload` can say what its signal did, not only that it
             // was sent.
@@ -691,12 +695,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         tokio::select! {
             // The pid file is published the moment the socket is this process's own, and before any request is served: a
             // start that is refused never reaches it, so the file never names a process that holds no listener.
-            result = serve_unix_bound(router.clone(), &unix_path, || {
-                publish_pid(&pid_path);
-                // This process holds the state directory alone, so a reload record in it is an older node's: it goes, and
-                // no reload of this node is ever taken for one of that node's.
-                clear_reload_record(&reload_path);
-            }) => result,
+            result = serve_unix_bound(router.clone(), &unix_path, || publish_pid(&pid_path)) => result,
             result = loopback => result,
             result = loopback_twin => result,
             result = tailnet => result,
@@ -784,7 +783,8 @@ fn publish_pid(path: &Path) {
     }
 }
 
-/// Removes the reload record a node that ran before left in `path`. A failure other than "no such file" is said once.
+/// Removes the reload record a node that ran before left in `path`. It is called once, before this node can record a
+/// reload of its own, and never after. A failure other than "no such file" is said once.
 fn clear_reload_record(path: &Path) {
     match fs::remove_file(path) {
         Ok(()) => {}
