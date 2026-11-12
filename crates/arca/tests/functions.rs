@@ -1716,7 +1716,13 @@ fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_r
         images[0]["fingerprint"].as_str().unwrap()
     );
     // Arca holds it in its secret store and nowhere else: no record, proposal, journal, log or answer has it.
+    // Its first run rebuilds nothing, its second is rebuilt from the store's copy: no registry is asked.
     rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("new"))
+    );
     let line = rig.run("relay");
     assert_eq!(
         (&line["outcome"], &line["root"]),
@@ -1758,17 +1764,26 @@ fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_r
         "the image went with its last function"
     );
 
-    // With the store's copy gone, a run's root is fetched again from the registry, with the credential.
+    // A function that has run, and whose stored image is then gone: its next run's root is fetched again from the
+    // registry, with the credential. (A function that never ran is given no rebuild, so it runs once first.)
     rig.approved("function_create", relay_args())
         .expect("relay again");
     let image = rig.fingerprint("relay");
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    assert_eq!(rig.run("relay")["root"], "new");
+    assert!(
+        rig.fake
+            .rebuilds(PROJECT, "relay")
+            .iter()
+            .all(|from| from.starts_with("store:"))
+    );
     send(
         &rig,
         "DELETE",
         &format!("/1.0/images/{image}?project={PROJECT}"),
         &json!({}),
     );
-    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    assert!(credentialed(&rig).is_empty());
     let line = rig.run("relay");
     assert_eq!(
         (&line["outcome"], &line["root"]),

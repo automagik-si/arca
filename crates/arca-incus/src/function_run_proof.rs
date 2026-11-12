@@ -927,7 +927,7 @@ fn a_real_incus_cannot_start_a_container_that_was_rebuilt_before_its_first_start
         for run_number in 1..=3 {
             let seen = run.read(&project, NAME).expect("a function's");
             let from = Instant::now();
-            let root = run.fresh_root(&seen, Some(&image), &source, &never);
+            let root = run.fresh_root(&seen, Some(&image), &source, None, &never);
             println!(
                 "PROOF 3. run {run_number}: fresh_root answered {root:?} in {} ms",
                 from.elapsed().as_millis()

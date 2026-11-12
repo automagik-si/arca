@@ -361,7 +361,7 @@ fn a_container_that_never_started_is_not_rebuilt_and_one_that_has_run_is() {
     // image the function's record took. Another image, and it is refused.
     let refused = rig
         .run
-        .fresh_root(&seen, Some(&"f".repeat(64)), &source, &never)
+        .fresh_root(&seen, Some(&"f".repeat(64)), &source, None, &never)
         .expect_err("another image than the record's");
     assert!(
         matches!(&refused, IncusError::Refused(why) if why.contains("never been started")),
@@ -371,7 +371,7 @@ fn a_container_that_never_started_is_not_rebuilt_and_one_that_has_run_is() {
     for recorded in [Some(made_from.as_str()), None] {
         assert_eq!(
             rig.run
-                .fresh_root(&seen, recorded, &source, &never)
+                .fresh_root(&seen, recorded, &source, None, &never)
                 .expect("a new root"),
             FreshRoot::New
         );
@@ -389,7 +389,7 @@ fn a_container_that_never_started_is_not_rebuilt_and_one_that_has_run_is() {
     // It has run: now its root is rebuilt before a run, and the start after the rebuild is taken too.
     assert_eq!(
         rig.run
-            .fresh_root(&seen, None, &source, &never)
+            .fresh_root(&seen, None, &source, None, &never)
             .expect("rebuilt"),
         FreshRoot::Registry
     );
