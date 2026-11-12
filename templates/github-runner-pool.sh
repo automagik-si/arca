@@ -72,10 +72,19 @@ DOCKER_GID=123
 
 say() { printf 'arca-runner-pool: %s\n' "$*"; }
 now() { date +%s; }
-# A pause a signal can end at once.
+# A pause a stop ends at once, wherever the signal lands. bash runs a trap only between two commands, so a signal that
+# comes while a command runs is read after it: the pause that follows is then not begun. One that comes while the pause
+# is being started, or while it runs, ends it: the trap calls wake. Without both, a signal that came during a command
+# was followed by the whole pause, five minutes of it where GitHub refuses the sign-in or the runner group.
+NAP=''
+wake() { [ -z "$NAP" ] || kill "$NAP" 2>/dev/null; }
 nap() {
+  [ -z "${STOP-}${ABORT-}" ] || return 0
   sleep "$1" &
-  wait $! 2>/dev/null
+  NAP=$!
+  [ -z "${STOP-}${ABORT-}" ] || wake
+  wait "$NAP" 2>/dev/null
+  NAP=''
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -581,7 +590,7 @@ slot_cycle() {
   local class=${SLOT_CLASS[$slot]} dir runner daemon slice token name body jit runner_id tries state code
   local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' home=() lines
   ABORT=''
-  trap 'ABORT=1' TERM INT
+  trap 'ABORT=1; wake' TERM INT
   dir=$(slot_dir "$slot")
   runner="$POOL_NAME-s$slot-run"
   daemon="$POOL_NAME-s$slot-dind"
@@ -812,9 +821,10 @@ prepare_images() {
   local image tag
   for image in "$RUNNER_IMAGE" "$DOCKER_IMAGE"; do
     until docker image inspect "$image" >/dev/null 2>&1 || docker pull -q "$image" >/dev/null 2>&1; do
-      [ -n "$STOP" ] && return 1
+      [ -z "$STOP" ] || return 1
       say "the image $image could not be pulled; trying again in 30 seconds"
       nap 30
+      [ -z "$STOP" ] || return 1
     done
   done
   # The runner's own files, copied out of the pinned image once, with their owners: every runner starts from them.
@@ -1045,7 +1055,7 @@ print_status() {
 
 run_pool() {
   STOP=''
-  trap 'STOP=1' TERM INT
+  trap 'STOP=1; wake' TERM INT
   load_settings || {
     say "the pool does not start until its settings are right: they were fixed when the machine was created, so create the pool again with the right ones"
     # Stay up, so the reason stays on the console instead of a restart loop.
@@ -1104,7 +1114,10 @@ run_pool() {
   until prepare_images; do
     [ -z "$STOP" ] || return 0
     nap 30
+    [ -z "$STOP" ] || return 0
   done
+  # A stop is read after every wait and every pause below, before anything else is begun: GitHub is not asked again.
+  [ -z "$STOP" ] || return 0
   clean_containers
   # No slot starts before GitHub takes the credential: a wrong one is said here, once per pause, not once per slot.
   local pause=0
@@ -1115,6 +1128,7 @@ run_pool() {
     [ "$pause" -gt "$POOL_BACKOFF_MAX" ] && pause=$POOL_BACKOFF_MAX
     say "GitHub sign-in failed: $TOKEN_ERROR. Trying again in $pause seconds"
     nap "$pause"
+    [ -z "$STOP" ] || return 0
   done
   [ -z "$STOP" ] || return 0
   # Nor before its runner group is one a pool may use. A refusal is told again every POOL_REFUSE_EVERY seconds, so it
@@ -1122,6 +1136,7 @@ run_pool() {
   local verdict
   while :; do
     github_token || {
+      [ -z "$STOP" ] || return 0
       printf x >>"$POOL_RUN/failures"
       say "GitHub sign-in failed: $TOKEN_ERROR. Trying again in $POOL_BACKOFF_MAX seconds"
       nap "$POOL_BACKOFF_MAX"
@@ -1130,6 +1145,7 @@ run_pool() {
     }
     check_runner_group "$TOKEN"
     verdict=$?
+    [ -z "$STOP" ] || return 0
     [ "$verdict" != 0 ] || break
     printf x >>"$POOL_RUN/failures"
     say "$GROUP_WORDS"
@@ -1231,7 +1247,8 @@ run_pool() {
   local deadline=$(($(now) + POOL_STOP_WAIT))
   for slot in "${!PIDS[@]}"; do
     [ -n "${PIDS[$slot]}" ] || continue
-    while kill -0 "${PIDS[$slot]}" 2>/dev/null && [ "$(now)" -lt "$deadline" ]; do nap 0.2; done
+    # The controller is stopping already, so this is a plain pause: nap would not begin one.
+    while kill -0 "${PIDS[$slot]}" 2>/dev/null && [ "$(now)" -lt "$deadline" ]; do sleep 0.2; done
   done
   say "stopped"
 }
