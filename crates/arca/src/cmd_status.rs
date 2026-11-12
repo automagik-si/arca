@@ -359,7 +359,7 @@ pub(crate) fn enrol_step(url: &str, config: &str, screen: bool) -> String {
         );
     }
     let mut step = format!(
-        "enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config {config}"
+        "enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config {config}, and type it on the page, {url}. Until one is trusted, nothing can be approved."
     );
     if let Some(port) = url
         .strip_suffix("/approve")
@@ -626,7 +626,7 @@ mod tests {
             false,
         );
         assert!(
-            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve there.\n      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain."),
+            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json, and type it on the page, http://localhost:7471/approve. Until one is trusted, nothing can be approved.\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve there.\n      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain."),
             "{text}"
         );
         assert!(text.ends_with(MORE), "{text}");

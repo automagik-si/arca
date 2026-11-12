@@ -1286,11 +1286,11 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
         "no second restart"
     );
 
-    // The installer's own unit again, so the node is restarted and the next step is the passkey. At a terminal with
-    // a screen that is ONE line, the page and its button; the way from another computer and the phone are not said.
+    // The installer's own unit again, so the node is restarted; init has no token to ask it with, so nobody has seen
+    // that the node holds its page. The next step is to ask the node, with or without a screen, and no setup code
+    // is typed before that.
     fs::write(units.join("arca.service"), unit(&node.config)).expect("the unit");
     let config = node.config.display().to_string();
-    let page = format!("http://localhost:{}/approve", node.port);
     let screen = |display: Option<&str>| {
         let mut command = arca();
         command
@@ -1309,35 +1309,107 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
         }
         node.run(&mut command, "")
     };
-    let said = screen(Some(":0"));
-    said.ok()
-        .never_says("ssh ")
-        .never_says("phone")
-        .never_says("setup-code");
-    assert_eq!(
-        said.report(5)[2],
-        format!(
-            "Next: enrol your passkey: open {page} and press \"Get a setup code\". Until one is trusted, nothing can be approved."
-        ),
-        "{}",
-        said.all()
-    );
-    assert_eq!(said.out.matches("Next: ").count(), 1, "{}", said.all());
-
-    // No screen: the code comes from this terminal, and the way to the page from the person's own computer, with
-    // what a phone needs, is the next step and is said.
-    let said = screen(None);
-    said.ok()
-        .says(&format!(
-            "Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config {config}"
-        ))
-        .says(&format!(
-            "      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>, then open {page} there.",
-            node.port
-        ))
-        .says("      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain.");
-    assert_eq!(said.out.matches("Next: ").count(), 1, "{}", said.all());
+    for display in [Some(":0"), None] {
+        let said = screen(display);
+        said.ok()
+            .never_says("enrol your passkey")
+            .never_says("ssh ");
+        assert_eq!(
+            said.report(5)[2],
+            format!(
+                "Next: ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config {config} --token-file <the file of one of its tokens>. It then says what comes next."
+            ),
+            "{}",
+            said.all()
+        );
+        assert_eq!(said.out.matches("Next: ").count(), 1, "{}", said.all());
+    }
     assert_eq!(calls().lines().count(), 3, "one restart per run");
+}
+
+/// The one next step, from the real program on a node that `arca init` made and that says its page is open: with a
+/// screen it is ONE line, the page and its button; with none, the code from this terminal, where to type it, the way
+/// to the page from the person's own computer and what a phone needs.
+#[test]
+fn status_gives_one_next_step_for_the_first_passkey_and_it_depends_on_whether_there_is_a_screen() {
+    let node = Installed::new("status-next");
+    let viewer = mint(&node.scratch, &node.hash_dir, "viewer");
+    node.init(&["--enable-changes", "--yes"], "").ok();
+    let config = node.config.display().to_string();
+    let page = format!("http://localhost:{}/approve", node.port);
+    let mut serve = Serve::start(&node.config, node.scratch.at("serve.log"));
+    serve.wait_for(&node.socket);
+    // The node binds its page's two addresses after it starts: wait for its own word that the page is open.
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let answer = result(
+            &mcp(&node.socket, &viewer, "arca_status", json!({})),
+            "arca_status",
+        );
+        if answer["approvalPage"]["open"] == json!(true) {
+            assert_eq!(answer["approvalPage"]["passkeys"], json!(0), "{answer}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the page did not open: {answer}\n{}",
+            serve.log_text()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let status = |display: Option<&str>| {
+        let mut command = arca();
+        command
+            .args(["status", "--config"])
+            .arg(&node.config)
+            .arg("--token-file")
+            .arg(node.scratch.at("viewer.secret"));
+        if let Some(display) = display {
+            command.env("WAYLAND_DISPLAY", display);
+        }
+        let out = command.output().expect("run arca status");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let text = status(Some("wayland-0"));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[lines.len() - 2..],
+        [
+            format!(
+                "Next: enrol your passkey: open {page} and press \"Get a setup code\". Until one is trusted, nothing can be approved."
+            ),
+            format!("More: arca status --security --config {config}"),
+        ],
+        "{text}"
+    );
+    assert!(
+        !text.contains("ssh ") && !text.contains("phone") && !text.contains("setup-code"),
+        "{text}"
+    );
+
+    let text = status(None);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[lines.len() - 4..],
+        [
+            format!("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config {config}, and type it on the page, {page}. Until one is trusted, nothing can be approved."),
+            format!(
+                "      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>, then open {page} there.",
+                node.port
+            ),
+            "      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain.".to_string(),
+            format!("More: arca status --security --config {config}"),
+        ],
+        "{text}"
+    );
+    assert_eq!(text.matches("Next: ").count(), 1, "{text}");
+    assert_eq!(serve.terminate(), Some(0), "{}", serve.log_text());
 }
 
 /// `arca status` on a node that may change things: a doctor token does not wait for the approval page, so status names

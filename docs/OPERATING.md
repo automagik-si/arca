@@ -370,11 +370,13 @@ A node started any other way is the owner's to restart, and the step says so.
    restarted node answered so itself;
 2. who waits for the page: either that no token of this node may do more than look and propose, or every `doctor`
    and `operator` token by name, with the line that revokes one. This line never leaves the report;
-3. `Next:`, the ONE thing to do. A node that was not restarted: restart it, with the command. A page the node does
-   not hold: type no code there. Otherwise the passkey: at a terminal with a screen (`DISPLAY` or `WAYLAND_DISPLAY`
-   is set), the page and its "Get a setup code" button; at one without, `arca setup-code`, and for the page of this
-   machine alone the `ssh` line that brings the page to your own computer and the sentence that a phone cannot
-   open it. With a passkey already trusted: ask your assistant for something;
+3. `Next:`, the ONE thing to do. A node that was not restarted: restart it, with the command. A node that was
+   restarted while init had no token to ask it with: ask it, with `arca status`, whether its page is open, before
+   a setup code is typed or anything is approved there. A page the node does not hold: type no code there.
+   Otherwise the passkey: at a terminal with a screen (`DISPLAY` or `WAYLAND_DISPLAY` is set), the page and its
+   "Get a setup code" button; at one without, `arca setup-code`, the page to type the code on, and for the page of
+   this machine alone the `ssh` line that brings the page to your own computer and the sentence that a phone
+   cannot open it. With a passkey already trusted: ask your assistant for something;
 4. `A database: ask your assistant for the postgres-autopg service.`;
 5. `More:`, one pointer: `arca status` for what is open and what comes next, `arca status --security` for
    everything else, and `arca init --watch-only` to go back.

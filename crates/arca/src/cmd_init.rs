@@ -664,6 +664,12 @@ fn enabled_report(
         format!(
             "the approval page is CLOSED: {reason}. Type no setup code and approve nothing there until `arca status --config {path}` says it is open."
         )
+    } else if matches!(restarted, Restart::Unasked) {
+        // Nobody has seen that the node holds its page: init had no token to ask with. A setup code is typed, and
+        // an approval is signed, only at a page the node says is open, so asking the node comes first.
+        format!(
+            "ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config {path} --token-file <the file of one of its tokens>. It then says what comes next."
+        )
     } else if passkey {
         format!(
             "ask your assistant for something. A passkey is already trusted on this node; what is proposed waits for you at {url}"
@@ -1361,7 +1367,7 @@ mod tests {
         let text =
             enabled_report(&answered, &nobody(), LOCAL, Path::new(CONFIG), false, false).join("\n");
         assert!(
-            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve there.\n      A phone cannot open this page:"),
+            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json, and type it on the page, http://localhost:7471/approve. Until one is trusted, nothing can be approved.\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve there.\n      A phone cannot open this page:"),
             "{text}"
         );
         // A page under a name of the owner's own: no ssh line and no word about a phone, screen or not.
@@ -1455,22 +1461,31 @@ mod tests {
                 "{lines:?}"
             );
         }
-        // Restarted, with no token to ask it: said, and the next step is the passkey.
-        let lines = enabled_report(
-            &Restart::Unasked,
-            &nobody(),
-            LOCAL,
-            Path::new(CONFIG),
-            false,
-            true,
-        );
-        assert!(lines[0].ends_with(
-            "There is no token to ask it with, so init cannot say that it took this up."
-        ));
-        assert!(
-            lines[2].starts_with("Next: enrol your passkey: open "),
-            "{lines:?}"
-        );
+        // Restarted, with no token to ask it: nobody has seen that the node holds its page, so the next step is to
+        // ask the node, and no setup code is typed before that. With a passkey already trusted, the same.
+        for passkey in [false, true] {
+            let lines = enabled_report(
+                &Restart::Unasked,
+                &nobody(),
+                LOCAL,
+                Path::new(CONFIG),
+                passkey,
+                true,
+            );
+            assert!(lines[0].ends_with(
+                "There is no token to ask it with, so init cannot say that it took this up."
+            ));
+            assert_eq!(
+                lines[2],
+                "Next: ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config /home/u/.config/arca/node.json --token-file <the file of one of its tokens>. It then says what comes next."
+            );
+            let text = lines.join("\n");
+            assert!(
+                !text.contains("enrol your passkey")
+                    && !text.contains("ask your assistant for something"),
+                "{text}"
+            );
+        }
     }
 
     /// On the way back, "now only looks" is the node's own word. Without it the first line says the running node
