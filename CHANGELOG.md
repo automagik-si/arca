@@ -30,12 +30,13 @@ and so is a key longer than a journal window when neither its BEGIN nor its END 
 line hides the text from its start, so a function's result that names such a line is hidden too; a stray BEGIN line
 hides everything up to the next END line. `docs/OPERATING.md` lists them all.
 
-## 0.14.0 (2026-11-12)
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
 what to propose it now reads the tenants (with what each instance uses and the deploy it came from) and the functions
 with their newest runs. A removal of a tenant, a deploy or a function deletes data or secrets for good, so its card and
 its Approve button are drawn in the alert colour.
+
+## 0.14.0 (2026-11-12)
 
 The metrics sampler no longer reads the listing of every instance with its live state each tick. On a node where one
 running virtual machine's guest agent is slow, that listing took up to its 10 second deadline, so a tick often had no
