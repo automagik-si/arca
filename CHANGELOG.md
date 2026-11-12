@@ -7,6 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.12.0 (2026-11-12)
+
+- the installer shows the one line that connects an assistant, arca status says who approves and which tokens do not wait, and a machine with no screen is told what to run
+- fix: token reload, link pair and link join never let a stale ARCA_CONFIG pick the node
+- one rule for finding the config on every command, a stale ARCA_CONFIG never picks the node for a command that hands out or removes, and an unknown field is named
+- fix: arca init calls the node's address the way token reload left it, so the merged set compiles (diff read by the Orchestrator)
+- arca init --enable-changes, one guided step from a node that only looks to one that can make changes, and it names every token that could change things without the passkey
+- arca token reload, a checked reload that never signals a stranger or a node still starting, and every hint names it
+
 ## 0.11.0 (2026-11-12)
 
 The MCP server now speaks protocol version `2026-07-28` beside `2025-11-25`. For a client of `2025-11-25`, or one that
