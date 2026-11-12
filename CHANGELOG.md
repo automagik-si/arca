@@ -7,6 +7,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The MCP server now speaks protocol version `2026-07-28` beside `2025-11-25`. A client of `2025-11-25`, or one that
+sends no version header, is answered as before. One thing is stricter for everyone: a request whose
+`MCP-Protocol-Version` header names a version that is neither of those two, nor `2025-06-18` or `2025-03-26`, used to be
+served and is now refused with `400` and the list of supported versions.
+
 ## 0.10.0 (2026-11-12)
 
 `service_status` now answers `update` for a service whose version is known: `pin`, the version it was created with,
