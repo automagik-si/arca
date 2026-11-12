@@ -1507,3 +1507,70 @@ fn the_postgres_descriptions_say_what_each_verb_returns() {
         }
     }
 }
+
+/// The text a client shows of a read is the answer itself, not only a count: a client that does not show the
+/// structured content to its model still gets each instance, each service and the node's state. Every value is
+/// synthetic.
+#[test]
+fn the_text_of_a_watch_report_a_service_list_and_a_status_carries_the_answer() {
+    let summary = |name: &str, value: Value| (verb(name).expect(name).summary_text)(&value);
+    let report = json!({ "at": 1, "projects": [
+        { "project": "default", "instances": [
+            { "name": "web", "kind": "container", "status": "Running" },
+            { "name": "db", "kind": "virtual-machine", "status": "Stopped" },
+        ] },
+        { "project": "empty", "instances": [] },
+    ] });
+    assert_eq!(
+        summary("watch_report", report),
+        "2 instance(s) in 2 project(s)\n- web in default: container, Running\n- db in default: virtual-machine, Stopped"
+    );
+    assert_eq!(
+        summary(
+            "service_list",
+            json!({ "services": [
+            { "name": "nats", "template": "nats", "state": "running", "ipv4": "192.0.2.20" },
+            // A machine on a host bridge: its address is in no record, only in the live state.
+            { "name": "wiki", "template": "automagik-workspace", "state": "running", "ipv4": "", "ipv4In": "state" },
+            // An instance the node holds no record of.
+            { "name": "stray", "template": "", "state": "unknown", "ipv4": "" },
+        ] })
+        ),
+        "3 service(s)\n- nats (nats): running at 192.0.2.20\n- wiki (automagik-workspace): running, address in its live state (service_status reads it)\n- stray (no template): unknown, no address"
+    );
+    assert_eq!(
+        summary("service_list", json!({ "services": [] })),
+        "0 service(s)"
+    );
+    assert_eq!(
+        summary(
+            "arca_status",
+            json!({ "version": "0.15.0", "mode": "watch-only", "incusReachable": true, "uptimeS": 3_725 })
+        ),
+        "arca 0.15.0 (watch-only mode)\nIncus answers; up 1 h 2 min"
+    );
+    assert_eq!(
+        summary(
+            "arca_status",
+            json!({ "version": "0.15.0", "mode": "kernel", "incusReachable": false, "uptimeS": 42 })
+        ),
+        "arca 0.15.0 (kernel mode)\nIncus does not answer; up 42 s"
+    );
+    // A long list names the first fifty and counts the rest; the structured answer keeps them all.
+    let many: Vec<Value> = (0..53)
+        .map(|n| json!({ "name": format!("i{n}"), "kind": "container", "status": "Running" }))
+        .collect();
+    let text = summary(
+        "watch_report",
+        json!({ "at": 1, "projects": [{ "project": "p", "instances": many }] }),
+    );
+    assert_eq!(text.lines().count(), 1 + 50 + 1, "{text}");
+    assert!(
+        text.starts_with("53 instance(s) in 1 project(s)\n- i0 in p: container, Running\n"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("\n- i49 in p: container, Running\n- and 3 more"),
+        "{text}"
+    );
+}

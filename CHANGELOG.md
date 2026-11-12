@@ -7,6 +7,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+On a node that only looks, a read that worked no longer begins with "this node only looks: nothing here can be
+changed ...": the answer comes first and that note after it, so an assistant that reads only the first text block no
+longer reports a refusal. The text of `watch_report`, `service_list` and `arca_status` now carries the answer itself
+(each instance, each service, and whether Incus answers and how long the node has run), not only a count.
+
 ## 0.17.0 (2026-11-12)
 
 Arguments a tool does not take are now answered as a tool result with `isError: true` and `droidd/error` `invalid_arguments`, in the same words, instead of a JSON-RPC error `-32602`, so an assistant reads why and corrects the call (MCP 2025-11-25). A value outside a closed list, such as an `action_propose` action that is not one, now lists the allowed values and names the nearest one. `arca call` prints such a failure as `{"code": "invalid_arguments", "message": ...}`. A call that names no tool, or a tool the server does not have, is still a JSON-RPC error.

@@ -451,14 +451,16 @@ fn tool_result(v: &Verb, value: Value, cut: Option<&str>, only_looks: bool) -> V
     if v.untrusted {
         content.push(json!({ "type": "text", "text": UNTRUSTED_NOTE }));
     }
-    if only_looks {
-        content.push(json!({ "type": "text", "text": ONLY_LOOKS_NOTE }));
-    }
     let mut summary = (v.summary_text)(&value);
     if let Some(what) = cut {
         summary.push_str(&format!("\n(truncated: {what})"));
     }
     content.push(json!({ "type": "text", "text": summary }));
+    // The answer comes first: a client that reads only the first block must not take a successful read for a
+    // refusal. The note that nothing can be changed here follows it.
+    if only_looks {
+        content.push(json!({ "type": "text", "text": ONLY_LOOKS_NOTE }));
+    }
     let mut structured = serde_json::Map::new();
     if v.untrusted {
         structured.insert("untrusted".to_string(), json!(UNTRUSTED_NOTE));
@@ -564,6 +566,17 @@ mod tests {
             .filter_map(|part| part["text"].as_str())
             .collect();
         assert!(texts.contains(&ONLY_LOOKS_NOTE), "{texts:?}");
+        // The answer comes before the note: a client that reads only the first text block of a read that worked must
+        // not take it for a refusal. (The untrusted note of a verb that has one still comes before the answer.)
+        assert_eq!(texts, [UNTRUSTED_NOTE, "one line", ONLY_LOOKS_NOTE]);
+        let trusted = Verb {
+            untrusted: false,
+            ..probe()
+        };
+        let read = tool_result(&trusted, json!(["one"]), None, true);
+        assert_eq!(read["content"][0]["text"], "one line");
+        assert_eq!(read["content"][1]["text"], ONLY_LOOKS_NOTE);
+        assert_eq!(read["content"].as_array().map(Vec::len), Some(2));
         assert_eq!(looks["structuredContent"][ONLY_LOOKS_KEY], ONLY_LOOKS_NOTE);
         assert_eq!(
             looks["structuredContent"]["items"],
@@ -633,9 +646,12 @@ mod tests {
         let capped = (list.cut)(&original).unwrap();
         conforms(&(list.result)(), &capped).unwrap();
         let result = tool_result(list, capped, Some(&cut), false);
+        let rows = "\n- svc (nats): running at 192.0.2.10".repeat(50);
         assert_eq!(
             result["content"][0]["text"],
-            "256 service(s)\n(truncated: 3 service row(s) omitted of 259 original row(s))"
+            format!(
+                "256 service(s){rows}\n- and 206 more\n(truncated: 3 service row(s) omitted of 259 original row(s))"
+            )
         );
         assert_eq!(result["structuredContent"]["truncated"], true);
     }
