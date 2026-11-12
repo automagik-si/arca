@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.13.0 (2026-11-12)
+
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU
 assignment no longer hold the word `watch-only`, which they did in 0.12.0: they carry the same sentence as every other
 refusal and every answer of such a node, `this node only looks: nothing here can be changed until the node is running
@@ -42,6 +44,12 @@ No call chooses a database's image any more. A `doctor` or `operator` token's ow
 digest-pinned image it named; it now uses the node's template, or `kernel.postgresImage` where the config sets it, and
 a call that states another image is refused. A node whose config sets `kernel.postgresImage` keeps the old kind of
 database whole, and its records and lists are unchanged; `image` is now optional in the call.
+
+- a database from a clean install is the shipped Postgres service, made through the owner's card, and no token names its own image
+- functions, a program that runs on a timer in a container of its own, created only from the owner's card, with limits and a run log that is the meter
+- after arca init a person sees one next action, the shipped Postgres service makes its own password so it starts through the card alone, and the README says what 0.12 does
+- a node that only looks still shows its services, their status and their logs, and refuses every write first, in one sentence
+- a runner pool obeys a stop at once, in every loop and during a request
 
 ## 0.12.0 (2026-11-12)
 
