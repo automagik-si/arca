@@ -1273,7 +1273,9 @@ same in both versions, and so are the tokens and their scopes.
 - **`2025-11-25`.** A request with the header `MCP-Protocol-Version: 2025-11-25`, or with no version header at all, is
   a legacy request. `initialize` answers `2025-11-25` whatever version it asks for, `ping` answers, and `tools/list`
   and `tools/call` return what they returned before `2026-07-28` existed: no result gains a field, and a JSON-RPC
-  error travels inside a `200`. The header values `2025-06-18` and `2025-03-26` are served the same way.
+  error travels inside a `200`. One answer changed in both eras: arguments a tool does not take are a tool result with
+  `isError` (`invalid_arguments`), no longer the error `-32602` (see the list below). The header values `2025-06-18` and
+  `2025-03-26` are served the same way.
 - **`server/discover`** answers `supportedVersions` (`2026-07-28`, `2025-11-25`), the capabilities and `serverInfo`:
   the server's name and the release it is, the version `arca --version` prints. `initialize` names the same release.
   It answers a request that names no version too, so one `curl` with a token shows what a node speaks.
@@ -1283,7 +1285,8 @@ same in both versions, and so are the tokens and their scopes.
 - The token is checked first, as always: a request without a valid one is `401` whatever version it declares.
 
 Before `2026-07-28` the server read no version from a request. It now does, so four answers changed for a client that
-never names `2026-07-28`. A client that follows `2025-11-25` meets none of them except the first, and only if it asks:
+never names `2026-07-28`, and a fifth changed for every client. A client that follows `2025-11-25` meets the fifth, and
+of the first four only the first, and only if it asks:
 
 - `server/discover` answers. It used to be an unknown method, `-32601`.
 - A version header that names a version the server does not know is `400` with `-32022`. It used to be ignored.
@@ -1291,6 +1294,9 @@ never names `2026-07-28`. A client that follows `2025-11-25` meets none of them 
 - A version in `params._meta` (the key `io.modelcontextprotocol/protocolVersion`) is read even when no header is sent.
   An unknown one is `400` with `-32022`, one that is not a string is `400` with `-32602`, and one that differs from
   the header, or names `2026-07-28` with no header, is `400` with `-32020`. It used to be ignored.
+- Arguments a tool does not take, refused by the tool's schema or by the tool itself, are a tool result with `isError:
+  true`, `_meta` `droidd/error` `invalid_arguments` and the same words. They used to be the error `-32602`. MCP
+  2025-11-25 asks for this, so the model reads why and can correct the call.
 
 `arca call` and the canvas are clients of this same route and still speak `2025-11-25`: `initialize`, then `tools/call`.
 That is deliberate and needs no action. Both are released together with the server they call, the server answers
@@ -1836,8 +1842,10 @@ arca call approval_submit --config /etc/arca/node.json --token-file "$HOME/.conf
 A call sends `initialize` and then `tools/call`, each on its own connection. Its exit codes:
 
 - `0`: the result is printed on stdout as JSON.
-- `3`: the node refused the call with a JSON-RPC error. The error object is printed on stdout, with the refusal in
-  `data.refusal`, and nothing is printed on stderr.
+- `3`: the node refused the call or the tool failed, and nothing is printed on stderr. A refusal is a JSON-RPC error,
+  printed on stdout as its error object, with the refusal in `data.refusal`. Arguments the tool does not take, or a
+  tool's own failure, are a tool result with `isError`, printed as `{"code": "invalid_arguments", "message": "<the
+  words>"}` (`internal` for a failure inside the node).
 - `4`: the node answered 401 or 403 to the token.
 - `1`: any other failure, such as a socket that does not answer.
 

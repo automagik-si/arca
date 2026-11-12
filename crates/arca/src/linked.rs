@@ -65,6 +65,13 @@ pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, Re
         _ => return Err(RelayError::Unreachable),
     }
     let reply: Value = serde_json::from_slice(&body).map_err(|_| RelayError::Unreachable)?;
+    answer_of(&reply)
+}
+
+/// A linked kernel's JSON-RPC reply as the relay's answer: its structured result, its refusal as it sent it, or why it
+/// failed. Arguments it does not take are a tool result with `isError`, and their words are passed on as it wrote them;
+/// a failure inside its tool is said in a plain sentence, as its own caller is told no more.
+fn answer_of(reply: &Value) -> Result<Value, RelayError> {
     if let Some(error) = reply.get("error") {
         let message = error
             .get("message")
@@ -83,9 +90,18 @@ pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, Re
     }
     let result = reply.get("result").ok_or(RelayError::Unreachable)?;
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return Err(RelayError::Failed(
-            "the linked machine could not complete the call".to_string(),
-        ));
+        let invalid = arca_mcp::jsonrpc::INVALID_ARGUMENTS;
+        let words = (result
+            .pointer("/_meta/droidd~1error")
+            .and_then(Value::as_str)
+            == Some(invalid))
+        .then(|| result.pointer("/content/0/text").and_then(Value::as_str))
+        .flatten()
+        .and_then(|text| text.strip_prefix(invalid)?.strip_prefix(": "));
+        return Err(RelayError::Failed(words.map_or_else(
+            || "the linked machine could not complete the call".to_string(),
+            str::to_string,
+        )));
     }
     result
         .get("structuredContent")
@@ -192,6 +208,39 @@ fn post(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Arguments the linked kernel does not take come back in its own words; its tool's own failure in a plain sentence.
+    #[test]
+    fn a_linked_kernels_invalid_arguments_are_passed_on_in_its_words() {
+        let failed = |meta: &str, text: &str| {
+            answer_of(&json!({ "jsonrpc": "2.0", "id": 1, "result": {
+                "isError": true,
+                "content": [{ "type": "text", "text": text }],
+                "_meta": { "droidd/error": meta }
+            }}))
+        };
+        assert_eq!(
+            failed(
+                "invalid_arguments",
+                "invalid_arguments: /plan: does not match the pattern"
+            ),
+            Err(RelayError::Failed(
+                "/plan: does not match the pattern".to_string()
+            ))
+        );
+        assert_eq!(
+            failed("internal", "internal: the tool failed"),
+            Err(RelayError::Failed(
+                "the linked machine could not complete the call".to_string()
+            ))
+        );
+        assert_eq!(
+            answer_of(&json!({ "jsonrpc": "2.0", "id": 1, "result": {
+                "isError": false, "structuredContent": { "plans": [] }
+            }})),
+            Ok(json!({ "plans": [] }))
+        );
+    }
 
     #[test]
     fn a_relayed_approval_waits_past_the_longest_action_it_can_run() {

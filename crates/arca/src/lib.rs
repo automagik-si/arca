@@ -5,8 +5,9 @@
 //! does anything; one that removes or cuts something off names the node's state directory too.
 //!
 //! Exit codes: 0 for success; 1 for a runtime failure (a socket, a read or a write that failed); 2 for a usage or config
-//! failure (a bad command line, a refused config, or a token directory that is unsafe or missing); 3 for a tool error, whose
-//! JSON-RPC error object `call` prints on stdout; 4 for a token the node refuses, HTTP 401 or 403. `arca adopt` exits 2 too when
+//! failure (a bad command line, a refused config, or a token directory that is unsafe or missing); 3 for a tool error: a refusal,
+//! whose JSON-RPC error object `call` prints on stdout, or a tool result with `isError` (arguments the tool does not
+//! take, or its own failure), printed as `{"code": ..., "message": ...}`; 4 for a token the node refuses, HTTP 401 or 403. `arca adopt` exits 2 too when
 //! it refuses before any write: a preflight check, a stale plan digest, an instance the config does not list, or a record that
 //! does not hold the adoption it is asked to resume, release or verify.
 
@@ -123,7 +124,8 @@ pub enum Failure {
     Config(String),
     /// A socket, read or write failed while the command ran.
     Runtime(String),
-    /// A tool call answered with an error. The JSON-RPC error object is printed on stdout, and nothing on stderr.
+    /// A tool call answered with an error: a refusal's JSON-RPC error object, or `{"code", "message"}` for a tool
+    /// result with `isError`. It is printed on stdout, and nothing on stderr.
     Tool(Value),
     /// The node refuses the token, or the token's scope may not make the call. The text names the refusal.
     Unauthorized(String),

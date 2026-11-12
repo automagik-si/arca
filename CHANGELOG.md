@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Arguments a tool does not take are now answered as a tool result with `isError: true` and `droidd/error` `invalid_arguments`, in the same words, instead of a JSON-RPC error `-32602`, so an assistant reads why and corrects the call (MCP 2025-11-25). A value outside a closed list, such as an `action_propose` action that is not one, now lists the allowed values and names the nearest one. `arca call` prints such a failure as `{"code": "invalid_arguments", "message": ...}`. A call that names no tool, or a tool the server does not have, is still a JSON-RPC error.
+
 A new Automagik starts from Automagik's published image: `automagik-server` and `automagik-workspace` now pin
 Automagik's release 3.136.4 by its digest (they pinned 3.95.0 and a build of commit `5fe0be6`), with nothing built on
 the node: Incus pulls the server's image at the create, and a workspace's Docker pulls it after `instance_start`. Omni channels are not in 3.136.4; they come through Automagik's welcome once
@@ -25,7 +27,6 @@ The MCP server names the release it is. `serverInfo.version` said `0.1.0`, the v
 `server/discover` answer now carries `serverInfo` too, where before the server was named only inside its `_meta`.
 
 ## 0.16.0 (2026-11-12)
-Arguments a tool does not take are now answered as a tool result with `isError: true` and `droidd/error` `invalid_arguments`, in the same words, instead of a JSON-RPC error `-32602`, so an assistant reads why and corrects the call (MCP 2025-11-25). A value outside a closed list, such as an `action_propose` action that is not one, now lists the allowed values and names the nearest one. `arca call` prints such a failure as `{"code": "invalid_arguments", "message": ...}`. A call that names no tool, or a tool the server does not have, is still a JSON-RPC error.
 
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know

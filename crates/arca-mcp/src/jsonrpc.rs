@@ -489,7 +489,6 @@ fn tool_result(v: &Verb, value: Value, cut: Option<&str>, only_looks: bool) -> V
     })
 }
 
-/// A tool-level failure that is not a refusal: `isError` with `<code>: <message>` and the door's error meta.
 /// The `droidd/error` of a call whose arguments the verb does not take.
 pub const INVALID_ARGUMENTS: &str = "invalid_arguments";
 
@@ -500,6 +499,7 @@ fn invalid_arguments(why: &str) -> Value {
     tool_failure(INVALID_ARGUMENTS, why)
 }
 
+/// A tool-level failure that is not a refusal: `isError` with `<code>: <message>` and the door's error meta.
 fn tool_failure(code: &str, message: &str) -> Value {
     let mut meta = serde_json::Map::new();
     meta.insert("droidd/error".to_string(), json!(code));
