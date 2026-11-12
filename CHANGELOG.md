@@ -28,12 +28,13 @@ Passkeys can now be RSA keys (RS256) as well as P-256 keys (ES256). Some Windows
 RSA keys, and setting up such a passkey failed at its last step. The page now offers both, enrols either, and checks
 either's signature on every approval and sign-in. A passkeys line names its key's `alg`, `ES256` or `RS256`.
 
-## 0.16.0 (2026-11-12)
 `arca status` works on a node that was upgraded rather than installed fresh. Such a node keeps its viewer token beside
 its config under another name (`viewer.secret`), and `arca status` with no `--token-file` asked only for the
 installer's `assistant-1.secret`, so the first command after an upgrade told the owner to mint a token. When that file
 is not there, `arca status` now uses a viewer token of this node from the same directory; a token of a wider scope is
 never taken in its place. A `--token-file` or `ARCA_TOKEN_FILE` that names a file is still read alone.
+
+## 0.16.0 (2026-11-12)
 
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
