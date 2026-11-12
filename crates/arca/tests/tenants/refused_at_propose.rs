@@ -20,23 +20,67 @@ fn waiting(rig: &Rig) -> usize {
 
 /// Approves a waiting proposal and runs it, as the approval page does.
 fn approve(rig: &Rig, proposal: &Value) -> Result<Value, CallError> {
+    approve_through(
+        rig,
+        proposal,
+        ActionExecutor::new(
+            rig.handlers
+                .iter()
+                .map(|(verb, handler)| (*verb, Arc::clone(handler))),
+        ),
+    )
+}
+
+/// As [`approve`], on a node that runs functions: one that serves the function verbs too.
+fn approve_with_functions(rig: &Rig, proposal: &Value) -> Result<Value, CallError> {
+    let now = rig.now();
+    let clock: arca::handlers::Clock = Arc::new(move || now);
+    let runner = Arc::new(
+        arca::function_run::FunctionRunner::new(
+            Arc::clone(&rig.kernel),
+            Arc::clone(&rig.cfg),
+            clock.clone(),
+        )
+        .expect("the runner"),
+    );
+    let functions = arca::handlers::service_handlers_with(
+        Arc::clone(&rig.kernel),
+        clock,
+        Arc::clone(&rig.cfg),
+        Some(runner),
+    )
+    .into_iter()
+    .filter(|(verb, _)| arca::handlers::FUNCTION_VERBS.contains(verb));
+    approve_through(
+        rig,
+        proposal,
+        ActionExecutor::new(
+            rig.handlers
+                .iter()
+                .map(|(verb, handler)| (*verb, Arc::clone(handler)))
+                .chain(functions),
+        ),
+    )
+}
+
+fn approve_through(
+    rig: &Rig,
+    proposal: &Value,
+    executor: ActionExecutor,
+) -> Result<Value, CallError> {
     let id = proposal["id"].as_str().expect("the proposal's id");
     let digest = proposal["argsDigest"].as_str().expect("its digest");
+    let action = proposal["action"].as_str().expect("its action");
     let nonce = format!("{:064x}", rig.nonce.fetch_add(1, Ordering::SeqCst) + 1);
     let statement =
-        arca::handlers::action_statement("node1", id, "service_create", digest, rig.now(), &nonce)
+        arca::handlers::action_statement("node1", id, action, digest, rig.now(), &nonce)
             .expect("the statement");
     let approved = arca::handlers::approve_action(
         &mut rig.kernel.lock().expect("kernel"),
         &json!({ "plan": id, "approval": common::approve_statement(&rig.key, &statement) }),
         rig.now(),
     )?;
-    ActionExecutor::new(
-        rig.handlers
-            .iter()
-            .map(|(verb, handler)| (*verb, Arc::clone(handler))),
-    )
-    .run(&approved.action, &approved.args, &approved.grant)
+    executor.run(&approved.action, &approved.args, &approved.grant)
 }
 
 /// The create as the approved action runs it: under the approval's own name, never under a token's.
@@ -497,6 +541,71 @@ fn a_function_named_like_a_tenants_instance_is_refused_when_it_is_proposed() {
     // A name no instance has is proposed, with the same arguments otherwise.
     rig.call("action_propose", function(&format!("x-{B}")))
         .expect("the other tenant holds no x, so that instance name is free");
+}
+
+/// A function's arguments as `function_create` takes them, under `name`.
+fn function_args(name: &str) -> Value {
+    json!({
+        "name": name,
+        "image": "registry.example/acme/relay",
+        "digest": DIGEST,
+        "command": ["/relay", "--once"],
+        "triggers": [{ "timer": { "everySeconds": 30 } }]
+    })
+}
+
+/// The other order: the node's function `x-<A>` is there first, and tenant A's service `x`, whose instance would have
+/// the function's name, is refused at its proposal and at its create, in the same words.
+#[test]
+fn a_tenants_service_whose_instance_would_have_a_functions_name_is_refused() {
+    let rig = two_tenants(policy());
+    let name = format!("x-{A}");
+    let card = rig
+        .call(
+            "action_propose",
+            json!({ "action": "function_create", "args": function_args(&name) }),
+        )
+        .expect("the function is proposed");
+    approve_with_functions(&rig, &card).expect("the approved function is made");
+    refused_as_the_create(
+        &rig,
+        json!({ "name": "x", "template": "app", "tenant": A }),
+        "the name x is taken on this node: the instance this service would get has the name of another service's instance. Choose another name",
+    );
+    rig.call(
+        "service_create",
+        json!({ "name": "x", "template": "app", "tenant": B }),
+    )
+    .expect("the other tenant's x has another instance name");
+}
+
+/// A function proposed while its name was free, and approved once a tenant's service has taken that instance name,
+/// is refused by the approved create itself, in the words its proposal would now get.
+#[test]
+fn an_approved_function_whose_instance_name_was_taken_since_its_proposal_is_refused() {
+    let rig = two_tenants(policy());
+    let name = format!("x-{A}");
+    let card = rig
+        .call(
+            "action_propose",
+            json!({ "action": "function_create", "args": function_args(&name) }),
+        )
+        .expect("the name is free when it is proposed");
+    rig.call(
+        "service_create",
+        json!({ "name": "x", "template": "app", "tenant": A }),
+    )
+    .expect("the tenant's service x");
+    let writes = rig.fake().writes().len();
+    let (code, message) = refusal(approve_with_functions(&rig, &card));
+    assert_eq!(code, "refused");
+    assert_eq!(
+        message,
+        format!(
+            "the name {name} is taken on this node: the instance this function would get has the name of another service's instance. Choose another name"
+        )
+    );
+    assert_eq!(rig.fake().writes().len(), writes, "nothing was written");
 }
 
 /// On a node whose database is made from its template, a database is a service of the node's own, and its
