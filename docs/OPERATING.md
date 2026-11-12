@@ -121,7 +121,7 @@ refused without the value being echoed back.
 | `incus.local` | no | Whether `incus.socket` reaches the local Incus daemon. When absent, the node asks Incus `GET /1.0` for `environment.server_name` and compares it with the local host name: a match is local, a mismatch is remote. The socket path rule (the standard local daemon sockets) is the fallback only when `/1.0` or the host name cannot be read. An explicit value wins. See "Host metrics". |
 | `identityPhones` | no | Instance names the watch flags with `identity: true`. |
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
-| `listen.loopback` | no | One loopback address and port, such as `"127.0.0.1:7471"`, or `null`: the HTTP MCP door for a client on the same machine. It serves the MCP routes alone, never the approval page, to loopback peers that name it by its own address or as `localhost`. See below. |
+| `listen.loopback` | no | One loopback address and port, such as `"127.0.0.1:7471"`, or `null`: the HTTP MCP door for a client on the same machine. It serves the MCP routes alone, never the approval page, to loopback peers that name it by its own address or as `localhost`. `null` is the owner's word for no door: `scripts/install.sh` writes it for `--no-door` and never opens a door in a config that says it. See below. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
 | `listen.proxy` | no | `{ "addr": "<ip>:<port>", "peer": "<ip>" }`, or `null`: one address for a reverse proxy on the same host, served to the single peer address `peer`. See below. |
 | `listen.services` | no | The path of a second unix socket, or `null`: the services socket. It serves the MCP routes alone, never the approval page, to the server's own user and to root. A service with kernel access connects to it. See below, and "A service that may talk to the kernel". |
@@ -198,10 +198,31 @@ What the listener serves and refuses:
 - **No `Origin`.** As on every listener, a request that carries an `Origin` is 403, so a web page cannot call the node
   from a browser.
 
+- **A bounded wait for each request.** A peer has 30 seconds to send a request's head, the first of a connection and
+  each next one on a connection that is kept open. A peer that sends nothing in that time is closed, so idle connections
+  cannot hold the listener's 64 slots.
+
+Use the address, `http://127.0.0.1:7471/mcp`, in a client, not the name `localhost`. The name can also mean `::1`,
+where this listener does not listen and another program of the machine could.
+
 What it does not do. The connection is plain HTTP, which on loopback never leaves the machine. Every user and every
 process of the machine can connect to the port; without a token each gets 401, and the token's file is readable by the
-node's user alone. A client that is given the token keeps it in its own config. A port that is in use when `serve`
-starts stops the server with exit 1, naming the address; it is not tried again.
+node's user alone. A client that is given the token keeps it in its own config.
+
+**The port can be taken by someone else.** A TCP port belongs to whoever binds it first. On a machine shared with
+other accounts, another account can take the port while the node is not running (before it starts, after a crash,
+during an upgrade) and would then receive what a client sends there, the bearer token included. The unix socket and
+`arca call` are not exposed to this: the socket lives in a directory only the node's user can open. On such a machine,
+leave the door off (`"loopback": null`, or `sh install.sh --no-door`) or accept that the token a client holds is a
+`viewer` token another account could come to read.
+
+A port that is in use when `serve` starts does not stop the node. The unix socket and every other listener serve as
+usual, `serve` says once on stderr `arca: the loopback door <addr> is closed: address in use: another program holds
+this port. The node runs without it and tries the address again`, and it tries the bind again after 1 second, then
+after twice as long each time, up to 30 seconds, for as long as it runs. When a try succeeds it says `arca: the
+loopback door <addr> is open`. `arca_status` reports the door of a node whose config names one, as
+`"loopback": { "addr": "<addr>", "open": true | false, "reason": "<why it is closed>" | null }`. While it reads
+`"open": false`, whatever answers on that port is not this node: do not send the token there.
 
 ### Tailnet listener
 
