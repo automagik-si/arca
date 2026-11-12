@@ -1420,9 +1420,8 @@ fn g5_uuid_swap_drops_output_and_never_reads_the_console() {
     for damage in ["success", "exit", "over_cap"] {
         let (rig, _) = signed_rig();
         system(&rig, "dash");
-        // The journal is always read at its most lines, whatever the call asks for.
         let mut s = ExecScript::new(
-            C::Journal(JournalLines::new(200).unwrap()).argv(),
+            C::Journal(JournalLines::new(1).unwrap()).argv(),
             0,
             "wrong instance output",
         );
@@ -1455,9 +1454,9 @@ fn g5_system_journal_and_capped_fallback_delete_both_recordings() {
     system(&rig, "dash");
     script(
         &rig,
-        C::Journal(JournalLines::new(200).unwrap()),
+        C::Journal(JournalLines::new(2).unwrap()),
         0,
-        "zero\none\ntwo\n",
+        "one\ntwo\n",
     );
     assert_eq!(
         rig.call("service_logs", json!({"name":"dash","lines":2}))
@@ -1466,7 +1465,7 @@ fn g5_system_journal_and_capped_fallback_delete_both_recordings() {
     );
     rig.fake
         .set_console_log(PROJECT, "dash", "console fallback");
-    let mut oversized = ExecScript::new(C::Journal(JournalLines::new(200).unwrap()).argv(), 0, "");
+    let mut oversized = ExecScript::new(C::Journal(JournalLines::new(2).unwrap()).argv(), 0, "");
     oversized.stdout = vec![b'x'; 65537];
     rig.fake.script_exec(oversized);
     assert_eq!(
@@ -1510,10 +1509,17 @@ fn g5_a_journal_window_that_starts_inside_a_key_shows_none_of_it() {
     let (rig, _) = signed_rig();
     system(&rig, "dash");
     let (text, body) = journal_key();
-    // Asked for 5 lines, the window would start in the key's body, after its BEGIN line. The journal is read whole,
-    // the key hidden, and the window cut after.
+    // The journal answers the last `lines` entries, as `journalctl -n` does. Asked for 5, the window starts in the
+    // key's body, after its BEGIN line: the text is hidden from its start to the END line no BEGIN comes before.
+    let entries: Vec<&str> = text.lines().collect();
     for lines in [1, 3, 5, 9, 200] {
-        script(&rig, C::Journal(JournalLines::new(200).unwrap()), 0, &text);
+        let tail = entries[entries.len().saturating_sub(lines)..].join("\n") + "\n";
+        script(
+            &rig,
+            C::Journal(JournalLines::new(lines as u64).unwrap()),
+            0,
+            &tail,
+        );
         let answer = rig
             .call("service_logs", json!({"name":"dash","lines":lines}))
             .expect("the log");

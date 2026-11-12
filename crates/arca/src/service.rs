@@ -3248,16 +3248,18 @@ const PEM_LABEL: &str = r"[\x21-\x2C\x2E-\x7E](?:[- ]?[\x21-\x2C\x2E-\x7E]){0,63
 /// stays shown; what can stay shown of a key is a last line shorter than 16 characters.
 const PEM_BODY: &str = r"(?:(?:\r\n|\r|\n|\\r|\\n|[ \t])*(?:(?:[A-Za-z0-9+=]|\\?/){16,}|(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset)[ \t]*:[^\r\n\\]*))*";
 
-/// A PEM block: from its BEGIN line to the next END line, whatever is between; or, when no END line follows, from its
-/// BEGIN line over the lines that look like a key's ([`PEM_BODY`]).
-fn pem_block() -> &'static regex::Regex {
+/// A PEM block with its END line: from its BEGIN line to the next END line, whatever is between; and one without:
+/// from its BEGIN line over the lines that look like a key's ([`PEM_BODY`]).
+fn pem_blocks() -> &'static (regex::Regex, regex::Regex) {
     use std::sync::OnceLock;
-    static PEM: OnceLock<regex::Regex> = OnceLock::new();
+    static PEM: OnceLock<(regex::Regex, regex::Regex)> = OnceLock::new();
     PEM.get_or_init(|| {
-        regex::Regex::new(&format!(
-            r"-----BEGIN {PEM_LABEL}-----(?:(?s:.*?)-----END {PEM_LABEL}-----|{PEM_BODY})"
-        ))
-        .expect("the PEM pattern is valid")
+        let ended = format!(r"-----BEGIN {PEM_LABEL}-----(?s:.*?)-----END {PEM_LABEL}-----");
+        let unended = format!(r"-----BEGIN {PEM_LABEL}-----{PEM_BODY}");
+        (
+            regex::Regex::new(&ended).expect("the PEM pattern is valid"),
+            regex::Regex::new(&unended).expect("the PEM pattern is valid"),
+        )
     })
 }
 
@@ -3283,7 +3285,15 @@ pub fn redact_blocks(text: &str) -> String {
             text = std::borrow::Cow::Owned(format!("[secret]{}", &text[first_end.end()..]));
         }
     }
-    pem_block().replace_all(&text, "[secret]").into_owned()
+    // A BEGIN line has an END line after it only before the last END line, so the text is cut there once: blocks
+    // are paired before it, and a BEGIN line after it is followed over a key's lines only. Searched for its END line
+    // in one pattern, each BEGIN line without one was followed to the end of the text, once per such line.
+    let last_end = end.find_iter(&text).last().map_or(0, |found| found.end());
+    let (with_end, without_end) = text.split_at(last_end);
+    let (ended, unended) = pem_blocks();
+    let mut hidden = ended.replace_all(with_end, "[secret]").into_owned();
+    hidden.push_str(&unended.replace_all(without_end, "[secret]"));
+    hidden
 }
 
 /// What hides the stored secrets in a text: the values to replace, longest first, and the base64 body of each secret
@@ -3475,6 +3485,32 @@ mod redaction_tests {
             redact_blocks(result),
             r#"{"ok":false,"error":"no [secret] found"}"#
         );
+    }
+
+    #[test]
+    fn a_long_text_of_begin_lines_without_their_end_is_hidden_in_one_pass() {
+        // A guest can print a BEGIN line on every line of its console. Each such line was once followed to the end of
+        // the text for an END line, so the time grew with the square of the text: 256 KiB took seconds. One pass
+        // takes a few milliseconds; the bound is generous, for a loaded machine and an unoptimised build.
+        let word = ["PRI", "VATE"].concat();
+        let (whole, body) = key(&format!("RSA {word} KEY"), 7, 4, 64);
+        let line = "-----BEGIN CERTIFICATE----- request 42 answered\n";
+        let lines = 256 * 1024 / line.len();
+        let text = format!("{whole}\n{}ready", line.repeat(lines));
+        let began = std::time::Instant::now();
+        let shown = redact_blocks(&text);
+        let took = began.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "{lines} BEGIN lines took {} ms",
+            took.as_millis()
+        );
+        assert!(
+            !shows_any(&shown, &body),
+            "a piece of the ended key is shown"
+        );
+        assert_eq!(shown.matches(" request 42 answered\n").count(), lines);
+        assert!(shown.ends_with("ready"), "the last line is hidden");
     }
 
     #[test]

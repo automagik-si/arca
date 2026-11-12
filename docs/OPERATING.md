@@ -3453,8 +3453,8 @@ Where a virtual machine's secret is, and is not:
   `OpenVPN Static key V1`): from its `-----BEGIN ...-----` line to its `-----END ...-----` line; when no END line
   follows, over the lines after the BEGIN line that look like a key (base64 of 16 characters or more, or a PEM header),
   so what follows the key stays shown; and when a text begins inside a key (an END line with no BEGIN before it), from
-  its start to that END line. `service_logs` of a container reads the last 200 lines of its journal whatever it is
-  asked for, and cuts to the lines asked for only after they are redacted. `function_runs` redacts a kept output and a
+  its start to that END line, so a window of a container's journal that starts inside a key shows none of it.
+  `function_runs` redacts a kept output and a
   run's line again when it reads them. Still shown: the last line of a key printed without its END line when it is
   shorter than 16 characters. Certificates, public keys and other public PEM blocks are hidden as `[secret]` too.
 

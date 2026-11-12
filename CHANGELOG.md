@@ -27,9 +27,8 @@ in a log, a failed command's words or a function's output is hidden whole before
 secret or not: from its BEGIN line to its END line; when no END line follows, over the lines after the BEGIN line that
 look like a key (base64 of 16 characters or more, or a PEM header), so the text after the key, and a function's result,
 stay shown; and when the text begins inside a key (an END line with no BEGIN line before it), from its start to that
-END line. A label may hold lowercase letters and hyphens (`OpenVPN Static key V1`). `service_logs` of a container now
-always reads the last 200 lines of its journal and cuts to the lines asked for only after they are redacted, so no
-window can start inside a key. A function's kept outputs and its runs' lines are redacted again when `function_runs`
+END line, so a window of a container's journal that starts inside a key shows none of it. A label may hold lowercase
+letters and hyphens (`OpenVPN Static key V1`). A function's kept outputs and its runs' lines are redacted again when `function_runs`
 reads them, with the secrets stored then, so an output kept by an earlier release, or before a secret was set, shows
 none of them. What is still shown: the last line of a key printed without its END line when it is shorter than 16
 characters, and a stored key whose letters were changed in case. Certificates, public keys and other public PEM
