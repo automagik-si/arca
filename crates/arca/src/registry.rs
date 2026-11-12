@@ -63,53 +63,43 @@ pub fn ever_set(cfg: &NodeConfig) -> bool {
     cfg.state_dir.join(REGISTRIES_DIR).is_dir()
 }
 
-/// Whether this node holds a credential for the registry `server` (`https://<host>`).
+/// Whether this node holds a credential for exactly the registry `server` (`https://<host>`).
 pub fn credential_set(cfg: &NodeConfig, server: &str) -> bool {
-    arca_providers::incus::registry_owner(server).is_some_and(|owner| {
-        let dir = cfg.state_dir.join("secrets").join(owner);
-        dir.join("username").is_file() && dir.join("password").is_file()
-    })
+    credential(cfg, server).is_some()
 }
 
-/// The credential this node holds for the registry `server`, read from the secret store at this moment.
+/// The credential this node holds for exactly the registry `server`, read from the secret store at this moment by
+/// the provider's own rules: a private directory, files of mode 0600 owned by this user, no link, and the address
+/// stored with the credential equal to `server`.
 pub fn credential(cfg: &NodeConfig, server: &str) -> Option<arca_incus::RegistryCredential> {
-    let dir = cfg
-        .state_dir
-        .join("secrets")
-        .join(arca_providers::incus::registry_owner(server)?);
-    let read = |file: &str| {
-        std::fs::read_to_string(dir.join(file))
-            .ok()
-            .map(|text| text.trim_end_matches('\n').to_string())
-            .filter(|text| !text.is_empty())
-    };
-    Some(arca_incus::RegistryCredential {
-        username: read("username")?,
-        password: read("password")?,
-    })
+    arca_providers::incus::registry_credential(&cfg.state_dir.join("secrets"), server)
 }
 
 /// The `Registry` row of a create's card, in the owner's words: the image is fetched with a credential, named by
 /// the registry it is for and never shown, and where that credential then rests.
 pub fn card_words(server: &str) -> String {
     format!(
-        "{server}: the image is fetched with the credential set for this registry on this node, which this card names by the registry and never shows. Incus keeps that credential with the image for as long as the image is kept, and whoever may use Incus on this machine can read it there. It goes when the image goes, with its last function or service"
+        "{server}: the image is fetched with the credential set for this registry on this node, which this card names by the registry and never shows. Incus keeps that credential with the image for as long as the image is kept, and whoever may use Incus on this machine can read it there"
     )
 }
 
 /// What a create must say about its image's registry, and why it is refused when it does not. A create whose image
 /// is on a registry this node holds a credential for states `registry`, that registry's address: a proposal fills
 /// it in, so the owner's card says it and the approval binds it. A create that states one this node holds no
-/// credential for is refused as well: the credential was removed since the card was shown.
+/// credential for is refused as well: the credential was removed since the card was shown. And one that states it
+/// in a call of its own, with no approved proposal behind it (`preapproved` false), is refused like one that says
+/// nothing: the owner saw no card.
 pub fn stated(
     cfg: &NodeConfig,
     server: Option<&str>,
     stated: Option<&Value>,
+    preapproved: bool,
 ) -> Result<(), CallError> {
     let held = server.filter(|server| credential_set(cfg, server));
     match (held, stated.and_then(Value::as_str)) {
         (None, None) => Ok(()),
-        (Some(server), Some(said)) if said == server => Ok(()),
+        // Saying it is not enough: only a call that runs an approved proposal has shown the owner the card.
+        (Some(server), Some(said)) if said == server && preapproved => Ok(()),
         (Some(server), _) => Err(CallError::Refused {
             code: "NotApproved".into(),
             message: format!(
@@ -218,7 +208,9 @@ impl ToolHandler for RegistryHandler {
                     })?;
                 let dir = self.secrets(&owner);
                 let _ = std::fs::remove_dir_all(&dir);
-                let stored = crate::service::write_secret(&dir.join("username"), username)
+                // The address is stored with the credential: it is given to that address and to no other.
+                let stored = crate::service::write_secret(&dir.join("server"), &server)
+                    .and_then(|()| crate::service::write_secret(&dir.join("username"), username))
                     .and_then(|()| crate::service::write_secret(&dir.join("password"), password))
                     .and_then(|()| {
                         let _ = std::fs::remove_file(self.listed(&owner));

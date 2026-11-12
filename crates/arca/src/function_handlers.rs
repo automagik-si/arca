@@ -553,6 +553,8 @@ impl ServiceHandler {
             &self.cfg,
             crate::registry::server_of(&definition.function.image).as_deref(),
             args.get("registry"),
+            // A function is created only from an approved proposal: the check above this call.
+            true,
         )?;
         // The private destinations are the ones this node's config names for the function now, and the approved
         // proposal states exactly those: a config that changed since the card was shown refuses the create.

@@ -1551,7 +1551,20 @@ fn every_run_starts_from_its_images_own_root_or_does_not_start() {
         rig.fake.rebuilds(PROJECT, "relay").last().unwrap(),
         "registry"
     );
+    // The fetch put the copy back into the store, under the fingerprint the record holds: the next run is rebuilt
+    // from the store again.
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["root"], &line["rootImage"]),
+        (&json!("store"), &json!(image))
+    );
     // Neither the store nor the registry: the run does not start, and its line says why.
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/images/{image}?project={PROJECT}"),
+        &json!({}),
+    );
     rig.fake.refuse_rebuild(PROJECT, "relay");
     let (writes, cleared) = (rig.state_writes(), clears(&rig));
     let line = rig.run("relay");
@@ -1673,6 +1686,16 @@ fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_r
         message.contains("holds a credential for the registry https://registry.example"),
         "{message}"
     );
+    // Saying it in the call does not stand in for the card: only an approved proposal has shown it to the owner.
+    let (code, message) = refusal(rig.call(
+        "service_create",
+        json!({ "name": "pg", "template": "pg", "registry": server }),
+    ));
+    assert_eq!(code, "NotApproved", "{message}");
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_none()
+    );
 
     rig.approve("function_create", &proposal).expect("relay");
     let mut tick = relay_args();
@@ -1699,7 +1722,10 @@ fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_r
         (&line["outcome"], &line["root"]),
         (&json!("ok"), &json!("store"))
     );
-    let store = rig.dir.join("secrets/registry-registry-example");
+    let store = rig
+        .dir
+        .join("secrets")
+        .join(arca_providers::incus::registry_owner(server).expect("a registry"));
     assert!(store.join("password").is_file());
     for (path, bytes) in rig.state_files() {
         if path.starts_with(&store) {
@@ -1790,6 +1816,126 @@ fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_r
             .iter()
             .all(|row| row["label"] != "Registry")
     );
+}
+
+/// A credential is the one registry's it was set for. A host that differs from it by a dot and a dash, which
+/// anyone can register, is another registry: its images are fetched bare, at a create and at a rebuild, its card
+/// names no credential, and setting or removing one of the two never touches the other. And no function can ask
+/// for a registry's password as a secret of its own.
+#[test]
+fn a_registrys_credential_never_reaches_another_host_or_a_functions_environment() {
+    let rig = Rig::new();
+    rig.nats();
+    let (real, twin) = ("https://my.registry.example", "https://my-registry.example");
+    let word = ["pull", "only", "word", "2345"].join("-");
+    rig.call(
+        "registry_secret_set",
+        json!({ "server": real, "username": "owner", "password": word }),
+    )
+    .expect("set");
+    let on = |host: &str, name: &str| {
+        let mut args = relay_args();
+        args["name"] = json!(name);
+        args["image"] = json!(format!("{host}/acme/relay"));
+        args
+    };
+    let kept = |rig: &Rig| -> Vec<String> {
+        rig.get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+            .and_then(|images| images.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|image| {
+                image["update_source"]["server"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+
+    // The twin's card names no registry and its image is fetched bare.
+    let proposal = rig
+        .propose("function_create", on("my-registry.example", "twin"))
+        .expect("proposed");
+    assert!(proposal["args"].get("registry").is_none());
+    assert!(
+        proposal["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["label"] != "Registry")
+    );
+    rig.approve("function_create", &proposal).expect("twin");
+    assert!(kept(&rig).iter().any(|address| address == twin));
+    assert!(kept(&rig).iter().all(|address| !address.contains('@')));
+    // A proposal that claims the real registry's credential for the twin's image is not taken.
+    let mut claims = on("my-registry.example", "claims");
+    claims["registry"] = json!(real);
+    let (_, message) = refusal(rig.propose("function_create", claims));
+    assert!(message.starts_with("args/registry:"), "{message}");
+    // Its root rebuilt from the registry, when the store's copy is gone, is asked for bare too.
+    rig.fake.exit_after_start(PROJECT, "twin", 0, OK);
+    assert_eq!(rig.run("twin")["outcome"], "ok");
+    let image = rig.fingerprint("twin");
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/images/{image}?project={PROJECT}"),
+        &json!({}),
+    );
+    let line = rig.run("twin");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("registry"))
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "twin").last().unwrap(),
+        "registry"
+    );
+    assert!(kept(&rig).iter().all(|address| !address.contains('@')));
+
+    // The real registry's own image is fetched with it: the control.
+    rig.approved("function_create", on("my.registry.example", "real"))
+        .expect("real");
+    assert_eq!(
+        kept(&rig)
+            .iter()
+            .filter(|address| address.contains(&word) && address.ends_with("@my.registry.example"))
+            .count(),
+        1
+    );
+
+    // Each registry has its own credential: setting or removing the twin's leaves the real one's as it was.
+    let other = ["another", "word", "6789"].join("-");
+    rig.call(
+        "registry_secret_set",
+        json!({ "server": twin, "username": "stranger", "password": other }),
+    )
+    .expect("set");
+    let held = |server: &str| arca::registry::credential(&rig.cfg, server).map(|c| c.username);
+    assert_eq!(held(real).as_deref(), Some("owner"));
+    assert_eq!(held(twin).as_deref(), Some("stranger"));
+    assert_eq!(
+        rig.call_as(Scope::Viewer, "registry_list", json!({}))
+            .expect("list")["registries"],
+        json!([{ "server": twin }, { "server": real }])
+    );
+    rig.call("registry_secret_remove", json!({ "server": twin }))
+        .expect("removed");
+    assert_eq!(held(real).as_deref(), Some("owner"));
+    assert_eq!(held(twin), None);
+
+    // A function's environment cannot name the registry's password: it is the node's, and no entry's.
+    let owner = arca_providers::incus::registry_owner(real).expect("a registry");
+    let mut greedy = on("my-registry.example", "greedy");
+    greedy["env"] = json!({ "X": format!("arca-secret:{owner}/password") });
+    let made = rig.approved("function_create", greedy);
+    assert!(made.is_err(), "{made:?}");
+    assert!(
+        rig.get(&format!("/1.0/instances/greedy?project={PROJECT}"))
+            .is_none()
+    );
+    let said = format!("{made:?}{:?}", rig.entries());
+    assert!(!said.contains(&word));
 }
 
 /// An edit made by an Incus operator, outside the kernel's writer.

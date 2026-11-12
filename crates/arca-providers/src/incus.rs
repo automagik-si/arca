@@ -863,15 +863,7 @@ impl IncusProvider {
         if source["protocol"] != "oci" {
             return None;
         }
-        let owner = registry_owner(source["server"].as_str()?)?;
-        let read = |file: &str| {
-            self.read_secret_file(&format!("{SECRET_PREFIX}{owner}/{file}"))
-                .ok()
-        };
-        Some(arca_incus::RegistryCredential {
-            username: read("username")?,
-            password: read("password")?,
-        })
+        registry_credential_as(&self.secrets_dir, self.uid, source["server"].as_str()?)
     }
 
     /// Reads a usable secret file without an entry check, including during the directory walk.
@@ -1984,9 +1976,15 @@ fn secret_owner(name: &str) -> Option<&str> {
     EntryId::parse(owner).map(|_| owner)
 }
 
-/// The name, in the secret store, of the directory that holds a registry's credential: `registry-` and the
-/// registry's host in lower case, with each `.` and `:` written as `-`. `None` for an address that is not
-/// `https://` and a plain host with an optional port. No entry has such an id, so no entry may read it as its own.
+/// The name, in the secret store, of the directory that holds a registry's credential: `registry-` and the first 32
+/// hex digits of the SHA-256 of the registry's host, with its port when it has one, in lower case. `None` for an
+/// address that is not `https://` and a plain host with an optional port.
+///
+/// The name is of one length and one-to-one for every practical purpose: two hosts do not share a directory, as
+/// `registry.example` and `registry-example` did when the name was the host with its dots written as dashes. It
+/// has the shape of an entry id, and no entry has such an id, so no entry may read it as its own
+/// ([`may_use_secret`] refuses every name under `registry-` besides). The directory also holds the exact address
+/// the credential was set for, and the credential is given only to that address ([`registry_credential`]).
 pub fn registry_owner(server: &str) -> Option<String> {
     let host = server.strip_prefix("https://")?;
     if host.is_empty()
@@ -1997,14 +1995,44 @@ pub fn registry_owner(server: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!(
-        "registry-{}",
-        host.to_ascii_lowercase().replace(['.', ':'], "-")
-    ))
+    let digest = Digest::of(host.to_ascii_lowercase().as_bytes()).to_hex();
+    Some(format!("registry-{}", &digest[..32]))
 }
 
+/// The credential the secret store under `secrets_dir` holds for exactly the registry `server` (`https://<host>`,
+/// compared in lower case), read with every check [`read_secret_file`] makes for the user this process runs as.
+/// `None` when none is held, when a file of it does not pass those checks, or when the address stored with it is
+/// not `server` byte for byte: a credential is never given to another host than the one it was set for.
+pub fn registry_credential(
+    secrets_dir: &Path,
+    server: &str,
+) -> Option<arca_incus::RegistryCredential> {
+    registry_credential_as(secrets_dir, process_uid().ok()?, server)
+}
+
+fn registry_credential_as(
+    secrets_dir: &Path,
+    uid: u32,
+    server: &str,
+) -> Option<arca_incus::RegistryCredential> {
+    let server = server.to_ascii_lowercase();
+    let owner = registry_owner(&server)?;
+    let read = |file: &str| {
+        read_secret_file(secrets_dir, uid, &format!("{SECRET_PREFIX}{owner}/{file}")).ok()
+    };
+    if read("server")? != server {
+        return None;
+    }
+    Some(arca_incus::RegistryCredential {
+        username: read("username")?,
+        password: read("password")?,
+    })
+}
+
+/// Whether `entry` may use the secret `name`: its own, or one no entry owns. A registry's credential is the node's
+/// and no entry's: nothing under `registry-` is anyone's to use, whatever its length.
 fn may_use_secret(entry: &EntryId, name: &str) -> bool {
-    secret_owner(name).is_none_or(|owner| owner == entry.0)
+    !name.starts_with("registry-") && secret_owner(name).is_none_or(|owner| owner == entry.0)
 }
 
 /// A secret name: `^[a-z0-9][a-z0-9/-]{0,127}$`. It is checked by hand, so no pattern library is needed.

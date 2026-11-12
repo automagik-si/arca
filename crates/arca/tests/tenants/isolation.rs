@@ -1520,6 +1520,16 @@ fn a_tenants_image_is_fetched_without_the_nodes_registry_credential() {
         "{stated:?}"
     );
 
+    // The node's own create that only says the registry, in a call of its own with no card behind it, does not run.
+    let direct = rig.call(
+        "service_create",
+        json!({ "name": "mine", "template": "own", "registry": server }),
+    );
+    assert!(
+        matches!(&direct, Err(CallError::Refused { code, .. }) if code == "NotApproved"),
+        "{direct:?}"
+    );
+    assert!(kept(PROJECT).iter().all(|address| !address.contains('@')));
     // The node's own, from the same registry, is sent the credential in the address: the control.
     rig.approved(
         "service_create",

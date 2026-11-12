@@ -5426,8 +5426,13 @@ pub(crate) fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // A registry's directory also holds the address its credential is for, which is no secret.
+        let registry = entry.file_name().to_string_lossy().starts_with("registry-");
         if let Ok(files) = std::fs::read_dir(&path) {
             for file in files.flatten() {
+                if registry && file.file_name() == "server" {
+                    continue;
+                }
                 if let Ok(text) = std::fs::read_to_string(file.path())
                     && text.len() >= 8
                     && text.len() <= 4096
@@ -6725,6 +6730,7 @@ impl ToolHandler for ServiceHandler {
                         &self.cfg,
                         crate::registry::server_of(&template.image).as_deref(),
                         args.get("registry"),
+                        preapproved,
                     )?;
                 } else if args.get("registry").is_some() {
                     return Err(CallError::Invalid(

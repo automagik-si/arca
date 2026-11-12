@@ -4576,6 +4576,12 @@ whoever holds the registry's credential sets it into the node, by the registry's
 From then on every image the node's own projects fetch from that registry is fetched with it. Nothing in a tenant
 is.
 
+A credential belongs to exactly the registry it was set for: the address is compared whole, the port with it, in
+lower case. A host that differs by one character, a dash where the other has a dot, is another registry and is
+given nothing. No function or service can ask for a registry's password as a secret of its own: it is the node's.
+`registry_list` is open to a `viewer` token, so the addresses, which may be hosts of an internal network, are read
+by every token of the node; never a value.
+
 **Where the credential goes, and where it rests.** Arca keeps it in its secret store and in nothing else of its own:
 no record, proposal, card, journal line, log or answer holds it. It leaves the store in one place. When an image
 is fetched, the address Arca sends to Incus names the registry with the credential in it, which is how Incus takes
@@ -4587,8 +4593,8 @@ secrets. So:
 - **set only a credential that can read, and only what this node pulls.** A registry's own pull token for one
   project is the right kind. Never one that can push or delete;
 - a create whose image is on such a registry says so on its card, in a `Registry` row, and runs only from an
-  approved proposal: a direct `service_create` is refused with `NotApproved`. The proposal fills the row in. A card
-  approved after the credential was removed does not run;
+  approved proposal: a direct `service_create` is refused with `NotApproved`, whether it names the registry or
+  not. The proposal fills the row in. A card approved after the credential was removed does not run;
 - Incus is told not to go back to the registry for the image by itself (`auto_update` is turned off on it): an image
   by digest never changes;
 - the image, and the credential with it, leaves Incus when its last function or service is removed;
@@ -4601,11 +4607,16 @@ reach the registry as it is. A registry's token is one.
 A function whose store copy is gone fetches its image again with the credential set at that moment; with none set,
 or with the registry out of reach, that run is `notStarted`.
 
+Two fetches use the credential with no card that names it, both of an image the owner approved by digest on the
+registry the credential was set for: a function approved before the credential was set, the next time its root is
+rebuilt from the registry; and a service the kernel creates again after its instance was lost.
+
 Seen on Incus 7.5.1 against a registry that asks for a login: a create without a credential is refused, with it the
 image is fetched; the image's record keeps the address with the credential, the instance's record and the list of
-operations do not; `auto_update` can be turned off. Not seen, and open: what Incus's own log holds, and whether Incus
-hands the credential to the program that fetches for it in a way other users of the machine could read while a
-fetch runs. Keeping the credential out of Incus altogether would take Arca fetching the image itself and handing
+operations do not; `auto_update` can be turned off. Read in the source of Incus 7.6.0, and not seen live: Incus
+hands the program that fetches for it the password in a temporary file only its own user reads, with only the file's
+path on the command line; and Incus's own log holds the address with the credential only when its daemon runs
+verbose or debug, in lines that then outlive the image. Keeping the credential out of Incus altogether would take Arca fetching the image itself and handing
 Incus the files: planned, not in this build.
 
 ## When an approved action fails

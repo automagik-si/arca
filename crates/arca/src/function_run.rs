@@ -472,7 +472,7 @@ impl FunctionRunner {
             "result": result,
         });
         if let Some(why) = why {
-            line["why"] = json!(crate::service::redact_log(&why, &self.secrets()));
+            line["why"] = json!(why_words(&why, &self.secrets()));
         }
         line
     }
@@ -826,10 +826,22 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// An Incus error in words a run log may hold: never a body, and at most a short reason.
+/// An Incus error in words: never a body. It is not cut here: [`why_words`] takes the secrets out of the whole
+/// text first, and cuts after.
 fn incus_words(error: &IncusError) -> String {
-    let text = error.to_string();
-    text.chars().take(240).collect()
+    error.to_string()
+}
+
+/// The longest `why` a run's line holds.
+const WHY_MAX: usize = 400;
+
+/// The `why` of a run's line: every secret taken out of the whole text, and only then the cut. Cut first, a secret
+/// that straddles the cut would leave its beginning behind, which no longer matches the secret.
+fn why_words(why: &str, secrets: &[String]) -> String {
+    crate::service::redact_log(why, secrets)
+        .chars()
+        .take(WHY_MAX)
+        .collect()
 }
 
 /// The function records among `entries`.
@@ -1114,6 +1126,21 @@ fn tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secret_that_straddles_the_cut_of_a_runs_why_leaves_nothing_behind() {
+        let secret = ["a", "registry", "word", "0123456789"].join("-");
+        // The secret begins ten characters before the cut and ends after it.
+        let why = format!("{}{secret} and what follows", "x".repeat(WHY_MAX - 10));
+        let said = why_words(&why, std::slice::from_ref(&secret));
+        assert!(said.chars().count() <= WHY_MAX);
+        assert!(!said.contains(&secret[..10]), "{said}");
+        // Nothing to take out: the text is cut and nothing else.
+        assert_eq!(
+            why_words(&"y".repeat(WHY_MAX + 50), &[]),
+            "y".repeat(WHY_MAX)
+        );
+    }
 
     #[test]
     fn a_result_is_the_last_line_when_it_is_a_json_object_with_ok() {

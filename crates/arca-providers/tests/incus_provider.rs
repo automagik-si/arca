@@ -1048,6 +1048,96 @@ fn a_create_or_patch_naming_another_entrys_secret_is_refused_and_own_and_shared_
     assert!(!format!("{:?}", fake.writes()).contains(OTHER_ENTRY_VALUE));
 }
 
+/// A registry's credential is the node's own. Two hosts never share a name in the secret store, the credential is
+/// given only to the address it was set for, and no entry can name it as a secret of its own or a shared one.
+#[test]
+fn a_registrys_credential_has_a_name_of_its_own_goes_to_its_own_host_and_is_no_entrys_to_name() {
+    use arca_providers::incus::{registry_credential, registry_owner};
+    let scratch = Scratch::new("registry-names");
+    let secrets = secrets_dir(&scratch);
+    let name = |server: &str| registry_owner(server).expect("a registry address");
+    // Hosts that differ only in a dot, a dash or a colon were one name once.
+    let twins = [
+        ("https://registry.example", "https://registry-example"),
+        ("https://us.gcr.example", "https://us-gcr.example"),
+        ("https://a.b:5000", "https://a-b:5000"),
+        ("https://a.b:5000", "https://a.b-5000"),
+    ];
+    for (one, other) in twins {
+        assert_ne!(name(one), name(other), "{one} and {other}");
+    }
+    // One length whatever the host's, in the shape of an entry id; the case of the host does not matter.
+    let long = format!(
+        "https://registry.{}.example",
+        "platform-engineering-internal".repeat(3)
+    );
+    for server in ["https://r.example", long.as_str()] {
+        let owner = name(server);
+        assert_eq!(owner.len(), "registry-".len() + 32, "{owner}");
+        assert!(arca_kernel::desired::EntryId::parse(&owner).is_some());
+    }
+    assert_eq!(
+        name("https://Registry.Example"),
+        name("https://registry.example")
+    );
+    for bad in [
+        "http://registry.example",
+        "https://registry.example/path",
+        "https://user@registry.example",
+        "https://",
+    ] {
+        assert!(registry_owner(bad).is_none(), "{bad}");
+    }
+
+    // The credential is given to the address stored with it, and to no other.
+    let word = ["pull", "only", "word", "8901"].join("-");
+    let store = |server: &str, stored: &str| {
+        let owner = name(server);
+        write_scoped_secret(&secrets, &owner, "server", stored);
+        write_scoped_secret(&secrets, &owner, "username", "puller");
+        write_scoped_secret(&secrets, &owner, "password", &word);
+    };
+    store("https://registry.example", "https://registry.example");
+    let held = registry_credential(&secrets, "https://registry.example").expect("held");
+    assert_eq!(
+        (held.username.as_str(), held.password.as_str()),
+        ("puller", word.as_str())
+    );
+    assert!(registry_credential(&secrets, "https://REGISTRY.example").is_some());
+    for other in [
+        "https://registry-example",
+        "https://registry.example:443",
+        "https://registry.example.evil.example",
+    ] {
+        assert!(registry_credential(&secrets, other).is_none(), "{other}");
+    }
+    // A directory under another host's name whose stored address is not that host's gives nothing.
+    store("https://registry-example", "https://registry.example");
+    assert!(registry_credential(&secrets, "https://registry-example").is_none());
+
+    // No entry can name it: under its own name, or under a longer one that is no entry id.
+    let old_style = format!("registry-{}", "long-internal-host-name".repeat(3));
+    write_scoped_secret(&secrets, &old_style, "password", &word);
+    let (_fake_dir, fake) = start("registry-names-fake");
+    let provider = provider(&fake, &secrets);
+    let refused = Err(EffectRefusal::Provider(
+        "a secret reference names another entry's secret".to_string(),
+    ));
+    for owner in [name("https://registry.example"), old_style] {
+        for who in ["toy", "service-web"] {
+            let op = create(
+                IncusKind::Instance,
+                "svc",
+                None,
+                "wants-the-password",
+                json!({"config": {"environment.X": format!("arca-secret:{owner}/password")}}),
+            );
+            assert_eq!(provider.plan(&entry(who), &op), refused, "{who} {owner}");
+        }
+    }
+    assert!(only_gets(&fake));
+}
+
 #[test]
 fn a_patch_that_clears_a_key_holding_a_secret_journals_the_reference_as_its_pre_image() {
     let (scratch, fake) = start("secret-clear");
