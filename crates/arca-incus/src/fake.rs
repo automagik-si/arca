@@ -635,13 +635,15 @@ impl FakeIncus {
         ));
     }
 
-    /// Holds the next `times` GETs whose target starts with `path_prefix` for `delay` before it answers them as usual,
-    /// as an Incus that is slow to read a virtual machine's state does.
-    pub fn slow_reads(&self, path_prefix: &str, times: u32, delay: Duration) {
+    /// Takes the next `times` GETs whose target starts with `path_prefix` and never answers them: each is held until the
+    /// client hangs up, as an Incus that has stopped answering does. A client's deadline is then the only way out of the
+    /// read, however late the client's thread gets to look. An answer sent some time after the deadline instead can
+    /// still be read by a client that a loaded machine let run only after that answer had come.
+    pub fn unanswered_reads(&self, path_prefix: &str, times: u32) {
         lock(&self.shared.read_faults).push((
             path_prefix.to_string(),
             times,
-            ReadFault::Slow(delay),
+            ReadFault::Unanswered,
         ));
     }
 
@@ -916,7 +918,18 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         drain(&mut stream);
         return;
     }
-    let (status, extra, envelope) = handle(shared, &request);
+    let fault = if request.method == "GET" {
+        take_read_fault(shared, &request.target)
+    } else {
+        None
+    };
+    if let Some(ReadFault::Unanswered) = fault {
+        // Recorded with no status, as no answer was given.
+        record(shared, &request, 0);
+        hold_until_hung_up(&mut stream);
+        return;
+    }
+    let (status, extra, envelope) = handle(shared, &request, fault);
     record(shared, &request, status);
     let _ = respond(
         &mut stream,
@@ -1081,8 +1094,8 @@ fn console_body(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)> {
 enum ReadFault {
     /// It answers with this status and an error envelope.
     Status(u16),
-    /// It waits this long, then answers as usual.
-    Slow(Duration),
+    /// It never answers, and lets go of the request once the client has hung up.
+    Unanswered,
 }
 
 /// The fault a GET of `target` meets, when one is left for it. One read is taken from the first fault that matches.
@@ -1095,13 +1108,33 @@ fn take_read_fault(shared: &Shared, target: &str) -> Option<ReadFault> {
     Some(faults[index].2)
 }
 
-/// The status, the extra header lines and the envelope for one request.
-fn handle(shared: &Shared, request: &Request) -> (u16, String, Value) {
+/// Reads from the client until it hangs up, or for a minute at most, and answers nothing.
+fn hold_until_hung_up(stream: &mut UnixStream) {
+    let until = Instant::now() + Duration::from_secs(60);
+    let mut chunk = [0u8; 512];
+    while Instant::now() < until {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// The status, the extra header lines and the envelope for one request. `fault` is the read fault this request met.
+fn handle(shared: &Shared, request: &Request, fault: Option<ReadFault>) -> (u16, String, Value) {
     if request.method.is_empty() {
         return (400, String::new(), error_envelope(400, "bad request"));
     }
     if request.method == "GET" {
-        match take_read_fault(shared, &request.target) {
+        match fault {
             Some(ReadFault::Status(status)) => {
                 return (
                     status,
@@ -1109,8 +1142,7 @@ fn handle(shared: &Shared, request: &Request) -> (u16, String, Value) {
                     error_envelope(status, "the fake was told to fail this read"),
                 );
             }
-            Some(ReadFault::Slow(delay)) => std::thread::sleep(delay),
-            None => {}
+            Some(ReadFault::Unanswered) | None => {}
         }
     }
     let route = parse(&request.target);

@@ -345,11 +345,33 @@ impl State {
         Ok(changed)
     }
 
-    pub fn status(&self) -> Result<Status> {
+    /// The gate around every try of the serve lock. Asking whether `serve` runs takes the serve lock for a moment when
+    /// none runs, and a `serve` that tried it in that moment found it held and stopped as "already running". Both now
+    /// try the serve lock only inside this gate, so neither ever finds the other's moment. It is held for one try.
+    fn serve_gate(&self) -> Result<File> {
+        let gate = self.open_lock(".link-serve-gate.lock")?;
+        runtime(gate.lock())?;
+        Ok(gate)
+    }
+
+    /// Takes the lock `serve` holds for as long as it runs, or says that another `serve` holds it.
+    pub(crate) fn hold_serve(&self) -> Result<File> {
+        let _gate = self.serve_gate()?;
         let lock = self.open_lock(".link-serve.lock")?;
-        match lock.try_lock() {
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            _ => return Err(Error::Runtime("link serve is not running")),
+        lock.try_lock()
+            .map_err(|_| Error::Runtime("link serve is already running"))?;
+        Ok(lock)
+    }
+
+    pub fn status(&self) -> Result<Status> {
+        let running = {
+            let _gate = self.serve_gate()?;
+            let lock = self.open_lock(".link-serve.lock")?;
+            // Dropped before the gate: a lock taken here is let go inside it.
+            matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+        };
+        if !running {
+            return Err(Error::Runtime("link serve is not running"));
         }
         self.read("status.json")?
             .ok_or(Error::Runtime("link serve status is absent"))
@@ -385,6 +407,65 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0.dir).unwrap();
         }
+    }
+
+    // `status` is asked while `serve` starts, by the commands that use a running link and by whatever waits for it to
+    // be up. Asking must never make the start fail.
+    #[test]
+    fn asking_for_the_status_never_makes_a_starting_serve_think_another_one_runs() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let fixture = Fixture::new();
+        let state = fixture.0.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(AtomicU64::new(0));
+        // Both sides start together, and the starts go on until the status has been asked 2000 times beside them: the
+        // two race for the whole loop, on a quiet machine or a loaded one.
+        let together = Arc::new(Barrier::new(2));
+        let asker = {
+            let (state, stop, asked, together) =
+                (state.clone(), stop.clone(), asked.clone(), together.clone());
+            std::thread::spawn(move || {
+                together.wait();
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = state.status();
+                    asked.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        together.wait();
+        let waited = Duration::from_secs(30);
+        let deadline = Instant::now() + waited;
+        let (mut starts, mut refused) = (0u64, 0u64);
+        while starts < 2000 || asked.load(Ordering::SeqCst) < 2000 {
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::SeqCst);
+                panic!(
+                    "after {waited:?}, {starts} starts and {} status checks beside them; the test needs 2000 of each",
+                    asked.load(Ordering::SeqCst)
+                );
+            }
+            match state.hold_serve() {
+                Ok(lock) => drop(lock),
+                Err(_) => refused += 1,
+            }
+            starts += 1;
+        }
+        stop.store(true, Ordering::SeqCst);
+        asker.join().unwrap();
+        assert_eq!(
+            refused,
+            0,
+            "{refused} of {starts} starts were refused as 'already running' while the status was asked {} times beside \
+             them, and no other serve ran",
+            asked.load(Ordering::SeqCst)
+        );
+        // A second serve is still refused.
+        let held = state.hold_serve().unwrap();
+        assert!(state.hold_serve().is_err());
+        drop(held);
     }
 
     fn peer(index: u64, paired: u64) -> Peer {

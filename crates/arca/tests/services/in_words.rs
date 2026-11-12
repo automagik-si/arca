@@ -478,12 +478,9 @@ fn a_read_of_incus_that_fails_fast_is_made_once_more_and_one_that_fails_twice_is
 fn a_read_of_incus_slower_than_its_deadline_is_refused_in_words_and_is_not_made_again() {
     let rig = machine_and_container();
     let door = Door::over(&rig);
-    // Slower than the ten seconds a read is given: this test waits them out once.
-    rig.fake.slow_reads(
-        LISTING,
-        1,
-        arca_incus::read::TIMEOUT + Duration::from_millis(500),
-    );
+    // Incus does not answer: this test waits out the ten seconds a read is given, once. It never answers, and is not
+    // late by some time: an answer sent late is still read by a node that a loaded machine let look only after it came.
+    rig.fake.unanswered_reads(LISTING, 1);
     let before = reads_of(&rig, LISTING);
     let reply = door.call("service_status", json!({"name":"p1"}));
     assert_eq!(
@@ -494,7 +491,7 @@ fn a_read_of_incus_slower_than_its_deadline_is_refused_in_words_and_is_not_made_
     );
     assert_eq!(refusal_code(&reply), "incus_unavailable");
     // A second read would double the wait: after a deadline there is none.
-    assert!(reads_of(&rig, LISTING) <= before + 1);
+    assert_eq!(reads_of(&rig, LISTING), before + 1);
     assert_eq!(
         answer(&door.call("service_status", json!({"name":"p1"}))),
         "ok"
@@ -668,11 +665,10 @@ fn one_machine_whose_live_state_is_slow_holds_up_only_its_own_status_and_that_st
     assert!(structured(&status).get("ipv4Problem").is_none());
     let state_of_p2 = format!("/1.0/instances/p2/state?project={PROJECT}");
 
-    // Now its guest is slow: its own state, and so the listing with every instance's state, take longer than a
-    // read is given.
-    let slow = arca_incus::read::TIMEOUT + Duration::from_millis(500);
-    rig.fake.slow_reads(LISTING_WITH_STATE, 100, slow);
-    rig.fake.slow_reads(&state_of_p2, 1, slow);
+    // Now its guest does not answer: its own state, and so the listing with every instance's state, are not answered
+    // in the time a read is given, nor ever after.
+    rig.fake.unanswered_reads(LISTING_WITH_STATE, 100);
+    rig.fake.unanswered_reads(&state_of_p2, 1);
     let with_state = reads_of(&rig, LISTING_WITH_STATE);
     let states = reads_of(&rig, "/1.0/instances/p2/state");
     let value = key_file(1679, true);
@@ -712,9 +708,10 @@ fn one_machine_whose_live_state_is_slow_holds_up_only_its_own_status_and_that_st
         answer(&door.call("service_logs", json!({"name":"tok"}))),
         "error -32000: service tok: no log"
     );
+    // A call that read that state would have waited the whole of a read's time for it.
     assert!(
-        began.elapsed() < Duration::from_secs(5),
-        "six calls beside a slow machine took {:?}",
+        began.elapsed() < arca_incus::read::TIMEOUT,
+        "six calls beside a machine whose state does not answer took {:?}, as long as a read of that state is given",
         began.elapsed()
     );
     // None of them read any state: not the listing with it, and not that machine's.
