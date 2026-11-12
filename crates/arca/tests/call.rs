@@ -707,6 +707,31 @@ fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
     );
 }
 
+/// How long a test waits for `serve` to write its pid file, and for a reload to take effect: generous, since the test
+/// machine may be busy and neither is a judgement of speed.
+const PID_WAIT: Duration = Duration::from_secs(120);
+
+/// Waits until `node`'s `serve.pid` exists and holds a pid. `serve` writes it from a task that runs after the socket is
+/// bound, so a node that already answers calls may not have written it yet.
+fn wait_for_pid_file(node: &Node) {
+    let path = node.scratch.path("state").join("serve.pid");
+    let deadline = Instant::now() + PID_WAIT;
+    loop {
+        let pid = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        if pid.is_some() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve writes {} with its pid within the deadline",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The command a refusal gives to make `node` read its tokens again.
 fn reload_command(node: &Node) -> String {
     format!(
@@ -761,6 +786,9 @@ fn a_token_minted_while_the_node_runs_is_refused_until_the_reload_the_refusal_na
         "the refusal names the reload: {refusal}"
     );
 
+    // `serve` writes its pid file a moment after it starts to listen, so a node that already answers may not have one
+    // yet. The reload reads that file, so the test waits for it first.
+    wait_for_pid_file(&node);
     // The reload, run as the refusal words it.
     let ran = Command::new("sh")
         .arg("-c")
@@ -772,7 +800,8 @@ fn a_token_minted_while_the_node_runs_is_refused_until_the_reload_the_refusal_na
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
-    let until = Instant::now() + Duration::from_secs(10);
+    // A bound, not a speed judgement: the node reloads in its own time.
+    let until = Instant::now() + PID_WAIT;
     let mut after = call(&node, &fresh, "arca_status", &[]);
     while code(&after) != 0 && Instant::now() < until {
         thread::sleep(Duration::from_millis(100));
