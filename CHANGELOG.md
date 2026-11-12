@@ -17,8 +17,14 @@ the node: Incus pulls the server's image at the create, and a workspace's Docker
 Automagik's fixed release is pinned. The hand-built `automagik` template and its build script stay as they were, for
 the Omni channels plugin until then and for publishing on the tailnet. An installed
 copy nobody edited is brought up to date by the upgrade; a service made before keeps running its own image, and
-`service_status` shows the newer release under `update`. Keep such a service on its release: moving it today is a
-remove and a create, and the remove deletes its data.
+`service_status` shows the newer release under `update`, and `service_update` moves a service to it.
+
+A running service made from an image by digest now moves to a new digest in one call: `service_update {name, digest}`
+stops it, rebuilds its root from the new digest (its data volume, config, secrets and firewall rules stay), starts it,
+checks that it answers (through its host port, within 120 seconds or `timeoutSeconds`) and records the digest so a
+restart keeps it. A failure at any step puts the old version back and the answer says it was rolled back. It needs a
+`doctor` token and no owner approval, and works inside a tenant. It does this for `automagik-server`; there is no
+update path for `automagik-workspace`, a virtual machine, yet.
 
 On the approval page, while no passkey is trusted, a waiting card's button says "Set up your passkey first" instead of
 "Approve", and a tap on it takes the owner to the passkey setup, which is at the top of the page. Before, it asked for a
@@ -47,11 +53,6 @@ never taken in its place. A `--token-file` or `ARCA_TOKEN_FILE` that names a fil
 - Merge PR 122: while no passkey is trusted, every card says to set one up first and takes the owner to the setup
 
 ## 0.16.0 (2026-11-12)
-A running service made from an image by digest now moves to a new digest in one call: `service_update {name, digest}`
-snapshots it, rebuilds its root from the new digest (its data volume, config, secrets and firewall rules stay),
-starts it, waits for its first port to answer TCP (120 seconds, or `timeoutSeconds`) and records the digest so a restart
-keeps it. A failure at any step puts the old version back and the answer says it was rolled back. It needs a `doctor`
-token and no owner approval, and works inside a tenant.
 
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know

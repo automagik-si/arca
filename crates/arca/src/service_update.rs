@@ -3,11 +3,14 @@
 //! The steps, each journalled in [`SERVICE_UPDATES_FILE`] (an append-only file of JSON lines in the state directory,
 //! one `begin` line before anything is sent to Incus, one line per step and one `end` line; no line holds a secret):
 //!
-//! 1. the instance is stopped, when it runs, and a snapshot of it is taken;
+//! 1. the instance is stopped, when it runs, and a snapshot of it is taken where the project allows one (an Arca
+//!    project never does, so on a node as Arca makes it there is none);
 //! 2. its root is rebuilt from the new digest. Incus keeps the config, the devices (the data volume among them), the
 //!    uuid, the secrets and the firewall rules; only the root is the new image's;
 //! 3. it is started;
-//! 4. the health check: the first port the service's record names answers TCP, within a timeout;
+//! 4. the health check, within a timeout: a service with a host port (`lan`) is tried through that port's proxy, a
+//!    service whose first port is its droidd port is tried at its address, and any other must stay running for a few
+//!    seconds, since the node may reach nothing else of it;
 //! 5. the new digest is recorded in the service's desired state, so a restart keeps it.
 //!
 //! A failure at any step puts the old version back: the snapshot is restored (or, in a project that does not allow
@@ -20,7 +23,7 @@ use crate::service::ServiceConfig;
 use arca_incus::{IncusError, InstanceState, StateAction, StateChanger};
 use arca_kernel::desired::Entry;
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -34,9 +37,17 @@ pub const DEFAULT_HEALTH_SECONDS: u64 = 120;
 pub const MAX_HEALTH_SECONDS: u64 = 900;
 /// One TCP attempt of the health check gives up after this long.
 const CONNECT_WAIT: Duration = Duration::from_secs(2);
+/// How long Incus may take over one step, a registry pull included: what a create allows for its fetch.
+const STEP_DEADLINE: Duration = Duration::from_secs(600);
+/// A service the node cannot reach has to stay running this long (at most the call's timeout).
+const STAY_RUNNING_SECONDS: u64 = 10;
+/// The old version, started again after a rollback, is given this long to answer.
+const OLD_ANSWERS_SECONDS: u64 = 30;
 
 /// One attempt of the health check: whether `address` answers on `port` now.
-pub type Probe = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
+/// `forwarded` is true when the address is the node's own side of a proxy: the proxy takes the connection before it dials
+/// the service, so an answer is a connection that is not closed at once.
+pub type Probe = Arc<dyn Fn(&str, u16, bool) -> bool + Send + Sync>;
 
 /// What a node's `service_update` does at its edges: how a port is tried and how long is waited between two tries.
 #[derive(Clone)]
@@ -48,10 +59,28 @@ pub struct UpdateOptions {
 impl Default for UpdateOptions {
     fn default() -> Self {
         Self {
-            probe: Arc::new(|address, port| {
-                address.parse::<std::net::IpAddr>().ok().is_some_and(|ip| {
-                    TcpStream::connect_timeout(&SocketAddr::new(ip, port), CONNECT_WAIT).is_ok()
-                })
+            probe: Arc::new(|address, port, forwarded| {
+                let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+                    return false;
+                };
+                let Ok(mut stream) =
+                    TcpStream::connect_timeout(&SocketAddr::new(ip, port), CONNECT_WAIT)
+                else {
+                    return false;
+                };
+                if !forwarded {
+                    return true;
+                }
+                // The proxy closes a connection whose target does not answer; a service that waits for the client
+                // to speak first leaves it open.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                match stream.read(&mut [0u8; 1]) {
+                    Ok(read) => read > 0,
+                    Err(error) => matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ),
+                }
             }),
             pace: Duration::from_secs(1),
         }
@@ -124,6 +153,26 @@ fn refused(message: impl Into<String>) -> CallError {
 struct Failure {
     step: &'static str,
     why: String,
+    /// Incus did not answer within its deadline: what it was asked may still be going on.
+    unsettled: bool,
+}
+
+impl Failure {
+    fn of(step: &'static str, error: &IncusError) -> Failure {
+        Failure {
+            step,
+            why: incus_words(error),
+            unsettled: matches!(error, IncusError::Timeout),
+        }
+    }
+
+    fn said(step: &'static str, why: String) -> Failure {
+        Failure {
+            step,
+            why,
+            unsettled: false,
+        }
+    }
 }
 
 fn incus_words(error: &IncusError) -> String {
@@ -244,6 +293,14 @@ impl ServiceHandler {
                 "its template declares no port, so there is nothing to check after the start",
             ));
         };
+        // How the node can tell that it answers: the host port's proxy, the droidd port, or only that it runs.
+        let reach = if let Some(lan) = &config.lan {
+            Reach::Lan(lan.port)
+        } else if config.droidd_port == Some(port) {
+            Reach::Direct(port)
+        } else {
+            Reach::Running
+        };
         if new_source == config.source {
             return Ok(json!({
                 "updated": false,
@@ -259,7 +316,8 @@ impl ServiceHandler {
             self.cfg.kernel.droidd_projects.iter().map(String::as_str),
         )
         .map_err(|_| internal())?;
-        let mut changer = StateChanger::new(self.cfg.incus.socket.clone(), family);
+        let mut changer =
+            StateChanger::new(self.cfg.incus.socket.clone(), family).with_deadline(STEP_DEADLINE);
         if config.tenant.is_some() {
             changer = changer
                 .with_tenants([config.project.as_str()])
@@ -276,6 +334,15 @@ impl ServiceHandler {
         let journalled = lock(&self.kernel)?.service_uuid(&entry.id, &config.instance);
         if seen.kind != "container" || journalled.is_none() || journalled != seen.uuid {
             return Err(said("its instance is not the one Arca created for it"));
+        }
+        // A rebuild of a container that has never run leaves it unable to start (Incus 7.5.1), as a function's does.
+        if !seen
+            .own_config
+            .contains_key(arca_incus::function_run::STARTED_KEY)
+        {
+            return Err(said(
+                "the service has never been started, and a rebuild would leave it unable to start: start it with instance_start first",
+            ));
         }
         let journal = Journal {
             path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
@@ -311,6 +378,7 @@ impl ServiceHandler {
             new_source: &new_source,
             digest: &digest,
             port,
+            reach,
             seconds,
             registry: registry.as_ref(),
             journal: &journal,
@@ -322,6 +390,17 @@ impl ServiceHandler {
     }
 }
 
+/// How the node tells that a service answers.
+#[derive(Clone, Copy)]
+enum Reach {
+    /// Through the proxy of the service's host port: the node's own loopback, this port.
+    Lan(u16),
+    /// At the service's address, on a port its firewall opens to the node.
+    Direct(u16),
+    /// The node can reach nothing of it: the instance must stay running.
+    Running,
+}
+
 struct Run<'a> {
     handler: &'a ServiceHandler,
     changer: &'a StateChanger,
@@ -330,6 +409,7 @@ struct Run<'a> {
     new_source: &'a Value,
     digest: &'a str,
     port: u16,
+    reach: Reach,
     seconds: u64,
     registry: Option<&'a arca_incus::RegistryCredential>,
     journal: &'a Journal,
@@ -360,6 +440,20 @@ impl Run<'_> {
         };
         self.journal
             .step(failure.step, false, json!({ "why": failure.why }));
+        if failure.unsettled && failure.step == "rebuild" {
+            self.journal.step(
+                "end",
+                false,
+                json!({ "rolledBack": false, "unsettled": true }),
+            );
+            return Err(CallError::Refused {
+                code: "update_unsettled".into(),
+                message: format!(
+                    "update service {name} to {}: Incus did not finish the rebuild in time ({}) and may still be at it. Nothing was rolled back, so as not to rebuild twice at once: service_status shows what is there, and the same update may be asked for again once Incus is idle",
+                    self.digest, failure.why,
+                ),
+            });
+        }
         let Some(back) = back else {
             // Nothing was changed but the power state: the old version is started again when it ran.
             let restarted = self.start_again(&mut instance);
@@ -379,21 +473,34 @@ impl Run<'_> {
                 },
             )));
         };
-        match self.roll_back(&mut instance, &back) {
-            Ok(()) => {
-                self.journal
-                    .step("end", false, json!({ "rolledBack": true }));
+        match self.roll_back(&mut instance, &back, failure.step) {
+            Ok(back) => {
+                self.journal.step(
+                    "end",
+                    false,
+                    json!({ "rolledBack": true, "rootKept": back.root_kept, "oldAnswers": back.answers }),
+                );
                 Err(CallError::Refused {
                     code: "rolled_back".into(),
                     message: format!(
-                        "update service {name} to {}: {} failed: {}. The update was rolled back: the old version is {}",
+                        "update service {name} to {}: {} failed: {}. The update was rolled back: {}the old version is {}{}",
                         self.digest,
                         failure.step,
                         failure.why,
+                        if back.root_kept {
+                            "Incus could not fetch the image again, so the old root was left as it was, and "
+                        } else {
+                            ""
+                        },
                         if self.was_running {
                             "running again"
                         } else {
                             "in place, and the service is stopped as it was"
+                        },
+                        if self.was_running && !back.answers {
+                            ", but its port did not answer yet: service_status and service_logs show how it is"
+                        } else {
+                            ""
                         },
                     ),
                 })
@@ -419,10 +526,7 @@ impl Run<'_> {
         self.changer
             .change(instance, StateAction::Start)
             .map(|state| *instance = state)
-            .map_err(|error| Failure {
-                step: "start",
-                why: incus_words(&error),
-            })
+            .map_err(|error| Failure::of("start", &error))
     }
 
     fn start_again(&self, instance: &mut InstanceState) -> Result<(), Failure> {
@@ -439,10 +543,7 @@ impl Run<'_> {
         self.changer
             .change(instance, StateAction::Stop)
             .map(|state| *instance = state)
-            .map_err(|error| Failure {
-                step: "stop",
-                why: incus_words(&error),
-            })
+            .map_err(|error| Failure::of("stop", &error))
     }
 
     /// Steps 1 to 5. `back` is set as soon as something that must be undone is about to be done.
@@ -460,9 +561,11 @@ impl Run<'_> {
                     .step("snapshot", true, json!({ "snapshot": snapshot }));
                 Some(snapshot)
             }
-            // A project that forbids snapshots (a tenant's does): the old version is put back by a rebuild from its
+            // A project that forbids snapshots (every project Arca makes does, and Incus answers 500 or 403): the old version is put back by a rebuild from its
             // own digest instead.
-            Err(IncusError::Status { code: 403, message }) => {
+            Err(IncusError::Status { code, message })
+                if code == 403 || message.contains("snapshot creation") =>
+            {
                 self.journal.step(
                     "snapshot",
                     false,
@@ -471,10 +574,7 @@ impl Run<'_> {
                 None
             }
             Err(error) => {
-                return Err(Failure {
-                    step: "snapshot",
-                    why: incus_words(&error),
-                });
+                return Err(Failure::of("snapshot", &error));
             }
         };
         *back = Some(match &held {
@@ -483,10 +583,7 @@ impl Run<'_> {
         });
         self.changer
             .rebuild_from_registry(instance, self.new_source, self.registry)
-            .map_err(|error| Failure {
-                step: "rebuild",
-                why: incus_words(&error),
-            })?;
+            .map_err(|error| Failure::of("rebuild", &error))?;
         self.journal
             .step("rebuild", true, json!({ "digest": self.digest }));
         self.started(instance)?;
@@ -499,25 +596,58 @@ impl Run<'_> {
         Ok(held)
     }
 
-    /// The first port answers TCP within the timeout.
+    /// The service answers within the timeout, as its reach lets the node tell.
     fn healthy(&self) -> Result<(), Failure> {
-        let options = &self.handler.update;
-        let begun = Instant::now();
-        let limit = Duration::from_secs(self.seconds);
-        loop {
-            if (options.probe)(&self.config.ipv4, self.port) {
-                return Ok(());
-            }
-            if begun.elapsed() >= limit {
-                return Err(Failure {
-                    step: "health check",
-                    why: format!(
+        if self.answers_within(self.seconds) {
+            Ok(())
+        } else {
+            Err(Failure::said(
+                "health check",
+                match self.reach {
+                    Reach::Running => "the instance did not stay running".to_string(),
+                    _ => format!(
                         "port {} did not answer within {} second{}",
                         self.port,
                         self.seconds,
                         if self.seconds == 1 { "" } else { "s" }
                     ),
-                });
+                },
+            ))
+        }
+    }
+
+    fn answers_within(&self, seconds: u64) -> bool {
+        let options = &self.handler.update;
+        let begun = Instant::now();
+        if let Reach::Running = self.reach {
+            // Looked at over a few seconds: one look at the first moment says little.
+            let limit = Duration::from_secs(seconds.min(STAY_RUNNING_SECONDS));
+            loop {
+                let up = self
+                    .changer
+                    .read(&self.config.project, &self.config.instance)
+                    .is_ok_and(|state| state.is_running());
+                if !up {
+                    return false;
+                }
+                if begun.elapsed() >= limit {
+                    return true;
+                }
+                std::thread::sleep(options.pace);
+            }
+        }
+        let limit = Duration::from_secs(seconds);
+        loop {
+            let up = match self.reach {
+                Reach::Lan(port) => (options.probe)("127.0.0.1", port, true),
+                Reach::Direct(port) => (options.probe)(&self.config.ipv4, port, false),
+                Reach::Running => true,
+            };
+            if up {
+                return true;
+            }
+            if begun.elapsed() >= limit {
+                return false;
             }
             std::thread::sleep(options.pace);
         }
@@ -525,10 +655,7 @@ impl Run<'_> {
 
     /// The new digest goes into the service's record, so a restart keeps it.
     fn record(&self) -> Result<(), Failure> {
-        let failed = |why: &str| Failure {
-            step: "record",
-            why: why.to_string(),
-        };
+        let failed = |why: &str| Failure::said("record", why.to_string());
         let _write = self
             .handler
             .writes
@@ -565,41 +692,63 @@ impl Run<'_> {
     }
 
     /// Puts the old version back, and starts it when it ran before the update. The record was never changed before
-    /// the health check passed, so it still names the old digest.
-    fn roll_back(&self, instance: &mut InstanceState, back: &Back) -> Result<(), Failure> {
+    /// the health check passed, so it still names the old digest. A failed fetch of the old image after a failed
+    /// fetch of the new one leaves the old root as it was (Incus resolves the image before it takes the root away), so
+    /// the old version is simply started.
+    fn roll_back(
+        &self,
+        instance: &mut InstanceState,
+        back: &Back,
+        after: &str,
+    ) -> Result<Rolled, Failure> {
         self.stopped(instance)?;
+        let mut root_kept = false;
         match back {
             Back::Snapshot(snapshot) => {
                 self.changer
                     .restore_snapshot(instance, snapshot)
-                    .map_err(|error| Failure {
-                        step: "restore",
-                        why: incus_words(&error),
-                    })?;
+                    .map_err(|error| Failure::of("restore", &error))?;
                 self.journal
                     .step("restore", true, json!({ "snapshot": snapshot }));
             }
             Back::OldImage => {
-                self.changer
-                    .rebuild_from_registry(instance, &self.config.source, self.registry)
-                    .map_err(|error| Failure {
-                        step: "rebuild back",
-                        why: incus_words(&error),
-                    })?;
-                self.journal.step("rebuild back", true, json!({}));
+                match self.changer.rebuild_from_registry(
+                    instance,
+                    &self.config.source,
+                    self.registry,
+                ) {
+                    Ok(()) => self.journal.step("rebuild back", true, json!({})),
+                    Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
+                        root_kept = true;
+                        self.journal.step(
+                            "rebuild back",
+                            false,
+                            json!({ "why": incus_words(&error) }),
+                        );
+                    }
+                    Err(error) => return Err(Failure::of("rebuild back", &error)),
+                }
             }
         }
         *instance = self
             .changer
             .read(&instance.project, &instance.name)
-            .map_err(|error| Failure {
-                step: "read",
-                why: incus_words(&error),
-            })?;
+            .map_err(|error| Failure::of("read", &error))?;
         self.start_again(instance)?;
+        let mut answers = true;
         if self.was_running {
             self.journal.step("start", true, json!({ "old": true }));
+            answers = self.answers_within(self.seconds.min(OLD_ANSWERS_SECONDS));
+            self.journal.step("old answers", answers, json!({}));
         }
-        Ok(())
+        Ok(Rolled { root_kept, answers })
     }
+}
+
+/// What a rollback did.
+struct Rolled {
+    /// The old root was never taken away.
+    root_kept: bool,
+    /// The old version answered after it was started.
+    answers: bool,
 }

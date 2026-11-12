@@ -404,11 +404,11 @@ static VERBS: [Verb; 65] = [
     },
     Verb {
         name: "service_update",
-        summary: "Move a running container service made from an image by digest to another digest of that image in one call: it is stopped, snapshotted, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept), started, and its first port must answer TCP within the timeout (120 seconds unless timeoutSeconds says otherwise). The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
+        summary: "Move a running container service made from an image by digest to another digest of that image in one call: it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
-        destructive: false,
+        destructive: true,
         untrusted: false,
         output_key: None,
         summary_text: summary_service_update,
@@ -1839,6 +1839,7 @@ fn not_confirmed(name: &str) -> String {
         "service_remove" => "nothing was removed",
         "service_import" => "nothing was imported",
         "service_release" => "nothing was released",
+        "service_update" => "nothing was updated",
         "gpu_detach" => "nothing was detached",
         "storage_add" => "nothing was added",
         "action_approve" => "nothing was run",
@@ -3463,7 +3464,7 @@ fn service_update_params() -> Value {
 }
 
 fn service_update_params_base() -> Value {
-    json!({
+    with_confirm(json!({
         "additionalProperties": false,
         "properties": {
             "digest": {
@@ -3481,7 +3482,7 @@ fn service_update_params_base() -> Value {
         },
         "required": ["name", "digest"],
         "type": "object"
-    })
+    }))
 }
 
 fn service_update_result() -> Value {
@@ -3492,7 +3493,7 @@ fn service_update_result() -> Value {
             "message": { "type": "string" },
             "service": { "type": "string" },
             "snapshot": {
-                "description": "The snapshot of the old version taken before the rebuild, or null when the service's project does not allow snapshots. Absent when nothing was changed.",
+                "description": "The snapshot of the old version taken before the rebuild, or null when the service's project does not allow snapshots (no project Arca makes does). Absent when nothing was changed.",
                 "type": ["string", "null"]
             },
             "updated": {

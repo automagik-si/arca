@@ -3244,11 +3244,19 @@ fn snapshot_or_backup(
     if store.restricted(&address.project)
         && !store.allows(&address.project, &format!("restricted.{kind}s"))
     {
-        return (
-            403,
-            String::new(),
-            error_envelope(403, &format!("Project restricted: {kind}s are forbidden")),
-        );
+        // As Incus answers it: a plain error, which its handler turns into a 500.
+        let message = if kind == "snapshot" {
+            format!(
+                "Project \"{}\" doesn't allow for snapshot creation",
+                address.project
+            )
+        } else {
+            format!(
+                "Project \"{}\" doesn't allow for backup creation",
+                address.project
+            )
+        };
+        return (500, String::new(), error_envelope(500, &message));
     }
     let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
         return (

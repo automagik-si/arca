@@ -15,6 +15,7 @@ fn app_template() -> Value {
         "digest": DIGEST,
         "ports": [8080],
         "data": { "path": "/data", "uid": 1000, "gid": 1000 },
+        "lan": { "port": 8080 },
         "env": {},
         "publishable": false
     })
@@ -56,7 +57,7 @@ fn bare_rig(up: &Arc<AtomicBool>) -> Rig {
         rig.cfg.clone(),
         None,
         UpdateOptions {
-            probe: Arc::new(move |_, _| answers.load(Ordering::SeqCst)),
+            probe: Arc::new(move |_, _, _| answers.load(Ordering::SeqCst)),
             pace: Duration::from_millis(10),
         },
     )
@@ -287,4 +288,67 @@ fn a_project_that_forbids_snapshots_is_rolled_back_by_a_rebuild_from_the_old_dig
     let done = update(&rig, json!({ "name": "app", "digest": NEW })).expect("update");
     assert_eq!(done["updated"], true);
     assert_eq!(done["snapshot"], Value::Null);
+}
+
+#[test]
+fn the_health_check_goes_through_the_host_port_proxy_on_loopback() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut rig = bare_rig(&Arc::new(AtomicBool::new(true)));
+    let log = Arc::clone(&seen);
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe: Arc::new(move |address, port, forwarded| {
+                log.lock()
+                    .unwrap()
+                    .push((address.to_string(), port, forwarded));
+                true
+            }),
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
+    update(&rig, json!({ "name": "app", "digest": NEW })).expect("update");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("127.0.0.1".to_string(), 8080, true)],
+        "the node's own loopback and the proxy's port, never the service's address"
+    );
+}
+
+#[test]
+fn a_service_never_started_is_refused_before_anything_is_changed() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    rig.call(
+        "service_create",
+        json!({ "name": "idle", "template": "app", "start": false }),
+    )
+    .expect("create stopped");
+    let CallError::Refused { message, .. } =
+        update(&rig, json!({ "name": "idle", "digest": NEW })).expect_err("never started")
+    else {
+        panic!("a refusal");
+    };
+    assert!(message.contains("never been started"), "{message}");
+    assert!(rig.fake.rebuilds(PROJECT, "idle").is_empty());
+}
+
+#[test]
+fn a_registry_that_is_down_leaves_the_old_root_and_the_old_version_runs_again() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    rig.fake.refuse_rebuild(PROJECT, "app");
+    let CallError::Refused { code, message } =
+        update(&rig, json!({ "name": "app", "digest": NEW })).expect_err("rebuild fails")
+    else {
+        panic!("a refusal");
+    };
+    assert_eq!(code, "rolled_back");
+    assert!(message.contains("left as it was"), "{message}");
+    assert_eq!(instance(&rig)["status"], "Running");
 }
