@@ -491,7 +491,7 @@ fn a_read_of_incus_slower_than_its_deadline_is_refused_in_words_and_is_not_made_
     );
     assert_eq!(refusal_code(&reply), "incus_unavailable");
     // A second read would double the wait: after a deadline there is none.
-    assert!(reads_of(&rig, LISTING) <= before + 1);
+    assert_eq!(reads_of(&rig, LISTING), before + 1);
     assert_eq!(
         answer(&door.call("service_status", json!({"name":"p1"}))),
         "ok"

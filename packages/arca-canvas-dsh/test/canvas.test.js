@@ -589,23 +589,37 @@ test('built client registers a browser-only module without host imports', async 
   assert.doesNotMatch(page, /node:os|hostname\s*\(/);
 });
 
-// The first host of the snapshot route, or a failure that says the route did not answer within ten seconds.
+// The first host of the snapshot route and the time it took, which must be under a second. The route answers from its
+// cache: a loaded machine took 290 ms, and a second is well under the 5 s after which the Arca client and the device
+// read give up, so a route that waited for either, or for one of them for a while, fails here and says how long it took.
 async function hostWithin(url, what) {
+  const start = performance.now();
+  let host;
   try {
-    return (await (await fetch(url, { signal: AbortSignal.timeout(10_000) })).json()).hosts[0];
+    host = (await (await fetch(url, { signal: AbortSignal.timeout(10_000) })).json()).hosts[0];
   } catch (error) {
     if (error.name !== 'TimeoutError') throw error;
     assert.fail(`the snapshot route had not answered ${what} ten seconds after it was asked: it waits for what it should not`);
   }
+  const elapsed = performance.now() - start;
+  assert.ok(elapsed < 1000, `the snapshot route took ${elapsed.toFixed(0)} ms to answer ${what}; it answers from its cache, within a second`);
+  return { host, elapsed };
 }
 
 test('host snapshot route answers from its cache while Arca is held and device HTTP never answers', async (t) => {
   const { config } = await sandbox(t);
-  // Arca's first answer is held until the route has answered: an answer given while Arca has not answered proves the
-  // route did not wait for it. A clock cannot prove that on a loaded machine, where the fetch alone can take longer.
+  // Arca's answers are held until the route has answered. A held request whose connection closes before then was given
+  // up by the Arca client, which happens only after 5 s: a route that made Arca's client wait that long is caught by
+  // the count as well as by the time.
   let letArcaAnswer;
   const arcaHeld = new Promise((resolve) => { letArcaAnswer = resolve; });
-  await fakeArca(t, config, async (body) => { await arcaHeld; return toolResult(body, fixtures[body.params.name]); });
+  let arcaHeldRequests = 0, arcaGivenUp = 0;
+  await fakeArca(t, config, async (body, req) => {
+    arcaHeldRequests++;
+    req.socket.once('close', () => { arcaGivenUp++; });
+    await arcaHeld;
+    return toolResult(body, fixtures[body.params.name]);
+  });
   let deviceRequests = 0, closed = 0;
   const devices = createServer((req, res) => {
     deviceRequests++;
@@ -624,12 +638,10 @@ test('host snapshot route answers from its cache while Arca is held and device H
     devicesUrl: `http://127.0.0.1:${devices.address().port}/mcp`, devicesTokenPath: config.viewerTokenPath });
   t.after(() => fiber.dispose());
   const url = `http://127.0.0.1:${web.address().port}/arca-canvas/snapshot`;
-  // The route answers from its cache. The 100 ms is the aim on a quiet machine and is reported, not asserted: what is
-  // asserted is that the answer came while Arca was held. A route that waited for Arca would never answer, and the
-  // fetch says so after ten seconds.
-  const routeStart = performance.now();
-  let snapshot = await hostWithin(url, 'while Arca was held');
-  const routeElapsed = performance.now() - routeStart;
+  // The route answers while Arca holds a request of the plugin's, and before any held request is given up.
+  await until(() => arcaHeldRequests > 0);
+  let { host: snapshot, elapsed: routeElapsed } = await hostWithin(url, 'while Arca was held');
+  assert.equal(arcaGivenUp, 0, `${arcaGivenUp} held Arca request(s) were given up before the route answered`);
   assert.equal(snapshot.machine, null, 'Arca was held, so the route had nothing of it yet');
   letArcaAnswer();
   const start = performance.now();
@@ -645,7 +657,7 @@ test('host snapshot route answers from its cache while Arca is held and device H
   await until(() => deviceRequests === 1);
   await new Promise((resolve) => setTimeout(resolve, 130));
   // The device request is still open, and the route answers from its cache all the same.
-  let next = await hostWithin(url, 'while the device request was open');
+  let { host: next } = await hostWithin(url, 'while the device request was open');
   assert.equal(closed, 0, 'the device request was still open when the route answered');
   for (let attempt = 0; attempt < 20 && next.at === snapshot.at; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -655,7 +667,7 @@ test('host snapshot route answers from its cache while Arca is held and device H
   assert.equal(next.error, null);
   await fiber.dispose();
   await until(() => closed === deviceRequests);
-  t.diagnostic(`host route ${routeElapsed.toFixed(1)}ms (aim <100ms) while Arca was held; Arca fixture ready in ${readyElapsed.toFixed(1)}ms; pending device request aborted on disposal`);
+  t.diagnostic(`host route ${routeElapsed.toFixed(1)}ms (<1000ms) while Arca was held; Arca fixture ready in ${readyElapsed.toFixed(1)}ms; pending device request aborted on disposal`);
 });
 
 test('host snapshots resolve a human node name without using the machine id', async () => {
