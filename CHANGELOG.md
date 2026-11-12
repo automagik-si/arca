@@ -28,6 +28,9 @@ that image is built with `templates/automagik.build.sh`.
 - Merge dev at v0.15.0 into set G
 - Merge PR 107: the tenant removal card says the tenant's address block, when it was made, and the services it holds as of the proposal, and that services made later go too
 - Merge PR 103: the canvas Doctor proposes all 22 kernel actions and reads tenants and functions, with the kernel's untrusted note first in what it reads
+On the approval page, while no passkey is trusted, a waiting card's button says "Set up your passkey first" instead of
+"Approve", and a tap on it takes the owner to the passkey setup, which is at the top of the page. Before, it asked for a
+passkey there was none of and failed. Once a passkey is trusted the cards are drawn again with their Approve buttons.
 
 ## 0.15.0 (2026-11-12)
 
