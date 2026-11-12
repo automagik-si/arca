@@ -107,6 +107,59 @@ fn write_once(socket: &Path, method: &str, path: &str, body: Option<&Value>) -> 
     }
 }
 
+/// What a proof run with a real credential does last, whatever happened before it: every image of the scratch
+/// project whose own record holds a credential in its address is deleted, and one that could not be is said in
+/// plain words. A proof that fails after its fetch must leave no image behind that was fetched with the real
+/// credential. Incus's own words are not printed here: they could hold the address.
+fn remove_credentialed_images(socket: &Path, project: &str) {
+    let Ok(listed) = send(
+        socket,
+        "GET",
+        &format!("/1.0/images?project={project}&recursion=1"),
+        None,
+    ) else {
+        println!(
+            "PROOF CLEAN-UP: the images of {project} could NOT be listed. LOOK for images fetched with the credential and delete them by hand"
+        );
+        return;
+    };
+    let mut found = 0;
+    for image in listed["metadata"].as_array().into_iter().flatten() {
+        let with_credential = image["update_source"]["server"]
+            .as_str()
+            .is_some_and(crate::write::address_holds_credential);
+        let Some(fingerprint) = image["fingerprint"].as_str().filter(|_| with_credential) else {
+            continue;
+        };
+        found += 1;
+        let short: String = fingerprint.chars().take(12).collect();
+        let hex = fingerprint.len() == 64 && fingerprint.bytes().all(|b| b.is_ascii_hexdigit());
+        let deleted = hex
+            && std::panic::catch_unwind(|| {
+                write(
+                    socket,
+                    "DELETE",
+                    &format!("/1.0/images/{fingerprint}?project={project}"),
+                    None,
+                )
+                .is_ok()
+            })
+            .unwrap_or(false);
+        if deleted {
+            println!(
+                "PROOF CLEAN-UP: an image fetched with the credential was still in {project} and is deleted: {short}"
+            );
+        } else {
+            println!(
+                "PROOF CLEAN-UP: AN IMAGE FETCHED WITH THE CREDENTIAL IS LEFT in {project} and could not be deleted: {short}. Delete it by hand"
+            );
+        }
+    }
+    if found == 0 {
+        println!("PROOF CLEAN-UP: no image fetched with the credential is left in {project}");
+    }
+}
+
 /// Deletes the proof's container. Just after a start that failed Incus is still ending it, so the delete is tried again
 /// for a few seconds.
 fn delete(socket: &Path, instance: &str) -> Result<(), String> {
@@ -1071,6 +1124,7 @@ fn a_real_incus_pulls_with_a_registry_credential_in_the_server_address() {
     }
     let Some(address) = created_with else {
         println!("PROOF no form of the address was taken: nothing more to read");
+        remove_credentialed_images(socket, &project);
         return;
     };
 
@@ -1186,6 +1240,7 @@ fn a_real_incus_pulls_with_a_registry_credential_in_the_server_address() {
         Ok(()) => println!("PROOF the container was deleted"),
         Err(why) => println!("PROOF the container was NOT deleted: {}", hide(&why)),
     }
+    remove_credentialed_images(socket, &project);
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
@@ -1314,6 +1369,7 @@ fn writers_path(
                 hide(&error.to_string())
             );
             let _ = delete(socket, &instance);
+            remove_credentialed_images(socket, &project);
             return;
         }
     };
@@ -1497,6 +1553,7 @@ fn writers_path(
         .ok()
         .and_then(|listed| listed["metadata"].as_array().map(Vec::len));
     println!("PROOF images left in the scratch project: {left:?}");
+    remove_credentialed_images(socket, &project);
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
@@ -1635,6 +1692,7 @@ fn starts_around_rebuilds(
                 hide(&error.to_string())
             );
             let _ = delete(socket, &instance);
+            remove_credentialed_images(socket, project);
             return None;
         }
     };
@@ -1757,6 +1815,7 @@ fn starts_around_rebuilds(
         run.drop_unused_image(project, &fingerprint)
             .map_err(|error| hide(&error.to_string()))
     );
+    remove_credentialed_images(socket, project);
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
@@ -1899,6 +1958,7 @@ fn sweeps_calls(
                 hide(&error.to_string())
             );
             let _ = delete(socket, &instance);
+            remove_credentialed_images(socket, &project);
             return;
         }
     };
@@ -1969,6 +2029,7 @@ fn sweeps_calls(
             println!("PROOF {left} is deleted: {:?}", delete(socket, left));
         }
     }
+    remove_credentialed_images(socket, &project);
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
