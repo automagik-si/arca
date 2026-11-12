@@ -51,6 +51,12 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             "confirm is false: nothing was removed and no approval was spent",
         ),
         (
+            "service_update",
+            json!({ "name": "pg", "digest": format!("sha256:{}", "a".repeat(64)) }),
+            json!({ "updated": true, "service": "pg", "digest": format!("sha256:{}", "a".repeat(64)), "snapshot": null, "message": "updated" }),
+            "confirm is false: nothing was updated and no approval was spent",
+        ),
+        (
             "service_import",
             json!({ "name": "db1", "approval": "0123456789abcdef" }),
             json!({

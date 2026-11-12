@@ -3582,7 +3582,7 @@
             },
             "update": {
               "additionalProperties": false,
-              "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Today the only way to the template's version is service_remove and service_create.",
+              "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
               "properties": {
                 "pin": {
                   "description": "service_status only: the version the service was created with, an image by digest.",
@@ -3843,7 +3843,7 @@
                   },
                   "update": {
                     "additionalProperties": false,
-                    "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Today the only way to the template's version is service_remove and service_create.",
+                    "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
                     "properties": {
                       "pin": {
                         "description": "service_status only: the version the service was created with, an image by digest.",
@@ -4127,7 +4127,7 @@
             },
             "update": {
               "additionalProperties": false,
-              "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Today the only way to the template's version is service_remove and service_create.",
+              "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
               "properties": {
                 "pin": {
                   "description": "service_status only: the version the service was created with, an image by digest.",
@@ -4302,6 +4302,98 @@
         }
       },
       "summary": "Remove a service, its links, its ACL and its secrets, with the owner's signed approval.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "service_update",
+      "params": [
+        {
+          "name": "digest",
+          "required": true,
+          "schema": {
+            "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository.",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "timeoutSeconds",
+          "required": false,
+          "schema": {
+            "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent.",
+            "maximum": 900,
+            "minimum": 1,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "digest": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "service": {
+              "type": "string"
+            },
+            "snapshot": {
+              "description": "The snapshot of the old version taken before the rebuild, or null when the service's project does not allow snapshots (no project Arca makes does). Absent when nothing was changed.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated": {
+              "description": "False when the service already ran this digest and nothing was changed.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "updated",
+            "service",
+            "digest",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Move a running container service made from an image by digest to another digest of that image in one call: it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -4551,7 +4643,7 @@
                 },
                 "update": {
                   "additionalProperties": false,
-                  "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Today the only way to the template's version is service_remove and service_create.",
+                  "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
                   "properties": {
                     "pin": {
                       "description": "service_status only: the version the service was created with, an image by digest.",

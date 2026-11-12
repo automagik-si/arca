@@ -12,6 +12,14 @@ changed ...": the answer comes first and that note after it, so an assistant tha
 longer reports a refusal. The text of `watch_report`, `service_list` and `arca_status` now carries the answer itself
 (each instance, each service, and whether Incus answers and how long the node has run), not only a count.
 
+A running service made from an image by digest now moves to a new digest in one call: `service_update {name, digest}`
+stops it, rebuilds its root from the new digest (its data volume, config, secrets and firewall rules stay), starts it,
+checks that it answers (through its host port, within 120 seconds or `timeoutSeconds`) and records the digest so a
+restart keeps it. A failure at any step puts the old version back and the answer says it was rolled back. It needs a
+`doctor` token and no owner approval, and works inside a tenant. It does this for `automagik-server`; there is no
+update path for `automagik-workspace`, a virtual machine, yet. This replaces moving such a service by a remove and a
+create, which deleted its data.
+
 ## 0.17.0 (2026-11-12)
 
 Arguments a tool does not take are now answered as a tool result with `isError: true` and `droidd/error` `invalid_arguments`, in the same words, instead of a JSON-RPC error `-32602`, so an assistant reads why and corrects the call (MCP 2025-11-25). A value outside a closed list, such as an `action_propose` action that is not one, now lists the allowed values and names the nearest one. `arca call` prints such a failure as `{"code": "invalid_arguments", "message": ...}`. A call that names no tool, or a tool the server does not have, is still a JSON-RPC error.

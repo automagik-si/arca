@@ -251,6 +251,105 @@ impl StateChanger {
         self.wait_for(&envelope)
     }
 
+    /// Takes a snapshot of one stopped instance, named `snapshot`, and waits for its operation. For `service_update`:
+    /// the snapshot it can go back to. A project that forbids snapshots (a tenant's does, unless it allows them)
+    /// answers 403, which the caller sees as [`IncusError::Status`].
+    pub fn snapshot_instance(
+        &self,
+        seen: &InstanceState,
+        snapshot: &str,
+    ) -> Result<(), IncusError> {
+        self.allow(&seen.project)?;
+        let fresh = self.read(&seen.project, &seen.name)?;
+        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+            return Err(refused("the instance was recreated since it was read"));
+        }
+        if !plain_name(snapshot) {
+            return Err(refused("the snapshot name is not plain"));
+        }
+        let url = format!(
+            "/1.0/instances/{}/snapshots?project={}",
+            seen.name, seen.project
+        );
+        let envelope = checked_envelope(self.send(
+            "POST",
+            &url,
+            Some(&json!({ "name": snapshot, "stateful": false })),
+        )?)?;
+        self.wait_for(&envelope)
+    }
+
+    /// Puts one stopped instance back to the snapshot `snapshot` it holds: its root, its config and its devices, and
+    /// nothing else. The instance is read again first, and one that was recreated since `seen` is refused.
+    pub fn restore_snapshot(&self, seen: &InstanceState, snapshot: &str) -> Result<(), IncusError> {
+        self.allow(&seen.project)?;
+        let fresh = self.read(&seen.project, &seen.name)?;
+        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+            return Err(refused("the instance was recreated since it was read"));
+        }
+        if !fresh.is_stopped() {
+            return Err(refused("the instance is not stopped"));
+        }
+        if !plain_name(snapshot) {
+            return Err(refused("the snapshot name is not plain"));
+        }
+        let url = object_url(&seen.project, &seen.name)?;
+        let envelope =
+            checked_envelope(self.send("PUT", &url, Some(&json!({ "restore": snapshot })))?)?;
+        self.wait_for(&envelope)
+    }
+
+    /// Gives one stopped instance the root of another image, an OCI image by digest on a registry: Incus rebuilds the
+    /// root disk and keeps the config, the devices (a data volume among them) and the uuid. `source` must be exactly
+    /// the five fields of such an image. A registry that asks for a credential is named with it, in the address that is
+    /// sent and nowhere else, and the image Incus fetches then is told not to go back to that address by itself.
+    pub fn rebuild_from_registry(
+        &self,
+        seen: &InstanceState,
+        source: &Value,
+        registry: Option<&crate::write::RegistryCredential>,
+    ) -> Result<(), IncusError> {
+        let fresh = self.read(&seen.project, &seen.name)?;
+        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+            return Err(refused("the instance was recreated since it was read"));
+        }
+        if !fresh.is_stopped() {
+            return Err(refused("the instance is not stopped"));
+        }
+        if !crate::function_run::registry_source(source) {
+            return Err(refused(
+                "the source is not an image by digest on a registry",
+            ));
+        }
+        let mut sent = source.clone();
+        let address = registry
+            .and_then(|registry| registry.address(source["server"].as_str().unwrap_or_default()));
+        let with_credential = address.is_some();
+        if let Some(address) = address {
+            sent["server"] = json!(address);
+        }
+        let rebuilt = self.rebuild(&fresh.project, &fresh.name, &json!({ "source": sent }));
+        if with_credential {
+            let settled = self.fetched_with_credential(&fresh.project).map(|images| {
+                images
+                    .iter()
+                    .filter(|image| image.auto_update)
+                    .filter(|image| {
+                        self.image_auto_update_off(&fresh.project, &image.fingerprint)
+                            .is_err()
+                    })
+                    .count()
+            });
+            if settled != Ok(0) {
+                eprintln!(
+                    "arca: auto_update could not be turned off on the image {} was rebuilt from: Incus may ask its registry again by itself until the next sweep",
+                    fresh.name
+                );
+            }
+        }
+        rebuilt
+    }
+
     /// Whether the store the project reads holds an image with this fingerprint. For [`crate::function_run`] alone.
     pub(crate) fn image_present(
         &self,

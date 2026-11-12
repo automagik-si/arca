@@ -1100,6 +1100,46 @@ lock. Any reconciliation failure or partial plan run is a typed refusal naming w
 the approval is spent, so another try needs a new one. Secret files are removed only after full success. An adopted
 record is refused.
 
+### Updating a service to a new image digest
+
+`service_update` takes `{name, digest, timeoutSeconds?, tenant?}` and moves a running container service made from an
+image by digest (today `automagik-server`) to another digest of the same image in one call. It is a destructive
+verb (it takes the optional `confirm`), needs a `doctor` token and asks the owner for nothing; it works inside a
+tenant as outside one. There is no update path for `automagik-workspace` yet: it is a virtual machine, whose Docker
+pulls its own server image, and the verb refuses it. In order, each step a line in `service-updates.jsonl` in the
+state directory (an append-only file of JSON lines: a `begin`, one line per step, an `end`; never a secret):
+
+1. the instance is stopped, if it runs, and a snapshot of it, `pre-update-<time>`, is taken where the project allows
+   one. No project Arca makes does (each is restricted, and Incus answers that it does not allow snapshot creation),
+   so on a node as Arca makes it there is no snapshot, and the answer's `snapshot` is `null`;
+2. its root is rebuilt from `<repository>@<digest>`; Incus may take up to 10 minutes to fetch the image. Incus keeps
+   what is not the root: the config, the secrets, the firewall rules and the data volume (a template's `data`
+   path, `/data` for `automagik-server`). Whatever the old version wrote to its own root is gone;
+3. it is started;
+4. the health check, within `timeoutSeconds` (1 to 900, 120 when absent). The node can reach a service's port only
+   through a proxy, since the firewall opens nothing else to it. A service with a host port (`lan`) is tried
+   through it, on the node's loopback: the connection must stay open. A service whose first port is its droidd port
+   is tried at its address. Any other service must only stay running for 10 seconds;
+5. the new digest is written into the service's record, so a restart keeps it and `service_status` names it.
+
+A failure at any step puts the old version back: the snapshot is restored, or, with none, the root is rebuilt from
+the old digest; the old version is started if it was running before, given 30 seconds to answer, and the call is
+refused with code `rolled_back` and the failing step's words (and a note when the old version does not answer yet).
+When Incus could not fetch the new image, the old root was never taken away: if it cannot fetch the old one either,
+the old version is started as it is, and the refusal says so. If Incus does not finish a rebuild in time, nothing is
+rolled back, so as not to rebuild twice at once: the refusal is `update_unsettled`, and the same update may be asked
+for again once Incus is idle. If the old version cannot be put back, the refusal is `rollback_failed`, says so, and
+leaves the service stopped. A failure before anything is changed (the digest is malformed, the service is not made
+from an image by digest, its instance is not the one Arca created, it has never been started, the snapshot failed for
+a reason other than the project not allowing one) says "Nothing was changed". A call for the digest the service
+already runs changes nothing and answers `updated: false`. A service being updated refuses a second update until
+the first ends. The call is synchronous and can take several minutes: the journal keeps what it did.
+
+The data volume is the service's own and is never snapshotted or touched: a rollback leaves in it what the new
+version wrote, a migration for example, which the old version may not read. A virtual machine, a function and an
+adopted service are refused. Where a snapshot was taken it stays, named in the answer, for you to delete or restore
+by hand.
+
 ### Who may call what
 
 | Caller | Result |
@@ -1127,7 +1167,7 @@ The 0.1.0 release predates `x-arca-read-only-hint`, so its methods carry only `x
 
 `tools/call` answers a success with a short summary text block and `structuredContent` that carries the result. The summary of `watch_report`, `service_list` and `arca_status` is the answer in words, for a client that shows its model only text: each instance with its project, kind and status; each service with its template, state and address; the version, the mode, whether Incus answers and how long the node has run. The instance and service lists show their first fifty rows, then how many more. `structuredContent` carries the untrusted note when the verb is untrusted, and `truncated` only when the result was cut; `_meta` carries `droidd/untrusted` and `droidd/truncated`. A refusal is a JSON-RPC error with `data.refusal`. A tool-level failure that is not a refusal is `isError: true` with `<code>: <message>` and `_meta` `droidd/error`. Arguments the tool does not take are such a failure, so the model reads why and can correct the call (MCP 2025-11-25): `invalid_arguments: args: missing required field name`. A value outside a closed list names the list and, when one is close, the nearest value: `invalid_arguments: /action: not one of the allowed values; it is one of: service_create, ...; did you mean postgres_create?`. A call that names no tool, or a tool the server does not have, is still a JSON-RPC error.
 
-Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `service_import`, `service_release`, `gpu_detach`, `storage_add`, `snapshot_delete`, `instance_stop`, `instance_restart`, `function_remove`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
+Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `service_update`, `service_import`, `service_release`, `gpu_detach`, `storage_add`, `snapshot_delete`, `instance_stop`, `instance_restart`, `function_remove`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
 
 ### Refusals for want of room and for asking too often
 
@@ -3646,8 +3686,9 @@ install --replace` from a newer release. `service_status` answers both under `up
 key on any other row. Both are read from this node's own records and files: no registry is asked and nothing is
 written. Two digests carry no order, so `differs` never says which version is the newer one. A service made from a
 system image by an alias has no version of this kind and carries no `update` (`baseImage`, above, is what it has),
-and neither does an adopted instance. Today the only way to the template's version is `service_remove` and
-`service_create`: this only tells you that there is one.
+and neither does an adopted instance. For a container made from an image by digest, `service_update` moves it to another digest (see "Updating a service
+to a new image digest"); for a virtual machine the only way is `service_remove` and `service_create`. This only tells you that
+there is one.
 
 A virtual-machine template says where its version is with one key:
 

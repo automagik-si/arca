@@ -224,6 +224,8 @@ struct Shared {
     rebuilds: Mutex<BTreeMap<(String, String), Vec<String>>>,
     /// The instances whose rebuild from the store's copy is refused, and whether one from a registry is refused too.
     rebuild_refusals: Mutex<BTreeMap<(String, String), bool>>,
+    /// The snapshots each instance was restored to, in order.
+    restores: Mutex<BTreeMap<(String, String), Vec<String>>>,
     counter: AtomicU64,
     /// The `/1.0/resources` document the fake serves, when a test sets one.
     resources: Mutex<Option<Value>>,
@@ -422,6 +424,7 @@ impl Shared {
             exits: Mutex::new(BTreeMap::new()),
             rebuilds: Mutex::new(BTreeMap::new()),
             rebuild_refusals: Mutex::new(BTreeMap::new()),
+            restores: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
         }
@@ -484,6 +487,15 @@ impl FakeIncus {
     /// own copy of an image, `registry` for one that named a registry.
     pub fn rebuilds(&self, project: &str, name: &str) -> Vec<String> {
         lock(&self.shared.rebuilds)
+            .get(&(project.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The snapshots the instance `name` in `project` was restored to, in order. A restore changes nothing else in the
+    /// fake: it keeps no root, and its config and devices are what they were.
+    pub fn restores(&self, project: &str, name: &str) -> Vec<String> {
+        lock(&self.shared.restores)
             .get(&(project.to_string(), name.to_string()))
             .cloned()
             .unwrap_or_default()
@@ -2041,6 +2053,30 @@ fn put(
         return write_project(shared, store, index, &body, true);
     }
     let bad = |message: &str| (400, String::new(), error_envelope(400, message));
+    // A restore names a snapshot the instance holds and replaces nothing the fake keeps.
+    if let Some(Value::String(snapshot)) = body.get("restore") {
+        let held = Address {
+            kind: "snapshot",
+            project: address.project.clone(),
+            parent: address.name.clone(),
+            name: snapshot.clone(),
+        };
+        if store.find(&held).is_none() {
+            return (
+                404,
+                String::new(),
+                error_envelope(404, "snapshot not found"),
+            );
+        }
+        if text_of(&store.objects[index].body, "status") != "Stopped" {
+            return bad("the fake restores only a stopped instance");
+        }
+        lock(&shared.restores)
+            .entry((address.project.clone(), address.name.clone()))
+            .or_default()
+            .push(snapshot.clone());
+        return answered(shared, store, "instance", "PUT", Ok(()));
+    }
     let text_map = |key: &str| match body.get(key) {
         None => Some(Map::new()),
         Some(Value::Object(map)) if map.values().all(Value::is_string) => Some(map.clone()),
@@ -2639,6 +2675,16 @@ impl Store {
     /// Starts the instance at `index`. Each NIC on a network gets its MAC (a new one is kept in `volatile.<dev>.hwaddr`) and
     /// its IPv4: a device's `ipv4.address` pins its lease, and a MAC without a lease is leased a free address.
     fn start(&mut self, index: usize, seed: u64) {
+        // Incus records that the instance has run, as it does at every start.
+        if let Some(config) = self.objects[index]
+            .body
+            .get_mut("config")
+            .and_then(Value::as_object_mut)
+        {
+            config
+                .entry("volatile.last_state.power")
+                .or_insert_with(|| json!("RUNNING"));
+        }
         for (name, device) in nics(&self.objects[index].body) {
             let Some(network) = device.get("network").and_then(Value::as_str) else {
                 continue;
@@ -3208,11 +3254,19 @@ fn snapshot_or_backup(
     if store.restricted(&address.project)
         && !store.allows(&address.project, &format!("restricted.{kind}s"))
     {
-        return (
-            403,
-            String::new(),
-            error_envelope(403, &format!("Project restricted: {kind}s are forbidden")),
-        );
+        // As Incus answers it: a plain error, which its handler turns into a 500.
+        let message = if kind == "snapshot" {
+            format!(
+                "Project \"{}\" doesn't allow for snapshot creation",
+                address.project
+            )
+        } else {
+            format!(
+                "Project \"{}\" doesn't allow for backup creation",
+                address.project
+            )
+        };
+        return (500, String::new(), error_envelope(500, &message));
     }
     let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
         return (
