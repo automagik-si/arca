@@ -148,6 +148,9 @@ impl FakeState {
     }
 }
 
+/// The id map the fake gives a new function's container, in the text Incus keeps it in.
+const ID_MAP: &str = r#"[{"Isuid":true,"Isgid":false,"Hostid":1000000,"Nsid":0,"Maprange":1000000000},{"Isuid":false,"Isgid":true,"Hostid":1000000,"Nsid":0,"Maprange":1000000000}]"#;
+
 /// One request the fake received: its method and target as sent, and the status it answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedRequest {
@@ -207,6 +210,8 @@ struct Shared {
     host_interfaces: Mutex<Vec<HostInterface>>,
     host_netmasks: Mutex<BTreeMap<IpAddr, u8>>,
     operations_unreadable: AtomicBool,
+    /// Reads the fake answers badly: each a path prefix, how many reads are left, and what happens to them.
+    read_faults: Mutex<Vec<(String, u32, ReadFault)>>,
     /// The operations whose wait answers 404 while the listing still shows them running.
     waits_ended: Mutex<Vec<String>>,
     console: Mutex<BTreeMap<(String, String), String>>,
@@ -215,6 +220,10 @@ struct Shared {
     exit_plans: Mutex<BTreeMap<(String, String), (u32, String)>>,
     /// The exits armed by a start that has not ended yet.
     exits: Mutex<BTreeMap<(String, String), (u32, String)>>,
+    /// The rebuilds each instance took, in order: `store` for the store's copy, `registry` for a registry's.
+    rebuilds: Mutex<BTreeMap<(String, String), Vec<String>>>,
+    /// The instances whose rebuild from the store's copy is refused, and whether one from a registry is refused too.
+    rebuild_refusals: Mutex<BTreeMap<(String, String), bool>>,
     counter: AtomicU64,
     /// The `/1.0/resources` document the fake serves, when a test sets one.
     resources: Mutex<Option<Value>>,
@@ -298,12 +307,15 @@ enum Route {
     ListInstances,
     ListInstancesWithState,
     ProjectInstancesWithState(String),
+    /// One project's instances without their state: the `recursion=1` listing with a `project`.
+    ProjectInstances(String),
     ListPools,
     HostInterfaces,
     HostInterfaceState(String),
     PoolResources(String),
     NetworkLeases(String),
     InstanceState(Address),
+    InstanceRebuild(Address),
     Console(Address),
     InstanceSnapshots(Address),
     InstanceBackups(Address),
@@ -326,6 +338,7 @@ impl Route {
             }
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
             Route::InstanceState(_) => &["GET", "PUT"],
+            Route::InstanceRebuild(_) => &["POST"],
             Route::Console(_) => &["GET"],
             Route::InstanceSnapshots(_) => &["GET", "POST"],
             Route::InstanceBackups(_) => &["GET", "POST"],
@@ -398,10 +411,13 @@ impl Shared {
             host_interfaces: Mutex::new(Vec::new()),
             host_netmasks: Mutex::new(BTreeMap::new()),
             operations_unreadable: AtomicBool::new(false),
+            read_faults: Mutex::new(Vec::new()),
             waits_ended: Mutex::new(Vec::new()),
             console: Mutex::new(BTreeMap::new()),
             exit_plans: Mutex::new(BTreeMap::new()),
             exits: Mutex::new(BTreeMap::new()),
+            rebuilds: Mutex::new(BTreeMap::new()),
+            rebuild_refusals: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
         }
@@ -458,6 +474,32 @@ impl FakeIncus {
     /// Takes back [`FakeIncus::exit_after_start`]: the instance runs until it is stopped.
     pub fn run_until_stopped(&self, project: &str, name: &str) {
         lock(&self.shared.exit_plans).remove(&(project.to_string(), name.to_string()));
+    }
+
+    /// The rebuilds the instance `name` in `project` took, in order: `store:<fingerprint>` for one from the store's
+    /// own copy of an image, `registry` for one that named a registry.
+    pub fn rebuilds(&self, project: &str, name: &str) -> Vec<String> {
+        lock(&self.shared.rebuilds)
+            .get(&(project.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The store no longer holds the image of the instance `name` in `project`: a rebuild from its fingerprint is
+    /// refused, and one that names a registry fetches it again.
+    pub fn lose_image(&self, project: &str, name: &str) {
+        lock(&self.shared.rebuild_refusals).insert((project.to_string(), name.to_string()), false);
+    }
+
+    /// Every rebuild of the instance `name` in `project` is refused: the store's copy is gone and the registry does
+    /// not answer.
+    pub fn refuse_rebuild(&self, project: &str, name: &str) {
+        lock(&self.shared.rebuild_refusals).insert((project.to_string(), name.to_string()), true);
+    }
+
+    /// Takes back [`FakeIncus::lose_image`] and [`FakeIncus::refuse_rebuild`].
+    pub fn allow_rebuild(&self, project: &str, name: &str) {
+        lock(&self.shared.rebuild_refusals).remove(&(project.to_string(), name.to_string()));
     }
 
     /// Sets the raw console log a project's instance serves from `/console`.
@@ -583,6 +625,26 @@ impl FakeIncus {
     }
 
     /// Makes the operations listing answer 500 while `unreadable` is true.
+    /// Answers the next `times` GETs whose target starts with `path_prefix` with `status` and an error envelope, as an
+    /// Incus that fails a read does. The reads after them are answered as usual.
+    pub fn fail_reads(&self, path_prefix: &str, times: u32, status: u16) {
+        lock(&self.shared.read_faults).push((
+            path_prefix.to_string(),
+            times,
+            ReadFault::Status(status),
+        ));
+    }
+
+    /// Holds the next `times` GETs whose target starts with `path_prefix` for `delay` before it answers them as usual,
+    /// as an Incus that is slow to read a virtual machine's state does.
+    pub fn slow_reads(&self, path_prefix: &str, times: u32, delay: Duration) {
+        lock(&self.shared.read_faults).push((
+            path_prefix.to_string(),
+            times,
+            ReadFault::Slow(delay),
+        ));
+    }
+
     pub fn set_operations_unreadable(&self, unreadable: bool) {
         self.shared
             .operations_unreadable
@@ -1014,10 +1076,42 @@ fn console_body(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)> {
     }
 }
 
+/// What the fake does to a read it was told to answer badly.
+#[derive(Debug, Clone, Copy)]
+enum ReadFault {
+    /// It answers with this status and an error envelope.
+    Status(u16),
+    /// It waits this long, then answers as usual.
+    Slow(Duration),
+}
+
+/// The fault a GET of `target` meets, when one is left for it. One read is taken from the first fault that matches.
+fn take_read_fault(shared: &Shared, target: &str) -> Option<ReadFault> {
+    let mut faults = lock(&shared.read_faults);
+    let index = faults
+        .iter()
+        .position(|(prefix, left, _)| *left > 0 && target.starts_with(prefix.as_str()))?;
+    faults[index].1 -= 1;
+    Some(faults[index].2)
+}
+
 /// The status, the extra header lines and the envelope for one request.
 fn handle(shared: &Shared, request: &Request) -> (u16, String, Value) {
     if request.method.is_empty() {
         return (400, String::new(), error_envelope(400, "bad request"));
+    }
+    if request.method == "GET" {
+        match take_read_fault(shared, &request.target) {
+            Some(ReadFault::Status(status)) => {
+                return (
+                    status,
+                    String::new(),
+                    error_envelope(status, "the fake was told to fail this read"),
+                );
+            }
+            Some(ReadFault::Slow(delay)) => std::thread::sleep(delay),
+            None => {}
+        }
     }
     let route = parse(&request.target);
     let allowed: &[&str] = route.as_ref().map_or(&["GET"][..], Route::methods);
@@ -1101,9 +1195,13 @@ fn parse(target: &str) -> Option<Route> {
         ["instances"] if query_param(query, "recursion") == Some("2") => {
             Route::ProjectInstancesWithState(project.into())
         }
+        ["instances"] if query_param(query, "recursion") == Some("1") => {
+            Route::ProjectInstances(project.into())
+        }
         ["instances"] => Route::Collection(address("instance", "", "")),
         ["instances", name] => Route::Object(address("instance", "", name)),
         ["instances", name, "state"] => Route::InstanceState(address("instance", "", name)),
+        ["instances", name, "rebuild"] => Route::InstanceRebuild(address("instance", "", name)),
         ["instances", name, "console"] => Route::Console(address("instance", "", name)),
         ["instances", name, "snapshots"] => Route::InstanceSnapshots(address("snapshot", name, "")),
         ["instances", name, "snapshots", snapshot] => {
@@ -1204,6 +1302,28 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                 sync(Value::Array(
                     store
                         .instances_with_state()
+                        .into_iter()
+                        .filter(|row| row["project"] == project)
+                        .collect(),
+                ))
+            }
+        }
+        ("GET", Route::ProjectInstances(project)) => {
+            if project != "default"
+                && !store
+                    .objects
+                    .iter()
+                    .any(|object| object.kind == "project" && object.name == project)
+            {
+                (
+                    404,
+                    String::new(),
+                    error_envelope(404, "the project is not found"),
+                )
+            } else {
+                sync(Value::Array(
+                    store
+                        .bodies("instance")
                         .into_iter()
                         .filter(|row| row["project"] == project)
                         .collect(),
@@ -1321,6 +1441,7 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         )),
         ("GET", Route::InstanceState(address)) => instance_state(store, &address),
         ("PUT", Route::InstanceState(address)) => change_state(shared, store, request, &address),
+        ("POST", Route::InstanceRebuild(address)) => rebuild(shared, store, request, &address),
         ("GET", Route::InstanceSnapshots(address) | Route::InstanceBackups(address)) => {
             sync(Value::Array(
                 store
@@ -1415,6 +1536,19 @@ impl Store {
         alias: &str,
         cached: bool,
     ) -> String {
+        self.put_image_from(project, fingerprint, alias, cached, None)
+    }
+
+    /// [`Store::put_image`], with the server a fetched image came from: Incus keeps it, and the alias it was asked
+    /// for, in the image's own record.
+    fn put_image_from(
+        &mut self,
+        project: &str,
+        fingerprint: String,
+        alias: &str,
+        cached: bool,
+        server: Option<&str>,
+    ) -> String {
         let home = self
             .image_store(project)
             .unwrap_or_else(|| project.to_string());
@@ -1435,6 +1569,8 @@ impl Store {
                 body: json!({
                     "fingerprint": fingerprint, "project": home, "cached": cached,
                     "aliases": aliases, "type": "container",
+                    "auto_update": cached,
+                    "update_source": server.map(|server| json!({ "server": server, "alias": alias, "protocol": "oci" })),
                 }),
             });
         }
@@ -1614,7 +1750,26 @@ fn create(
         // The image is pulled from the server into the store the project reads, and kept there as a cached image.
         let alias = source.get("alias").and_then(Value::as_str).unwrap_or("");
         let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
-        store.put_image(&project, fingerprint, alias, true);
+        let (server, alias) = (server.to_string(), alias.to_string());
+        store.put_image_from(&project, fingerprint.clone(), &alias, true, Some(&server));
+        // A new instance says which image it was made from, as Incus writes it for every instance. The fake writes
+        // it for a function's, and for an instance whose image was fetched with a registry's credential: a service's
+        // view shows the key, and the suites that compare whole views were written without it. The id map Incus
+        // gives a new container to start with is written for a function's alone, for the same reason.
+        let credentialed = server
+            .strip_prefix("https://")
+            .is_some_and(|rest| rest.contains('@'));
+        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut) {
+            let function = config.contains_key("user.arca.function");
+            if credentialed || function {
+                config.insert("volatile.base_image".to_string(), json!(fingerprint));
+            }
+            if function {
+                config.insert("volatile.idmap.base".to_string(), json!("0"));
+                config.insert("volatile.idmap.next".to_string(), json!(ID_MAP));
+                config.insert("volatile.last_state.idmap".to_string(), json!("[]"));
+            }
+        }
     }
     let parent = address.parent.clone();
     if matches!(kind, "volume" | "bucket") && !store.pools.iter().any(|(pool, _)| *pool == parent) {
@@ -1849,6 +2004,19 @@ fn patch(
             String::new(),
             error_envelope(400, "patch rejected by test"),
         );
+    }
+    // An image takes one change here: whether Incus goes back to its registry for it by itself.
+    if address.kind == "image" {
+        let Some(index) = store.find(address) else {
+            return (404, String::new(), error_envelope(404, "not found"));
+        };
+        if let Ok(sent) = serde_json::from_slice::<Value>(&request.body)
+            && let Some(auto) = sent.get("auto_update").and_then(Value::as_bool)
+            && let Some(body) = store.objects[index].body.as_object_mut()
+        {
+            body.insert("auto_update".to_string(), json!(auto));
+        }
+        return (200, String::new(), sync_envelope(Value::Null));
     }
     let (index, changes) = match written(store, request, address) {
         Ok(found) => found,
@@ -2721,6 +2889,105 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
     )
 }
 
+/// Rebuilds a stopped instance's root from an image, as an operation, and records which image the request named: the
+/// store's copy by fingerprint (`store`) or a registry's by alias (`registry`). A running instance is refused, and
+/// so is what a test set with [`FakeIncus::lose_image`] or [`FakeIncus::refuse_rebuild`]. The fake keeps no root; a
+/// rebuild from a registry leaves the image's record in the store, as a fetch does.
+fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Address) -> Answer {
+    let bad = |message: &str| (400, String::new(), error_envelope(400, message));
+    let Some(index) = store.find(address) else {
+        return (404, String::new(), error_envelope(404, "not found"));
+    };
+    let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
+        return bad("the body is not a JSON object");
+    };
+    if text_of(&store.objects[index].body, "status") != "Stopped" {
+        return bad("Instance must be stopped to be rebuilt");
+    }
+    let key = (address.project.clone(), address.name.clone());
+    let local = sent
+        .get("source")
+        .and_then(|source| source.get("fingerprint"))
+        .is_some();
+    let refusal = lock(&shared.rebuild_refusals).get(&key).copied();
+    match (local, refusal) {
+        (true, Some(_)) => {
+            return answered(
+                shared,
+                store,
+                "instance",
+                "PUT",
+                Err((400, "Image not provided for instance rebuild".to_string())),
+            );
+        }
+        (false, Some(true)) => {
+            return answered(
+                shared,
+                store,
+                "instance",
+                "PUT",
+                Err((400, "Failed getting remote image info".to_string())),
+            );
+        }
+        _ => {}
+    }
+    let named = sent
+        .get("source")
+        .and_then(|source| source.get("fingerprint"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || {
+                // A registry named with a credential in its address is told from one named without.
+                let with_credential = sent
+                    .get("source")
+                    .and_then(|source| source.get("server"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|server| server.contains('@'));
+                if with_credential {
+                    "registry+credential".to_string()
+                } else {
+                    "registry".to_string()
+                }
+            },
+            |fingerprint| format!("store:{fingerprint}"),
+        );
+    lock(&shared.rebuilds).entry(key).or_default().push(named);
+    // A rebuild takes away the id map the container would start with next, as Incus does: one that has run starts
+    // from the map it last ran with, and one that never ran has none left.
+    if let Some(config) = store.objects[index]
+        .body
+        .get_mut("config")
+        .and_then(Value::as_object_mut)
+    {
+        config.remove("volatile.idmap.next");
+        config.remove("volatile.last_state.idmap");
+    }
+    // A rebuild that names a registry fetches the image again: Incus makes its record anew, with the address it was
+    // asked at and `auto_update` on, and the instance names it.
+    if let Some(source) = sent.get("source").filter(|_| !local)
+        && let Some(server) = source.get("server").and_then(Value::as_str)
+    {
+        let alias = source.get("alias").and_then(Value::as_str).unwrap_or("");
+        let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
+        store.put_image_from(
+            &address.project,
+            fingerprint.clone(),
+            alias,
+            true,
+            Some(server),
+        );
+        if let Some(config) = store.objects[index]
+            .body
+            .get_mut("config")
+            .and_then(Value::as_object_mut)
+            && config.contains_key("volatile.base_image")
+        {
+            config.insert("volatile.base_image".to_string(), json!(fingerprint));
+        }
+    }
+    answered(shared, store, "instance", "PUT", Ok(()))
+}
+
 /// Starts, stops or restarts an instance from a PUT of its state, as an operation. A stop or a restart of a hung instance fails
 /// inside its operation and leaves it running, unless it is forced and only the graceful stop hangs.
 fn change_state(
@@ -2741,6 +3008,31 @@ fn change_state(
     match text_in(&sent, "action").as_str() {
         "start" if running => bad("The instance is already running"),
         "start" => {
+            // A container the fake gave an id map starts from the next one, or from the one it last ran with. A
+            // rebuild takes the next one away, so a container that was rebuilt before it ever started has neither:
+            // Incus refuses its start, and leaves an empty map behind.
+            if let Some(config) = store.objects[index]
+                .body
+                .get_mut("config")
+                .and_then(Value::as_object_mut)
+                && config.contains_key("volatile.idmap.base")
+            {
+                let map = ["volatile.idmap.next", "volatile.idmap.current"]
+                    .into_iter()
+                    .filter_map(|key| config.get(key).and_then(Value::as_str))
+                    .find(|map| *map != "[]")
+                    .map(str::to_string);
+                let Some(map) = map else {
+                    config.insert("volatile.idmap.current".to_string(), json!("[]"));
+                    let failure = Err((
+                        400,
+                        "No ID map found for unprivileged container".to_string(),
+                    ));
+                    return answered(shared, store, "instance", "PUT", failure);
+                };
+                config.insert("volatile.idmap.current".to_string(), json!(map));
+                config.insert("volatile.last_state.power".to_string(), json!("RUNNING"));
+            }
             store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
             let key = (address.project.clone(), address.name.clone());
             if let Some(plan) = lock(&shared.exit_plans).get(&key).cloned() {
@@ -2757,6 +3049,14 @@ fn change_state(
             }
             if let Some(body) = store.objects[index].body.as_object_mut() {
                 body.insert("status".to_string(), json!("Stopped"));
+            }
+            if let Some(config) = store.objects[index]
+                .body
+                .get_mut("config")
+                .and_then(Value::as_object_mut)
+                && config.contains_key("volatile.last_state.power")
+            {
+                config.insert("volatile.last_state.power".to_string(), json!("STOPPED"));
             }
             lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));
             answered(shared, store, "instance", "PUT", Ok(()))

@@ -25,6 +25,9 @@ use crate::{Chosen, Failure, Flags, INSTALL_UNIT, Origin, closest, parse_flags};
 
 /// The node a call addresses, for the next step a refusal names: every command in a hint names this node's own config, so
 /// following it never acts on another node.
+/// What a printed `token mint` line says where the person names the file the token is written to.
+const TOKEN_FILE: &str = "TOKEN_FILE";
+
 pub(crate) struct Addressed {
     /// The config that names the node.
     config: String,
@@ -52,8 +55,15 @@ impl Addressed {
     /// How a token of `scope` is made for this node into `out`, and the step that makes a running node take it: `token
     /// mint` writes the hash and sends no signal.
     fn mint(&self, scope: &str, out: &str) -> String {
+        // The values a person fills in are words in capitals, with what goes in their place: a shell reads `<...>`
+        // as a redirect when the line is pasted.
+        let placed = if out == TOKEN_FILE {
+            "a name for the token in place of TOKEN_ID, and the path to write it to in place of TOKEN_FILE"
+        } else {
+            "a name for the token in place of TOKEN_ID"
+        };
         format!(
-            "arca token mint --scope {scope} --id <id> --out {out} --config {}. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}",
+            "arca token mint --scope {scope} --id TOKEN_ID --out {out} --config {} ({placed}). A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}",
             self.config,
             self.reload()
         )
@@ -71,7 +81,7 @@ impl Addressed {
                 self.mint("viewer", &file.path.display().to_string())
             ),
             Origin::Flag | Origin::Variable => {
-                format!("mint one with: {}", self.mint("viewer", "<file>"))
+                format!("mint one with: {}", self.mint("viewer", TOKEN_FILE))
             }
         }
     }
@@ -111,7 +121,7 @@ pub fn call(args: &[String]) -> Result<Option<Value>, Failure> {
     let names = || verbs().iter().map(|verb| verb.name);
     let Some((name, rest)) = args.split_first() else {
         return Err(Failure::Usage(format!(
-            "call needs a verb: arca call <verb>. The verbs are: {}",
+            "call needs a verb: arca call VERB, with one of these in place of VERB: {}",
             names().collect::<Vec<_>>().join(", ")
         )));
     };
@@ -319,7 +329,7 @@ fn accepted(status: u16, name: &str, node: &Addressed) -> Result<(), Failure> {
         401 => Err(Failure::Unauthorized(format!(
             "the node does not accept this token: it was minted after the node last read its tokens, it was revoked, or it is another node's. If it was just minted, have the node read it: {}. For a new one: {}",
             node.reload(),
-            node.mint("viewer", "<file>")
+            node.mint("viewer", TOKEN_FILE)
         ))),
         403 if node.peer => Err(Failure::Unauthorized(format!(
             "the token's scope may not make this call on the peer: ask the peer's owner for a token of a higher scope, or one whose --tools list names {name}"
@@ -330,7 +340,7 @@ fn accepted(status: u16, name: &str, node: &Addressed) -> Result<(), Failure> {
                 .unwrap_or("operator");
             Err(Failure::Unauthorized(format!(
                 "the token's scope may not make this call: {name} needs a token of the {scope} scope, and a token minted with --tools must list it. An owner mints one with: {}",
-                node.mint(scope, "<file>")
+                node.mint(scope, TOKEN_FILE)
             )))
         }
         _ => Err(Failure::Runtime(

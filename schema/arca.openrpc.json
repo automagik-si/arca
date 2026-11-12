@@ -2652,6 +2652,15 @@
           }
         },
         {
+          "name": "templateDigest",
+          "required": false,
+          "schema": {
+            "description": "Filled in by the node with the template: SHA-256, in hex, of the template's file and of each script it names. The create runs only while the template on the node is still exactly that one. A caller leaves it out.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
           "name": "tenant",
           "required": false,
           "schema": {
@@ -3231,6 +3240,16 @@
           }
         },
         {
+          "name": "image",
+          "required": false,
+          "schema": {
+            "description": "Filled in by the node when a create is proposed: the image the template names, <image>@sha256:<digest> when it gives a digest and the bare name when it gives none; a virtual machine that names a version adds \" running <version>\". The owner's card shows it and the approval binds it. A caller leaves it out; one that states it must state the node's own.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
           "name": "kernelAccess",
           "required": false,
           "schema": {
@@ -3259,6 +3278,16 @@
           }
         },
         {
+          "name": "registry",
+          "required": false,
+          "schema": {
+            "description": "Only for an image on a registry this node holds a credential for (registry_secret_set): that registry's address. A proposal made with action_propose fills it in, so the owner's card says that the image is fetched with the credential and that Incus then keeps it with the image; a caller has no need to state it. Such a create runs only from an approved proposal.",
+            "maxLength": 128,
+            "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?$",
+            "type": "string"
+          }
+        },
+        {
           "name": "settings",
           "required": false,
           "schema": {
@@ -3272,6 +3301,15 @@
           "schema": {
             "description": "Optional. Absent or true: the service is started once it is created, as without the field. A container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets, are created stopped whatever this says, and the answer's stoppedBecause says why. False: it is created stopped, the answer's state is \"stopped\", and its create carries no boot.autostart, so a host restart does not boot it before its first instance_start and afterwards restores the state it was in. service_secret_set and service_connect then apply to it, and instance_start starts it for the first time: a container with every secret and link in its environment. A virtual machine's secrets are never in its environment: instance_start writes them into the guest as files once it has booted, in a tenant's machine as in one of the node's own.",
             "type": "boolean"
+          }
+        },
+        {
+          "name": "templateDigest",
+          "required": false,
+          "schema": {
+            "description": "Filled in by the node when a create is proposed: SHA-256, in hex, of the template's file and of each script it names, as the node holds them then. The create runs only while the template on the node is still exactly that one. A caller leaves it out; one that states it must state the node's own.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
           }
         },
         {
@@ -3325,8 +3363,18 @@
               "type": "array"
             },
             "ipv4": {
-              "description": "Its fixed address on the service bridge.",
+              "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: it has none now.",
               "maxLength": 15,
+              "type": "string"
+            },
+            "ipv4In": {
+              "const": "state",
+              "description": "service_list only, on a virtual machine on a host bridge: its address is not in its record and exists only in its live state, which the list does not read. service_status of it reads it.",
+              "type": "string"
+            },
+            "ipv4Problem": {
+              "description": "service_status only, on a running virtual machine on a host bridge whose live state could not be read: why, in words. ipv4 is then empty because it was not read, and every other field is as usual.",
+              "maxLength": 400,
               "type": "string"
             },
             "kernelAccess": {
@@ -3581,8 +3629,18 @@
                     "type": "array"
                   },
                   "ipv4": {
-                    "description": "Its fixed address on the service bridge.",
+                    "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: it has none now.",
                     "maxLength": 15,
+                    "type": "string"
+                  },
+                  "ipv4In": {
+                    "const": "state",
+                    "description": "service_list only, on a virtual machine on a host bridge: its address is not in its record and exists only in its live state, which the list does not read. service_status of it reads it.",
+                    "type": "string"
+                  },
+                  "ipv4Problem": {
+                    "description": "service_status only, on a running virtual machine on a host bridge whose live state could not be read: why, in words. ipv4 is then empty because it was not read, and every other field is as usual.",
+                    "maxLength": 400,
                     "type": "string"
                   },
                   "kernelAccess": {
@@ -3851,8 +3909,18 @@
               "type": "array"
             },
             "ipv4": {
-              "description": "Its fixed address on the service bridge.",
+              "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: it has none now.",
               "maxLength": 15,
+              "type": "string"
+            },
+            "ipv4In": {
+              "const": "state",
+              "description": "service_list only, on a virtual machine on a host bridge: its address is not in its record and exists only in its live state, which the list does not read. service_status of it reads it.",
+              "type": "string"
+            },
+            "ipv4Problem": {
+              "description": "service_status only, on a running virtual machine on a host bridge whose live state could not be read: why, in words. ipv4 is then empty because it was not read, and every other field is as usual.",
+              "maxLength": 400,
               "type": "string"
             },
             "kernelAccess": {
@@ -4265,8 +4333,18 @@
                   "type": "array"
                 },
                 "ipv4": {
-                  "description": "Its fixed address on the service bridge.",
+                  "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: it has none now.",
                   "maxLength": 15,
+                  "type": "string"
+                },
+                "ipv4In": {
+                  "const": "state",
+                  "description": "service_list only, on a virtual machine on a host bridge: its address is not in its record and exists only in its live state, which the list does not read. service_status of it reads it.",
+                  "type": "string"
+                },
+                "ipv4Problem": {
+                  "description": "service_status only, on a running virtual machine on a host bridge whose live state could not be read: why, in words. ipv4 is then empty because it was not read, and every other field is as usual.",
+                  "maxLength": 400,
                   "type": "string"
                 },
                 "kernelAccess": {
@@ -4681,8 +4759,8 @@
           "name": "value",
           "required": true,
           "schema": {
-            "description": "The secret, 8 to 4096 characters.",
-            "maxLength": 4096,
+            "description": "The secret. A container's is one line of 8 to 4096 characters without control characters: it is an environment value, so a line break at its end is refused. A virtual machine's is a file in its guest and is stored as given, with the line break at its end when it has one (a key file read whole): 8 to 4096 characters not counting that one line break, with line breaks and no other control character, each carriage return and line feed pair stored as one line feed.",
+            "maxLength": 4097,
             "minLength": 8,
             "type": "string"
           }
@@ -7948,6 +8026,16 @@
           }
         },
         {
+          "name": "registry",
+          "required": false,
+          "schema": {
+            "description": "Only for an image on a registry this node holds a credential for (registry_secret_set): that registry's address. A proposal made with action_propose fills it in, so the owner's card says that the image is fetched with the credential and that Incus then keeps it with the image; a caller has no need to state it. Such a create runs only from an approved proposal.",
+            "maxLength": 128,
+            "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?$",
+            "type": "string"
+          }
+        },
+        {
           "name": "secrets",
           "required": false,
           "schema": {
@@ -7989,6 +8077,12 @@
             },
             "env": {
               "type": "object"
+            },
+            "fingerprint": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "image": {
               "type": "string"
@@ -8081,7 +8175,7 @@
           "type": "object"
         }
       },
-      "summary": "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
+      "summary": "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container, on its image's own root, with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -8165,7 +8259,7 @@
           "name": "value",
           "required": true,
           "schema": {
-            "description": "The secret: one line of 8 to 4096 characters, without control characters.",
+            "description": "The secret: one line of 8 to 4096 characters, without control characters. Each run reads it as an environment value, so a line break at its end is refused.",
             "maxLength": 4096,
             "minLength": 8,
             "type": "string"
@@ -8228,6 +8322,12 @@
                   },
                   "env": {
                     "type": "object"
+                  },
+                  "fingerprint": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "image": {
                     "type": "string"
@@ -8490,6 +8590,34 @@
                     "null"
                   ]
                 },
+                "root": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "new",
+                        "store",
+                        "registry"
+                      ],
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "rootImage": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "rootMs": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "run": {
                   "description": "A run's id: fr-, the time it began in milliseconds, and a number.",
                   "pattern": "^fr-[0-9]{1,16}-[0-9]{1,12}$",
@@ -8595,6 +8723,34 @@
                       "null"
                     ]
                   },
+                  "root": {
+                    "anyOf": [
+                      {
+                        "enum": [
+                          "new",
+                          "store",
+                          "registry"
+                        ],
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "rootImage": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "rootMs": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
                   "run": {
                     "description": "A run's id: fr-, the time it began in milliseconds, and a number.",
                     "pattern": "^fr-[0-9]{1,16}-[0-9]{1,12}$",
@@ -8642,12 +8798,150 @@
           "type": "object"
         }
       },
-      "summary": "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. With run, that one run and the end of its output, when it is still kept.",
+      "summary": "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. root says what its root was: new, as its create made it, for a function that had never started; store, rebuilt from the node's own copy of the image; or registry, rebuilt from the image fetched again. rootImage is that image's fingerprint, for new and for store. With run, that one run and the end of its output, when it is still kept.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
+    },
+    {
+      "name": "registry_secret_set",
+      "params": [
+        {
+          "name": "password",
+          "required": true,
+          "schema": {
+            "description": "The password or token: 8 to 4096 of letters, digits and - . _ ~. One that can only read, and only what this node pulls.",
+            "maxLength": 4096,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9._~-]+$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "server",
+          "required": true,
+          "schema": {
+            "description": "The registry's address: https://<host>, with an optional :<port> and nothing after it.",
+            "maxLength": 128,
+            "pattern": "^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "username",
+          "required": true,
+          "schema": {
+            "description": "The user name the registry asks for.",
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "removed": {
+              "type": "boolean"
+            },
+            "server": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "server"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Set the credential of a registry that asks for one before it gives an image: its address (https://<host>), a user name and a password. Write-only: no tool, log, record or card shows it again. From then on every image this node's own projects fetch from that registry is fetched with it; nothing in a tenant is. Incus keeps the credential with each image it fetched, for as long as it keeps the image, and whoever may use Incus on this machine can read it there: set only a credential that can read, and only what this node pulls. The password is 8 to 4096 of letters, digits and - . _ ~.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "registry_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "registries": {
+              "items": {
+                "properties": {
+                  "server": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "server"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "registries"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The registries this node holds a credential for, by address. Never a user name or a password.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "registry_secret_remove",
+      "params": [
+        {
+          "name": "server",
+          "required": true,
+          "schema": {
+            "description": "The registry's address: https://<host>, with an optional :<port> and nothing after it.",
+            "maxLength": 128,
+            "pattern": "^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "removed": {
+              "type": "boolean"
+            },
+            "server": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "server"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Remove the credential this node holds for a registry. Images already fetched stay, and Incus still holds the credential with each of them until that image is removed with its last function or service; the next fetch from that registry is made without a credential.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
     }
   ],
   "openrpc": "1.3.2",

@@ -88,7 +88,7 @@ node takes a new token after `arca token reload` or a restart.
 | `arca watch --once --json [--config <file>]` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
 | `arca store check [--config <file>]` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
-| `arca templates install [--config <file>] [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
+| `arca templates install [--config <file>] [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept", "replaced" }` as JSON. A file that is an earlier release's own, byte for byte, is brought up to this release's and named under `replaced`; any other file that differs is the owner's edit and is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> [--config <file>]` / `remove --name <n> [--config <file>]` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve [--config <file>]` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan and two questions; it writes the config's missing keys after a yes, and ends in five lines: what changed, who does not wait for the page, the one next step, where a database comes from, and one pointer to the rest. See "Turning on changes" |
@@ -467,6 +467,14 @@ and holds no record answers an empty list.
 
 **What this step does not do:**
 
+- It does not make every shipped template start from the page alone. A template that makes every secret it needs
+  starts once its card is approved: `postgres-autopg`, `nats`, `omni-api` and `automagik-server`. A template that
+  needs a secret of the owner's is created stopped until it is set: `cloudflare-tunnel` (`TUNNEL_TOKEN`), the
+  runner pools and `automagik-workspace` (their tokens and keys). Omni starts, and its Telegram and WhatsApp tools
+  need `telegram_bot_token` and `whatsapp_phone_number`. `automagik` needs an image built from a checkout before it
+  can be created, and its `tailscale_authkey` before it can be published. `service_secret_set` cannot be proposed, so it needs a `doctor` token, which changes
+  things with no card and no passkey: mint one for that step and revoke it after, or leave those templates until
+  setting a secret can go through the page.
 - It does not enrol a passkey. The owner does, on the page, with a setup code from the node's own screen or from
   `arca setup-code`; see "The page on this machine alone".
 - The page it names is the page of one machine, for a machine where every account is trusted. Approving from a
@@ -478,7 +486,7 @@ and holds no record answers an empty list.
   itself at create (32 letters and digits, stored as the service's `POSTGRES_PASSWORD` secret and never shown), so
   the approved create starts by itself, and a proposed `service_connect` gives the linked service its
   `DATABASE_URL`. No `service_secret_set` is needed, which matters because that verb cannot be proposed and needs a
-  `doctor` token. See "A node set up before the template made its password" below for an older node. No call
+  `doctor` token. See "Templates an earlier release installed" below for an older node. No call
   chooses the image: a `doctor` or `operator` token's own `postgres_create` runs without a card, as its
   `service_create` of that template does. It sets no `kernel.vmLimits`, so no virtual machine is created.
   Tenants, adoption and import are not turned on. A node that may change things also runs its snapshot writer
@@ -565,6 +573,12 @@ The file name is `<id>.hash`, and the id is 1 to 64 lowercase letters, digits or
 and `operator`. The `tools=` line is optional; without it the token reaches every verb its scope admits, and with it the token
 reaches only those named tools. A tool above the scope is refused at mint, so the list only narrows.
 
+One id is no token's: `owner-approval`, the name an action runs under once the owner approved it. `arca token mint`
+refuses it. A release before this one did not, so a file `owner-approval.hash` may exist: the node starts and reads
+every other token, leaves that file out, and writes one line each time it reads its tokens ("token file
+owner-approval.hash is ignored: ..."). Its secret is refused as any unknown token is. Remove the file with `arca
+token revoke owner-approval`.
+
 ### Modes and the umask
 
 **The token directory must be mode 0700 or 0500.** The server refuses any directory with a group or other write bit, and it
@@ -638,14 +652,37 @@ images and vendored npm lockfile. Five of them, `workspace-vm`, `github-runner-p
 virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners", "A pool
 of GitLab runners" and "An Automagik workspace in its own virtual machine").
 
-**A node set up before the template made its password.** Up to 0.12.0 the shipped `postgres-autopg` template
-declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped until a `doctor` token set the secret.
-`arca init` and `arca templates install` keep a template that is already installed and differs, so such a node
-still has the old one. `arca templates install --replace --config <file>` installs the shipped one; it overwrites
-every shipped template you edited, and names the node first. Nothing changes for a `postgres-autopg` service that
-already exists: a password that is stored stays the one used, and none is made over it. A service that was created
+**Templates an earlier release installed.** A release may change a shipped template: up to 0.12.0, for one, the
+shipped `postgres-autopg` template declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped
+until a `doctor` token set the secret. A node keeps no such template by accident. `arca templates install`, which
+`arca init --enable-changes` also runs, compares each installed file with the files earlier releases shipped (the
+program holds their SHA-256 hashes):
+
+- a file that is an earlier release's own, byte for byte, is replaced with this release's and named under
+  `replaced`; `arca init` names those in one line before its report. Nobody edited it, so nothing is lost;
+- a file that matches no release is the owner's edit. It is kept, under `kept`, as before, and only `--replace`
+  overwrites it (that flag names the node first);
+- a template and the script it reads move together: where one of the two is edited, the other is kept as it is too,
+  though it is an earlier release's, so a new template is never paired with a script it was not shipped with.
+
+The installer runs this step on an upgrade (`sh install.sh` on a machine that has Arca), for the node it runs as
+a service and only where templates are already installed: a node that only looks has none and gets none. Its
+report names what it brought up to this release, and what it kept because it was edited, with the one command that
+replaces those (`arca templates install --replace --config <file>`). Where the run puts an older program over a
+newer one (`--version`), the files it keeps may be the newer release's own: the report says so and gives no command
+to replace them. The step writes every file before it puts any in place; if it stops between two files, its words
+name what it had already put in place, and running it again finishes. For a node started any other way, run `arca
+templates install --config <file>` once after the upgrade, or `arca init --enable-changes` again; neither needs
+`--replace` for a template nobody edited.
+
+What a replaced template changes is the next create. A create that was proposed before the replacement and still
+waits is not made from the new file: its card bound the content of the template it showed, so approving it is
+refused and nothing is created; propose it again (see "What the owner saw is what is created"). `arca init` and the
+installer say so beside the names they replaced. Nothing changes for a service that already exists: a
+`postgres-autopg` service keeps the password that is stored, and none is made over it. One that was created
 stopped with no password gains none by itself either: set it with `service_secret_set`, or remove the service and
-create it again from the new template.
+create it again from the new template. A runner pool reads its script when its virtual machine is created, so a
+pool that runs keeps the script it has.
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
 script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `github-runner-pool.sh` for
@@ -656,6 +693,24 @@ dashes and underscores, not starting with a dot, so no path. A template whose sc
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.
+
+A local image may be pinned: a `digest` (`sha256:` and 64 lowercase hex digits, the image's Incus fingerprint) beside
+`local:<alias>`, in a container template or a virtual machine's. Without it the alias is trusted for whatever image
+stands under it. With it the fingerprint decides, and the alias is only the name the image is looked for under:
+
+- `service_create` refuses, before anything is created, when the image under the alias has another fingerprint. The
+  refusal gives both: `its image <alias> is pinned to sha256:<a>, and the image under that alias in the service project
+  arcak-svc is sha256:<b>`. An approved create is held to it like any other, and a create in a tenant is checked
+  against the tenant's own project.
+- It also refuses when the alias is missing, and when the project's images cannot be read: a pin that cannot be checked
+  is not met. On a node with no service yet the service project does not exist, so no image can be in it; the refusal
+  says so and to create another service first.
+- The instance is made from the pinned image: Incus is given the fingerprint, and with a fingerprint Incus never looks
+  the alias up.
+- The owner's card shows the pinned image in its `Image` row, as `local:<alias>@sha256:<fingerprint>`, and the
+  approval binds it with the rest of the template (see "What the owner saw is what is created"). An unpinned local
+  image is shown as `local:<alias>` with the words that say it has no digest.
+- A digest in upper case, or one that is not 64 hex digits, is refused when the template is read.
 
 **Creating a service stopped.** A secret (`service_secret_set`) and a link (`service_connect`) reach a container's
 environment at its next start, not while it runs. A service that is started as it is created therefore boots once
@@ -770,11 +825,11 @@ is the service that `service_create` makes from the node's `postgres-autopg` tem
 - Its name must be one no database and no service holds.
 - A token with a tool list needs `service_create` in it beside `postgres_create`: the database is a service.
 
-A proposal is given the template's name and the image it pins when it is made. The card shows the image by digest,
-the template and a `Made as` row, which says that the template generates the password only when it does, and the
-approval binds the image and the template: if the template on the node names another image when the owner
-approves, the create is refused and nothing is made; propose it again. The card binds the image, not the template's
-entrypoint script, which is the node's own file in its state directory.
+A proposal is given the template's name, the image it pins and the fingerprint of the template's content when it is
+made. The card shows the image by digest, the template, a `Made as` row, which says that the template generates the
+password only when it does, and last a `Template content` row. The approval binds all of it: if the template on the
+node is another one when the owner approves (another image, or an edit of the script that opens the database), the
+create is refused and nothing is made; propose it again. See "What the owner saw is what is created".
 
 If the template is not installed, the create and the proposal are refused in words that name `arca templates
 install`. An image or a template stated in a call must be exactly the node's own, or the call is refused; the
@@ -1107,6 +1162,45 @@ in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, 
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
+
+### When Incus does not answer, and when the answer is "internal"
+
+Every service verb, a read too, first asks Incus for the node's instances. That listing holds each instance's status,
+config and devices and is answered at once. It does not ask for an instance's **live state**, which for a running
+virtual machine Incus takes from the machine's guest agent: a machine that runs many containers of its own can take
+most of the 10 seconds a read is given, and a listing with every instance's state is as slow as the slowest of them.
+Only three things read live state:
+
+- `service_status` of a virtual machine **on a host bridge**, which runs: its address is given by that network and
+  is in no record, so this one call reads the state of that one instance. When Incus does not answer in time the
+  call still answers, with `ipv4` empty and `ipv4Problem` saying why. `service_list` reads no state: such a machine's
+  row has `ipv4` empty and `ipv4In: "state"`, which says the address is there to be read and is not "none".
+- `service_create` and `function_create`, and `tenant_create`: a new instance's address, MAC or block must not be one
+  that an instance holds live without a record of it.
+
+A read that failed fast (the socket was not reached, or Incus answered with a server error) is made once more after a
+fifth of a second, inside the same 10 seconds. One that got no answer by its deadline is not made again. When the
+listing still fails, and when one of the reads a create makes for an address, for its project or for its new instance
+fails, the call is refused in words, with a code of its own in `data.refusal`:
+
+| Code | What happened | What to do |
+|---|---|---|
+| `incus_unavailable` | Incus did not answer within the 10 seconds, could not be reached on its socket, or answered with a server error (status 500 and above). | Read the sentence. When it says nothing was changed, nothing is wrong with the request: make it again (an approved action is proposed again, since its approval was used). When it says a create or an import went through, or that an instance may exist, do NOT make it again: look with `service_status`, `service_list` or `function_list`, which the sentence names. |
+| `incus_answer` | Incus answered with another status, with more than this node reads, or with something that is not the JSON it expects. | Asking again is likely to answer the same: look at Incus. |
+| `state_not_saved` | The kernel could not save the change as the node's next state. The service's record is as it was. | The node's log has the reason; make the request again once it is fixed. |
+
+The sentence says what was being read and for which service, and what the call had changed by then ("Nothing was
+changed.", or that a create did go through). It never holds Incus's own text.
+
+`internal: the tool failed` is left for a fault of Arca's own: a handler that panicked, an answer that does not fit
+the verb's schema, or a failure a handler keeps to itself. A few failures that could be said in words are still among
+them: the kernel refusing to save a create's own state, and the read of the host's addresses a function with
+destinations makes. The caller is told no more than "internal". The node's log gets one line for each, with the verb
+and a reason the server wrote (it can name a file of the node or a service, and never an argument of the call):
+
+```
+arca: service_status was answered "internal: the tool failed": the kernel could not complete the call
+```
 
 ### Protocol versions
 
@@ -1721,6 +1815,98 @@ record. A proposal cannot choose a container image: `postgres_create` uses the i
 template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is
 refused (see "A database"). `service_create` names a template from the kernel's catalog, whose name the schema constrains;
 its card has a `Start` row whenever the service will be created stopped, with the reason, so the owner approves a stopped service knowingly.
+
+**What the owner saw is what is created.** When a `service_create` or a `postgres_create` is proposed, the node
+reads the template and gives the proposal two things, which no caller gives:
+
+- `image`: the image the template names. The card's `Image` row shows it: `<image>@sha256:<digest>` when the template
+  gives a digest. When it gives none the row says so: `images:debian/13 (no digest: Incus takes what that name gives
+  when the service is created)`. For a virtual machine that names the version it runs, the row names the machine's
+  own system image first and then `running <version>`.
+- `templateDigest`: a fingerprint (SHA-256) of the template's file and of each script it names. The card's last row,
+  `Template content`, shows it whole, with the words "Arca creates this only if the template on the node is still
+  exactly this one".
+
+The approved create reads the template once and is made from that read. If the template is no longer exactly the one
+the card showed, nothing is created and the answer says "propose it again". That covers an edit of the template's
+file, even of one space, an edit of a script it names, and a template installed again: a card that waits while an
+upgrade replaces a shipped template is refused, and the next proposal shows the new one. A proposal lives fifteen
+minutes, so this is a short wait. A proposal for a template that is not installed, or whose script is missing, is
+refused when it is made.
+
+**A proposal the node has no room for is refused when it is made.** A `service_create` is held to two sets of caps:
+the node's caps on virtual machines (`kernel.vmLimits`, or `kernel.bridged.limits` on a node that sets
+`kernel.bridged`: `virtualMachines`, `cpu`, `memory`, `disk`), and, when it names a tenant, that tenant's caps
+(`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk`).
+Both are checked when the proposal is made, from the node's config, its own records and the template, without asking
+Incus. A proposal that would pass a cap is refused then, with the code `capacity` and the sentence the create itself
+uses: `creating <name> would exceed this node's cap on CPUs (kernel.bridged.limits.cpu): 2 in use, 2 asked, 3
+allowed`. No card is recorded, so the owner is never asked to approve it. A proposal exactly at a cap is recorded. A
+proposal that names a tenant the node does not hold is refused when it is made too.
+
+The approved create checks the same caps again, with the same code. The node can fill up in the fifteen minutes a card
+waits: another create, or a config that lowers a cap. The owner's approval is then accepted and used up, the card is
+retired, and the answer begins "The approval was accepted, but service_create did not complete:" and carries
+`proposeAgain: true`. Proposed again while the node is still full, it is refused when it is made.
+
+A card that waited while the node filled up stays on the owner's page and can still be approved; that approval is
+used up and the create then refuses. Proposing the same create again in that time is refused for want of room, and
+the old card stands until it is declined or its fifteen minutes pass: decline it. A create that fits only once
+something else is removed is refused until that removal has run, because the caps count what the node holds now:
+remove first, then propose the create.
+
+One refusal for want of room can still come after an approval on a node where nothing changed: the service subnet, or
+a tenant's block, has no free address. Addresses in use are read from Incus, and a proposal is answered without
+Incus. `function_create` and `postgres_create` are held to no cap; only the free address applies to them.
+
+**What else a proposed create is refused for when it is made.** The arguments are held to the verb's schema first,
+so a name that is not a service name is told as that. Then everything the create would refuse for what the node's
+config and its own records hold is refused in the create's words, and no card is recorded:
+
+- a name a service of that tenant, or of the node, already holds (`service <name> exists`), and a name a function
+  holds;
+- a name whose instance another service on the node already has. A tenant's instance is named `<service>-<tenant
+  id>` and the node's own is named as its service, so the node's `x-<tenant id>` and that tenant's `x` are one
+  instance name, and Incus takes a name once on the service network. The second is refused: `the name <name> is
+  taken on this node: ...`. The words say nothing of the service that has it. A proposed `function_create`, and a
+  proposed `postgres_create` on a node whose database is made from its template, are refused the same way;
+- a `deploy` named outside a tenant; a deploy that is closed; and a deploy a token opened. An approved create runs
+  as the approval itself and not as any token, so a card can open a deploy, and a later card can add to a deploy a
+  card opened while it is provisional, but no card adds to a deploy a token opened. The proposal and the create say
+  it in one sentence, which is also what a token is told about a deploy another token or a card opened: "deploy
+  <id> was opened by another caller: only the caller that opened a deploy adds to it, and an approved action runs
+  as the owner's approval, never as the token that proposed it";
+- a tenant's virtual machine that names a `bridge`, and a tenant's service from a template that opens a port on
+  the host (`lan`) or publishes a dash;
+- a `mac` another of the node's records holds;
+- a config that leaves the service project out or sets up no service network, on a node that makes changes;
+- a virtual-machine count the config sets below the machines the node holds.
+
+What is read from Incus is asked by the approved create alone, so these can still follow an approval: Incus does
+not answer; an instance of that name exists that is not Arca's; a local image the template pins is not there; an
+instance Arca holds no record of has the MAC; the Incus project exists and this node did not make it; the default
+profile names no storage pool; no address is free; and whatever Incus itself refuses while it creates or starts
+the instance. An instance that carries Arca's marks and that the node holds no record of is adopted first, and the
+create then answers `service <name> exists`. The node's own disk can refuse too: the deploy journal or the
+service's secrets cannot be written. So can anything that changed while the card waited: the template (see above), the room, the name, a
+deploy that closed, or a restart of the node with another config. On a node that only looks, two of the checks
+above are not made when a create is proposed: the config's service project, and the virtual-machine count against
+what the node holds. Its create answers that the node only looks, so a proposal those two alone would refuse is
+recorded there as before. Everything else in the list, and the room, is refused there as on any other node.
+
+A token's own `service_create` shows no card and binds nothing, as before. It may state `templateDigest` or `image`
+itself, and is then refused when the node's template differs. Not part of the fingerprint: why a service is created
+stopped (the card's `Start` row is read from the stored secrets), the node's config, and whatever an image name
+without a digest points at.
+
+A card made before the node bound a template's content (one that waits while the node is upgraded to this version)
+has no `Template content` row. It is refused when its approval is submitted, with "propose it again", and the
+approval is not used: nothing is signed away. That holds for a create and for a database made from the template.
+
+The binding covers the create only. What acts on a service afterwards reads the template as it is installed then:
+`service_connect` (the variables a link gives, and the secrets the template declares), the Omni verbs, and
+`instance_start` when it writes a machine's secrets. Editing a template after a service was created changes what
+those do for it.
 A GPU proposal names an existing Incus instance and the card's PCI address. The kernel resolves the instance's project,
 type and `volatile.uuid` when the proposal is made and puts them in the arguments, so the owner's digest binds them. Only a
 kernel-mode node writes, and only an instance in `kernel.projects` whose own config classifies as a kernel object: a
@@ -2755,8 +2941,13 @@ The pools that `disk-pool-full` reads come from Incus's own pool list on every t
 file filters that list (see the config table), so a pool that is left out is never evaluated.
 
 `store-write-failed` is built in. It is not in `alerts.json`, it is critical, and it lives only in memory. It fires at the
-first failed commit, or at the first commit that takes over one second, and it clears after 120 seconds of commits that work.
-It shows in `alerts_list`, in the HEALTH line and as `arca_alert_firing`.
+first failed commit, and it clears after 120 seconds of commits that work. It shows in `alerts_list`, in the HEALTH line and
+as `arca_alert_firing`.
+
+`store-commit-slow` is built in the same way, and it is a warning. It fires at the first commit that works and takes over one
+second, and it clears after 120 seconds of commits that take less. Such a commit is on disk and nothing waits: the alert
+says the disk under the store is slow, not that a write failed. (Up to 0.13 a slow commit fired `store-write-failed`,
+critical, and counted as a failed write.)
 
 ### Unknown data
 
@@ -2940,7 +3131,8 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_update_failed` | gauge | | 1 for a failed update, no completed check in 14 days, or a node up 24 hours with no completed check and no usable check time; 0 for a known recent success; absent when unknown |
 | `arca_smart_passed` | gauge | `device` | 1 when the drive's SMART check passed, 0 when it failed; see "SMART drive labels" |
 | `arca_alert_firing` | gauge | `rule`, `severity`, and the alert's own labels | 1 for each firing alert |
-| `arca_store_write_failures_total` | counter | | the failed writes since the server started |
+| `arca_store_write_failures_total` | counter | | the failed writes since the server started: a commit or a rollup the store refused |
+| `arca_store_slow_commits_total` | counter | | the commits since the server started that worked and took over one second |
 | `arca_sample_timestamp_seconds` | gauge | | when the newest host sample was taken, in epoch seconds |
 
 Notes on the names above:
@@ -2950,7 +3142,8 @@ Notes on the names above:
 - **Drift.** See "Drift" above. `arca_drift_entries` has two kinds only.
 - **TPM and update.** See "incus-osd readings" above.
 - **Alerts.** A firing alert has one series, with its rule, its severity and its own labels. A pending, resolved or disabled
-  alert has no series, so an absent series means the alert is not firing. The `store-write-failed` alert appears here too.
+  alert has no series, so an absent series means the alert is not firing. The `store-write-failed` and `store-commit-slow`
+  alerts appear here too.
 - **Instances.** A stopped instance has `arca_instance_running` 0 and no CPU or memory series.
 - **Ordering.** Series are written in order of their label values as text, so the `load` windows read `15m`, `1m`, `5m`.
 
@@ -3033,8 +3226,9 @@ When a commit fails, for example on a full disk:
   every alert event dropped since the server started, and that count does not reset until a restart.
 - The next commit that works writes the waiting events with their original times. Until then they appear in `alerts_list`
   without a `seq`, and they are not in `/alerts`.
-- `store-write-failed` fires at once, and `arca_store_write_failures_total` counts the failure. A commit that takes over one
-  second also counts as a failure, although its events are kept.
+- `store-write-failed` fires at once, and `arca_store_write_failures_total` counts the failure.
+- A commit that works and takes over one second is no failure: its events are kept and nothing waits. `store-commit-slow`, a
+  warning, fires at once, and `arca_store_slow_commits_total` counts it.
 - A rollup that fails, which runs at the first tick of a minute, takes the same path: that tick's `storeError` is set and
   `store-write-failed` fires.
 
@@ -3120,7 +3314,9 @@ A template is a virtual machine when its `kind` is `virtual-machine`:
 }
 ```
 
-`image` is `images:<alias>` (the public images server, with an optional `digest` fingerprint) or `local:<alias>`.
+`image` is `images:<alias>` (the public images server, with an optional `digest` fingerprint) or `local:<alias>`
+(an image in the service project's own store, with an optional `digest` that pins it; see "A local image may be
+pinned" above).
 `limits` must set both `cpu` and `memory`, and `rootSize` is required; all three follow the size rules above. A
 virtual-machine template may also set `description` and `autostart`, and `ports` with `provides` when a container is
 to link to it: a link opens the port in the managed service network's ACL, so a template with `ports` is refused on a
@@ -3146,16 +3342,20 @@ the agent's config drive (see "What every virtual machine carries"). It carries 
 kernel's mark and `user.arca.template`. It gets its address from the bridge's own network; Arca
 neither assigns nor filters it. A bridge whose network hands out no addresses by DHCP (one where another hypervisor
 assigns them itself) gives the guest none: put such a virtual machine on the managed service network of a mixed node,
-or configure its address inside the guest. `service_list` and `service_status` show the address the guest reports, or an empty
-`ipv4` when the guest reports none.
+or configure its address inside the guest. `service_status` of the running machine reads its live state and shows the
+address its own network card holds, or an empty `ipv4` when it holds none; an address of a bridge the guest made for
+its own containers is never shown. `service_list` reads no live state: the machine's row has an empty `ipv4` and
+`ipv4In: "state"` (see "When Incus does not answer").
 
 Ownership, the journal and approvals are the same as for a container. `service_create` needs a doctor token, can be
 proposed with `action_propose`, and writes the same journal records. A proposal is checked when it is made, so the
 owner is never asked to approve a create the node is sure to refuse: the template's kind must fit the node's mode, the
 mode must fit the desired state, and the bridge must be an allowed one. A bridge the request leaves out is filled in
 then. The owner's card says "Create the virtual machine <name> from template <template> on the host bridge <bridge>"
-and lists the bridge and the MAC. The caps and the MAC are checked when the approved create runs, because both can
-change while a proposal waits. `service_remove` needs the owner's approval and retires the virtual machine through the same delete plan.
+and lists the bridge and the MAC. The caps are checked when the proposal is made too (see "A proposal the node has
+no room for is refused when it is made"), and again when the approved create runs, because the node can fill up while
+a proposal waits. A MAC another of the node's records holds is refused when the proposal is made; whether an instance
+Arca holds no record of has it is read from Incus when the approved create runs. `service_remove` needs the owner's approval and retires the virtual machine through the same delete plan.
 `service_logs` returns the virtual machine's console log.
 
 What a bridged node refuses, and why:
@@ -3205,9 +3405,15 @@ machine's is never there. The steps:
    host restarts, also before the first `instance_start`: the machine then boots with no secret file, and what runs in
    it has to wait for one (the runner pool registers nothing until its credential is there).
 2. `service_secret_set` with `{"name", "key", "value"}` stores the value in Arca's private `secrets/` directory, as for
-   a container, and answers `{"ok": true}`. The value is 8 to 4096 characters; for a virtual machine it may have line
-   breaks (a private key in PEM form is several lines; a file with Windows line endings is stored with plain line
-   breaks), and no other control character. Nothing is sent to the machine yet.
+   a container, and answers `{"ok": true}`. A virtual machine's value is a file, so it is stored as given, with the
+   line break at its end when it has one: send a key file whole, as it was read. It is 8 to 4096 characters, not
+   counting one line break at its end, and at least 8 of them are not line breaks; it may have line breaks (a private
+   key in PEM form is several lines) and no other control character. One thing is not byte for byte: a file with
+   Windows line endings is stored with plain line breaks (each carriage return and line feed pair as one line feed).
+   The call itself carries at most 4097 characters, and there every carriage return counts: a file with Windows line
+   endings that is near the limit is refused as too long, and goes through once its line endings are plain.
+   A container's value, and a function's, is an environment value: one line of 8 to 4096 characters, and a line break
+   at its end is refused in words that say it is the one thing to change. Nothing is sent to the machine yet.
 3. `instance_start` with `{"project": "arcak-svc", "instance": "<name>"}` starts the machine, waits for its guest agent
    (up to 120 seconds: a new machine boots first) and writes each stored secret into the guest as the file
    `/etc/arca-secrets/<KEY>`. The directory is root's with mode 0700 and each file is root's with mode 0600. Arca
@@ -3238,11 +3444,17 @@ Where a virtual machine's secret is, and is not:
   asked. Root inside the machine can read it, and a snapshot or a copy of the machine's disk carries it.
 - It is not in the instance's config in Incus (so `incus config show` does not show it), in Arca's desired state, in
   the effect journal, in `instance-actions.jsonl` (which names the secrets written), in `exec-audit.jsonl`, or in any
-  answer or refusal. `service_logs` replaces a stored value with `[secret]` when it fits on one line.
+  answer or refusal. `service_logs`, a failed command's words and a function's output replace a stored value with
+  `[secret]`: whole, and for a value of several lines (a key file) each of its lines of 16 characters or more, since a
+  log shows it one line at a time. A shorter line of such a value is not hidden by its value: a line of a few
+  characters is ordinary text that a log holds in many places. A PEM block, from its `-----BEGIN ...-----` line to its
+  `-----END ...-----` line, is replaced whole wherever it is printed, a stored secret or not; one whose END line was not
+  printed is hidden to the end of the text.
 
 **Settings for one service.** A template may let a create replace some of its settings, so that two services of one
 template differ without a second template file. It lists their names in `createSettings`, each a key of its
-`settings`, whose value there is the default:
+`settings`, whose value there is the default. A refusal of a create tells these names back, so each is 1 to 64 plain
+characters; a template that lists another is refused when it is read, without the name:
 
 ```json
 "settings": { "url": "https://github.com/example-org", "maxSlots": 5, "pin": "registry.example/tool@sha256:..." },
@@ -3277,6 +3489,33 @@ value in words, so an address is seen before it is approved. A list has one row 
 1`, `Setting classes 2`), each with its fields, so a long list is shown whole. The card cuts nothing: a proposal whose
 setting would need a row of more than 160 characters is refused when it is made, naming the row, and nothing is asked
 of the owner. The service's record keeps the replaced values as `vm.settings`.
+
+**What must hold between settings.** A template may also say what must hold between its settings, in
+`settingRules`, so that a create the machine itself would refuse at its first boot is refused before anything is
+made, and its proposal before any card is shown:
+
+```json
+"settingRules": [
+  { "need": "maxSlots", "atLeast": { "count": "classes" }, "why": "every class is kept one place under the cap" },
+  { "need": 200, "atLeast": "percent", "why": "200 is the most" }
+]
+```
+
+Each rule says one amount is at least another. An amount is a whole number, the name of a top-level setting whose
+value is a whole number, or `{ "count": "<name>" }`, the number of entries of a top-level setting that is a list.
+There is nothing else: a rule whose `need` is a number is a ceiling on the other amount. Arca compares the two
+amounts and knows nothing of what they mean. The rules are asked of the settings one service would have (the
+template's, with the create's values in place of the defaults), when the create is proposed and again when it
+runs. The refusal has Arca's words about the two amounts and then the template's `why`: `settings:
+settings.maxSlots is 2, below the number of entries in settings.classes (3): every class is kept one place under
+the cap`. A template lists at most 16 rules, each with a `why` of 1 to 200 plain characters, and a rule names a
+setting in 1 to 64 plain characters. A template is refused
+when it is read, naming the rule (`settingRules[1]: ...`), when a rule names a setting it does not have or one of
+the wrong type, when an amount has another form, or when the template's own defaults do not pass the rule. Only a
+virtual-machine template has rules. They are asked of a create only: a service that exists is not checked again.
+The machine's own script keeps its checks; the rules repeat only what it refuses. The two GitLab runner pool
+templates state eight: `concurrent` and `jobCpu` from 1 to 999, `memoryOvercommitPercent` from 100 to 200, and 1
+to 12 entries in `runners`.
 
 **Which image a machine was made from.** A template may name its image by an alias (`images:debian/13/cloud`), which
 does not say which build that was. `service_status` adds `baseImage`, the fingerprint (SHA-256) Incus recorded on the
@@ -3766,7 +4005,7 @@ since it is where the pool's credential will be used.
 | `url` | yes | The organisation the runners belong to, or one repository (`https://github.com/example-org/example-repo`; read step 2 first). A plain `https` address on the template's own host, `github.com`: a create changes the path only, and Arca refuses another host, a port, a user name, a query or a fragment, as the pool does. |
 | `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
 | `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
-| `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. |
+| `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. Never below the number of classes: a pool created with less does not start ("A place for every class" below). |
 | `allowDefaultRunnerGroup` | no | `true` lets the pool start on the organisation's default runner group. Leave it out. |
 | `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |
 | `dockerCache`, `dependencyCache` | no | The disk the Docker layer caches and the dependency caches may use, over all slots. |
@@ -3799,10 +4038,45 @@ much. (It does not say this when `maxSlots` is below the number of slots: then t
 once.) A slot that is larger by itself than the memory for slots never starts, whatever `maxSlots` is, and the jobs
 that ask for its labels wait for ever: the controller says that too, as a `WARNING` that names the class.
 
+**A place for every class.** `maxSlots` caps registered runners, and a runner that is registered and waits for a job
+keeps its place until a job ends. So that no class is left without a runner behind the idle runners of the others,
+the pool keeps every class one place under the cap:
+
+- `maxSlots` is never below the number of classes. A pool created with less does not start, and its console says
+  both numbers and what to set: `settings: maxSlots is 2 and classes names 3 classes. ... Set maxSlots to 3 or more,
+  or name fewer classes`.
+- A free place goes to the class that has the fewest runners, so every class has one runner before any has two.
+  Among classes that have equally many, and among the slots of one class, the places go round-robin.
+- When a class has no runner and every place is held, the pool retires one runner that waits for a job and the class
+  gets its place. The runner is one of the class that holds the most places, among the classes that hold two or more.
+  The pool first asks GitHub to take the runner off, and removes it only on GitHub's yes. What GitHub was seen to
+  answer, for an organisation's runners:
+
+  - A refusal for a runner that is running a job (status 422, "is currently running a job and cannot be deleted").
+    So a job that reached the runner in that moment is kept and runs to its end.
+  - Yes (204) for every other runner, also for one it no longer has or never had. A just-in-time runner that took a
+    job and ended it in that moment is one it no longer has. So after a yes the pool reads the runner's own output:
+    a runner that has taken a job is left to end, its job is recorded as every job is, and it is not called retired.
+
+  Every other answer retires nothing, a 404 as well: GitHub does not answer 404 for a runner that is gone, so a 404
+  says the request did not reach the runner, and GitHub may still hold it and hand it a job.
+
+What this is not:
+
+- It is not a cap on running jobs, and it promises no job a start time. A just-in-time runner cannot be told to wait:
+  every registered runner may take a job at any moment. A runner that has a job is never retired, and neither is a
+  class's only runner, nor one that is updating itself. So when every runner that could give its place up is at
+  work, the class waits until a job ends.
+- A place is not memory. A slot still starts only when its whole memory fits (above), and the pool retires nothing
+  for a class whose slot would still lack its memory.
+- It is one place a class, not a share. Beyond that one place, the busiest classes can hold all the others.
+
+A pool with one class has nothing to hand out between classes and works as it did.
+
 **4. Arca: `service_secret_set`**, for the App twice:
 `{"name": "ci-pool", "key": "GITHUB_APP_CLIENT_ID", "value": "<the client ID>"}` and
 `{"name": "ci-pool", "key": "GITHUB_APP_PRIVATE_KEY", "value": "<the whole content of the key file>"}`. The key keeps
-its line breaks; a key pasted on one line works too. For a token, once:
+its line breaks, the one at its end too; a key pasted on one line works too. For a token, once:
 `{"name": "ci-pool", "key": "GITHUB_TOKEN", "value": "<the token>"}`. Arca answers `{"ok": true}` and no answer, list
 or log shows a value again. When the App's two secrets and a token are all set, the pool uses the App and says so.
 
@@ -3871,7 +4145,19 @@ repository, one that admits public repositories, and the default group each show
 public repository for a pool that serves one. The pool reads this again every ten minutes, so a change made on GitHub
 after the pool started shows up. If the group has become one the pool refuses (it was made the default group, or
 deleted), the line begins `REFUSED`, the runners that already wait or work are left, and no new slot starts
-(`queued (held: ...)`) until it is put right on GitHub; the pool then goes on by itself. The last ten
+(`queued (held: ...)`) until it is put right on GitHub; the pool then goes on by itself.
+
+A pool with more than one class and more slots than `maxSlots` says in every block what the cap is and is not (`every
+class is kept one place under the cap of 4: ...`). While a class has no runner and every place is held, one more line
+names the class (`class large: no runner, and every place under the cap of 4 is held. ...`) and says what the pool
+does about it: which slot gives up its idle runner's place, or, as a `WARNING`, why none does: no class that holds
+two or more places has a runner that waits for a job, or the class's slot would still lack its memory. Each retired
+runner is one line of its own (`slot 0 (standard): its idle runner is retired and its place goes to class large,
+...`), and so is a runner that GitHub kept because it had a job. If GitHub answers the request to take a runner off
+with anything but its yes or that refusal (a 5xx, 401, 403 or 404), or not at all, nothing is retired: the pool says
+GitHub's answer once, keeps it in the class's line, and asks again after a pause that starts at five seconds and
+doubles up to five minutes. If the runner then stops because GitHub had taken it off after all, the pool says so and
+counts no failure. The last ten
 finished jobs are repeated in every block (`recent job`), so `service_logs` still reaches them after many blocks. All
 job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish
 time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name. Past 4MiB (some
@@ -4159,6 +4445,9 @@ arca-gitlab-pool: totals jobs_now=3 of 6 jobs_done=161 jobs_failed=12 runners=2 
   an `image:` fails, since the pool has no default one.
 - **Stopping.** `instance_stop` and `instance_restart` need your approval. GitLab Runner is told to take no new job
   and the jobs that run get a minute to finish; a job still running then is lost, and GitLab reports it as failed.
+  The pool's service holds its stop open through one `sleep infinity` process inside the machine: should that process
+  end by itself (killed by hand, or by the machine when it is out of memory), the pool stops in the same order
+  without being asked, and its service starts it again ten seconds later.
 - **Pins.** GitLab Runner is `registry.gitlab.com/gitlab-org/gitlab-runner` 19.5.3 and its helper is
   `gitlab-runner-helper` `x86_64-v19.5.3`, both by digest, read from GitLab's registry when the template was written;
   the tailnet node is `tailscale/tailscale` 1.104.4, the digest the workspace template pins. A pool keeps what it was
@@ -4315,7 +4604,7 @@ action_propose { "action": "function_create", "args": {
 
 | Field | Rule |
 |-------|------|
-| `name` | A service's grammar. Functions and services share one name space: neither takes a name the other holds, and each verb keeps to its kind (`service_status` of a function, and `function_run` of a service, are refused in words). |
+| `name` | A service's grammar. Functions and services share one name space: neither takes a name the other holds, and each verb keeps to its kind (`service_status` of a function, and `function_run` of a service, are refused in words). A function's instance has the function's name, so a name that is a tenant's instance name (`x-<tenant id>` for that tenant's service `x`) is refused too, when it is proposed and when the approved create runs: `the name <name> is taken on this node: ...`; and a tenant's `x` is refused while the function `x-<tenant id>` is there. |
 | `image`, `digest` | `<registry>/<repository>` in lower case and `sha256:` with 64 hex digits. Never a tag. Arca pulls the image without a credential. |
 | `command` | Optional. The program's absolute path inside the image, then its arguments. No shell runs it. Left out, the image's own entry point runs. |
 | `env` | Plain values by name, at most 32, each at most 160 characters. The card shows each whole. |
@@ -4368,6 +4657,36 @@ one is still going as the next is due, the next is not started, and a `function_
 `FunctionBusy`. Nothing is queued and nothing is retried: the next tick is the next try. After a restart of the
 kernel every function is due at once, and no missed tick is made up.
 
+**Every run starts from the image's own root.** Before it starts a run the kernel has Incus rebuild the container's
+root disk from the function's image. The config, the secrets among it, and the network card stay as they are; the
+files are the image's again. So no run finds what an earlier run wrote, and none can leave the next something to
+execute.
+
+The first run of a function is the one run with nothing rebuilt before it: its container has never been started, so
+its root is still the one its create made from the image, and no program has run in it. It must not be rebuilt
+either: Incus cannot start a container that was rebuilt before it ever ran (it answers `No ID map found for
+unprivileged container`; seen on Incus 7.5.1, and the source of Incus 7.6.0 gives such a container a map again,
+which was read and not run). Whether a container has started is read on the container itself, from
+the key Incus writes at its first start. Before that first run the kernel checks what it can of the root: the
+container must still say it was made from the image the function's record took, or the run does not start. That
+run's line says `root` is `new`.
+
+For every run after the first, the rebuild uses the copy of the image the node already holds, and asks no registry: the copy whose
+fingerprint the function's record took when it was created, read from the image Incus fetched for the approved
+registry and digest. It is never the image the container itself says it was made from, which whoever may write the
+container could change. When that copy is gone (Incus drops a cached image nothing has used for a while; a function's
+runs keep using it) the rebuild names the registry and the digest the owner approved, and Incus fetches the image
+again. A copy that is there and cannot be rebuilt from is an error, and the registry is not asked. When the root
+cannot be rebuilt the run does not start: `notStarted`, and `why` says what was answered.
+
+A function's record may hold no fingerprint: when its create could not tell which one image of the store is the
+approved one (two records for the same registry and digest, or an instance that says it was made from another). And
+the store's copy may be gone and fetched again under another fingerprint than the record holds. In both cases every
+run asks the registry, by the approved digest: safe, slower, and in need of the registry each time. A person sees
+it in `function_list`, where `fingerprint` is `null`, or in the run lines, where `root` is `registry` and `rootImage`
+is `null` run after run. `function_remove` and `function_create` again, two cards, bring it back to the store's
+copy.
+
 **What the program must do.** Run one batch and exit. Print what it likes, up to 1 MiB in one run (past that the
 output cannot be read, and the run ends `died` whatever it printed); **its last output line is its result: one JSON
 object, at most 4096 bytes, with `"ok": true` or `"ok": false`**. Incus reports no exit status of a container's
@@ -4388,10 +4707,10 @@ killed.
 | `memory` | It ended without a result and the node counted a kill at its memory limit. Best effort: the count is gone with the container, so a run killed for memory is often `died`. |
 | `died` | It ended without a result line. |
 | `interrupted` | The kernel stopped it for another reason: the function's removal, or a kernel that started and found a run nobody watched. |
-| `notStarted` | Nothing was started, and `why` says so: a secret is not set, Incus refused the start, the instance is not the one Arca created. |
+| `notStarted` | Nothing was started, and `why` says so: a secret is not set, the root could not be rebuilt from the image, Incus refused the start, the instance is not the one Arca created. |
 
 Between the end of one run of a function and its next start the kernel keeps 2 seconds. Incus is still putting a
-container away for a moment after its program exits, and a start in that moment can be refused. The shortest timer is
+container away for a moment after its program exits, and a rebuild or a start in that moment can be refused. The shortest timer is
 10 seconds, so only a `function_run` that follows another run at once waits for it.
 
 ### The run log is the meter
@@ -4401,11 +4720,17 @@ One line for each run, appended and never rewritten, in `<stateDir>/function-run
 
 ```
 {"run":"fr-1793361600000-7","function":"relay","digest":"sha256:...","kind":"container","trigger":"timer",
- "startedAt":1793361600000,"startMs":265,"durationMs":41,"cpuMs":12,"memoryPeakBytes":3194880,
+ "startedAt":1793361600000,"root":"store","rootImage":"<64 hex digits>","rootMs":55,"startMs":265,"durationMs":41,
+ "cpuMs":12,
+ "memoryPeakBytes":3194880,
  "memoryLimitBytes":134217728,"outcome":"ok","result":{"ok":true,"published":3}}
 ```
 
-`startMs` is how long Incus took to start the container; `durationMs` runs from there to the exit the kernel saw.
+`root` says what the root was before the run: `new` (the root the create made, for a function that had never
+started: nothing was rebuilt), `store` (rebuilt from the node's own copy of the image) or `registry` (rebuilt from
+the image fetched again). `rootImage` is the image's fingerprint for `new` and `store`, and `rootMs` is how long it
+took. `startMs` is how long Incus took to start the container; `durationMs`
+runs from there to the exit the kernel saw.
 `cpuMs` and `memoryPeakBytes` are read from the container's cgroup while it runs, and only when the node's Incus is on
 the machine `arca serve` runs on: the files are gone when the container stops, so the peak is the last reading before
 the exit, a lower bound, and both are `null` when nothing could be read. `memoryLimitBytes` is what the run was allowed.
@@ -4413,8 +4738,9 @@ the exit, a lower bound, and both are `null` when nothing could be read. `memory
 line and the end of the run's output (64 KiB, kept for the 20 newest runs of each function under
 `function-runs/output/`). A function's output is untrusted text.
 
-**What a run writes.** To Incus: the container's power state, and its console log, which is cleared before each start
-so that what is read afterwards is that run's output alone. To the state directory: the run's line and the end of its
+**What a run writes.** To Incus: the container's root disk, rebuilt from its image; its power state; and its console
+log, which is cleared before each start so that what is read afterwards is that run's output alone. A rebuild keeps
+the container's config, its devices and its uuid. To the state directory: the run's line and the end of its
 output. Nothing else: no desired-state entry, no line of the effect journal. The run log's directory is made by the
 first run of the node's first function: a node with no function has none. A function's container is never started
 by Incus itself (`boot.autostart` is `false`), so a host that comes back up starts none. `instance_start`, `instance_stop` and
@@ -4422,14 +4748,18 @@ by Incus itself (`boot.autostart` is `false`), so a host that comes back up star
 
 ### What to know
 
-- **A run's root file system is not read-only and is kept between runs.** Incus refuses to start an OCI container
-  whose root disk is read-only (seen on Incus 7.5.1), so a run can write its container's root, and the next run finds
-  what it wrote. A function's program must not execute what an earlier run could have left, and must keep no state
-  there. Giving every run the image's own root again is a change of its own.
-- The image is pulled without a credential, so it must be one the node can pull anonymously.
+- **A run can write its container's root, and the next run does not find it.** Incus refuses to start an OCI
+  container whose root disk is read-only (seen on Incus 7.5.1), so the root is rebuilt from the image before each run
+  instead. A function keeps no state in its container: what must outlive a run goes to the services it reaches.
+- A function whose image is gone from the node's store needs its registry for its next run. With the registry out of
+  reach that run is `notStarted`, and so is each one after it until the image can be fetched.
+- An image on a registry that asks for a credential is fetched with the one set for that registry
+  ([A registry that asks for a credential](#a-registry-that-asks-for-a-credential)); any other is fetched without
+  one.
 - On Incus 7.5.1, on one machine and without a network card on the container, a run of a program that prints two lines
   and exits took a third of a second from the clearing of its log to its output being read (median of 20; start 0.27 s),
-  and a forced stop 0.63 s. A network card and its rules add to the start.
+  and a forced stop 0.63 s. The rebuild before it took 55 ms from the node's own copy of the image and 1.3 s when the
+  registry was named (medians of 10). A network card and its rules add to the start.
 - A function is created in the node's own project only: not in a tenant, and not on a bridged node without the managed
   service network.
 - A service a function links to is not removed while the function is there: `service_remove` is refused, when it is
@@ -4446,6 +4776,82 @@ by Incus itself (`boot.autostart` is `false`), so a host that comes back up star
   8,640 lines a day, and the run log is never cut.
 - A kernel that stops between a program's exit and the writing of its line loses that run from the run log.
 - A run of a program that never exits is ended only by its time limit.
+
+## A registry that asks for a credential
+
+A service's or a function's image may be on a registry that gives nothing without a login. Arca reads no vault:
+whoever holds the registry's credential sets it into the node, by the registry's address.
+
+| Verb | Who runs it | What it does |
+|------|-------------|--------------|
+| `registry_secret_set {server, username, password}` | a `doctor` token | Sets the credential of the registry `https://<host>`. Write-only. |
+| `registry_list` | a `viewer` token | The registries a credential is set for, by address. Never a value. |
+| `registry_secret_remove {server}` | a `doctor` token | Removes it. The next fetch from that registry is made without one. |
+
+From then on every image the node's own projects fetch from that registry is fetched with it. Nothing in a tenant
+is.
+
+A credential belongs to exactly the registry it was set for: the address is compared whole, the port with it, in
+lower case. A host that differs by one character, a dash where the other has a dot, is another registry and is
+given nothing. No function or service can ask for a registry's password as a secret of its own: it is the node's.
+`registry_list` is open to a `viewer` token, so the addresses, which may be hosts of an internal network, are read
+by every token of the node; never a value.
+
+**Where the credential goes, and where it rests.** Arca keeps it in its secret store and in nothing else of its own:
+no record, proposal, card, journal line, log or answer holds it. It leaves the store in one place. When an image
+is fetched, the address Arca sends to Incus names the registry with the credential in it, which is how Incus takes
+one. **Incus then keeps that address in the record of the image it fetched, for as long as it keeps the image, and
+whoever may use Incus on this machine can read it there**: root, the members of the group that may use Incus's
+socket, and the user `arca serve` runs as. That is the same reader who already reads a container's environment
+secrets. So:
+
+- **set only a credential that can read, and only what this node pulls.** A registry's own pull token for one
+  project is the right kind. Never one that can push or delete;
+- a create whose image is on such a registry says so on its card, in a `Registry` row, and runs only from an
+  approved proposal: a direct `service_create` is refused with `NotApproved`, whether it names the registry or
+  not. The proposal fills the row in. A card approved after the credential was removed does not run;
+- Incus is told not to go back to the registry for the image by itself (`auto_update` is turned off on it): an image
+  by digest never changes. Arca turns it off right after every create and every rebuild that was sent the
+  credential, whatever that create or rebuild answered;
+- the image, and the credential with it, leaves Incus when its last function or service is removed;
+- **every ten minutes**, and when `arca serve` starts, the node looks at the images its own project fetched with a
+  credential. It turns `auto_update` off on one that has it on, and deletes one that no service or function is made
+  from once it has seen it so for **fifteen minutes** (a create may still be between its fetch and its instance
+  before that). It knows such an image by the image's own record in Incus, the address kept there, and not by what
+  the secret store holds: removing a credential forgets no image. It never touches an image with no source address
+  (a local one, one imported by hand) or one from an address without a credential, and never deletes an image a
+  service or a function is made from, a stopped function's included. Each thing it does, and each image deleted
+  at a removal, is one line in `registry-images.jsonl` in the state directory: when, the project, the fingerprint,
+  what and why, and never the address. A round goes on past an image Incus will not let it change, so one such
+  image does not leave the others as they were, and the quarter of an hour is counted on a clock that only goes
+  forward, whatever the machine's own clock does. A round that fails says so once on the log of `arca serve` and
+  is tried again at the next; it stops nothing and no create or run waits for it;
+- **what this does not give:** between a fetch and the turn-off that follows it, `auto_update` is on: for seconds,
+  or, when the turn-off failed, until a round can turn it off. A round is tried every ten minutes; while Incus
+  keeps refusing, it stays on. Incus's own round for cached images is hours apart, and what
+  it would do in it is ask the same registry for the same digest with the address it keeps. Closing that at the
+  source takes a key on the project itself (`images.auto_update_cached`), a change to the config of a project that
+  already exists: planned as its own change, after it is seen to work on the Incus the nodes run;
+- a new credential replaces the old one for every later fetch. An image already fetched keeps the address it was
+  fetched with until it is removed.
+
+A password is 8 to 4096 of letters, digits and `- . _ ~`: it stands in an address, and only such a word is known to
+reach the registry as it is. A registry's token is one.
+
+A function whose store copy is gone fetches its image again with the credential set at that moment; with none set,
+or with the registry out of reach, that run is `notStarted`.
+
+Two fetches use the credential with no card that names it, both of an image the owner approved by digest on the
+registry the credential was set for: a function approved before the credential was set, the next time its root is
+rebuilt from the registry; and a service the kernel creates again after its instance was lost.
+
+Seen on Incus 7.5.1 against a registry that asks for a login: a create without a credential is refused, with it the
+image is fetched; the image's record keeps the address with the credential, the instance's record and the list of
+operations do not; `auto_update` can be turned off. Read in the source of Incus 7.6.0, and not seen live: Incus
+hands the program that fetches for it the password in a temporary file only its own user reads, with only the file's
+path on the command line; and Incus's own log holds the address with the credential only when its daemon runs
+verbose or debug, in lines that then outlive the image. Keeping the credential out of Incus altogether would take Arca fetching the image itself and handing
+Incus the files: planned, not in this build.
 
 ## When an approved action fails
 
@@ -4674,7 +5080,11 @@ What the fake cannot say was read from a real Incus by an ignored test,
 `ARCA_REAL_INCUS_PROOF=1` and runs only in a project whose name begins with `arcak-scratch-`: how long a start and a
 stop take, that Incus refuses to start an OCI container with a read-only root, that the console log is empty after a
 clear and holds a run's output after it, that Incus reports no exit status, and that two runs with no pause between
-them can find the older run's output in the log. Not proven anywhere yet: a function on a live node with its network
+them can find the older run's output in the log. A second one beside it,
+`function_run::proof::a_real_incus_gives_a_container_its_images_root_again`, read that a snapshot restore puts the
+instance's config back too (so it would undo a secret set since), and that a rebuild from the image removes what a run
+wrote, keeps the config and the uuid, takes 55 ms from the store's copy, and fetches the image again when the store no
+longer holds it. Not proven anywhere yet: a function on a live node with its network
 card and rules, a link that carries a real connection, and a run killed at its memory limit.
 
 ### Service wiring

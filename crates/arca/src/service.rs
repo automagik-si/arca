@@ -1173,6 +1173,11 @@ pub struct Template {
     /// `settings`, whose value there is the default and gives the type. No other kind sets it.
     #[serde(default)]
     pub create_settings: Vec<String>,
+    /// What must hold between a virtual-machine template's settings, for the defaults and for every create: each
+    /// rule says one amount is at least another ([`SettingRule`]). The machine's own first-boot script may refuse
+    /// the same; stated here, a create that would not start is refused before anything is made. No other kind sets it.
+    #[serde(default)]
+    pub setting_rules: Vec<SettingRule>,
     /// A container template whose service may talk to this node's kernel: `{ "port": <n> }`, the port inside the
     /// instance where the kernel answers on loopback. Only a service of the node's own project is created from such a
     /// template, never one in a tenant.
@@ -1184,9 +1189,168 @@ pub struct Template {
     pub update: Option<Update>,
 }
 
+/// One rule of a template's `settingRules`: `{ "need": <amount>, "atLeast": <amount>, "why": "<words>" }`. An amount
+/// is a whole number, the name of a top-level setting whose value is a whole number, or `{ "count": "<name>" }`, the
+/// number of entries of a top-level setting that is a list. The kernel compares the two amounts and knows nothing
+/// of what they mean; `why` is the template's own reason, told after the kernel's words when a create is refused.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SettingRule {
+    pub need: Value,
+    pub at_least: Value,
+    pub why: String,
+}
+
+/// One side of a [`SettingRule`].
+enum Amount<'a> {
+    Number(u64),
+    Setting(&'a str),
+    Count(&'a str),
+}
+
+impl<'a> Amount<'a> {
+    /// The amount a rule's side states, or `None` for anything but the three forms.
+    fn of(side: &'a Value) -> Option<Self> {
+        match side {
+            Value::Number(number) => number.as_u64().map(Amount::Number),
+            Value::String(name) => Some(Amount::Setting(name)),
+            Value::Object(object) if object.len() == 1 => {
+                object.get("count")?.as_str().map(Amount::Count)
+            }
+            _ => None,
+        }
+    }
+
+    /// Its value in `settings`: `Err` says what is wrong with the setting it names.
+    fn value(&self, settings: Option<&Value>) -> Result<i128, String> {
+        let setting = |name: &str| {
+            settings
+                .and_then(|settings| settings.get(name))
+                .ok_or_else(|| format!("names {name}, which is not a setting of the template"))
+        };
+        match self {
+            Amount::Number(number) => Ok(i128::from(*number)),
+            Amount::Setting(name) => match setting(name)? {
+                Value::Number(number) if number.is_u64() || number.is_i64() => Ok(number
+                    .as_i64()
+                    .map(i128::from)
+                    .or(number.as_u64().map(i128::from))
+                    .unwrap_or_default()),
+                _ => Err(format!("names {name}, whose value is not a whole number")),
+            },
+            Amount::Count(name) => match setting(name)? {
+                Value::Array(entries) => Ok(entries.len() as i128),
+                _ => Err(format!("counts {name}, whose value is not a list")),
+            },
+        }
+    }
+
+    /// The amount in the words of a refusal.
+    fn words(&self) -> String {
+        match self {
+            Amount::Number(number) => number.to_string(),
+            Amount::Setting(name) => format!("settings.{name}"),
+            Amount::Count(name) => format!("the number of entries in settings.{name}"),
+        }
+    }
+}
+
+/// How a [`SettingRule`] stands against one settings object.
+enum RuleCheck {
+    Holds,
+    /// The rule cannot be read against these settings: what is wrong with it.
+    Unreadable(String),
+    /// The settings do not pass it: the kernel's words, without the template's reason.
+    Fails(String),
+}
+
+fn check_rule(rule: &SettingRule, settings: Option<&Value>) -> RuleCheck {
+    let (Some(need), Some(least)) = (Amount::of(&rule.need), Amount::of(&rule.at_least)) else {
+        return RuleCheck::Unreadable(
+            "need and atLeast are each a whole number, the name of a setting, or { \"count\": \"<the name of a setting that is a list>\" }".into(),
+        );
+    };
+    if matches!((&need, &least), (Amount::Number(_), Amount::Number(_))) {
+        return RuleCheck::Unreadable(
+            "need and atLeast are both numbers, so it says nothing about a setting".into(),
+        );
+    }
+    let (have, floor) = match (need.value(settings), least.value(settings)) {
+        (Ok(have), Ok(floor)) => (have, floor),
+        (Err(why), _) => return RuleCheck::Unreadable(format!("need {why}")),
+        (_, Err(why)) => return RuleCheck::Unreadable(format!("atLeast {why}")),
+    };
+    if have >= floor {
+        return RuleCheck::Holds;
+    }
+    // Said about the setting, not about the number: a rule whose `need` is a number is a ceiling on the other side.
+    RuleCheck::Fails(match (&need, &least) {
+        (Amount::Number(_), _) => format!("{} is {floor}, above {have}", least.words()),
+        (_, Amount::Number(_)) => format!("{} is {have}, below {floor}", need.words()),
+        _ => format!(
+            "{} is {have}, below {} ({floor})",
+            need.words(),
+            least.words()
+        ),
+    })
+}
+
+/// The longest name of a setting that a rule may give, and that a refusal shows of a name a create gave.
+const SETTING_NAME_MAX: usize = 64;
+
+/// Why a template's `settingRules` are not ones it may state, or `None`: each is readable against the template's own
+/// settings, gives a plain reason, and holds for the template's own defaults.
+fn setting_rules_refusal(template: &Template) -> Option<String> {
+    if template.setting_rules.len() > 16 {
+        return Some("settingRules lists at most 16 rules".into());
+    }
+    template
+        .setting_rules
+        .iter()
+        .enumerate()
+        .find_map(|(n, rule)| {
+            let why = rule.why.trim();
+            if why.is_empty() || rule.why.chars().count() > 200 || !plain_text(&rule.why) {
+                return Some(format!(
+                    "settingRules[{n}]: why is its reason in plain words, 1 to 200 characters"
+                ));
+            }
+            // A name a rule gives is told back in a refusal, of the template and of a create: it is held to the
+            // length and the characters a create's own setting names are shown with, and one that is not is never
+            // told back.
+            let named = |side: &Value| match Amount::of(side) {
+                Some(Amount::Setting(name) | Amount::Count(name)) => {
+                    name.is_empty() || name.chars().count() > SETTING_NAME_MAX || !plain_text(name)
+                }
+                _ => false,
+            };
+            if named(&rule.need) || named(&rule.at_least) {
+                return Some(format!(
+                    "settingRules[{n}]: a setting is named in 1 to {SETTING_NAME_MAX} plain characters"
+                ));
+            }
+            match check_rule(rule, template.settings.as_ref()) {
+                RuleCheck::Holds => None,
+                RuleCheck::Unreadable(what) => Some(format!("settingRules[{n}]: {what}")),
+                RuleCheck::Fails(what) => Some(format!(
+                    "settingRules[{n}]: the template's own settings do not pass it: {what}"
+                )),
+            }
+        })
+}
+
 impl Template {
     pub fn is_vm(&self) -> bool {
         self.kind == VM_KIND
+    }
+
+    /// The alias of a template's local image, and the fingerprint the template pins it to, when its image is a local
+    /// one (`local:<alias>`) that carries a `digest`. A local image is one somebody put in the service project by
+    /// hand; without a pin the alias is trusted for whatever stands under it.
+    pub fn local_image_pin(&self) -> Option<(&str, &str)> {
+        let alias = self.image.strip_prefix("local:")?;
+        let fingerprint = self.digest.as_deref()?.strip_prefix("sha256:")?;
+        (self.kind != "oci").then_some((alias, fingerprint))
     }
 }
 
@@ -1212,6 +1376,11 @@ impl TemplateError {
 }
 
 pub fn load_template(dir: &Path, name: &str) -> Result<Template, TemplateError> {
+    read_template(dir, name).map(|(template, _)| template)
+}
+
+/// The template `name` and the text of its file, from one read of it.
+fn read_template(dir: &Path, name: &str) -> Result<(Template, String), TemplateError> {
     if !template_name_ok(name) {
         return Err(TemplateError::refused("template: invalid name"));
     }
@@ -1233,8 +1402,137 @@ pub fn load_template(dir: &Path, name: &str) -> Result<Template, TemplateError> 
         )));
     }
     validate_template(&template, dir)?;
-    Ok(template)
+    Ok((template, text))
 }
+
+/// A template as this node holds it at one moment: its file and every script it names, each read once, and the
+/// fingerprint of exactly those bytes. A create that is made from this value is made from what the fingerprint
+/// names, with no second read between the check and the create.
+#[derive(Debug, Clone)]
+pub struct TemplateContent {
+    pub template: Template,
+    /// The scripts the template names, by file name, as they were read, or why one could not be.
+    scripts: BTreeMap<String, Result<String, std::io::ErrorKind>>,
+    /// SHA-256, in hex, of the template's file and of each script it names ([`template_digest`]). `None` when a
+    /// script it names could not be read: such a template is no content a card can show.
+    pub digest: Option<String>,
+}
+
+impl TemplateContent {
+    /// The entrypoint, from the scripts read with the template ([`entrypoint`]).
+    pub fn entrypoint(&self) -> Result<Option<String>, TemplateError> {
+        entrypoint_with(&self.template, &mut |file| self.script(file))
+    }
+
+    /// The first-boot script, from the scripts read with the template ([`first_boot`]).
+    pub fn first_boot(&self) -> Result<Option<String>, TemplateError> {
+        first_boot_with(&self.template, &mut |file| self.script(file))
+    }
+
+    /// The fingerprint of the content, or the refusal a create gives for the script that stands in its way: one
+    /// that is missing, cannot be read, or is not what its place takes.
+    pub fn bound(&self) -> Result<&str, TemplateError> {
+        self.entrypoint()?;
+        self.first_boot()?;
+        self.digest
+            .as_deref()
+            .ok_or_else(|| TemplateError::refused("a script of the template could not be read"))
+    }
+
+    fn script(&self, file: &str) -> std::io::Result<String> {
+        match self.scripts.get(file) {
+            Some(Ok(script)) => Ok(script.clone()),
+            Some(Err(kind)) => Err(std::io::Error::from(*kind)),
+            None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        }
+    }
+}
+
+/// The template `name` with everything it is made of on this node: its file, and the script its entrypoint or its
+/// first boot names, each read once. A script that cannot be read does not fail the load: the builder that needs it
+/// refuses in its own words, where a create has always met it ([`TemplateContent::entrypoint`],
+/// [`TemplateContent::first_boot`]), and the content then has no fingerprint.
+pub fn load_template_content(dir: &Path, name: &str) -> Result<TemplateContent, TemplateError> {
+    let (template, text) = read_template(dir, name)?;
+    let scripts: BTreeMap<String, Result<String, std::io::ErrorKind>> = script_files(&template)
+        .into_iter()
+        .map(|file| {
+            let read = std::fs::read_to_string(dir.join(&file)).map_err(|error| error.kind());
+            (file, read)
+        })
+        .collect();
+    let read: Option<BTreeMap<&str, &str>> = scripts
+        .iter()
+        .map(|(file, script)| Some((file.as_str(), script.as_deref().ok()?)))
+        .collect();
+    let digest = read.map(|scripts| template_digest(name, &text, &scripts));
+    Ok(TemplateContent {
+        template,
+        scripts,
+        digest,
+    })
+}
+
+/// The plain file names a template names: the `{ "file": ... }` parts of its entrypoint, and its first-boot script.
+/// A name that is not a plain file name is left out here and refused by the builder that meets it.
+fn script_files(template: &Template) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    for part in template.entrypoint.iter().flatten() {
+        if let Some(file) = part
+            .get("file")
+            .and_then(Value::as_str)
+            .filter(|file| script_name_ok(file))
+        {
+            files.insert(file.to_string());
+        }
+    }
+    if let Some(file) = template.first_boot.as_ref().and_then(first_boot_file) {
+        files.insert(file.to_string());
+    }
+    files
+}
+
+/// The fingerprint of a template as a node holds it: SHA-256 over the bytes of its file and of each script it
+/// names, lowest file name first. Every part is framed by its name and its length, so no byte can pass from one part
+/// to another, and the bytes are hashed as they stand: any edit, a changed space among them, gives another value.
+pub fn template_digest(name: &str, text: &str, scripts: &BTreeMap<&str, &str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"arca-template-content-v1\0");
+    let mut part = |name: &str, bytes: &[u8]| {
+        hash.update((name.len() as u64).to_be_bytes());
+        hash.update(name.as_bytes());
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    };
+    part(&format!("{name}.json"), text.as_bytes());
+    for (file, script) in scripts {
+        part(file, script.as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The image of the services made from a template, as a proposal binds it and a card shows it: what Incus makes the
+/// instance from, `<image>@<digest>` when the template gives a digest (an OCI image by its registry digest, a system
+/// or local image by its fingerprint) and the bare `<image>` when it gives none. A virtual machine whose template
+/// names a version (`update.pin`) adds ` running <version>`: the machine's own system image first, then what it
+/// runs. No image name holds a space, so the two parts are told apart by that word alone.
+pub fn template_image(template: &Template) -> String {
+    let boots = match &template.digest {
+        Some(digest) => format!("{}@{digest}", template.image),
+        None => template.image.clone(),
+    };
+    match template_pin(template).filter(|_| template.is_vm()) {
+        Some(version) => format!("{boots}{IMAGE_RUNNING}{version}"),
+        None => boots,
+    }
+}
+
+/// What stands between a machine's own image and the version it runs in [`template_image`].
+pub const IMAGE_RUNNING: &str = " running ";
 
 fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateError> {
     let name = &template.name;
@@ -1259,9 +1557,31 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             "template {name}: only a virtual-machine template has a firstBoot, settings or createSettings"
         )));
     }
+    if !template.setting_rules.is_empty() {
+        return Err(TemplateError::refused(format!(
+            "template {name}: only a virtual-machine template has settingRules"
+        )));
+    }
     if template.update.is_some() {
         return Err(TemplateError::refused(format!(
             "template {name}: only a virtual-machine template has an update; a container's version is its digest"
+        )));
+    }
+    // A local image may carry a digest, which pins the alias to one image: it has the shape every digest has.
+    if template.kind != "oci"
+        && template.image.starts_with("local:")
+        && template.digest.as_deref().is_some_and(|digest| {
+            // Lowercase only: it is compared with the fingerprint as Incus writes it.
+            !digest.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        })
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: the digest of a local image is sha256: and 64 lowercase hex digits, as Incus writes a fingerprint"
         )));
     }
     if template.kind == "oci" && template.digest.is_none() {
@@ -1451,6 +1771,17 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     {
         return refused("settings is one JSON object of at most 16KiB");
     }
+    // A name createSettings lists is told back in a create's refusal ("it lets a create set ..."): it is held to
+    // what a rule's names are held to, and one that is not is refused without being shown.
+    if template
+        .create_settings
+        .iter()
+        .any(|key| key.is_empty() || key.chars().count() > SETTING_NAME_MAX || !plain_text(key))
+    {
+        return refused(&format!(
+            "createSettings names each setting in 1 to {SETTING_NAME_MAX} plain characters"
+        ));
+    }
     let mut listed = BTreeSet::new();
     if template.create_settings.len() > 32
         || !template.create_settings.iter().all(|key| {
@@ -1464,6 +1795,9 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         return refused(
             "createSettings lists at most 32 distinct keys of settings, each with its default there",
         );
+    }
+    if let Some(why) = setting_rules_refusal(template) {
+        return refused(&why);
     }
     if let Some(update) = &template.update
         && (listed.contains(update.pin.as_str())
@@ -1499,18 +1833,28 @@ fn first_boot_file(first_boot: &Value) -> Option<&str> {
 /// text cloud-init is given as user data, so it begins `#!` (a script, run once at the first boot) or `#cloud-config`.
 /// `None` for a template without one.
 pub fn first_boot(template: &Template, dir: &Path) -> Result<Option<String>, TemplateError> {
+    first_boot_with(template, &mut |file| {
+        std::fs::read_to_string(dir.join(file))
+    })
+}
+
+/// [`first_boot`], with the script given by `read`: the file itself, or what was read with the template.
+fn first_boot_with(
+    template: &Template,
+    read: &mut dyn FnMut(&str) -> std::io::Result<String>,
+) -> Result<Option<String>, TemplateError> {
     let Some(first_boot) = &template.first_boot else {
         return Ok(None);
     };
     let name = &template.name;
     let file = first_boot_file(first_boot)
         .ok_or_else(|| TemplateError::refused(format!("template {name}: invalid firstBoot")))?;
-    let script = std::fs::read_to_string(dir.join(file)).map_err(|error| {
+    let script = read(file).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             TemplateError::refused(format!(
                 "template {name}: its first-boot script is not installed (templates/{file} does not exist). \
                  The script belongs beside templates/{name}.json in the state directory; for a template Arca ships, \
-                 `arca templates install --config <file>` puts the template and its script there"
+                 `arca templates install --config CONFIG_FILE` (this node's config in place of CONFIG_FILE) puts the template and its script there"
             ))
         } else {
             TemplateError::refused(format!(
@@ -1621,7 +1965,7 @@ pub fn create_settings(
             let shown: String = key
                 .chars()
                 .filter(|c| plain_text(&c.to_string()))
-                .take(64)
+                .take(SETTING_NAME_MAX)
                 .collect();
             return refused(format!(
                 "settings.{shown}: template {name} does not let a create set it; it lets a create set {}",
@@ -1640,6 +1984,21 @@ pub fn create_settings(
         return refused(format!(
             "settings: with these values the settings of template {name} pass 16KiB"
         ));
+    }
+    // What the template says must hold between its settings, asked of the values this service would have. The
+    // kernel's words say which amounts, the template's own say why.
+    for rule in &template.setting_rules {
+        match check_rule(rule, Some(&merged)) {
+            RuleCheck::Holds => {}
+            RuleCheck::Fails(what) => {
+                return refused(format!("settings: {what}: {}", rule.why.trim()));
+            }
+            // A value of another type than its default was refused above, so a rule the template passed when it
+            // was read is readable here too.
+            RuleCheck::Unreadable(what) => {
+                return refused(format!("settings: a rule of template {name} {what}"));
+            }
+        }
     }
     Ok(ServiceSettings {
         merged: Some(merged),
@@ -2060,7 +2419,15 @@ pub fn source(template: &Template) -> Result<Value, TemplateError> {
         .filter(|(_kind, alias)| !alias.is_empty())
         .ok_or_else(|| TemplateError::refused("invalid system image"))?;
     match kind {
-        "local" => Ok(json!({ "type": "image", "alias": alias })),
+        // A pinned local image is named to Incus by its fingerprint as well. When a source carries a fingerprint Incus
+        // uses it and never looks the alias up, so the fingerprint decides which image the instance is made from and
+        // the alias is only a name kept in the record.
+        "local" => Ok(match template.local_image_pin() {
+            Some((alias, fingerprint)) => {
+                json!({ "type": "image", "alias": alias, "fingerprint": fingerprint })
+            }
+            None => json!({ "type": "image", "alias": alias }),
+        }),
         "images" => {
             let mut source = json!({
                 "type": "image",
@@ -2243,6 +2610,123 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_templates_fingerprint_is_of_its_bytes_as_they_stand_and_no_byte_passes_between_parts() {
+        let digest = |name: &str, text: &str, scripts: &[(&str, &str)]| {
+            template_digest(name, text, &scripts.iter().copied().collect())
+        };
+        let base = digest("app", "{\"name\":\"app\"}", &[("app.sh", "exec app\n")]);
+        assert_eq!(base.len(), 64);
+        assert!(
+            base.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_eq!(
+            base,
+            digest("app", "{\"name\":\"app\"}", &[("app.sh", "exec app\n")])
+        );
+        // Any edit gives another value: a space in the file, a byte in the script, a script more or less, another
+        // name for the template or for the script.
+        for other in [
+            digest("app", "{\"name\": \"app\"}", &[("app.sh", "exec app\n")]),
+            digest("app", "{\"name\":\"app\"}\n", &[("app.sh", "exec app\n")]),
+            digest("app", "{\"name\":\"app\"}", &[("app.sh", "exec app")]),
+            digest("app", "{\"name\":\"app\"}", &[]),
+            digest(
+                "app",
+                "{\"name\":\"app\"}",
+                &[("app.sh", "exec app\n"), ("b.sh", "")],
+            ),
+            digest("apq", "{\"name\":\"app\"}", &[("app.sh", "exec app\n")]),
+            digest("app", "{\"name\":\"app\"}", &[("apq.sh", "exec app\n")]),
+        ] {
+            assert_ne!(other, base);
+        }
+        // The same bytes cut at another place are another template: a byte moved from the file's end to the
+        // script's name, or from one script to the next, does not give the same value.
+        assert_ne!(
+            digest("a", "xy", &[("s", "z")]),
+            digest("a", "x", &[("ys", "z")])
+        );
+        assert_ne!(
+            digest("a", "x", &[("s", "yz"), ("t", "")]),
+            digest("a", "x", &[("s", "y"), ("t", "z")])
+        );
+        // The scripts are taken lowest name first, whatever order they were named in.
+        assert_eq!(
+            digest("a", "x", &[("b.sh", "2"), ("a.sh", "1")]),
+            digest("a", "x", &[("a.sh", "1"), ("b.sh", "2")])
+        );
+    }
+
+    #[test]
+    fn the_image_of_a_template_is_what_boots_and_then_the_version_a_machine_runs() {
+        let template =
+            |value: Value| -> Template { serde_json::from_value(value).expect("a template") };
+        let digest = format!("sha256:{}", "a".repeat(64));
+        // A registry image by its digest: the reference the instance is fetched by.
+        let oci = template(json!({
+            "name": "app", "kind": "oci", "image": "docker.io/library/app", "digest": digest
+        }));
+        assert_eq!(
+            template_image(&oci),
+            format!("docker.io/library/app@{digest}")
+        );
+        assert_eq!(Some(template_image(&oci)), template_pin(&oci));
+        // A system image: with the fingerprint the template gives, or bare when it gives none.
+        let bare = template(
+            json!({ "name": "vm", "kind": "virtual-machine", "image": "images:debian/13" }),
+        );
+        assert_eq!(template_image(&bare), "images:debian/13");
+        let pinned = template(json!({
+            "name": "vm", "kind": "virtual-machine", "image": "images:debian/13", "digest": digest
+        }));
+        assert_eq!(
+            template_image(&pinned),
+            format!("images:debian/13@{digest}")
+        );
+        let local = template(json!({ "name": "built", "kind": "system", "image": "local:built" }));
+        assert_eq!(template_image(&local), "local:built");
+        // A machine that names the version it runs: its own image first, then that version.
+        let running = template(json!({
+            "name": "ws", "kind": "virtual-machine", "image": "images:debian/13/cloud",
+            "update": { "pin": "serverImage" },
+            "settings": { "serverImage": format!("registry.example/server@{digest}") }
+        }));
+        assert_eq!(
+            template_image(&running),
+            format!("images:debian/13/cloud running registry.example/server@{digest}")
+        );
+    }
+
+    #[test]
+    fn a_bridged_machines_address_is_its_own_interfaces_and_never_one_the_guest_made() {
+        let state = json!({ "network": {
+            "docker0": { "hwaddr": "02:42:00:00:00:01", "addresses": [
+                { "family": "inet", "address": "172.17.0.1", "scope": "global" } ] },
+            "enp5s0": { "hwaddr": "10:66:6A:00:00:07", "addresses": [
+                { "family": "inet6", "address": "fe80::1", "scope": "link" },
+                { "family": "inet", "address": "198.51.100.7", "scope": "global" } ] },
+            "lo": { "hwaddr": "", "addresses": [
+                { "family": "inet", "address": "127.0.0.1", "scope": "local" } ] }
+        }});
+        let by_incus = json!({ "config": { "volatile.eth0.hwaddr": "10:66:6a:00:00:07" } });
+        let by_device = json!({ "config": {}, "devices": {
+            "eth0": { "type": "nic", "hwaddr": "10:66:6a:00:00:07" } } });
+        for row in [by_incus, by_device] {
+            assert_eq!(
+                bridged_ipv4(&row, &state),
+                Some("198.51.100.7".parse().unwrap())
+            );
+        }
+        // The first interface with a global address is the guest's own bridge: the old reading took that one.
+        assert_eq!(live_ipv4(&state), Some("172.17.0.1".parse().unwrap()));
+        // No interface of the instance's own, or none with an address yet: none.
+        let other = json!({ "config": { "volatile.eth0.hwaddr": "10:66:6a:00:00:99" } });
+        assert_eq!(bridged_ipv4(&other, &state), None);
+        assert_eq!(bridged_ipv4(&other, &json!({})), None);
+    }
+
+    #[test]
     fn generated_secrets_reject_biased_bytes_refill_and_stop_at_length() {
         let mut calls = 0;
         let secret = generated_secret_with("key_", |bytes| {
@@ -2259,6 +2743,114 @@ mod tests {
         assert_eq!(secret.len(), 32);
         assert!(secret.bytes().all(|b| b.is_ascii_alphanumeric()));
     }
+}
+
+/// What a secret is a value of: where it goes decides what it may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretOf {
+    /// A virtual machine's: a file in its guest, so it may have line breaks and end with one.
+    Machine,
+    /// A container's: an environment value, so it is one line.
+    Container,
+    /// A function's: an environment value of each run, so it is one line.
+    Function,
+}
+
+/// The longest secret, in characters. A virtual machine's does not count one line break at its end.
+pub const SECRET_MAX: usize = 4096;
+/// The shortest secret, in characters. In a virtual machine's, line breaks do not count toward it.
+pub const SECRET_MIN: usize = 8;
+
+/// A secret without the one line break at its end that its length does not count.
+fn secret_body(value: &str) -> &str {
+    value.strip_suffix('\n').unwrap_or(value)
+}
+
+/// What a log line or an output must never show for a stored secret: the stored text without the line breaks at its
+/// end, since a line never holds them. `None` for a stored text that no secret can be: one longer than the rule
+/// allows, counted as [`secret_value`] counts it (in characters, not counting one line break at its end), or shorter
+/// than a secret once the line breaks at its end are cut. The two share that count, so no value the node accepts is left out.
+pub fn secret_to_hide(stored: &str) -> Option<&str> {
+    if secret_body(stored).chars().count() > SECRET_MAX {
+        return None;
+    }
+    let shown = stored.trim_end_matches('\n');
+    (shown.chars().count() >= SECRET_MIN).then_some(shown)
+}
+
+/// The control character that stands in the way, by what it is. The words never hold the character or where it is.
+fn control_named(text: &str) -> &'static str {
+    match text.chars().find(|c| c.is_control() && *c != '\n') {
+        Some('\0') => "a NUL character",
+        Some('\t') => "a tab",
+        Some('\r') => "a carriage return that no line feed follows",
+        Some(_) => "a control character that is no line break",
+        None => "a line break",
+    }
+}
+
+/// The value a secret verb stores for the value a caller gave, or why it stores none, in words that name the rule and
+/// its limit and never the value, a part of it or its length.
+///
+/// A virtual machine's secret is a file, as a key file is: it is stored byte for byte as given, with the line break
+/// at its end when it has one, except that each carriage return and line feed pair is stored as one line feed. It is
+/// 8 to 4096 characters, not counting one line break at its end, and at least 8 of them are not line breaks.
+///
+/// A container's and a function's secret is an environment value: one line of 8 to 4096 characters. A line break at
+/// its end would become part of the value the program reads, so it is refused, in words that say it is the only fault.
+pub fn secret_value(given: &str, of: SecretOf) -> Result<String, String> {
+    if of == SecretOf::Machine {
+        let value = given.replace("\r\n", "\n");
+        let limits = format!(
+            "a virtual machine's secret is {SECRET_MIN} to {SECRET_MAX} characters, not counting one line break at its end; it may have line breaks, and no other control character"
+        );
+        if value.chars().any(|c| c.is_control() && c != '\n') {
+            return Err(format!("{limits}: this one has {}", control_named(&value)));
+        }
+        let counted = secret_body(&value).chars().count();
+        if counted > SECRET_MAX {
+            return Err(format!("{limits}: this one is longer"));
+        }
+        if value.chars().filter(|c| *c != '\n').count() < SECRET_MIN {
+            return Err(format!(
+                "{limits}: this one has fewer than {SECRET_MIN} characters that are not line breaks"
+            ));
+        }
+        return Ok(value);
+    }
+    let (whose, why) = match of {
+        SecretOf::Function => ("a function's", "each run reads it as an environment value"),
+        _ => (
+            "a container's",
+            "the program reads it as an environment value",
+        ),
+    };
+    let limits = format!(
+        "{whose} secret is one line of {SECRET_MIN} to {SECRET_MAX} characters without control characters"
+    );
+    let length_ok = |text: &str| (SECRET_MIN..=SECRET_MAX).contains(&text.chars().count());
+    if !given.chars().any(char::is_control) {
+        return if length_ok(given) {
+            Ok(given.to_string())
+        } else {
+            Err(format!(
+                "{limits}: this one is not {SECRET_MIN} to {SECRET_MAX} characters"
+            ))
+        };
+    }
+    // A value read whole from a file ends with a line break: said as the one thing to change, when it is.
+    let cut = given
+        .strip_suffix("\r\n")
+        .or_else(|| given.strip_suffix('\n'));
+    if let Some(cut) = cut
+        && !cut.chars().any(char::is_control)
+        && length_ok(cut)
+    {
+        return Err(format!(
+            "{limits}: this one ends with a line break, and nothing else is wrong with it. Send it without the line break at its end ({why}, and the line break would be part of it; only a virtual machine's secret, which is a file, may end with one)"
+        ));
+    }
+    Err(format!("{limits}: this one has {}", control_named(given)))
 }
 
 pub fn write_secret(path: &Path, value: &str) -> Result<(), TemplateError> {
@@ -2337,6 +2929,16 @@ pub fn render(
 
 /// A template entrypoint, with a `{ "file": "name.sh" }` element read from the template directory.
 pub fn entrypoint(template: &Template, dir: &Path) -> Result<Option<String>, TemplateError> {
+    entrypoint_with(template, &mut |file| {
+        std::fs::read_to_string(dir.join(file))
+    })
+}
+
+/// [`entrypoint`], with each script given by `read`: the file itself, or what was read with the template.
+fn entrypoint_with(
+    template: &Template,
+    read: &mut dyn FnMut(&str) -> std::io::Result<String>,
+) -> Result<Option<String>, TemplateError> {
     let Some(parts) = &template.entrypoint else {
         return Ok(None);
     };
@@ -2363,9 +2965,8 @@ pub fn entrypoint(template: &Template, dir: &Path) -> Result<Option<String>, Tem
                          letters, digits, dots, dashes and underscores, not starting with a dot)",
                     ));
                 }
-                let path = dir.join(file);
-                let script = std::fs::read_to_string(&path)
-                    .map_err(|error| script_unreadable(&template.name, file, &error))?;
+                let script =
+                    read(file).map_err(|error| script_unreadable(&template.name, file, &error))?;
                 out.push(shell_quote(script.trim_end_matches('\n')));
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),
@@ -2395,7 +2996,7 @@ fn script_unreadable(template: &str, file: &str, error: &std::io::Error) -> Temp
         return TemplateError::refused(format!(
             "template {template}: its entrypoint script is not installed (templates/{file} does not exist). \
              The script belongs beside templates/{template}.json in the state directory; for a template Arca ships, \
-             `arca templates install --config <file>` puts the template and its script there"
+             `arca templates install --config CONFIG_FILE` (this node's config in place of CONFIG_FILE) puts the template and its script there"
         ));
     }
     TemplateError::refused(format!(
@@ -2437,6 +3038,44 @@ pub fn live_ipv4(state: &Value) -> Option<Ipv4Addr> {
         .iter()
         .filter(|(name, _)| name.as_str() != "lo")
         .flat_map(|(_, nic)| nic["addresses"].as_array().into_iter().flatten())
+        .find_map(|address| {
+            (address["family"] == "inet" && address["scope"] == "global")
+                .then(|| address["address"].as_str()?.parse::<Ipv4Addr>().ok())
+                .flatten()
+        })
+}
+
+/// The address a machine on a host bridge holds now: the first global IPv4 address of an interface whose hardware
+/// address is one the instance's own network devices have, as Incus gave it (`volatile.<device>.hwaddr` in `row`'s
+/// config) or as its device states it (`hwaddr`). An interface the guest made for itself, such as a container bridge
+/// inside it, has an address too, and is never the one meant.
+pub fn bridged_ipv4(row: &Value, state: &Value) -> Option<Ipv4Addr> {
+    let mut given: Vec<&str> = row["config"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| key.starts_with("volatile.") && key.ends_with(".hwaddr"))
+        .filter_map(|(_, value)| value.as_str())
+        .collect();
+    for devices in ["devices", "expanded_devices"] {
+        given.extend(
+            row[devices]
+                .as_object()
+                .into_iter()
+                .flat_map(|devices| devices.values())
+                .filter(|device| device["type"] == "nic")
+                .filter_map(|device| device["hwaddr"].as_str()),
+        );
+    }
+    state["network"]
+        .as_object()?
+        .values()
+        .filter(|nic| {
+            nic["hwaddr"]
+                .as_str()
+                .is_some_and(|held| given.iter().any(|mac| mac.eq_ignore_ascii_case(held)))
+        })
+        .flat_map(|nic| nic["addresses"].as_array().into_iter().flatten())
         .find_map(|address| {
             (address["family"] == "inet" && address["scope"] == "global")
                 .then(|| address["address"].as_str()?.parse::<Ipv4Addr>().ok())
@@ -2600,16 +3239,121 @@ fn credential_patterns() -> &'static [(regex::Regex, &'static str)] {
     })
 }
 
-/// Replaces every stored/rendered secret value (longest first) and then every credential pattern.
-pub fn redact_log(text: &str, secrets: &[String]) -> String {
-    let mut out = text.to_string();
-    let mut values: Vec<&String> = secrets.iter().filter(|value| value.len() >= 8).collect();
+/// The shortest line of a secret of several lines that is hidden by its value wherever it is shown, in characters.
+///
+/// A secret of several lines (a key file) is shown one line at a time in a log, so each of its lines is hidden as a
+/// value of its own. A short line is not: a line of a few characters (`}`, `[server]`, `port = 5432`) is ordinary
+/// text that a log holds in many places, and hiding it would blank lines that hold no secret. At 16 characters a line
+/// of random text carries 96 bits of a base64 key, more than anyone finds in a log by chance, and a line of a key
+/// file (64 characters, or the last one) is hidden whole. What a shorter line can leave shown is at most the last
+/// few characters of such a file, too few to rebuild anything from; a PEM block is also hidden whole by its shape.
+pub const SECRET_LINE_MIN: usize = 16;
+
+/// A PEM block, from its BEGIN line to its END line, whatever is between; one whose END was not printed is hidden
+/// to the end of the text.
+fn pem_block() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static PEM: OnceLock<regex::Regex> = OnceLock::new();
+    PEM.get_or_init(|| {
+        regex::Regex::new(
+            r"(?s)-----BEGIN [A-Z0-9 ]{1,64}-----.*?(?:-----END [A-Z0-9 ]{1,64}-----|\z)",
+        )
+        .expect("the PEM pattern is valid")
+    })
+}
+
+/// Hides each whole PEM block in a text as it came, before it is cut into lines or cleaned: a key printed on a
+/// console is hidden whatever it is, a stored secret or not.
+pub fn redact_blocks(text: &str) -> std::borrow::Cow<'_, str> {
+    pem_block().replace_all(text, "[secret]")
+}
+
+/// The texts that hide `secrets`: each value whole, each value as [`clean_log`] shows it, and for a value of several
+/// lines each of its lines of at least [`SECRET_LINE_MIN`] characters, as it is and as it is shown cleaned. Longest first.
+/// Made once for a text of many lines and given to [`redact_hidden`] for each line.
+pub fn values_to_hide(secrets: &[String]) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    let mut add = |value: &str, shortest_chars: usize| {
+        if value.len() >= 8
+            && value.chars().count() >= shortest_chars
+            && !values.iter().any(|v| v == value)
+        {
+            values.push(value.to_string());
+        }
+    };
+    for secret in secrets {
+        add(secret, 0);
+        add(&clean_log(secret), 0);
+        if secret.contains(['\n', '\r']) {
+            for line in secret.split(['\n', '\r']) {
+                add(line.trim(), SECRET_LINE_MIN);
+                add(&clean_log(line), SECRET_LINE_MIN);
+            }
+        }
+    }
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    for value in values {
-        out = out.replace(value, "[secret]");
+    values
+}
+
+/// Hides each PEM block, then every stored/rendered secret value (whole and, for one of several lines, line by line;
+/// longest first), then every credential pattern.
+pub fn redact_log(text: &str, secrets: &[String]) -> String {
+    redact_hidden(text, &values_to_hide(secrets))
+}
+
+/// [`redact_log`] with the values to hide already made by [`values_to_hide`].
+pub fn redact_hidden(text: &str, hidden: &[String]) -> String {
+    let mut out = redact_blocks(text).into_owned();
+    for value in hidden {
+        out = out.replace(value.as_str(), "[secret]");
     }
     for (pattern, replacement) in credential_patterns() {
         out = pattern.replace_all(&out, *replacement).into_owned();
     }
     out
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// Lines of letters made from a counter: no value of a real secret.
+    fn lines(seed: u32, count: usize, width: usize) -> Vec<String> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                (0..width)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        (b'a' + (state >> 24) as u8 % 26) as char
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_failures_words_hide_a_secret_of_several_lines_that_cleaning_would_join() {
+        // A stored secret of three lines, printed by a failing command on its error stream with the lines apart.
+        let secret = format!("{}\n", lines(7, 3, 40).join("\n"));
+        let stderr = format!("cannot load:\n{secret}giving up\n");
+        let shown = crate::service_exec::failure_text(&stderr, &[secret.clone()]);
+        let leaks = secret.lines().any(|line| shown.contains(line));
+        assert!(!leaks, "a line of the secret is in the failure's words");
+        assert!(shown.starts_with("cannot load:") && shown.ends_with("giving up"));
+    }
+
+    #[test]
+    fn a_short_line_of_a_secret_of_several_lines_is_not_hidden_by_its_value() {
+        let long = lines(9, 1, SECRET_LINE_MIN).remove(0);
+        let short = lines(11, 1, SECRET_LINE_MIN - 1).remove(0);
+        let secret = format!("{long}\n{short}\n");
+        let hidden = redact_log(&format!("a {long} b"), &[secret.clone()]);
+        assert!(
+            hidden == "a [secret] b",
+            "a line of the shortest length hidden is not hidden"
+        );
+        let kept = redact_log(&format!("a {short} b"), &[secret]);
+        assert!(kept == format!("a {short} b"), "a shorter line is hidden");
+    }
 }

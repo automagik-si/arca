@@ -62,6 +62,21 @@ fn pin(rig: &Rig) -> String {
     arca::service::template_pin(&template).expect("it names an image by digest")
 }
 
+/// The fingerprint of the node's database template as it stands now: its file and its entrypoint script.
+fn content(rig: &Rig) -> String {
+    arca::service::load_template_content(&rig.dir.join("templates"), DATABASE_TEMPLATE)
+        .unwrap_or_else(|_| panic!("the database template loads"))
+        .digest
+        .expect("its content has a fingerprint")
+}
+
+/// The card's last row for a template whose content has the fingerprint `digest`.
+fn content_row(digest: &str) -> String {
+    format!(
+        "{digest}. Arca creates this only if the template on the node is still exactly this one."
+    )
+}
+
 fn propose(rig: &Rig, args: Value) -> Result<Value, CallError> {
     rig.call(
         "action_propose",
@@ -150,9 +165,12 @@ fn on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_f
     let pin = pin(&rig);
     let proposal = propose(&rig, json!({ "name": "orders" })).expect("the proposal");
     // The kernel names the template and the image it pins: the card shows the image, and the approval binds both.
+    let content = content(&rig);
     assert_eq!(
         proposal["args"],
-        json!({ "name": "orders", "template": DATABASE_TEMPLATE, "image": pin })
+        json!({
+            "name": "orders", "template": DATABASE_TEMPLATE, "image": pin, "templateDigest": content
+        })
     );
     assert_eq!(
         proposal["details"],
@@ -160,7 +178,8 @@ fn on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_f
             { "label": "Database", "value": "orders" },
             { "label": "Image", "value": pin },
             { "label": "Template", "value": DATABASE_TEMPLATE },
-            { "label": "Made as", "value": MADE_AS }
+            { "label": "Made as", "value": MADE_AS },
+            { "label": "Template content", "value": content_row(&content) }
         ])
     );
     assert!(
@@ -581,7 +600,8 @@ fn a_template_that_generates_no_password_makes_a_stopped_database_and_the_card_s
             { "label": "Image", "value": pin },
             { "label": "Template", "value": DATABASE_TEMPLATE },
             { "label": "Made as", "value": MADE_AS_PLAIN },
-            { "label": "Start", "value": format!("No: it is created stopped because {why}; instance_start starts it later") }
+            { "label": "Start", "value": format!("No: it is created stopped because {why}; instance_start starts it later") },
+            { "label": "Template content", "value": content_row(&content(&rig)) }
         ])
     );
     let made = approve(&rig, &proposal).expect("the approved create");
@@ -602,6 +622,80 @@ fn a_template_that_generates_no_password_makes_a_stopped_database_and_the_card_s
         .call("postgres_create", json!({ "name": "bills" }))
         .expect("the direct create");
     assert_eq!(direct["stoppedBecause"], why);
+}
+
+fn waiting(rig: &Rig) -> Vec<Value> {
+    rig.call("plan_list", json!({})).expect("plans")["plans"]
+        .as_array()
+        .expect("plans")
+        .clone()
+}
+
+#[test]
+fn a_waiting_databases_card_says_the_same_after_the_node_restarts() {
+    // What the node read from its template when the database was proposed is not in the proposal's arguments. A
+    // restart inside the proposal's fifteen minutes keeps it: the stopped row above all, so the owner never approves
+    // a card that lost it.
+    let rig = clean();
+    edit_database_template(&rig, |template| {
+        template
+            .as_object_mut()
+            .expect("a template")
+            .remove("generate");
+    });
+    let stopped = propose(&rig, json!({ "name": "orders" })).expect("the proposal");
+    assert_eq!(
+        stopped["details"][4],
+        json!({
+            "label": "Start",
+            "value": "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; instance_start starts it later"
+        })
+    );
+    edit_database_template(&rig, |template| {
+        template["generate"] = json!({ "POSTGRES_PASSWORD": "" });
+    });
+    let generated = propose(&rig, json!({ "name": "bills" })).expect("the proposal");
+    assert_eq!(generated["details"][3]["value"], MADE_AS);
+    let before = waiting(&rig);
+    assert_eq!(before.len(), 2);
+    let rig = rig.restart();
+    let after = waiting(&rig);
+    assert_eq!(after, before, "both cards are the ones the owner was shown");
+    for (proposal, shown) in [("orders", &stopped), ("bills", &generated)] {
+        let kept = after
+            .iter()
+            .find(|plan| plan["args"]["name"] == proposal)
+            .unwrap_or_else(|| panic!("{proposal} still waits"));
+        assert_eq!(kept["details"], shown["details"], "{proposal}");
+        assert_eq!(kept["argsDigest"], shown["argsDigest"], "{proposal}");
+    }
+    // A proposal that waited through the restart is still approved and run.
+    let made = approve(&rig, &generated).expect("the approved create");
+    assert_eq!(made["name"], "bills");
+    assert!(made.get("stoppedBecause").is_none());
+}
+
+#[test]
+fn a_card_does_not_say_generated_when_a_password_is_already_stored_for_the_name() {
+    // The create uses a password that is stored for the name and generates none, so the card claims nothing.
+    let rig = clean();
+    let file = password_file(&rig, "orders");
+    fs::create_dir_all(file.parent().expect("its directory")).expect("the secrets directory");
+    fs::write(&file, "a-password-stored-before").expect("a stored password");
+    let proposal = propose(&rig, json!({ "name": "orders" })).expect("the proposal");
+    assert_eq!(
+        proposal["details"],
+        json!([
+            { "label": "Database", "value": "orders" },
+            { "label": "Image", "value": pin(&rig) },
+            { "label": "Template", "value": DATABASE_TEMPLATE },
+            { "label": "Made as", "value": MADE_AS_PLAIN },
+            { "label": "Template content", "value": content_row(&content(&rig)) }
+        ])
+    );
+    // A name with no stored password still gets the claim: the template generates it.
+    let other = propose(&rig, json!({ "name": "bills" })).expect("the proposal");
+    assert_eq!(other["details"][3]["value"], MADE_AS);
 }
 
 #[test]
@@ -638,30 +732,29 @@ fn a_token_whose_tool_list_leaves_out_service_create_makes_no_database_from_the_
 }
 
 #[test]
-fn the_image_checked_and_the_image_created_from_are_one_read_of_the_template() {
-    // The service handler is told the image the database's create was checked against, and compares it with the
-    // template it reads for the create: a template that names another by then makes nothing.
+fn what_a_database_was_checked_against_and_what_it_is_created_from_are_one_read_of_the_template() {
+    // The service handler is told the image and the content the database's create was checked against, and compares
+    // both with the template it reads for the create: a template that is another by then makes nothing.
     let rig = clean();
-    let now = pin(&rig);
-    let stale = format!("ghcr.io/automagik-si/autopg@sha256:{}", "e".repeat(64));
+    let image = pin(&rig);
     let entries = rig.entries();
-    let (code, message) = refusal(rig.call(
-        "service_create",
-        json!({ "name": "orders", "template": DATABASE_TEMPLATE, "pin": stale }),
-    ));
-    assert_eq!(code, "refused");
-    assert_eq!(
-        message,
-        format!(
-            "image: a call cannot choose an image. This node makes a database from its postgres-autopg template, which names {now} now. A proposal that names another was made before the template changed: nothing was created, propose it again"
-        )
-    );
+    for stale in [
+        json!({ "name": "orders", "template": DATABASE_TEMPLATE, "image": image, "templateDigest": "e".repeat(64) }),
+        json!({
+            "name": "orders", "template": DATABASE_TEMPLATE,
+            "image": format!("ghcr.io/automagik-si/autopg@sha256:{}", "e".repeat(64)),
+            "templateDigest": content(&rig)
+        }),
+    ] {
+        let (code, message) = refusal(rig.call("service_create", stale));
+        assert_eq!(code, "refused");
+        assert_eq!(
+            message,
+            "the template postgres-autopg on this node is not the one this create names: it was changed or installed again since the card was shown, or the call states an image or a template content of its own. Nothing was created; propose it again"
+        );
+    }
     assert_eq!(rig.entries(), entries);
     assert!(!password_file(&rig, "orders").exists());
-    // The schema of service_create has no such field: only postgres_create passes it, inside the node.
-    let params = (arca_api::verb("service_create").expect("the verb").params)();
-    assert!(params["properties"].get("pin").is_none());
-    assert_eq!(params["additionalProperties"], false);
 }
 
 #[test]

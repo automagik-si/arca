@@ -308,6 +308,23 @@ impl UnixIncusWriter {
     /// the moment it exists. The name must be free: its GET must answer 404. The POST is then sent, and the object is read
     /// back, which must class as this entry's own. An instance starts by default unless its body explicitly sets `start: false`.
     pub fn create(&self, target: &Target, body: &Value) -> Result<Owned, IncusError> {
+        self.create_with_registry(target, body, None)
+    }
+
+    /// [`Self::create`], for an instance whose image is on a registry that asks for a credential. `body` is the body
+    /// a create always takes, with no credential in it, and every check is made on it as it is: a server address
+    /// that carries one is still refused. Only the body that is sent names the registry as
+    /// its address with the user name and the password before the host, which is how Incus takes a registry's credential. Nothing else of the
+    /// body changes, and a body whose source is not an OCI pull is sent as it is.
+    ///
+    /// Incus keeps that address in the record of the image it fetches. It is told not to use it again by itself: once
+    /// the instance exists, `auto_update` is turned off on the image it was made from.
+    pub fn create_with_registry(
+        &self,
+        target: &Target,
+        body: &Value,
+        registry: Option<&RegistryCredential>,
+    ) -> Result<Owned, IncusError> {
         self.allow_target(target)?;
         if target.uuid.is_some() {
             return Err(refused("a create names no uuid yet"));
@@ -351,8 +368,68 @@ impl UnixIncusWriter {
             self.network_is_own(network)?;
         }
         self.require_free(&urls.object)?;
-        self.mutate("POST", &urls.collection, None, Some(&Value::Object(sent)))?;
+        let with_credential = registry.and_then(|registry| {
+            let source = sent.get("source")?;
+            if target.kind != IncusKind::Instance || source["protocol"] != "oci" {
+                return None;
+            }
+            let address = registry.address(source["server"].as_str()?)?;
+            let mut source = source.clone();
+            source["server"] = json!(address);
+            Some(source)
+        });
+        let fetched = with_credential.is_some();
+        if let Some(source) = with_credential {
+            sent.insert("source".to_string(), source);
+        }
+        let posted = self.mutate("POST", &urls.collection, None, Some(&Value::Object(sent)));
+        if fetched {
+            // Whatever the create answered: the fetch may be done when the create is not (an instance Incus made
+            // and did not start, a read-back that did not confirm), and the image's record then holds the address.
+            self.fetched_images_stay_put(&target.project, &target.name);
+        }
+        posted?;
         self.confirm(target, |_| Ok(()))
+    }
+
+    /// Turns `auto_update` off on every cached image of `project` whose record says it was fetched with a
+    /// credential and that still has it on. An image by digest never changes, so Incus has no reason to go back to
+    /// the registry for it with the address it keeps. A failure is said on the log and nothing else: the periodic
+    /// sweep of such images tries again.
+    fn fetched_images_stay_put(&self, project: &str, for_whom: &str) {
+        let listed = self
+            .send(
+                "GET",
+                &format!("/1.0/images?project={project}&recursion=1"),
+                None,
+                None,
+            )
+            .and_then(|framed| checked_envelope(&framed.into_raw()));
+        let mut failed = listed.is_err();
+        for image in listed
+            .iter()
+            .flat_map(|envelope| envelope["metadata"].as_array().into_iter().flatten())
+        {
+            let on = image["cached"] == true
+                && image["auto_update"] != false
+                && image["update_source"]["server"]
+                    .as_str()
+                    .is_some_and(address_holds_credential);
+            if let (true, Some(fingerprint)) = (on, image["fingerprint"].as_str())
+                && fingerprint.len() == 64
+                && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                let url = format!("/1.0/images/{fingerprint}?project={project}");
+                failed |= self
+                    .mutate("PATCH", &url, None, Some(&json!({ "auto_update": false })))
+                    .is_err();
+            }
+        }
+        if failed {
+            eprintln!(
+                "arca: auto_update could not be turned off on the image of {for_whom}: Incus may ask its registry again by itself until the next sweep"
+            );
+        }
     }
 
     /// Sets and removes config keys of an object this entry owns, under the ETag of `owned`. The change must leave the object
@@ -1086,6 +1163,61 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     } else {
         Err(refused("a create may name only an image source"))
     }
+}
+
+/// A registry's credential: the user name and the password a registry asks for before it gives an image. It is
+/// read from the node's secret store at the moment of a create and lives nowhere else in Arca.
+#[derive(Clone)]
+pub struct RegistryCredential {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for RegistryCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RegistryCredential(..)")
+    }
+}
+
+impl RegistryCredential {
+    /// The registry `server` (`https://<host>`) as Incus takes it with this credential:
+    /// the same address with the user name, a colon, the password and an `@` before the host, each written as an
+    /// address writes them
+    /// (everything but letters, digits and `- . _ ~` as `%XX`). `None` for a server that is not a plain registry
+    /// address, or an empty user name or password.
+    pub fn address(&self, server: &str) -> Option<String> {
+        if !oci_server_ok(server) || self.username.is_empty() || self.password.is_empty() {
+            return None;
+        }
+        let host = server.strip_prefix("https://")?;
+        let encoded = |text: &str| -> String {
+            text.bytes()
+                .map(|byte| {
+                    if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                        (byte as char).to_string()
+                    } else {
+                        format!("%{byte:02X}")
+                    }
+                })
+                .collect()
+        };
+        let mut address = String::from("https://");
+        address.push_str(&encoded(&self.username));
+        address.push(':');
+        address.push_str(&encoded(&self.password));
+        address.push('@');
+        address.push_str(host);
+        Some(address)
+    }
+}
+
+/// Whether a registry address as Incus keeps it holds a user name and a password before its host. This is how an
+/// image says, in its own record, that it was fetched with a credential: nothing of Arca's is asked.
+pub fn address_holds_credential(server: &str) -> bool {
+    server
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 /// An OCI registry server: `https://` and a host, with an optional port. No path, credentials or query.

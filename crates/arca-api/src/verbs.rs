@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 61] = [
+static VERBS: [Verb; 64] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -852,7 +852,7 @@ static VERBS: [Verb; 61] = [
     },
     Verb {
         name: "function_create",
-        summary: "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
+        summary: "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container, on its image's own root, with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -922,7 +922,7 @@ static VERBS: [Verb; 61] = [
     },
     Verb {
         name: "function_runs",
-        summary: "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. With run, that one run and the end of its output, when it is still kept.",
+        summary: "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. root says what its root was: new, as its create made it, for a function that had never started; store, rebuilt from the node's own copy of the image; or registry, rebuilt from the image fetched again. rootImage is that image's fingerprint, for new and for store. With run, that one run and the end of its output, when it is still kept.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -934,7 +934,119 @@ static VERBS: [Verb; 61] = [
         params: function_runs_params,
         result: function_runs_result,
     },
+    Verb {
+        name: "registry_secret_set",
+        summary: "Set the credential of a registry that asks for one before it gives an image: its address (https://<host>), a user name and a password. Write-only: no tool, log, record or card shows it again. From then on every image this node's own projects fetch from that registry is fetched with it; nothing in a tenant is. Incus keeps the credential with each image it fetched, for as long as it keeps the image, and whoever may use Incus on this machine can read it there: set only a credential that can read, and only what this node pulls. The password is 8 to 4096 of letters, digits and - . _ ~.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_registry,
+        cut: no_cut,
+        params: registry_secret_set_params,
+        result: registry_result,
+    },
+    Verb {
+        name: "registry_list",
+        summary: "The registries this node holds a credential for, by address. Never a user name or a password.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_registry_list,
+        cut: no_cut,
+        params: empty_params,
+        result: registry_list_result,
+    },
+    Verb {
+        name: "registry_secret_remove",
+        summary: "Remove the credential this node holds for a registry. Images already fetched stay, and Incus still holds the credential with each of them until that image is removed with its last function or service; the next fetch from that registry is made without a credential.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_registry,
+        cut: no_cut,
+        params: registry_server_params,
+        result: registry_result,
+    },
 ];
+
+fn registry_server_schema() -> Value {
+    json!({
+        "description": "The registry's address: https://<host>, with an optional :<port> and nothing after it.",
+        "maxLength": 128,
+        "pattern": "^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$",
+        "type": "string"
+    })
+}
+
+fn registry_secret_set_params() -> Value {
+    params(vec![
+        ("server", true, registry_server_schema()),
+        (
+            "username",
+            true,
+            json!({ "description": "The user name the registry asks for.", "maxLength": 255, "minLength": 1, "type": "string" }),
+        ),
+        (
+            "password",
+            true,
+            json!({
+                "description": "The password or token: 8 to 4096 of letters, digits and - . _ ~. One that can only read, and only what this node pulls.",
+                "maxLength": 4096,
+                "minLength": 8,
+                "pattern": "^[A-Za-z0-9._~-]+$",
+                "type": "string"
+            }),
+        ),
+    ])
+}
+
+fn registry_server_params() -> Value {
+    params(vec![("server", true, registry_server_schema())])
+}
+
+fn registry_result() -> Value {
+    result(vec![
+        ("server", true, string()),
+        ("ok", false, boolean()),
+        ("removed", false, boolean()),
+    ])
+}
+
+fn registry_list_result() -> Value {
+    result(vec![(
+        "registries",
+        true,
+        array(result(vec![("server", true, string())])),
+    )])
+}
+
+fn summary_registry(v: &Value) -> String {
+    format!(
+        "registry {}: {}",
+        v["server"].as_str().unwrap_or("?"),
+        if v["removed"] == true {
+            "credential removed"
+        } else {
+            "credential set"
+        }
+    )
+}
+
+fn summary_registry_list(v: &Value) -> String {
+    format!(
+        "{} registr(ies) with a credential",
+        v["registries"].as_array().map_or(0, Vec::len)
+    )
+}
 
 /// A function's name: the grammar of a service's, since the two share one name space.
 fn function_name_schema() -> Value {
@@ -1025,6 +1137,10 @@ fn function_destinations_schema() -> Value {
 }
 
 fn function_create_params() -> Value {
+    with_registry(function_create_params_base())
+}
+
+fn function_create_params_base() -> Value {
     json!({
         "additionalProperties": false,
         "properties": {
@@ -1091,6 +1207,7 @@ fn function_result() -> Value {
         ("kind", true, one_of(&["container"])),
         ("image", true, string()),
         ("digest", true, string()),
+        ("fingerprint", false, nullable(string())),
         ("command", true, array(string())),
         ("env", true, json!({ "type": "object" })),
         (
@@ -1157,7 +1274,7 @@ fn function_secret_set_params() -> Value {
             "value",
             true,
             json!({
-                "description": "The secret: one line of 8 to 4096 characters, without control characters.",
+                "description": "The secret: one line of 8 to 4096 characters, without control characters. Each run reads it as an environment value, so a line break at its end is refused.",
                 "maxLength": 4096,
                 "minLength": 8,
                 "type": "string"
@@ -1212,6 +1329,9 @@ fn function_run_line() -> Value {
         ("kind", true, one_of(&["container"])),
         ("trigger", true, one_of(&["timer", "manual", "kernel"])),
         ("startedAt", true, at_least(0)),
+        ("root", false, nullable_enum(&["new", "store", "registry"])),
+        ("rootImage", false, nullable(string())),
+        ("rootMs", false, nullable(at_least(0))),
         ("startMs", false, nullable(at_least(0))),
         ("durationMs", false, nullable(at_least(0))),
         ("cpuMs", false, nullable(at_least(0))),
@@ -2447,6 +2567,15 @@ fn postgres_create_params_base() -> Value {
                 "Filled in by the node: the template a database is made from when its config names no image (postgres-autopg). A caller leaves it out.",
             ),
         ),
+        (
+            "templateDigest",
+            false,
+            json!({
+                "description": "Filled in by the node with the template: SHA-256, in hex, of the template's file and of each script it names. The create runs only while the template on the node is still exactly that one. A caller leaves it out.",
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+            }),
+        ),
     ])
 }
 fn postgres_create_result() -> Value {
@@ -2617,8 +2746,18 @@ pub fn service_view_schema() -> Value {
                 "type": "string"
             },
             "ipv4": {
-                "description": "Its fixed address on the service bridge.",
+                "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: it has none now.",
                 "maxLength": 15,
+                "type": "string"
+            },
+            "ipv4In": {
+                "const": "state",
+                "description": "service_list only, on a virtual machine on a host bridge: its address is not in its record and exists only in its live state, which the list does not read. service_status of it reads it.",
+                "type": "string"
+            },
+            "ipv4Problem": {
+                "description": "service_status only, on a running virtual machine on a host bridge whose live state could not be read: why, in words. ipv4 is then empty because it was not read, and every other field is as usual.",
+                "maxLength": 400,
                 "type": "string"
             },
             "links": {
@@ -2916,7 +3055,23 @@ fn service_name_schema(description: &'static str) -> Value {
 }
 
 fn service_create_params() -> Value {
-    with_deploy(with_tenant(service_create_params_base()))
+    with_registry(with_deploy(with_tenant(service_create_params_base())))
+}
+
+/// The same params with the optional `registry` a create names when its image is fetched with a credential.
+fn with_registry(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert(
+            "registry".to_string(),
+            json!({
+                "description": "Only for an image on a registry this node holds a credential for (registry_secret_set): that registry's address. A proposal made with action_propose fills it in, so the owner's card says that the image is fetched with the credential and that Incus then keeps it with the image; a caller has no need to state it. Such a create runs only from an approved proposal.",
+                "maxLength": 128,
+                "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?$",
+                "type": "string"
+            }),
+        );
+    }
+    schema
 }
 
 fn service_create_params_base() -> Value {
@@ -2927,6 +3082,17 @@ fn service_create_params_base() -> Value {
             "template": {
                 "description": "The template's name.",
                 "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                "type": "string"
+            },
+            "image": {
+                "description": "Filled in by the node when a create is proposed: the image the template names, <image>@sha256:<digest> when it gives a digest and the bare name when it gives none; a virtual machine that names a version adds \" running <version>\". The owner's card shows it and the approval binds it. A caller leaves it out; one that states it must state the node's own.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+            },
+            "templateDigest": {
+                "description": "Filled in by the node when a create is proposed: SHA-256, in hex, of the template's file and of each script it names, as the node holds them then. The create runs only while the template on the node is still exactly that one. A caller leaves it out; one that states it must state the node's own.",
+                "pattern": "^[0-9a-f]{64}$",
                 "type": "string"
             },
             "bridge": {
@@ -3286,7 +3452,7 @@ fn service_secret_set_params() -> Value {
 }
 
 fn service_secret_set_params_base() -> Value {
-    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"key":{"description":"The secret's name, one of the template's secrets.","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$","type":"string"},"name":{"description":"The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"value":{"description":"The secret, 8 to 4096 characters.","maxLength":4096,"minLength":8,"type":"string"}},"required":["name","key","value"],"type":"object"}"##).expect("fixed service schema")
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"key":{"description":"The secret's name, one of the template's secrets.","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$","type":"string"},"name":{"description":"The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"value":{"description":"The secret. A container's is one line of 8 to 4096 characters without control characters: it is an environment value, so a line break at its end is refused. A virtual machine's is a file in its guest and is stored as given, with the line break at its end when it has one (a key file read whole): 8 to 4096 characters not counting that one line break, with line breaks and no other control character, each carriage return and line feed pair stored as one line feed.","maxLength":4097,"minLength":8,"type":"string"}},"required":["name","key","value"],"type":"object"}"##).expect("fixed service schema")
 }
 fn service_secret_set_result() -> Value {
     serde_json::from_str(r##"{"additionalProperties":false,"properties":{"ok":{"const":true,"type":"boolean"}},"required":["ok"],"type":"object"}"##).expect("fixed service schema")

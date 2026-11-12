@@ -40,6 +40,7 @@ pub mod linked;
 pub mod omni;
 mod passkey_change;
 pub mod peer_sync;
+pub mod registry;
 pub mod service;
 pub mod service_exec;
 pub mod service_import;
@@ -387,7 +388,7 @@ fn refuse_another_users_config(chosen: &Chosen, does: Does) -> Result<(), Failur
 pub(crate) fn load_found(chosen: Chosen, does: Does) -> Result<(Chosen, NodeConfig), Failure> {
     if chosen.origin == Origin::Default && std::fs::symlink_metadata(&chosen.path).is_err() {
         return Err(Failure::Config(format!(
-            "there is no config at {}, where the installer writes it: install Arca for this user, or name another config with --config <file> or {CONFIG_VARIABLE}",
+            "there is no config at {}, where the installer writes it: install Arca for this user, or name another config with --config CONFIG_FILE (its path in place of CONFIG_FILE) or {CONFIG_VARIABLE}",
             chosen.path.display()
         )));
     }
@@ -616,7 +617,7 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
             Some((action, rest)) if action == "revoke" => {
                 let (id, rest) = rest.split_first().ok_or_else(|| {
                     Failure::Usage(
-                        "token revoke needs the id of the token to revoke: arca token revoke <id>"
+                        "token revoke needs the id of the token to revoke: arca token revoke TOKEN_ID, with that id in place of TOKEN_ID"
                             .to_string(),
                     )
                 })?;

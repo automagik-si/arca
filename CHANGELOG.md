@@ -7,6 +7,139 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A virtual-machine template can say what must hold between its settings (`settingRules`: one amount at least
+another), and a create whose settings would not pass is refused when it is proposed, before any card. The two GitLab
+runner pool templates now state what their script already refused on the machine's console: `concurrent` and
+`jobCpu` from 1 to 999, `memoryOvercommitPercent` from 100 to 200, and 1 to 12 `runners`. Both files changed, so an
+installed copy that was not edited is brought up to date by the upgrade, and a card for one of them that waits across
+the upgrade is refused when approved, and must be proposed again.
+
+A create is refused when the instance it would get has the name of another service's instance on the node: the
+node's own service `x-<tenant id>` and that tenant's service `x`. Before, the second one was recorded and Incus
+refused it.
+A secret of several lines, such as a key file a virtual machine reads, is now hidden in `service_logs`, in a failed
+command's words and in a function's output. Before, a log was cleaned line by line before the stored values were looked
+for, so a value of several lines was never found and a key the guest printed on its console was shown to any token
+that may read logs. Each line of such a secret of 16 characters or more is now hidden as a value of its own, and every
+PEM block (BEGIN to END) is hidden whole before the log is cut into lines, a stored secret or not. A PEM block whose
+END line was not printed is hidden to the end of the text, so a log after such a line shows `[secret]` and nothing more.
+
+More of what a `service_create` would refuse is now refused when it is proposed, in the create's words, so no card is
+shown for it: a name that is taken, a deploy the approved create could not add to, a tenant's machine on a host
+bridge, a tenant's service from a template that opens a host port, a MAC another record holds, and a config with no
+service project. A proposal with a bad name is told about the name first. What is read from Incus (a free address,
+an instance Arca does not know, a local image) is still asked by the approved create alone; `docs/OPERATING.md`
+lists it.
+
+No token can be minted with the id `owner-approval` any more: it is the name an approved action runs under. If your
+token directory holds `owner-approval.hash` from an earlier release, the node still starts, ignores that file and says
+so in its log; remove it with `arca token revoke owner-approval`.
+
+The refusal of a create that names a deploy somebody else opened is reworded, so it is true for every caller: "deploy
+<id> was opened by another caller: only the caller that opened a deploy adds to it, and an approved action runs as the
+owner's approval, never as the token that proposed it". A client that matched the old sentence must match this one.
+A stop of an Automagik workspace or of a GitLab runner pool could be lost inside the machine. The script that
+keeps each of them took its stop signal in the same process that did its work, and bash 5.2 can drop such a signal
+without running the script's stop (seen under bash 5.2.21; Debian 13's own bash, which these machines run, was not
+tested). A workspace's keeper then ran on until systemd killed it, a minute and a half later. A pool's controller
+was killed too, after two and a half minutes, and that kill reached the controller alone: GitLab Runner and the
+jobs' containers are Docker's, not the service's. So GitLab Runner was never told to stop taking jobs and went on
+taking them, with no controller, until Docker stopped it as the machine went down or the pool's next start removed
+it. Both scripts now take the signal in a process that does nothing else and stops the work from there, so the stop
+cannot be dropped. A machine made from an earlier release keeps the script it was made with.
+
+The GitHub runner pool's script had the same fault, in its controller and in every slot, and has the same change. A
+lost stop there left runner containers running and registered on GitHub with no controller. The controller and its
+slots now read their stop from a line that the one process holding the signal lets go of, and none of them has a
+trap. The controller no longer signals its slots at a stop: each has read the same line and is cleaning up, and is
+given the same minute to finish.
+
+A card that waits while the node is upgraded to the version that binds a template's content (a create, or a database
+made from the template) is now refused when its approval is submitted, and the approval is not used; propose it
+again. Before, the approval was accepted and the create then refused.
+
+A `service_create` the node has no room for is now refused when it is proposed, in the words the create uses (what is
+in use, what is asked, what is allowed, and the config key), so the owner is never shown a card for it. Before, the
+card was shown, the approval was accepted and used up, and only then did the create refuse. This covers the node's
+caps on virtual machines (`kernel.vmLimits`, `kernel.bridged.limits`) and a tenant's caps. The approved create still
+checks them, because the node can fill up while a card waits. One refusal for room can still follow an approval: no
+free address in the service subnet.
+Every service call read the live state of every instance on the node before it did anything, and Incus takes a
+running virtual machine's state from its guest agent: on a node with a machine full of containers (a runner pool) that
+one read took about ten seconds, the whole time it is given, so calls failed. Service calls no longer read live state:
+`service_list`, `service_status`, `service_logs`, a secret, a link and the tenant reads answer at once whatever a
+guest is doing. One thing works now that the guide promised and the node never did: `service_status` of a running
+virtual machine on a host bridge shows the address its own network card holds (until now `ipv4` was always empty for
+such a machine, in the list and in the status). It reads that one machine's state for it and, when Incus does not
+answer, still answers, with `ipv4Problem` saying why. `service_list` reads no state, so such a machine's row has an
+empty `ipv4` and the new `ipv4In: "state"`, which says the address is there to be read and is not "none". A create still reads live state, to pick an
+address nothing holds. A read of Incus that fails fast is made once more.
+
+A service call that failed because Incus was slow or did not answer said only `internal: the tool failed`, and the
+node's log had no line for it. Such a call is now refused in words that say Incus did not answer, for which service,
+and that the same request may be made again, under the code `incus_unavailable` (`incus_answer` when Incus answered
+something this node cannot use, `state_not_saved` when the kernel could not save the change). When an answer is still
+`internal`, the node's log gets one line with the verb and the reason. A virtual machine's secret may be 4096
+characters and one line break at its end (a key file read whole). Such a value needs 8 characters that are not line
+breaks: one of only line breaks is refused, and so is one that was accepted before, of fewer than 8 characters and
+line breaks to make up the count (seven characters and a line break). A stored secret that long, or one of many
+bytes a character, is taken out of logs and outputs like any other when it is one line; a secret of several lines is
+not taken out by its value yet. A
+container's or a function's secret that ends with a line break is refused in words that name the line break. A text
+that is too short or too long for its field is refused in words that name the limit. See "When Incus does not answer,
+and when the answer is internal" in docs/OPERATING.md.
+
+A template whose image is `local:<alias>` and that already carried a `digest` was accepted before, and the digest was
+ignored. It is enforced now: a create from such a template is refused unless the image under the alias has that
+fingerprint, and a digest that is not `sha256:` and 64 lowercase hex digits is refused when the template is read. Check
+a local template's `digest` against `incus image list` before you upgrade, or take the digest out.
+
+Every run of a function now starts from its image's own root. Before a run starts, its container's root is rebuilt
+from the function's image: from the copy the node already holds, the one the function's record took when it was
+created, or from the registry by the approved digest when that copy is gone. So no run finds what an earlier one
+wrote, which replaces the limit 0.13.0 named. A root that cannot be rebuilt is a run that does not start, and its
+line says why. A run's line gains `root`, `rootImage` and `rootMs`. A function's first run rebuilds nothing, and its
+line says `root` is `new`: a container that has never started still has the root its create made from the image, and
+Incus cannot start one that was rebuilt before its first start.
+
+What the owner approves on a card is now what is created. A proposed `service_create` or `postgres_create` is given,
+by the node, the image its template names and a fingerprint of the template's content (its file and the scripts it
+names). The card shows an `Image` row and ends with a `Template content` row, and the approved create runs only while
+the template on the node is still exactly that one: an edit, or a template installed again by an upgrade, refuses the
+create with "propose it again". An image named without a digest is shown with words that say so. Two new optional
+arguments, `image` and `templateDigest`, are filled in by the node; a caller that states one must state the node's
+own. A proposal for a template that is not installed, or whose script is missing, is now refused when it is made.
+
+**If your node has templates from 0.13.0 or older:** upgrading with the installer now brings them up to the release.
+A shipped template that nobody edited is replaced with this release's and named in the report; one you edited is
+kept and named, with the command that replaces it. For a node the installer does not run as a service, run `arca
+templates install --config <file>` once after the upgrade (or `arca init --enable-changes` again). 0.13.0 said to
+use `--replace` for this, which also overwrites your edits: it is no longer needed. A service that already exists is
+not changed.
+A service's or a function's image can now be on a registry that asks for a credential. The credential is set by the
+registry's address (`registry_secret_set`, with `registry_list` and `registry_secret_remove`) and is kept in the
+node's secret store; no record, proposal, card or journal line holds it. Incus is sent it in the registry's address
+when the image is fetched, and Incus keeps that address with the image for as long as it keeps the image, where
+whoever may use Incus on the machine can read it: so set only a credential that can read, and only what the node
+pulls. A create whose image is fetched that way says so on its card and runs only from an approved proposal; the
+image, and the credential with it, leaves Incus with its last function or service. Every ten minutes the node looks
+at the images it fetched that way, turns off Incus's own re-fetching of them where it is on, and deletes one that
+nothing has been made from for fifteen minutes; each such step is a line in `registry-images.jsonl`.
+`docs/OPERATING.md`, "A registry that asks for a credential", has the whole of it.
+
+A commit to the node's store that works but takes over one second is no longer called a failed write. It has its own
+counter, `arca_store_slow_commits_total`, and its own alert, the warning `store-commit-slow`.
+`arca_store_write_failures_total` and the critical alert `store-write-failed` now mean only a write the store refused. A
+dashboard or an outside alert built on `arca_store_write_failures_total`, or on `store-write-failed`, stops firing for a slow
+disk: watch the new counter or the new alert for that. Both counters start at 0 when the server starts, as before.
+
+A GitHub runner pool now keeps every class one place under `maxSlots`. A free place goes to the class with the fewest
+runners, and when a class has no runner while every place is held, one runner that waits for a job is retired for it;
+a runner that has a job never is. A pool created with `maxSlots` below the number of classes does not start, and says
+both numbers and what to set. It is still a cap on registered runners, not on running jobs, and a place is not
+memory: "A place for every class" in `docs/OPERATING.md` says what is kept and what is not. Pools that exist keep the
+script they were created with; a pool of one class works as before.
+
 ## 0.13.0 (2026-11-12)
 
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU

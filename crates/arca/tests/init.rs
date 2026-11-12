@@ -2,6 +2,8 @@
 //! process over a fake Incus. Every file is in the test's own scratch directory; nothing here asks the machine's Incus,
 //! its systemd or its desktop.
 
+mod templates_before;
+
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -13,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arca_incus::{FakeIncus, FakeState, IncusRead as _};
 use serde_json::{Value, json};
+use templates_before::postgres_file_of_0_12_0;
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -507,6 +510,14 @@ impl Said {
 
     fn ok(&self) -> &Said {
         assert_eq!(self.code, Some(0), "init failed:\n{}", self.all());
+        // Nothing it printed reads as a redirection to a shell: a value the person fills in is a word in capitals.
+        for line in self.all().lines() {
+            assert!(
+                !line.contains('<') && !line.contains('>'),
+                "a printed line a shell would read as a redirection: {line:?}\n{}",
+                self.all()
+            );
+        }
         self
     }
 
@@ -647,7 +658,7 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         .says("It is for a machine where every account, and every agent that shares its network, is trusted")
         .says("check that `arca status` says the page is open")
         .says(&format!(
-            "To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>, then open http://localhost:{0}/approve in its browser.",
+            "To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open http://localhost:{0}/approve in its browser.",
             node.port
         ))
         .says("If ssh warns that it could not bind the port, close it")
@@ -832,7 +843,7 @@ fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks
         .says("from an image the token names, remove a database's record, password and links, and use the Omni verbs.")
         .never_says("This node holds tenants")
         .says(&format!(
-            "To take one away first: arca token revoke <id> --config {}",
+            "To take one away first: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
             node.config.display()
         ))
         .says("Let Arca make changes on this machine: what is proposed after your approval, and directly for the tokens named above? [y/N]")
@@ -863,7 +874,7 @@ fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks
     assert_eq!(
         said.report(5)[1],
         format!(
-            "NOT every change waits for you: these tokens change things directly, with no card and no passkey: doctor-1 (doctor). To take one away: arca token revoke <id> --config {}",
+            "NOT every change waits for you: these tokens change things directly, with no card and no passkey: doctor-1 (doctor). To take one away: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
             node.config.display()
         ),
         "{}",
@@ -1333,14 +1344,61 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
         assert_eq!(
             said.report(5)[2],
             format!(
-                "Next: ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config {config} --token-file <the file of one of its tokens>. It then says what comes next."
+                "Next: ask the node whether its approval page is open, before you type a setup code or approve anything there: arca status --config {config} --token-file TOKEN_FILE, with the path of one of this node's token files in place of TOKEN_FILE. It then says what comes next."
             ),
             "{}",
             said.all()
         );
         assert_eq!(said.out.matches("Next: ").count(), 1, "{}", said.all());
+        // The step is a line a person may paste: nothing in it is a redirect to a shell.
+        assert!(
+            !said.report(5)[2].contains('<') && !said.report(5)[2].contains('>'),
+            "{}",
+            said.all()
+        );
     }
     assert_eq!(calls().lines().count(), 3, "one restart per run");
+}
+
+/// A node whose templates were installed by 0.12.0: `arca init` brings the unedited ones up to this release and says
+/// which, before its report, and the report is still its last five lines. A template the owner edited is kept and
+/// not named.
+#[test]
+fn init_brings_templates_an_earlier_release_installed_up_to_date_and_says_which() {
+    let node = Installed::new("old-templates");
+    mint(&node.scratch, &node.hash_dir, "viewer");
+    let templates = node.state.join("templates");
+    fs::create_dir_all(&templates).expect("the templates directory");
+    for name in ["postgres-autopg.json", "postgres-autopg.sh"] {
+        fs::write(templates.join(name), postgres_file_of_0_12_0(name)).expect("the file of 0.12.0");
+    }
+    fs::write(templates.join("nats.json"), "{}").expect("the owner's edit");
+
+    let said = node.init(&["--enable-changes", "--yes"], "");
+    said.ok().says(
+        "Templates brought up to this release (each was an earlier release's own file, not edited): postgres-autopg.json, postgres-autopg.sh. A create that was proposed from one of them and still waits is refused when it is approved: propose it again.",
+    );
+    assert!(
+        said.report(5)[0].starts_with("The config now lets Arca make changes on this machine."),
+        "{}",
+        said.all()
+    );
+    let installed =
+        fs::read_to_string(templates.join("postgres-autopg.json")).expect("the template");
+    assert!(
+        installed.contains("\"generate\": { \"POSTGRES_PASSWORD\": \"\" }"),
+        "{installed}"
+    );
+    assert_eq!(
+        fs::read_to_string(templates.join("nats.json")).expect("the edit"),
+        "{}",
+        "an edited template is kept"
+    );
+
+    // A second run has nothing to bring up, and says nothing of templates.
+    node.init(&["--enable-changes", "--yes"], "")
+        .ok()
+        .never_says("Templates brought up");
 }
 
 /// The one next step, from the real program on a node that `arca init` made and that says its page is open: with a
@@ -1416,7 +1474,7 @@ fn status_gives_one_next_step_for_the_first_passkey_and_it_depends_on_whether_th
         [
             format!("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config {config}, and type it on the page, {page}. Until one is trusted, nothing can be approved."),
             format!(
-                "      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>, then open {page} there.",
+                "      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open {page} there.",
                 node.port
             ),
             "      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain.".to_string(),
@@ -1476,7 +1534,7 @@ fn status_names_a_token_that_changes_things_without_the_page_and_does_not_say_ea
     );
     assert!(
         text.contains(&format!(
-            "To take one away: arca token revoke <id> --config {}",
+            "To take one away: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
             node.config.display()
         )),
         "{text}"

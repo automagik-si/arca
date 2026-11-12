@@ -602,7 +602,8 @@ fn an_approved_create_that_fails_at_start_reports_its_message_and_leaves_a_defin
         .expect("kernel")
         .propose_action(
             ActionKind::ServiceCreate,
-            json!({"name":"ws1","template":"ws"}),
+            // Bound as the node binds a proposal when it is made.
+            common::bound_create(&rig.dir, json!({"name":"ws1","template":"ws"})),
             NOW,
             None,
         )
@@ -1094,5 +1095,55 @@ mod vm_secrets;
 #[path = "create_settings.rs"]
 mod create_settings;
 
+#[path = "setting_rules.rs"]
+mod setting_rules;
+
 #[path = "update_available.rs"]
 mod update_available;
+
+#[test]
+fn a_virtual_machine_whose_local_image_is_pinned_is_made_from_that_image_or_not_at_all() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    // The service project is made with the node's first service, and holds the image after that.
+    rig.call("service_create", json!({"name":"ws1","template":"ws"}))
+        .expect("the first service makes the project");
+    let held = rig.fake.add_image(PROJECT, "machine-image");
+    let other = "f".repeat(64);
+    let template = |digest: &str| {
+        json!({
+            "name": "pinned",
+            "kind": "virtual-machine",
+            "image": "local:machine-image",
+            "digest": format!("sha256:{digest}"),
+            "limits": { "cpu": "2", "memory": "4GiB" },
+            "rootSize": "20GiB"
+        })
+    };
+    // The alias holds another image than the template pins: nothing is created.
+    rig.template("pinned", template(&other));
+    let entries = rig.entries();
+    match rig.call("service_create", json!({"name":"vm1","template":"pinned"})) {
+        Err(CallError::Refused { message, .. }) => assert_eq!(
+            message,
+            format!(
+                "template pinned: its image machine-image is pinned to sha256:{other}, and the image under that alias in the service project {PROJECT} is sha256:{held}. Nothing was created. Put the pinned image under the alias, or change the template's digest"
+            )
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(rig.entries(), entries, "no record was saved");
+    // The pinned image under the alias: the machine is made from it, by its fingerprint.
+    rig.template("pinned", template(&held));
+    rig.call("service_create", json!({"name":"vm1","template":"pinned"}))
+        .expect("the pinned machine");
+    let record = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "service-vm1")
+        .expect("the machine's record");
+    assert_eq!(
+        record.config["source"],
+        json!({ "type": "image", "alias": "machine-image", "fingerprint": held })
+    );
+}

@@ -171,6 +171,7 @@ impl Rig {
             Arc::clone(&cfg),
             Some(Arc::clone(&runner)),
         ))
+        .chain(arca::registry::registry_handlers(Arc::clone(&cfg)))
         .collect();
         let executor = ActionExecutor::new(
             handlers
@@ -242,6 +243,14 @@ impl Rig {
 
     /// Has the owner approve a proposal that waits, and runs it once through the executor.
     fn approve(&self, action: &str, proposal: &Value) -> Result<Value, CallError> {
+        let args = self.approval(action, proposal);
+        let result = arca::handlers::run_approved_action(&self.kernel, &self.executor, &args, NOW)
+            .map(|answer| answer["result"].clone());
+        result
+    }
+
+    /// The owner's signed approval of a proposal that waits, as the arguments that run it.
+    fn approval(&self, action: &str, proposal: &Value) -> Value {
         let id = proposal["id"].as_str().expect("an id").to_string();
         let nonce = self.nonce.fetch_add(1, Ordering::SeqCst);
         let statement = arca::handlers::action_statement(
@@ -254,13 +263,21 @@ impl Rig {
         )
         .expect("the statement");
         let approval = approve_statement(&self.key, &statement);
-        arca::handlers::run_approved_action(
-            &self.kernel,
-            &self.executor,
-            &json!({ "plan": id, "approval": approval }),
-            NOW,
-        )
-        .map(|answer| answer["result"].clone())
+        json!({ "plan": id, "approval": approval })
+    }
+
+    /// The fingerprint a function's record took of its image when it was created.
+    fn fingerprint(&self, name: &str) -> String {
+        self.call_as(Scope::Viewer, "function_list", json!({}))
+            .expect("list")["functions"]
+            .as_array()
+            .expect("functions")
+            .iter()
+            .find(|function| function["name"] == name)
+            .expect("the function")["fingerprint"]
+            .as_str()
+            .expect("a fingerprint")
+            .to_string()
     }
 
     fn get(&self, path: &str) -> Option<Value> {
@@ -573,6 +590,19 @@ fn functions_and_services_share_one_name_space_and_each_verb_keeps_to_its_kind()
             .contains("a function named relay exists: functions and services share one name space"),
         "{message}"
     );
+    // The proposal of that create is refused when it is made, in the create's words; no card waits for it, and no
+    // file under the node's state directory changes.
+    let before = rig.state_files();
+    let (_, proposed) = refusal(rig.propose(
+        "service_create",
+        json!({ "name": "relay", "template": "nats" }),
+    ));
+    assert_eq!(proposed, message);
+    assert!(rig.kernel.lock().unwrap().action_proposals().is_empty());
+    assert!(
+        rig.state_files() == before,
+        "a refused proposal changed a file"
+    );
     // No service verb acts on a function.
     for (name, args) in [
         ("service_status", json!({ "name": "relay" })),
@@ -698,9 +728,52 @@ fn a_secret_is_set_by_name_and_a_run_waits_for_it() {
         "function_secret_set",
         json!({ "name": "relay", "key": "NATS_URL", "value": "two\nlines-of-it" }),
     ));
-    assert!(
-        message.contains("8 to 4096 characters without control characters"),
-        "{message}"
+    assert_eq!(
+        message,
+        "a function's secret is one line of 8 to 4096 characters without control characters: this one has a line break"
+    );
+    // A value read whole from a file ends with a line break. A function's secret is an environment value, so it is
+    // refused, in words that say the line break is the one thing to change; a carriage return before it changes nothing.
+    for end in ["\n", "\r\n"] {
+        let (code, message) = refusal(rig.call(
+            "function_secret_set",
+            json!({ "name": "relay", "key": "NATS_URL", "value": format!("nats://192.0.2.10:4222{end}") }),
+        ));
+        assert_eq!(code, "Invalid");
+        assert_eq!(
+            message,
+            "a function's secret is one line of 8 to 4096 characters without control characters: this one ends with a line break, and nothing else is wrong with it. Send it without the line break at its end (each run reads it as an environment value, and the line break would be part of it; only a virtual machine's secret, which is a file, may end with one)"
+        );
+    }
+    for (value, why) in [
+        (
+            "1234567".to_string(),
+            "this one is not 8 to 4096 characters",
+        ),
+        ("v".repeat(4097), "this one is not 8 to 4096 characters"),
+        ("\n".repeat(8), "this one has a line break"),
+        (
+            format!("nats://192.0.2.10{}", '\0'),
+            "this one has a NUL character",
+        ),
+    ] {
+        let (_, message) = refusal(rig.call(
+            "function_secret_set",
+            json!({ "name": "relay", "key": "NATS_URL", "value": value }),
+        ));
+        assert_eq!(
+            message,
+            format!(
+                "a function's secret is one line of 8 to 4096 characters without control characters: {why}"
+            )
+        );
+    }
+    // None of them was stored: the function still waits for both.
+    assert_eq!(rig.state_writes(), writes);
+    let line = rig.run("relay");
+    assert_eq!(
+        line["why"],
+        "the secrets DATABASE_URL, NATS_URL are not set: function_secret_set sets each"
     );
 
     // A database address with a word in it, put together here: no secret-shaped text stands in this file.
@@ -800,7 +873,9 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
         "the effect journal has the length it had"
     );
     assert_eq!(after, journal);
-    // To Incus it sent a start for each run and no other write but the clearing of its console log.
+    // To Incus the first run sent two writes, the clearing of its console log and its start: a container that has
+    // never started has its image's own root already. Each run after it sent three, in this order: the rebuild of
+    // its root from its image, the clearing of its console log, and its start. Nothing else.
     let writes: Vec<String> = rig
         .fake
         .requests()
@@ -815,19 +890,20 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
             )
         })
         .collect();
+    let one_run = [
+        "POST /1.0/instances/relay/rebuild",
+        "DELETE /1.0/instances/relay/console",
+        "PUT /1.0/instances/relay/state",
+    ];
+    assert_eq!(writes.len(), 29, "{writes:?}");
+    assert_eq!(writes[..2], one_run[1..], "{writes:?}");
+    for run in writes[2..].chunks(3) {
+        assert_eq!(run, one_run, "{writes:?}");
+    }
+    let image = rig.fingerprint("relay");
     assert_eq!(
-        writes
-            .iter()
-            .filter(|w| *w == "PUT /1.0/instances/relay/state")
-            .count(),
-        10
-    );
-    assert!(
-        writes
-            .iter()
-            .all(|w| w == "PUT /1.0/instances/relay/state"
-                || w == "DELETE /1.0/instances/relay/console"),
-        "{writes:?}"
+        rig.fake.rebuilds(PROJECT, "relay"),
+        vec![format!("store:{image}"); 9]
     );
 
     // One line a run, in the month's file, each a meter.
@@ -853,6 +929,9 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
         line["startMs"].is_u64() && line["durationMs"].is_u64(),
         "{line}"
     );
+    assert_eq!(line["root"], "store");
+    assert_eq!(line["rootImage"], image.as_str());
+    assert!(line["rootMs"].is_u64(), "{line}");
     assert_eq!(line["cpuMs"], 42);
     assert_eq!(line["memoryPeakBytes"], 6_291_456);
     assert_eq!(line["memoryLimitBytes"], 128 * 1024 * 1024);
@@ -1193,6 +1272,72 @@ fn two_approved_actions_in_either_order_never_leave_a_function_linked_to_nothing
 }
 
 #[test]
+fn a_removal_that_passed_its_own_check_is_refused_by_the_kernel_and_the_handler_says_so() {
+    let rig = Rig::new();
+    // A function linked to nats is made and removed again: its record is kept for later.
+    rig.relay();
+    let record = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "service-relay")
+        .expect("relay's record");
+    rig.approved("function_remove", json!({ "name": "relay" }))
+        .expect("removed");
+    // The owner approves the removal of nats while no function links to it. The removal reads the node, passes its
+    // own check, and then waits for the write gate, which this test holds.
+    let removal = rig
+        .propose("service_remove", json!({ "name": "nats" }))
+        .expect("proposed");
+    let args = rig.approval("service_remove", &removal);
+    let gate = rig.kernel.lock().expect("kernel").write_gate();
+    let held = gate.lock().expect("the write gate");
+    let listings = |rig: &Rig| {
+        rig.fake
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.method == "GET" && request.path.starts_with("/1.0/instances?")
+            })
+            .count()
+    };
+    let before = listings(&rig);
+    let (kernel, executor) = (Arc::clone(&rig.kernel), rig.executor.clone());
+    let removing = std::thread::spawn(move || {
+        arca::handlers::run_approved_action(&kernel, &executor, &args, NOW)
+    });
+    // The removal has read the node's instances, which it does just before it reads the entries and checks them.
+    let until = Instant::now() + Duration::from_secs(10);
+    while listings(&rig) == before {
+        assert!(Instant::now() < until, "the removal never read the node");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !removing.is_finished(),
+        "the removal waits for the write gate"
+    );
+    // Meanwhile the function comes to be, linked to nats, as a create that held the gate would have left it.
+    let outcomes = rig
+        .kernel
+        .lock()
+        .expect("kernel")
+        .propose(vec![arca::desired_store::EntryChange::Put(record)], NOW)
+        .expect("the function's record is taken");
+    assert!(!format!("{outcomes:?}").contains("Failed"), "{outcomes:?}");
+    let entries = rig.entries();
+    drop(held);
+    // The kernel refuses under its own lock, and the handler says it in the owner's words, approval and all.
+    let (_, message) = refusal(removing.join().expect("the removal answers"));
+    assert_eq!(
+        message,
+        "The approval was accepted, but service_remove did not complete: remove service nats: the function relay links to it, and what a function reaches is part of what its owner approved. Remove the function relay first (function_remove); nothing was removed, and the owner's approval is spent, so another try needs a new one"
+    );
+    assert_eq!(rig.entries(), entries, "no record changed");
+    assert_eq!(rig.instance("nats")["status"], "Running");
+    assert_eq!(rig.instance("relay")["status"], "Stopped");
+}
+
+#[test]
 fn a_create_that_fails_is_said_as_a_functions_with_the_verbs_that_act_on_one() {
     let rig = Rig::new();
     rig.nats();
@@ -1369,12 +1514,733 @@ fn a_node_with_no_function_has_no_run_log_and_one_appears_with_the_first_run() {
     assert!(dir.join("runs-2026-10.jsonl").is_file());
 }
 
+#[test]
+fn every_run_starts_from_its_images_own_root_or_does_not_start() {
+    let rig = Rig::new();
+    rig.relay();
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    let image = rig.fingerprint("relay");
+    let instance = format!("/1.0/instances/relay?project={PROJECT}");
+    let clears = |rig: &Rig| {
+        rig.fake
+            .requests()
+            .iter()
+            .filter(|request| request.method == "DELETE" && request.path.contains("/console"))
+            .count()
+    };
+    // A new function's container has never been started: its root is the one its create made from the image, and
+    // Incus cannot start a container that was rebuilt before it ever ran. So nothing is rebuilt before the first
+    // run. What can be checked of that root is: someone who may write the instance points it, before its first
+    // run, at another image of the store, and the run does not start.
+    let other = rig.fake.add_image(PROJECT, "another-image");
+    let own = rig.instance("relay");
+    let mut body = own.clone();
+    body["config"]["volatile.base_image"] = json!(other);
+    send(&rig, "PUT", &instance, &body);
+    let (writes, cleared) = (rig.state_writes(), clears(&rig));
+    let line = rig.run("relay");
+    assert_eq!(line["outcome"], "notStarted");
+    assert!(
+        line["why"]
+            .as_str()
+            .unwrap()
+            .contains("has never been started and does not say it was made from the image its function's record took"),
+        "{line}"
+    );
+    assert_eq!((rig.state_writes(), clears(&rig)), (writes, cleared));
+    send(&rig, "PUT", &instance, &own);
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"], &line["rootImage"]),
+        (&json!("ok"), &json!("new"), &json!(image))
+    );
+    assert!(
+        rig.fake.rebuilds(PROJECT, "relay").is_empty(),
+        "a rebuild before the first start would leave it unable to start"
+    );
+    // It has run. The node holds the copy the record took at create: from now on the root is rebuilt from it
+    // before every run, and no registry is asked.
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"], &line["rootImage"]),
+        (&json!("ok"), &json!("store"), &json!(image))
+    );
+    // Someone who may write the instance points it at another image of the store. The run does not follow: it
+    // rebuilds from the image its record names, and its line says which.
+    let mut body = rig.instance("relay");
+    body["config"]["volatile.base_image"] = json!(other);
+    send(&rig, "PUT", &instance, &body);
+    let line = rig.run("relay");
+    assert_eq!(line["rootImage"], image.as_str());
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay"),
+        vec![format!("store:{image}"); 2]
+    );
+    // The copy is there and Incus cannot rebuild from it: the run does not start, and the registry is not asked.
+    rig.fake.lose_image(PROJECT, "relay");
+    let (writes, cleared) = (rig.state_writes(), clears(&rig));
+    let line = rig.run("relay");
+    assert_eq!(line["outcome"], "notStarted");
+    assert!(
+        line["why"].as_str().unwrap().starts_with(
+            "its root could not be put back to its image's own, so nothing was started: "
+        ),
+        "{line}"
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "relay").len(), 2);
+    assert_eq!((rig.state_writes(), clears(&rig)), (writes, cleared));
+    rig.fake.allow_rebuild(PROJECT, "relay");
+    // The copy is gone from the store: the rebuild names the registry and the digest the owner approved, and Incus
+    // fetches the image again. The run goes on, and its line says the registry served it.
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/images/{image}?project={PROJECT}"),
+        &json!({}),
+    );
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"], &line["rootImage"]),
+        (&json!("ok"), &json!("registry"), &Value::Null)
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay").last().unwrap(),
+        "registry"
+    );
+    // The fetch put the copy back into the store, under the fingerprint the record holds: the next run is rebuilt
+    // from the store again.
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["root"], &line["rootImage"]),
+        (&json!("store"), &json!(image))
+    );
+    // Neither the store nor the registry: the run does not start, and its line says why.
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/images/{image}?project={PROJECT}"),
+        &json!({}),
+    );
+    rig.fake.refuse_rebuild(PROJECT, "relay");
+    let (writes, cleared) = (rig.state_writes(), clears(&rig));
+    let line = rig.run("relay");
+    assert_eq!(line["outcome"], "notStarted");
+    assert_eq!(line["root"], Value::Null);
+    assert!(
+        line["why"].as_str().unwrap().contains(
+            "the node's own copy of the image is gone, and the registry did not give it again"
+        ),
+        "{line}"
+    );
+    assert_eq!((rig.state_writes(), clears(&rig)), (writes, cleared));
+    rig.fake.allow_rebuild(PROJECT, "relay");
+    assert_eq!(rig.run("relay")["root"], "registry");
+    // A record whose image is not the one its definition names is refused by the plugin, and no run starts on it.
+    let mut entry = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "service-relay")
+        .expect("relay's record");
+    entry.config["source"]["alias"] = json!(format!("acme/other@sha256:{}", "b".repeat(64)));
+    let outcomes = rig
+        .kernel
+        .lock()
+        .unwrap()
+        .propose(vec![arca::desired_store::EntryChange::Put(entry)], NOW)
+        .expect("the document is taken");
+    assert!(format!("{outcomes:?}").contains("Failed"), "{outcomes:?}");
+    let before = rig.fake.rebuilds(PROJECT, "relay").len();
+    let line = rig.run("relay");
+    assert_eq!(
+        line["why"],
+        "its record's image is not the one its definition names, so nothing was started"
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "relay").len(), before);
+}
+
+#[test]
+fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_rests_in_incus_alone()
+ {
+    let rig = Rig::new();
+    rig.nats();
+    fs::write(rig.dir.join("templates/pg.json"), pg_template().to_string()).expect("template");
+    let server = "https://registry.example";
+    let word = ["pull", "only", "word", "0123"].join("-");
+    let credentialed = |rig: &Rig| -> Vec<Value> {
+        rig.get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+            .and_then(|images| images.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|image| {
+                image["update_source"]["server"]
+                    .as_str()
+                    .is_some_and(|kept| kept.contains('@'))
+            })
+            .collect()
+    };
+    // Who may set one, and what a password may be.
+    assert!(matches!(
+        rig.call_as(
+            Scope::Viewer,
+            "registry_secret_set",
+            json!({ "server": server, "username": "deploy+token", "password": word })
+        ),
+        Err(CallError::Forbidden { .. })
+    ));
+    for bad in ["short", "has a space in it", "with/a/slash/in/it"] {
+        let (_, message) = refusal(rig.call(
+            "registry_secret_set",
+            json!({ "server": server, "username": "deploy+token", "password": bad }),
+        ));
+        assert!(
+            message.starts_with("password: 8 to 4096 of letters, digits and - . _ ~"),
+            "{message}"
+        );
+    }
+    let (_, message) = refusal(rig.call(
+        "registry_secret_set",
+        json!({ "server": "https://registry.example/path", "username": "u", "password": word }),
+    ));
+    assert!(message.starts_with("server:"), "{message}");
+    let set = rig
+        .call(
+            "registry_secret_set",
+            json!({ "server": server, "username": "deploy+token", "password": word }),
+        )
+        .expect("set");
+    assert_eq!(set["server"], server);
+    let listed = rig
+        .call_as(Scope::Viewer, "registry_list", json!({}))
+        .expect("list");
+    assert_eq!(listed["registries"], json!([{ "server": server }]));
+
+    // The card names the registry and says where the credential will rest. It does not show it.
+    let proposal = rig
+        .propose("function_create", relay_args())
+        .expect("proposed");
+    assert_eq!(proposal["args"]["registry"], server);
+    let row = proposal["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["label"] == "Registry")
+        .expect("the Registry row")["value"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        row.starts_with("https://registry.example: the image is fetched with the credential set for this registry on this node")
+            && row.contains("Incus keeps that credential with the image for as long as the image is kept")
+            && row.contains("whoever may use Incus on this machine can read it there"),
+        "{row}"
+    );
+    // A create that does not say it does not run: a service from an image on that registry, called directly.
+    let (code, message) =
+        refusal(rig.call("service_create", json!({ "name": "pg", "template": "pg" })));
+    assert_eq!(code, "NotApproved", "{message}");
+    assert!(
+        message.contains("holds a credential for the registry https://registry.example"),
+        "{message}"
+    );
+    // Saying it in the call does not stand in for the card: only an approved proposal has shown it to the owner.
+    let (code, message) = refusal(rig.call(
+        "service_create",
+        json!({ "name": "pg", "template": "pg", "registry": server }),
+    ));
+    assert_eq!(code, "NotApproved", "{message}");
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_none()
+    );
+
+    rig.approve("function_create", &proposal).expect("relay");
+    let mut tick = relay_args();
+    tick["name"] = json!("tick");
+    rig.approved("function_create", tick).expect("tick");
+    // Incus was sent the credential in the address, keeps it with the image, and was told not to go back by itself.
+    let images = credentialed(&rig);
+    assert_eq!(images.len(), 1, "{images:?}");
+    let kept = images[0]["update_source"]["server"].as_str().unwrap();
+    assert!(
+        kept.starts_with("https://deploy%2Btoken:")
+            && kept.ends_with("@registry.example")
+            && kept.contains(&word)
+    );
+    assert_eq!(images[0]["auto_update"], false);
+    assert_eq!(
+        rig.fingerprint("relay"),
+        images[0]["fingerprint"].as_str().unwrap()
+    );
+    // Arca holds it in its secret store and nowhere else: no record, proposal, journal, log or answer has it.
+    // Its first run rebuilds nothing, its second is rebuilt from the store's copy: no registry is asked.
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("new"))
+    );
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("store"))
+    );
+    let store = rig
+        .dir
+        .join("secrets")
+        .join(arca_providers::incus::registry_owner(server).expect("a registry"));
+    assert!(store.join("password").is_file());
+    for (path, bytes) in rig.state_files() {
+        if path.starts_with(&store) {
+            continue;
+        }
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(&word),
+            "{} holds the password",
+            path.display()
+        );
+    }
+    let said = format!(
+        "{:?}{}{}{}{}",
+        rig.entries(),
+        proposal,
+        listed,
+        rig.call("function_list", json!({})).expect("list"),
+        fs::read_to_string(rig.dir.join(RUNS_DIR).join("runs-2026-10.jsonl")).expect("the run log")
+    );
+    assert!(!said.contains(&word));
+
+    // The image goes with its last user, and the credential leaves Incus with it.
+    rig.approved("function_remove", json!({ "name": "tick" }))
+        .expect("removed");
+    assert_eq!(credentialed(&rig).len(), 1, "relay was made from it still");
+    rig.approved("function_remove", json!({ "name": "relay" }))
+        .expect("removed");
+    assert!(
+        credentialed(&rig).is_empty(),
+        "the image went with its last function"
+    );
+    let gone = fs::read_to_string(rig.dir.join(arca::registry::IMAGES_LOG)).expect("the log");
+    assert_eq!(gone.lines().count(), 1, "{gone}");
+    assert!(
+        gone.contains("\"did\":\"deleted\"")
+            && gone.contains("its last function or service was removed")
+            && !gone.contains(&word),
+        "{gone}"
+    );
+
+    // A function that has run, and whose stored image is then gone: its next run's root is fetched again from the
+    // registry, with the credential. (A function that never ran is given no rebuild, so it runs once first.)
+    rig.approved("function_create", relay_args())
+        .expect("relay again");
+    let image = rig.fingerprint("relay");
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    assert_eq!(rig.run("relay")["root"], "new");
+    assert!(
+        rig.fake
+            .rebuilds(PROJECT, "relay")
+            .iter()
+            .all(|from| from.starts_with("store:"))
+    );
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/images/{image}?project={PROJECT}"),
+        &json!({}),
+    );
+    assert!(credentialed(&rig).is_empty());
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("registry"))
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay").last().unwrap(),
+        "registry+credential"
+    );
+    assert!(!line.to_string().contains(&word));
+    // Incus made the image's record anew, with the address and auto_update on: it is turned off again.
+    let again = credentialed(&rig);
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert_eq!(again[0]["auto_update"], false);
+
+    // A card approved after the credential was removed no longer says what would happen: it does not run.
+    let mut tock = relay_args();
+    tock["name"] = json!("tock");
+    let waiting = rig.propose("function_create", tock).expect("proposed");
+    rig.call("registry_secret_remove", json!({ "server": server }))
+        .expect("removed");
+    assert_eq!(
+        rig.call_as(Scope::Viewer, "registry_list", json!({}))
+            .expect("list")["registries"],
+        json!([])
+    );
+    let (_, message) = refusal(rig.approve("function_create", &waiting));
+    assert!(
+        message.contains("this node holds no credential for https://registry.example now"),
+        "{message}"
+    );
+    // And without one, a create names no registry and is sent without a credential.
+    let plain = rig
+        .propose("function_create", {
+            let mut args = relay_args();
+            args["name"] = json!("plain");
+            args
+        })
+        .expect("proposed");
+    assert!(plain["args"].get("registry").is_none());
+    assert!(
+        plain["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["label"] != "Registry")
+    );
+}
+
+/// A credential is the one registry's it was set for. A host that differs from it by a dot and a dash, which
+/// anyone can register, is another registry: its images are fetched bare, at a create and at a rebuild, its card
+/// names no credential, and setting or removing one of the two never touches the other. And no function can ask
+/// for a registry's password as a secret of its own.
+#[test]
+fn a_registrys_credential_never_reaches_another_host_or_a_functions_environment() {
+    let rig = Rig::new();
+    rig.nats();
+    let (real, twin) = ("https://my.registry.example", "https://my-registry.example");
+    let word = ["pull", "only", "word", "2345"].join("-");
+    rig.call(
+        "registry_secret_set",
+        json!({ "server": real, "username": "owner", "password": word }),
+    )
+    .expect("set");
+    let on = |host: &str, name: &str| {
+        let mut args = relay_args();
+        args["name"] = json!(name);
+        args["image"] = json!(format!("{host}/acme/relay"));
+        args
+    };
+    let kept = |rig: &Rig| -> Vec<String> {
+        rig.get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+            .and_then(|images| images.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|image| {
+                image["update_source"]["server"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+
+    // The twin's card names no registry and its image is fetched bare.
+    let proposal = rig
+        .propose("function_create", on("my-registry.example", "twin"))
+        .expect("proposed");
+    assert!(proposal["args"].get("registry").is_none());
+    assert!(
+        proposal["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["label"] != "Registry")
+    );
+    rig.approve("function_create", &proposal).expect("twin");
+    assert!(kept(&rig).iter().any(|address| address == twin));
+    assert!(kept(&rig).iter().all(|address| !address.contains('@')));
+    // A proposal that claims the real registry's credential for the twin's image is not taken.
+    let mut claims = on("my-registry.example", "claims");
+    claims["registry"] = json!(real);
+    let (_, message) = refusal(rig.propose("function_create", claims));
+    assert!(message.starts_with("args/registry:"), "{message}");
+    // Its root rebuilt from the registry, when the store's copy is gone, is asked for bare too.
+    rig.fake.exit_after_start(PROJECT, "twin", 0, OK);
+    assert_eq!(rig.run("twin")["outcome"], "ok");
+    let image = rig.fingerprint("twin");
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/images/{image}?project={PROJECT}"),
+        &json!({}),
+    );
+    let line = rig.run("twin");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("registry"))
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "twin").last().unwrap(),
+        "registry"
+    );
+    assert!(kept(&rig).iter().all(|address| !address.contains('@')));
+
+    // The real registry's own image is fetched with it: the control.
+    rig.approved("function_create", on("my.registry.example", "real"))
+        .expect("real");
+    assert_eq!(
+        kept(&rig)
+            .iter()
+            .filter(|address| address.contains(&word) && address.ends_with("@my.registry.example"))
+            .count(),
+        1
+    );
+
+    // Each registry has its own credential: setting or removing the twin's leaves the real one's as it was.
+    let other = ["another", "word", "6789"].join("-");
+    rig.call(
+        "registry_secret_set",
+        json!({ "server": twin, "username": "stranger", "password": other }),
+    )
+    .expect("set");
+    let held = |server: &str| arca::registry::credential(&rig.cfg, server).map(|c| c.username);
+    assert_eq!(held(real).as_deref(), Some("owner"));
+    assert_eq!(held(twin).as_deref(), Some("stranger"));
+    assert_eq!(
+        rig.call_as(Scope::Viewer, "registry_list", json!({}))
+            .expect("list")["registries"],
+        json!([{ "server": twin }, { "server": real }])
+    );
+    rig.call("registry_secret_remove", json!({ "server": twin }))
+        .expect("removed");
+    assert_eq!(held(real).as_deref(), Some("owner"));
+    assert_eq!(held(twin), None);
+
+    // A function's environment cannot name the registry's password: it is the node's, and no entry's.
+    let owner = arca_providers::incus::registry_owner(real).expect("a registry");
+    let mut greedy = on("my-registry.example", "greedy");
+    greedy["env"] = json!({ "X": format!("arca-secret:{owner}/password") });
+    let made = rig.approved("function_create", greedy);
+    assert!(made.is_err(), "{made:?}");
+    assert!(
+        rig.get(&format!("/1.0/instances/greedy?project={PROJECT}"))
+            .is_none()
+    );
+    let said = format!("{made:?}{:?}", rig.entries());
+    assert!(!said.contains(&word));
+}
+
+/// The sweep of the images the node's own project fetched with a credential. It knows such an image by the image's
+/// own record, so a credential removed since changes nothing; it turns `auto_update` off where it is on; it deletes
+/// one that no instance is made from, and only after a quarter of an hour; it never touches an image with no source
+/// address or one from an address without a credential, and never deletes one a stopped function was made from.
+/// Each thing it does is one line that names the project and the fingerprint.
+#[test]
+fn the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_old_orphan() {
+    use arca::registry::{IMAGES_LOG, ImageSweep, ORPHAN_AGE_MS, Swept};
+    let rig = Rig::new();
+    rig.nats();
+    let ticking = Arc::clone(&rig.now);
+    let clock: Clock = Arc::new(move || ticking.load(Ordering::SeqCst));
+    let sweep = ImageSweep::new(Arc::clone(&rig.cfg), clock.clone());
+    let image =
+        |fingerprint: &str| rig.get(&format!("/1.0/images/{fingerprint}?project={PROJECT}"));
+
+    // A node where no credential was ever set: the sweep asks Incus nothing.
+    let asked = rig.fake.requests().len();
+    assert_eq!(sweep.round(), Ok(Swept::default()));
+    assert_eq!(rig.fake.requests().len(), asked);
+
+    let server = "https://registry.example";
+    let word = ["pull", "only", "word", "6543"].join("-");
+    rig.call(
+        "registry_secret_set",
+        json!({ "server": server, "username": "puller", "password": word }),
+    )
+    .expect("set");
+    // Two functions, each on an image of its own. One runs and stops; the other's container is deleted by an
+    // operator behind Arca's back, which leaves its image with no instance made from it.
+    rig.approved("function_create", relay_args())
+        .expect("relay");
+    let mut lost = relay_args();
+    lost["name"] = json!("lost");
+    lost["image"] = json!("registry.example/acme/lost");
+    rig.approved("function_create", lost).expect("lost");
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    assert_eq!(rig.run("relay")["outcome"], "ok");
+    let (kept, orphan) = (rig.fingerprint("relay"), rig.fingerprint("lost"));
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/instances/lost?project={PROJECT}"),
+        &json!({}),
+    );
+    // Someone turns auto_update back on on the image the stopped function was made from.
+    send(
+        &rig,
+        "PATCH",
+        &format!("/1.0/images/{kept}?project={PROJECT}"),
+        &json!({ "auto_update": true }),
+    );
+    // Two images that are not the sweep's: one with no source address, one from an address without a credential.
+    let local = rig.fake.add_image(PROJECT, "a-local-image");
+    let bare = rig
+        .get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+        .and_then(|images| images.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .find(|image| image["update_source"]["server"] == "https://docker.io")
+        .expect("the image of nats")["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let others = (image(&local), image(&bare));
+    assert_eq!(others.1.as_ref().unwrap()["auto_update"], true);
+    // The credential is removed before the sweep ever looks: the images say by themselves what they were fetched with.
+    rig.call("registry_secret_remove", json!({ "server": server }))
+        .expect("removed");
+
+    // The first round turns auto_update off, and deletes nothing: the orphan was only just seen.
+    let first = Instant::now();
+    let age = Duration::from_millis(ORPHAN_AGE_MS);
+    assert_eq!(
+        sweep.round_at(first),
+        Ok(Swept {
+            turned_off: vec![kept.clone()],
+            deleted: vec![]
+        })
+    );
+    assert_eq!(image(&kept).unwrap()["auto_update"], false);
+    assert!(image(&orphan).is_some());
+    // The age is counted on a clock that only goes forward. The wall clock stepping ten ages ahead deletes
+    // nothing a minute short of the age; stepping back a day does not keep the orphan past it.
+    rig.now.fetch_add(10 * ORPHAN_AGE_MS, Ordering::SeqCst);
+    assert_eq!(
+        sweep.round_at(first + age - Duration::from_secs(60)),
+        Ok(Swept::default())
+    );
+    assert!(image(&orphan).is_some());
+    rig.now.fetch_sub(24 * 60 * 60 * 1000, Ordering::SeqCst);
+    assert_eq!(
+        sweep.round_at(first + age),
+        Ok(Swept {
+            turned_off: vec![],
+            deleted: vec![orphan.clone()]
+        })
+    );
+    assert!(image(&orphan).is_none());
+    // The image a stopped function was made from stays however long it has been: its next run is rebuilt from it.
+    assert_eq!(sweep.round_at(first + 10 * age), Ok(Swept::default()));
+    assert!(image(&kept).is_some());
+    assert_eq!(rig.run("relay")["root"], "store");
+    // The two that are not the sweep's are as they were, auto_update and all.
+    assert_eq!((image(&local), image(&bare)), others);
+
+    // One line for each thing done: the project and the fingerprint, and nothing of the address.
+    let log = fs::read_to_string(rig.dir.join(IMAGES_LOG)).expect("the log");
+    let lines: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let said: Vec<(&str, &str, &str)> = lines
+        .iter()
+        .map(|line| {
+            (
+                line["did"].as_str().unwrap(),
+                line["project"].as_str().unwrap(),
+                line["fingerprint"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("autoUpdateOff", PROJECT, kept.as_str()),
+            ("deleted", PROJECT, orphan.as_str())
+        ]
+    );
+    assert!(!log.contains(&word) && !log.contains("registry.example"));
+
+    // A round that cannot reach Incus is an error in words of Arca's own, and a later round works.
+    let mut away = (*rig.cfg).clone();
+    away.incus.socket = rig.dir.join("no-such-socket");
+    let failed = ImageSweep::new(Arc::new(away), clock)
+        .round()
+        .expect_err("Incus is not there");
+    assert!(failed.starts_with("Incus did not "), "{failed}");
+    assert_eq!(sweep.round(), Ok(Swept::default()));
+}
+
+/// A round of the sweep goes on past an image it cannot settle. Of three images fetched with a credential and left
+/// with `auto_update` on, the second cannot be changed, round after round: the first and the third are turned off
+/// all the same, and the round's error says how many were not.
+#[test]
+fn a_sweep_round_goes_on_past_an_image_that_incus_will_not_change() {
+    use arca::registry::{IMAGES_LOG, ImageSweep};
+    let rig = Rig::new();
+    rig.nats();
+    let ticking = Arc::clone(&rig.now);
+    let clock: Clock = Arc::new(move || ticking.load(Ordering::SeqCst));
+    let sweep = ImageSweep::new(Arc::clone(&rig.cfg), clock);
+    let word = ["pull", "only", "word", "7788"].join("-");
+    rig.call(
+        "registry_secret_set",
+        json!({ "server": "https://registry.example", "username": "puller", "password": word }),
+    )
+    .expect("set");
+    for name in ["one", "two", "three"] {
+        let mut args = relay_args();
+        args["name"] = json!(name);
+        args["image"] = json!(format!("registry.example/acme/{name}"));
+        rig.approved("function_create", args).expect("created");
+    }
+    // The three, in the order Incus lists them, each with auto_update turned back on by hand.
+    let listed: Vec<String> = rig
+        .get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+        .and_then(|images| images.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|image| {
+            image["update_source"]["server"]
+                .as_str()
+                .is_some_and(|address| address.contains('@'))
+        })
+        .map(|image| image["fingerprint"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(listed.len(), 3);
+    for fingerprint in &listed {
+        send(
+            &rig,
+            "PATCH",
+            &format!("/1.0/images/{fingerprint}?project={PROJECT}"),
+            &json!({ "auto_update": true }),
+        );
+    }
+    let on = |fingerprint: &str| {
+        rig.get(&format!("/1.0/images/{fingerprint}?project={PROJECT}"))
+            .expect("the image")["auto_update"]
+            .clone()
+    };
+    // From now on Incus refuses every change of the second.
+    rig.fake
+        .set_reject_patch(&format!("/1.0/images/{}", listed[1]));
+    for _ in 0..2 {
+        let failed = sweep.round().expect_err("one image was not settled");
+        assert!(
+            failed.starts_with(
+                "Incus did not turn auto_update off on 1 and did not delete 0 of the 3 images"
+            ),
+            "{failed}"
+        );
+        assert_eq!(
+            (on(&listed[0]), on(&listed[1]), on(&listed[2])),
+            (json!(false), json!(true), json!(false))
+        );
+    }
+    // One line for each image that was turned off, and none for the one that was not.
+    let log = fs::read_to_string(rig.dir.join(IMAGES_LOG)).expect("the log");
+    assert_eq!(log.lines().count(), 2, "{log}");
+    assert!(log.contains(&listed[0]) && log.contains(&listed[2]) && !log.contains(&listed[1]));
+}
+
 /// An edit made by an Incus operator, outside the kernel's writer.
 fn put(rig: &Rig, path: &str, body: &Value) {
+    send(rig, "PUT", path, body);
+}
+
+/// A request an Incus operator makes, outside the kernel's writer.
+fn send(rig: &Rig, method: &str, path: &str, body: &Value) {
     use std::io::{Read, Write};
     let mut stream = std::os::unix::net::UnixStream::connect(rig.fake.socket()).unwrap();
     let body = body.to_string();
-    write!(stream, "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     assert!(

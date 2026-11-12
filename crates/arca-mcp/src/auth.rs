@@ -92,6 +92,8 @@ struct Entry {
 #[derive(Clone)]
 pub struct TokenStore {
     entries: Arc<RwLock<Vec<Entry>>>,
+    /// The hash files the last load left out ([`TokenStore::ignored`]).
+    ignored: Arc<RwLock<Vec<String>>>,
 }
 
 impl std::fmt::Debug for TokenStore {
@@ -125,11 +127,18 @@ impl TokenStore {
         let mut paths = list(dir)?;
         paths.sort();
         let mut entries: Vec<Entry> = Vec::with_capacity(paths.len());
+        let mut ignored = Vec::new();
         for path in paths {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // A file under the name approved actions run under is no token. An older release let one be minted, so
+            // it is left out, not refused: the store loads without it, and its secret authenticates nobody.
+            if name.strip_suffix(".hash") == Some(APPROVED_ACTION_ID) {
+                ignored.push(name);
+                continue;
+            }
             let id = name
                 .strip_suffix(".hash")
                 .filter(|id| valid_id(id))
@@ -148,7 +157,17 @@ impl TokenStore {
         entries.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(TokenStore {
             entries: Arc::new(RwLock::new(entries)),
+            ignored: Arc::new(RwLock::new(ignored)),
         })
+    }
+
+    /// The hash files the last load, or reload, found and left out: a file named for [`APPROVED_ACTION_ID`]. Whoever
+    /// loaded the store says so once, since such a file is the owner's to remove.
+    pub fn ignored(&self) -> Vec<String> {
+        self.ignored
+            .read()
+            .map(|ignored| ignored.clone())
+            .unwrap_or_default()
     }
 
     /// Replaces the live token set from `dir` and returns its size. The previous set stays in place when the load fails.
@@ -162,9 +181,13 @@ impl TokenStore {
             })?
             .clone();
         let len = next.len();
+        let left_out = loaded.ignored();
         *self.entries.write().map_err(|_| TokenStoreError::Io {
             file: "the token store".into(),
         })? = next;
+        if let Ok(mut ignored) = self.ignored.write() {
+            *ignored = left_out;
+        }
         Ok(len)
     }
 
@@ -353,6 +376,10 @@ fn parse_scope(text: &str) -> Option<Scope> {
         _ => None,
     }
 }
+
+/// The caller id an action runs under once the owner approved its proposal. It is not a token: no token may be
+/// minted under it, so a call under this id is always an approved action and never a person's token.
+pub const APPROVED_ACTION_ID: &str = "owner-approval";
 
 /// An id is 1 to 64 characters: a lowercase letter or digit, then lowercase letters, digits and hyphens.
 fn valid_id(id: &str) -> bool {

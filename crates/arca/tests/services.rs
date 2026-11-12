@@ -1,5 +1,7 @@
 //! Service verbs against a fake Incus: create, list and status are hermetic; no live host is touched.
 mod common;
+mod templates_before;
+use templates_before::postgres_file_of_0_12_0;
 #[path = "../../arca-approval/tests/common/webauthn.rs"]
 mod webauthn;
 
@@ -583,6 +585,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         first_boot: None,
         settings: None,
         create_settings: Vec::new(),
+        setting_rules: Vec::new(),
         kernel_access: None,
         update: None,
     }
@@ -1057,16 +1060,23 @@ fn lists_the_service_project_with_each_instances_own_config_and_devices_none_whe
         rows[0]["template"], "",
         "an unmarked instance config is not a service record"
     );
+    // The list reads the instances without their live state: a guest's agent is never waited for.
     assert!(rig.fake.requests().iter().any(|request| request.path
-        == "/1.0/instances?all-projects=true&recursion=2"
+        == "/1.0/instances?all-projects=true&recursion=1"
         && request.status == 200));
+    assert!(
+        !rig.fake
+            .requests()
+            .iter()
+            .any(|request| request.path == "/1.0/instances?all-projects=true&recursion=2")
+    );
     let empty = Rig::new();
     assert_eq!(
         empty.call("service_list", json!({})).expect("empty"),
         json!({"services":[]})
     );
     assert!(empty.fake.requests().iter().any(|request| request.path
-        == "/1.0/instances?all-projects=true&recursion=2"
+        == "/1.0/instances?all-projects=true&recursion=1"
         && request.status == 200));
 }
 
@@ -1089,6 +1099,92 @@ fn doctor() -> Caller {
         scope: Scope::Doctor,
         tools: None,
     }
+}
+
+#[test]
+fn a_local_image_that_carries_a_digest_is_held_to_it_and_one_that_carries_none_is_not() {
+    let template = |digest: Option<&str>| {
+        let mut template = json!({
+            "name":"dash","kind":"system","image":"local:dash-image",
+            "ports":[],"env":{},"publishable":false
+        });
+        if let Some(digest) = digest {
+            template["digest"] = json!(format!("sha256:{digest}"));
+        }
+        template
+    };
+    let refused = |result: Result<Value, CallError>| match result {
+        Err(CallError::Refused { message, .. }) => message,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let other = "0".repeat(64);
+
+    // A node with no service yet has no service project, so no image can be in it: the pin cannot be met, and the
+    // refusal says what comes first.
+    let fresh = Rig::new();
+    fresh.template("dash", template(Some(&other)));
+    assert_eq!(
+        refused(fresh.call("service_create", json!({"name":"dash","template":"dash"}))),
+        format!(
+            "template dash: its image dash-image is pinned to sha256:{other}, and the service project {PROJECT} does not exist yet: it is made with this node's first service, so no image can be in it. Create another service first, put the pinned image in the project under the alias dash-image, then create this one"
+        )
+    );
+    assert!(fresh.entries().is_empty(), "no record was saved");
+
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("the first service makes the project");
+    let held = rig.fake.add_image(PROJECT, "dash-image");
+    let create = |name: &str| {
+        rig.call(
+            "service_create",
+            json!({ "name": name, "template": "dash" }),
+        )
+    };
+    let entries = rig.entries();
+    let writes = rig.fake.writes().len();
+
+    // The alias holds another image than the template pins: refused with both, and nothing is created.
+    rig.template("dash", template(Some(&other)));
+    assert_eq!(
+        refused(create("dash")),
+        format!(
+            "template dash: its image dash-image is pinned to sha256:{other}, and the image under that alias in the service project {PROJECT} is sha256:{held}. Nothing was created. Put the pinned image under the alias, or change the template's digest"
+        )
+    );
+    // A pinned alias that is not there at all.
+    let mut absent = template(Some(&held));
+    absent["image"] = json!("local:no-such-image");
+    rig.template("dash", absent);
+    assert!(
+        refused(create("dash"))
+            .starts_with("template dash: its image no-such-image is not on this node"),
+    );
+    // A digest that is not one, and one in upper case, are refused when the template is read: the pin is compared
+    // with the fingerprint as Incus writes it.
+    let malformed = "template dash: the digest of a local image is sha256: and 64 lowercase hex digits, as Incus writes a fingerprint";
+    for digest in ["abc".to_string(), held.to_uppercase()] {
+        rig.template("dash", template(Some(&digest)));
+        assert_eq!(refused(create("dash")), malformed, "{digest}");
+    }
+    assert_eq!(rig.entries(), entries, "no record was saved");
+    assert_eq!(rig.fake.writes().len(), writes, "Incus was not written to");
+
+    // The pinned image under the alias: created, and Incus is given the fingerprint, which decides the image.
+    rig.template("dash", template(Some(&held)));
+    create("dash").expect("the pinned create");
+    assert_eq!(
+        rig.service_config("dash").source,
+        json!({ "type": "image", "alias": "dash-image", "fingerprint": held })
+    );
+    // A template with no digest is as it was: the alias is enough.
+    rig.template("dash", template(None));
+    create("dash2").expect("an unpinned local image");
+    assert_eq!(
+        rig.service_config("dash2").source,
+        json!({ "type": "image", "alias": "dash-image" })
+    );
 }
 
 #[test]
@@ -3168,7 +3264,7 @@ fn service_create_names_the_missing_entrypoint_script_and_how_it_gets_there() {
         "the refusal names the file it looked for and where it belongs: {message}"
     );
     assert!(
-        message.contains("for a template Arca ships, `arca templates install --config <file>`"),
+        message.contains("for a template Arca ships, `arca templates install --config CONFIG_FILE` (this node's config in place of CONFIG_FILE)"),
         "the one-step install is offered for shipped templates only: {message}"
     );
     assert!(
@@ -3215,6 +3311,173 @@ fn an_entrypoint_script_is_a_plain_file_name_in_the_template_directory() {
                     if message.starts_with("entrypoint: invalid file (a plain file name in the templates directory")
             ),
             "{file:?} is refused"
+        );
+    }
+}
+
+/// A node that installed its templates with an earlier release is not left on a template a later release fixed. A
+/// file that is an earlier release's own, byte for byte, is replaced without `--replace` and named. A file the owner
+/// edited matches no release and is kept, as before, and so is the earlier file that belongs with it.
+#[test]
+fn templates_install_brings_an_earlier_shipped_file_up_to_date_and_keeps_an_edited_one() {
+    let rig = Rig::new();
+    let dir = rig.dir.join("templates");
+    let shipped = |name: &str| {
+        arca::cmd_templates::SHIPPED
+            .iter()
+            .find(|(shipped, _)| *shipped == name)
+            .map(|(_, text)| text.to_string())
+            .expect("a shipped file")
+    };
+    let read = |name: &str| fs::read_to_string(dir.join(name)).expect("an installed file");
+    let (json_file, script) = ("postgres-autopg.json", "postgres-autopg.sh");
+    let old_json = postgres_file_of_0_12_0(json_file);
+    let old_script = postgres_file_of_0_12_0(script);
+    assert_ne!(old_json, shipped(json_file));
+    assert_ne!(old_script, shipped(script));
+
+    // The node as 0.12.0 left it: both files are that release's own. One plain run brings both to this release.
+    arca::cmd_templates::install_into(&dir, false).expect("install");
+    fs::write(dir.join(json_file), &old_json).expect("the template of 0.12.0");
+    fs::write(dir.join(script), &old_script).expect("the script of 0.12.0");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("upgrade");
+    assert_eq!(report["replaced"], json!([json_file, script]), "{report}");
+    assert_eq!(report["installed"], json!([]));
+    assert_eq!(report["kept"], json!([]));
+    assert_eq!(read(json_file), shipped(json_file));
+    assert_eq!(read(script), shipped(script));
+    assert!(
+        service::load_template(&dir, "postgres-autopg")
+            .expect("it loads")
+            .generate
+            .contains_key("POSTGRES_PASSWORD"),
+        "the template now makes its password"
+    );
+    // And once more: nothing is left to replace.
+    let again = arca::cmd_templates::install_into(&dir, false).expect("again");
+    assert_eq!(again["replaced"], json!([]));
+
+    // The owner edited the template: it matches no release, so it is kept, and the earlier script that belongs
+    // with it is kept too, so the pair stays the one the owner has.
+    let edited = old_json.replace("PostgreSQL 18", "My PostgreSQL 18");
+    fs::write(dir.join(json_file), &edited).expect("the owner's edit");
+    fs::write(dir.join(script), &old_script).expect("the script of 0.12.0");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("kept");
+    assert_eq!(report["kept"], json!([json_file, script]), "{report}");
+    assert_eq!(report["replaced"], json!([]));
+    assert_eq!(read(json_file), edited);
+    assert_eq!(read(script), old_script);
+
+    // The other way round: an edited script holds the earlier template as it is.
+    fs::write(dir.join(json_file), &old_json).expect("the template of 0.12.0");
+    fs::write(dir.join(script), format!("{old_script}# mine\n")).expect("the owner's edit");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("kept");
+    assert_eq!(report["kept"], json!([json_file, script]), "{report}");
+    assert_eq!(read(json_file), old_json);
+
+    // An edit elsewhere holds nothing of this pair back.
+    fs::write(dir.join(script), &old_script).expect("the script of 0.12.0");
+    fs::write(dir.join("nats.json"), "{}").expect("an edit to another template");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("upgrade");
+    assert_eq!(report["replaced"], json!([json_file, script]), "{report}");
+    assert_eq!(report["kept"], json!(["nats.json"]));
+
+    // --replace still overwrites an edit, and says an earlier file was replaced.
+    fs::write(dir.join(json_file), &edited).expect("the owner's edit");
+    fs::write(dir.join(script), &old_script).expect("the script of 0.12.0");
+    let report = arca::cmd_templates::install_into(&dir, true).expect("replace");
+    assert_eq!(
+        report["installed"],
+        json!(["nats.json", json_file]),
+        "{report}"
+    );
+    assert_eq!(report["replaced"], json!([script]));
+    assert_eq!(report["kept"], json!([]));
+}
+
+/// The list of earlier shipped files is sound: every entry names a shipped file by a SHA-256, and none is the file
+/// this build ships (that one is "unchanged", not "earlier"). Where the checkout has the release tags, every file a
+/// release shipped is this build's or is on the list, so a release that changes a template cannot forget its entry.
+#[test]
+fn every_file_an_earlier_release_shipped_is_this_builds_or_is_on_the_list() {
+    use arca::cmd_templates::{EARLIER, SHIPPED};
+    let digest = |bytes: &[u8]| arca_kernel::canon::Digest::of(bytes).to_hex();
+    for (name, hash) in EARLIER {
+        let (_, text) = SHIPPED
+            .iter()
+            .find(|(shipped, _)| shipped == name)
+            .unwrap_or_else(|| panic!("{name} is not a shipped file"));
+        assert!(
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "{name}: {hash} is not a SHA-256 in lower-case hex"
+        );
+        assert_ne!(
+            *hash,
+            digest(text.as_bytes()),
+            "{name}: that is the file this build ships"
+        );
+    }
+
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let git = |arguments: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(arguments)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| out.stdout)
+    };
+    let tags = git(&["tag", "--list", "v*"])
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .unwrap_or_default();
+    let mut checked = 0;
+    for tag in tags.lines() {
+        // A release from before `templates install` put no file on any node.
+        if git(&[
+            "cat-file",
+            "-e",
+            &format!("{tag}:crates/arca/src/cmd_templates.rs"),
+        ])
+        .is_none()
+        {
+            continue;
+        }
+        for (name, text) in SHIPPED {
+            let Some(then) = git(&["show", &format!("{tag}:templates/{name}")]) else {
+                continue;
+            };
+            checked += 1;
+            let hash = digest(&then);
+            assert!(
+                then == text.as_bytes()
+                    || EARLIER
+                        .iter()
+                        .any(|(earlier, listed)| earlier == name && *listed == hash),
+                "{name} as {tag} shipped it ({hash}) is neither this build's file nor on cmd_templates::EARLIER: add it"
+            );
+        }
+    }
+    if checked == 0 {
+        // Without the tags nothing above compared a single file, and a check that did not run must not look like one
+        // that passed: a release once changed two shipped scripts with no entry here, and the gate, whose checkout
+        // had no tags, stayed green. In CI that is a failure. Elsewhere (a source archive, a shallow clone) it is
+        // said on standard error, past the harness's capture.
+        let words = "no release tag (v*) in this checkout, so no file an earlier release shipped was compared with \
+                     cmd_templates::EARLIER: the list was checked for form only";
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{words}. The gate must fetch the release tags before it runs the tests"
+        );
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "every_file_an_earlier_release_shipped_is_this_builds_or_is_on_the_list: {words}"
         );
     }
 }

@@ -666,7 +666,8 @@ impl Rig {
         let proposal = kernel
             .propose_action(
                 arca::action_proposal::ActionKind::ServiceCreate,
-                json!({ "name": name, "template": "nats" }),
+                // Bound, as the node binds a create when it is proposed: an unbound one is never approved.
+                json!({ "name": name, "template": "nats", "templateDigest": "ab".repeat(32) }),
                 now,
                 None,
             )
@@ -1325,13 +1326,20 @@ fn action_proposals_are_listed_next_to_delete_plans_and_decline_removes_one() {
     );
     assert_eq!(
         action["args"],
-        json!({ "name": "nats", "template": "nats" })
+        json!({ "name": "nats", "template": "nats", "templateDigest": "ab".repeat(32) })
     );
     assert_eq!(
         action["details"],
         json!([
             { "label": "Name", "value": "nats" },
-            { "label": "Template", "value": "nats" }
+            { "label": "Template", "value": "nats" },
+            {
+                "label": "Template content",
+                "value": format!(
+                    "{}. Arca creates this only if the template on the node is still exactly this one.",
+                    "ab".repeat(32)
+                )
+            }
         ])
     );
     let id = action["id"].as_str().expect("an id");

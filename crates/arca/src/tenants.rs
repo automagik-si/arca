@@ -323,6 +323,29 @@ pub(super) fn open_deploy(
     entry: &str,
     now: u64,
 ) -> Result<Option<String>, CallError> {
+    let Some(id) = joinable_deploy(cfg, scope, args, &caller.token_id, now)? else {
+        return Ok(None);
+    };
+    let scope = scope.ok_or_else(internal)?;
+    journal_deploy(
+        cfg,
+        json!({ "kind": "create", "tenant": scope.id, "deploy": id, "token_id": caller.token_id,
+            "entry": entry, "at_ms": now }),
+    )?;
+    Ok(Some(id))
+}
+
+/// The deploy a create names, when the token `token` may add to it now: a deploy nobody opened yet, or one this
+/// token opened that is still provisional. `None` for a create that names none. Nothing is written. The create asks
+/// here before it journals its part ([`open_deploy`]), and a proposal asks here when it is made, with the token its
+/// approved create will run as.
+pub(super) fn joinable_deploy(
+    cfg: &NodeConfig,
+    scope: Option<&TenantScope>,
+    args: &Value,
+    token: &str,
+    now: u64,
+) -> Result<Option<String>, CallError> {
     let Some(value) = args.get("deploy") else {
         return Ok(None);
     };
@@ -338,10 +361,8 @@ pub(super) fn open_deploy(
             CallError::Invalid("deploy: expected 1 to 64 of a-z, 0-9 and \"-\"".into())
         })?;
     if let Some(open) = deploys(cfg)?.get(&(scope.id.clone(), id.to_string())) {
-        if open.token != caller.token_id {
-            return Err(service_refused(format!(
-                "deploy {id} was opened by another token: only the token that opened a deploy adds to it"
-            )));
+        if open.token != token {
+            return Err(service_refused(deploy_of_another_caller(id)));
         }
         if !open.provisional(now) {
             return Err(service_refused(format!(
@@ -349,12 +370,16 @@ pub(super) fn open_deploy(
             )));
         }
     }
-    journal_deploy(
-        cfg,
-        json!({ "kind": "create", "tenant": scope.id, "deploy": id, "token_id": caller.token_id,
-            "entry": entry, "at_ms": now }),
-    )?;
     Ok(Some(id.to_string()))
+}
+
+/// Why a create does not join a deploy another caller opened. One sentence for every reader of it: a token that
+/// names a deploy another token opened, a token that names a deploy a card opened, and a card (when it is proposed
+/// and when its approved create runs) that names a deploy a token opened, the proposing token's own included.
+fn deploy_of_another_caller(id: &str) -> String {
+    format!(
+        "deploy {id} was opened by another caller: only the caller that opened a deploy adds to it, and an approved action runs as the owner's approval, never as the token that proposed it"
+    )
 }
 
 /// The deploy an entry of a tenant was created in, when it names one.
@@ -1059,9 +1084,15 @@ fn id_arg(args: &Value) -> Result<&str, CallError> {
         .ok_or_else(|| CallError::Invalid("id: expected a tenant id".into()))
 }
 
-/// The tenant's instances as Incus lists them, with their state and expanded config.
+/// The tenant's instances as Incus lists them, with their status and expanded config, and without their live state.
 fn tenant_rows(read: &UnixIncus, scope: &TenantScope) -> Result<Vec<Value>, CallError> {
-    service_listing(read, Some(&scope.project))
+    service_listing(
+        read,
+        Some(&scope.project),
+        false,
+        &format!("tenant {}", scope.id),
+        "",
+    )
 }
 
 fn status_json(scope: &TenantScope, entries: &[Entry], instances: Option<usize>) -> Value {
@@ -1498,11 +1529,20 @@ impl TenantHandler {
                     "the Incus project {project} already exists and Arca did not create it for this tenant; it is left alone"
                 )));
             }
-            Err(_) => return Err(internal()),
+            Err(error) => {
+                return Err(super::incus_read_refused(
+                    &error,
+                    "the Incus project a new tenant would take",
+                    &format!("tenant {id}"),
+                    "Nothing was created.",
+                ));
+            }
         }
         // The block: the highest one of the tenant's size that overlaps no tenant's and holds no address in use.
-        let rows = service_listing(read, None)?;
-        let leases = service_leases(read)?;
+        let subject = format!("tenant {id}");
+        // A new tenant's block holds no address in use, and a live address is in no record: this one reads the state.
+        let rows = service_listing(read, None, true, &subject, "Nothing was created.")?;
+        let leases = service_leases(read, &subject)?;
         let in_use = service_used(&rows, &leases, entries);
         let held = held_blocks(&self.cfg, entries);
         let prefix = block::block_prefix(&caps);

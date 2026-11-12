@@ -216,6 +216,17 @@ impl ActionKind {
         schema
     }
 
+    /// The template of a create whose proposal names no fingerprint of the template's content: a `service_create`,
+    /// or a `postgres_create` made from the node's template, recorded before the node bound it (or by a handler that
+    /// was given no node). Such a proposal is never approved: what its card showed cannot be held to. `None` for
+    /// every other action, and for a database of the old kind, which is made from no template.
+    pub fn unbound_template(self, args: &Value) -> Option<&str> {
+        let template = args.get("template")?.as_str()?;
+        (matches!(self, Self::ServiceCreate | Self::PostgresCreate)
+            && args.get("templateDigest").is_none())
+        .then_some(template)
+    }
+
     /// Checks `args` against the verb's own schema (without `approval`) and the verb's semantic rules, and returns the
     /// normalized arguments the owner will approve.
     ///
@@ -406,6 +417,14 @@ impl ActionKind {
                         &destinations_words(&args["destinations"]),
                     ));
                 }
+                // The image is on a registry this node holds a credential for: the proposal names the registry (it
+                // is filled in when the proposal is made), and the card says where that credential then rests.
+                if let Some(server) = args.get("registry") {
+                    rows.push(row(
+                        "Registry",
+                        &crate::registry::card_words(server.as_str().unwrap_or("(cannot be read)")),
+                    ));
+                }
                 // The row says what will happen, so the owner approves a stopped service knowingly: a create that
                 // said `start: false`, and one whose template is created stopped whatever the call says (the reason
                 // is read from the template when the proposal is made, and is not in its arguments).
@@ -584,6 +603,19 @@ impl ActionKind {
         {
             rows.push(row("Deploy", deploy));
         }
+        // What the node read from the template when a create was proposed, and filled in. They close the card: the
+        // image, the row a person reads (a database's card has it second already), and last the fingerprint of the
+        // template's content, which the create is held to.
+        if self == Self::ServiceCreate
+            && let Some(image) = args["image"].as_str()
+        {
+            rows.push(row("Image", &image_words(image)));
+        }
+        if matches!(self, Self::ServiceCreate | Self::PostgresCreate)
+            && let Some(digest) = args["templateDigest"].as_str()
+        {
+            rows.push(row("Template content", &template_content_words(digest)));
+        }
         rows
     }
 
@@ -744,6 +776,35 @@ pub fn destinations_list(destinations: &Value) -> String {
     }
 }
 
+/// The card's `Image` row for the image a proposal names ([`crate::service::template_image`]): the image by its
+/// digest, or its bare name with the words that say it has none, and after it the version a virtual machine runs.
+pub fn image_words(image: &str) -> String {
+    let (boots, version) = match image.split_once(crate::service::IMAGE_RUNNING) {
+        Some((boots, version)) => (boots, Some(version)),
+        None => (image, None),
+    };
+    let mut words = boots.to_string();
+    if !boots.contains("@sha256:") {
+        words.push_str(NO_DIGEST);
+    }
+    if let Some(version) = version {
+        words.push_str(&format!(", running {version}"));
+    }
+    words
+}
+
+/// What an `Image` row says of an image a template names without a digest.
+const NO_DIGEST: &str =
+    " (no digest: Incus takes what that name gives when the service is created)";
+
+/// The card's last row for a create from a template: the fingerprint of the template's content as the node held it
+/// when the proposal was made, whole, and what it means.
+pub fn template_content_words(digest: &str) -> String {
+    format!(
+        "{digest}. Arca creates this only if the template on the node is still exactly this one."
+    )
+}
+
 /// What the card of a template database is told, in place of a stopped reason, when the node's template generates
 /// the database's password. No stopped reason reads so.
 pub const DATABASE_PASSWORD_GENERATED: &str = "generated";
@@ -784,8 +845,11 @@ pub fn start_words(start: bool) -> &'static str {
 /// The `Start` row of a `service_create` whose template is created stopped whatever the call says: `reason` finishes
 /// "it is created stopped because".
 pub fn stopped_words(reason: &str) -> String {
-    format!("{STOPPED_BECAUSE}{reason}; instance_start starts it later")
+    format!("{STOPPED_BECAUSE}{reason}{STOPPED_THEN}")
 }
+
+/// How every [`stopped_words`] row ends.
+const STOPPED_THEN: &str = "; instance_start starts it later";
 
 /// How every [`stopped_words`] row begins.
 const STOPPED_BECAUSE: &str = "No: it is created stopped because ";
@@ -834,7 +898,8 @@ impl ActionProposal {
 /// The summary and details to show for a proposal read from the journal. A GPU proposal's product is not in its arguments:
 /// the inventory that named it at proposal time may be gone when the kernel next opens. The journal is the kernel's own
 /// private file, so its words are kept for a GPU action when they still carry the proposal's instance and PCI address;
-/// otherwise the rows are rebuilt without a product. Every other action is rebuilt from its arguments, as before.
+/// otherwise the rows are rebuilt without a product. A deploy's parts, why a create is stopped, and what the node
+/// read from its database template are kept the same way. Every other action is rebuilt from its arguments.
 fn loaded_words(
     action: ActionKind,
     args: &Value,
@@ -874,6 +939,37 @@ fn loaded_words(
         let fits = args.get("start") != Some(&Value::Bool(false))
             && stored_start.is_some_and(|row| row.value.starts_with(STOPPED_BECAUSE))
             && without_start(stored_details) == without_start(&rebuilt);
+        return (
+            action.summary(args),
+            if fits {
+                stored_details.to_vec()
+            } else {
+                rebuilt
+            },
+        );
+    }
+    // What the node read from its database template when a database was proposed (that the template generates the
+    // password, or why the database is created stopped) is not in the arguments either: the journal's rows are kept
+    // when they are the rows this action writes for these arguments, with that claim or with such a `Start` row.
+    if action == ActionKind::PostgresCreate && args.get("template").is_some() {
+        let rebuilt = action.details(args);
+        let generated = action.details_with_gpu(args, Some(DATABASE_PASSWORD_GENERATED));
+        // A stopped card is kept when it is, row for row, the card this action writes for these arguments and the
+        // reason its own `Start` row gives: the row stands where the card puts it, before the template's content.
+        let stopped = stored_details
+            .iter()
+            .find(|row| row.label == "Start")
+            .and_then(|start| {
+                start
+                    .value
+                    .strip_prefix(STOPPED_BECAUSE)?
+                    .strip_suffix(STOPPED_THEN)
+            })
+            .is_some_and(|reason| {
+                reason != DATABASE_PASSWORD_GENERATED
+                    && stored_details == action.details_with_gpu(args, Some(reason)).as_slice()
+            });
+        let fits = stopped || stored_details == generated.as_slice();
         return (
             action.summary(args),
             if fits {
@@ -1462,6 +1558,42 @@ mod tests {
     const OTHER_IMAGE: &str = "docker.io/library/postgres@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
+    fn the_image_row_says_what_boots_what_its_name_leaves_open_and_what_a_machine_runs() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let open = " (no digest: Incus takes what that name gives when the service is created)";
+        // By its digest: the reference, and nothing more.
+        let pinned = format!("docker.io/library/app@{digest}");
+        assert_eq!(image_words(&pinned), pinned);
+        let local = format!("local:built@{digest}");
+        assert_eq!(image_words(&local), local);
+        // No digest: the name, and the words that say what that leaves open.
+        assert_eq!(
+            image_words("images:debian/13"),
+            format!("images:debian/13{open}")
+        );
+        assert_eq!(image_words("local:built"), format!("local:built{open}"));
+        // A machine that names the version it runs: its own system image first, with those words when it has no
+        // digest, then the version.
+        let version = format!("registry.example/server@{digest}");
+        assert_eq!(
+            image_words(&format!("images:debian/13/cloud running {version}")),
+            format!("images:debian/13/cloud{open}, running {version}")
+        );
+        assert_eq!(
+            image_words(&format!("images:debian/13@{digest} running {version}")),
+            format!("images:debian/13@{digest}, running {version}")
+        );
+        // The template's content: the whole value, and what it means.
+        assert_eq!(
+            template_content_words(&"ab".repeat(32)),
+            format!(
+                "{}. Arca creates this only if the template on the node is still exactly this one.",
+                "ab".repeat(32)
+            )
+        );
+    }
+
+    #[test]
     fn a_proposed_database_names_the_configured_image_or_the_template_the_kernel_filled_in() {
         let create = ActionKind::PostgresCreate;
         // The config names the image: it is filled in, and neither another image nor a template is taken.
@@ -1688,6 +1820,97 @@ mod tests {
         );
         assert!(!path.exists(), "the journal was moved aside");
         assert!(quarantined(&dir.0), "the invalid journal was quarantined");
+    }
+
+    #[test]
+    fn a_databases_card_keeps_what_the_node_read_from_its_template_on_replay() {
+        let action = ActionKind::PostgresCreate;
+        let args = json!({
+            "name": "orders",
+            "template": crate::service::DATABASE_TEMPLATE,
+            "image": PINNED_IMAGE
+        });
+        let reason = "its template needs the secret POSTGRES_PASSWORD, which is not set yet";
+        // Proposed from a template that generates no password: the journal's rows carry the Start row, and a replay
+        // keeps it, so the owner still sees that the database is created stopped.
+        let stopped = action.details_with_gpu(&args, Some(reason));
+        assert_eq!(stopped.last().map(|row| row.label.as_str()), Some("Start"));
+        assert_eq!(stopped.last().unwrap().value, stopped_words(reason));
+        assert_eq!(loaded_words(action, &args, "", &stopped).1, stopped);
+        // Proposed from a template that generates it: the claim is kept too.
+        let generated = action.details_with_gpu(&args, Some(DATABASE_PASSWORD_GENERATED));
+        assert_ne!(generated, action.details(&args));
+        assert_eq!(loaded_words(action, &args, "", &generated).1, generated);
+        // Rows with neither are the rows the arguments give, and stay.
+        let plain = action.details(&args);
+        assert_eq!(loaded_words(action, &args, "", &plain).1, plain);
+        // Rows that do not fit the arguments, a Start row in other words, a second Start row, and a claim on a row
+        // that also says stopped are rebuilt from the arguments alone: no claim, no row.
+        let other = json!({
+            "name": "other",
+            "template": crate::service::DATABASE_TEMPLATE,
+            "image": PINNED_IMAGE
+        });
+        assert_eq!(
+            loaded_words(action, &other, "", &stopped).1,
+            action.details(&other)
+        );
+        assert_eq!(
+            loaded_words(action, &other, "", &generated).1,
+            action.details(&other)
+        );
+        let mut forged = stopped.clone();
+        forged.last_mut().unwrap().value = "Yes: anything".to_string();
+        assert_eq!(loaded_words(action, &args, "", &forged).1, plain);
+        let mut twice = stopped.clone();
+        twice.push(stopped.last().unwrap().clone());
+        assert_eq!(loaded_words(action, &args, "", &twice).1, plain);
+        let mut both = generated.clone();
+        both.push(stopped.last().unwrap().clone());
+        assert_eq!(loaded_words(action, &args, "", &both).1, plain);
+        // A proposal that binds its template's content has that row last, after the Start row: both are kept.
+        let bound = json!({
+            "name": "orders",
+            "template": crate::service::DATABASE_TEMPLATE,
+            "image": PINNED_IMAGE,
+            "templateDigest": "ab".repeat(32)
+        });
+        let stopped_bound = action.details_with_gpu(&bound, Some(reason));
+        let labels: Vec<&str> = stopped_bound.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Database",
+                "Image",
+                "Template",
+                "Made as",
+                "Start",
+                "Template content"
+            ]
+        );
+        assert_eq!(
+            loaded_words(action, &bound, "", &stopped_bound).1,
+            stopped_bound
+        );
+        let generated_bound = action.details_with_gpu(&bound, Some(DATABASE_PASSWORD_GENERATED));
+        assert_eq!(
+            loaded_words(action, &bound, "", &generated_bound).1,
+            generated_bound
+        );
+        // A Start row moved to the end, after the template's content, is not the card this action writes.
+        let mut moved = stopped_bound.clone();
+        let start = moved.remove(4);
+        moved.push(start);
+        assert_eq!(
+            loaded_words(action, &bound, "", &moved).1,
+            action.details(&bound)
+        );
+        // A database of the old kind has no such rows: its card is rebuilt from its arguments, as before.
+        let old_kind = json!({ "name": "orders", "image": PINNED_IMAGE });
+        assert_eq!(
+            loaded_words(action, &old_kind, "", &stopped).1,
+            action.details(&old_kind)
+        );
     }
 
     #[test]

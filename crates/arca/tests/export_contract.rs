@@ -339,9 +339,40 @@ fn inputs_at(at: u64, sample: &HostSample) -> Inputs {
 
 /// Runs the scenario on the store in `state` and returns the snapshot of its last tick, with `watch_at` set as the server sets it.
 fn run(state: &Path) -> AlertSnapshot {
+    // The engine counts a commit that works but takes over a second as a slow commit, and says so in the very text
+    // this file holds to a golden copy (`arca_store_slow_commits_total`, and the warning `store-commit-slow`). How
+    // long a commit takes is the machine's doing, not the scenario's: on a runner whose disk was busy, two of the
+    // scenario's 38 commits once took over a second and the golden text was "wrong" with nothing wrong.
+    //
+    // So the scenario is judged only on a run whose commits were in time. A run with a slow commit is made again in
+    // an empty store, a few times. A commit that FAILS is another matter: that stops the test at once, with the
+    // store's own words.
+    const RUNS: usize = 5;
+    let mut slow = Vec::new();
+    for _ in 0..RUNS {
+        match run_once(state) {
+            Ok(snapshot) => return snapshot,
+            Err(took) => slow.push(took),
+        }
+        fs::remove_dir_all(state).expect("the state directory is emptied");
+        fs::create_dir(state).expect("the state directory is created");
+        fs::set_permissions(state, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    }
+    panic!(
+        "the scenario was not judged: in each of {RUNS} runs a commit of the store took over a second on this \
+         machine, which the engine counts as a slow commit and shows in the text. Nothing failed. The slow \
+         commits, in milliseconds, run by run: {slow:?}"
+    );
+}
+
+/// One run of the scenario in the store at `state`: the last tick's snapshot, or how long each commit took that
+/// the engine counted as slow. Panics when a commit failed.
+fn run_once(state: &Path) -> Result<AlertSnapshot, Vec<u64>> {
     let store = Store::open(state, NOW).expect("the store opens").store;
     let mut engine = Engine::start(store, Rules::default(), false, NOW).expect("the engine starts");
     let mut last = None;
+    let mut slow = Vec::new();
+    let mut counted = 0;
     for at in (NOW..=NOW + 185_000).step_by(5_000) {
         let used = if at - NOW <= 60_000 { 95 } else { 50 };
         let (sample, readings) = sample_at(at, used);
@@ -359,11 +390,24 @@ fn run(state: &Path) -> AlertSnapshot {
         });
         let points = export::points_of(&sample, &readings, &inputs);
         let mut snapshot = engine.tick(&inputs, points, at);
+        assert_eq!(
+            snapshot.store_error, None,
+            "a write to the scenario's store failed at {at}: the test's machine could not write, and that is no \
+             matter of speed"
+        );
+        if snapshot.store_slow_commits > counted {
+            counted = snapshot.store_slow_commits;
+            slow.push(snapshot.commit_ms.unwrap_or(0));
+        }
         snapshot.sample_at = Some(at);
         snapshot.watch_at = inputs.watch.as_ref().map(|watch| watch.at);
         last = Some(snapshot);
     }
-    last.expect("the ticks ran")
+    if slow.is_empty() {
+        Ok(last.expect("the ticks ran"))
+    } else {
+        Err(slow)
+    }
 }
 
 /// A server over the scenario in a new store: `/metrics`, `/alerts` and `alerts_list` answer its last tick.

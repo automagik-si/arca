@@ -272,7 +272,8 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "tenant_status",
             "tenant_usage",
             "function_list",
-            "function_runs"
+            "function_runs",
+            "registry_list"
         ]
     );
 }
@@ -1004,7 +1005,7 @@ fn the_loopback_listener_answers_its_own_two_names_as_the_unix_socket_does() {
             403,
             "{host}: an Origin is 403 on an MCP route, its own name included"
         );
-        let reply = post(&[authorization.clone()]);
+        let reply = post(std::slice::from_ref(&authorization));
         assert_eq!(reply.status, 200, "{host}: a viewer's initialize is 200");
         assert_eq!(reply.json()["result"]["protocolVersion"], "2025-11-25");
 

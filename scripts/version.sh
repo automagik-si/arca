@@ -11,7 +11,8 @@
 #   - nothing is cut when everything that changed is inert: documents, tests, the workflows.
 # The first release under this rule is 0.8.0. The seven before it were v0.1.0-alpha.1 to v0.1.0-alpha.7.
 #
-#   scripts/version.sh check                       every field carries the workspace version; exit 1 when not
+#   scripts/version.sh check                       every field carries the workspace version, and CHANGELOG.md heads
+#                                                  no release twice; exit 1 when not
 #   scripts/version.sh set <version>               write it everywhere
 #   scripts/version.sh next                        the next full release
 #   scripts/version.sh next-patch                  the next patch release
@@ -141,6 +142,14 @@ check() {
             bad=1
         fi
     done < <(fields)
+    # A release has one section in CHANGELOG.md. Two headings for one version come from a merge of two branches that
+    # both wrote under it, and the next release would publish them as they stand: `changelog` only adds lines.
+    if [ -f "$root/CHANGELOG.md" ]; then
+        while read -r value; do
+            echo "version: CHANGELOG.md has the heading \"## $value\" more than once: make it one" >&2
+            bad=1
+        done < <(sed -n -E 's/^## ([0-9]+\.[0-9]+\.[0-9]+)( .*)?$/\1/p' "$root/CHANGELOG.md" | sort | uniq -d)
+    fi
     [ "$bad" = 0 ] || exit 1
     echo "version: $want everywhere"
 }

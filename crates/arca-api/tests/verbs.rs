@@ -93,6 +93,9 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "function_list",
             "function_run",
             "function_runs",
+            "registry_secret_set",
+            "registry_list",
+            "registry_secret_remove",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -156,6 +159,21 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("function_list", VerbClass::L, Scope::Viewer, false, false),
         ("function_run", VerbClass::L, Scope::Doctor, true, false),
         ("function_runs", VerbClass::L, Scope::Viewer, false, false),
+        (
+            "registry_secret_set",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            false,
+        ),
+        ("registry_list", VerbClass::L, Scope::Viewer, false, false),
+        (
+            "registry_secret_remove",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            false,
+        ),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");

@@ -14,6 +14,16 @@
     "TAILSCALE_AUTHKEY"
   ],
   "createSettings": ["url", "concurrent", "jobCpu", "jobMemory", "serviceMemory", "jobServices", "runners", "memoryOvercommitPercent", "reach", "gitlabNode"],
+  "settingRules": [
+    { "need": "concurrent", "atLeast": 1, "why": "the pool runs one job at a time or more" },
+    { "need": 999, "atLeast": "concurrent", "why": "the pool reads a count of jobs of at most three digits" },
+    { "need": "jobCpu", "atLeast": 1, "why": "a job has one CPU or more" },
+    { "need": 999, "atLeast": "jobCpu", "why": "the pool reads a count of CPUs of at most three digits" },
+    { "need": "memoryOvercommitPercent", "atLeast": 100, "why": "at 100 the jobs' memory caps add up to no more than the machine has for jobs, and that is the least" },
+    { "need": 200, "atLeast": "memoryOvercommitPercent", "why": "at 200 the jobs' memory caps add up to twice what the machine has for jobs, and that is the most" },
+    { "need": { "count": "runners" }, "atLeast": 1, "why": "the pool needs one entry for each runner you created in GitLab" },
+    { "need": 12, "atLeast": { "count": "runners" }, "why": "one pool takes at most 12 runners, each with a secret of its own: create a second pool for the others" }
+  ],
   "settings": {
     "url": "",
     "concurrent": 20,

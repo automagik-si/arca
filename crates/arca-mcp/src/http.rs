@@ -87,6 +87,8 @@ pub struct Server {
     gets: Vec<(&'static str, &'static str, Arc<dyn GetHandler>)>,
     /// Whether the node only looks: it reads and answers, and changes nothing. Every answer of such a node says so.
     pub(crate) only_looks: bool,
+    /// Where the line for an answer of "internal" goes: the process's standard error, unless a test collects it.
+    pub(crate) log: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 /// Answers one GET route with a body. The server runs it on a blocking thread, after the bearer check.
@@ -122,7 +124,16 @@ impl Server {
             handlers: HashMap::new(),
             gets: Vec::new(),
             only_looks: false,
+            log: Arc::new(|line| eprintln!("{line}")),
         }
+    }
+
+    /// Sends the line the door writes when it answers "internal" to `sink` instead of standard error. The caller of a
+    /// tool is told only "internal: the tool failed"; the line is where the node's own log says which verb failed and
+    /// why. It names the verb and a reason the server wrote, and never an argument of the call.
+    pub fn log_to(mut self, sink: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.log = sink;
+        self
     }
 
     /// Marks the node as one that only looks (or not). Every tool answer of such a node carries one sentence that says

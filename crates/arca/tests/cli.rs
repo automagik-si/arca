@@ -1378,7 +1378,7 @@ fn a_default_config_that_is_not_there_says_where_it_was_looked_for_and_what_to_d
     assert_eq!(
         stderr_text(&out).trim_end(),
         format!(
-            "arca: there is no config at {}/.config/arca/node.json, where the installer writes it: install Arca for this user, or name another config with --config <file> or ARCA_CONFIG",
+            "arca: there is no config at {}/.config/arca/node.json, where the installer writes it: install Arca for this user, or name another config with --config CONFIG_FILE (its path in place of CONFIG_FILE) or ARCA_CONFIG",
             home.display()
         )
     );
@@ -1891,7 +1891,7 @@ fn a_token_file_that_is_not_there_says_so_and_how_to_mint_one_the_node_will_read
     assert_eq!(
         stderr_text(&out),
         format!(
-            "arca: the token file {installed}/assistant-1.secret, where the installer writes it, does not exist: mint one with: arca token mint --scope viewer --id <id> --out {installed}/assistant-1.secret --config {installed}/node.json. {reload}\n"
+            "arca: the token file {installed}/assistant-1.secret, where the installer writes it, does not exist: mint one with: arca token mint --scope viewer --id TOKEN_ID --out {installed}/assistant-1.secret --config {installed}/node.json (a name for the token in place of TOKEN_ID). {reload}\n"
         )
     );
     // A path the caller gave, in the flag or in the variable, is never repeated.
@@ -1909,7 +1909,7 @@ fn a_token_file_that_is_not_there_says_so_and_how_to_mint_one_the_node_will_read
         assert_eq!(
             stderr_text(&out),
             format!(
-                "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> --config {installed}/node.json. {reload}\n"
+                "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id TOKEN_ID --out TOKEN_FILE --config {installed}/node.json (a name for the token in place of TOKEN_ID, and the path to write it to in place of TOKEN_FILE). {reload}\n"
             )
         );
     }
@@ -1945,7 +1945,7 @@ fn a_mistyped_verb_is_answered_with_the_closest_one_and_call_alone_lists_them() 
     let listed = stderr_text(&out);
     assert!(
         listed
-            .starts_with("arca: call needs a verb: arca call <verb>. The verbs are: arca_status, "),
+            .starts_with("arca: call needs a verb: arca call VERB, with one of these in place of VERB: arca_status, "),
         "{listed}"
     );
     assert!(listed.contains(", watch_report"), "{listed}");
@@ -2503,7 +2503,7 @@ fn status_says_whether_changes_are_on_which_page_approves_and_what_to_do_next_fr
     let said = stderr_text(&out);
     assert!(
         said.contains(&format!(
-            "ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>"
+            "ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} THIS_MACHINE (this machine's name or address in place of THIS_MACHINE)"
         )),
         "{said}"
     );

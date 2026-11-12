@@ -1,18 +1,20 @@
 //! Running a function: the timer, one run, its limits, the run log and the meter.
 //!
-//! One run is one start of the function's own container. The kernel clears the container's console log, starts it,
-//! and watches it until its program exits or the run passes its time limit, when the kernel stops it (a stop the
+//! One run is one start of the function's own container. The kernel gives the container its image's own root again
+//! (a rebuild from the copy of the image the node already holds, or from the registry when that copy is gone), so no
+//! run finds what an earlier one wrote and none can leave the next something to execute. A root that cannot be put
+//! back is a run that does not start. The kernel then clears the container's console log, starts it, and watches it until its program exits or the run passes its time limit, when the kernel stops it (a stop the
 //! program has a few seconds to obey, then a forced one). What the program wrote is read from the console log; its last
 //! line is its result.
 //!
-//! **What a run writes, and where.** To Incus: the instance's power state and its console log, through
-//! `arca_incus::function_run` and nothing else. To the state directory: one line in the run log
+//! **What a run writes, and where.** To Incus: the instance's root disk (rebuilt), its power state and its console
+//! log, through `arca_incus::function_run` and nothing else. To the state directory: one line in the run log
 //! (`function-runs/runs-<year>-<month>.jsonl`) and the end of the run's output
 //! (`function-runs/output/<function>/<run>.log`). A run writes nothing to the desired state and nothing to the effect
 //! journal: neither is touched, read apart, by anything in this module. Thousands of runs a day leave both as they were.
 //!
 //! **The run log is the meter.** One line for each run, never rewritten: the run's id, its function and digest, what
-//! triggered it, when it started, how long the start took, how long it ran, the CPU time and the memory peak when they
+//! triggered it, when it started, where its root came from and how long that, and the start, took, how long it ran, the CPU time and the memory peak when they
 //! could be read, the memory it was allowed, its outcome and its result line. A month has its own file, and no file
 //! is ever cut, because runs will be billed from them.
 //!
@@ -458,6 +460,9 @@ impl FunctionRunner {
             "kind": "container",
             "trigger": trigger,
             "startedAt": started_ms,
+            "root": measured.root,
+            "rootImage": measured.root_image,
+            "rootMs": measured.root_ms,
             "startMs": measured.start_ms,
             "durationMs": measured.duration_ms,
             "cpuMs": measured.cpu_ms,
@@ -467,7 +472,7 @@ impl FunctionRunner {
             "result": result,
         });
         if let Some(why) = why {
-            line["why"] = json!(crate::service::redact_log(&why, &self.secrets()));
+            line["why"] = json!(why_words(&why, &self.secrets()));
         }
         line
     }
@@ -549,6 +554,40 @@ impl FunctionRunner {
         if !wait.is_zero() {
             std::thread::sleep(wait);
         }
+        // Every run starts from its image's own root, or not at all.
+        let rooting = Instant::now();
+        // The image is the one the definition names: the record's source must be exactly that, and the store's copy
+        // is the one whose fingerprint the record took at create.
+        if crate::function::pinned_source(&config).as_ref() != Some(&config.source) {
+            return not_started(
+                &config,
+                "its record's image is not the one its definition names, so nothing was started"
+                    .to_string(),
+            );
+        }
+        let cancelled = || ticket.cancel.load(Ordering::SeqCst);
+        // A registry that asks for a credential gets this node's, read now and handed to the one call that needs it.
+        let registry = crate::registry::server_of(&function.image)
+            .and_then(|server| crate::registry::credential(&self.cfg, &server));
+        let root = match self.writer.fresh_root(
+            &seen,
+            function.fingerprint.as_deref(),
+            &config.source,
+            registry.as_ref(),
+            &cancelled,
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                return not_started(
+                    &config,
+                    format!(
+                        "its root could not be put back to its image's own, so nothing was started: {}",
+                        incus_words(&error)
+                    ),
+                );
+            }
+        };
+        let root_ms = millis(rooting.elapsed());
         // A run starts with an empty log, or not at all: what is read after it is then this run's output alone.
         let cleared = self
             .writer
@@ -596,6 +635,12 @@ impl FunctionRunner {
         }
         let mut measured = Measured {
             start_ms: Some(millis(begun.elapsed())),
+            root: Some(root.as_str()),
+            // A new root and one rebuilt from the store's copy are both of the image the function's record took.
+            root_image: (root != arca_incus::function_run::FreshRoot::Registry)
+                .then(|| function.fingerprint.clone())
+                .flatten(),
+            root_ms: Some(root_ms),
             ..Measured::default()
         };
         let running = Instant::now();
@@ -739,6 +784,11 @@ enum Ended {
 /// What the meter read of one run. Each is `None` when it was not read.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Measured {
+    /// Where the image the root was rebuilt from came from, and how long the rebuild took.
+    root: Option<&'static str>,
+    /// The fingerprint of the store's copy the root was rebuilt from, when it was the store's.
+    root_image: Option<String>,
+    root_ms: Option<u64>,
     start_ms: Option<u64>,
     duration_ms: Option<u64>,
     cpu_ms: Option<u64>,
@@ -776,10 +826,22 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// An Incus error in words a run log may hold: never a body, and at most a short reason.
+/// An Incus error in words: never a body. It is not cut here: [`why_words`] takes the secrets out of the whole
+/// text first, and cuts after.
 fn incus_words(error: &IncusError) -> String {
-    let text = error.to_string();
-    text.chars().take(240).collect()
+    error.to_string()
+}
+
+/// The longest `why` a run's line holds.
+const WHY_MAX: usize = 400;
+
+/// The `why` of a run's line: every secret taken out of the whole text, and only then the cut. Cut first, a secret
+/// that straddles the cut would leave its beginning behind, which no longer matches the secret.
+fn why_words(why: &str, secrets: &[String]) -> String {
+    crate::service::redact_log(why, secrets)
+        .chars()
+        .take(WHY_MAX)
+        .collect()
 }
 
 /// The function records among `entries`.
@@ -798,6 +860,7 @@ pub fn function_entries(entries: &[Entry]) -> Vec<(Entry, ServiceConfig)> {
 /// taken out, and only its end when it is long.
 pub fn clean_output(output: &str, secrets: &[String]) -> String {
     let patterns = secret_patterns(secrets);
+    let hidden = crate::service::values_to_hide(secrets);
     let redact = |text: &str| -> String {
         let mut out = text.to_string();
         for pattern in &patterns {
@@ -805,8 +868,10 @@ pub fn clean_output(output: &str, secrets: &[String]) -> String {
                 .replace_all(&out, regex::NoExpand("[secret]"))
                 .into_owned();
         }
-        crate::service::redact_log(&out, secrets)
+        crate::service::redact_hidden(&out, &hidden)
     };
+    // A PEM block is hidden whole before the output is cut into lines: cut first, its lines are no longer one block.
+    let output = crate::service::redact_blocks(output);
     let mut lines = Vec::new();
     for line in output.split(['\n', '\r']) {
         if line.trim().is_empty() {
@@ -1064,6 +1129,21 @@ fn tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secret_that_straddles_the_cut_of_a_runs_why_leaves_nothing_behind() {
+        let secret = ["a", "registry", "word", "0123456789"].join("-");
+        // The secret begins ten characters before the cut and ends after it.
+        let why = format!("{}{secret} and what follows", "x".repeat(WHY_MAX - 10));
+        let said = why_words(&why, std::slice::from_ref(&secret));
+        assert!(said.chars().count() <= WHY_MAX);
+        assert!(!said.contains(&secret[..10]), "{said}");
+        // Nothing to take out: the text is cut and nothing else.
+        assert_eq!(
+            why_words(&"y".repeat(WHY_MAX + 50), &[]),
+            "y".repeat(WHY_MAX)
+        );
+    }
 
     #[test]
     fn a_result_is_the_last_line_when_it_is_a_json_object_with_ok() {

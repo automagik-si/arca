@@ -250,20 +250,27 @@ fn check_bounds(map: &Map<String, Value>, value: &Value, at: &str) -> Result<(),
     Ok(())
 }
 
+/// A text outside its schema's length. The words name the limit, so a caller who chose the text knows by how much to
+/// change it without reading the schema; they never name the text or its own length.
 fn check_length(map: &Map<String, Value>, chars: usize, at: &str) -> Result<(), String> {
-    if map
-        .get("minLength")
-        .and_then(Value::as_u64)
-        .is_some_and(|min| (chars as u64) < min)
+    let count = |n: u64| if n == 1 { "character" } else { "characters" };
+    if let Some(min) = map.get("minLength").and_then(Value::as_u64)
+        && (chars as u64) < min
     {
-        return Err(format!("{}: shorter than the minimum length", here(at)));
+        return Err(format!(
+            "{}: shorter than the minimum length of {min} {}",
+            here(at),
+            count(min)
+        ));
     }
-    if map
-        .get("maxLength")
-        .and_then(Value::as_u64)
-        .is_some_and(|max| (chars as u64) > max)
+    if let Some(max) = map.get("maxLength").and_then(Value::as_u64)
+        && (chars as u64) > max
     {
-        return Err(format!("{}: longer than the maximum length", here(at)));
+        return Err(format!(
+            "{}: longer than the maximum length of {max} {}",
+            here(at),
+            count(max)
+        ));
     }
     Ok(())
 }

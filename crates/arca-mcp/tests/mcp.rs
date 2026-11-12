@@ -137,6 +137,8 @@ struct Fixture {
     doctor: String,
     operator: String,
     writes: Arc<Mutex<Vec<String>>>,
+    /// The lines the door wrote for its answers of "internal".
+    internal: Arc<Mutex<Vec<String>>>,
 }
 
 impl Fixture {
@@ -150,7 +152,12 @@ impl Fixture {
         let operator = mint_into(scratch.path(), "o-operator", Scope::Operator);
         let tokens = TokenStore::load(scratch.path()).expect("the store loads");
         let writes = Arc::new(Mutex::new(Vec::new()));
+        let internal = Arc::new(Mutex::new(Vec::new()));
+        let lines = internal.clone();
         let server = Server::new(table(), tokens)
+            .log_to(Arc::new(move |line| {
+                lines.lock().expect("the lines").push(line.to_string())
+            }))
             .handle("arca_status", Arc::new(Canned(status_result())))
             .handle(
                 "token_list",
@@ -179,6 +186,7 @@ impl Fixture {
             doctor,
             operator,
             writes,
+            internal,
         }
     }
 
@@ -455,7 +463,8 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "tenant_status",
             "tenant_usage",
             "function_list",
-            "function_runs"
+            "function_runs",
+            "registry_list"
         ]
     );
 }
@@ -860,6 +869,65 @@ fn a_handler_internal_failure_is_an_is_error_tool_result() {
         !reply.body.contains("must not leave"),
         "the detail is not echoed"
     );
+}
+
+#[test]
+fn each_answer_of_internal_writes_one_line_that_names_the_verb_and_the_reason_and_no_argument() {
+    let fx = Fixture::start("internal-line");
+    let lines = |fx: &Fixture| fx.internal.lock().expect("the lines").clone();
+    // A call that is answered, and one that is refused in words, write nothing.
+    fx.tool_call(&fx.doctor, "write_probe", json!({ "name": "fine" }));
+    fx.tool_call(&fx.doctor, "write_probe", json!({ "name": "replayed" }));
+    assert_eq!(lines(&fx), Vec::<String>::new());
+
+    // The handler's own internal reason, a handler that panics, and an answer that breaks the verb's result schema.
+    for (verb, argument, why) in [
+        (
+            "write_probe",
+            "boom",
+            "a detail that must not leave the server",
+        ),
+        ("write_probe", "panic", "its handler panicked"),
+        (
+            "watch_report",
+            "",
+            "its answer does not fit the verb's result schema (",
+        ),
+    ] {
+        let before = lines(&fx).len();
+        let arguments = if argument.is_empty() {
+            json!({})
+        } else {
+            json!({ "name": argument })
+        };
+        let reply = fx.tool_call(&fx.operator, verb, arguments);
+        assert_eq!(
+            reply.json()["result"]["content"][0]["text"],
+            "internal: the tool failed",
+            "{verb} {argument}"
+        );
+        // The caller is told nothing more than before.
+        assert!(
+            !reply.body.contains(why),
+            "{verb} {argument}: {}",
+            reply.body
+        );
+        let written = lines(&fx);
+        assert_eq!(written.len(), before + 1, "{verb} {argument}: one line");
+        let line = &written[before];
+        assert!(
+            line.starts_with(&format!(
+                "arca: {verb} was answered \"internal: the tool failed\": {why}"
+            )),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "one line: {line:?}");
+        // No argument of the call is in the line: the probe's argument is its only one.
+        if !argument.is_empty() {
+            assert!(!line.contains(&format!("\"{argument}\"")), "{line}");
+            assert!(!line.contains("name"), "{line}");
+        }
+    }
 }
 
 #[test]

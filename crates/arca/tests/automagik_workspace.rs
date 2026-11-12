@@ -140,6 +140,8 @@ fn settings_with_access(public_url: &str) -> Value {
 struct Workspace {
     dir: PathBuf,
     child: Option<Child>,
+    /// Seconds between two looks of the keeper, as the script's `WS_TICK` takes them.
+    tick: &'static str,
 }
 
 impl Workspace {
@@ -155,7 +157,11 @@ impl Workspace {
             fs::create_dir_all(dir.join(sub)).expect("scratch");
         }
         fs::write(dir.join("etc/settings.json"), settings.to_string()).expect("settings");
-        let workspace = Workspace { dir, child: None };
+        let workspace = Workspace {
+            dir,
+            child: None,
+            tick: "0.1",
+        };
         fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/automagik_workspace/fake-docker.sh"),
             workspace.dir.join("bin/docker"),
@@ -227,7 +233,7 @@ impl Workspace {
             .env("WS_TUNNEL_OWNER", &me)
             .env("WS_TAILNET_OWNER", &me)
             .env("WS_TAILNET_STATE", self.dir.join("tailnet"))
-            .env("WS_TICK", "0.1")
+            .env("WS_TICK", self.tick)
             .env("WS_STATUS_EVERY", "1")
             .env("WS_REFUSE_EVERY", "1")
             .env("WS_BACKOFF_MAX", "1")
@@ -249,7 +255,10 @@ impl Workspace {
         self.child = Some(child);
     }
 
-    /// Stops the keeper as systemd does, with SIGTERM, and returns its exit code.
+    /// Stops the keeper with one SIGTERM to the keeper alone, and returns its exit code. systemd signals every
+    /// process of the service at once; the keeper must stop on its own signal without that help. What the keeper
+    /// leaves running (a pause, a call to docker it had not finished) is ended once it is gone, as systemd ends what
+    /// is left of a service, so that nothing writes into this scratch machine after the stop.
     fn stop(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
         let status = Command::new("kill")
@@ -258,18 +267,25 @@ impl Workspace {
             .status()
             .expect("kill");
         assert!(status.success());
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
+        let waited = Duration::from_secs(20);
+        let deadline = Instant::now() + waited;
+        let code = loop {
             if let Some(status) = child.try_wait().expect("the keeper's status") {
-                return status.code();
+                break status.code();
             }
-            assert!(
-                Instant::now() < deadline,
-                "the keeper did not stop:\n{}",
-                self.output()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+            if Instant::now() >= deadline {
+                // The keeper is taken back so that the drop ends it and its group.
+                self.child = Some(child);
+                panic!(
+                    "the keeper was sent one SIGTERM and was still running {waited:?} later, under {}. It said:\n{}",
+                    bash_version(),
+                    self.output()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        end_group(child.id());
+        code
     }
 
     fn read(&self, file: &str) -> String {
@@ -331,14 +347,35 @@ impl Workspace {
 impl Drop for Workspace {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{}", child.id()))
-                .output();
+            end_group(child.id());
+            let _ = child.kill();
             let _ = child.wait();
         }
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Ends every process of a process group. bash's own `kill` does it and not the `kill` program, which is not to be
+/// trusted with a negative number after a signal option: `signal` in gitlab_runner_pool.rs says what procps-ng does
+/// with one up to 4.0.4, and the 4.0.4 this was written beside reported success for a group that was not there.
+fn end_group(group: u32) {
+    let _ = Command::new(which("bash"))
+        .arg("-c")
+        .arg(format!("kill -KILL -- -{group}"))
+        .output();
+}
+
+/// The bash that runs the keeper in these tests, as it names itself.
+fn bash_version() -> String {
+    let output = Command::new(which("bash"))
+        .arg("--version")
+        .output()
+        .expect("bash");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("a bash that does not say its version")
+        .to_string()
 }
 
 fn wait_for(workspace: &Workspace, what: &str, mut ready: impl FnMut() -> bool) {
@@ -654,6 +691,386 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
             .join("docker/containers/automagik-server/running")
             .exists()
     );
+}
+
+/// One SIGTERM stops the keeper, at whatever moment it comes.
+///
+/// bash 5.2 can lose a signal that a trap with a command in it was to take. When the signal comes while bash is
+/// between two commands and the next thing it does is look for the end of a `$( )` in a word, bash runs the trap
+/// there and reads the trap's own text as if it stood inside that `$( )`: "unexpected EOF while looking for matching
+/// `)'". The trap's command is not run. A keeper whose trap set a flag for its loop to read then ran on as if nothing
+/// had been sent, or ended at once without its last line, or was aborted by bash. bash 5.3 does not do this.
+///
+/// So this test can fail only where the keeper runs under a bash that has the fault, and it says on standard error
+/// which bash ran it. Each stop is one chance: the keeper is stopped many times, at moments spread over its look, with
+/// next to no pause between two looks so that the signal seldom finds it at rest.
+#[test]
+fn one_sigterm_stops_the_keeper_at_whatever_moment_it_comes() {
+    const STOPS: u32 = 40;
+    let bash = bash_version();
+    // Written past the test harness's capture, so that a run that passes still says which bash it was.
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "one_sigterm_stops_the_keeper_at_whatever_moment_it_comes: the keeper runs under {bash}"
+        );
+    }
+    let mut workspace = Workspace::new(&settings_with_access(URL));
+    workspace.tick = "0.01";
+    workspace.secret(TOKEN);
+    for stop in 0..STOPS {
+        workspace.start();
+        says(&workspace, "status: the server is healthy");
+        // A different moment of the look each time.
+        std::thread::sleep(Duration::from_millis(u64::from(stop * 7 % 60)));
+        let code = workspace.stop();
+        let output = workspace.output();
+        assert_eq!(
+            code,
+            Some(0),
+            "stop {stop} of {STOPS}, under {bash}: the keeper did not end with code 0. It said:\n{output}"
+        );
+        assert!(
+            output.ends_with(
+                "the keeper stops; the three containers run on until the machine stops them\n"
+            ),
+            "stop {stop} of {STOPS}, under {bash}: the keeper ended without its last line. It said:\n{output}"
+        );
+        assert!(
+            !output.contains("unexpected EOF"),
+            "stop {stop} of {STOPS}, under {bash}: bash could not read the keeper's trap. It said:\n{output}"
+        );
+    }
+}
+
+/// The processes whose parent is `parent`, as /proc lists them now.
+fn children_of(parent: u32) -> Vec<u32> {
+    let parent = parent.to_string();
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            // "pid (name) state parent ...": the name may hold anything, so the fields are read from its end.
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let (_, rest) = stat.rsplit_once(") ")?;
+            (rest.split(' ').nth(1) == Some(parent.as_str()))
+                .then(|| entry.file_name().to_string_lossy().parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// A stop that reaches the keeper's child before the keeper is still a stop.
+///
+/// The keeper's service has no KillMode of its own, so systemd sends SIGTERM to every process of it, in no order it
+/// promises. When the child is ended first, the keeper finds it gone before its own signal has come. It then says its
+/// last line and ends with code 0, as for its own signal: ending with the child's code (143) would have systemd
+/// record a stop that was asked for as a failure.
+#[test]
+fn a_stop_that_reaches_the_keepers_child_first_is_still_a_stop() {
+    let mut workspace = Workspace::new(&settings_with_access(URL));
+    workspace.secret(TOKEN);
+    // The keeper's own signal follows at once, a moment later, and long after the keeper has ended by itself.
+    for gap in [0, 2, 10, 300] {
+        workspace.start();
+        says(&workspace, "status: the server is healthy");
+        let keeper = workspace.child.as_ref().expect("the keeper").id();
+        let children = children_of(keeper);
+        assert_eq!(
+            children.len(),
+            1,
+            "the keeper has one child, the keeping: {children:?}"
+        );
+        let sent = Command::new(which("bash"))
+            .arg("-c")
+            .arg(format!("kill -TERM {}", children[0]))
+            .status()
+            .expect("bash");
+        assert!(sent.success(), "the keeper's child was sent SIGTERM");
+        std::thread::sleep(Duration::from_millis(gap));
+        let code = workspace.stop();
+        let output = workspace.output();
+        assert_eq!(
+            code,
+            Some(0),
+            "the child was signalled {gap} ms before the keeper, which said:\n{output}"
+        );
+        assert!(
+            output.ends_with(
+                "the keeper stops; the three containers run on until the machine stops them\n"
+            ),
+            "the child was signalled {gap} ms before the keeper, which said:\n{output}"
+        );
+    }
+}
+
+/// The functions of a shell script that is written as the shipped ones are: `name() {` on a line of its own, down to
+/// the `}` in the first column, or the whole function on one line. Each with its lines, in order.
+fn shell_functions(text: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut functions = std::collections::BTreeMap::new();
+    let mut open: Option<(String, Vec<String>)> = None;
+    for line in text.lines() {
+        if let Some((_, lines)) = open.as_mut() {
+            if line == "}" {
+                let (name, lines) = open.take().expect("an open function");
+                functions.insert(name, lines);
+            } else {
+                lines.push(line.to_string());
+            }
+            continue;
+        }
+        let Some((name, rest)) = line.split_once("() {") else {
+            continue;
+        };
+        let named = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !named {
+            continue;
+        }
+        if rest.is_empty() {
+            open = Some((name.to_string(), Vec::new()));
+        } else {
+            functions.insert(name.to_string(), vec![rest.to_string()]);
+        }
+    }
+    functions
+}
+
+/// The lines of a piece of shell with what bash does not expand taken out: the text between single quotes, also when
+/// it runs over several lines, and comments. What stands between double quotes stays, since bash expands it.
+fn expanded_text(lines: &[String]) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum In {
+        Plain,
+        Single,
+        Double,
+    }
+    let mut state = In::Plain;
+    let mut out = Vec::new();
+    for line in lines {
+        let mut kept = String::new();
+        let mut chars = line.chars();
+        let mut before = ' ';
+        while let Some(c) = chars.next() {
+            match state {
+                In::Single => {
+                    if c == '\'' {
+                        state = In::Plain;
+                    }
+                }
+                In::Double => {
+                    kept.push(c);
+                    if c == '\\' {
+                        kept.extend(chars.next());
+                    } else if c == '"' {
+                        state = In::Plain;
+                    }
+                }
+                In::Plain => {
+                    if c == '#' && before.is_whitespace() {
+                        break;
+                    }
+                    match c {
+                        '\'' => state = In::Single,
+                        '"' => {
+                            kept.push(c);
+                            state = In::Double;
+                        }
+                        '\\' => {
+                            kept.push(c);
+                            kept.extend(chars.next());
+                        }
+                        _ => kept.push(c),
+                    }
+                }
+            }
+            before = c;
+        }
+        out.push(kept);
+    }
+    out
+}
+
+/// Whether a line of shell, as [`expanded_text`] leaves it, runs a command substitution or a process substitution.
+/// Arithmetic alone does not.
+fn substitutes(code: &str) -> bool {
+    code.replace("$((", "").contains("$(")
+        || code.contains('`')
+        || code.contains("<(")
+        || code.contains(">(")
+}
+
+/// The command of a trap that runs one when a signal comes, or nothing for a line that sets no such trap. A trap on
+/// EXIT alone is not one: it is run as the shell ends. Neither is one that ignores a signal or puts its trap down:
+/// there is no text to read.
+fn trap_command(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("trap ")?;
+    let (command, signals) = match rest.strip_prefix('\'') {
+        Some(quoted) => quoted.split_once('\'').unwrap_or((quoted, "")),
+        None => rest.split_once(' ').unwrap_or((rest, "")),
+    };
+    (!command.is_empty()
+        && command != "-"
+        && signals.split_whitespace().any(|signal| signal != "EXIT"))
+    .then_some(command)
+}
+
+/// Why a script's traps are not safe from the fault of bash 5.2 that
+/// `one_sigterm_stops_the_keeper_at_whatever_moment_it_comes` describes, one sentence for each place; empty when they
+/// are. The rule: a trap that runs a command for a signal is set inside a function, its command runs no substitution,
+/// and from that line to the function's end neither the function nor any function it calls runs one. A function it
+/// starts as a child (`name &`) is another process, which the rule does not reach: it must set no such trap of its
+/// own, and then it has none, because a child puts down the traps it was born with.
+///
+/// It reads the scripts as text, the way the shipped ones are written, and it can be fooled. It does not see:
+/// - a function written `function name {`, or one whose closing `}` is not in the first column;
+/// - a trap set in the middle of a line (`condition && trap ...`);
+/// - what runs after the function that set the trap has returned to its caller, or in a loop that goes back above
+///   the trap's line;
+/// - what `source` and `eval` run, and a function called through a variable;
+/// - a here-document, which it reads as ordinary lines, and `$'...'`, which it reads as plain single quotes.
+fn unsafe_traps(file: &str, text: &str) -> Vec<String> {
+    let functions = shell_functions(text);
+    let mut found = Vec::new();
+    let inside: Vec<&String> = functions.values().flatten().collect();
+    for line in text.lines() {
+        if trap_command(line).is_some() && !inside.contains(&&line.to_string()) {
+            found.push(format!(
+                "{file}: `{}` is set outside every function",
+                line.trim()
+            ));
+        }
+    }
+    for (name, lines) in &functions {
+        for (at, line) in lines.iter().enumerate() {
+            let Some(command) = trap_command(line) else {
+                continue;
+            };
+            if substitutes(command) {
+                found.push(format!(
+                    "{file}: {name} sets `{}`, whose own command runs a substitution",
+                    line.trim()
+                ));
+            }
+            // The function's own lines after the trap, then every function those lines call, and theirs.
+            let mut read = vec![name.clone()];
+            let mut waiting: Vec<(String, Vec<String>)> =
+                vec![(name.clone(), lines[at + 1..].to_vec())];
+            while let Some((from, body)) = waiting.pop() {
+                for (code, written) in expanded_text(&body).iter().zip(&body) {
+                    if substitutes(code) {
+                        found.push(format!(
+                            "{file}: {name} sets `{}` and then, in {from}, runs `{}`",
+                            line.trim(),
+                            written.trim()
+                        ));
+                    }
+                    // `name &` starts a child, which is another process. `name &&` does not.
+                    let ends = code.trim_end();
+                    if ends.ends_with('&') && !ends.ends_with("&&") {
+                        continue;
+                    }
+                    for word in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                        if let Some(called) = functions.get(word)
+                            && !read.contains(&word.to_string())
+                        {
+                            read.push(word.to_string());
+                            waiting.push((word.to_string(), called.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// No script a template ships takes a signal in a process that runs a substitution.
+///
+/// This is the same fault as in `one_sigterm_stops_the_keeper_at_whatever_moment_it_comes`, read from the scripts
+/// instead of waited for: that test fails only under a bash that has the fault and only when a signal lands in a gap
+/// a few instructions wide, and this one fails on any machine as soon as a script is written that way again.
+#[test]
+fn no_shipped_script_takes_a_signal_in_a_process_that_runs_a_substitution() {
+    // No script is left out now. A name goes here only for a script that is known to have the fault and is being
+    // changed elsewhere; the test fails once such a script no longer has it.
+    const NOT_YET: [&str; 0] = [];
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let mut scripts: Vec<PathBuf> = fs::read_dir(&dir)
+        .expect("the templates")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sh"))
+        .collect();
+    scripts.sort();
+    let names: Vec<String> = scripts
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    for script in [
+        "automagik-workspace.sh",
+        "gitlab-runner-pool.sh",
+        "github-runner-pool.sh",
+    ] {
+        assert!(names.contains(&script.to_string()), "{script} is read");
+    }
+    let mut found = Vec::new();
+    for (path, name) in scripts.iter().zip(&names) {
+        let faults = unsafe_traps(name, &fs::read_to_string(path).expect("the script"));
+        if NOT_YET.contains(&name.as_str()) {
+            // The exception ends with the fault: a script that is listed and no longer has it fails here.
+            assert!(
+                !faults.is_empty(),
+                "{name} is left out of this test as a script that still has the fault, and it has it no more: take \
+                 its name out of NOT_YET"
+            );
+            continue;
+        }
+        found.extend(faults);
+    }
+    for name in NOT_YET {
+        assert!(names.contains(&name.to_string()), "{name} is read");
+    }
+    assert!(
+        found.is_empty(),
+        "bash 5.2 can lose a signal whose trap runs a command, when the process that takes it runs a $( ): the \
+         process that takes the signal must only start a child and wait for it.\n{}",
+        found.join("\n")
+    );
+
+    // The rule finds the fault where it is known to be: a keeper that sets its flag by a trap and then keeps the
+    // workspace itself, and a trap that a function it calls would undo.
+    let keeper = "run() {\n  trap 'STOP=1' TERM INT\n  while [ -z \"$STOP\" ]; do\n    state=$(look)\n  done\n}\n";
+    assert_eq!(unsafe_traps("keeper.sh", keeper).len(), 1);
+    let called =
+        "now() { date +%s; }\nlook() {\n  at=$(now)\n}\nrun() {\n  trap 'STOP=1' TERM\n  look\n}\n";
+    assert_eq!(unsafe_traps("called.sh", called).len(), 1);
+    let outside = "trap 'exit 143' TERM\nx=$(date)\n";
+    assert_eq!(unsafe_traps("outside.sh", outside).len(), 1);
+    // A function called on a line that ends `&&` is followed, and a trap whose own command substitutes is found.
+    let and_then =
+        "look() {\n  at=$(date)\n}\nrun() {\n  trap 'STOP=1' TERM\n  look &&\n    true\n}\n";
+    assert_eq!(unsafe_traps("and.sh", and_then).len(), 1);
+    let in_trap = "run() {\n  trap 'AT=$(date)' TERM\n  wait\n}\n";
+    assert_eq!(unsafe_traps("in-trap.sh", in_trap).len(), 1);
+    // What bash does not expand is no substitution: single quotes, on one line or over several, and a comment after
+    // a command. What stands between double quotes is one.
+    let quoted = "run() {\n  trap 'STOP=1' TERM\n  jq '.a | $(b)' file # not $(this) either\n  awk '\n    { print $(NF) }\n  ' file\n  wait # `no`\n}\n";
+    assert_eq!(unsafe_traps("quoted.sh", quoted), Vec::<String>::new());
+    let double = "run() {\n  trap 'STOP=1' TERM\n  say \"it's $(date)\"\n}\n";
+    assert_eq!(unsafe_traps("double.sh", double).len(), 1);
+    // And it lets pass what is safe: a child started with `&`, arithmetic, an EXIT trap, a trap put down.
+    let safe = "keep() {\n  trap - TERM\n  state=$(look)\n}\nrun() {\n  name=$(hostname)\n  trap 'STOP=1' TERM\n  keep &\n  n=$((n + 1))\n  wait \"$!\"\n}\ntrap cleanup EXIT\n";
+    assert_eq!(unsafe_traps("safe.sh", safe), Vec::<String>::new());
 }
 
 #[test]

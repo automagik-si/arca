@@ -25,9 +25,12 @@ its renderer, polling and styles.
 
 ## Install
 
-Use Node **24.9.0 or newer** and **`@deepseek-ai/dsh@0.2.2-rc.1`**. npm's `latest`
-tag was checked against that exact release on 2026-11-05. Install the package at
-an exact full commit containing this directory:
+Use Node **24.9.0 or newer** and **`@deepseek-ai/dsh@0.2.2-rc.1`** or **`0.2.2-rc.2`**:
+the package was checked against those two exact releases (npm's `latest` and `next`
+tags on 2026-11-12). DSH leaves out a plugin whose `engines.dsh` range its own version
+does not meet, and counts prereleases when it compares: the range here is
+`>=0.2.2-rc.1 <0.3.0-0`, which takes every 0.2.2 release from rc.1 on and no 0.3.0
+prerelease. Install the package at an exact full commit containing this directory:
 
 ```sh
 dsh plugin --profile <profile> add -w "github:automagik-si/arca#<commit>&path:/packages/arca-canvas-dsh"
@@ -324,7 +327,7 @@ the plain reason "this machine is not linked for approvals yet"; a page host
 whose status cannot be read links nothing. The proposal is recorded by the
 target host's own kernel, which later verifies the owner's passkey itself. The tools are
 registered globally with a per-session `when` condition, the Doctor's scope is
-restricted with `restrict({ allow: DOCTOR_TOOLS })` (the eight reads plus
+restricted with `restrict({ allow: DOCTOR_TOOLS })` (the ten reads plus
 `arca_propose`), and scoped `tools/pre-execute` and `tools.guard` checks deny every
 other name (including the reserved `run_code`) at dispatch. A setup that cannot
 install the restriction and guard, or enumerate its tools, fails after the
@@ -493,7 +496,7 @@ SSE events, in order. Every `data` is one JSON object.
 | --- | --- | --- |
 | `start` | `{ "session": "Doctor", "sessionId"?: "<dsh-session-id>" }` | Always first, sent before agent or model work so the kernel's idle timer never starts on a silent socket. `sessionId` is present when a persisted session is already known. |
 | `text` | `{ "text": "<delta>" }` | One assistant text delta; concatenate in arrival order. |
-| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"?, "proposal"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the eight reads or `arca_propose`. `proposal` is `{ "id": "act-<12 hex>" }` when the kernel accepted an action proposal. |
+| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"?, "proposal"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the ten reads or `arca_propose`. `proposal` is `{ "id": "act-<12 hex>" }` when the kernel accepted an action proposal. |
 | `usage` | `{ "turnToolCalls", "turnOutputTokens", "dailyTokens", "dailyBudget", "day" }` | Token accounting from the model's own usage; `dailyTokens` counts input plus output for the UTC day. |
 | `budget` | `{ "scope": "daily", "used", "budget", "message" }` | Daily budget reached; the message is `Daily budget reached, try tomorrow.`. The turn then ends. |
 | `cap` | `{ "reason", "limit", "message" }` | Per-turn cap reached: `reason` is `tool-calls` (40) or `output-tokens` (64000). |
@@ -554,6 +557,20 @@ npx -y node@24.11.0 --test
 npx -y node@24.11.0 build.mjs
 git diff --exit-code -- client.js page.js page.css
 ```
+
+One test runs against a real DSH and is skipped unless it is given one:
+
+```sh
+ARCA_REAL_DSH_PROOF=/path/to/dsh npx -y node@24.11.0 --test test/real-host.test.js
+```
+
+`pnpm` must be beside that `dsh` or on `PATH`. The test installs this package's
+shipped files into a profile in a temporary home, starts the harness on a free
+loopback port, and fetches the canvas page, its snapshot and its chat history.
+It fails when the harness leaves the plugin out, as it does for a version the
+`engines.dsh` range refuses. The harness gets none of the caller's environment,
+and no model is asked. Run it against each DSH release before the range is
+changed to let that release in: every other test stands in for the host.
 
 Tests use fixture data, temporary Unix sockets and an ephemeral loopback browser
 server. Playwright 1.64.0 is pinned to the Chromium used by the rendering checks.

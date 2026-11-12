@@ -198,7 +198,9 @@ impl Rig {
                 plugins,
                 verifier,
                 "node1".into(),
-                Some(PG_IMAGE),
+                // As serve does: the image the node's config names, or none. The proposals that wait are checked
+                // against it when the kernel opens.
+                cfg.kernel.postgres_image.as_deref(),
                 move |retained| {
                     Ok(Box::new(
                         IncusProvider::new(socket, family, secrets, retained)
@@ -516,3 +518,9 @@ mod kernel_access;
 mod real_incus;
 #[path = "tenants/refusal_codes.rs"]
 mod refusal_codes;
+#[path = "tenants/refused_at_propose.rs"]
+mod refused_at_propose;
+#[path = "tenants/room_at_propose.rs"]
+mod room_at_propose;
+#[path = "tenants/template_binding.rs"]
+mod template_binding;

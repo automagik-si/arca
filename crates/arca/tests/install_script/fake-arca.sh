@@ -17,6 +17,11 @@
 #   init           `init --enable-changes --yes --config <file>`: it refuses in words while $FAKE_DIR/init-refuses is
 #                  there; otherwise the node's mode becomes kernel, the config gains a key (so it is no longer the
 #                  installer's text) and it prints the first line of the real report. It restarts nothing here.
+#   templates install   the REAL program's own `templates install`, when the test names it in $FAKE_REAL_ARCA: the
+#                  installer runs this on an upgrade, and what it replaces and keeps is the real program's doing.
+#                  Without that variable, or while $FAKE_DIR/program-without-replaced is there, it answers as a
+#                  program from before "replaced" did, with nothing kept. It fails while
+#                  $FAKE_DIR/templates-install-fails is there.
 #   serve          the installer must never start the node in the foreground: recorded, and it fails.
 #
 # The installer runs on a PATH of its own listed programs; the stand-in finds its tools on $FAKE_PATH.
@@ -115,6 +120,14 @@ case "${1-} ${2-}" in
       door='"loopback":{"addr":"127.0.0.1:7471","open":false,"reason":"address in use: another program holds this port"},'
     printf '{"appliedSeq":0,"incusReachable":%s,%s"metricsSource":"incus","metricsSourceReason":null,"mode":"%s","node":"scratch","uptimeS":1,"version":"%s"}\n' \
       "$reach" "$door" "$mode" "$version"
+    ;;
+  "templates install")
+    [ ! -e "$root/templates-install-fails" ] ||
+      fail "a template cannot be put in place (no space left). Already put in place by this run: postgres-autopg.json. The rest are as they were"
+    if [ -n "${FAKE_REAL_ARCA-}" ] && [ ! -e "$root/program-without-replaced" ]; then
+      exec "$FAKE_REAL_ARCA" "$@"
+    fi
+    echo '{"dir":"unused","installed":[],"kept":[],"unchanged":[]}'
     ;;
   "serve "*)
     fail "the installer started the node in the foreground"

@@ -878,38 +878,39 @@ public_state() {
 # ---------------------------------------------------------------------------------------------------------------------
 
 STOP=''
+KEEPING=''
+KEEPER=''
 WORDS=''
 SERVER_STATE=''
 GATE_STATE=''
 TUNNEL_STATE=''
 
-run_workspace() {
+# The keeping itself. It runs as a child of the keeper and takes no signal: the keeper ends it. It tells the keeper,
+# once, that nothing keeps the workspace from starting any more.
+keep_workspace() {
   local missing state last='' said=0
-  : "${WS_NAME:=$(hostname)}"
-  trap 'STOP=1' TERM INT
+  trap - TERM INT USR1
   # Whatever keeps the workspace from starting is said at intervals by a keeper that stays up: one that exits is
   # started again by systemd every few seconds, with a line on the console each time.
   until missing=$(missing_programs) && [ -z "$missing" ]; do
     say "workspace $WS_NAME does not start: these commands are missing on this machine: $missing. The first boot did not finish; /var/log/cloud-init-output.log inside the machine says why"
     nap "$WS_REFUSE_EVERY"
-    [ -z "$STOP" ] || exit 0
   done
   until load_settings; do
     say "workspace $WS_NAME does not start: its settings cannot be used: $REFUSAL. They are fixed when the machine is created: service_remove it and create it again with settings that are right"
     nap "$WS_REFUSE_EVERY"
-    [ -z "$STOP" ] || exit 0
   done
   until mkdir -p "$WS_RUN" && chmod 0700 "$WS_RUN" && data_directories; do
     say "workspace $WS_NAME does not start: $WS_RUN or one of its data directories under ${WS_DATA%/*} could not be made"
     nap "$WS_REFUSE_EVERY"
-    [ -z "$STOP" ] || exit 0
   done
+  kill -USR1 "$$"
   if [ "$REACH" = tailnet ]; then
     say "workspace $WS_NAME: the server and the gate on loopback port $GATE_PORT in one network namespace, and the tailnet node in one of its own, reaching the gate through the relay alone; $(public_state)"
   else
     say "workspace $WS_NAME: the server, the gate on loopback port $GATE_PORT and the tunnel, in one network namespace; $(public_state)"
   fi
-  while [ -z "$STOP" ]; do
+  while :; do
     keep_server
     keep_gate
     keep_relay
@@ -919,8 +920,6 @@ run_workspace() {
     look_at_gate
     look_at_tunnel
     state="$SERVER_STATE; $GATE_STATE; $TUNNEL_STATE; $(public_state)"
-    # A look that the stop interrupted says nothing: its answers were cut short.
-    [ -z "$STOP" ] || break
     if [ "$state" != "$last" ] || [ $(($(now) - said)) -ge "$WS_STATUS_EVERY" ]; then
       say "status: $state"
       last=$state
@@ -928,7 +927,49 @@ run_workspace() {
     fi
     nap "$WS_TICK"
   done
-  say "the keeper stops; the three containers run on until the machine stops them"
+}
+
+# The keeper: the process systemd stops. From the line that sets its traps on it runs NO command substitution, and
+# that is the whole reason the keeping is a child of it. bash 5.2 runs a trap that is waiting while it looks for the
+# end of a $( ) in a word, and reads the trap's own text as if it stood inside that $( ): the text does not parse,
+# nothing is run and the signal is gone. A keeper that kept the workspace itself, with a trap that set a flag, lost
+# one stop in several that way and ran on until systemd killed it. So this process only waits. A stop ends the child
+# at once, wherever it is: a look that the stop interrupted says nothing, and a container being started is Docker's
+# to finish. The child has no trap, so it has no text to lose.
+run_workspace() {
+  local ended again
+  : "${WS_NAME:=$(hostname)}"
+  trap 'STOP=1; [ -z "$KEEPER" ] || kill "$KEEPER" 2>/dev/null' TERM INT
+  trap 'KEEPING=1' USR1
+  keep_workspace &
+  KEEPER=$!
+  while [ -z "$STOP" ]; do
+    wait "$KEEPER"
+    ended=$?
+    # wait also returns when a trap ran. Only a child that is gone ends the keeper, with the child's own code, as a
+    # keeper that kept the workspace itself would have ended. A wait that a trap cut short just as the child ended
+    # is asked again for that code.
+    if [ -z "$STOP" ] && ! kill -0 "$KEEPER" 2>/dev/null; then
+      wait "$KEEPER"
+      again=$?
+      [ "$again" = 127 ] || ended=$again
+      # The child has no process number any more: nothing is to be sent to that number from here on.
+      KEEPER=''
+      # A child that a SIGTERM ended (128 + 15) was stopped with the keeper. systemd signals every process of the
+      # service, and it may reach the child before the keeper: that is a stop that was asked for, and the keeper ends
+      # as it does for its own signal. A SIGTERM that reaches the child alone, with no stop asked, is told the same
+      # way, as a stop, and systemd then starts the keeper again.
+      [ "$ended" = 143 ] || exit "$ended"
+      STOP=1
+    fi
+  done
+  # A stop that came before the child had a name, or before the child had put down the traps it was born with, has
+  # not ended it yet.
+  while [ -n "$KEEPER" ] && kill "$KEEPER" 2>/dev/null; do
+    sleep 0.05
+  done
+  # A keeper that was still saying why the workspace does not start stops without a word, as it always has.
+  [ -z "$KEEPING" ] || say "the keeper stops; the three containers run on until the machine stops them"
   exit 0
 }
 

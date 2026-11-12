@@ -1591,6 +1591,9 @@ impl ToolHandler for ActionPropose {
             }
             _ => payload,
         };
+        // What a create's card says of its template beyond the arguments (why it is created stopped, or that a
+        // database's password is generated), read from the very template the proposal's fingerprint is of.
+        let mut card_fact: Option<String> = None;
         let payload = if is_gpu {
             let Some(gpu) = &self.gpu else {
                 return Err(gpu_refusal(GpuRefusal::Disabled));
@@ -1599,11 +1602,16 @@ impl ToolHandler for ActionPropose {
         } else if let Some(storage) = storage {
             crate::storage::enrich(storage, action, &payload, now)?
         } else if let (ActionKind::ServiceCreate, Some(node)) = (action, &self.node) {
+            // The arguments are held to the verb's schema first, so a proposal with a bad name is told about the
+            // name and not about what the node holds. What the node fills in below is checked again after it.
+            action
+                .prepare(&payload, self.postgres_image.as_deref())
+                .map_err(CallError::Invalid)?;
             let entries = lock(&self.kernel)?.entries().to_vec();
-            enrich_service_create(node, &entries, &payload)?
+            enrich_service_create(node, &entries, &payload, &mut card_fact, now)?
         } else if let (ActionKind::PostgresCreate, Some(node)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
-            enrich_postgres_create(node, &entries, &payload)?
+            enrich_postgres_create(node, &entries, &payload, &mut card_fact)?
         } else if action == ActionKind::PostgresCreate
             && self.postgres_image.is_none()
             && payload.get("template").is_some()
@@ -1654,6 +1662,14 @@ impl ToolHandler for ActionPropose {
         } else {
             payload
         };
+        // A create whose image is on a registry this node holds a credential for names that registry, so the card
+        // says where the credential will rest and the approval binds it.
+        let payload = match (action, &self.node) {
+            (ActionKind::ServiceCreate | ActionKind::FunctionCreate, Some(node)) => {
+                function_handlers::with_registry(node, action, payload)?
+            }
+            _ => payload,
+        };
         let payload = action
             .prepare(&payload, self.postgres_image.as_deref())
             .map_err(CallError::Invalid)?;
@@ -1697,16 +1713,10 @@ impl ToolHandler for ActionPropose {
             .card
             .map(|card| card.product),
             // The card of a create says when its template is created stopped whatever the call says, and why.
-            ActionKind::ServiceCreate => self
-                .node
-                .as_deref()
-                .and_then(|node| service_create_stopped_reason(node, &payload)),
             // The card of a database made from the node's template says that the template generates its password
-            // only when it does, and otherwise why the database is created stopped.
-            ActionKind::PostgresCreate => self
-                .node
-                .as_deref()
-                .and_then(|node| database_card_fact(node, &payload)),
+            // only when it does, and otherwise why the database is created stopped. Both were read when the
+            // proposal was given its template's fingerprint, from that one read of the template.
+            ActionKind::ServiceCreate | ActionKind::PostgresCreate => card_fact.take(),
             // The card of a deploy's removal lists the deploy's parts as they stand now.
             ActionKind::DeployRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
@@ -2158,6 +2168,10 @@ fn action_approval_failure(error: ActionApprovalError) -> CallError {
             message: "the action proposal has expired".to_string(),
         },
         ActionApprovalError::Approval(refusal) => refusal_failure(refusal),
+        // Said before the approval is checked: the owner's approval is not spent on it.
+        ActionApprovalError::Unbound(template) => service_refused(format!(
+            "this card was shown before this node bound a create to the content of its template ({template}), so it cannot be approved. Nothing was created and the approval was not used; propose it again"
+        )),
         ActionApprovalError::Store(_) => internal(),
     }
 }
@@ -2210,13 +2224,17 @@ impl ActionExecutor {
         handler.call(
             call,
             &Caller {
-                token_id: "owner-approval".to_string(),
+                token_id: APPROVED_CALLER.to_string(),
                 scope: Scope::Operator,
                 tools: None,
             },
         )
     }
 }
+
+/// The token an approved action's handler is called as: no token a person holds, since no token may be minted
+/// under it.
+const APPROVED_CALLER: &str = arca_mcp::auth::APPROVED_ACTION_ID;
 
 /// The kernel's write gate, shared by the service, database and tenant handlers and by the front pass.
 fn write_gate(kernel: &Mutex<Kernel>) -> Arc<Mutex<()>> {
@@ -3458,14 +3476,44 @@ fn caps_refusal(
     None
 }
 
+/// Why creating `name` from `template` would pass a cap, or `None`: the node's caps on virtual machines first
+/// ([`caps_refusal`]), then the caps of the tenant the create names. `entries` are all the node's records. The
+/// proposal and the create both ask here, so a proposal the node has no room for is refused when it is made, in
+/// the words the create would use, and the create asks again because the node can fill up while a card waits.
+fn create_room_refusal(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+    tenant: Option<&tenants::TenantScope>,
+    name: &str,
+    template: &crate::service::Template,
+) -> Option<CallError> {
+    // A node that sets no caps for virtual machines creates none: both callers refuse that first, in its own words.
+    if template.is_vm()
+        && let Some(caps) = cfg.kernel.vm_caps()
+        && let Some(refusal) = caps_refusal(cfg, caps, entries, tenant.is_none(), name, template)
+    {
+        return Some(refusal);
+    }
+    tenant.and_then(|scope| tenants::service_caps_refusal(scope, entries, name, template))
+}
+
 /// The checks a proposed `service_create` must pass on this node before the owner is asked: the template's kind fits the
 /// node's networks, the config fits the desired state, and a virtual machine's bridge is an allowed one. On a bridged
-/// node an omitted bridge is filled in, so the owner's card names it; a virtual machine for the managed network names none. A template that does not load is left for the create itself to refuse.
+/// node an omitted bridge is filled in, so the owner's card names it; a virtual machine for the managed network names none.
+/// Last, the create must fit under the node's caps and its tenant's ([`create_room_refusal`]).
 fn enrich_service_create(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
     payload: &Value,
+    card_fact: &mut Option<String>,
+    now: u64,
 ) -> Result<Value, CallError> {
+    // First, as in the create: the tenant the proposal names, and what the node's config and records refuse before
+    // any template is read.
+    let tenant = tenants::tenant_arg(cfg, payload, entries)?;
+    if let Some(refusal) = proposed_before_template(cfg, entries, payload, tenant.as_ref()) {
+        return Err(refusal);
+    }
     // A private destination comes from the node's config alone, by the service's name. The proposal names it, so the
     // owner's card says it and the approval binds it; a caller that states anything else is refused now.
     let destinations = destinations_for(
@@ -3504,11 +3552,47 @@ fn enrich_service_create(
         }
         payload
     };
-    let Some(template) = payload["template"].as_str().and_then(|name| {
-        crate::service::load_template(&cfg.state_dir.join("templates"), name).ok()
-    }) else {
+    // A proposal that names no template is refused by its schema; one whose template does not load, or names a
+    // script that cannot be read, is refused now in the words the create would use, so the owner is never shown a
+    // card for it.
+    let Some(template_name) = payload["template"].as_str() else {
         return Ok(payload.clone());
     };
+    let content =
+        crate::service::load_template_content(&cfg.state_dir.join("templates"), template_name)
+            .map_err(service_template_error)?;
+    // What the owner is shown is what is created: the proposal is given the image the template names and the
+    // fingerprint of the template's content as this node holds it now, so the card shows the image and the approval
+    // binds both. A caller that states either is only compared with the node's own.
+    let image = crate::service::template_image(&content.template);
+    let digest = content.bound().map_err(service_template_error)?.to_string();
+    if payload
+        .get("image")
+        .is_some_and(|given| given.as_str() != Some(image.as_str()))
+        || payload
+            .get("templateDigest")
+            .is_some_and(|given| given.as_str() != Some(digest.as_str()))
+    {
+        return Err(template_not_the_one_stated(template_name));
+    }
+    // Why this template is created stopped whatever the call's `start` says, for the card's `Start` row: from the
+    // template this fingerprint is of, and from the secrets stored for the service now.
+    if let Some(name) = payload["name"].as_str() {
+        *card_fact = crate::service::template_stopped_reason(
+            &content.template,
+            &crate::service::entry_id(payload["tenant"].as_str(), name),
+            &cfg.state_dir.join("secrets"),
+        );
+    }
+    let payload = &{
+        let mut payload = payload.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("image".to_string(), json!(image));
+            object.insert("templateDigest".to_string(), json!(digest));
+        }
+        payload
+    };
+    let template = content.template;
     // A create that could never give the kernel access its template declares is refused now, so the owner is never asked
     // to approve it. The proposal then names the access, so the owner's card says it and the approval binds it.
     let stated = kernel_access_for(cfg, &template, payload.get("tenant").is_some(), None)?
@@ -3530,6 +3614,24 @@ fn enrich_service_create(
         }
         crate::service::create_settings(&template, payload.get("settings"))
             .map_err(service_template_error)?;
+        if tenant.is_some() && (template.lan.is_some() || template.publishable) {
+            return Err(service_refused(tenant_host_port(&template.name)));
+        }
+        if let Some(refusal) = create_room_refusal(
+            cfg,
+            entries,
+            tenant.as_ref(),
+            payload["name"].as_str().unwrap_or_default(),
+            &template,
+        ) {
+            return Err(refusal);
+        }
+        // The node's own project and network are written with the first service that needs them: a write the
+        // create would refuse is refused now. Not on a node that only looks, whose proposal is recorded as before.
+        if tenant.is_none() && !node_only_looks(cfg) {
+            ensure_netproject(entries, cfg).map_err(no_service_project)?;
+        }
+        tenants::joinable_deploy(cfg, tenant.as_ref(), payload, APPROVED_CALLER, now)?;
         let mut payload = payload.clone();
         if let (Some(stated), Some(object)) = (stated, payload.as_object_mut()) {
             object.insert("kernelAccess".to_string(), stated);
@@ -3546,7 +3648,16 @@ fn enrich_service_create(
         return Err(service_refused(why));
     }
     let mut payload = payload.clone();
-    match vm_network(cfg, &payload)? {
+    // A tenant's machine joins the managed service network and nothing else.
+    if tenant.is_some() && payload.get("bridge").is_some() {
+        return Err(service_refused(TENANT_BRIDGE));
+    }
+    let network = if tenant.is_some() {
+        VmNetwork::Managed
+    } else {
+        vm_network(cfg, &payload)?
+    };
+    match &network {
         VmNetwork::Managed => {
             if payload.get("mac").is_some() {
                 return Err(service_refused(MANAGED_MAC));
@@ -3562,11 +3673,149 @@ fn enrich_service_create(
                 )));
             }
             if let Some(object) = payload.as_object_mut() {
-                object.insert("bridge".to_string(), Value::String(bridge));
+                object.insert("bridge".to_string(), Value::String(bridge.clone()));
             }
         }
     }
+    // A MAC another of this node's records holds is refused now. Whether an instance Arca holds no record of has
+    // it is read from Incus, and the create asks that.
+    if let Some(mac) = payload
+        .get("mac")
+        .and_then(Value::as_str)
+        .and_then(crate::service::normalize_mac)
+        && record_holds_mac(&tenants::scoped_entries(entries, tenant.as_ref()), &mac)
+    {
+        return Err(service_refused(mac_held(&mac)));
+    }
+    // As in the create: a machine the node has no room for is refused now, so the owner is never asked to
+    // approve it.
+    if let Some(refusal) = create_room_refusal(
+        cfg,
+        entries,
+        tenant.as_ref(),
+        payload["name"].as_str().unwrap_or_default(),
+        &template,
+    ) {
+        return Err(refusal);
+    }
+    // Last, the write of the node's own project that the create would refuse: its entry would carry a count of
+    // virtual machines below what the node holds. Not on a node that only looks, whose proposal is recorded as
+    // before.
+    if tenant.is_none() && !node_only_looks(cfg) {
+        project_changes(
+            entries,
+            cfg,
+            ProjectNeeds {
+                managed: matches!(network, VmNetwork::Managed),
+                vm: true,
+                host_bridge: matches!(network, VmNetwork::Host(_)),
+            },
+        )
+        .map_err(no_service_project)?;
+    }
+    // A deploy the approved create could not add to: one another token opened, or one that is closed. The approved
+    // create runs as the approval's own caller, and the deploy journal says who opened what.
+    tenants::joinable_deploy(cfg, tenant.as_ref(), &payload, APPROVED_CALLER, now)?;
     Ok(payload)
+}
+
+/// What a proposed `service_create` is refused for before its template is read, in the words and the order of the
+/// create: a deploy named outside a tenant, a config that sets up no service project for it, a name a function
+/// holds, and a name a service holds. All of it is read from the node's config and its records. Whether an instance
+/// Arca holds no record of has the name is read from Incus, and the create asks that. On a node that only looks
+/// two things are not asked: its config's service project here, and the write of that project in
+/// [`enrich_service_create`]. Its create answers that the node only looks, so a proposal those two alone would
+/// refuse is recorded there as before. Every other check, here and there, is made on such a node as on any other.
+fn proposed_before_template(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+    payload: &Value,
+    tenant: Option<&tenants::TenantScope>,
+) -> Option<CallError> {
+    if tenant.is_none() && payload.get("deploy").is_some() {
+        return Some(CallError::Invalid(DEPLOY_OUTSIDE_TENANT.into()));
+    }
+    if !node_only_looks(cfg) {
+        let project = if tenant.is_some() {
+            tenants::network(cfg).map(|_| ())
+        } else if no_service_project_asked(cfg) && holds_service_records(entries) {
+            Err(service_records_without_config())
+        } else if cfg.kernel.bridged.is_some() && cfg.kernel.service_cidr.is_none() {
+            bridged_project(cfg)
+        } else {
+            service_project(cfg).map(|_| ())
+        };
+        if let Err(refusal) = project {
+            return Some(refusal);
+        }
+    }
+    if let Some(refusal) = function_handlers::kind_refusal("service_create", payload, entries) {
+        return Some(refusal);
+    }
+    let name = payload["name"].as_str()?;
+    let tenant_id = tenant.map(|scope| scope.id.as_str());
+    let id = crate::service::entry_id(tenant_id, name);
+    if entries
+        .iter()
+        .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
+    {
+        return Some(service_exists(name));
+    }
+    instance_name_taken(entries, tenant_id, name).then(|| name_taken("service", name))
+}
+
+/// Whether another service record on the node, of the node's own or of any tenant, already has the instance name a
+/// create of `name` in `tenant` would take. A tenant's instance is `<name>-<tenant id>` and the node's own is its
+/// name alone, so the node's service `x-<id>` and tenant `<id>`'s service `x` are one instance name; Incus takes a
+/// name once on the service bridge, whatever the project. `entries` are all the node's records.
+pub(super) fn instance_name_taken(
+    entries: &[arca_kernel::desired::Entry],
+    tenant: Option<&str>,
+    name: &str,
+) -> bool {
+    let id = crate::service::entry_id(tenant, name);
+    let instance = crate::service::instance_name(tenant, name);
+    service_entries(entries)
+        .iter()
+        .any(|(entry, other)| entry.id.0 != id && other.instance == instance)
+}
+
+/// The refusal of a create whose instance name another service on the node has. `what` is what is being created:
+/// a service, a function or a database. It says nothing of the service that has the name: it may be another side's.
+pub(super) fn name_taken(what: &str, name: &str) -> CallError {
+    service_refused(format!(
+        "the name {name} is taken on this node: the instance this {what} would get has the name of another service's instance. Choose another name"
+    ))
+}
+
+/// The refusal of a create whose name a service already holds.
+fn service_exists(name: &str) -> CallError {
+    service_refused(format!("service {name} exists"))
+}
+
+/// Why a create outside a tenant that names a deploy is not made.
+const DEPLOY_OUTSIDE_TENANT: &str = "deploy: only a call inside a tenant names a deploy";
+
+/// Why a tenant's virtual machine that names a host bridge is not made.
+const TENANT_BRIDGE: &str = "bridge: a virtual machine in a tenant joins the managed service network only, never a host bridge";
+
+/// Why a tenant's service is not made from a template that opens a port on the host or publishes.
+fn tenant_host_port(template: &str) -> String {
+    format!(
+        "template {template} opens a port on the host or publishes a dash, and nothing in a tenant does: a tenant's service is reached through the node's front service"
+    )
+}
+
+/// Whether one of `entries`, the records on the call's own side, is a virtual machine that holds `mac`.
+fn record_holds_mac(entries: &[arca_kernel::desired::Entry], mac: &str) -> bool {
+    service_entries(entries)
+        .iter()
+        .any(|(_, other)| other.vm.as_ref().and_then(|vm| vm.mac.as_deref()) == Some(mac))
+}
+
+/// Why a create that states a MAC something else holds is not made.
+fn mac_held(mac: &str) -> String {
+    format!("the MAC {mac} is already held by another instance")
 }
 
 /// What a `service_create` call brings to a template that declares kernel access: what it stated as `kernelAccess`, and
@@ -3873,16 +4122,19 @@ fn kernel_access_mismatch(template: &crate::service::Template) -> CallError {
     })
 }
 
-/// Why the template a proposed `service_create` names is created stopped whatever the call's `start` says, for the
-/// owner's card. `None` when a create starts it, or when the template does not load (the create itself refuses that).
-fn service_create_stopped_reason(cfg: &NodeConfig, payload: &Value) -> Option<String> {
-    let template = crate::service::load_template(
-        &cfg.state_dir.join("templates"),
-        payload["template"].as_str()?,
-    )
-    .ok()?;
-    let owner = crate::service::entry_id(payload["tenant"].as_str(), payload["name"].as_str()?);
-    crate::service::template_stopped_reason(&template, &owner, &cfg.state_dir.join("secrets"))
+/// The refusal for a create whose stated image or template content is not what the template on this node is: a call
+/// that stated its own, or a card shown before the template was edited or installed again.
+fn template_not_the_one_stated(name: &str) -> CallError {
+    service_refused(format!(
+        "the template {name} on this node is not the one this create names: it was changed or installed again since the card was shown, or the call states an image or a template content of its own. Nothing was created; propose it again"
+    ))
+}
+
+/// The refusal for an approved create whose proposal was made before this node bound a template's content.
+fn template_not_bound(name: &str) -> CallError {
+    service_refused(format!(
+        "this approval was given on a card that did not bind the content of the template {name}. Nothing was created; propose it again"
+    ))
 }
 
 /// The words of a create's answer for a service created stopped: the call's own `start: false`, or the template's
@@ -3956,9 +4208,14 @@ enum DatabaseSource {
     /// The image the node's config names (`kernel.postgresImage`): a database of the old kind, made from an image
     /// Incus already holds under that fingerprint.
     Configured(String),
-    /// The node's database template, with the image by digest it names now: a service, fetched as every template's
-    /// image is.
-    Template(String),
+    /// The node's database template, with the image by digest it names now and the fingerprint of its content as
+    /// this node holds it now: a service, fetched as every template's image is.
+    Template {
+        image: String,
+        digest: String,
+        /// The template itself, from that same read: what a card says of it is said of this one.
+        template: Box<crate::service::Template>,
+    },
 }
 
 /// The source of a database this node creates now: the image its config names, or else its database template. A call
@@ -4001,8 +4258,11 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
     }
     // A database is a container on the managed service network: a node that runs no services refuses in those words.
     service_project(cfg)?;
-    let template = crate::service::load_template(&cfg.state_dir.join("templates"), template_name)
-        .map_err(|error| {
+    let content = crate::service::load_template_content(
+        &cfg.state_dir.join("templates"),
+        template_name,
+    )
+    .map_err(|error| {
             if error.not_found {
                 service_refused(format!(
                     "this node has no {template_name} template (templates/{template_name}.json in its state directory), and its config names no kernel.postgresImage: a database is made from one of the two. `arca templates install` puts the template Arca ships there"
@@ -4011,7 +4271,8 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
                 service_template_error(error)
             }
         })?;
-    let pin = crate::service::template_pin(&template)
+    let template = &content.template;
+    let pin = crate::service::template_pin(template)
         .filter(|_| template.kind == "oci")
         .ok_or_else(|| {
             service_refused(format!(
@@ -4021,7 +4282,20 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
     if stated.is_some_and(|image| image != pin) {
         return Err(database_image_changed(&pin));
     }
-    Ok(DatabaseSource::Template(pin))
+    // The content a proposal's card showed is the content now, or nothing is created: the same image with another
+    // script, environment or port is another template.
+    let digest = content.bound().map_err(service_template_error)?.to_string();
+    if args
+        .get("templateDigest")
+        .is_some_and(|stated| stated.as_str() != Some(digest.as_str()))
+    {
+        return Err(template_not_the_one_stated(template_name));
+    }
+    Ok(DatabaseSource::Template {
+        image: pin,
+        digest,
+        template: Box::new(content.template),
+    })
 }
 
 /// The refusal for an image that is not the one the node's database template names now, `pin`.
@@ -4032,27 +4306,33 @@ fn database_image_changed(pin: &str) -> CallError {
     ))
 }
 
-/// What the owner's card is told about a proposed database made from the node's template, read from that template
-/// now: why it is created stopped (its template generates no password and none is stored for it), or that the
-/// template generates the password. `None` for a database of the old kind, for a template that does not load (the
-/// proposal is refused for that), and for a password already stored, where the card claims nothing.
-fn database_card_fact(cfg: &NodeConfig, payload: &Value) -> Option<String> {
-    let template = crate::service::load_template(
-        &cfg.state_dir.join("templates"),
-        payload["template"].as_str()?,
-    )
-    .ok()?;
-    let owner = crate::service::entry_id(None, payload["name"].as_str()?);
-    crate::service::template_stopped_reason(&template, &owner, &cfg.state_dir.join("secrets"))
-        .or_else(|| {
-            template
-                .generate
-                .contains_key("POSTGRES_PASSWORD")
-                .then(|| crate::action_proposal::DATABASE_PASSWORD_GENERATED.to_string())
-        })
+/// What the owner's card is told about a proposed database `name` made from `template`, the node's database template
+/// as it was read for the proposal's fingerprint, and from the node's stored secrets now. In this order:
+/// - why the service is created stopped, when it is (`template_stopped_reason`: its environment names a secret that
+///   is neither stored for this name nor generated by the template);
+/// - nothing, when a `POSTGRES_PASSWORD` is already stored for this name: the create uses the stored one and
+///   generates none, so the card does not say "generates";
+/// - that the template generates the password, when it does.
+///
+/// `None` also for a template that neither generates the password nor leaves the service stopped.
+fn database_card_fact(
+    cfg: &NodeConfig,
+    template: &crate::service::Template,
+    name: &str,
+) -> Option<String> {
+    let owner = crate::service::entry_id(None, name);
+    let secrets = cfg.state_dir.join("secrets");
+    if let Some(stopped) = crate::service::template_stopped_reason(template, &owner, &secrets) {
+        return Some(stopped);
+    }
+    let stored = crate::service::secret_file(&secrets, &owner, "POSTGRES_PASSWORD")
+        .is_some_and(|file| file.is_file());
+    (!stored && template.generate.contains_key("POSTGRES_PASSWORD"))
+        .then(|| crate::action_proposal::DATABASE_PASSWORD_GENERATED.to_string())
 }
 
-/// Refuses a database made from the template under a name a database of either kind, or a service, holds already.
+/// Refuses a database made from the template under a name a database of either kind, or a service, holds already,
+/// or whose instance would have the name of another service's instance.
 fn database_name_free(
     entries: &[arca_kernel::desired::Entry],
     name: &str,
@@ -4072,6 +4352,11 @@ fn database_name_free(
             crate::service::DATABASE_TEMPLATE
         )));
     }
+    // The database is a service of the node's own, so its instance has its name: a name a tenant's instance has
+    // is taken. Its `service_create` asks the same, and this asks it before a card is shown.
+    if instance_name_taken(entries, None, name) {
+        return Err(name_taken("database", name));
+    }
     Ok(())
 }
 
@@ -4084,19 +4369,28 @@ fn enrich_postgres_create(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
     payload: &Value,
+    card_fact: &mut Option<String>,
 ) -> Result<Value, CallError> {
     if cfg.kernel.postgres_image.is_some() || !payload.is_object() {
         return Ok(payload.clone());
     }
-    let DatabaseSource::Template(pin) = database_source(cfg, payload)? else {
+    let DatabaseSource::Template {
+        image,
+        digest,
+        template,
+    } = database_source(cfg, payload)?
+    else {
         return Ok(payload.clone());
     };
     if let Some(name) = payload["name"].as_str() {
         database_name_free(entries, name)?;
+        // What the card says of the password, from the template this fingerprint is of.
+        *card_fact = database_card_fact(cfg, &template, name);
     }
     let mut payload = payload.clone();
     payload["template"] = json!(crate::service::DATABASE_TEMPLATE);
-    payload["image"] = json!(pin);
+    payload["image"] = json!(image);
+    payload["templateDigest"] = json!(digest);
     Ok(payload)
 }
 
@@ -4130,17 +4424,18 @@ fn template_databases(
 
 impl PostgresHandler {
     /// `postgres_create` on a node whose config names no image: the service `service_create` makes from the node's
-    /// database template, made by that handler and by nothing else. `pin` is the image the template named when this
-    /// call was checked: the handler compares it with the template it reads for the create, so the image checked and
-    /// the image created from are one read. The password is the template's to generate; from a template that
-    /// generates none the service is created stopped, and the answer says why. The name must be free among databases
-    /// of both kinds and among services. A token whose tool list leaves out `service_create` makes no service this
-    /// way either.
+    /// database template, made by that handler and by nothing else. `image` and `digest` are what the template named
+    /// and was when this call was checked: the handler compares both with the template it reads for the create, so
+    /// what was checked and what is created from are one read. The password is the template's to generate; from a
+    /// template that generates none the service is created stopped, and the answer says why. The name must be free
+    /// among databases of both kinds and among services. A token whose tool list leaves out `service_create` makes
+    /// no service this way either.
     fn create_from_template(
         &self,
         args: &Value,
         caller: &Caller,
-        pin: &str,
+        image: &str,
+        digest: &str,
     ) -> Result<Value, CallError> {
         if !caller.allows_tool("service_create") {
             return Err(service_refused(format!(
@@ -4154,7 +4449,12 @@ impl PostgresHandler {
         }
         database_name_free(lock(&self.kernel)?.entries(), &name)?;
         let made = self.service_create.call(
-            json!({ "name": name, "template": crate::service::DATABASE_TEMPLATE, "pin": pin }),
+            json!({
+                "name": name,
+                "template": crate::service::DATABASE_TEMPLATE,
+                "image": image,
+                "templateDigest": digest
+            }),
             caller,
         )?;
         let mut answer = json!({
@@ -4320,8 +4620,8 @@ impl ToolHandler for PostgresHandler {
         // create is the service handler's own and takes the write gate itself.
         let configured_image = if self.verb == "postgres_create" {
             match database_source(&self.cfg, &args)? {
-                DatabaseSource::Template(pin) => {
-                    return self.create_from_template(&args, caller, &pin);
+                DatabaseSource::Template { image, digest, .. } => {
+                    return self.create_from_template(&args, caller, &image, &digest);
                 }
                 DatabaseSource::Configured(image) => Some(image),
             }
@@ -4700,6 +5000,127 @@ fn service_refused(message: impl Into<String>) -> CallError {
     }
 }
 
+/// The code of a refusal for a read of Incus that got no answer: Incus did not answer by the deadline, could not be
+/// reached, or answered with a server error. Nothing is wrong with the request, and the same request may be made again.
+pub const INCUS_UNAVAILABLE: &str = "incus_unavailable";
+/// The code of a refusal for a read of Incus whose answer could not be used: a status that is no server error, an
+/// answer over the size this node reads, or one that is not the JSON it expects. Asking again is likely to answer the
+/// same.
+pub const INCUS_ANSWER: &str = "incus_answer";
+
+/// What follows a read of Incus that got no answer.
+const ASK_AGAIN: &str =
+    "The same request may be made again (an approved action is proposed again).";
+/// What follows a read of Incus whose answer could not be used.
+const ASKED_THE_SAME: &str =
+    "The same request is likely to be answered the same until Incus answers that read.";
+
+/// What went wrong with a read of Incus, in words, and the code of its refusal. The words hold the kind of failure
+/// and Incus's status, and never Incus's own text, which may quote a value.
+fn incus_read_cause(error: &arca_incus::IncusError) -> (&'static str, String) {
+    use arca_incus::IncusError;
+    match error {
+        IncusError::Timeout => (
+            INCUS_UNAVAILABLE,
+            format!(
+                "Incus did not answer within {} seconds",
+                arca_incus::read::TIMEOUT.as_secs()
+            ),
+        ),
+        IncusError::Io(_) => (
+            INCUS_UNAVAILABLE,
+            "Incus could not be reached on its socket".to_string(),
+        ),
+        IncusError::Status { code, .. } if *code >= 500 => (
+            INCUS_UNAVAILABLE,
+            format!("Incus answered with its own error (status {code})"),
+        ),
+        IncusError::Status { code, .. } => {
+            (INCUS_ANSWER, format!("Incus answered with status {code}"))
+        }
+        IncusError::TooLarge => (
+            INCUS_ANSWER,
+            format!(
+                "Incus's answer was over the {} MiB this node reads",
+                arca_incus::read::MAX_BODY >> 20
+            ),
+        ),
+        _ => (
+            INCUS_ANSWER,
+            "Incus's answer was not the JSON this node expects".to_string(),
+        ),
+    }
+}
+
+/// The refusal for a read of Incus, inside a service call, that failed: in words, never "internal". `what` is what was
+/// read and `subject` what it was read for (the service the call names, or the list); `changed` says what the call had
+/// done by then, such as "Nothing was changed.". The words hold the kind of failure and Incus's status, and never
+/// Incus's own text, which may quote a value.
+fn incus_read_refused(
+    error: &arca_incus::IncusError,
+    what: &str,
+    subject: &str,
+    changed: &str,
+) -> CallError {
+    let (code, _) = incus_read_cause(error);
+    let after = if code == INCUS_UNAVAILABLE {
+        ASK_AGAIN
+    } else {
+        ASKED_THE_SAME
+    };
+    let mut tail = String::from(changed);
+    if !tail.is_empty() {
+        tail.push(' ');
+    }
+    tail.push_str(after);
+    incus_read_told(error, what, subject, &tail)
+}
+
+/// The same refusal with its last sentences given whole, for a read made after the call changed something: there the
+/// caller is told what is there and what to look at, and never to make the same request again.
+fn incus_read_told(
+    error: &arca_incus::IncusError,
+    what: &str,
+    subject: &str,
+    tail: &str,
+) -> CallError {
+    let (code, cause) = incus_read_cause(error);
+    CallError::Refused {
+        code: code.into(),
+        message: format!("{cause} when this node read {what} for {subject}. {tail}"),
+    }
+}
+
+/// What a service call reads Incus for, as a refusal names it: the service or the function the call names, or the list.
+fn read_subject(verb: &str, args: &Value) -> String {
+    let kind = if verb.starts_with("function_") {
+        "function"
+    } else {
+        "service"
+    };
+    ["name", "from"]
+        .into_iter()
+        .find_map(|key| args.get(key).and_then(Value::as_str))
+        .filter(|name| crate::service::service_name_ok(name))
+        .map(|name| format!("{kind} {name}"))
+        .unwrap_or_else(|| format!("the list of {kind}s"))
+}
+
+/// What a service call had changed when its first reads of Incus are made: nothing, which a call that only reads does
+/// not need said. A call that runs from an owner's approval has used that approval by then, and says so.
+fn nothing_changed(verb: &str, approved: bool) -> &'static str {
+    if matches!(
+        verb,
+        "service_list" | "service_status" | "service_logs" | "function_list" | "function_runs"
+    ) {
+        ""
+    } else if approved {
+        "Nothing was changed, and the approval was used."
+    } else {
+        "Nothing was changed."
+    }
+}
+
 fn service_not_found(message: impl Into<String>) -> CallError {
     CallError::Refused {
         code: "not_found".into(),
@@ -4742,36 +5163,77 @@ fn service_template_error(error: crate::service::TemplateError) -> CallError {
 /// anything is created: such an image is built or copied in by hand, and Incus's own answer to the create names no reason.
 /// Only a listing that answers and lacks the alias refuses. A listing that cannot be read (the project is not made yet, or
 /// the read fails) decides nothing, and the create goes on.
+///
+/// A template that pins its local image (a `digest` beside `local:<alias>`) is held to it, a virtual machine's too. The
+/// fingerprint decides which image an instance is made from, and the alias is only the name it is looked for under: the
+/// image under the alias must be the pinned one. Here an unreadable listing refuses: a pin that cannot be checked is
+/// not met.
 fn local_image_present(
     read: &UnixIncus,
     template: &crate::service::Template,
     project: &str,
 ) -> Result<(), CallError> {
-    let Some(alias) = (template.kind == "system")
-        .then(|| template.image.strip_prefix("local:"))
-        .flatten()
-    else {
-        return Ok(());
+    let pin = template.local_image_pin();
+    let alias = match pin {
+        Some((alias, _)) => alias,
+        None => {
+            let Some(alias) = (template.kind == "system")
+                .then(|| template.image.strip_prefix("local:"))
+                .flatten()
+            else {
+                return Ok(());
+            };
+            alias
+        }
     };
-    let Ok(images) = read.get(&format!("/1.0/images?project={project}&recursion=1")) else {
-        return Ok(());
+    let listing = read
+        .get(&format!("/1.0/images?project={project}&recursion=1"))
+        .ok()
+        .and_then(|images| images.as_array().cloned());
+    let Some(images) = listing else {
+        let Some((_, fingerprint)) = pin else {
+            return Ok(());
+        };
+        // The service project is made with the node's first service. Before that it has no images to hold the pinned
+        // one, and the refusal says so and what comes first.
+        let no_project = matches!(
+            read.get(&format!("/1.0/projects/{project}")),
+            Err(arca_incus::IncusError::Status { code: 404, .. })
+        );
+        return Err(service_refused(if no_project {
+            format!(
+                "template {}: its image {alias} is pinned to sha256:{fingerprint}, and the service project {project} does not exist yet: it is made with this node's first service, so no image can be in it. Create another service first, put the pinned image in the project under the alias {alias}, then create this one",
+                template.name
+            )
+        } else {
+            format!(
+                "template {}: its image {alias} is pinned to sha256:{fingerprint}, and the images of the service project {project} cannot be read to check it. Nothing was created",
+                template.name
+            )
+        }));
     };
-    let Some(images) = images.as_array() else {
-        return Ok(());
-    };
-    let held = images.iter().any(|image| {
+    let held = images.iter().find(|image| {
         image["aliases"]
             .as_array()
             .is_some_and(|aliases| aliases.iter().any(|a| a["name"].as_str() == Some(alias)))
     });
-    if held {
-        return Ok(());
+    let Some(held) = held else {
+        return Err(service_refused(format!(
+            "template {}: its image {alias} is not on this node: no image in the service project {} has that alias. \
+             A local image is built or copied into that project before the service is created; the template's description says how",
+            template.name, project
+        )));
+    };
+    if let Some((_, fingerprint)) = pin {
+        let found = held["fingerprint"].as_str().unwrap_or("unknown");
+        if found != fingerprint {
+            return Err(service_refused(format!(
+                "template {}: its image {alias} is pinned to sha256:{fingerprint}, and the image under that alias in the service project {project} is sha256:{found}. Nothing was created. Put the pinned image under the alias, or change the template's digest",
+                template.name
+            )));
+        }
     }
-    Err(service_refused(format!(
-        "template {}: its image {alias} is not on this node: no image in the service project {} has that alias. \
-         A local image is built or copied into that project before the service is created; the template's description says how",
-        template.name, project
-    )))
+    Ok(())
 }
 
 /// Whether the node's config asks for no service project at all: no service subnet, no host bridges, and the service
@@ -4940,24 +5402,74 @@ fn vm_refusal(name: &str, what: &str) -> CallError {
     service_refused(format!("service {name} is a virtual machine: {what}"))
 }
 
-fn service_listing(read: &UnixIncus, project: Option<&str>) -> Result<Vec<Value>, CallError> {
+/// How long a read of Incus that failed fast waits before its one second try.
+const READ_AGAIN_AFTER: Duration = Duration::from_millis(200);
+/// A failure that came back within this long is a fast one: Incus was not there, or said so at once.
+const FAST_FAILURE: Duration = Duration::from_secs(1);
+
+/// One read of Incus, made a second time when the first failed fast: the socket was not reached, or Incus answered
+/// with a server error, within a second. "Fast" is the time that passed, not the kind of failure: an error that took
+/// most of the deadline to come is not tried again, and neither is a read that got no answer by its deadline. Both
+/// tries share the one deadline a read is given, since a write holds its gate while it reads. Only the read is made
+/// again; it changes nothing, so the second is safe. The node's log gets a line for it.
+fn read_again_once(read: &UnixIncus, path: &str) -> Result<Value, arca_incus::IncusError> {
+    use arca_incus::IncusError;
+    let began = Instant::now();
+    let first = read.get(path);
+    let Err(error @ (IncusError::Io(_) | IncusError::Status { code: 500.., .. })) = &first else {
+        return first;
+    };
+    if began.elapsed() >= FAST_FAILURE {
+        return first;
+    }
+    eprintln!(
+        "arca: a read of Incus failed at once and is made once more: {}",
+        incus_read_cause(error).1
+    );
+    thread::sleep(READ_AGAIN_AFTER);
+    let left = arca_incus::read::TIMEOUT.saturating_sub(began.elapsed());
+    read.clone().with_timeout(left).get(path)
+}
+
+/// The instances of `project`, or of every project. `with_state` asks Incus for each one's live state too, which for a
+/// running virtual machine it takes from the guest's agent and can take seconds for one machine: only a call that
+/// picks an address or a MAC for a new instance asks for it, since a live address or interface is in no record. Every
+/// other call reads the listing without state, which holds each instance's status, config and devices and is answered
+/// at once. `subject` and `changed` are for the refusal when Incus does not answer ([`incus_read_refused`]).
+fn service_listing(
+    read: &UnixIncus,
+    project: Option<&str>,
+    with_state: bool,
+    subject: &str,
+    changed: &str,
+) -> Result<Vec<Value>, CallError> {
+    let recursion = if with_state { 2 } else { 1 };
     let path = project
-        .map(|project| format!("/1.0/instances?project={project}&recursion=2"))
-        .unwrap_or_else(|| "/1.0/instances?all-projects=true&recursion=2".into());
-    match read.get(&path) {
+        .map(|project| format!("/1.0/instances?project={project}&recursion={recursion}"))
+        .unwrap_or_else(|| format!("/1.0/instances?all-projects=true&recursion={recursion}"));
+    match read_again_once(read, &path) {
         Ok(rows) => Ok(rows.as_array().cloned().unwrap_or_default()),
         Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
-        Err(_) => Err(internal()),
+        Err(error) => Err(incus_read_refused(
+            &error,
+            if with_state {
+                "the instances and their live state"
+            } else {
+                "the instances"
+            },
+            subject,
+            changed,
+        )),
     }
 }
 
-fn service_leases(read: &UnixIncus) -> Result<Vec<String>, CallError> {
+fn service_leases(read: &UnixIncus, subject: &str) -> Result<Vec<String>, CallError> {
     let path = format!(
         "/1.0/networks/{}/leases?project={}",
         arca_netproject::BRIDGE,
         arca_netproject::PROJECT
     );
-    match read.get(&path) {
+    match read_again_once(read, &path) {
         Ok(rows) => Ok(rows
             .as_array()
             .into_iter()
@@ -4965,7 +5477,12 @@ fn service_leases(read: &UnixIncus) -> Result<Vec<String>, CallError> {
             .filter_map(|lease| lease["address"].as_str().map(str::to_string))
             .collect()),
         Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
-        Err(_) => Err(internal()),
+        Err(error) => Err(incus_read_refused(
+            &error,
+            "the addresses the service network has leased",
+            subject,
+            "Nothing was created.",
+        )),
     }
 }
 
@@ -5307,13 +5824,19 @@ pub(crate) fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // A registry's directory also holds the address its credential is for, which is no secret.
+        let registry = entry.file_name().to_string_lossy().starts_with("registry-");
         if let Ok(files) = std::fs::read_dir(&path) {
             for file in files.flatten() {
+                if registry && file.file_name() == "server" {
+                    continue;
+                }
+                // Which stored values are hidden is decided by the rule that says which values are stored
+                // ([`crate::service::secret_to_hide`]), so no secret the node accepts is left out of this list.
                 if let Ok(text) = std::fs::read_to_string(file.path())
-                    && text.len() >= 8
-                    && text.len() <= 4096
+                    && let Some(hidden) = crate::service::secret_to_hide(&text)
                 {
-                    values.push(text.trim_end_matches('\n').to_string());
+                    values.push(hidden.to_string());
                 }
             }
         }
@@ -5357,8 +5880,7 @@ fn service_removal_refused(
 
 fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConfig, CallError> {
     let source = crate::service::source(parts.template).map_err(service_template_error)?;
-    let entrypoint = crate::service::entrypoint(parts.template, parts.templates_dir)
-        .map_err(service_template_error)?;
+    let entrypoint = parts.content.entrypoint().map_err(service_template_error)?;
     let (environment, start) = crate::service::environment(
         parts.template,
         parts.owner,
@@ -5419,17 +5941,16 @@ enum VmPlace {
 /// gets the merged object, and the record keeps the replaced values beside it.
 fn vm_service_config(
     name: &str,
-    template: &crate::service::Template,
-    templates_dir: &std::path::Path,
+    content: &crate::service::TemplateContent,
     settings: Option<&Value>,
     place: VmPlace,
     pool: String,
     now: u64,
 ) -> Result<crate::service::ServiceConfig, CallError> {
+    let template = &content.template;
     let source = crate::service::source(template).map_err(service_template_error)?;
     let root_size = template.root_size.clone().ok_or_else(internal)?;
-    let user_data =
-        crate::service::first_boot(template, templates_dir).map_err(service_template_error)?;
+    let user_data = content.first_boot().map_err(service_template_error)?;
     let settings =
         crate::service::create_settings(template, settings).map_err(service_template_error)?;
     let vendor_data = crate::service::vendor_data_of(&template.name, settings.merged.as_ref())
@@ -5495,7 +6016,8 @@ struct ServiceParts<'a> {
     pool: String,
     now: u64,
     secrets_dir: &'a std::path::Path,
-    templates_dir: &'a std::path::Path,
+    /// The template as it was read for this create: its scripts are the ones read with it.
+    content: &'a crate::service::TemplateContent,
     /// The kernel access of a template that declares it, with the listener this node gives it.
     kernel_access: Option<crate::service::KernelLink>,
 }
@@ -5511,9 +6033,10 @@ impl ServiceHandler {
         rows: &[Value],
         entries: &[arca_kernel::desired::Entry],
         tenant: Option<&tenants::TenantScope>,
+        subject: &str,
     ) -> Result<String, CallError> {
         let candidates = crate::service::candidates(cidr).map_err(service_template_error)?;
-        let leases = service_leases(read)?;
+        let leases = service_leases(read, subject)?;
         let used = service_used(rows, &leases, entries);
         if let Some(scope) = tenant {
             return tenants::free_address(scope, &used);
@@ -5615,7 +6138,28 @@ impl ServiceHandler {
                     )));
                 }
                 Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
-                Err(_) => return Err(internal()),
+                Err(error) => {
+                    // Said as what it is, with the verbs that act on one: a function is not a service.
+                    let (subject, look) = if config.function.is_some() {
+                        (
+                            format!("function {name}"),
+                            "function_list shows what is there, and function_remove removes it",
+                        )
+                    } else {
+                        (
+                            format!("service {name}"),
+                            "service_status shows what is there, and service_remove removes it",
+                        )
+                    };
+                    return Err(incus_read_told(
+                        &error,
+                        "the instance of a create that did not complete",
+                        &subject,
+                        &format!(
+                            "Whether its instance exists is not known: {look}. Look before the create is made again."
+                        ),
+                    ));
+                }
             }
             let removal = {
                 let mut kernel = lock(&self.kernel)?;
@@ -5652,7 +6196,26 @@ impl ServiceHandler {
         )) {
             Ok(state) => Some(state),
             Err(arca_incus::IncusError::Status { code: 404, .. }) => None,
-            Err(_) => return Err(internal()),
+            Err(error) => {
+                // The create went through: the caller is told to look, never to make it again.
+                let (subject, look) = if config.function.is_some() {
+                    (
+                        format!("function {name}"),
+                        "The function was created: function_list shows it",
+                    )
+                } else {
+                    (
+                        format!("service {name}"),
+                        "The service was created: service_status shows it",
+                    )
+                };
+                return Err(incus_read_told(
+                    &error,
+                    "the state of the new instance",
+                    &subject,
+                    &format!("{look}. Do not make the create again."),
+                ));
+            }
         };
         let live = live.map(|state| {
             let mut row = state;
@@ -5687,6 +6250,7 @@ impl ToolHandler for ServiceHandler {
             "service_create" => &[
                 "name",
                 "template",
+                "registry",
                 "bridge",
                 "mac",
                 "deploy",
@@ -5696,9 +6260,11 @@ impl ToolHandler for ServiceHandler {
                 "settings",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
-                // Only `postgres_create` carries it: the image its template named when that call was checked. The
-                // create refuses when the template it reads names another. It can only refuse, never widen.
-                "pin",
+                // What a proposal is given when it is made: the image the template names and the fingerprint of
+                // the template's content. A call that states either is compared with the template this create
+                // reads, and refused when they differ: they can only refuse, never widen.
+                "image",
+                "templateDigest",
             ],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
@@ -5720,6 +6286,7 @@ impl ToolHandler for ServiceHandler {
                 "triggers",
                 "limits",
                 "concurrency",
+                "registry",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
             ],
@@ -5832,9 +6399,7 @@ impl ToolHandler for ServiceHandler {
             Some(_) => tenants::tenant_arg(&self.cfg, &args, lock(&self.kernel)?.entries())?,
         };
         if tenant.is_none() && args.get("deploy").is_some() {
-            return Err(CallError::Invalid(
-                "deploy: only a call inside a tenant names a deploy".into(),
-            ));
+            return Err(CallError::Invalid(DEPLOY_OUTSIDE_TENANT.into()));
         }
         // A node whose config asks for no service project, and whose desired state holds nothing of one, has no service:
         // the list is empty, and Incus is not asked. A node that still holds records of what it ran has not, so no call
@@ -5874,7 +6439,16 @@ impl ToolHandler for ServiceHandler {
             _ => service_project(&self.cfg)?,
         };
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
-        let rows = service_listing(&read, None)?;
+        let subject = read_subject(self.verb, &args);
+        // Only a create needs an instance's live state: the addresses and the interfaces that are in no record.
+        let picks_an_address = matches!(self.verb, "service_create" | "function_create");
+        let rows = service_listing(
+            &read,
+            None,
+            picks_an_address,
+            &subject,
+            nothing_changed(self.verb, preapproved),
+        )?;
         let mut entries = {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
@@ -5965,6 +6539,11 @@ impl ToolHandler for ServiceHandler {
                     }
                     let live = service_live_in(&rows, &config.project, &config.instance);
                     let mut view = crate::service::view(config, live);
+                    // A machine on a host bridge takes its address from that network: it is in no record, and the
+                    // list reads no live state. Said so, so an empty address is not read as "has none".
+                    if config.on_host_bridge() {
+                        view["ipv4In"] = json!("state");
+                    }
                     // Only a service whose installed template names another version carries the key, so every
                     // other row is the one it always was.
                     if service_update(&self.cfg, &mut templates, config)
@@ -6008,6 +6587,32 @@ impl ToolHandler for ServiceHandler {
                 if let Some((_, config)) = record {
                     let live = service_live_in(&rows, &config.project, &config.instance);
                     let mut view = crate::service::view(&config, live);
+                    // A machine on a host bridge has its address only in its live state, so this one call reads the
+                    // state of this one instance, when it runs. A service on the service network has its address
+                    // in its record, and nothing is read for it. A read that fails still answers: the address is
+                    // left empty and the answer says why.
+                    if config.on_host_bridge()
+                        && let Some(row) = live
+                        && row["status"].as_str() == Some("Running")
+                    {
+                        let path = format!(
+                            "/1.0/instances/{}/state?project={}",
+                            config.instance, config.project
+                        );
+                        match read_again_once(&read, &path) {
+                            Ok(state) => {
+                                if let Some(ipv4) = crate::service::bridged_ipv4(row, &state) {
+                                    view["ipv4"] = json!(ipv4.to_string());
+                                }
+                            }
+                            Err(error) => {
+                                let (_, cause) = incus_read_cause(&error);
+                                view["ipv4Problem"] = json!(format!(
+                                    "{cause} when this node read the live state of service {name}, which is where the address of a machine on a host bridge is: the address was not read. Every other field is as usual; ask again for the address"
+                                ));
+                            }
+                        }
+                    }
                     // The image the instance was made from, as Incus recorded it: a template that names an image
                     // by an alias does not say which build that was.
                     if let Some(image) = live.and_then(crate::service::base_image) {
@@ -6139,6 +6744,10 @@ impl ToolHandler for ServiceHandler {
                         secrets.push(value.to_string());
                     }
                 }
+                // A PEM block is hidden whole before the log is cut into lines: cut first, its lines are no longer
+                // one block. Each line is then cleaned and hidden again, a secret of several lines line by line.
+                let text = crate::service::redact_blocks(&text);
+                let hidden = crate::service::values_to_hide(&secrets);
                 let mut lines_out = Vec::new();
                 for line in text.split(['\n', '\r']) {
                     if line.trim().is_empty() {
@@ -6146,7 +6755,7 @@ impl ToolHandler for ServiceHandler {
                     }
                     let clean = crate::service::clean_log(line);
                     if !clean.is_empty() {
-                        lines_out.push(json!(crate::service::redact_log(&clean, &secrets)));
+                        lines_out.push(json!(crate::service::redact_hidden(&clean, &hidden)));
                     }
                 }
                 let start = lines_out.len().saturating_sub(lines as usize);
@@ -6170,8 +6779,8 @@ impl ToolHandler for ServiceHandler {
                 if config.adopted {
                     return Err(service_wiring::adopted(&name));
                 }
-                // A service a function links to stays until the function is gone: said before any approval is
-                // spent.
+                // A service a function links to stays until the function is gone: said here, on the entries this call
+                // read, before the write gate is waited for. The kernel checks again under its own lock.
                 // A removal that runs from an approved card has used that approval up by now, and says so.
                 if tenant.is_none()
                     && let Some(refusal) =
@@ -6238,6 +6847,10 @@ impl ToolHandler for ServiceHandler {
                 }
                 let secrets = self.cfg.state_dir.join("secrets").join(&id.0);
                 let _ = std::fs::remove_dir_all(secrets);
+                // An image this service was fetched from with a registry's credential goes with its last user.
+                if tenant.is_none() {
+                    self.drop_fetched_images(&read, &config);
+                }
                 Ok(json!({ "removed": true }))
             }
             "service_import" => {
@@ -6247,7 +6860,22 @@ impl ToolHandler for ServiceHandler {
                 }
                 let done = crate::service_import::import(&self.cfg, &name, &entries, now)?;
                 // The mark is on the instance now. Its record is made from it, exactly as a restart reads it.
-                let rows = service_listing(&read, None)?;
+                // The import landed and its approval is used: the caller is told to look, never to ask for it again.
+                let rows = match read_again_once(
+                    &read,
+                    "/1.0/instances?all-projects=true&recursion=1",
+                ) {
+                    Ok(rows) => rows.as_array().cloned().unwrap_or_default(),
+                    Err(arca_incus::IncusError::Status { code: 404, .. }) => Vec::new(),
+                    Err(error) => {
+                        return Err(incus_read_told(
+                            &error,
+                            "the instances",
+                            &subject,
+                            "The instance carries Arca's mark already, and its record is made by the next service call that Incus answers: service_list shows it. Do not propose the import again.",
+                        ));
+                    }
+                };
                 adopt_services(
                     &self.kernel,
                     &self.cfg,
@@ -6330,7 +6958,11 @@ impl ToolHandler for ServiceHandler {
                     .iter()
                     .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
                 {
-                    return Err(service_refused(format!("service {name} exists")));
+                    return Err(service_exists(&name));
+                }
+                // The instance name is one name on the node, whichever side holds it: asked of every record.
+                if instance_name_taken(&all_entries, tenant_id, &name) {
+                    return Err(name_taken("service", &name));
                 }
                 let instance = crate::service::instance_name(tenant_id, &name);
                 if rows
@@ -6342,16 +6974,11 @@ impl ToolHandler for ServiceHandler {
                     )));
                 }
                 let templates_dir = self.cfg.state_dir.join("templates");
-                let template = crate::service::load_template(&templates_dir, template_name)
+                // The template's file and the scripts it names are read once, here. What the call states of them
+                // is compared with this read, and the service is made from this read and no other.
+                let content = crate::service::load_template_content(&templates_dir, template_name)
                     .map_err(service_template_error)?;
-                // A database's create was checked against the image its template named: this read, the one the
-                // service is made from, must name the same.
-                if let Some(pin) = args.get("pin") {
-                    let now = crate::service::template_pin(&template);
-                    if pin.as_str().is_none() || pin.as_str() != now.as_deref() {
-                        return Err(database_image_changed(now.as_deref().unwrap_or("no image")));
-                    }
-                }
+                let template = content.template.clone();
                 // Read before the create makes any secret: why this template is created stopped whatever `start` says.
                 let forced = crate::service::template_stopped_reason(
                     &template,
@@ -6371,6 +6998,22 @@ impl ToolHandler for ServiceHandler {
                     }),
                 )?
                 .map(|(port, connect)| crate::service::KernelLink { port, connect });
+                // What the call states of the template is compared with this read: the content its card showed
+                // (an approved proposal always names it) and the image. A template that is no longer that one
+                // creates nothing. It comes after the kernel access above, whose own refusal says more, and
+                // before any write.
+                match args.get("templateDigest") {
+                    Some(stated) if stated.as_str() != content.digest.as_deref() => {
+                        return Err(template_not_the_one_stated(template_name));
+                    }
+                    None if preapproved => return Err(template_not_bound(template_name)),
+                    _ => {}
+                }
+                if args.get("image").is_some_and(|stated| {
+                    stated.as_str() != Some(crate::service::template_image(&template).as_str())
+                }) {
+                    return Err(template_not_the_one_stated(template_name));
+                }
                 // A service the node's config gives a private destination: refused unless the create runs from an
                 // approved proposal that states exactly what the config names now, and when an address is one of
                 // the node's own. All of it comes before any write.
@@ -6390,9 +7033,14 @@ impl ToolHandler for ServiceHandler {
                     }
                 }
                 if template.is_vm() {
-                    let Some(caps) = self.cfg.kernel.vm_caps() else {
+                    // A virtual machine's local image is checked only when the template pins it: an unpinned one is
+                    // left to Incus, as before.
+                    if template.local_image_pin().is_some() {
+                        local_image_present(&read, &template, project)?;
+                    }
+                    if self.cfg.kernel.vm_caps().is_none() {
                         return Err(service_refused(no_vm_caps(template_name)));
-                    };
+                    }
                     // Every refusal below comes before any write, so a refused create leaves nothing behind.
                     if let Some(why) = mode_refusal(&self.cfg, &all_entries) {
                         return Err(service_refused(why));
@@ -6402,9 +7050,7 @@ impl ToolHandler for ServiceHandler {
                     // A tenant's machine joins the managed service network and nothing else: a host bridge would put
                     // it on the host's own network.
                     if tenant.is_some() && args.get("bridge").is_some() {
-                        return Err(service_refused(
-                            "bridge: a virtual machine in a tenant joins the managed service network only, never a host bridge",
-                        ));
+                        return Err(service_refused(TENANT_BRIDGE));
                     }
                     let network = if tenant.is_some() {
                         VmNetwork::Managed
@@ -6440,28 +7086,18 @@ impl ToolHandler for ServiceHandler {
                         VmNetwork::Managed => {}
                     }
                     if let Some(mac) = &mac
-                        && (service_entries(&entries).iter().any(|(_, other)| {
-                            other.vm.as_ref().and_then(|vm| vm.mac.as_ref()) == Some(mac)
-                        }) || rows.iter().any(|row| instance_holds_mac(row, mac)))
+                        && (record_holds_mac(&entries, mac)
+                            || rows.iter().any(|row| instance_holds_mac(row, mac)))
                     {
-                        return Err(service_refused(format!(
-                            "the MAC {mac} is already held by another instance"
-                        )));
+                        return Err(service_refused(mac_held(mac)));
                     }
-                    if let Some(refusal) = caps_refusal(
+                    if let Some(refusal) = create_room_refusal(
                         &self.cfg,
-                        caps,
                         &all_entries,
-                        tenant.is_none(),
+                        tenant.as_ref(),
                         &name,
                         &template,
                     ) {
-                        return Err(refusal);
-                    }
-                    if let Some(scope) = &tenant
-                        && let Some(refusal) =
-                            tenants::service_caps_refusal(scope, &all_entries, &name, &template)
-                    {
                         return Err(refusal);
                     }
                     // A project that exists must be the one its owning entry made: the bridged entry's on a node whose
@@ -6496,7 +7132,14 @@ impl ToolHandler for ServiceHandler {
                             )));
                         }
                         Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
-                        Err(_) => return Err(internal()),
+                        Err(error) => {
+                            return Err(incus_read_refused(
+                                &error,
+                                "the service project",
+                                &subject,
+                                "Nothing was created.",
+                            ));
+                        }
                     }
                     let needs = ProjectNeeds {
                         managed: matches!(network, VmNetwork::Managed),
@@ -6518,6 +7161,7 @@ impl ToolHandler for ServiceHandler {
                                 &all_rows,
                                 &all_entries,
                                 tenant.as_ref(),
+                                &subject,
                             )?;
                             VmPlace::Managed {
                                 ipv4,
@@ -6531,15 +7175,8 @@ impl ToolHandler for ServiceHandler {
                         project_changes(&all_entries, &self.cfg, needs)
                             .map_err(no_service_project)?
                     };
-                    let mut config = vm_service_config(
-                        &name,
-                        &template,
-                        &templates_dir,
-                        args.get("settings"),
-                        place,
-                        pool,
-                        now,
-                    )?;
+                    let mut config =
+                        vm_service_config(&name, &content, args.get("settings"), place, pool, now)?;
                     config.destinations = destinations.clone();
                     let deploy =
                         tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)?;
@@ -6583,20 +7220,38 @@ impl ToolHandler for ServiceHandler {
                 crate::service::create_settings(&template, args.get("settings"))
                     .map_err(service_template_error)?;
                 local_image_present(&read, &template, project)?;
+                // An image fetched with this node's credential for its registry is said on the card: a create that
+                // does not say it does not run. Nothing in a tenant is fetched with it.
+                if tenant.is_none() && template.kind == "oci" {
+                    crate::registry::stated(
+                        &self.cfg,
+                        crate::registry::server_of(&template.image).as_deref(),
+                        args.get("registry"),
+                        preapproved,
+                    )?;
+                } else if args.get("registry").is_some() {
+                    return Err(CallError::Invalid(
+                        "registry: only a create of the node's own project, from an image on a registry, names one".into(),
+                    ));
+                }
                 if let Some(scope) = &tenant {
                     if template.lan.is_some() || template.publishable {
-                        return Err(service_refused(format!(
-                            "template {template_name} opens a port on the host or publishes a dash, and nothing in a tenant does: a tenant's service is reached through the node's front service"
-                        )));
+                        return Err(service_refused(tenant_host_port(template_name)));
                     }
                     if let Some(refusal) =
-                        tenants::service_caps_refusal(scope, &all_entries, &name, &template)
+                        create_room_refusal(&self.cfg, &all_entries, Some(scope), &name, &template)
                     {
                         return Err(refusal);
                     }
                 }
-                let ipv4 =
-                    self.free_address(&read, &cidr, &all_rows, &all_entries, tenant.as_ref())?;
+                let ipv4 = self.free_address(
+                    &read,
+                    &cidr,
+                    &all_rows,
+                    &all_entries,
+                    tenant.as_ref(),
+                    &subject,
+                )?;
                 let pool = service_pool(&self.cfg).map_err(|_| {
                     service_refused("the default profile does not name a storage pool")
                 })?;
@@ -6617,7 +7272,7 @@ impl ToolHandler for ServiceHandler {
                     pool,
                     now,
                     secrets_dir: &secrets_dir,
-                    templates_dir: &templates_dir,
+                    content: &content,
                     kernel_access,
                 })
                 .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;

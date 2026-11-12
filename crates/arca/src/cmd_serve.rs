@@ -184,6 +184,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
 
     // The token store is read before anything listens. The server and the SIGHUP handler share it.
     let tokens = TokenStore::load(&cfg.tokens.hash_dir).map_err(token_failure)?;
+    say_ignored_tokens(&tokens);
     let key = NodeKey::load_or_create(&cfg.state_dir.join(NODE_KEY_FILE))
         .map_err(|e| Failure::Runtime(e.to_string()))?;
     let node = key.id().to_hex();
@@ -498,6 +499,19 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // CPU from this machine's cgroup tree only while the node's Incus is this machine's.
     // Nothing of it stops `serve`: a runner that cannot be made, or a timer that cannot start, is said on the log and
     // the node serves everything else, with the function verbs answering that it runs no functions.
+    // The images this node's own project fetched with a registry's credential are looked at now and every ten
+    // minutes. It asks Incus nothing on a node where no such credential was ever set, and never stops serve.
+    if kernel_mode && cfg.kernel.service_cidr.is_some() {
+        let sweep = Arc::new(crate::registry::ImageSweep::new(
+            Arc::new(cfg.clone()),
+            clock.clone(),
+        ));
+        if let Err(error) = sweep.spawn() {
+            eprintln!(
+                "arca: the sweep of images fetched with a registry's credential did not start: {error}"
+            );
+        }
+    }
     let functions = if kernel_mode && cfg.kernel.service_cidr.is_some() {
         let source = Arc::clone(&metrics_source);
         match crate::function_run::FunctionRunner::new(
@@ -565,6 +579,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             service_create,
         ))
         .chain(service_handlers)
+        .chain(crate::registry::registry_handlers(Arc::new(cfg.clone())))
         .chain(crate::handlers::tenant_handlers(
             kernel.clone(),
             clock.clone(),
@@ -698,6 +713,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 let tokens = match reload_tokens.reload(&reload_dir) {
                     Ok(count) => {
                         eprintln!("arca: {count} token(s) reloaded");
+                        say_ignored_tokens(&reload_tokens);
                         Some(count)
                     }
                     Err(error) => {
@@ -1219,6 +1235,17 @@ fn approval_failure(error: ApprovalRefusal) -> Failure {
     match error {
         ApprovalRefusal::Untrusted(_) => Failure::Config(error.to_string()),
         other => Failure::Runtime(other.to_string()),
+    }
+}
+
+/// One line for each token file the store left out when it was last read: a file under the name approved actions
+/// run under. The node runs without it, and the line says how the file is removed.
+fn say_ignored_tokens(tokens: &TokenStore) {
+    for file in tokens.ignored() {
+        eprintln!(
+            "arca: token file {file} is ignored: it uses the name an action runs under once the owner approved it, so no token of that name is accepted. Remove it with: arca token revoke {}",
+            arca_mcp::auth::APPROVED_ACTION_ID
+        );
     }
 }
 

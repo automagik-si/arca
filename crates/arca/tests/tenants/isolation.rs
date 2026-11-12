@@ -1467,3 +1467,132 @@ fn a_secret_that_was_not_written_says_whether_asking_again_can_help() {
     assert!(!message.contains("Run instance_start for it again"));
     assert!(!message.contains(SECRET_A));
 }
+
+/// The node's credential for a registry is the node's: an image a tenant's service is made from is fetched without
+/// it, from the same registry and with the credential set, while a service of the node's own is fetched with it.
+#[test]
+fn a_tenants_image_is_fetched_without_the_nodes_registry_credential() {
+    let rig = two_tenants(policy());
+    let mut own = app_template("own");
+    own["image"] = json!("docker.io/library/own");
+    own["digest"] = json!(format!("sha256:{}", "c".repeat(64)));
+    rig.template("own", own);
+    let server = "https://docker.io";
+    let word = ["pull", "only", "word", "4567"].join("-");
+    let (_, set) = arca::registry::registry_handlers(Arc::clone(&rig.cfg))
+        .into_iter()
+        .find(|(verb, _)| *verb == "registry_secret_set")
+        .expect("the verb");
+    set.call(
+        json!({ "server": server, "username": "puller", "password": word }),
+        &Caller {
+            token_id: "doctor".into(),
+            scope: Scope::Doctor,
+            tools: None,
+        },
+    )
+    .expect("set");
+    assert!(arca::registry::credential_set(&rig.cfg, server));
+    // Where the fake's Incus keeps the address it was sent for each image it fetched.
+    let kept = |project: &str| -> Vec<String> {
+        rig.get(&format!("/1.0/images?project={project}&recursion=1"))
+            .and_then(|images| images.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|image| {
+                image["update_source"]["server"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+
+    // A tenant's create names no registry and is sent the bare address.
+    create(&rig, "web", "app", Some(A));
+    assert_eq!(kept(&project(A)), [server]);
+    let stated = rig.call(
+        "service_create",
+        json!({ "name": "web2", "template": "app", "tenant": A, "registry": server }),
+    );
+    assert!(
+        matches!(&stated, Err(CallError::Invalid(message))
+            if message.starts_with("registry: only a create of the node's own project")),
+        "{stated:?}"
+    );
+
+    // The node's own create that only says the registry, in a call of its own with no card behind it, does not run.
+    let direct = rig.call(
+        "service_create",
+        json!({ "name": "mine", "template": "own", "registry": server }),
+    );
+    assert!(
+        matches!(&direct, Err(CallError::Refused { code, .. }) if code == "NotApproved"),
+        "{direct:?}"
+    );
+    assert!(kept(PROJECT).iter().all(|address| !address.contains('@')));
+    // The node's own, from the same registry, is sent the credential in the address: the control.
+    rig.approved(
+        "service_create",
+        json!({ "name": "mine", "template": "own" }),
+    )
+    .expect("the node's own");
+    let with: Vec<String> = kept(PROJECT)
+        .into_iter()
+        .filter(|address| address.contains('@'))
+        .collect();
+    assert_eq!(with.len(), 1, "{with:?}");
+    assert!(with[0].ends_with("@docker.io") && with[0].contains(&word));
+    // Incus is told not to go back to the registry for it by itself, and the image stays while a service is made
+    // from it and goes with the last one.
+    let credentialed = || -> Vec<Value> {
+        rig.get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+            .and_then(|images| images.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|image| {
+                image["update_source"]["server"]
+                    .as_str()
+                    .is_some_and(|address| address.contains('@'))
+            })
+            .collect()
+    };
+    assert_eq!(credentialed()[0]["auto_update"], false);
+    rig.approved(
+        "service_create",
+        json!({ "name": "mine2", "template": "own" }),
+    )
+    .expect("a second of the node's own");
+    assert_eq!(credentialed().len(), 1);
+    rig.approved("service_remove", json!({ "name": "mine" }))
+        .expect("removed");
+    assert_eq!(credentialed().len(), 1, "mine2 is made from it still");
+    rig.approved("service_remove", json!({ "name": "mine2" }))
+        .expect("removed");
+    assert!(
+        credentialed().is_empty(),
+        "the image went with its last service"
+    );
+
+    // An image fetched without a credential holds none: it is Incus's to keep or prune, and a removal leaves it.
+    let mut plain = app_template("plain");
+    plain["image"] = json!("quay.example/acme/plain");
+    plain["digest"] = json!(format!("sha256:{}", "d".repeat(64)));
+    rig.template("plain", plain);
+    create(&rig, "bare", "plain", None);
+    let bare = "https://quay.example".to_string();
+    assert!(kept(PROJECT).contains(&bare));
+    rig.approved("service_remove", json!({ "name": "bare" }))
+        .expect("removed");
+    assert!(kept(PROJECT).contains(&bare), "{:?}", kept(PROJECT));
+    // And still nothing of the tenant's holds it.
+    assert!(
+        kept(&project(A))
+            .iter()
+            .all(|address| !address.contains('@'))
+    );
+    assert!(
+        kept(&project(B))
+            .iter()
+            .all(|address| !address.contains('@'))
+    );
+}

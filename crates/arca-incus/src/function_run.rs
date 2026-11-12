@@ -7,9 +7,11 @@
 //! ([`FUNCTION_KEY`]) in its own config, or that is not a container, before anything is written. A service's instance
 //! never carries the mark, so no service is ever started, stopped or force-stopped from here.
 //!
-//! What a run writes to Incus: the instance's `state` (a start, and a stop when the run passes its time limit) and its
-//! console log (cleared before the start, so what is read after the run is that run's output and nothing older). It
-//! never creates, deletes, renames or reconfigures an instance.
+//! What a run writes to Incus: the instance's root disk (rebuilt from its image before the start, so no run finds what
+//! an earlier one wrote), its `state` (a start, and a stop when the run passes its time limit) and its console log
+//! (cleared before the start, so what is read after the run is that run's output and nothing older). It never
+//! creates, deletes or renames an instance, and never changes its config or its devices: a rebuild keeps both, and
+//! the instance's uuid.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,6 +28,33 @@ pub const FUNCTION_KEY: &str = "user.arca.function";
 pub const OUTPUT_MAX: usize = 1024 * 1024;
 /// The longest one start or stop operation is waited on.
 const DEADLINE: Duration = Duration::from_secs(60);
+
+/// The key Incus writes on an instance when it starts it for the first time, and keeps from then on, across a stop
+/// and across a rebuild. An instance without it has never run: a start that Incus refused does not write it.
+pub const STARTED_KEY: &str = "volatile.last_state.power";
+
+/// Where a run's root came from: the image it was rebuilt from, or nowhere, when nothing was rebuilt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshRoot {
+    /// Nothing was rebuilt: the container has never been started, so its root is the one its create made from the
+    /// image, and no program has run in it.
+    New,
+    /// The copy the project's own image store holds: no registry was asked.
+    Store,
+    /// The registry: the store's copy was gone, and Incus fetched the image again.
+    Registry,
+}
+
+impl FreshRoot {
+    /// The word a run's line carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Store => "store",
+            Self::Registry => "registry",
+        }
+    }
+}
 
 /// Whether `state` is a function's instance: a container whose own config carries the mark.
 pub fn is_function(state: &InstanceState) -> bool {
@@ -83,6 +112,146 @@ impl FunctionRun {
             return Err(refused("the instance is not stopped"));
         }
         self.put_state(&fresh, &json!({ "action": "start" }))
+    }
+
+    /// Gives the instance its image's own root again: Incus rebuilds the root disk from the image and keeps the config,
+    /// the devices and the uuid.
+    ///
+    /// An instance that has never been started is not rebuilt ([`FreshRoot::New`]): its root is the one its create
+    /// made from the image and nothing has run in it. It must not be rebuilt either: a rebuild takes away the id map
+    /// a container would start with next, a container that has run starts from the map it last ran with, and one
+    /// that never ran has none, so Incus refuses its start from then on ("No ID map found for unprivileged
+    /// container", seen on Incus 7.5.1). Whether it has started is read on the instance itself ([`STARTED_KEY`]).
+    ///
+    /// `fingerprint` is the image the function was created from, as its record holds it: the copy the project's own
+    /// store keeps, for which no registry is asked. The instance's own word for its image (`volatile.base_image`) is
+    /// never used: whoever may write the instance could point it at another image of the store. When the store no
+    /// longer holds that copy, or the record names none, the rebuild names `source` instead, the image by digest on
+    /// its registry, and Incus fetches it again; `source` must be exactly that. A copy that is there and cannot be
+    /// rebuilt from is an error, and the registry is not asked: only a missing copy is. `cancelled` is asked before
+    /// the registry is: a function that is being removed fetches nothing. The instance must be stopped.
+    pub fn fresh_root(
+        &self,
+        seen: &InstanceState,
+        fingerprint: Option<&str>,
+        source: &Value,
+        registry: Option<&crate::write::RegistryCredential>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<FreshRoot, IncusError> {
+        let fresh = self.fresh(seen)?;
+        if !fresh.is_stopped() {
+            return Err(refused("the instance is not stopped"));
+        }
+        if fingerprint.is_some_and(|held| !self::fingerprint(held)) {
+            return Err(refused(
+                "the function's record names an image that is no fingerprint",
+            ));
+        }
+        if !fresh.own_config.contains_key(STARTED_KEY) {
+            // Never started: nothing has run in its root, and a rebuild would leave it unable to start. What can
+            // be checked of such a root is checked: the instance still says it was made from the image the
+            // function's record took.
+            let made_from = fresh.own_config.get("volatile.base_image");
+            if fingerprint.is_some_and(|held| made_from.map(String::as_str) != Some(held)) {
+                return Err(refused(
+                    "the instance has never been started and does not say it was made from the image its function's record took: remove the function and create it again",
+                ));
+            }
+            return Ok(FreshRoot::New);
+        }
+        if let Some(held) = fingerprint
+            && self.changer.image_present(&fresh.project, held)?
+        {
+            self.changer.rebuild(
+                &fresh.project,
+                &fresh.name,
+                &json!({ "source": { "type": "image", "fingerprint": held } }),
+            )?;
+            return Ok(FreshRoot::Store);
+        }
+        if cancelled() {
+            return Err(refused(
+                "the function is being removed, so its image was not fetched",
+            ));
+        }
+        if !registry_source(source) {
+            return Err(refused(
+                "the function's record names no image by digest on a registry to rebuild its root from",
+            ));
+        }
+        // A registry that asks for a credential is named with it, in the address that is sent and nowhere else.
+        let mut sent = source.clone();
+        let address = registry
+            .and_then(|registry| registry.address(source["server"].as_str().unwrap_or_default()));
+        let with_credential = address.is_some();
+        if let Some(address) = address {
+            sent["server"] = json!(address);
+        }
+        let rebuilt = self
+            .changer
+            .rebuild(&fresh.project, &fresh.name, &json!({ "source": sent }));
+        if with_credential {
+            self.fetched_images_stay_put(&fresh);
+        }
+        match rebuilt {
+            Ok(()) => Ok(FreshRoot::Registry),
+            Err(remote) => Err(refused(&format!(
+                "the node's own copy of the image is gone, and the registry did not give it again: {remote}"
+            ))),
+        }
+    }
+
+    /// After a rebuild that was sent a registry's credential, done or not: Incus makes a record for the image it
+    /// fetched, with the address it was fetched from and `auto_update` on, as it does for every image it fetches.
+    /// It is turned off on every such image of the project, so Incus does not go back to the registry with that
+    /// address by itself. A failure is said on the log: the periodic sweep tries again.
+    fn fetched_images_stay_put(&self, rebuilt: &InstanceState) {
+        // Every one of them is tried: one that Incus will not change does not leave the others on.
+        let settled = self
+            .fetched_with_credential(&rebuilt.project)
+            .map(|images| {
+                images
+                    .iter()
+                    .filter(|image| image.auto_update)
+                    .filter(|image| {
+                        self.auto_update_off(&rebuilt.project, &image.fingerprint)
+                            .is_err()
+                    })
+                    .count()
+            });
+        if settled != Ok(0) {
+            eprintln!(
+                "arca: auto_update could not be turned off on the image {} was rebuilt from: Incus may ask its registry again by itself until the next sweep",
+                rebuilt.name
+            );
+        }
+    }
+
+    /// The cached images of the project's store whose own record says they were fetched with a credential, each
+    /// with whether Incus would fetch it again by itself and whether an instance of the project is made from it.
+    pub fn fetched_with_credential(
+        &self,
+        project: &str,
+    ) -> Result<Vec<crate::lifecycle::FetchedImage>, IncusError> {
+        self.changer.fetched_with_credential(project)
+    }
+
+    /// Tells Incus not to go back by itself to where the cached image `fingerprint` came from.
+    pub fn auto_update_off(&self, project: &str, fingerprint: &str) -> Result<(), IncusError> {
+        if !self::fingerprint(fingerprint) {
+            return Err(refused("not an image fingerprint"));
+        }
+        self.changer.image_auto_update_off(project, fingerprint)
+    }
+
+    /// Deletes a cached image the project's store holds, when no instance of the project was made from it any more.
+    /// Incus keeps, with an image it fetched, the address it fetched it from, a registry's credential included: the
+    /// image goes with its last user, and the credential with it. Returns whether it was deleted.
+    pub fn drop_unused_image(&self, project: &str, fingerprint: &str) -> Result<bool, IncusError> {
+        if !self::fingerprint(fingerprint) {
+            return Err(refused("not an image fingerprint"));
+        }
+        self.changer.delete_unused_image(project, fingerprint)
     }
 
     /// Stops the instance: a graceful stop that Incus gives `grace` to finish, then a forced one. With no grace the stop
@@ -174,6 +343,34 @@ impl FunctionRun {
     fn put_state(&self, fresh: &InstanceState, body: &Value) -> Result<(), IncusError> {
         self.changer.put_state(&fresh.project, &fresh.name, body)
     }
+}
+
+/// Whether `text` is an image fingerprint as Incus writes one: 64 hex digits in lower case.
+fn fingerprint(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Whether `source` is an OCI image pulled by digest from a registry, and nothing more: the only source a rebuild that
+/// asks a registry may name.
+fn registry_source(source: &Value) -> bool {
+    let Some(fields) = source.as_object() else {
+        return false;
+    };
+    fields.len() == 5
+        && source["type"] == "image"
+        && source["mode"] == "pull"
+        && source["protocol"] == "oci"
+        && source["server"]
+            .as_str()
+            .is_some_and(|server| server.starts_with("https://"))
+        && source["alias"].as_str().is_some_and(|alias| {
+            alias
+                .rsplit_once("@sha256:")
+                .is_some_and(|(name, digest)| !name.is_empty() && fingerprint(digest))
+        })
 }
 
 fn console_url(state: &InstanceState, query: &str) -> Result<String, IncusError> {

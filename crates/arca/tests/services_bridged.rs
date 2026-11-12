@@ -441,8 +441,11 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
     assert_eq!(vm.mac.as_deref(), Some("02:aa:bb:00:00:01"));
 
     // List, status and logs work.
+    // The list reads no live state, and a machine on a host bridge has its address nowhere else: its row says so.
     let listed = rig.call("service_list", json!({})).expect("list");
-    assert_eq!(listed["services"], json!([created]));
+    let mut row = created.clone();
+    row["ipv4In"] = json!("state");
+    assert_eq!(listed["services"], json!([row]));
     assert_eq!(
         rig.call("service_status", json!({"name":"ws1"}))
             .expect("status"),
@@ -728,7 +731,13 @@ fn a_vm_create_is_proposed_approved_by_the_owner_and_run_by_the_same_handler() {
         .kernel
         .lock()
         .expect("kernel")
-        .propose_action(ActionKind::ServiceCreate, args, NOW, None)
+        .propose_action(
+            ActionKind::ServiceCreate,
+            // Bound as the node binds a proposal when it is made.
+            common::bound_create(&rig.dir, args),
+            NOW,
+            None,
+        )
         .expect("the proposal is inert");
     assert!(
         rig.fake.writes().is_empty() && rig.entry_ids().is_empty(),

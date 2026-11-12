@@ -197,6 +197,65 @@ fn state_files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::P
 }
 
 #[test]
+fn a_pinned_local_image_holds_for_an_approved_create_and_for_a_create_in_a_tenant() {
+    let rig = Rig::new(Some(policy()));
+    rig.create_tenant(json!({ "id": A })).expect("the tenant");
+    // The service project is made with the node's first service, and holds the image after that.
+    rig.template("app", app_template("app"));
+    rig.call(
+        "service_create",
+        json!({ "name": "first", "template": "app" }),
+    )
+    .expect("the first service makes the project");
+    let held = rig.fake().add_image(PROJECT, "pinned-image");
+    let other = "0".repeat(64);
+    let template = |digest: &str| {
+        json!({
+            "name": "pinned", "kind": "system", "image": "local:pinned-image",
+            "digest": format!("sha256:{digest}"), "ports": [], "env": {}, "publishable": false
+        })
+    };
+    // A create the owner approved is held to the pin like any other: with another image under the alias it is refused.
+    rig.template("pinned", template(&other));
+    let (_, message) = refusal(rig.approved(
+        "service_create",
+        json!({ "name": "dash", "template": "pinned" }),
+    ));
+    assert_eq!(
+        message,
+        format!(
+            "template pinned: its image pinned-image is pinned to sha256:{other}, and the image under that alias in the service project {PROJECT} is sha256:{held}. Nothing was created. Put the pinned image under the alias, or change the template's digest"
+        )
+    );
+    rig.template("pinned", template(&held));
+    rig.approved(
+        "service_create",
+        json!({ "name": "dash", "template": "pinned" }),
+    )
+    .expect("the approved create, from the pinned image");
+
+    // In a tenant the image is looked for in the tenant's own project, and held to the same pin.
+    let project = project(A);
+    let in_tenant = rig.fake().add_image(&project, "pinned-image");
+    let (_, message) = refusal(rig.call(
+        "service_create",
+        json!({ "name": "dash", "template": "pinned", "tenant": A }),
+    ));
+    assert_eq!(
+        message,
+        format!(
+            "template pinned: its image pinned-image is pinned to sha256:{held}, and the image under that alias in the service project {project} is sha256:{in_tenant}. Nothing was created. Put the pinned image under the alias, or change the template's digest"
+        )
+    );
+    rig.template("pinned", template(&in_tenant));
+    rig.call(
+        "service_create",
+        json!({ "name": "dash", "template": "pinned", "tenant": A }),
+    )
+    .expect("the tenant's create, from the image its project holds");
+}
+
+#[test]
 fn a_node_without_the_key_has_no_tenants_whatever_the_verb() {
     let rig = Rig::new(None);
     rig.template("app", app_template("app"));

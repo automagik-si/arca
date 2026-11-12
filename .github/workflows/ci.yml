@@ -122,13 +122,58 @@ jobs:
     env:
       CI_SLOT_CPUS: 6
     steps:
+      # With the release tags: one test compares every file an earlier release shipped with the list of them in
+      # crates/arca/src/cmd_templates.rs, and reads those files from the tags. Without the tags it has nothing to
+      # compare and, in CI, fails. The whole history comes with them, about half a second more than a shallow checkout.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
       - name: Toolchain, C compiler and test programs
         run: scripts/ci-setup.sh test
+      # The tests are built first, and what the build left to write is written out before any of them runs.
+      # A test that keeps a store commits to it with fsync, and the node counts a commit that takes over a second as a
+      # slow commit and says so in what it publishes (`arca_store_slow_commits_total`, the warning
+      # `store-commit-slow`), which a golden text reads. Straight after a build the disk still owes the build's
+      # gigabytes, and an fsync waits behind them: a golden text once came out "wrong" that way, with nothing wrong.
+      - name: Build the tests
+        run: cargo test --workspace --no-run
+      - name: Write out what the build left, and time a small write before and after
+        run: |
+          probe() {
+            # Ten 4 KiB writes, each on the disk before the next: the slowest, in milliseconds.
+            local worst=0 start took
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              start=$(date +%s%N)
+              dd if=/dev/zero of="${TMPDIR:-/tmp}/arca-write-probe" bs=4k count=1 conv=fsync status=none
+              took=$(( ($(date +%s%N) - start) / 1000000 ))
+              [ "$took" -le "$worst" ] || worst=$took
+            done
+            rm -f "${TMPDIR:-/tmp}/arca-write-probe"
+            echo "$1: the slowest of ten small writes took ${worst} ms"
+          }
+          probe "after the build"
+          start=$(date +%s)
+          sync
+          echo "sync took $(( $(date +%s) - start )) s"
+          probe "after sync"
       - name: cargo test
         run: cargo test --workspace
+      # Printed on every run, also a red one: where the tests wrote, and what the job's memory held at the end. A
+      # write that fails for want of memory or room shows here; so does a job that sits at its slot's limit.
+      - name: Where the tests wrote and what the job's memory held
+        if: always()
+        run: |
+          df -hT "${TMPDIR:-/tmp}" "${CARGO_TARGET_DIR:-target}" 2>/dev/null || true
+          cgroup=/sys/fs/cgroup
+          for file in memory.max memory.high memory.current memory.peak memory.swap.current; do
+            if [ -r "$cgroup/$file" ]; then echo "$file $(cat "$cgroup/$file")"; fi
+          done
+          grep -E '^(anon|file|shmem|file_dirty|file_writeback|slab) ' "$cgroup/memory.stat" 2>/dev/null || true
+          for file in memory.events memory.pressure io.pressure; do
+            if [ -r "$cgroup/$file" ]; then echo "$file:"; sed 's/^/  /' "$cgroup/$file"; fi
+          done
 
   canvas:
     name: canvas node --test

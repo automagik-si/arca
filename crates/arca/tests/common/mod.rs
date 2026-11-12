@@ -548,3 +548,17 @@ pub fn listed_refusal_entry(code: &str) -> Option<Value> {
         .find(|entry| entry["code"] == code)
         .cloned()
 }
+
+/// A create's arguments as the node gives them to a proposal when it is made: with the image the template names and
+/// the fingerprint of the template's content, read from `state_dir/templates`. A test that records a proposal
+/// itself, and not through `action_propose`, binds it with this, as the node does.
+#[allow(dead_code)]
+pub fn bound_create(state_dir: &std::path::Path, mut args: serde_json::Value) -> serde_json::Value {
+    let template = args["template"].as_str().expect("a template").to_string();
+    let content = arca::service::load_template_content(&state_dir.join("templates"), &template)
+        .unwrap_or_else(|_| panic!("the template {template} loads"));
+    args["image"] = serde_json::json!(arca::service::template_image(&content.template));
+    args["templateDigest"] =
+        serde_json::json!(content.digest.expect("its content has a fingerprint"));
+    args
+}

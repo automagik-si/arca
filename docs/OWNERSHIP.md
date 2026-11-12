@@ -994,15 +994,18 @@ Source: `mode_refusal` in `crates/arca/src/handlers.rs` and `check_bridged_start
 **Rule 58.** The virtual-machine caps (count, CPUs, memory, root disk) are one set per node and cover every virtual machine Arca
 holds, on either network: `kernel.bridged.limits` when the node sets `kernel.bridged`, and `kernel.vmLimits` on a managed node
 that does not. A node with neither creates no virtual machine. `service_create` adds up the virtual-machine records it holds and
-refuses a create that would pass a cap, before any write. Incus enforces them too only where it can do so for virtual machines
+refuses a create that would pass a cap, before any write. A proposed create is refused the same way when the proposal is made,
+by the same function, so no card is recorded for it; the approved create asks again. Incus enforces them too only where it can do so for virtual machines
 alone: on a bridged node the project carries all four as `limits.*` and `limits.containers` is `0`; on a mixed or managed node
 the project carries `limits.virtual-machines` only, because Incus's `limits.cpu`, `limits.memory` and `limits.disk` count the
 containers of the project as well. So on those nodes the CPU, memory and disk caps are Arca's check alone, and a virtual machine
 made by hand in the project is outside them. Containers have no node cap: each keeps the service profile's own limits (or its
 template's), and the address plan bounds containers, databases and managed virtual machines together at 230.
-Source: `KernelConfig::vm_caps`, `check_bridged` and `check_vm_limits` in `crates/arca/src/config.rs`; `caps_refusal` in
-`crates/arca/src/handlers.rs`; tests `the_caps_count_virtual_machines_on_both_networks_and_no_container` and
-`vm_limits_are_the_caps_of_a_managed_node_without_host_bridges`.
+Source: `KernelConfig::vm_caps`, `check_bridged` and `check_vm_limits` in `crates/arca/src/config.rs`; `caps_refusal` and
+`create_room_refusal` in `crates/arca/src/handlers.rs`; tests
+`the_caps_count_virtual_machines_on_both_networks_and_no_container`,
+`vm_limits_are_the_caps_of_a_managed_node_without_host_bridges` and
+`a_proposal_over_a_cap_of_the_node_is_refused_when_it_is_made_and_no_card_waits`.
 
 **Rule 59.** Every virtual machine Arca creates carries the device `agent` (`{"type":"disk","source":"agent:config"}`), the NIC
 name `enp5s0` on its `eth0` device and `agent.nic_config` set to `true`. Incus 7.6 offers the guest its config share over 9p
@@ -1061,7 +1064,8 @@ enter Incus's instance config.
   unchanged. Neither may hold a secret, and nothing is changed on a virtual machine after its create (Rule 59), so a changed
   script or setting applies to a machine created after the change.
 - `createSettings` lists the top-level keys of `settings` that one `service_create` may replace with its own `settings`
-  argument. The value in the template is the default and gives the shape. `create_settings` refuses, before any write and
+  argument, each named in 1 to 64 plain characters (`validate_vm_template`, as a rule's names are), since a refusal
+  tells them back. The value in the template is the default and gives the shape. `create_settings` refuses, before any write and
   again when a create is proposed, and names the place down to a list's element (`setting_refusal`): a key that is not
   listed; at any level a value of another JSON type than the default, an element of a list unlike the default's first,
   or a key the default's object does not have; a number that does not read back the same from the canonical JSON an
@@ -1093,8 +1097,10 @@ enter Incus's instance config.
   `crates/arca/tests/services/update_available.rs`.
 - `secrets` names the template's secrets. `service_secret_set` stores a value in the secret store, the private files under
   `<stateDir>/secrets` that a container's secrets use, and puts a reference in the record's `secretRefs`. A virtual
-  machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value; a
-  carriage return before a line feed is dropped, and a carriage return alone is refused. A virtual machine whose template
+  machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value, and
+  it is stored as given, with the line break at its end when it has one (the limit of 4096 characters does not count
+  that one); a carriage return before a line feed is dropped, and a carriage return alone is refused. A container's and
+  a function's value is one line, and a line break at its end is refused (`service::secret_value`). A virtual machine whose template
   declares secrets is created stopped. That fails closed and is not a guarantee that it never boots without them: a
   machine with `boot.autostart` that Incus starts by itself before the first `instance_start` boots with no secret file,
   and what runs in it must wait for the file.
@@ -1487,7 +1493,17 @@ Source: `function_egress_rules` in `crates/arca-netproject/src/tenant.rs`, with 
 
 **Rule 73.** A run is not an effect. `arca_incus::function_run` is a path beside the effect journal, as the state
 writer of the instance verbs is: it reads one instance, refuses it unless it is a container that carries the function
-mark and has the uuid it was read with, and then writes only its `state` (a start, a stop) and clears its console log.
+mark and has the uuid it was read with, and then writes only three things of it: its root disk, which Incus rebuilds
+from an image (the store's copy whose fingerprint the function's record took at its create, or, when that copy is
+gone, the function's own image by digest on its registry, and no other source: never the image the instance itself
+names); its `state` (a start, a stop); and its console log, which it clears. A rebuild
+keeps the instance's config, devices and uuid, so nothing a journalled effect wrote is changed by it.
+An instance that has never been started is not rebuilt: its root is the one its create made from the image and no
+program has run in it, and Incus cannot start a container that was rebuilt before its first start. Whether it has
+started is read on the instance (`volatile.last_state.power`, which Incus writes at the first start and keeps), and
+before that first start the instance must say it was made from the image the function's record took. Whoever may
+write the instance through Incus can remove that key or write into a stopped container's root; that right already
+decides what the function runs, since the entry point and the devices are config a rebuild keeps.
 It forces a stop when a run passes its time limit, and nothing reaches it with a service's instance: the instance
 verbs and their writer still force nothing, and refuse a function's instance. (The kernel's own delete of an instance,
 and the folder and adoption writers, force a stop too, each of its own object, as before.) The kernel starts a run only for the instance whose uuid the effect
@@ -1496,10 +1512,13 @@ state directory, and nothing to the desired state or the effect journal.
 
 Source: `FunctionRun` and `is_function` in `crates/arca-incus/src/function_run.rs`, with the tests in
 `crates/arca-incus/tests/function_run.rs` (`a_service_is_never_read_started_or_force_stopped_from_here`,
-`a_function_outside_the_family_or_recreated_is_refused`); `FunctionRunner` in `crates/arca/src/function_run.rs`;
+`a_function_outside_the_family_or_recreated_is_refused`,
+`a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that_is_gone`,
+`a_container_that_never_started_is_not_rebuilt_and_one_that_has_run_is`); `FunctionRunner` in `crates/arca/src/function_run.rs`;
 `InstanceLifecycle::target` in `crates/arca/src/lifecycle.rs`. Tests in `crates/arca/tests/functions.rs`
 (`ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state`,
-`a_run_starts_only_the_instance_arca_created_for_its_function`).
+`a_run_starts_only_the_instance_arca_created_for_its_function`,
+`every_run_starts_from_its_images_own_root_or_does_not_start`).
 
 `function_create` and `function_remove` run only from a proposal the owner approved; a removal is the removal of a
 service (the instance is deleted before its ACL), after the run that is going has been stopped. A service a function
@@ -1511,9 +1530,9 @@ links to is not removed while the function exists: the removal is refused when i
 **Rule 74.** No call chooses the image a database runs. `postgres_create` takes its image from the node alone, through
 both doors, a token's own call and a proposal the owner approves. On a node whose config sets no
 `kernel.postgresImage` the database is the service that `service_create` makes from the node's `postgres-autopg`
-template: `postgres_create` calls that handler with the name, the template and the image the template named when the
-call was checked, and nothing else. So the image is fetched by registry and digest as every template's is (Rule 11),
-the handler compares that image with the template it reads for the create, and a token's own `postgres_create` makes
+template: `postgres_create` calls that handler with the name, the template, and the image and the content of the
+template as they were when the call was checked (Rule 75), and nothing else. So the image is fetched by registry and digest as every template's is (Rule 11),
+the handler compares both with the template it reads for the create, and a token's own `postgres_create` makes
 no more than its own `service_create` of that template makes: a token whose tool list leaves out `service_create`
 makes no database this way. A proposal is given the template's name and the image it pins when it is made, by the
 node and by no caller, so the card shows the image and the approval binds it; one that states another image is
@@ -1527,13 +1546,12 @@ from a template that generates none the service is created stopped, the card car
 has, and the answer says why.
 
 A record of the old kind is not touched by any of this: the `arca.postgres` plugin and its record are as they were,
-so an existing database's entry, digest, instance and ACL are the same after an upgrade. The binding is of the image:
-the template's entrypoint script, environment and ports are the node's own files and are read when the service is
-created.
+so an existing database's entry, digest, instance and ACL are the same after an upgrade. A database's proposal binds
+the content of its template as every create's does (Rule 75): the script that opens the database, its environment
+and its ports are part of what the card's last row names.
 
 Source: `database_source`, `database_image_changed`, `enrich_postgres_create`, `database_card_fact`,
-`PostgresHandler::create_from_template`, `PostgresHandler::call` and the `pin` check of `service_create` in
-`crates/arca/src/handlers.rs`; `ActionKind::prepare`, `database_service_words` and the `PostgresCreate` rows in
+`PostgresHandler::create_from_template` and `PostgresHandler::call` in `crates/arca/src/handlers.rs`; `ActionKind::prepare`, `database_service_words` and the `PostgresCreate` rows in
 `crates/arca/src/action_proposal.rs`. Tests in `crates/arca/tests/tenants/databases.rs`
 (`the_shipped_database_template_generates_its_password`,
 `on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_fetched_by_digest`,
@@ -1544,12 +1562,116 @@ Source: `database_source`, `database_image_changed`, `enrich_postgres_create`, `
 `a_database_takes_a_name_nothing_holds_and_a_failed_create_leaves_no_password`,
 `a_template_that_generates_no_password_makes_a_stopped_database_and_the_card_says_so`,
 `a_token_whose_tool_list_leaves_out_service_create_makes_no_database_from_the_template`,
-`the_image_checked_and_the_image_created_from_are_one_read_of_the_template`,
+`what_a_database_was_checked_against_and_what_it_is_created_from_are_one_read_of_the_template`,
 `a_create_the_service_handler_refuses_leaves_no_password_behind`,
 `a_node_whose_config_sets_up_no_services_refuses_a_database_in_those_words`) and in
 `crates/arca/src/action_proposal.rs`
 (`a_proposed_database_names_the_configured_image_or_the_template_the_kernel_filled_in`). That a clean node's Incus
 fetches the template's image by digest is under "Assumptions to confirm".
+
+## What the owner saw is what is created
+
+**Rule 75.** A create that the owner approves is made from the template the card showed, and from no other. When a
+`service_create` or a `postgres_create` is proposed, the node gives the proposal two things it reads from the
+template then, and no caller does: `image`, the image the template names (`<image>@sha256:<digest>` when it gives a
+digest, the bare name when it gives none, and for a virtual machine that names a version, ` running <version>` after
+its own system image), and `templateDigest`, the fingerprint of the template's content: SHA-256 over the bytes of its
+file and of each script it names (its entrypoint's, a machine's first-boot script), each part framed by its name and
+its length. The bytes are hashed as they stand, so any edit, a changed space among them, is another template. Both
+are arguments, so the approval's digest binds them and a restart keeps them; a caller that states either is only
+compared with the node's own, and refused when it differs.
+
+The card ends with them: an `Image` row, which for an image with no digest says in words that Incus takes what that
+name gives when the service is created, and last a `Template content` row with the fingerprint whole. The create reads
+the template's file and its scripts once (`load_template_content`), compares what the call states with that read, and
+builds the service from that same read: its entrypoint and its first-boot script are the ones that were hashed, so
+nothing stands between the check and the create. A template that was edited, or installed again by an upgrade, since
+the card was shown creates nothing, and the refusal says to propose it again. A card that names no
+`templateDigest` (a create, or a database made from the node's template, recorded before the node bound it) is
+refused when its approval is submitted, before the approval is checked, so the owner's approval is not spent on it
+and nothing runs; the create refuses such a call too. A token's own create has no card
+and binds nothing; one that states a `templateDigest` or an `image` is held to it the same way. A proposal for a
+template that does not load, or whose script cannot be read, is refused when it is made, so no card is shown for it.
+
+What a card says of its template beyond the arguments is read from that same read: the `Start` row of a create whose
+template leaves it stopped, and a database card's words about its password. So the rows of one card describe one
+template, the one its fingerprint names.
+
+Not bound, because they are not the template's: why a service is created stopped (that is read from the stored
+secrets when the create runs), the node's own config, and what stands behind an image name that has no digest. The
+kernel access and the private destinations of a create are bound by their own arguments (Rules 69 and 70).
+
+The binding covers the create and nothing after it. The verbs that act on a service later read the template as it
+is installed then: `service_connect` reads its `provides` and the secrets it declares, the Omni verbs read it, and
+`instance_start` writes a machine's secrets by its list. A template edited after a service was created changes what
+those verbs do for that service.
+
+Known limits. A handler built without the node's config fills nothing in: it records the `image` a caller states,
+and its card shows it. `serve` always gives the config; only tests build such a handler. A proposal from it is
+either unbound, and never approved, or held by the create's own compare, so nothing is created from it. On a
+reload, the reason in a kept `Start` row is the journal's own text: whoever can write the node's private journal
+can change those words and nothing else of a card, and what runs is decided by the arguments' digest.
+
+Source: `TemplateContent`, `load_template_content`, `template_digest`, `template_image`, `entrypoint_with` and
+`first_boot_with` in `crates/arca/src/service.rs`; `enrich_service_create`, `enrich_postgres_create`,
+`database_source`, `database_card_fact`, `template_not_the_one_stated`, `template_not_bound` and the compare in
+`service_create` in `crates/arca/src/handlers.rs`; `Kernel::approve_action` in `crates/arca/src/kernel.rs`;
+`ActionKind::unbound_template`, `image_words`, `template_content_words` and the closing rows of
+`ActionKind::details_with_gpu` in `crates/arca/src/action_proposal.rs`. Tests in
+`crates/arca/tests/tenants/template_binding.rs`
+(`a_proposed_create_is_given_its_templates_image_and_content_and_the_card_shows_both`,
+`a_pinned_local_image_is_on_the_card_by_its_fingerprint_and_is_what_the_instance_is_made_from`,
+`a_template_changed_after_the_card_was_shown_is_not_created`,
+`a_card_that_waits_across_an_upgrade_of_the_shipped_templates_is_refused_and_proposed_again`,
+`a_database_proposal_binds_the_content_of_its_template_too`, `the_binding_holds_across_a_restart_of_the_node`,
+`a_card_that_bound_no_content_is_refused_before_the_approval_is_spent`,
+`a_tokens_own_create_has_no_card_and_one_that_states_the_content_is_held_to_it`,
+`a_create_that_could_not_be_made_from_its_template_is_refused_when_it_is_proposed`), in
+`crates/arca/src/service.rs`
+(`a_templates_fingerprint_is_of_its_bytes_as_they_stand_and_no_byte_passes_between_parts`,
+`the_image_of_a_template_is_what_boots_and_then_the_version_a_machine_runs`) and in
+`crates/arca/src/action_proposal.rs`
+(`the_image_row_says_what_boots_what_its_name_leaves_open_and_what_a_machine_runs`).
+
+## A registry's credential
+
+**Rule 76.** A registry's credential is a secret of the node, not of an entry: its files stand in the secret store
+under `registry-` and 32 hex digits of the SHA-256 of the registry's host and port, a name of one length that two
+hosts do not share and no entry has, and no entry may use any secret whose name begins `registry-`. The directory
+holds the address the credential was set for, and the credential is given only when that address equals the one
+asked for, byte for byte in lower case: never to another host. Only the provider reads them, at
+the moment of an instance's create in a project of the node's own, never a tenant's, and hands them to the writer
+beside the create's body. The writer checks the body as it is, which still refuses a credential in a server address,
+and writes the credential only into the address of the body it sends. The desired state, the effect journal (whose
+digest is of the body without it), a proposal and a card never hold it. A create whose image is on a registry the
+node holds a credential for states `registry`, that registry's address, which a proposal fills in and the card says in
+words: without it the create is refused, and so is one that states it in a call with no approved proposal behind it. A function's rebuild from the registry is sent the credential the same way.
+Incus keeps the address in the fetched image's record: the writer turns `auto_update` off on such images after a
+create that was sent the credential, whatever the create answered, the narrow path does the same after a rebuild, and
+a removal deletes a cached image that was fetched with a credential once no instance of the project was made from it.
+
+A sweep (`ImageSweep`, at the start of `arca serve` and every ten minutes, in the node's own service project and no
+other) is a third path beside the effect journal, as a run is. It writes two things, each of a cached image whose own
+record holds a credential in its address, and of no other image: `auto_update`, which it turns off, and the image
+itself, which it deletes when no instance of the project is made from it and it has seen it so for fifteen minutes.
+These belong to no entry and have no inverse, so they are not effects: each is a line of `registry-images.jsonl` in
+the state directory (the project, the fingerprint, what and why), as a run is a line of the run log.
+
+Source: `RegistryCredential` and `create_with_registry` in `crates/arca-incus/src/write.rs`; `ImageSweep`, `SWEEP_EVERY_MS` and `ORPHAN_AGE_MS` in
+`crates/arca/src/registry.rs`; `fetched_with_credential` in `crates/arca-incus/src/lifecycle.rs`; `registry_credential`
+and `registry_owner` in `crates/arca-providers/src/incus.rs`; `crates/arca/src/registry.rs`; `with_registry` and
+`drop_fetched_images` in `crates/arca/src/function_handlers.rs`; `FunctionRun::fresh_root` and `drop_unused_image`
+in `crates/arca-incus/src/function_run.rs`. Tests in `crates/arca/tests/functions.rs`
+(`an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_rests_in_incus_alone`,
+`a_registrys_credential_never_reaches_another_host_or_a_functions_environment`,
+`the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_old_orphan`,
+`a_sweep_round_goes_on_past_an_image_that_incus_will_not_change`),
+`crates/arca/tests/tenants/isolation.rs` (`a_tenants_image_is_fetched_without_the_nodes_registry_credential`),
+`crates/arca-providers/tests/incus_provider.rs`
+(`a_registrys_credential_has_a_name_of_its_own_goes_to_its_own_host_and_is_no_entrys_to_name`) and
+`crates/arca-incus/tests/function_run.rs`
+(`a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_deleted`,
+`the_turn_off_after_a_rebuild_goes_on_past_an_image_that_incus_will_not_change`).
 
 ## Out of scope
 
