@@ -793,15 +793,19 @@ incus delete base-prep --project PROJECT
 The pull also leaves a cached copy of `images:debian/13` in the project; delete it if it is not wanted. The build
 removes its own builder instance and leaves the base and the built image.
 
-The image's name carries both things it is built from: `arca-automagik-<commit>-dsh-<harness>`, the first 12 hex digits
-of the template's `commit` and of the SHA-256 of `templates/automagik-dsh/package-lock.json`, which pins DSH and
-everything it installs (Incus takes an alias of 64 characters at most, so the full commit is the image's `arca.commit`
-property, beside `arca.harness`). The template names that image, and the script refuses a template that names another
-before it touches Incus, with the name to set. So a new DSH is a new name: it is built beside the image of the harness
-before, and the script refuses only a build of the same commit with the same harness, which is there already. Nothing is
-deleted by hand.
+The image's name carries what it is built from: `arca-automagik-<commit>-dsh-<harness>`, the first 12 hex digits of the
+template's `commit` and of the harness. The harness is every other input the build pins, hashed together: the build
+script's own bytes (the Node, Tailscale and Omni plugin pins and every other pin are in it),
+`templates/automagik-dsh/package.json` and `package-lock.json` (DSH and everything npm installs), and the template's
+`dashPort`, which the build writes into the dashboard's unit. It is the SHA-256 of what this prints in `templates/`:
+`sha256sum automagik.build.sh automagik-dsh/package.json automagik-dsh/package-lock.json; echo "dashPort 3080"`. Incus
+takes an alias of 64 characters at most, so the full commit and the full harness are the image's `arca.commit` and
+`arca.harness` properties. The template names that image, and the script refuses a template that names another before it
+touches Incus, with the name to set. So a change to any input is a new name: it is built beside the image of before, and
+the script refuses only a build of the same commit with the same inputs, which is there already. Nothing is deleted by
+hand. The base image is not in the name: it is the build's argument, kept as `arca.base`.
 
-A node that built its image before the name carried the harness (up to Arca 0.13.0, `arca-automagik-` and the whole
+A node that built its image before the name carried the harness (up to Arca 0.14.0, `arca-automagik-` and the whole
 commit) keeps it. The upgrade replaces the `automagik` template, as it replaces any shipped template nobody edited. A
 service made before keeps running: it is its own instance, made when it was created, and the upgrade does not touch it.
 A new `service_create` from the template is refused, before anything is written, with `template automagik: its image
