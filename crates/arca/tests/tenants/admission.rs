@@ -2,6 +2,31 @@
 use super::*;
 
 #[test]
+fn a_node_never_set_up_for_services_lists_no_tenants_and_every_other_tenant_verb_refuses() {
+    // No kernel project, no service subnet, no tenants policy: the node only looks.
+    let rig = Rig::with_kernel(json!({ "droiddProjects": ["other"] }), empty_state());
+    assert_eq!(
+        rig.call("tenant_list", json!({})).expect("the empty list"),
+        json!({ "tenants": [] })
+    );
+    for (verb, args) in [
+        ("tenant_create", json!({})),
+        ("tenant_status", json!({ "id": A })),
+        ("tenant_usage", json!({ "id": A })),
+        ("tenant_remove", json!({ "id": A, "approval": "x" })),
+        ("service_list", json!({ "tenant": A })),
+    ] {
+        let (code, message) = refusal(rig.call_as(verb, args, Some(&["tenant_create"])));
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("no_tenants", "this node has no tenants"),
+            "{verb}"
+        );
+    }
+    assert!(rig.fake().writes().is_empty(), "nothing was written");
+}
+
+#[test]
 fn a_node_without_the_key_has_no_tenants_whatever_the_verb() {
     let rig = Rig::new(None);
     rig.template("app", app_template("app"));

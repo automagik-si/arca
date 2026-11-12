@@ -1135,6 +1135,14 @@ impl ToolHandler for TenantHandler {
                 "arguments: a field the schema does not name".into(),
             ));
         }
+        // A node that was never set up for services or tenants has no tenant: the list is empty. Every other tenant verb,
+        // and a node set up for services with no tenants policy, still answers that the node has no tenants.
+        if self.verb == "tenant_list"
+            && self.cfg.kernel.tenants.is_none()
+            && super::no_service_project_asked(&self.cfg)
+        {
+            return Ok(json!({ "tenants": [] }));
+        }
         if self.cfg.kernel.tenants.is_none() {
             return Err(no_tenants());
         }

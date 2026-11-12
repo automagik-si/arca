@@ -1068,6 +1068,67 @@ fn lists_the_service_project_with_each_instances_own_config_and_devices_none_whe
         && request.status == 200));
 }
 
+/// What every refusal for want of a service subnet ends with: the config keys that would let the node run services.
+const SERVICE_KEYS: &str = "its config must set kernel.serviceCidr to an IPv4 /24 and list arcak-svc in kernel.projects, and the node be restarted";
+
+#[test]
+fn a_node_never_set_up_for_services_lists_none_and_every_other_service_call_says_what_it_needs() {
+    let state = || FakeState {
+        server: json!({}),
+        projects: vec![],
+        instances: vec![],
+        networks: vec![],
+        pools: vec![],
+    };
+    // A node that only looks: no kernel project, no service subnet, no host bridge.
+    let rig = Rig::with(state(), vec![], None);
+    assert_eq!(
+        rig.call("service_list", json!({})).expect("the empty list"),
+        json!({ "services": [] })
+    );
+    for (verb, args) in [
+        ("service_create", json!({"name":"nats","template":"nats"})),
+        ("service_status", json!({"name":"nats"})),
+    ] {
+        match rig.call(verb, args) {
+            Err(CallError::Refused { message, .. }) => assert_eq!(
+                message,
+                format!(
+                    "no service project: this node only looks, and runs no services. To let it run them, {SERVICE_KEYS}"
+                ),
+                "{verb}"
+            ),
+            other => panic!("{verb}: expected a refusal, got {other:?}"),
+        }
+    }
+    assert!(rig.fake.requests().is_empty(), "Incus was not contacted");
+
+    // A config that names the service project and no subnet is half made: the list refuses too, so the fault shows.
+    let half = Rig::with(state(), vec![PROJECT.to_string()], None);
+    for (verb, args) in [
+        ("service_list", json!({})),
+        ("service_status", json!({"name":"nats"})),
+    ] {
+        match half.call(verb, args) {
+            Err(CallError::Refused { message, .. }) => assert_eq!(
+                message,
+                format!(
+                    "no service project: the node's config does not set kernel.serviceCidr. To run services, {SERVICE_KEYS}"
+                ),
+                "{verb}"
+            ),
+            other => panic!("{verb}: expected a refusal, got {other:?}"),
+        }
+    }
+    // A subnet with the service project left out of the kernel's projects is the other half: it refuses as before.
+    let excluded = Rig::with(state(), vec![], Some("192.0.2.0/24"));
+    assert!(matches!(
+        excluded.call("service_list", json!({})),
+        Err(CallError::Refused { message, .. })
+            if message == "no service project: the service project is excluded by kernel configuration"
+    ));
+}
+
 #[test]
 fn refuses_every_service_call_without_a_service_project_asking_incus_nothing() {
     let rig = Rig::with(
