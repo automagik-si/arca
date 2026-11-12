@@ -2467,3 +2467,24 @@ fn a_private_destination_comes_from_the_nodes_config_and_is_on_the_card() {
         ]
     );
 }
+
+#[test]
+fn a_function_create_reads_the_instances_with_their_live_state() {
+    let rig = Rig::new();
+    rig.nats();
+    let with_state = |rig: &Rig| {
+        rig.fake
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.method == "GET"
+                    && request.path.starts_with("/1.0/instances?")
+                    && request.path.contains("recursion=2")
+            })
+            .count()
+    };
+    let before = with_state(&rig);
+    rig.approved("function_create", relay_args())
+        .expect("the function relay");
+    assert!(with_state(&rig) > before, "the create read no live state");
+}

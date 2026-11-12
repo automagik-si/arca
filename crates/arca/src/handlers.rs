@@ -5421,8 +5421,9 @@ fn read_again_once(read: &UnixIncus, path: &str) -> Result<Value, arca_incus::In
         incus_read_cause(error).1
     );
     thread::sleep(READ_AGAIN_AFTER);
-    let left = arca_incus::read::TIMEOUT.saturating_sub(began.elapsed());
-    read.clone().with_timeout(left).get(path)
+    // The second try has what is left of this client's own deadline, so both together take no longer than one read.
+    let left = read.timeout().saturating_sub(began.elapsed());
+    read.get_within(path, left)
 }
 
 /// The instances of `project`, or of every project. `with_state` asks Incus for each one's live state too, which for a

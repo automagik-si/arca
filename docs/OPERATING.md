@@ -1169,7 +1169,7 @@ Every service verb, a read too, first asks Incus for the node's instances. That 
 config and devices and is answered at once. It does not ask for an instance's **live state**, which for a running
 virtual machine Incus takes from the machine's guest agent: a machine that runs many containers of its own can take
 most of the 10 seconds a read is given, and a listing with every instance's state is as slow as the slowest of them.
-Only three things read live state:
+Among the service verbs, only these read live state:
 
 - `service_status` of a virtual machine **on a host bridge**, which runs: its address is given by that network and
   is in no record, so this one call reads the state of that one instance. When Incus does not answer in time the
@@ -3338,8 +3338,9 @@ kernel's mark and `user.arca.template`. It gets its address from the bridge's ow
 neither assigns nor filters it. A bridge whose network hands out no addresses by DHCP (one where another hypervisor
 assigns them itself) gives the guest none: put such a virtual machine on the managed service network of a mixed node,
 or configure its address inside the guest. `service_status` of the running machine reads its live state and shows the
-address its own network card holds, or an empty `ipv4` when it holds none; an address of a bridge the guest made for
-its own containers is never shown. `service_list` reads no live state: the machine's row has an empty `ipv4` and
+address the guest reports for the card that has the machine's MAC, or an empty `ipv4` when the guest reports none
+there: the card is down, or the guest's agent does not answer (the guest can set what it reports). An address of a
+bridge the guest made for its own containers is never shown. `service_list` reads no live state: the machine's row has an empty `ipv4` and
 `ipv4In: "state"` (see "When Incus does not answer").
 
 Ownership, the journal and approvals are the same as for a container. `service_create` needs a doctor token, can be

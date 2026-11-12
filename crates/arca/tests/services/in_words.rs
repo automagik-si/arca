@@ -677,3 +677,97 @@ fn a_change_the_kernel_cannot_save_is_refused_in_words_with_its_own_code() {
     assert_eq!(refusal_code(&reply), "state_not_saved");
     assert_eq!(stored(&rig, "p1", "SIGNING_KEY"), Some(shape(&first)));
 }
+
+/// The address `name` was given, from its status.
+fn address_of(rig: &Rig, name: &str) -> String {
+    let status = rig
+        .call("service_status", json!({"name":name}))
+        .expect("the status");
+    status["ipv4"].as_str().expect("an address").to_string()
+}
+
+#[test]
+fn a_create_never_hands_out_an_address_or_a_mac_that_only_a_guests_live_state_holds() {
+    // Two nodes made the same way pick the same address for the same create; on the second, a running guest holds that
+    // address and a MAC on cards of its own that no device and no lease of it names, so only its live state shows them.
+    let twin = machine_and_container();
+    let life_twin = life(&twin, Duration::from_millis(200));
+    start(&life_twin, "p1").expect("start");
+    twin.call("service_create", json!({"name":"p3","template":"pool"}))
+        .expect("the create on the twin");
+    let picked = address_of(&twin, "p3");
+
+    let rig = machine_and_container();
+    let life = life(&rig, Duration::from_millis(200));
+    start(&life, "p1").expect("start");
+    let mac = "02:aa:bb:00:00:09";
+    let own: &[&str] = &[&picked];
+    rig.fake.set_live_network(
+        PROJECT,
+        "p1",
+        &[
+            ("eth0", "02:aa:bb:00:00:01", true, &[]),
+            ("br-inside", mac, true, own),
+        ],
+    );
+    let with_state = reads_of(&rig, LISTING_WITH_STATE);
+    rig.call("service_create", json!({"name":"p3","template":"pool"}))
+        .expect("the create");
+    assert!(
+        reads_of(&rig, LISTING_WITH_STATE) > with_state,
+        "the create read no live state"
+    );
+    let given = address_of(&rig, "p3");
+    assert_ne!(
+        given, picked,
+        "the create handed out an address a guest holds live"
+    );
+
+    // A machine on a host bridge asking for the MAC that only the guest's live state holds is refused.
+    let refused = rig
+        .call(
+            "service_create",
+            json!({"name":"p4","template":"pool","bridge":"br0","mac":mac}),
+        )
+        .expect_err("a MAC a guest holds live");
+    assert!(
+        format!("{refused:?}").contains(&format!(
+            "the MAC {mac} is already held by another instance"
+        )),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_running_machine_on_a_host_bridge_whose_card_is_down_has_no_address_and_no_problem() {
+    let rig = machine_and_container();
+    let mac = "02:aa:bb:00:00:07";
+    rig.call(
+        "service_create",
+        json!({"name":"p2","template":"pool","bridge":"br0","mac":mac}),
+    )
+    .expect("a machine on the host bridge");
+    let life = life(&rig, Duration::from_millis(200));
+    start(&life, "p2").expect("start");
+    // Its card has another name inside the guest, has its MAC, is down and holds no address; a bridge the guest made
+    // for its own containers holds one, which is never its address.
+    let inside: &[&str] = &["192.0.2.1"];
+    rig.fake.set_live_network(
+        PROJECT,
+        "p2",
+        &[
+            ("enp5s0", mac, false, &[]),
+            ("lxdbr0", "02:aa:bb:00:00:42", true, inside),
+        ],
+    );
+    let door = Door::over(&rig);
+    let status = door.call("service_status", json!({"name":"p2"}));
+    assert_eq!(answer(&status), "ok");
+    let structured = &status["result"]["structuredContent"];
+    assert_eq!(structured["ipv4"], "", "a down card has no address");
+    assert!(
+        structured.get("ipv4Problem").is_none(),
+        "the read worked: no problem"
+    );
+    assert_eq!(structured["state"], "running");
+}

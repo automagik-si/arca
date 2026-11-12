@@ -2746,7 +2746,7 @@ pub fn service_view_schema() -> Value {
                 "type": "string"
             },
             "ipv4": {
-                "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: it has none now.",
+                "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
                 "maxLength": 15,
                 "type": "string"
             },

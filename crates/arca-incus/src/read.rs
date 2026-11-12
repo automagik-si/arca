@@ -126,6 +126,11 @@ impl UnixIncus {
         self.timeout = timeout;
         self
     }
+
+    /// The deadline each of this client's reads is given.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
 /// The instant a request's deadline falls at, or `None` when the timeout reaches past the clock's range.

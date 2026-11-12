@@ -524,3 +524,31 @@ mod refused_at_propose;
 mod room_at_propose;
 #[path = "tenants/template_binding.rs"]
 mod template_binding;
+
+/// The listings of instances with their live state the fake was asked for.
+fn listings_with_state(fake: &FakeIncus) -> usize {
+    fake.requests()
+        .iter()
+        .filter(|request| {
+            request.method == "GET"
+                && request.path.starts_with("/1.0/instances?")
+                && request.path.contains("recursion=2")
+        })
+        .count()
+}
+
+#[test]
+fn a_tenant_create_reads_the_instances_with_their_live_state_and_a_tenant_list_does_not() {
+    let rig = Rig::new(Some(policy()));
+    let before = listings_with_state(rig.fake());
+    rig.create_tenant(json!({ "id": A })).expect("tenant");
+    let after = listings_with_state(rig.fake());
+    assert!(after > before, "the create read no live state");
+    rig.call_as("tenant_list", json!({}), Some(&["tenant_list"]))
+        .expect("the list");
+    assert_eq!(
+        listings_with_state(rig.fake()),
+        after,
+        "the list read live state"
+    );
+}
