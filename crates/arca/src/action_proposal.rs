@@ -826,8 +826,11 @@ pub fn start_words(start: bool) -> &'static str {
 /// The `Start` row of a `service_create` whose template is created stopped whatever the call says: `reason` finishes
 /// "it is created stopped because".
 pub fn stopped_words(reason: &str) -> String {
-    format!("{STOPPED_BECAUSE}{reason}; instance_start starts it later")
+    format!("{STOPPED_BECAUSE}{reason}{STOPPED_THEN}")
 }
+
+/// How every [`stopped_words`] row ends.
+const STOPPED_THEN: &str = "; instance_start starts it later";
 
 /// How every [`stopped_words`] row begins.
 const STOPPED_BECAUSE: &str = "No: it is created stopped because ";
@@ -932,11 +935,21 @@ fn loaded_words(
     if action == ActionKind::PostgresCreate && args.get("template").is_some() {
         let rebuilt = action.details(args);
         let generated = action.details_with_gpu(args, Some(DATABASE_PASSWORD_GENERATED));
-        let stopped = stored_details.split_last().is_some_and(|(start, rest)| {
-            start.label == "Start"
-                && start.value.starts_with(STOPPED_BECAUSE)
-                && rest == rebuilt.as_slice()
-        });
+        // A stopped card is kept when it is, row for row, the card this action writes for these arguments and the
+        // reason its own `Start` row gives: the row stands where the card puts it, before the template's content.
+        let stopped = stored_details
+            .iter()
+            .find(|row| row.label == "Start")
+            .and_then(|start| {
+                start
+                    .value
+                    .strip_prefix(STOPPED_BECAUSE)?
+                    .strip_suffix(STOPPED_THEN)
+            })
+            .is_some_and(|reason| {
+                reason != DATABASE_PASSWORD_GENERATED
+                    && stored_details == action.details_with_gpu(args, Some(reason)).as_slice()
+            });
         let fits = stopped || stored_details == generated.as_slice();
         return (
             action.summary(args),
@@ -1836,6 +1849,43 @@ mod tests {
         let mut both = generated.clone();
         both.push(stopped.last().unwrap().clone());
         assert_eq!(loaded_words(action, &args, "", &both).1, plain);
+        // A proposal that binds its template's content has that row last, after the Start row: both are kept.
+        let bound = json!({
+            "name": "orders",
+            "template": crate::service::DATABASE_TEMPLATE,
+            "image": PINNED_IMAGE,
+            "templateDigest": "ab".repeat(32)
+        });
+        let stopped_bound = action.details_with_gpu(&bound, Some(reason));
+        let labels: Vec<&str> = stopped_bound.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Database",
+                "Image",
+                "Template",
+                "Made as",
+                "Start",
+                "Template content"
+            ]
+        );
+        assert_eq!(
+            loaded_words(action, &bound, "", &stopped_bound).1,
+            stopped_bound
+        );
+        let generated_bound = action.details_with_gpu(&bound, Some(DATABASE_PASSWORD_GENERATED));
+        assert_eq!(
+            loaded_words(action, &bound, "", &generated_bound).1,
+            generated_bound
+        );
+        // A Start row moved to the end, after the template's content, is not the card this action writes.
+        let mut moved = stopped_bound.clone();
+        let start = moved.remove(4);
+        moved.push(start);
+        assert_eq!(
+            loaded_words(action, &bound, "", &moved).1,
+            action.details(&bound)
+        );
         // A database of the old kind has no such rows: its card is rebuilt from its arguments, as before.
         let old_kind = json!({ "name": "orders", "image": PINNED_IMAGE });
         assert_eq!(

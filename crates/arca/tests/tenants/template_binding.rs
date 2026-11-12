@@ -44,6 +44,15 @@ fn machine() -> Value {
     })
 }
 
+/// A container from a local image the template pins by its fingerprint: an image somebody put in the service
+/// project by hand, under the alias `built`.
+fn built(fingerprint: &str) -> Value {
+    json!({
+        "name": "built", "kind": "system", "image": "local:built",
+        "digest": format!("sha256:{fingerprint}"), "ports": [], "env": {}, "publishable": false
+    })
+}
+
 /// A virtual machine on a system image the template pins by its fingerprint.
 fn pinned_machine() -> Value {
     json!({
@@ -254,6 +263,72 @@ fn a_proposed_create_is_given_its_templates_image_and_content_and_the_card_shows
     )
     .expect("the node's own, stated");
     assert_eq!(same["args"]["templateDigest"], digest);
+}
+
+#[test]
+fn a_pinned_local_image_is_on_the_card_by_its_fingerprint_and_is_what_the_instance_is_made_from() {
+    let rig = node();
+    // The service project is made with the node's first service, and holds the image after that.
+    rig.call(
+        "service_create",
+        json!({ "name": "first", "template": "app" }),
+    )
+    .expect("the first service makes the project");
+    let held = rig.fake().add_image(PROJECT, "built");
+    rig.template("built", built(&held));
+    let proposal = propose(
+        &rig,
+        "service_create",
+        json!({ "name": "dash", "template": "built" }),
+    )
+    .expect("the proposal");
+    // One field and one row for it, as for every kind of template: the alias and the fingerprint it is pinned to.
+    let image = format!("local:built@sha256:{held}");
+    assert_eq!(proposal["args"]["image"], image);
+    assert_eq!(row(&proposal, "Image"), Some(image));
+    assert_eq!(
+        rows(&proposal)
+            .iter()
+            .filter(|(label, _)| label == "Image")
+            .count(),
+        1
+    );
+    assert!(proposal["args"].get("imagePin").is_none());
+    // A pin edited after the card is another template: the approval creates nothing.
+    let other = "0".repeat(64);
+    rig.template("built", built(&other));
+    let (_, message) = refusal(approve(&rig, &proposal));
+    assert_eq!(message, not_the_one("built"));
+    assert!(!has_entry(&rig, "service-dash"));
+    // Proposed again from the pin that fits the image the project holds, it is created, and Incus is told the
+    // fingerprint: the instance is made from that image whatever the alias points at.
+    rig.template("built", built(&held));
+    let again = propose(
+        &rig,
+        "service_create",
+        json!({ "name": "dash", "template": "built" }),
+    )
+    .expect("proposed again");
+    approve(&rig, &again).expect("the approved create, from the pinned image");
+    assert_eq!(
+        rig.entry("service-dash")["source"],
+        json!({ "type": "image", "alias": "built", "fingerprint": held })
+    );
+    // A local image with no pin is shown with the words that say what its name leaves open.
+    let mut unpinned = built(&held);
+    unpinned
+        .as_object_mut()
+        .expect("a template")
+        .remove("digest");
+    rig.template("built", unpinned);
+    let open = propose(
+        &rig,
+        "service_create",
+        json!({ "name": "other", "template": "built" }),
+    )
+    .expect("the proposal");
+    assert_eq!(open["args"]["image"], "local:built");
+    assert_eq!(row(&open, "Image"), Some(format!("local:built{NO_DIGEST}")));
 }
 
 #[test]

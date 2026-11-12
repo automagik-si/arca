@@ -16,6 +16,7 @@ from the function's image: from the copy the node already holds, the one the fun
 created, or from the registry by the approved digest when that copy is gone. So no run finds what an earlier one
 wrote, which replaces the limit 0.13.0 named. A root that cannot be rebuilt is a run that does not start, and its
 line says why. A run's line gains `root`, `rootImage` and `rootMs`.
+
 What the owner approves on a card is now what is created. A proposed `service_create` or `postgres_create` is given,
 by the node, the image its template names and a fingerprint of the template's content (its file and the scripts it
 names). The card shows an `Image` row and ends with a `Template content` row, and the approved create runs only while

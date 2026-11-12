@@ -689,7 +689,8 @@ fn a_card_does_not_say_generated_when_a_password_is_already_stored_for_the_name(
             { "label": "Database", "value": "orders" },
             { "label": "Image", "value": pin(&rig) },
             { "label": "Template", "value": DATABASE_TEMPLATE },
-            { "label": "Made as", "value": MADE_AS_PLAIN }
+            { "label": "Made as", "value": MADE_AS_PLAIN },
+            { "label": "Template content", "value": content_row(&content(&rig)) }
         ])
     );
     // A name with no stored password still gets the claim: the template generates it.

@@ -670,6 +670,9 @@ stands under it. With it the fingerprint decides, and the alias is only the name
   says so and to create another service first.
 - The instance is made from the pinned image: Incus is given the fingerprint, and with a fingerprint Incus never looks
   the alias up.
+- The owner's card shows the pinned image in its `Image` row, as `local:<alias>@sha256:<fingerprint>`, and the
+  approval binds it with the rest of the template (see "What the owner saw is what is created"). An unpinned local
+  image is shown as `local:<alias>` with the words that say it has no digest.
 - A digest in upper case, or one that is not 64 hex digits, is refused when the template is read.
 
 **Creating a service stopped.** A secret (`service_secret_set`) and a link (`service_connect`) reach a container's

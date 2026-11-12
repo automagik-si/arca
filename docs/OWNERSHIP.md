@@ -1588,6 +1588,7 @@ Source: `TemplateContent`, `load_template_content`, `template_digest`, `template
 `ActionKind::details_with_gpu` in `crates/arca/src/action_proposal.rs`. Tests in
 `crates/arca/tests/tenants/template_binding.rs`
 (`a_proposed_create_is_given_its_templates_image_and_content_and_the_card_shows_both`,
+`a_pinned_local_image_is_on_the_card_by_its_fingerprint_and_is_what_the_instance_is_made_from`,
 `a_template_changed_after_the_card_was_shown_is_not_created`,
 `a_card_that_waits_across_an_upgrade_of_the_shipped_templates_is_refused_and_proposed_again`,
 `a_database_proposal_binds_the_content_of_its_template_too`, `the_binding_holds_across_a_restart_of_the_node`,
