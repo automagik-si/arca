@@ -245,7 +245,7 @@ The repository is `github.com/automagik-si/arca`.
 - A token can be limited to a list of tools, and revoked; `SIGHUP` reloads the tokens.
 - `journal_list` and `ontology_query` are new reads. The OpenRPC document carries each verb's `readOnlyHint`.
 
-**Not in this release.** There is no `arca init` and no stdio MCP door; Linux x86_64 is the only published binary.
+**Not in this release.** There is no `arca init`; Linux x86_64 is the only published binary.
 
 ## 0.1.0-alpha.2
 

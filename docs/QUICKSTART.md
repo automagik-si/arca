@@ -4,6 +4,11 @@ You need an x86_64 Linux host with glibc 2.34 or newer (Enterprise Linux 9, Ubun
 Incus, and a user who can read the Incus socket (on most installs, a member of the `incus-admin` group). This quickstart
 names no kernel project, so the node only reads: it sends Incus nothing but GET.
 
+**What you have at the end:** a node that looks, not one that changes things. An assistant connected to it can read your
+projects, instances, host readings and alerts. It cannot create a database or a service, and there is no approval page.
+Letting the node change things is a further step, done by hand today:
+["Next: a node that changes things"](#next-a-node-that-changes-things), at the end of this page.
+
 ## Install with one command
 
 [`scripts/install.sh`](../scripts/install.sh) does the quickstart below for you, for the user who runs it. It needs what
@@ -28,7 +33,13 @@ curl -fsSL https://github.com/automagik-si/arca/releases/latest/download/install
 
 To hand it to a coding agent, paste this: *Download
 `https://github.com/automagik-si/arca/releases/latest/download/install.sh`, read it, run it with `sh`, and tell me
-what it printed.*
+what it printed. Then tell me plainly that this node only looks: it can read my machines and it cannot change
+anything yet, and there is no approval page. Tell me the next step is "Next: a node that changes things" in
+docs/QUICKSTART.md, which is done by hand today, and do not start it unless I ask.*
+
+**If you are an agent following this page:** end your report with those same words. The install is done when the node
+answers `arca_status` with `"mode":"watch-only"`. That is a node that reads. Do not tell the person that Arca is ready
+to run their services.
 
 - **It checks first.** Linux, x86_64, glibc, `curl`, `sha256sum`, a runtime directory that is yours alone, and an Incus
   socket this user may open. When one is missing it says which and how to fix it, and stops before it has changed
@@ -146,8 +157,33 @@ work today:
   in the operating guide say what each address may be and how to turn it on. A request that carries an `Origin` header
   is refused, so a web page cannot call the node.
 
-**Not yet:** there is no `arca init`, so the config and its directories are written by hand as above; there is no stdio
-MCP door, so a client that can only start a local command cannot connect; and Linux x86_64 is the only published binary.
+Streamable HTTP is the node's one MCP transport. A client connects to the node's socket or to an address the node
+serves; the node is not started as a client's local command.
 
-To let the node change things (kernel projects, the owner's passkey and the approval page), and to run it as a service,
-read [`docs/OPERATING.md`](OPERATING.md).
+**Not yet:** there is no `arca init`, so the config and its directories are written by hand as above; no TCP address is
+open until the config names one, so an assistant that takes a URL cannot connect to the node as this page leaves it;
+and Linux x86_64 is the only published binary.
+
+## Next: a node that changes things
+
+The node this page leaves only looks: `arca_status` answers `"mode":"watch-only"`, and a watch-only node writes nothing.
+It serves no approval page. Neither the installer nor the steps above turn these on. Today that is done by hand in the
+node's config, and a one-step way is being built.
+
+This is a list of what to set and where the operating guide says how. The guide is a reference, not a walk-through, and
+the work needs a person comfortable with a terminal.
+
+1. **Name the projects Arca may write in.** `kernel.projects` in `~/.config/arca/node.json`. With projects named, the
+   node's mode is `kernel`; with none it stays `watch-only`. ["The config file"](OPERATING.md#the-config-file) says
+   what this key and the keys beside it (`kernel.droiddProjects`, `kernel.serviceCidr`) may hold, and which configs
+   `serve` refuses.
+2. **Install the shipped templates.** `arca templates install --config ~/.config/arca/node.json` writes them into the
+   node's state directory. A service is created from one of them.
+3. **Set up the approval page and your passkey.** `approvalOrigin` in the config, an HTTPS address in front of the
+   node, and a first passkey enrolled with a one-time code. ["The approval page"](OPERATING.md#the-approval-page) says
+   what the page serves; the numbered steps begin at "To use it:" further down that section. Until a passkey is
+   trusted, every approval fails closed.
+4. **Restart the node** so it reads the config again: `systemctl --user restart arca.service` where the installer
+   started it, or stop and start `arca serve`.
+
+To run the node as a service by hand, read ["Running as a user service"](OPERATING.md#running-as-a-user-service).

@@ -21,6 +21,17 @@
 
 </div>
 
+## Works today, and not yet
+
+Arca is an alpha. Read this before you install.
+
+| Works today | Not yet |
+|---|---|
+| The installer below sets up a node that only looks. An assistant with its token reads your projects, instances, host readings and alerts, and changes nothing. | The installer does not turn on changes, and it sets up no approval page. Both are done by hand today: [what to set, and where the guide says how](docs/QUICKSTART.md#next-a-node-that-changes-things). A one-step way is being built. |
+| On a node set up by hand to change things, these run from the templates Arca ships: Postgres, NATS, Omni, Automagik, a Cloudflare tunnel, a workspace virtual machine, and GitHub and GitLab runner pools. An assistant proposes, and you approve with your passkey on a page the node serves. | Arca cannot run any app or container image you name: a service comes from a template, or Arca takes over one that already runs on the machine. |
+| The node is an MCP server over HTTP. An assistant with a shell on the same machine reaches it with `arca call`. | The installer opens no network address. An assistant that takes an MCP server URL needs one you add to the config by hand: [step 4 of the quickstart](docs/QUICKSTART.md#by-hand). |
+| One Linux machine (x86_64) with Incus. | There is no installer for a Mac, and the installer has not been run on a machine that never had Arca or Incus. |
+
 ## Get Arca
 
 | | |
@@ -33,6 +44,8 @@ On a Linux machine with Incus ([what this does and does not do](docs/QUICKSTART.
 ```sh
 curl -fsSL https://github.com/automagik-si/arca/releases/latest/download/install.sh | sh
 ```
+
+This gives you a node that only looks: it reads your machines and changes nothing, and it has no approval page yet. Letting it change things is [set up by hand today](docs/QUICKSTART.md#next-a-node-that-changes-things); a one-step way is being built.
 
 ## How it works
 
