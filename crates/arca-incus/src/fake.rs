@@ -1665,7 +1665,16 @@ fn create(
         // The image is pulled from the server into the store the project reads, and kept there as a cached image.
         let alias = source.get("alias").and_then(Value::as_str).unwrap_or("");
         let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
-        store.put_image_from(&project, fingerprint, alias, true, Some(server));
+        let (server, alias) = (server.to_string(), alias.to_string());
+        store.put_image_from(&project, fingerprint.clone(), &alias, true, Some(&server));
+        // A new function's instance says which image it was made from, as Incus writes it for every instance. The
+        // fake writes it for a function's alone: a service's view shows the key, and the suites that compare whole
+        // views were written without it.
+        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut)
+            && config.contains_key("user.arca.function")
+        {
+            config.insert("volatile.base_image".to_string(), json!(fingerprint));
+        }
     }
     let parent = address.parent.clone();
     if matches!(kind, "volume" | "bucket") && !store.pools.iter().any(|(pool, _)| *pool == parent) {

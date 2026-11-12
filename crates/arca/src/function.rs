@@ -387,22 +387,23 @@ pub fn pinned_source(cfg: &ServiceConfig) -> Option<Value> {
 }
 
 /// The fingerprint of the image in `images` (a listing of a project's image store) that Incus fetched from the
-/// registry and digest `source` names: the record whose own alias is that digest and whose server is that registry,
-/// whatever credential stands in the address Incus kept. `None` when no record, or more than one, is.
-pub fn fetched_fingerprint(images: &Value, source: &Value) -> Option<String> {
-    let host = |server: &str| -> Option<String> {
-        let rest = server.strip_prefix("https://")?;
-        Some(rest.rsplit('@').next()?.to_string())
-    };
-    let wanted = host(source["server"].as_str()?)?;
+/// registry and digest `source` names. It is the one record that Incus itself says it fetched over the OCI protocol,
+/// from that registry's host, under that digest; a credential in the address Incus kept is no part of the host.
+/// `base_image` is what the new instance says it was made from, read right after its create: the record must be
+/// that very image. `None` when no record, or more than one, is the approved image, or when the instance was made
+/// from another: a run then asks the registry, by the approved digest, every time.
+pub fn fetched_fingerprint(
+    images: &Value,
+    source: &Value,
+    base_image: Option<&str>,
+) -> Option<String> {
+    let wanted = registry_host(source["server"].as_str()?)?;
     let alias = source["alias"].as_str()?;
     let mut found = images.as_array()?.iter().filter(|image| {
-        image["update_source"]["alias"].as_str() == Some(alias)
-            && image["update_source"]["server"]
-                .as_str()
-                .and_then(host)
-                .as_deref()
-                == Some(wanted.as_str())
+        let from = &image["update_source"];
+        from["protocol"].as_str() == Some("oci")
+            && from["alias"].as_str() == Some(alias)
+            && from["server"].as_str().and_then(registry_host).as_deref() == Some(wanted.as_str())
     });
     let one = found.next()?;
     if found.next().is_some() {
@@ -410,8 +411,24 @@ pub fn fetched_fingerprint(images: &Value, source: &Value) -> Option<String> {
     }
     one["fingerprint"]
         .as_str()
-        .filter(|text| fingerprint_ok(text))
+        .filter(|text| fingerprint_ok(text) && base_image == Some(*text))
         .map(str::to_string)
+}
+
+/// The host, with its port when it names one, of a registry address as Incus keeps it: the scheme, then the
+/// authority (an optional credential, an `@`, the host and an optional port), then an optional path. The credential
+/// is the part of the authority before its last `@`; an `@` in the path, the query or the fragment is not one, and
+/// never moves the host. `None` for an
+/// address that is not https, or whose host is empty or holds anything but letters, digits, `.`, `-` and `:`.
+pub fn registry_host(server: &str) -> Option<String> {
+    let rest = server.strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    (!host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':')))
+    .then(|| host.to_ascii_lowercase())
 }
 
 /// Whether `text` is an image fingerprint as Incus writes one: 64 hex digits in lower case.
@@ -697,6 +714,104 @@ mod tests {
             "links": [{ "to": "pg1", "port": 5432 }, { "to": "nats", "port": 4222 }],
             "triggers": [{ "timer": { "everySeconds": 30 } }],
         })
+    }
+
+    #[test]
+    fn the_approved_image_is_the_one_record_incus_fetched_from_that_host_under_that_digest() {
+        let digest = format!("acme/relay@sha256:{}", "a".repeat(64));
+        let source = json!({ "type": "image", "mode": "pull", "protocol": "oci",
+            "server": "https://registry.example", "alias": digest });
+        let (good, other) = ("c".repeat(64), "d".repeat(64));
+        let image = |fingerprint: &str, server: &str, protocol: &str| {
+            json!({ "fingerprint": fingerprint,
+                "update_source": { "server": server, "alias": digest, "protocol": protocol } })
+        };
+        let pick = |images: Value, base: Option<&str>| fetched_fingerprint(&images, &source, base);
+        // An address with a credential before the host, put together here from its parts.
+        let with = |user: &str, word: &str, rest: &str| {
+            let mut address = String::from("https://");
+            address.push_str(user);
+            address.push(':');
+            address.push_str(word);
+            address.push('@');
+            address.push_str(rest);
+            address
+        };
+        // The record Incus fetched from the host, with or without a credential in the address it kept.
+        for server in [
+            "https://registry.example".to_string(),
+            with("user", "word", "registry.example"),
+            with("us%40er", "w%2Frd", "registry.example/"),
+            "https://REGISTRY.example".to_string(),
+        ] {
+            let server = server.as_str();
+            assert_eq!(
+                pick(json!([image(&good, server, "oci")]), Some(&good)),
+                Some(good.clone()),
+                "{server}"
+            );
+        }
+        // An address that only holds the host's name somewhere after an `@` is another host's.
+        for server in [
+            "https://evil.example/@registry.example",
+            "https://evil.example/x?y=@registry.example",
+            "https://evil.example#@registry.example",
+            "https://registry.example.evil.example",
+            "https://registry.example@evil.example",
+            "http://registry.example",
+            "https://",
+        ] {
+            assert_eq!(
+                pick(json!([image(&good, server, "oci")]), Some(&good)),
+                None,
+                "{server}"
+            );
+        }
+        assert_eq!(
+            registry_host("https://evil.example/@registry.example").as_deref(),
+            Some("evil.example")
+        );
+        assert_eq!(
+            registry_host(&with("u", "p", "registry.example:5000/v2")).as_deref(),
+            Some("registry.example:5000")
+        );
+        // Another protocol's record, another digest's, and two records at once are none of them it.
+        assert_eq!(
+            pick(
+                json!([image(&good, "https://registry.example", "simplestreams")]),
+                Some(&good)
+            ),
+            None
+        );
+        let mut elsewhere = image(&good, "https://registry.example", "oci");
+        elsewhere["update_source"]["alias"] =
+            json!(format!("acme/relay@sha256:{}", "b".repeat(64)));
+        assert_eq!(pick(json!([elsewhere]), Some(&good)), None);
+        assert_eq!(
+            pick(
+                json!([
+                    image(&good, "https://registry.example", "oci"),
+                    image(&other, &with("a", "b", "registry.example"), "oci")
+                ]),
+                Some(&good)
+            ),
+            None
+        );
+        // And the instance must have been made from that very image, as it says right after its create.
+        assert_eq!(
+            pick(
+                json!([image(&good, "https://registry.example", "oci")]),
+                Some(&other)
+            ),
+            None
+        );
+        assert_eq!(
+            pick(
+                json!([image(&good, "https://registry.example", "oci")]),
+                None
+            ),
+            None
+        );
     }
 
     #[test]

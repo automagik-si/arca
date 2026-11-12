@@ -4379,6 +4379,14 @@ runs keep using it) the rebuild names the registry and the digest the owner appr
 again. A copy that is there and cannot be rebuilt from is an error, and the registry is not asked. When the root
 cannot be rebuilt the run does not start: `notStarted`, and `why` says what was answered.
 
+A function's record may hold no fingerprint: when its create could not tell which one image of the store is the
+approved one (two records for the same registry and digest, or an instance that says it was made from another). And
+the store's copy may be gone and fetched again under another fingerprint than the record holds. In both cases every
+run asks the registry, by the approved digest: safe, slower, and in need of the registry each time. A person sees
+it in `function_list`, where `fingerprint` is `null`, or in the run lines, where `root` is `registry` and `rootImage`
+is `null` run after run. `function_remove` and `function_create` again, two cards, bring it back to the store's
+copy.
+
 **What the program must do.** Run one batch and exit. Print what it likes, up to 1 MiB in one run (past that the
 output cannot be read, and the run ends `died` whatever it printed); **its last output line is its result: one JSON
 object, at most 4096 bytes, with `"ok": true` or `"ok": false`**. Incus reports no exit status of a container's

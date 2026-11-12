@@ -556,8 +556,14 @@ impl ServiceHandler {
         if let Ok(images) = read.get(&format!(
             "/1.0/images?project={}&recursion=1",
             config.project
-        )) && let Some(fingerprint) = function::fetched_fingerprint(&images, &config.source)
-        {
+        )) && let Ok(made) = read.get(&format!(
+            "/1.0/instances/{}?project={}",
+            config.instance, config.project
+        )) && let Some(fingerprint) = function::fetched_fingerprint(
+            &images,
+            &config.source,
+            made["config"]["volatile.base_image"].as_str(),
+        ) {
             let Some((_, mut held)) = service_entries(lock(&self.kernel)?.entries())
                 .into_iter()
                 .find(|(entry, _)| entry.id.0 == id)
