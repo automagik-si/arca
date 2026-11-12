@@ -3486,9 +3486,16 @@ Where a virtual machine's secret is, and is not:
   answer or refusal. `service_logs`, a failed command's words and a function's output replace a stored value with
   `[secret]`: whole, and for a value of several lines (a key file) each of its lines of 16 characters or more, since a
   log shows it one line at a time. A shorter line of such a value is not hidden by its value: a line of a few
-  characters is ordinary text that a log holds in many places. A PEM block, from its `-----BEGIN ...-----` line to its
-  `-----END ...-----` line, is replaced whole wherever it is printed, a stored secret or not; one whose END line was not
-  printed is hidden to the end of the text.
+  characters is ordinary text that a log holds in many places. A piece of 16 or more characters of a stored key's
+  base64 body is hidden too, printed at another width or with each `/` written `\/`. A PEM block in those texts is
+  replaced whole before the text is cut into lines, a stored secret or not, and whatever its label (`RSA PRIVATE KEY`,
+  `OpenVPN Static key V1`): from its `-----BEGIN ...-----` line to its `-----END ...-----` line; when no END line
+  follows, over the lines after the BEGIN line that look like a key (base64 of 16 characters or more, or a PEM header),
+  so what follows the key stays shown; and when a text begins inside a key (an END line with no BEGIN before it), from
+  its start to that END line, so a window of a container's journal that starts inside a key shows none of it.
+  `function_runs` redacts a kept output and a
+  run's line again when it reads them. Still shown: the last line of a key printed without its END line when it is
+  shorter than 16 characters. Certificates, public keys and other public PEM blocks are hidden as `[secret]` too.
 
 **Settings for one service.** A template may let a create replace some of its settings, so that two services of one
 template differ without a second template file. It lists their names in `createSettings`, each a key of its

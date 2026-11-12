@@ -6700,6 +6700,9 @@ impl ToolHandler for ServiceHandler {
                 {
                     if let Some(_permit) = self.exec.journal_permit() {
                         let target = self.exec_target(&entry, &config)?;
+                        // A window of the lines asked for can start inside a key: `redact_blocks` hides a text
+                        // from its start to an END line no BEGIN line comes before. Reading more lines than asked
+                        // would push a busy service's journal over the exec cap, and its log to the console's.
                         let cmd = arca_incus::exec::ExecCommand::Journal(
                             arca_incus::exec::JournalLines::new(lines).map_err(|_| {
                                 CallError::Invalid("lines: expected 1 to 200".into())

@@ -1482,6 +1482,61 @@ fn g5_system_journal_and_capped_fallback_delete_both_recordings() {
         .count();
     assert_eq!(deletes, 4);
 }
+/// A key's lines as a program prints them to the journal, one entry each: made when the test runs, no key.
+fn journal_key() -> (String, Vec<String>) {
+    let word = ["PRI", "VATE"].concat();
+    let mut state: u32 = 0x2468_ace0;
+    let body: Vec<String> = (0..6)
+        .map(|_| {
+            (0..64)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                        [(state >> 24) as usize % 64] as char
+                })
+                .collect()
+        })
+        .collect();
+    let text = format!(
+        "starting\n-----BEGIN EC {word} KEY-----\n{}\n-----END EC {word} KEY-----\nlistening\nready\n",
+        body.join("\n")
+    );
+    (text, body)
+}
+
+#[test]
+fn g5_a_journal_window_that_starts_inside_a_key_shows_none_of_it() {
+    let (rig, _) = signed_rig();
+    system(&rig, "dash");
+    let (text, body) = journal_key();
+    // The journal answers the last `lines` entries, as `journalctl -n` does. Asked for 5, the window starts in the
+    // key's body, after its BEGIN line: the text is hidden from its start to the END line no BEGIN comes before.
+    let entries: Vec<&str> = text.lines().collect();
+    for lines in [1, 3, 5, 9, 200] {
+        let tail = entries[entries.len().saturating_sub(lines)..].join("\n") + "\n";
+        script(
+            &rig,
+            C::Journal(JournalLines::new(lines as u64).unwrap()),
+            0,
+            &tail,
+        );
+        let answer = rig
+            .call("service_logs", json!({"name":"dash","lines":lines}))
+            .expect("the log");
+        let shown: Vec<String> = answer["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .map(|line| line.as_str().unwrap_or("").to_string())
+            .collect();
+        let leaks = shown
+            .iter()
+            .any(|line| body.iter().any(|piece| line.contains(&piece[..16])));
+        assert!(!leaks, "{lines} lines: a piece of the key is shown");
+        assert_eq!(shown.last().map(String::as_str), Some("ready"), "{lines}");
+    }
+}
+
 #[test]
 fn g5_audit_failure_and_bad_lines_send_no_exec() {
     let (rig, _) = signed_rig();

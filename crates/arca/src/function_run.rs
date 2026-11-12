@@ -398,26 +398,39 @@ impl FunctionRunner {
 
     /// The newest `limit` lines of the function `name`, newest first.
     pub fn runs(&self, name: &str, limit: usize) -> Vec<Value> {
-        lock(&self.log)
+        let mut lines: Vec<Value> = lock(&self.log)
             .recent
             .get(name)
             .map(|lines| lines.iter().rev().take(limit).cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Redacted again as they are read, as [`FunctionRunner::run_output`] is.
+        let secrets = self.secrets();
+        for line in &mut lines {
+            redact_value(line, &secrets);
+        }
+        lines
     }
 
-    /// The line of the run `run` of the function `name`, and the end of its output when it is still kept.
+    /// The line of the run `run` of the function `name`, and the end of its output when it is still kept. Both are
+    /// redacted again as they are read, with the secrets stored now: an output kept by an earlier release, or before a
+    /// secret was set, shows none of them.
     pub fn run_output(&self, name: &str, run: &str) -> Option<(Value, Option<String>)> {
-        let log = lock(&self.log);
-        let line = log
-            .recent
-            .get(name)?
-            .iter()
-            .find(|line| line["run"] == run)?
-            .clone();
-        let output = run_id_ok(run)
-            .then(|| fs::read_to_string(log.output_path(name, run)).ok())
-            .flatten();
-        Some((line, output))
+        let (mut line, output) = {
+            let log = lock(&self.log);
+            let line = log
+                .recent
+                .get(name)?
+                .iter()
+                .find(|line| line["run"] == run)?
+                .clone();
+            let output = run_id_ok(run)
+                .then(|| fs::read_to_string(log.output_path(name, run)).ok())
+                .flatten();
+            (line, output)
+        };
+        let secrets = self.secrets();
+        redact_value(&mut line, &secrets);
+        Some((line, output.map(|text| clean_output(&text, &secrets))))
     }
 
     fn record(&self, name: &str, line: &Value) {
@@ -1185,6 +1198,88 @@ mod tests {
         let kept = clean_output(&long, &[]);
         assert!(kept.len() <= OUTPUT_KEEP, "{}", kept.len());
         assert!(kept.ends_with(&format!("line 4999 {}", "x".repeat(40))));
+    }
+
+    /// A key file of four body lines of 64 base64 characters, from a counter: no key.
+    fn key_text(seed: u32) -> (String, Vec<String>) {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let word = ["PRI", "VATE"].concat();
+        let mut state = seed;
+        let body: Vec<String> = (0..4)
+            .map(|_| {
+                (0..64)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        ALPHABET[(state >> 24) as usize % ALPHABET.len()] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let text = format!(
+            "-----BEGIN RSA {word} KEY-----\n{}\n-----END RSA {word} KEY-----\n",
+            body.join("\n")
+        );
+        (text, body)
+    }
+
+    #[test]
+    fn a_functions_output_hides_a_stored_key_line_by_line_and_an_unstored_one_by_its_shape() {
+        let (stored, stored_body) = key_text(21);
+        let (unstored, unstored_body) = key_text(42);
+        let secrets = std::slice::from_ref(&stored);
+        // The stored key's body lines printed one by one behind a prefix, the unstored key whole, and a result.
+        let printed: String = stored_body
+            .iter()
+            .map(|line| format!("got {line}\n"))
+            .collect();
+        let output = format!("{printed}{unstored}{}\n", json!({ "ok": true, "n": 1 }));
+        let clean = clean_output(&output, secrets);
+        for line in stored_body.iter().chain(&unstored_body) {
+            assert!(
+                !clean.contains(&line[..16]),
+                "a piece of a key is in the output"
+            );
+        }
+        assert_eq!(
+            clean.lines().filter(|line| *line == "got [secret]").count(),
+            4
+        );
+        assert_eq!(
+            result_line(&clean, secrets),
+            Some(json!({ "ok": true, "n": 1 }))
+        );
+    }
+
+    #[test]
+    fn a_result_after_a_begin_line_without_its_end_is_still_the_result() {
+        let output = "-----BEGIN CERTIFICATE-----\n{\"ok\":true,\"n\":2}\n";
+        let clean = clean_output(output, &[]);
+        assert_eq!(
+            result_line(&clean, &[]),
+            Some(json!({ "ok": true, "n": 2 }))
+        );
+        let error = "{\"ok\":false,\"error\":\"no -----BEGIN CERTIFICATE----- found\"}\n";
+        assert_eq!(
+            result_line(&clean_output(error, &[]), &[]),
+            Some(json!({ "ok": false, "error": "no [secret] found" }))
+        );
+    }
+
+    #[test]
+    fn a_line_of_a_stored_key_is_taken_out_of_every_string_of_a_result() {
+        let (stored, body) = key_text(63);
+        let secrets = std::slice::from_ref(&stored);
+        let line = json!({ "ok": false, "error": format!("bad {}", body[1]), body[2].clone(): [format!("x {}", body[3])] })
+            .to_string();
+        let result = result_line(&line, secrets).expect("a result");
+        let shown = result.to_string();
+        for piece in &body {
+            assert!(
+                !shown.contains(&piece[..16]),
+                "a piece of the key is in the result"
+            );
+        }
+        assert_eq!(result["error"], "bad [secret]");
     }
 
     #[test]
