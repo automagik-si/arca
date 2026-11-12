@@ -569,7 +569,9 @@ impl Rig {
         }));
         let closed: Arc<Mutex<Option<String>>> = Arc::default();
         let gate = Arc::clone(&closed);
-        let page = page.with_gate(Arc::new(move || gate.lock().expect("gate lock").clone()));
+        let page = page
+            .with_gate(Arc::new(move || gate.lock().expect("gate lock").clone()))
+            .with_setup_command("arca setup-code --config /the/node.json".to_string());
         let canvas = page.canvas().clone();
         let proxy_router = if with_page {
             base.clone().merge(page.router(true))
@@ -1975,7 +1977,24 @@ fn the_terminal_setup_code_works_where_no_screen_does_and_shares_the_hourly_boun
     rig.display.fail.store(true, Ordering::SeqCst);
     let (status, body) = rig.post_empty("/approve/setup-code", Some(ORIGIN));
     assert_eq!(status, 503);
-    assert!(String::from_utf8_lossy(&body).contains("No screen to show the code on"));
+    // The answer does not leave the person there: it names the exact line that needs no screen, with this node's own
+    // config, and the page shows the same line before anything was pressed.
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).expect("a refusal in JSON"),
+        json!({
+            "message": "No screen to show the code on",
+            "command": "arca setup-code --config /the/node.json"
+        })
+    );
+    let (status, page) = rig.get("/approve", None);
+    assert_eq!(status, 200);
+    let page = String::from_utf8(page).expect("the page is text");
+    assert!(
+        page.contains("data-setup-command=\"arca setup-code --config /the/node.json\""),
+        "the page carries the line"
+    );
+    assert!(!page.contains("__ARCA_SETUP_COMMAND__"));
+    assert!(page.contains("In a terminal on that computer, run: \" + SETUP_COMMAND"));
     // Eight more page requests, each refused and each counted: nine of the hour's ten are spent.
     for _ in 0..8 {
         assert!(refusal(

@@ -83,6 +83,17 @@ pub fn setup_code(flags: &Flags) -> Result<Option<Value>, Failure> {
         "arca: type this code on the approval page ({page}) within {} minute(s). It works once, for the first passkey only.",
         seconds.div_ceil(60).max(1)
     );
+    // The page of this machine alone, on a machine with no screen: how to bring it to the person's own computer, in
+    // two sentences, and what it cannot do.
+    if let Some(port) = arca_approval::localhost_origin_port(&origin) {
+        eprintln!(
+            "arca: no browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L {port}:127.0.0.1:{port} <this machine>"
+        );
+        eprintln!("arca: then open {page} in its browser: the page is this node's.");
+        eprintln!(
+            "arca: a phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain; the guide's section \"The approval page\" says how."
+        );
+    }
     Ok(Some(
         json!({ "code": code, "expiresInSeconds": seconds, "page": page }),
     ))

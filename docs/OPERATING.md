@@ -81,7 +81,7 @@ node takes a new token after `arca token reload` or a restart.
 
 | Command | Reads | Prints |
 |---------|-------|--------|
-| `arca status [--json] [--config <file>] [--token-file <file>]` | the running node, with the same call as `arca call arca_status` | the node in words: version, mode, uptime, whether Incus answers, the unix socket it answered on, the loopback door as the node itself reports it (open with its URL, or CLOSED with the reason), the other listeners the config file names (not checked) and a next step; with `--json`, the `arca_status` result as it came |
+| `arca status [--json \| --security] [--config <file>] [--token-file <file>]` | the running node, with the same call as `arca call arca_status` | the node in words: version, mode, uptime, whether Incus answers, the unix socket it answered on, the loopback door as the node itself reports it (open with its URL, or CLOSED with the reason), the other listeners the config file names (not checked); then approvals, from the node's own answer: whether changes are on, the page that approves and whether it is open, whether a passkey is trusted yet, and the next step (enrol with `arca setup-code`, or open the page; a node that only looks names `arca init`). With `--json`, the `arca_status` result as it came. With `--security`, what to know before sharing the machine or a token: the cautions for each door this config opens, from the config alone, so the node need not be running |
 | `arca watch --once --json [--config <file>]` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
 | `arca store check [--config <file>]` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
@@ -258,7 +258,11 @@ this port. The node runs without it and tries the address again`, and it tries t
 after twice as long each time, up to 30 seconds, for as long as it runs. When a try succeeds it says `arca: the
 loopback door <addr> is open`. `arca_status` reports the door of a node whose config names one, as
 `"loopback": { "addr": "<addr>", "open": true | false, "reason": "<why it is closed>" | null }`, with a `"page"`
-object beside them when the node's approval page is on this listener (see "The page on this machine alone"). While it reads
+object beside them when the node's approval page is on this listener (see "The page on this machine alone"). A node
+that serves an approval page also reports `"approvalPage": { "url", "open", "reason", "passkeys" }`: the page's
+address, whether it is open (for the page of this machine alone, whether the node holds both loopback addresses),
+the reason while it is not, and how many owner passkeys the node trusts (`null` while the kernel is busy with a
+change). `arca status` says these in words. While it reads
 `"open": false`, whatever answers on that port is not this node: do not send the token there.
 
 ### Tailnet listener
@@ -1752,6 +1756,8 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
 - `GET /approve/plans` returns the waiting delete plans and action proposals. A delete plan has the same fields as
   `plan_list`; an action proposal adds `statement`, the exact passkey statement for that proposal.
 - `POST /approve/setup-code` issues a one-time 8-digit setup code to the machine's own screen while no passkey is trusted.
+  On a machine with no screen it answers 503 `{ "message": "No screen to show the code on", "command": "arca setup-code
+  --config <this node's config>" }`, and the page shows that exact line: the code then comes from the terminal.
 - `POST /approve/approve` takes `{ "plan": "<digest or act-id>", "approval": "<string>" }`. A delete plan keeps the
   `approval_submit` path; an `act-…` id verifies the passkey against the proposal's statement and runs its action once.
 - `POST /approve/decline` takes `{ "plan": "<act-id>" }` and declines only an action proposal. The open page has no

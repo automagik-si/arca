@@ -334,7 +334,7 @@
   }
 </style>
 </head>
-<body data-credential-ids="__ARCA_CREDENTIAL_IDS__">
+<body data-credential-ids="__ARCA_CREDENTIAL_IDS__" data-setup-command="__ARCA_SETUP_COMMAND__">
 <svg width="0" height="0" class="sprite" aria-hidden="true">
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3m-3 3 2 2m-4.5.5 2 2"/></symbol>
   <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
@@ -389,7 +389,7 @@
           <div>
             <p class="step-title">Get a setup code</p>
             <p class="step-text">Arca shows the 8 digits on the computer that runs Arca, so be at that computer for this step. The passkey itself is saved on the phone or computer you're using now.</p>
-            <p class="step-text">No screen on that computer? In a terminal there, run <code>arca setup-code --config ~/.config/arca/node.json</code> (with the path of this node's config) and type the 8 digits it prints.</p>
+            <p class="step-text">No screen on that computer? In a terminal there, run <code class="setup-command"></code> and type the 8 digits it prints.</p>
             <button id="get-code" class="btn btn-secondary" type="button">Get a setup code</button>
           </div>
         </li>
@@ -424,6 +424,9 @@
 const enc = new TextEncoder();
 const NO_PASSKEY = "No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows.";
 // The page of a node on its own machine is served over plain http at localhost; every other page is https.
+// The line that prints the setup code on a terminal of the machine that runs Arca, as that machine's node names it.
+const SETUP_COMMAND = document.body.dataset.setupCommand || "arca setup-code --config <this node's config>";
+for (const node of document.querySelectorAll(".setup-command")) node.textContent = SETUP_COMMAND;
 const LOCAL_PAGE = location.protocol === "http:";
 if (LOCAL_PAGE) {
   for (const node of document.querySelectorAll(".local-origin")) node.textContent = "http://localhost:" + location.port;
@@ -494,7 +497,7 @@ function plain(error) {
   }
   if (error && error.name === "NotAllowedError" && LOCAL_PAGE && !allowCredentials.length) return "No passkey was saved. If you closed the prompt, try again. If the browser offered no way to save one, it has no passkey manager: see the note under step 3.";
   if (message === "A code is already on your screen") return "A code is already showing on the computer that runs Arca. Type that one below.";
-  if (message === "No screen to show the code on") return "The computer that runs Arca has no screen to show the code on. In a terminal on that computer, run \"arca setup-code --config ~/.config/arca/node.json\" (with the path of this node's config), then type the 8 digits it prints below.";
+  if (message === "No screen to show the code on") return "The computer that runs Arca has no screen to show the code on. In a terminal on that computer, run: " + SETUP_COMMAND + " Then type the 8 digits it prints below.";
   const answered = message.match(/answered (\d+)$/);
   if (answered) return "Arca could not do that just now (error " + answered[1] + "). Try again in a moment.";
   if (/locked/.test(message)) return message + ". This happens after too many tries, and it unlocks by itself.";

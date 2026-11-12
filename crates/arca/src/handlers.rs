@@ -452,6 +452,34 @@ pub struct StatusHandler {
     pub approval: Option<ApprovalStatus>,
     /// The loopback listener, when the config names one: whether it holds its address, and why not while it does not.
     pub loopback: Option<LoopbackDoor>,
+    /// The approval page, when the node serves one: its address, whether it is open, and how many passkeys approve.
+    pub page: Option<PageStatus>,
+}
+
+/// What `arca_status` says of the node's approval page. The address is the config's; whether the page is open is the
+/// loopback door's word for a page of this machine alone, and a page with another origin is open whenever it is
+/// served; the passkeys are the kernel's own count of the owner passkeys it trusts.
+#[derive(Clone)]
+pub struct PageStatus {
+    /// The page's address: the approval origin and `/approve`.
+    pub url: String,
+    /// The door of a page of this machine alone, which is closed while the node does not hold both its addresses.
+    pub door: Option<LoopbackDoor>,
+    pub kernel: Arc<Mutex<Kernel>>,
+}
+
+impl PageStatus {
+    /// `url`, `open`, `reason` while it is closed, and `passkeys`: the number trusted, or null while the kernel is
+    /// busy with a change and cannot be asked without waiting.
+    fn json(&self) -> Value {
+        let closed = self.door.as_ref().and_then(LoopbackDoor::page_refusal);
+        let passkeys = self
+            .kernel
+            .try_lock()
+            .ok()
+            .map(|kernel| kernel.owner_passkey_count());
+        json!({ "url": self.url, "open": closed.is_none(), "reason": closed, "passkeys": passkeys })
+    }
 }
 
 /// The loopback listener's state: its address, and why it is closed while it is. `serve` shares one value between the
@@ -770,6 +798,9 @@ impl ToolHandler for StatusHandler {
         }
         if let Some(door) = &self.loopback {
             status["loopback"] = door.json();
+        }
+        if let Some(page) = &self.page {
+            status["approvalPage"] = page.json();
         }
         Ok(status)
     }

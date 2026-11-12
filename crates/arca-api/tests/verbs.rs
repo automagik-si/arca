@@ -500,6 +500,16 @@ fn arca_status_schemas_equal_its_table_row() {
                         },
                     },
                     "required": ["addr", "open", "reason"],
+                },
+                "approvalPage": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" },
+                        "open": { "type": "boolean" },
+                        "reason": { "type": ["string", "null"] },
+                        "passkeys": { "type": ["integer", "null"], "minimum": 0 },
+                    },
+                    "required": ["url", "open", "reason", "passkeys"],
                 }
             }),
             &[

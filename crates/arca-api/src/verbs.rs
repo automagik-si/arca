@@ -1440,6 +1440,16 @@ fn arca_status_result() -> Value {
                 ),
             ]),
         ),
+        (
+            "approvalPage",
+            false,
+            result(vec![
+                ("url", true, string()),
+                ("open", true, boolean()),
+                ("reason", true, nullable(string())),
+                ("passkeys", true, nullable(at_least(0))),
+            ]),
+        ),
     ])
 }
 

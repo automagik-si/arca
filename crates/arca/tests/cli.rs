@@ -1703,7 +1703,7 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
     assert_eq!(out.status.code(), Some(0));
     let help = stdout_text(&out);
     for line in [
-        "  status [--json] [--config <file>] [--token-file <file>]",
+        "  status [--json | --security] [--config <file>] [--token-file <file>]",
         "  --config      ~/.config/arca/node.json",
         "  --token-file  ~/.config/arca/assistant-1.secret",
         "  The order is: the flag, then the variable (ARCA_CONFIG, ARCA_TOKEN_FILE), then the default.",
@@ -2320,6 +2320,153 @@ fn the_page_of_this_machine_is_on_the_loopback_listener_and_its_setup_code_comes
             .count(),
         0
     );
+    let summary = rig.shim.stop().expect("stop the shim");
+    assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn status_says_whether_changes_are_on_which_page_approves_and_what_to_do_next_from_the_nodes_own_answer()
+ {
+    let scratch = Scratch::new("status-approvals");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let secret_file = scratch.at("viewer-1.secret");
+    let minted = arca()
+        .args(["token", "mint", "--scope", "viewer", "--id", "viewer-1"])
+        .arg("--hash-dir")
+        .arg(&tokens)
+        .arg("--out")
+        .arg(&secret_file)
+        .output()
+        .expect("mint a token");
+    assert!(minted.status.success(), "the token is minted");
+
+    let (mut child, at) = serve_on_a_free_port(&scratch, rig.shim.socket(), &|value, at| {
+        value["listen"]["loopback"] = json!(at.to_string());
+        value["approvalOrigin"] = json!(format!("http://localhost:{}", at.port()));
+    });
+    let port = at.port();
+    let page = format!("http://localhost:{port}/approve");
+    let node = scratch.at("node.json");
+    let command = format!(
+        "arca setup-code --config {}",
+        fs::canonicalize(&node)
+            .expect("the config's path")
+            .display()
+    );
+    let status = |arguments: &[&str]| {
+        let out = arca()
+            .arg("status")
+            .args(arguments)
+            .arg("--config")
+            .arg(&node)
+            .arg("--token-file")
+            .arg(&secret_file)
+            .output()
+            .expect("run arca status");
+        assert!(out.status.success(), "{}", stderr_text(&out));
+        stdout_text(&out)
+    };
+    // The page opens once the node holds both loopback addresses of its port.
+    let deadline = Instant::now() + WAIT;
+    let answer = loop {
+        let answer: Value = serde_json::from_str(&status(&["--json"])).expect("the status is JSON");
+        if answer["approvalPage"]["open"] == json!(true) {
+            break answer;
+        }
+        assert!(Instant::now() < deadline, "the page opens: {answer}");
+        thread::sleep(Duration::from_millis(100));
+    };
+    // The node's own answer: the page's address, that it is open, and that no passkey is trusted.
+    assert_eq!(
+        answer["approvalPage"],
+        json!({ "url": page, "open": true, "reason": null, "passkeys": 0 })
+    );
+    // In words: this node only looks, so changes are off; the page and the passkeys are still the node's word.
+    let words = status(&[]);
+    for said in [
+        "Changes: off. This node only looks".to_string(),
+        format!("Approval page: {page} (open)"),
+        "Passkeys: none trusted yet, so nothing can be approved".to_string(),
+        "Next: this node only looks. To let it make changes".to_string(),
+        format!("arca init --enable-changes --config {}", node.display()),
+    ] {
+        assert!(words.contains(&said), "{said:?} is missing:\n{words}");
+    }
+    // The page itself names the exact line for a machine with no screen, with this node's config by its whole path.
+    let html = reply_of(
+        at,
+        &format!("GET /approve HTTP/1.1\r\nHost: localhost:{port}"),
+        "",
+    );
+    assert!(
+        html.contains(&format!("data-setup-command=\"{command}\"")),
+        "the page carries the line for this node"
+    );
+    // And that line's own words give the way to the person's own computer, and promise no phone.
+    let out = arca()
+        .args(["setup-code", "--config"])
+        .arg(&node)
+        .output()
+        .expect("run arca setup-code");
+    assert!(out.status.success(), "{}", stderr_text(&out));
+    let said = stderr_text(&out);
+    assert!(
+        said.contains(&format!(
+            "ssh -o ExitOnForwardFailure=yes -L {port}:127.0.0.1:{port} <this machine>"
+        )),
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!("then open {page} in its browser")),
+        "{said}"
+    );
+    assert!(
+        said.contains("a phone cannot open this page. Approving from a phone needs the node reachable under a name"),
+        "{said}"
+    );
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(
+        wait_exit(&mut child).code(),
+        Some(0),
+        "serve exits 0 on SIGTERM"
+    );
+
+    // The cautions are the config's to tell: no node is asked, so they are there with the node stopped.
+    let out = arca()
+        .args(["status", "--security", "--config"])
+        .arg(&node)
+        .output()
+        .expect("run arca status --security");
+    assert!(out.status.success(), "{}", stderr_text(&out));
+    let cautions = stdout_text(&out);
+    for said in [
+        format!(
+            "The HTTP door, http://127.0.0.1:{port}/mcp, answers this machine only, and only with a token."
+        ),
+        "keeps the token in its own config, in clear text".to_string(),
+        format!("The approval page, {page}, is the page of this machine alone."),
+        "A phone cannot open this page.".to_string(),
+    ] {
+        assert!(cautions.contains(&said), "{said:?} is missing:\n{cautions}");
+    }
+    let both = arca()
+        .args(["status", "--security", "--json", "--config"])
+        .arg(&node)
+        .output()
+        .expect("run arca status");
+    assert_eq!(both.status.code(), Some(2), "one of the two");
     let summary = rig.shim.stop().expect("stop the shim");
     assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
 }
