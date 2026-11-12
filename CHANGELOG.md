@@ -11,6 +11,7 @@ A template whose image is `local:<alias>` and that already carried a `digest` wa
 ignored. It is enforced now: a create from such a template is refused unless the image under the alias has that
 fingerprint, and a digest that is not `sha256:` and 64 lowercase hex digits is refused when the template is read. Check
 a local template's `digest` against `incus image list` before you upgrade, or take the digest out.
+
 Every run of a function now starts from its image's own root. Before a run starts, its container's root is rebuilt
 from the function's image: from the copy the node already holds, the one the function's record took when it was
 created, or from the registry by the approved digest when that copy is gone. So no run finds what an earlier one
@@ -24,11 +25,7 @@ the template on the node is still exactly that one: an edit, or a template insta
 create with "propose it again". An image named without a digest is shown with words that say so. Two new optional
 arguments, `image` and `templateDigest`, are filled in by the node; a caller that states one must state the node's
 own. A proposal for a template that is not installed, or whose script is missing, is now refused when it is made.
-**If your node has templates from 0.13.0 or older:** run `arca templates install --config <file>` once after the
-upgrade (or `arca init --enable-changes` again). A shipped template that nobody edited is replaced with this
-release's, and the answer names it under `replaced`; a template you edited is kept, as before. 0.13.0 said to use
-`--replace` for this, which also overwrites your edits: it is no longer needed. A service that already exists is not
-changed.
+
 **If your node has templates from 0.13.0 or older:** upgrading with the installer now brings them up to the release.
 A shipped template that nobody edited is replaced with this release's and named in the report; one you edited is
 kept and named, with the command that replaces it. For a node the installer does not run as a service, run `arca
@@ -38,7 +35,6 @@ not changed.
 
 ## 0.13.0 (2026-11-12)
 
-## 0.13.0 (2026-11-12)
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU
 assignment no longer hold the word `watch-only`, which they did in 0.12.0: they carry the same sentence as every other
 refusal and every answer of such a node, `this node only looks: nothing here can be changed until the node is running
