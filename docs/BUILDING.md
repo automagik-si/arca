@@ -35,6 +35,9 @@ ships has changed:
    `arca-<version>-linux-x86_64`, `install.sh` (the installer as the release commit holds it, which installs that
    release) and `SHA256SUMS`, the checksums of those two.
 5. `main` moves to the release commit. `main` holds released commits and nothing else.
+   GitHub refuses that push when the release carries a change to a workflow file: the job's own token may not move a
+   branch across one, and no other credential is kept for it. The release is already published by then; the job
+   fails and prints the one command that moves `main`, for someone whose own access has the workflow scope.
 
 Steps 1 to 3 run the repository's code and its dependencies' (build scripts, tests, a package's install), so their
 job may only read: it holds no token that can write. It hands the release commit, its tag and the files to the second

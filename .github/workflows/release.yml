@@ -174,7 +174,11 @@ jobs:
         with:
           node-version: 24.11.0
 
-      # The limit is the rule: these tests stay in the gate only while they finish well inside it.
+      # The limit is the rule: these tests stay in the gate only while they finish well inside it. A test that hangs
+      # is stopped after 90 seconds and named, and the run then ends although the test left a server or a browser
+      # open: without --test-force-exit Node names the test and still waits for what it left, until the step's limit.
+      # The cost of that flag: a file whose tests all pass but which leaves something open no longer holds the run
+      # up, so that kind of leak is not seen here.
       - name: The canvas package's tests
         if: steps.plan.outputs.mode == 'cut'
         timeout-minutes: 5
@@ -183,7 +187,7 @@ jobs:
           set -euo pipefail
           npm ci --no-audit --no-fund
           npx playwright install --with-deps chromium
-          node --test
+          node --test --test-timeout=90000 --test-force-exit
 
       - name: Version, commit and tag
         id: cut
@@ -544,10 +548,28 @@ jobs:
           set -euo pipefail
           # Fast-forward only: main holds released commits and nothing else. The first release creates it.
           # The full name of the branch: a pattern such as `main` would also match another branch ending in /main.
+          #
+          # GitHub refuses a push that creates or updates a workflow file when the pusher lacks the workflows
+          # permission, and a job's own token can never hold it. So a release that carries a change to a workflow
+          # file may be refused here. Nothing is lost then: dev, the tag and the release are already out, and this
+          # job says which one command moves main. No other credential is kept for it.
+          move() {
+            local said=""
+            if said=$(git push -q origin "${SHA}:refs/heads/main" 2>&1); then
+              return 0
+            fi
+            printf '%s\n' "${said}"
+            if [[ "${said}" == *"create or update workflow"* ]]; then
+              echo "::error::main was not moved to ${SHA}: this release carries a change to a workflow file, and the job's token may not move a branch across one. The release itself is published. Someone whose own access has the workflow scope runs: git push origin ${SHA}:refs/heads/main"
+            else
+              echo "::error::main was not moved to ${SHA}: the push was refused, for the reason printed above"
+            fi
+            return 1
+          }
           found=0
           git ls-remote --exit-code origin refs/heads/main > /dev/null || found=$?
           if [[ "${found}" == 2 ]]; then
-            git push -q origin "${SHA}:refs/heads/main"
+            move
             echo "main created at ${SHA}"
           elif [[ "${found}" != 0 ]]; then
             echo "::error::could not read the remote's branches"
@@ -555,7 +577,7 @@ jobs:
           else
             git fetch -q origin "refs/heads/main:refs/remotes/origin/main"
             if git merge-base --is-ancestor origin/main "${SHA}"; then
-              git push -q origin "${SHA}:refs/heads/main"
+              move
             else
               echo "main is already past ${SHA}"
             fi

@@ -7,8 +7,10 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use arca_approval::{ApprovalVerifier, FileNonces, SshSigVerifier};
+use arca_kernel::KernelError;
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{DesiredStateGate, EntryId};
 use arca_kernel::journal::Inverse;
@@ -134,6 +136,27 @@ fn probe_family() -> Family {
     }
 }
 
+/// Opens the journal at `path`, and waits for a lock that is on its way out.
+///
+/// The journal's lock belongs to the open file and not to the handle. While another test of this binary starts its child,
+/// that child holds a copy of every file this process has open, until it has become its own program. So a journal this
+/// test closed a moment ago can still read as held, for as long as that start takes: the open is tried again for up to ten
+/// seconds, and only on that one refusal. A journal that stays held still fails, with the kernel's own words.
+fn open_journal(path: &Path) -> FileJournal {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match FileJournal::open(path) {
+            Ok(store) => return store,
+            Err(KernelError::Journal(why))
+                if why.ends_with("is held by another process") && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => panic!("the journal opens: {e:?}"),
+        }
+    }
+}
+
 /// The reconciler the probe runs under, on `journal`. With `kill` set, its provider aborts at that effect.
 fn reconciler_at(
     dir: &Path,
@@ -158,7 +181,7 @@ fn reconciler_at(
         }),
         None => Box::new(inner),
     };
-    let store = FileJournal::open(journal).expect("the journal opens");
+    let store = open_journal(journal);
     Reconciler::open(
         DesiredStateGate::new(node_key().public(), None),
         Journal::open(store).expect("the journal folds"),
@@ -319,8 +342,7 @@ fn kill_then_restart(case: Option<(usize, Phase)>) {
                 );
             }
             // Every object the killed process made has a journal record, even when its outcome is unknown.
-            let reopened = Journal::open(FileJournal::open(&journal).expect("the journal opens"))
-                .expect("the journal folds");
+            let reopened = Journal::open(open_journal(&journal)).expect("the journal folds");
             let live = live_places_of(&reopened);
             for target in &targets {
                 if present(&fake, target) {
@@ -851,8 +873,7 @@ fn the_journal_a_refused_project_tombstone_left_opens_and_its_removal_deletes_th
         22,
         "the journal as the earlier kernel left it"
     );
-    let earlier = Journal::open(FileJournal::open(&journal).expect("the journal opens"))
-        .expect("the journal folds");
+    let earlier = Journal::open(open_journal(&journal)).expect("the journal folds");
     let open: Vec<u64> = earlier
         .unresolved()
         .iter()
