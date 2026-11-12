@@ -2400,8 +2400,100 @@ fn plan_ref() -> Value {
 fn action_propose_params() -> Value {
     params(vec![
         ("action", true, one_of(&ACTION_NAMES)),
-        ("args", true, json!({ "type": "object" })),
+        ("args", true, action_args()),
     ])
+}
+
+/// One `args` of each action, as an assistant proposes it: the fields it must name, and no field the node fills in.
+const ACTION_EXAMPLES: [(&str, &str); 22] = [
+    ("service_create", r#"{"name":"nats","template":"nats"}"#),
+    ("service_remove", r#"{"name":"nats"}"#),
+    ("service_import", r#"{"name":"web"}"#),
+    ("service_release", r#"{"name":"web"}"#),
+    ("service_publish", r#"{"name":"dash","reach":"tailnet"}"#),
+    ("service_unpublish", r#"{"name":"dash"}"#),
+    ("service_connect", r#"{"from":"api","to":"nats"}"#),
+    ("service_disconnect", r#"{"from":"api","to":"nats"}"#),
+    ("postgres_create", r#"{"name":"orders"}"#),
+    (
+        "gpu_attach",
+        r#"{"project":"arcak-gpu","instance":"llm","pci":"0000:01:00.0"}"#,
+    ),
+    (
+        "gpu_detach",
+        r#"{"project":"arcak-gpu","instance":"llm","pci":"0000:01:00.0"}"#,
+    ),
+    ("storage_add", r#"{"name":"usb1","device":"sdb"}"#),
+    (
+        "snapshot_create",
+        r#"{"project":"shop","instance":"web","pool":"usb1"}"#,
+    ),
+    (
+        "snapshot_delete",
+        r#"{"name":"shop--web--20261030T1200","pool":"usb1"}"#,
+    ),
+    (
+        "instance_start",
+        r#"{"project":"arcak-svc","instance":"web"}"#,
+    ),
+    (
+        "instance_stop",
+        r#"{"project":"arcak-svc","instance":"web"}"#,
+    ),
+    (
+        "instance_restart",
+        r#"{"project":"arcak-svc","instance":"web"}"#,
+    ),
+    ("tenant_create", r#"{}"#),
+    ("tenant_remove", r#"{"id":"abcdefgh"}"#),
+    ("deploy_remove", r#"{"tenant":"abcdefgh","deploy":"d1"}"#),
+    (
+        "function_create",
+        r#"{"name":"relay","image":"registry.example/acme/relay","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","triggers":[{"timer":{"everySeconds":60}}]}"#,
+    ),
+    ("function_remove", r#"{"name":"relay"}"#),
+];
+
+/// The schema keyword that tells the door's check which branch of an `anyOf` a value is held to: the one whose `title`
+/// is the value of the sibling field it names.
+pub const BRANCH_BY: &str = "x-arca-by";
+
+/// The `args` of `action_propose`: one branch per action, titled with the action's name, with the fields of the verb it
+/// proposes (less `approval`, which the proposal replaces; a destructive verb's `confirm` stays, as the proposal drops
+/// `true` and refuses `false`), what each does, and an example. The door holds `args` to the branch `action` names
+/// ([`BRANCH_BY`]), so a refusal keeps that branch's own words.
+fn action_args() -> Value {
+    let branches: Vec<Value> = ACTION_NAMES
+        .iter()
+        .map(|name| {
+            let verb = verb(name).expect("every action is a verb in the table");
+            let mut schema = (verb.params)();
+            if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+                required.retain(|field| field.as_str() != Some("approval"));
+            }
+            if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                properties.remove("approval");
+            }
+            let example: Value = ACTION_EXAMPLES
+                .iter()
+                .find(|(action, _)| action == name)
+                .map(|(_, example)| serde_json::from_str(example).expect("an example is JSON"))
+                .expect("every action has an example");
+            schema["title"] = json!(name);
+            schema["description"] = json!(format!(
+                "The args of {name}: {} Example: {example}",
+                verb.summary
+            ));
+            schema["examples"] = json!([example]);
+            schema
+        })
+        .collect();
+    json!({
+        "type": "object",
+        "description": "The action's own arguments: those of the anyOf branch whose title is the action.",
+        BRANCH_BY: "action",
+        "anyOf": branches
+    })
 }
 
 fn action_propose_result() -> Value {

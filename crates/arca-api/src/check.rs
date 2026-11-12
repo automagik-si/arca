@@ -291,7 +291,15 @@ fn check_object(
     if let Some(props) = props {
         for (name, sub) in props {
             if let Some(field) = fields.get(name) {
-                validate(sub, field, &child(at, name))?;
+                match branch_of(sub, fields) {
+                    Some((rest, branch)) => {
+                        validate(&rest, field, &child(at, name))?;
+                        if let Some(branch) = branch {
+                            validate(branch, field, &child(at, name))?;
+                        }
+                    }
+                    None => validate(sub, field, &child(at, name))?,
+                }
             }
         }
     }
@@ -404,6 +412,29 @@ pub fn unknown_field(at: &str, key: &str, known: &[&str]) -> String {
         _ => String::new(),
     };
     format!("{place}{named}; {takes}{hint}")
+}
+
+/// A field whose schema names a sibling in [`crate::verbs::BRANCH_BY`] is held to the one branch of its `anyOf` whose
+/// `title` is that sibling's value, so a refusal is in that branch's own words and not "matches none". It returns the
+/// schema without its `anyOf`, and the branch when one is titled so; with none (a sibling value that is not one), only
+/// the rest is checked here and the sibling's own schema refuses the value. `None` for any other schema.
+fn branch_of<'a>(
+    sub: &'a Value,
+    fields: &Map<String, Value>,
+) -> Option<(Value, Option<&'a Value>)> {
+    let sibling = sub.get(crate::verbs::BRANCH_BY)?.as_str()?;
+    let Value::Array(options) = sub.get("anyOf")? else {
+        return None;
+    };
+    let chosen = fields.get(sibling).and_then(Value::as_str);
+    let branch = options
+        .iter()
+        .find(|option| chosen.is_some() && option.get("title").and_then(Value::as_str) == chosen);
+    let mut rest = sub.clone();
+    if let Some(rest) = rest.as_object_mut() {
+        rest.remove("anyOf");
+    }
+    Some((rest, branch))
 }
 
 /// The most allowed values a refusal lists by name.

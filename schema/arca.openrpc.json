@@ -1880,7 +1880,1159 @@
           "name": "args",
           "required": true,
           "schema": {
-            "type": "object"
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The args of service_create: Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or a virtual machine on the service network or on an existing host bridge the node allows. With start: false it is created stopped, so service_secret_set and service_connect put its secrets and links in place before instance_start starts it for the first time. Example: {\"name\":\"nats\",\"template\":\"nats\"}",
+                "examples": [
+                  {
+                    "name": "nats",
+                    "template": "nats"
+                  }
+                ],
+                "properties": {
+                  "bridge": {
+                    "description": "For a virtual-machine template: the existing host bridge its NIC joins, one of the node's allowed bridges. Left out, the virtual machine joins the managed service network when the node has one, and otherwise the node's only allowed bridge.",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$",
+                    "type": "string"
+                  },
+                  "deploy": {
+                    "description": "A deploy id: 1 to 64 of a-z, 0-9 and \"-\". What a create inside a tenant makes under it is provisional until the same token confirms the deploy or 15 minutes pass, and that token may roll the deploy back until then.",
+                    "pattern": "^[a-z0-9-]{1,64}$",
+                    "type": "string"
+                  },
+                  "destinations": {
+                    "description": "Only for a service this node's config names in kernel.serviceDestinations: exactly the addresses and tcp ports the config names for it. A proposal made with action_propose fills it in from the config, so the owner's approval binds it and the owner's card shows each address; a caller has no need to state it, and cannot state one of its own. Such a service, and everything that runs in it, can reach each address on its one tcp port through this node; every other private address stays closed. A create of such a service runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant and for a virtual machine on a host bridge.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "address": {
+                          "maxLength": 15,
+                          "type": "string"
+                        },
+                        "port": {
+                          "maximum": 65535,
+                          "minimum": 1,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "address",
+                        "port"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 4,
+                    "type": "array"
+                  },
+                  "image": {
+                    "description": "Filled in by the node when a create is proposed: the image the template names, <image>@sha256:<digest> when it gives a digest and the bare name when it gives none; a virtual machine that names a version adds \" running <version>\". The owner's card shows it and the approval binds it. A caller leaves it out; one that states it must state the node's own.",
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "kernelAccess": {
+                    "additionalProperties": false,
+                    "description": "Only for a template that declares kernelAccess: the template's own kernelAccess. A proposal made with action_propose fills it in from the template, so the owner's approval binds it and the owner's card says it; a caller has no need to state it. Such a service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given; the token's scope and tool list decide what it may do. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, and on a node that sets no listen.services.",
+                    "properties": {
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1024,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "port"
+                    ],
+                    "type": "object"
+                  },
+                  "mac": {
+                    "description": "For a virtual-machine template on a host bridge: a fixed MAC for its NIC, six hex octets joined by \":\". Left out, Incus picks one. Refused on the managed service network.",
+                    "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$",
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "registry": {
+                    "description": "Only for an image on a registry this node holds a credential for (registry_secret_set): that registry's address. A proposal made with action_propose fills it in, so the owner's card says that the image is fetched with the credential and that Incus then keeps it with the image; a caller has no need to state it. Such a create runs only from an approved proposal.",
+                    "maxLength": 128,
+                    "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?$",
+                    "type": "string"
+                  },
+                  "settings": {
+                    "description": "For a virtual-machine template that lists createSettings: the settings this one service gets in place of the template's defaults, by name. Only a listed name is taken, and a value has the type of the template's default; an address is a plain https address. Never a secret: service_status shows them. Fixed at create.",
+                    "type": "object"
+                  },
+                  "start": {
+                    "description": "Optional. Absent or true: the service is started once it is created, as without the field. A container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets, are created stopped whatever this says, and the answer's stoppedBecause says why. False: it is created stopped, the answer's state is \"stopped\", and its create carries no boot.autostart, so a host restart does not boot it before its first instance_start and afterwards restores the state it was in. service_secret_set and service_connect then apply to it, and instance_start starts it for the first time: a container with every secret and link in its environment. A virtual machine's secrets are never in its environment: instance_start writes them into the guest as files once it has booted, in a tenant's machine as in one of the node's own.",
+                    "type": "boolean"
+                  },
+                  "template": {
+                    "description": "The template's name.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "templateDigest": {
+                    "description": "Filled in by the node when a create is proposed: SHA-256, in hex, of the template's file and of each script it names, as the node holds them then. The create runs only while the template on the node is still exactly that one. A caller leaves it out; one that states it must state the node's own.",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "template",
+                  "name"
+                ],
+                "title": "service_create",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_remove: Remove a service, its links, its ACL and its secrets, with the owner's signed approval. Example: {\"name\":\"nats\"}",
+                "examples": [
+                  {
+                    "name": "nats"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "service_remove",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_import: Take over a service another manager created, where it stands: write one key on its instance, the kernel's import mark, and record it as an adopted service. Only a service kernel.importServices lists, only from an approved proposal. Nothing is stopped, moved or changed otherwise. Example: {\"name\":\"web\"}",
+                "examples": [
+                  {
+                    "name": "web"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The service name, as kernel.importServices lists it (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "service_import",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_release: Undo a service import: clear the one key the import wrote and remove Arca's record of the service, only from an approved proposal. The instance keeps running and nothing else on it changes. Example: {\"name\":\"web\"}",
+                "examples": [
+                  {
+                    "name": "web"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The service name, as kernel.importServices lists it (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "service_release",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_publish: Publish a service's dash on the owner's tailnet (droidd's own) and nowhere else: the service joins it as its own node, arca-<name> (tag:arca-svc), and serves HTTPS on port 8443 only, to its dash. Needs the service's tailscale_authkey secret (the owner's tagged, pre-approved Tailscale auth key, service_secret_set) and the owner's signed approval (arca-approve, action publish, target the service, its arguments' digest), which an agent asks the owner for and relays. Returns the node and its https address. Example: {\"name\":\"dash\",\"reach\":\"tailnet\"}",
+                "examples": [
+                  {
+                    "name": "dash",
+                    "reach": "tailnet"
+                  }
+                ],
+                "properties": {
+                  "name": {
+                    "description": "The service name.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "reach": {
+                    "description": "Where the dash is published: \"tailnet\", the only reach there is.",
+                    "maxLength": 32,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "reach"
+                ],
+                "title": "service_publish",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_unpublish: Take a service's dash off the tailnet: it stops serving 8443, its node logs out and leaves the tailnet, and tailscaled stops. Runs whether or not a publish finished. Example: {\"name\":\"dash\"}",
+                "examples": [
+                  {
+                    "name": "dash"
+                  }
+                ],
+                "properties": {
+                  "name": {
+                    "description": "The service name.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "service_unpublish",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_connect: Link a consumer to a provider: the provider's network ACL lets the consumer's address reach its first port, and nothing else, and the consumer's environment gets what the provider's template provides (DATABASE_URL, say); the environment applies on its next start. Returns the variable names only. Example: {\"from\":\"api\",\"to\":\"nats\"}",
+                "examples": [
+                  {
+                    "from": "api",
+                    "to": "nats"
+                  }
+                ],
+                "properties": {
+                  "from": {
+                    "description": "The consumer: the service whose environment gets the provider's variables.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  },
+                  "to": {
+                    "description": "The provider: the service whose first port the link opens.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "title": "service_connect",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_disconnect: Remove a link: the provider's ACL rule for the consumer goes, and so do the variables it gave the consumer (applied on its next start). Returns their names. Example: {\"from\":\"api\",\"to\":\"nats\"}",
+                "examples": [
+                  {
+                    "from": "api",
+                    "to": "nats"
+                  }
+                ],
+                "properties": {
+                  "from": {
+                    "description": "The consumer: the service whose environment gets the provider's variables.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  },
+                  "to": {
+                    "description": "The provider: the service whose first port the link opens.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "title": "service_disconnect",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of postgres_create: Create a Postgres database in the node's service project (arcak-svc). Give the name only: the image is the node's, never the call's. With no kernel.postgresImage in the node's config, the database is a service from the node's postgres-autopg template: its digest-pinned image is fetched, the template generates the password (when it does not, the service is created stopped and stoppedBecause says why), and the answer says service: true; connect to it with service_connect, remove it with service_remove. With kernel.postgresImage, it is a database of the old kind from that image, linked with postgres_link. Returns its name, its entry and the status pending; postgres_list shows when it runs. Example: {\"name\":\"orders\"}",
+                "examples": [
+                  {
+                    "name": "orders"
+                  }
+                ],
+                "properties": {
+                  "image": {
+                    "maxLength": 512,
+                    "type": "string"
+                  },
+                  "name": {
+                    "maxLength": 31,
+                    "type": "string"
+                  },
+                  "template": {
+                    "description": "Filled in by the node: the template a database is made from when its config names no image (postgres-autopg). A caller leaves it out.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "templateDigest": {
+                    "description": "Filled in by the node with the template: SHA-256, in hex, of the template's file and of each script it names. The create runs only while the template on the node is still exactly that one. A caller leaves it out.",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Always refused. The database verbs act in the node's own project only. Inside a tenant, a database is the postgres service template, created with service_create and linked with service_connect.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "postgres_create",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of gpu_attach: Attach a physical GPU card to an Incus instance, by PCI address, with the owner's signed approval. A card bound to vfio-pci is refused for a container. Example: {\"instance\":\"llm\",\"pci\":\"0000:01:00.0\",\"project\":\"arcak-gpu\"}",
+                "examples": [
+                  {
+                    "instance": "llm",
+                    "pci": "0000:01:00.0",
+                    "project": "arcak-gpu"
+                  }
+                ],
+                "properties": {
+                  "instance": {
+                    "description": "The Incus instance name.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "container",
+                      "virtual-machine"
+                    ],
+                    "type": "string"
+                  },
+                  "pci": {
+                    "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
+                    "pattern": "^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+                    "type": "string"
+                  },
+                  "project": {
+                    "description": "The Incus instance name.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                    "type": "string"
+                  },
+                  "uuid": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "instance",
+                  "pci"
+                ],
+                "title": "gpu_attach",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of gpu_detach: Detach a physical GPU card from an Incus instance, by PCI address, with the owner's signed approval. Example: {\"instance\":\"llm\",\"pci\":\"0000:01:00.0\",\"project\":\"arcak-gpu\"}",
+                "examples": [
+                  {
+                    "instance": "llm",
+                    "pci": "0000:01:00.0",
+                    "project": "arcak-gpu"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "instance": {
+                    "description": "The Incus instance name.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "container",
+                      "virtual-machine"
+                    ],
+                    "type": "string"
+                  },
+                  "pci": {
+                    "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
+                    "pattern": "^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+                    "type": "string"
+                  },
+                  "project": {
+                    "description": "The Incus instance name.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                    "type": "string"
+                  },
+                  "uuid": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "instance",
+                  "pci"
+                ],
+                "title": "gpu_detach",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of storage_add: Add snapshot storage, with the owner's signed approval: a folder on a mounted disk, or a whole free disk that Incus wipes and formats as the pool arca-snapshots-<name>. A system disk, a member disk, a disk that holds snapshots and a mounted disk are refused as a whole-disk target. Example: {\"device\":\"sdb\",\"name\":\"usb1\"}",
+                "examples": [
+                  {
+                    "device": "sdb",
+                    "name": "usb1"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "contents": {
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "device": {
+                    "description": "A whole free disk, such as sdb or /dev/sdb. Incus wipes and formats it as btrfs; the pool is named arca-snapshots-<name> (at most 32 characters).",
+                    "pattern": "^(?:/dev/)?[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$",
+                    "type": "string"
+                  },
+                  "disk": {
+                    "maxLength": 64,
+                    "type": "string"
+                  },
+                  "fsUuid": {
+                    "maxLength": 128,
+                    "type": "string"
+                  },
+                  "inUseCheck": {
+                    "enum": [
+                      "exclusive open",
+                      "system lists"
+                    ],
+                    "type": "string"
+                  },
+                  "model": {
+                    "maxLength": 256,
+                    "type": "string"
+                  },
+                  "mount": {
+                    "maxLength": 1024,
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "The storage pool name (1-32 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "A folder on a mounted disk that is not a system disk. The pool lives in <path>/arca-pool, which Arca makes (empty, 0700) when the approved add runs; Arca must be able to write in the folder.",
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "pattern": "^/",
+                    "type": "string"
+                  },
+                  "serial": {
+                    "maxLength": 256,
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": "integer"
+                  },
+                  "transport": {
+                    "maxLength": 32,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "storage_add",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of snapshot_create: Copy one app, data volume or host folder (such as /home) onto snapshot storage, with the owner's signed approval. The copy lives in the arcak-snapshots project, never starts on its own, and the source is never changed. Example: {\"instance\":\"web\",\"pool\":\"usb1\",\"project\":\"shop\"}",
+                "examples": [
+                  {
+                    "instance": "web",
+                    "pool": "usb1",
+                    "project": "shop"
+                  }
+                ],
+                "properties": {
+                  "allocated": {
+                    "type": "integer"
+                  },
+                  "files": {
+                    "type": "integer"
+                  },
+                  "folder": {
+                    "description": "A host folder to copy, such as /home: absolute, with no link in its path, and not /, /proc, /sys, /dev, /run, /boot, /tmp or /var/lib/incus. Incus copies it read-only through a short-lived helper container.",
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "pattern": "^/",
+                    "type": "string"
+                  },
+                  "fsUuid": {
+                    "maxLength": 128,
+                    "type": "string"
+                  },
+                  "instance": {
+                    "description": "The Incus instance name.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "container",
+                      "virtual-machine",
+                      "volume",
+                      "folder"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "The snapshot's name, set by the kernel.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "pool": {
+                    "description": "The storage pool name (1-32 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "poolFree": {
+                    "type": "integer"
+                  },
+                  "project": {
+                    "description": "The source's Incus project (an app or a data volume).",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "separate": {
+                    "items": {
+                      "maxLength": 4096,
+                      "type": "string"
+                    },
+                    "maxItems": 100,
+                    "type": "array"
+                  },
+                  "separateCount": {
+                    "type": "integer"
+                  },
+                  "size": {
+                    "type": "integer"
+                  },
+                  "sourcePool": {
+                    "description": "A source volume's pool.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  },
+                  "unreadable": {
+                    "type": "integer"
+                  },
+                  "uuid": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "volume": {
+                    "description": "The source custom volume.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pool"
+                ],
+                "title": "snapshot_create",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of snapshot_delete: Delete one snapshot copy from the arcak-snapshots project, with the owner's signed approval. Nothing outside that project is touched. Example: {\"name\":\"shop--web--20261030T1200\",\"pool\":\"usb1\"}",
+                "examples": [
+                  {
+                    "name": "shop--web--20261030T1200",
+                    "pool": "usb1"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "kind": {
+                    "enum": [
+                      "instance",
+                      "volume"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "The snapshot's name.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "pool": {
+                    "description": "The snapshot's pool.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "source": {
+                    "maxLength": 512,
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "snapshot_delete",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of instance_start: Start a stopped Incus instance that Arca owns or has adopted, named by its project and its name. An instance that already runs is left running, and the answer says so. An instance that is not Arca's is refused. For a virtual-machine service with stored secrets (service_secret_set) it also writes them into the guest, whether it started the machine or found it running, and the answer names them. Example: {\"instance\":\"web\",\"project\":\"arcak-svc\"}",
+                "examples": [
+                  {
+                    "instance": "web",
+                    "project": "arcak-svc"
+                  }
+                ],
+                "properties": {
+                  "instance": {
+                    "description": "The Incus instance name.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                    "type": "string"
+                  },
+                  "project": {
+                    "description": "The Incus project the instance is in. Required unless tenant names the tenant whose project it is.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                    "type": "string"
+                  },
+                  "service": {
+                    "description": "Inside a tenant, the service whose instance is meant, in place of instance.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "title": "instance_start",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of instance_stop: Stop a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. Inside a tenant it needs no approval, from a token whose tool allowlist names it. An instance that is already stopped is left stopped, and the answer says so. An instance that is not Arca's is refused. Example: {\"instance\":\"web\",\"project\":\"arcak-svc\"}",
+                "examples": [
+                  {
+                    "instance": "web",
+                    "project": "arcak-svc"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "instance": {
+                    "description": "The Incus instance name.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                    "type": "string"
+                  },
+                  "project": {
+                    "description": "The Incus project the instance is in. Required unless tenant names the tenant whose project it is.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                    "type": "string"
+                  },
+                  "service": {
+                    "description": "Inside a tenant, the service whose instance is meant, in place of instance.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "title": "instance_stop",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of instance_restart: Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. Inside a tenant it needs no approval, from a token whose tool allowlist names it. A stopped instance is started instead, and the answer says so. An instance that is not Arca's is refused. Example: {\"instance\":\"web\",\"project\":\"arcak-svc\"}",
+                "examples": [
+                  {
+                    "instance": "web",
+                    "project": "arcak-svc"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "instance": {
+                    "description": "The Incus instance name.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                    "type": "string"
+                  },
+                  "project": {
+                    "description": "The Incus project the instance is in. Required unless tenant names the tenant whose project it is.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                    "type": "string"
+                  },
+                  "service": {
+                    "description": "Inside a tenant, the service whose instance is meant, in place of instance.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "title": "instance_restart",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of tenant_create: Create a tenant: one restricted Incus project on the node's managed service network, with its own address block and caps. Inside the node's standing policy (kernel.tenants: default caps, capacity, tenant count and create rate) it needs no approval, from a token whose tool allowlist names it. Caps above the node's defaults run only from a proposal the owner approved. Example: {}",
+                "examples": [
+                  {}
+                ],
+                "properties": {
+                  "caps": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "containers": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cpu": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "disk": {
+                        "maxLength": 32,
+                        "type": "string"
+                      },
+                      "instances": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "memory": {
+                        "maxLength": 32,
+                        "type": "string"
+                      },
+                      "virtualMachines": {
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "instances",
+                      "containers",
+                      "virtualMachines",
+                      "cpu",
+                      "memory",
+                      "disk"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "title": "tenant_create",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of tenant_remove: Remove a tenant and everything in it, only from a proposal the owner approved: each instance is deleted and confirmed gone before its firewall rules, then its secrets, and last the tenant's profile and project. Example: {\"id\":\"abcdefgh\"}",
+                "examples": [
+                  {
+                    "id": "abcdefgh"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "id": {
+                    "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id"
+                ],
+                "title": "tenant_remove",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of deploy_remove: Remove everything a deploy created in a tenant, once the deploy is confirmed or its 15 minutes have passed, only from a proposal the owner approved: one approval for all its services, each instance deleted and confirmed gone before its firewall rules, then its secrets and volumes. Nothing else of the tenant is touched. A deploy that is still provisional is refused: its own token rolls it back. Example: {\"deploy\":\"d1\",\"tenant\":\"abcdefgh\"}",
+                "examples": [
+                  {
+                    "deploy": "d1",
+                    "tenant": "abcdefgh"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "deploy": {
+                    "description": "A deploy id: 1 to 64 of a-z, 0-9 and \"-\". What a create inside a tenant makes under it is provisional until the same token confirms the deploy or 15 minutes pass, and that token may roll the deploy back until then.",
+                    "pattern": "^[a-z0-9-]{1,64}$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "tenant",
+                  "deploy"
+                ],
+                "title": "deploy_remove",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of function_create: Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container, on its image's own root, with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on. Example: {\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"image\":\"registry.example/acme/relay\",\"name\":\"relay\",\"triggers\":[{\"timer\":{\"everySeconds\":60}}]}",
+                "examples": [
+                  {
+                    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "image": "registry.example/acme/relay",
+                    "name": "relay",
+                    "triggers": [
+                      {
+                        "timer": {
+                          "everySeconds": 60
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "properties": {
+                  "command": {
+                    "description": "The program and its arguments: the first is the program's absolute path inside the image. No shell runs it. Left out, the image's own entry point runs.",
+                    "items": {
+                      "maxLength": 160,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 32,
+                    "type": "array"
+                  },
+                  "concurrency": {
+                    "description": "How many runs of the function may go at once. This build runs one: the only value is 1, which is also the default.",
+                    "enum": [
+                      1
+                    ],
+                    "type": "integer"
+                  },
+                  "destinations": {
+                    "description": "Only for a function this node's config names in kernel.serviceDestinations: exactly the addresses and tcp ports the config names for it. A proposal fills it in from the config, so the owner's card shows each address and the approval binds it; a caller cannot state one of its own.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "address": {
+                          "maxLength": 15,
+                          "pattern": "^[0-9]{1,3}(?:\\.[0-9]{1,3}){3}$",
+                          "type": "string"
+                        },
+                        "port": {
+                          "maximum": 65535,
+                          "minimum": 1,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "address",
+                        "port"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 4,
+                    "type": "array"
+                  },
+                  "digest": {
+                    "description": "The image's digest: sha256: and 64 hex digits. A function is an image by digest, never a tag, so a new version is a new function_create that the owner approves.",
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "env": {
+                    "additionalProperties": {
+                      "maxLength": 160,
+                      "type": "string"
+                    },
+                    "description": "Plain environment values, by name, at most 32. The owner's card shows each whole. Never a secret: a secret is named in secrets.",
+                    "propertyNames": {
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "image": {
+                    "description": "The image, as <registry>/<repository> in lower case, such as registry.example/acme/relay. Arca pulls it without a credential.",
+                    "maxLength": 255,
+                    "pattern": "^[a-z0-9][a-z0-9._:-]*/[a-z0-9._/:-]+$",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "description": "How a run is isolated. This build runs a function in a container: the only value is \"container\", which is also the default.",
+                    "enum": [
+                      "container"
+                    ],
+                    "type": "string"
+                  },
+                  "limits": {
+                    "additionalProperties": false,
+                    "description": "What one run may use. seconds: the longest it may take (default 60); Arca stops a run that passes it, with a stop the program has 5 seconds to obey and then a kill. memory: the most it may use, as a size such as 128MiB (default 128MiB, at least 8MiB); a run that passes it is killed. cpu: the CPUs it may use (default 1).",
+                    "properties": {
+                      "cpu": {
+                        "maximum": 64,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "memory": {
+                        "maxLength": 32,
+                        "pattern": "^[1-9][0-9]*(?:MiB|GiB)$",
+                        "type": "string"
+                      },
+                      "seconds": {
+                        "maximum": 900,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "links": {
+                    "description": "The services of this node the function may reach, each on one tcp port the service declares. A link opens the way and nothing else: no connection value is put in the function's environment.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "port": {
+                          "maximum": 65535,
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "to": {
+                          "description": "A service of this node.",
+                          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "to",
+                        "port"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "name": {
+                    "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "registry": {
+                    "description": "Only for an image on a registry this node holds a credential for (registry_secret_set): that registry's address. A proposal made with action_propose fills it in, so the owner's card says that the image is fetched with the credential and that Incus then keeps it with the image; a caller has no need to state it. Such a create runs only from an approved proposal.",
+                    "maxLength": 128,
+                    "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?$",
+                    "type": "string"
+                  },
+                  "secrets": {
+                    "description": "The names of the function's secrets, at most 16. Each run is given these as environment values, and no other. function_secret_set sets each value.",
+                    "items": {
+                      "description": "The name of an environment variable.",
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+                      "type": "string"
+                    },
+                    "maxItems": 16,
+                    "type": "array"
+                  },
+                  "triggers": {
+                    "description": "When the function runs: exactly one trigger, a timer. A run starts every everySeconds, unless one is still going.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "timer": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "everySeconds": {
+                              "maximum": 86400,
+                              "minimum": 10,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "everySeconds"
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "timer"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "name",
+                  "image",
+                  "digest",
+                  "triggers"
+                ],
+                "title": "function_create",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of function_remove: Remove a function, only from a proposal the owner approved: the run that is going, if one is, is stopped, then its instance, its firewall rules and its secrets are deleted and each linked service closes to it. Its lines in the run log are kept. Example: {\"name\":\"relay\"}",
+                "examples": [
+                  {
+                    "name": "relay"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "function_remove",
+                "type": "object"
+              }
+            ],
+            "description": "The action's own arguments: those of the anyOf branch whose title is the action.",
+            "type": "object",
+            "x-arca-by": "action"
           }
         }
       ],

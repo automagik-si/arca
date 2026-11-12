@@ -1815,7 +1815,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
     };
     assert_eq!(
         failure(json!({ "action": "function_create", "args": {} })),
-        "invalid_arguments: args: missing required field name"
+        "invalid_arguments: /args: missing required field name"
     );
     let params = (verb("action_propose").expect("the verb").params)();
     let all: Vec<&str> = params["properties"]["action"]["enum"]
@@ -1833,4 +1833,29 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         )
     );
     assert_eq!(rig.list()["plans"].as_array().map(Vec::len), Some(0));
+}
+
+/// Each example the tool's schema gives for an action's `args` is one the action takes: its own check passes it, or,
+/// for an action whose card carries what the kernel reads at propose (a GPU's instance kind, a disk's model), it gets
+/// past every check of what the caller gives and stops only at the first field the kernel fills in.
+#[test]
+fn every_example_in_the_schema_of_action_propose_is_one_its_action_takes() {
+    let params = (verb("action_propose").expect("the verb").params)();
+    let branches = params["properties"]["args"]["anyOf"]
+        .as_array()
+        .expect("one branch per action");
+    assert_eq!(branches.len(), ActionKind::ALL.len());
+    for action in ActionKind::ALL {
+        let branch = branches
+            .iter()
+            .find(|branch| branch["title"] == json!(action.as_str()))
+            .unwrap_or_else(|| panic!("{action:?} has a branch"));
+        let example = &branch["examples"][0];
+        if let Err(why) = action.prepare(example, Some(TEST_PG_IMAGE)) {
+            assert!(
+                why.ends_with(": the kernel resolves it when the proposal is made"),
+                "{action:?} takes its example {example}: {why}"
+            );
+        }
+    }
 }
