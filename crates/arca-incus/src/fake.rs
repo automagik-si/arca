@@ -216,7 +216,7 @@ struct Shared {
     /// The exits armed by a start that has not ended yet.
     exits: Mutex<BTreeMap<(String, String), (u32, String)>>,
     /// The rebuilds each instance took, in order: `store` for the store's copy, `registry` for a registry's.
-    rebuilds: Mutex<BTreeMap<(String, String), Vec<&'static str>>>,
+    rebuilds: Mutex<BTreeMap<(String, String), Vec<String>>>,
     /// The instances whose rebuild from the store's copy is refused, and whether one from a registry is refused too.
     rebuild_refusals: Mutex<BTreeMap<(String, String), bool>>,
     counter: AtomicU64,
@@ -468,9 +468,9 @@ impl FakeIncus {
         lock(&self.shared.exit_plans).remove(&(project.to_string(), name.to_string()));
     }
 
-    /// The rebuilds the instance `name` in `project` took, in order: `store` for one from the store's own copy of its
-    /// image, `registry` for one that named a registry.
-    pub fn rebuilds(&self, project: &str, name: &str) -> Vec<&'static str> {
+    /// The rebuilds the instance `name` in `project` took, in order: `store:<fingerprint>` for one from the store's
+    /// own copy of an image, `registry` for one that named a registry.
+    pub fn rebuilds(&self, project: &str, name: &str) -> Vec<String> {
         lock(&self.shared.rebuilds)
             .get(&(project.to_string(), name.to_string()))
             .cloned()
@@ -1451,6 +1451,19 @@ impl Store {
         alias: &str,
         cached: bool,
     ) -> String {
+        self.put_image_from(project, fingerprint, alias, cached, None)
+    }
+
+    /// [`Store::put_image`], with the server a fetched image came from: Incus keeps it, and the alias it was asked
+    /// for, in the image's own record.
+    fn put_image_from(
+        &mut self,
+        project: &str,
+        fingerprint: String,
+        alias: &str,
+        cached: bool,
+        server: Option<&str>,
+    ) -> String {
         let home = self
             .image_store(project)
             .unwrap_or_else(|| project.to_string());
@@ -1471,6 +1484,8 @@ impl Store {
                 body: json!({
                     "fingerprint": fingerprint, "project": home, "cached": cached,
                     "aliases": aliases, "type": "container",
+                    "auto_update": cached,
+                    "update_source": server.map(|server| json!({ "server": server, "alias": alias, "protocol": "oci" })),
                 }),
             });
         }
@@ -1650,7 +1665,7 @@ fn create(
         // The image is pulled from the server into the store the project reads, and kept there as a cached image.
         let alias = source.get("alias").and_then(Value::as_str).unwrap_or("");
         let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
-        store.put_image(&project, fingerprint, alias, true);
+        store.put_image_from(&project, fingerprint, alias, true, Some(server));
     }
     let parent = address.parent.clone();
     if matches!(kind, "volume" | "bucket") && !store.pools.iter().any(|(pool, _)| *pool == parent) {
@@ -2798,10 +2813,15 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
         }
         _ => {}
     }
-    lock(&shared.rebuilds)
-        .entry(key)
-        .or_default()
-        .push(if local { "store" } else { "registry" });
+    let named = sent
+        .get("source")
+        .and_then(|source| source.get("fingerprint"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || "registry".to_string(),
+            |fingerprint| format!("store:{fingerprint}"),
+        );
+    lock(&shared.rebuilds).entry(key).or_default().push(named);
     answered(shared, store, "instance", "PUT", Ok(()))
 }
 

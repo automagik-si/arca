@@ -32,8 +32,6 @@ use serde_json::{Value, json};
 const NOW: u64 = 1_793_361_600_000;
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OK: &str = "published 3\n{\"ok\":true,\"published\":3}\n";
-/// The fingerprint of the copy of a function's image in the node's store, as an instance made from it records it.
-const BASE_IMAGE: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 struct Rig {
@@ -247,7 +245,6 @@ impl Rig {
         let args = self.approval(action, proposal);
         let result = arca::handlers::run_approved_action(&self.kernel, &self.executor, &args, NOW)
             .map(|answer| answer["result"].clone());
-        self.after_create(action, &result);
         result
     }
 
@@ -268,20 +265,18 @@ impl Rig {
         json!({ "plan": id, "approval": approval })
     }
 
-    /// A real Incus records on a new instance the image it was made from. The fake does not, so it is written here.
-    fn after_create(&self, action: &str, result: &Result<Value, CallError>) {
-        if action == "function_create"
-            && let Ok(created) = result
-            && let Some(name) = created["name"].as_str()
-        {
-            let mut body = self.instance(name);
-            body["config"]["volatile.base_image"] = json!(BASE_IMAGE);
-            put(
-                self,
-                &format!("/1.0/instances/{name}?project={PROJECT}"),
-                &body,
-            );
-        }
+    /// The fingerprint a function's record took of its image when it was created.
+    fn fingerprint(&self, name: &str) -> String {
+        self.call_as(Scope::Viewer, "function_list", json!({}))
+            .expect("list")["functions"]
+            .as_array()
+            .expect("functions")
+            .iter()
+            .find(|function| function["name"] == name)
+            .expect("the function")["fingerprint"]
+            .as_str()
+            .expect("a fingerprint")
+            .to_string()
     }
 
     fn get(&self, path: &str) -> Option<Value> {
@@ -846,7 +841,11 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
     for run in writes.chunks(3) {
         assert_eq!(run, one_run, "{writes:?}");
     }
-    assert_eq!(rig.fake.rebuilds(PROJECT, "relay"), ["store"; 10]);
+    let image = rig.fingerprint("relay");
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay"),
+        vec![format!("store:{image}"); 10]
+    );
 
     // One line a run, in the month's file, each a meter.
     // NOW is in October 2026: a month has its own file.
@@ -872,6 +871,7 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
         "{line}"
     );
     assert_eq!(line["root"], "store");
+    assert_eq!(line["rootImage"], image.as_str());
     assert!(line["rootMs"].is_u64(), "{line}");
     assert_eq!(line["cpuMs"], 42);
     assert_eq!(line["memoryPeakBytes"], 6_291_456);
@@ -1460,24 +1460,8 @@ fn every_run_starts_from_its_images_own_root_or_does_not_start() {
     let rig = Rig::new();
     rig.relay();
     rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
-    // The node holds a copy of the image: the root is rebuilt from it, and no registry is asked.
-    let line = rig.run("relay");
-    assert_eq!(
-        (&line["outcome"], &line["root"]),
-        (&json!("ok"), &json!("store"))
-    );
-    // The copy is gone from the store: the rebuild names the registry and the digest the owner approved, and Incus
-    // fetches the image again. The run goes on.
-    rig.fake.lose_image(PROJECT, "relay");
-    let line = rig.run("relay");
-    assert_eq!(
-        (&line["outcome"], &line["root"]),
-        (&json!("ok"), &json!("registry"))
-    );
-    assert_eq!(rig.fake.rebuilds(PROJECT, "relay"), ["store", "registry"]);
-    // Neither answers: the run does not start, and its line says why. Nothing was started and no log was cleared.
-    rig.fake.refuse_rebuild(PROJECT, "relay");
-    let writes = rig.state_writes();
+    let image = rig.fingerprint("relay");
+    let instance = format!("/1.0/instances/relay?project={PROJECT}");
     let clears = |rig: &Rig| {
         rig.fake
             .requests()
@@ -1485,48 +1469,104 @@ fn every_run_starts_from_its_images_own_root_or_does_not_start() {
             .filter(|request| request.method == "DELETE" && request.path.contains("/console"))
             .count()
     };
-    let cleared = clears(&rig);
+    // The node holds the copy the record took at create: the root is rebuilt from it, and no registry is asked.
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"], &line["rootImage"]),
+        (&json!("ok"), &json!("store"), &json!(image))
+    );
+    // Someone who may write the instance points it at another image of the store. The run does not follow: it
+    // rebuilds from the image its record names, and its line says which.
+    let other = rig.fake.add_image(PROJECT, "another-image");
+    let mut body = rig.instance("relay");
+    body["config"]["volatile.base_image"] = json!(other);
+    send(&rig, "PUT", &instance, &body);
+    let line = rig.run("relay");
+    assert_eq!(line["rootImage"], image.as_str());
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay"),
+        vec![format!("store:{image}"); 2]
+    );
+    // The copy is there and Incus cannot rebuild from it: the run does not start, and the registry is not asked.
+    rig.fake.lose_image(PROJECT, "relay");
+    let (writes, cleared) = (rig.state_writes(), clears(&rig));
+    let line = rig.run("relay");
+    assert_eq!(line["outcome"], "notStarted");
+    assert!(
+        line["why"].as_str().unwrap().starts_with(
+            "its root could not be put back to its image's own, so nothing was started: "
+        ),
+        "{line}"
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "relay").len(), 2);
+    assert_eq!((rig.state_writes(), clears(&rig)), (writes, cleared));
+    rig.fake.allow_rebuild(PROJECT, "relay");
+    // The copy is gone from the store: the rebuild names the registry and the digest the owner approved, and Incus
+    // fetches the image again. The run goes on, and its line says the registry served it.
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/images/{image}?project={PROJECT}"),
+        &json!({}),
+    );
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"], &line["rootImage"]),
+        (&json!("ok"), &json!("registry"), &Value::Null)
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay").last().unwrap(),
+        "registry"
+    );
+    // Neither the store nor the registry: the run does not start, and its line says why.
+    rig.fake.refuse_rebuild(PROJECT, "relay");
+    let (writes, cleared) = (rig.state_writes(), clears(&rig));
     let line = rig.run("relay");
     assert_eq!(line["outcome"], "notStarted");
     assert_eq!(line["root"], Value::Null);
-    let why = line["why"].as_str().expect("why");
     assert!(
-        why.starts_with(
-            "its root could not be put back to its image's own, so nothing was started: "
+        line["why"].as_str().unwrap().contains(
+            "the node's own copy of the image is gone, and the registry did not give it again"
         ),
-        "{why}"
+        "{line}"
     );
-    assert!(
-        why.contains("from the node's own copy of the image") && why.contains("from the registry"),
-        "{why}"
-    );
-    assert_eq!(rig.state_writes(), writes);
-    assert_eq!(clears(&rig), cleared);
-    assert_eq!(rig.fake.rebuilds(PROJECT, "relay").len(), 2);
-    // The next run, once the image can be had again, is an ordinary one.
+    assert_eq!((rig.state_writes(), clears(&rig)), (writes, cleared));
     rig.fake.allow_rebuild(PROJECT, "relay");
-    assert_eq!(rig.run("relay")["root"], "store");
-    // An instance that names no image it was made from is rebuilt from the registry too.
-    let mut body = rig.instance("relay");
-    body["config"]
-        .as_object_mut()
-        .unwrap()
-        .remove("volatile.base_image");
-    put(
-        &rig,
-        &format!("/1.0/instances/relay?project={PROJECT}"),
-        &body,
-    );
     assert_eq!(rig.run("relay")["root"], "registry");
-    assert_eq!(rig.runs("relay").len(), 5);
+    // A record whose image is not the one its definition names is refused by the plugin, and no run starts on it.
+    let mut entry = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "service-relay")
+        .expect("relay's record");
+    entry.config["source"]["alias"] = json!(format!("acme/other@sha256:{}", "b".repeat(64)));
+    let outcomes = rig
+        .kernel
+        .lock()
+        .unwrap()
+        .propose(vec![arca::desired_store::EntryChange::Put(entry)], NOW)
+        .expect("the document is taken");
+    assert!(format!("{outcomes:?}").contains("Failed"), "{outcomes:?}");
+    let before = rig.fake.rebuilds(PROJECT, "relay").len();
+    let line = rig.run("relay");
+    assert_eq!(
+        line["why"],
+        "its record's image is not the one its definition names, so nothing was started"
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "relay").len(), before);
 }
 
 /// An edit made by an Incus operator, outside the kernel's writer.
 fn put(rig: &Rig, path: &str, body: &Value) {
+    send(rig, "PUT", path, body);
+}
+
+/// A request an Incus operator makes, outside the kernel's writer.
+fn send(rig: &Rig, method: &str, path: &str, body: &Value) {
     use std::io::{Read, Write};
     let mut stream = std::os::unix::net::UnixStream::connect(rig.fake.socket()).unwrap();
     let body = body.to_string();
-    write!(stream, "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     assert!(

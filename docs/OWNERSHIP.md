@@ -1488,8 +1488,9 @@ Source: `function_egress_rules` in `crates/arca-netproject/src/tenant.rs`, with 
 **Rule 73.** A run is not an effect. `arca_incus::function_run` is a path beside the effect journal, as the state
 writer of the instance verbs is: it reads one instance, refuses it unless it is a container that carries the function
 mark and has the uuid it was read with, and then writes only three things of it: its root disk, which Incus rebuilds
-from an image (the one the instance says it was made from, by fingerprint, or the function's own image by digest on
-its registry, and no other source); its `state` (a start, a stop); and its console log, which it clears. A rebuild
+from an image (the store's copy whose fingerprint the function's record took at its create, or, when that copy is
+gone, the function's own image by digest on its registry, and no other source: never the image the instance itself
+names); its `state` (a start, a stop); and its console log, which it clears. A rebuild
 keeps the instance's config, devices and uuid, so nothing a journalled effect wrote is changed by it.
 It forces a stop when a run passes its time limit, and nothing reaches it with a service's instance: the instance
 verbs and their writer still force nothing, and refuse a function's instance. (The kernel's own delete of an instance,

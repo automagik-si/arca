@@ -107,35 +107,46 @@ impl FunctionRun {
     }
 
     /// Gives the instance its image's own root again: Incus rebuilds the root disk from the image and keeps the config,
-    /// the devices and the uuid. The image is first the one the instance says it was made from
-    /// (`volatile.base_image`), named by its fingerprint, which the project's own store holds and no registry is asked
-    /// for. When that is refused (the store no longer holds the copy) the rebuild names `source` instead, the image
-    /// by digest on its registry, and Incus fetches it again. `source` must be exactly that: an OCI image, pulled, by
-    /// digest. The instance must be stopped. When both are refused the error says why each was.
+    /// the devices and the uuid.
+    ///
+    /// `fingerprint` is the image the function was created from, as its record holds it: the copy the project's own
+    /// store keeps, for which no registry is asked. The instance's own word for its image (`volatile.base_image`) is
+    /// never used: whoever may write the instance could point it at another image of the store. When the store no
+    /// longer holds that copy, or the record names none, the rebuild names `source` instead, the image by digest on
+    /// its registry, and Incus fetches it again; `source` must be exactly that. A copy that is there and cannot be
+    /// rebuilt from is an error, and the registry is not asked: only a missing copy is. `cancelled` is asked before
+    /// the registry is: a function that is being removed fetches nothing. The instance must be stopped.
     pub fn fresh_root(
         &self,
         seen: &InstanceState,
+        fingerprint: Option<&str>,
         source: &Value,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<FreshRoot, IncusError> {
         let fresh = self.fresh(seen)?;
         if !fresh.is_stopped() {
             return Err(refused("the instance is not stopped"));
         }
-        let local = match fresh
-            .own_config
-            .get("volatile.base_image")
-            .filter(|text| fingerprint(text))
-        {
-            Some(base) => self.changer.rebuild(
-                &fresh.project,
-                &fresh.name,
-                &json!({ "source": { "type": "image", "fingerprint": base } }),
-            ),
-            None => Err(refused("the instance names no image it was made from")),
-        };
-        let Err(local) = local else {
-            return Ok(FreshRoot::Store);
-        };
+        if let Some(held) = fingerprint {
+            if !self::fingerprint(held) {
+                return Err(refused(
+                    "the function's record names an image that is no fingerprint",
+                ));
+            }
+            if self.changer.image_present(&fresh.project, held)? {
+                self.changer.rebuild(
+                    &fresh.project,
+                    &fresh.name,
+                    &json!({ "source": { "type": "image", "fingerprint": held } }),
+                )?;
+                return Ok(FreshRoot::Store);
+            }
+        }
+        if cancelled() {
+            return Err(refused(
+                "the function is being removed, so its image was not fetched",
+            ));
+        }
         if !registry_source(source) {
             return Err(refused(
                 "the function's record names no image by digest on a registry to rebuild its root from",
@@ -147,7 +158,7 @@ impl FunctionRun {
         {
             Ok(()) => Ok(FreshRoot::Registry),
             Err(remote) => Err(refused(&format!(
-                "from the node's own copy of the image: {local}; from the registry: {remote}"
+                "the node's own copy of the image is gone, and the registry did not give it again: {remote}"
             ))),
         }
     }

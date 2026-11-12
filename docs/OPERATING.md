@@ -4371,10 +4371,13 @@ kernel every function is due at once, and no missed tick is made up.
 **Every run starts from the image's own root.** Before it starts a run the kernel has Incus rebuild the container's
 root disk from the function's image. The config, the secrets among it, and the network card stay as they are; the
 files are the image's again. So no run finds what an earlier run wrote, and none can leave the next something to
-execute. The rebuild uses the copy of the image the node already holds, and asks no registry. When that copy is gone
-(Incus drops a cached image nothing has used for a while; a function's runs keep using it) the rebuild names the
-registry and the digest the owner approved, and Incus fetches the image again. When neither can be done the run does
-not start: `notStarted`, and `why` says what each answered.
+execute. The rebuild uses the copy of the image the node already holds, and asks no registry: the copy whose
+fingerprint the function's record took when it was created, read from the image Incus fetched for the approved
+registry and digest. It is never the image the container itself says it was made from, which whoever may write the
+container could change. When that copy is gone (Incus drops a cached image nothing has used for a while; a function's
+runs keep using it) the rebuild names the registry and the digest the owner approved, and Incus fetches the image
+again. A copy that is there and cannot be rebuilt from is an error, and the registry is not asked. When the root
+cannot be rebuilt the run does not start: `notStarted`, and `why` says what was answered.
 
 **What the program must do.** Run one batch and exit. Print what it likes, up to 1 MiB in one run (past that the
 output cannot be read, and the run ends `died` whatever it printed); **its last output line is its result: one JSON
@@ -4409,13 +4412,14 @@ One line for each run, appended and never rewritten, in `<stateDir>/function-run
 
 ```
 {"run":"fr-1793361600000-7","function":"relay","digest":"sha256:...","kind":"container","trigger":"timer",
- "startedAt":1793361600000,"root":"store","rootMs":55,"startMs":265,"durationMs":41,"cpuMs":12,
+ "startedAt":1793361600000,"root":"store","rootImage":"<64 hex digits>","rootMs":55,"startMs":265,"durationMs":41,
+ "cpuMs":12,
  "memoryPeakBytes":3194880,
  "memoryLimitBytes":134217728,"outcome":"ok","result":{"ok":true,"published":3}}
 ```
 
-`root` says where the image the root was rebuilt from came from, `store` (the node's own copy) or `registry` (fetched
-again), and `rootMs` how long the rebuild took. `startMs` is how long Incus took to start the container; `durationMs`
+`root` says where the image the root was rebuilt from came from, `store` (the node's own copy, whose fingerprint is
+`rootImage`) or `registry` (fetched again), and `rootMs` how long the rebuild took. `startMs` is how long Incus took to start the container; `durationMs`
 runs from there to the exit the kernel saw.
 `cpuMs` and `memoryPeakBytes` are read from the container's cgroup while it runs, and only when the node's Incus is on
 the machine `arca serve` runs on: the files are gone when the container stops, so the peak is the last reading before

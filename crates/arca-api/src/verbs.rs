@@ -922,7 +922,7 @@ static VERBS: [Verb; 61] = [
     },
     Verb {
         name: "function_runs",
-        summary: "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. root says where the image its root was rebuilt from came from before the run: store, the node's own copy, or registry, fetched again. With run, that one run and the end of its output, when it is still kept.",
+        summary: "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. root says where the image its root was rebuilt from came from before the run: store, the node's own copy (rootImage is its fingerprint, the one the function's record took when it was created), or registry, fetched again. With run, that one run and the end of its output, when it is still kept.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -1091,6 +1091,7 @@ fn function_result() -> Value {
         ("kind", true, one_of(&["container"])),
         ("image", true, string()),
         ("digest", true, string()),
+        ("fingerprint", false, nullable(string())),
         ("command", true, array(string())),
         ("env", true, json!({ "type": "object" })),
         (
@@ -1213,6 +1214,7 @@ fn function_run_line() -> Value {
         ("trigger", true, one_of(&["timer", "manual", "kernel"])),
         ("startedAt", true, at_least(0)),
         ("root", false, nullable_enum(&["store", "registry"])),
+        ("rootImage", false, nullable(string())),
         ("rootMs", false, nullable(at_least(0))),
         ("startMs", false, nullable(at_least(0))),
         ("durationMs", false, nullable(at_least(0))),

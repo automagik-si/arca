@@ -461,6 +461,7 @@ impl FunctionRunner {
             "trigger": trigger,
             "startedAt": started_ms,
             "root": measured.root,
+            "rootImage": measured.root_image,
             "rootMs": measured.root_ms,
             "startMs": measured.start_ms,
             "durationMs": measured.duration_ms,
@@ -555,7 +556,22 @@ impl FunctionRunner {
         }
         // Every run starts from its image's own root, or not at all.
         let rooting = Instant::now();
-        let root = match self.writer.fresh_root(&seen, &config.source) {
+        // The image is the one the definition names: the record's source must be exactly that, and the store's copy
+        // is the one whose fingerprint the record took at create.
+        if crate::function::pinned_source(&config).as_ref() != Some(&config.source) {
+            return not_started(
+                &config,
+                "its record's image is not the one its definition names, so nothing was started"
+                    .to_string(),
+            );
+        }
+        let cancelled = || ticket.cancel.load(Ordering::SeqCst);
+        let root = match self.writer.fresh_root(
+            &seen,
+            function.fingerprint.as_deref(),
+            &config.source,
+            &cancelled,
+        ) {
             Ok(root) => root,
             Err(error) => {
                 return not_started(
@@ -616,6 +632,9 @@ impl FunctionRunner {
         let mut measured = Measured {
             start_ms: Some(millis(begun.elapsed())),
             root: Some(root.as_str()),
+            root_image: (root == arca_incus::function_run::FreshRoot::Store)
+                .then(|| function.fingerprint.clone())
+                .flatten(),
             root_ms: Some(root_ms),
             ..Measured::default()
         };
@@ -762,6 +781,8 @@ enum Ended {
 struct Measured {
     /// Where the image the root was rebuilt from came from, and how long the rebuild took.
     root: Option<&'static str>,
+    /// The fingerprint of the store's copy the root was rebuilt from, when it was the store's.
+    root_image: Option<String>,
     root_ms: Option<u64>,
     start_ms: Option<u64>,
     duration_ms: Option<u64>,

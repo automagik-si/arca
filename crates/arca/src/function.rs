@@ -72,6 +72,12 @@ pub struct Function {
     /// these and nothing else of the service network.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reach: Vec<Destination>,
+    /// The fingerprint Incus gave the image when the function was created: the copy in the node's own store that each
+    /// run's root is rebuilt from. It is read once, from the image record whose registry and digest are the approved
+    /// ones, and a run uses no other image of the store, whatever the instance itself says it was made from. Absent
+    /// when it could not be read: each run then asks the registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// One link of a definition: a service of this node, and the tcp port of it the function may reach.
@@ -321,6 +327,7 @@ pub fn definition(args: &Value) -> Result<Definition, String> {
             every_seconds,
             seconds,
             reach: Vec::new(),
+            fingerprint: None,
         },
         limits: Limits {
             cpu: Some(cpu.to_string()),
@@ -371,6 +378,48 @@ pub fn entrypoint(command: &[String]) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" ")
     })
+}
+
+/// The image source a function's definition names: the registry and the digest its owner approved, and nothing else.
+/// A function's record must carry exactly this as its source, and a run's root is rebuilt from no other.
+pub fn pinned_source(cfg: &ServiceConfig) -> Option<Value> {
+    crate::service::source(&template(cfg)?).ok()
+}
+
+/// The fingerprint of the image in `images` (a listing of a project's image store) that Incus fetched from the
+/// registry and digest `source` names: the record whose own alias is that digest and whose server is that registry,
+/// whatever credential stands in the address Incus kept. `None` when no record, or more than one, is.
+pub fn fetched_fingerprint(images: &Value, source: &Value) -> Option<String> {
+    let host = |server: &str| -> Option<String> {
+        let rest = server.strip_prefix("https://")?;
+        Some(rest.rsplit('@').next()?.to_string())
+    };
+    let wanted = host(source["server"].as_str()?)?;
+    let alias = source["alias"].as_str()?;
+    let mut found = images.as_array()?.iter().filter(|image| {
+        image["update_source"]["alias"].as_str() == Some(alias)
+            && image["update_source"]["server"]
+                .as_str()
+                .and_then(host)
+                .as_deref()
+                == Some(wanted.as_str())
+    });
+    let one = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    one["fingerprint"]
+        .as_str()
+        .filter(|text| fingerprint_ok(text))
+        .map(str::to_string)
+}
+
+/// Whether `text` is an image fingerprint as Incus writes one: 64 hex digits in lower case.
+pub fn fingerprint_ok(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// The secrets of a function that are not set yet, in the definition's order: a run starts only when there is none.
@@ -438,6 +487,8 @@ pub fn record_ok(cfg: &ServiceConfig) -> bool {
         && cfg.links.len() <= LINKS_MAX
         && cfg.links.iter().all(|link| link.env.is_empty())
         && environment_ok(cfg, function)
+        && pinned_source(cfg).as_ref() == Some(&cfg.source)
+        && function.fingerprint.as_deref().is_none_or(fingerprint_ok)
         && function.reach.len() == cfg.links.len()
         && function.reach.iter().all(|one| linked.contains(&one.port))
         && (EVERY_MIN..=EVERY_MAX).contains(&function.every_seconds)
