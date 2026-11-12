@@ -1724,6 +1724,7 @@ fn a_tenants_removal_card_names_at_most_sixteen_services_and_counts_the_rest() {
     let held = TenantHeld {
         block: "192.0.2.16/28".to_string(),
         made_ms: 1_793_361_600_000,
+        read_ms: 1_793_361_600_000 + 90 * 60_000,
         services,
     };
     let args = json!({ "id": "abcdefgh" });
@@ -1739,11 +1740,14 @@ fn a_tenants_removal_card_names_at_most_sixteen_services_and_counts_the_rest() {
     assert_eq!(details[3].label, "Services");
     assert_eq!(
         details[3].value,
-        format!("{}, and 2 more", named.join(", "))
+        format!(
+            "As of 2026-10-30 13:30 UTC, when this was proposed: {}, and 2 more",
+            named.join(", ")
+        )
     );
     assert_eq!(
         ActionKind::TenantRemove.summary_with(&args, Some(&fact)),
-        "Remove the tenant abcdefgh (192.0.2.16/28, made 2026-10-30 12:00 UTC) and everything in it: 18 services, 2 of them databases"
+        "Remove the tenant abcdefgh (192.0.2.16/28, made 2026-10-30 12:00 UTC) and everything in it when the removal runs, services made after this proposal included; at 2026-10-30 13:30 UTC it held 18 services, 2 of them databases"
     );
     // A text that is not what the node writes gives the card without what it held.
     assert_eq!(
@@ -1753,6 +1757,7 @@ fn a_tenants_removal_card_names_at_most_sixteen_services_and_counts_the_rest() {
     let one = TenantHeld {
         block: "192.0.2.16/29".to_string(),
         made_ms: 1_793_361_600_000,
+        read_ms: 1_793_361_600_000,
         services: vec![HeldService {
             name: format!("db\n{}", "x".repeat(80)),
             vm: false,
@@ -1763,8 +1768,14 @@ fn a_tenants_removal_card_names_at_most_sixteen_services_and_counts_the_rest() {
     assert!(
         ActionKind::TenantRemove
             .summary_with(&args, Some(&fact))
-            .ends_with(": 1 service, a database")
+            .ends_with("; at 2026-10-30 12:00 UTC it held 1 service, a database")
     );
     let shown = &ActionKind::TenantRemove.details_with_gpu(&args, Some(&fact))[3].value;
-    assert_eq!(shown, &format!("db {}… (database)", "x".repeat(61)));
+    assert_eq!(
+        shown,
+        &format!(
+            "As of 2026-10-30 12:00 UTC, when this was proposed: db {}… (database)",
+            "x".repeat(61)
+        )
+    );
 }

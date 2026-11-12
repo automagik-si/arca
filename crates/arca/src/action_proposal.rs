@@ -570,7 +570,14 @@ impl ActionKind {
                     Some(held) => {
                         rows.push(row("Address block", &held.block));
                         rows.push(row("Made", &made_words(held.made_ms)));
-                        rows.push(row("Services", &held.services_words()));
+                        rows.push(row(
+                            "Services",
+                            &format!(
+                                "As of {}, when this was proposed: {}",
+                                made_words(held.read_ms),
+                                held.services_words()
+                            ),
+                        ));
                     }
                     None => rows.push(row("Services", "read when the removal runs")),
                 }
@@ -632,10 +639,11 @@ impl ActionKind {
     pub fn summary_with(self, args: &Value, fact: Option<&str>) -> String {
         match (self, TenantHeld::read(fact)) {
             (Self::TenantRemove, Some(held)) => format!(
-                "Remove the tenant {} ({}, made {}) and everything in it: {}",
+                "Remove the tenant {} ({}, made {}) and everything in it when the removal runs, services made after this proposal included; at {} it held {}",
                 args["id"].as_str().unwrap_or_default(),
                 held.block,
                 made_words(held.made_ms),
+                made_words(held.read_ms),
                 held.count_words()
             ),
             _ => self.summary(args),
@@ -772,21 +780,24 @@ impl ActionKind {
 }
 
 /// The `Effect` row of a tenant's removal.
-const TENANT_REMOVE_EFFECT: &str =
-    "Deletes every service of this tenant, with its data, and then the tenant's project.";
+/// The removal deletes what the tenant holds when it runs, not what the card listed: a service made after the proposal
+/// goes too, and the row says so.
+const TENANT_REMOVE_EFFECT: &str = "Deletes every service of this tenant as it stands when the removal runs, with its data, services made after this proposal included, and then the tenant's project.";
 
 /// The most services a tenant's card names one by one: the most instances a tenant may hold. A record past it is
 /// counted, not named.
 pub const TENANT_SERVICES_NAMED: usize = 16;
 
-/// What a tenant held when its removal was proposed, read from the node's records: its block, when it was made, and
-/// its services. It travels to the card as the text [`Self::fact`] writes, and a text that does not read back as one
+/// What a tenant held when its removal was proposed, read from the node's records: its block, when it was made, its
+/// services, and when they were read. The card says the list is as of that time: the removal deletes what the tenant
+/// holds when it runs. It travels to the card as the text [`Self::fact`] writes, and a text that does not read back as one
 /// gives the card that says it is read when the removal runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TenantHeld {
     pub block: String,
     pub made_ms: u64,
+    pub read_ms: u64,
     pub services: Vec<HeldService>,
 }
 
@@ -1899,6 +1910,60 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.0.join(ACTION_PROPOSALS_FILE)).expect("the compacted journal"),
             ""
+        );
+    }
+
+    /// A tenant removal's card is kept across a restart only when it is a card this action writes for this tenant:
+    /// another tenant's rows, another Effect, or another tenant's summary each give the card rebuilt from the arguments.
+    #[test]
+    fn a_tenant_removals_card_is_kept_across_a_restart_only_when_it_is_this_tenants() {
+        let held = |id: &str| {
+            let args = json!({ "id": id });
+            let fact = TenantHeld {
+                block: "192.0.2.16/29".to_string(),
+                made_ms: 1_793_361_600_000,
+                read_ms: 1_793_361_600_000,
+                services: vec![HeldService {
+                    name: "web".to_string(),
+                    vm: false,
+                    database: false,
+                }],
+            }
+            .fact();
+            (
+                ActionKind::TenantRemove.summary_with(&args, Some(&fact)),
+                ActionKind::TenantRemove.details_with_gpu(&args, Some(&fact)),
+            )
+        };
+        let args = json!({ "id": "abcdefgh" });
+        let rebuilt = (
+            ActionKind::TenantRemove.summary(&args),
+            ActionKind::TenantRemove.details(&args),
+        );
+        let (summary, details) = held("abcdefgh");
+        assert_ne!((summary.clone(), details.clone()), rebuilt);
+        // This tenant's card is kept whole.
+        assert_eq!(
+            loaded_words(ActionKind::TenantRemove, &args, &summary, &details),
+            (summary.clone(), details.clone())
+        );
+        // Another tenant's rows under this tenant's summary.
+        let (other_summary, other_details) = held("bbbbbbbb");
+        assert_eq!(
+            loaded_words(ActionKind::TenantRemove, &args, &summary, &other_details),
+            rebuilt
+        );
+        // Another Effect.
+        let mut changed = details.clone();
+        changed[4].value = "Deletes nothing.".to_string();
+        assert_eq!(
+            loaded_words(ActionKind::TenantRemove, &args, &summary, &changed),
+            rebuilt
+        );
+        // Another tenant's summary over this tenant's rows.
+        assert_eq!(
+            loaded_words(ActionKind::TenantRemove, &args, &other_summary, &details),
+            rebuilt
         );
     }
 

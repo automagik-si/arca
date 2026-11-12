@@ -979,9 +979,9 @@ pub(super) fn deploy_parts(entries: &[Entry], payload: &Value) -> String {
 }
 
 /// What tenant `id` holds as its removal is proposed, for the owner's card: its block, when it was made, and each of
-/// its services, read from the desired state only. `None` when no record of the tenant is found, and the card then says
+/// its services, read from the desired state only at `now`. `None` when no record of the tenant is found, and the card then says
 /// that what it holds is read when the removal runs.
-pub(super) fn tenant_held(entries: &[Entry], payload: &Value) -> Option<String> {
+pub(super) fn tenant_held(entries: &[Entry], payload: &Value, now: u64) -> Option<String> {
     let id = payload["id"].as_str()?;
     let (_, config) = tenants(entries)
         .into_iter()
@@ -999,6 +999,7 @@ pub(super) fn tenant_held(entries: &[Entry], payload: &Value) -> Option<String> 
         crate::action_proposal::TenantHeld {
             block: config.block,
             made_ms: config.created,
+            read_ms: now,
             services,
         }
         .fact(),
