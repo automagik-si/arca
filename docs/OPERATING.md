@@ -4152,24 +4152,25 @@ deleted), the line begins `REFUSED`, the runners that already wait or work are l
 
 A pool with more than one class and more slots than `maxSlots` says in every block what the cap is and is not (`every
 class is kept one place under the cap of 4: ...`). While a class has no runner and every place is held, one more line
-names the class (`class large: no runner, and every place under the cap of 4 is held. ...`) and says what the pool
-does about it: which slot gives up its idle runner's place, or, as a `WARNING`, why none does: no class that holds
-two or more places has a runner that can be asked, or the class's slot would still lack its memory. Each retired
-runner is one line of its own (`slot 0 (standard): its idle runner is retired and its place goes to class large,
-...`), and so is a runner that GitHub kept because it had a job. If GitHub answers the request to take a runner off
-with anything but its yes or that refusal (a 5xx, 401, 403 or 404), or not at all, nothing is retired: the pool says
-GitHub's answer once, keeps it in the class's line, and asks again after a pause that starts at five seconds and
-doubles up to five minutes. If GitHub can have taken the runner off though no yes came (it answered with a
-5xx, or the request went out and its answer was lost: the connection closed, or the time ran out) and that runner
-then stops before it took a job, the pool takes it as retired, says so and counts no failure: it cannot tell why
-the runner stopped, and GitHub having taken it off after all is the likely cause. It does not read a stop so after
-a 401, 403 or 404, which say GitHub did not act, nor when the request never went out (the connection was refused),
-nor when GitHub has told the runner to update itself since the request. A runner that was updating itself when it
-was asked is asked again once its update is over. The last ten
-finished jobs are repeated in every block (`recent job`), so `service_logs` still reaches them after many blocks. All
-job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish
-time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name. Past 4MiB (some
-twenty thousand jobs) the file is set aside as `jobs.tsv.1`, replacing the one set aside before.
+names the class (`class large: no runner, and every place under the cap of 4 is held. ...`) and says what the pool does
+about it: which slot gives up its idle runner's place, or, as a `WARNING`, why none does: no class that holds two or
+more places has a runner that can be asked, or the class's slot would still lack its memory. Each retired runner is one
+line of its own (`slot 0 (standard): its idle runner is retired and its place goes to class large, ...`), and so is a
+runner that GitHub kept because it had a job, and one that was asked while it was updating itself (GitHub is not asked
+then; it is asked again once the update is over). If GitHub answers the request to take a runner off with anything but
+its yes or that refusal (a 5xx, 401, 403 or 404), or not at all, nothing is retired: the pool says GitHub's answer once,
+keeps it in the class's line, and asks again after a pause that starts at five seconds and doubles up to five minutes.
+If GitHub can have taken the runner off though no yes came (it answered with a 5xx, or the request went out and its
+answer was lost: the connection closed, or the time ran out) and that runner then stops before it took a job, the pool
+takes it as retired, says so and counts no failure: it cannot tell why the runner stopped, and GitHub having taken it
+off after all is the likely cause. It does not read a stop so after a 401, 403 or 404, which say GitHub did not act
+(also when the answer's body was cut off), nor when the request never went out (the connection was refused), nor when
+GitHub has told the runner to update itself since the request. A runner that was updating itself when it was asked is
+asked again once its update is over. The last ten finished jobs are repeated in every block (`recent job`), so
+`service_logs` still reaches them after many blocks. All job lines are kept in the virtual machine, in
+`/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish time, slot, class, labels, name, result, seconds,
+peak memory in bytes, CPU seconds and runner name. Past 4MiB (some twenty thousand jobs) the file is set aside as
+`jobs.tsv.1`, replacing the one set aside before.
 
 **Sizing runners from real numbers.** The `class` line is what the last 2000 jobs of a class used, beside the size the
 class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit.

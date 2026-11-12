@@ -162,6 +162,8 @@ case $command in
     exit 0
     ;;
   logs)
+    # Each read is one look of the slot at its runner: a test can wait for one.
+    [ ! -d "$root/containers/$1" ] || printf x >>"$root/containers/$1/looks"
     cat "$root/containers/$1/log" 2>/dev/null
     ;;
   exec)

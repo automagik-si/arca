@@ -131,6 +131,8 @@ struct State {
     /// Whether the next such request is carried out all the same: GitHub takes the runner off and its answer is lost.
     /// Once.
     delete_acts: bool,
+    /// Requests to take a runner off are answered with a body shorter than the answer says.
+    cut_delete_answers: bool,
     /// Whether a runner is registered without its id in the answer, as no real GitHub does.
     register_without_id: bool,
     held: usize,
@@ -488,10 +490,12 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, scratch: &Path) {
         return;
     }
     let text = answer.map(|value| value.to_string()).unwrap_or_default();
+    // An answer cut off: its body is shorter than it says, and the connection closes (curl's exit 18).
+    let cut = method == "DELETE" && state.lock().expect("state").cut_delete_answers;
     let _ = write!(
         stream,
         "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-        text.len()
+        text.len() + if cut { 100 } else { 0 }
     );
 }
 
@@ -3878,9 +3882,9 @@ fn runners_of_slot(github: &Github, slot: u64) -> Vec<Runner> {
 
 /// A runner that is updating itself when it is asked to give its place up is asked again once its update is over.
 /// The controller asks only slots it reads as idle, and a slot can find the request and the update in one look:
-/// here the slots look every three seconds, GitHub tells the runner to update in between, and the controller asks
-/// while its state still reads idle. It answers that it is updating, GitHub is not asked, and when the update is
-/// over it is asked again and retired. The class's other runner has a job all along, so this runner is the only one
+/// here the slots look every five seconds, and right after a look GitHub tells the runner to update and the
+/// controller asks while its state still reads idle. At its next look it answers that it is updating, says so, and
+/// GitHub is not asked; when the update is over it is asked again and retired. The class's other runner has a job all along, so this runner is the only one
 /// that can be asked: were it marked "not asked again", the class would have no place until that job ended.
 #[test]
 fn a_runner_asked_during_its_update_is_asked_again_when_the_update_is_over() {
@@ -3891,7 +3895,7 @@ fn a_runner_asked_during_its_update_is_asked_again_when_the_update_is_over() {
         &github,
         &[class_of("small", "4GiB", 2)],
         2,
-        &[("POOL_POLL", "3"), ("FAKE_UPDATE_SECONDS", "8")],
+        &[("POOL_POLL", "5"), ("FAKE_UPDATE_SECONDS", "10")],
     );
     // Longer than the update and the requests below take: were the class to get its place only when this job ends,
     // no runner would have been taken off, and the count of requests below says so.
@@ -3909,6 +3913,14 @@ fn a_runner_asked_during_its_update_is_asked_again_when_the_update_is_over() {
         status.contains(&format!("slot {busy} small 4096MiB/2cpu busy ")),
         "{status}"
     );
+    // Right after a look of the idle slot, so the update and the request both come before its next one.
+    let looks = |pool: &Pool| {
+        pool.read(&format!("docker/containers/pool1-s{idle}-run/looks"))
+            .len()
+    };
+    let before = looks(&pool);
+    wait_for(&pool, "a look of the idle slot", || looks(&pool) > before);
+    let look = looks(&pool);
     github.state().update_required = true;
     wait_for(
         &pool,
@@ -3920,7 +3932,19 @@ fn a_runner_asked_during_its_update_is_asked_again_when_the_update_is_over() {
     );
     assert!(totals(&pool).contains(" idle=1 "), "{}", totals(&pool));
     pool.memory(64 * GIB, 60 * GIB);
-    // It was asked while it updated, and it cannot be asked now.
+    wait_for(&pool, "the request, or a look of the slot", || {
+        pool.dir.join(format!("run/retire/{idle}")).exists() || looks(&pool) != look
+    });
+    // What the test is about holds only if the slot did not look in between: say so if the machine was too slow.
+    assert_eq!(looks(&pool), look, "the slot looked before it was asked");
+    // It was asked while it updated, says so, and cannot be asked now.
+    let answered = format!(
+        "arca-runner-pool: slot {idle} (small): its runner is updating itself, so GitHub is not asked to take it off \
+         now: it can be asked to give its place to class large once its update is over\n"
+    );
+    wait_for(&pool, "the slot's answer that it is updating", || {
+        pool.output().contains(&answered)
+    });
     let waits = "arca-runner-pool: WARNING: class large: no runner, and every place under the cap of 2 is held, and \
                  no class that holds two or more has a runner that can be asked to give its place up.";
     wait_for(&pool, "the status that says no runner can be asked", || {
@@ -4073,6 +4097,47 @@ fn a_runner_that_stops_after_a_request_that_never_went_out_is_a_failure_all_the_
     });
     assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
+}
+
+/// An answer that says GitHub did not act (401, 403, 404) is no lost answer, nor is one whose body was cut off: its
+/// status is GitHub's word. The runner that was asked then stops before a job, and that is counted and said as for
+/// any runner.
+#[test]
+fn a_runner_that_stops_after_github_said_it_did_not_act_is_a_failure_all_the_same() {
+    for (code, cut) in [(401, false), (403, false), (404, false), (401, true)] {
+        let scratch = scratch_dir();
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().tokens.push(PAT.to_string());
+        let mut pool = pool_whose_large_class_has_no_place_with(
+            &github,
+            &[class_of("small", "4GiB", 2)],
+            2,
+            &[("POOL_BACKOFF_MAX", "300")],
+        );
+        github.state().delete_answer = Some(code);
+        github.state().cut_delete_answers = cut;
+        pool.memory(64 * GIB, 60 * GIB);
+        let kept = format!("is kept, because GitHub did not take it off: GitHub answered {code}");
+        wait_for(&pool, "the line that says the runner is kept", || {
+            pool.output().contains(&kept)
+        });
+        // GitHub removes that runner for a reason of its own, and it stops.
+        take_off_the_runner_of_slot_0(&github);
+        let failed = "arca-runner-pool: slot 0 (small) failed: its runner stopped (exit 1) before it took a job.";
+        wait_for(&pool, "the failure of the slot that was asked", || {
+            pool.output().contains(failed)
+        });
+        let output = pool.output();
+        assert!(
+            !output.contains("It is taken as retired"),
+            "{code} cut={cut}: {output}"
+        );
+        wait_for(&pool, "the failure in the totals", || {
+            totals(&pool).contains(" failures=") && !totals(&pool).contains(" failures=0 ")
+        });
+        assert_eq!(pool.stop(), Some(0));
+        let _ = fs::remove_dir_all(scratch);
+    }
 }
 
 /// A runner that updated itself before it was asked is read like any other. It is asked, GitHub takes it off and
