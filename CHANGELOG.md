@@ -7,6 +7,16 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The approval page speaks to the owner. It says "Arca asks before it changes anything", not only before a delete. An
+action's card leads with one sentence of what the assistant wants ("Your assistant wants to create a Postgres database
+called blog."), and says how to undo it in a `To undo` row. A create from a template also says what it takes of the
+node in a `Uses` row (its CPUs, memory and disk, or that its template sets no share), read from the template the
+approval binds. The verb's name, the target, the image by digest, the template's content and the fingerprint are in a
+Details disclosure that starts closed, and a delete plan's and a request's fingerprints are folded the same way. No
+card row names a verb any more: a database's `Made as` row and a stopped create's `Start` row say what can be done
+in words. After an approval the page says "Approved. Done: " and the card's sentence, not the verb that ran. The
+signed statement and what the approval binds are unchanged.
+
 ## 0.17.0 (2026-11-12)
 
 Arguments a tool does not take are now answered as a tool result with `isError: true` and `droidd/error` `invalid_arguments`, in the same words, instead of a JSON-RPC error `-32602`, so an assistant reads why and corrects the call (MCP 2025-11-25). A value outside a closed list, such as an `action_propose` action that is not one, now lists the allowed values and names the nearest one. `arca call` prints such a failure as `{"code": "invalid_arguments", "message": ...}`. A call that names no tool, or a tool the server does not have, is still a JSON-RPC error.

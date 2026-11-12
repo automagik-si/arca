@@ -1452,6 +1452,17 @@ pub(crate) fn list_plans(
     Ok(json!({ "plans": plans }))
 }
 
+/// The card's words beside an action's rows: what a create takes of the node (`uses`, when the node read it from the
+/// template) and how the owner undoes the action (`undo`).
+fn card_words(value: &mut Value, proposal: &ActionProposal) {
+    if let Some(uses) = &proposal.uses {
+        value["uses"] = json!(uses);
+    }
+    if let Some(action) = ActionKind::from_name(&proposal.action) {
+        value["undo"] = json!(action.undo_words());
+    }
+}
+
 /// One action proposal in a listing. The page gets the exact statement the owner signs; `plan_list` does not.
 fn action_json(
     host: &str,
@@ -1471,6 +1482,7 @@ fn action_json(
         "expiresAt": proposal.expires_at,
         "host": host,
     });
+    card_words(&mut value, proposal);
     if statement {
         value["statement"] = json!(action_statement(
             host,
@@ -1594,6 +1606,8 @@ impl ToolHandler for ActionPropose {
         // What a create's card says of its template beyond the arguments (why it is created stopped, or that a
         // database's password is generated), read from the very template the proposal's fingerprint is of.
         let mut card_fact: Option<String> = None;
+        // What a create from a template takes of the node, for the card's `Uses` line: read from that same template.
+        let mut card_uses: Option<String> = None;
         let payload = if is_gpu {
             let Some(gpu) = &self.gpu else {
                 return Err(gpu_refusal(GpuRefusal::Disabled));
@@ -1608,10 +1622,17 @@ impl ToolHandler for ActionPropose {
                 .prepare(&payload, self.postgres_image.as_deref())
                 .map_err(CallError::Invalid)?;
             let entries = lock(&self.kernel)?.entries().to_vec();
-            enrich_service_create(node, &entries, &payload, &mut card_fact, now)?
+            enrich_service_create(
+                node,
+                &entries,
+                &payload,
+                &mut card_fact,
+                &mut card_uses,
+                now,
+            )?
         } else if let (ActionKind::PostgresCreate, Some(node)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
-            enrich_postgres_create(node, &entries, &payload, &mut card_fact)?
+            enrich_postgres_create(node, &entries, &payload, &mut card_fact, &mut card_uses)?
         } else if action == ActionKind::PostgresCreate
             && self.postgres_image.is_none()
             && payload.get("template").is_some()
@@ -1751,7 +1772,13 @@ impl ToolHandler for ActionPropose {
                 fields: retry_after(wait),
             });
         }
-        let proposal = match kernel.propose_action(action, payload, now, gpu_product.as_deref()) {
+        let proposal = match kernel.propose_action_using(
+            action,
+            payload,
+            now,
+            gpu_product.as_deref(),
+            card_uses,
+        ) {
             Ok(proposal) => proposal,
             Err(error) => {
                 // Only a newly recorded proposal counts. A refusal gives back the place reserved above.
@@ -1761,7 +1788,7 @@ impl ToolHandler for ActionPropose {
                 return Err(propose_failure(error));
             }
         };
-        Ok(json!({
+        let mut answer = json!({
             "kind": "action",
             "id": proposal.id,
             "action": proposal.action,
@@ -1771,7 +1798,9 @@ impl ToolHandler for ActionPropose {
             "argsDigest": proposal.args_digest,
             "createdAt": proposal.created_ms,
             "expiresAt": proposal.expires_at,
-        }))
+        });
+        card_words(&mut answer, &proposal);
+        Ok(answer)
     }
 }
 
@@ -3509,6 +3538,7 @@ fn enrich_service_create(
     entries: &[arca_kernel::desired::Entry],
     payload: &Value,
     card_fact: &mut Option<String>,
+    card_uses: &mut Option<String>,
     now: u64,
 ) -> Result<Value, CallError> {
     // First, as in the create: the tenant the proposal names, and what the node's config and records refuse before
@@ -3596,6 +3626,7 @@ fn enrich_service_create(
         payload
     };
     let template = content.template;
+    *card_uses = Some(crate::action_proposal::uses_words(&template));
     // A create that could never give the kernel access its template declares is refused now, so the owner is never asked
     // to approve it. The proposal then names the access, so the owner's card says it and the approval binds it.
     let stated = kernel_access_for(cfg, &template, payload.get("tenant").is_some(), None)?
@@ -4373,6 +4404,7 @@ fn enrich_postgres_create(
     entries: &[arca_kernel::desired::Entry],
     payload: &Value,
     card_fact: &mut Option<String>,
+    card_uses: &mut Option<String>,
 ) -> Result<Value, CallError> {
     if cfg.kernel.postgres_image.is_some() || !payload.is_object() {
         return Ok(payload.clone());
@@ -4390,6 +4422,7 @@ fn enrich_postgres_create(
         // What the card says of the password, from the template this fingerprint is of.
         *card_fact = database_card_fact(cfg, &template, name);
     }
+    *card_uses = Some(crate::action_proposal::uses_words(&template));
     let mut payload = payload.clone();
     payload["template"] = json!(crate::service::DATABASE_TEMPLATE);
     payload["image"] = json!(image);

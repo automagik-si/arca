@@ -151,6 +151,51 @@ impl ActionKind {
         Self::FunctionRemove,
     ];
 
+    /// How the owner undoes this action once it has run, in the owner's words: the card says it beside what the action
+    /// does. An action that deletes says that it cannot be undone.
+    pub fn undo_words(self) -> &'static str {
+        match self {
+            Self::ServiceCreate => {
+                "Ask your assistant to remove it. Removing it deletes the service with its data."
+            }
+            Self::PostgresCreate => {
+                "Ask your assistant to remove it. Removing it deletes the database with its data."
+            }
+            Self::ServiceRemove => "It cannot be undone: the service is deleted with its data.",
+            Self::ServiceImport => {
+                "Ask your assistant to release it. The service itself is not changed either way."
+            }
+            Self::ServiceRelease => {
+                "Ask your assistant to import it again. The service itself is not changed either way."
+            }
+            Self::ServicePublish => "Ask your assistant to unpublish it.",
+            Self::ServiceUnpublish => "Ask your assistant to publish it again.",
+            Self::ServiceConnect => "Ask your assistant to disconnect them.",
+            Self::ServiceDisconnect => "Ask your assistant to connect them again.",
+            Self::GpuAttach => "Ask your assistant to detach the card.",
+            Self::GpuDetach => "Ask your assistant to attach the card again.",
+            Self::StorageAdd => {
+                "The storage stays added. A disk that was erased for it cannot be brought back."
+            }
+            Self::SnapshotCreate => "Ask your assistant to delete the snapshot.",
+            Self::SnapshotDelete => "It cannot be undone: the snapshot is deleted.",
+            Self::InstanceStart => "Ask your assistant to stop it.",
+            Self::InstanceStop => "Ask your assistant to start it again.",
+            Self::InstanceRestart => "There is nothing to undo: it runs again once it is back.",
+            Self::TenantCreate => "Ask your assistant to remove the tenant.",
+            Self::TenantRemove => {
+                "It cannot be undone: the tenant is deleted with every service in it and their data."
+            }
+            Self::DeployRemove => {
+                "It cannot be undone: the deploy's services are deleted with their data."
+            }
+            Self::FunctionCreate => "Ask your assistant to remove the function.",
+            Self::FunctionRemove => {
+                "It cannot be undone: the function is deleted with its secrets."
+            }
+        }
+    }
+
     /// The verb name this action runs.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -654,12 +699,6 @@ impl ActionKind {
     /// that decide what the action does; the exact values are in [`ActionKind::details`].
     pub fn summary(self, args: &Value) -> String {
         let text = |key: &str| args[key].as_str().unwrap_or_default();
-        let image = |key: &str| {
-            text(key)
-                .split_once('@')
-                .map_or_else(|| text(key), |(reference, _)| reference)
-                .to_string()
-        };
         let sentence = match self {
             // Only a virtual machine on a host bridge names a bridge, and a proposal for one always does: a bridge left out
             // on a bridged node is filled in when the proposal is made.
@@ -698,11 +737,8 @@ impl ActionKind {
                 text("from"),
                 text("to")
             ),
-            Self::PostgresCreate => format!(
-                "Create the database {} from {}",
-                text("name"),
-                image("image")
-            ),
+            // The image is in the card's Details; the sentence says what the owner gets.
+            Self::PostgresCreate => format!("Create a Postgres database called {}", text("name")),
             Self::GpuAttach if !text("project").is_empty() => format!(
                 "Attach the GPU at {} to instance {} in project {}",
                 text("pci"),
@@ -929,12 +965,62 @@ pub fn template_content_words(digest: &str) -> String {
     )
 }
 
+/// The longest `uses` line a card shows.
+const USES_MAX: usize = 512;
+
+/// The card's `Uses` line for a create from `template`: what the new service takes of this node, read from the template
+/// the proposal's fingerprint binds. A share the template does not set is said to be unset: the service then uses what
+/// it needs of the node's.
+pub fn uses_words(template: &crate::service::Template) -> String {
+    let limits = template.limits.as_ref();
+    let cpu = limits.and_then(|limits| limits.cpu.as_deref());
+    let memory = limits.and_then(|limits| limits.memory.as_deref());
+    let cpus = |count: &str| {
+        if count == "1" {
+            "1 CPU".to_string()
+        } else {
+            format!("{count} CPUs")
+        }
+    };
+    let disk = match template.data.as_ref().and_then(|data| data.size.as_deref()) {
+        Some(size) => format!("a {size} disk for its data"),
+        None => "the disk its files take".to_string(),
+    };
+    if template.is_vm() {
+        let cpu = cpu.map_or_else(|| "what it needs of this node's CPUs".to_string(), cpus);
+        let memory = memory.map_or_else(
+            || "what it needs of this node's memory".to_string(),
+            |memory| format!("{memory} of memory"),
+        );
+        let root = template
+            .root_size
+            .as_deref()
+            .map_or_else(|| disk.clone(), |size| format!("a {size} disk"));
+        return format!("{cpu}, {memory} and {root}.");
+    }
+    match (cpu, memory) {
+        (None, None) => format!(
+            "No set share: it uses what it needs of this node's CPUs and memory, and {disk}."
+        ),
+        (Some(cpu), Some(memory)) => {
+            format!("Up to {} and {memory} of memory, and {disk}.", cpus(cpu))
+        }
+        (Some(cpu), None) => format!(
+            "Up to {} and what it needs of this node's memory, and {disk}.",
+            cpus(cpu)
+        ),
+        (None, Some(memory)) => {
+            format!("Up to {memory} of memory and what it needs of this node's CPUs, and {disk}.")
+        }
+    }
+}
+
 /// What the card of a template database is told, in place of a stopped reason, when the node's template generates
 /// the database's password. No stopped reason reads so.
 pub const DATABASE_PASSWORD_GENERATED: &str = "generated";
 
-/// The card's words for a database made from the node's template `template`: what the owner gets, and the verbs that
-/// reach it afterwards. They say the password is generated only when `generated`: when the node read its template and
+/// The card's words for a database made from the node's template `template`: what the owner gets, and what can be done
+/// with it afterwards, in the owner's words. They say the password is generated only when `generated`: when the node read its template and
 /// the template generates it.
 pub fn database_service_words(template: &str, generated: bool) -> String {
     let password = if generated {
@@ -943,7 +1029,7 @@ pub fn database_service_words(template: &str, generated: bool) -> String {
         ""
     };
     format!(
-        "A service from this node's {template} template{password}. A database made this way is a service: connect to it with service_connect, remove it with service_remove."
+        "A service from this node's {template} template{password}. Your assistant can connect it to your other services, and removing that service deletes the database with its data."
     )
 }
 
@@ -962,7 +1048,7 @@ pub fn start_words(start: bool) -> &'static str {
     if start {
         "Yes: it is started once it is created"
     } else {
-        "No: it is created stopped, and instance_start starts it later"
+        "No: it is created stopped, and can be started later"
     }
 }
 
@@ -973,7 +1059,7 @@ pub fn stopped_words(reason: &str) -> String {
 }
 
 /// How every [`stopped_words`] row ends.
-const STOPPED_THEN: &str = "; instance_start starts it later";
+const STOPPED_THEN: &str = "; it can be started later";
 
 /// How every [`stopped_words`] row begins.
 const STOPPED_BECAUSE: &str = "No: it is created stopped because ";
@@ -1010,6 +1096,8 @@ pub struct ActionProposal {
     pub summary: String,
     #[serde(default)]
     pub details: Vec<ActionDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses: Option<String>,
 }
 
 impl ActionProposal {
@@ -1219,6 +1307,19 @@ impl ActionProposalStore {
         now: u64,
         gpu_product: Option<&str>,
     ) -> Result<ActionProposal, ProposeError> {
+        self.propose_using(action, args, now, gpu_product, None)
+    }
+
+    /// The same, with what a create takes of the node ([`uses_words`]), read from the template the proposal binds: it is
+    /// kept with the proposal, so the card says it after the kernel opens again.
+    pub fn propose_using(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now: u64,
+        gpu_product: Option<&str>,
+        uses: Option<String>,
+    ) -> Result<ActionProposal, ProposeError> {
         self.waiting.retain(|proposal| !proposal.expired(now));
         let digest = action_args_digest(action.as_str(), &args).ok_or_else(|| {
             ProposeError::Store(io::Error::other("arguments do not canonicalize"))
@@ -1242,6 +1343,7 @@ impl ActionProposalStore {
             action: action.as_str().to_string(),
             summary: action.summary_with(&args, gpu_product),
             details: action.details_with_gpu(&args, gpu_product),
+            uses: uses.map(|words| shown(&words, USES_MAX)),
             args,
             args_digest: digest,
             created_ms: now,
@@ -1366,6 +1468,8 @@ impl ActionProposalStore {
                         action: action.as_str().to_string(),
                         summary,
                         details,
+                        // The kernel's own words from when it was proposed, as a card shows them.
+                        uses: proposal.uses.map(|words| shown(&words, USES_MAX)),
                         args,
                         args_digest: digest,
                         created_ms: proposal.created_ms,
@@ -1799,13 +1903,13 @@ mod tests {
                 .map(|row| (row.label, row.value))
                 .collect()
         };
-        let plain = "A service from this node's postgres-autopg template. A database made this way is a service: connect to it with service_connect, remove it with service_remove.";
+        let plain = "A service from this node's postgres-autopg template. Your assistant can connect it to your other services, and removing that service deletes the database with its data.";
         assert_eq!(rows(None), [("Made as".to_string(), plain.to_string())]);
         assert_eq!(
             rows(Some(DATABASE_PASSWORD_GENERATED)),
             [(
                 "Made as".to_string(),
-                "A service from this node's postgres-autopg template, with the password that template generates; Arca keeps it. A database made this way is a service: connect to it with service_connect, remove it with service_remove.".to_string()
+                "A service from this node's postgres-autopg template, with the password that template generates; Arca keeps it. Your assistant can connect it to your other services, and removing that service deletes the database with its data.".to_string()
             )]
         );
         assert_eq!(
@@ -1814,7 +1918,7 @@ mod tests {
                 ("Made as".to_string(), plain.to_string()),
                 (
                     "Start".to_string(),
-                    "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; instance_start starts it later".to_string()
+                    "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; it can be started later".to_string()
                 )
             ]
         );
@@ -2356,5 +2460,115 @@ mod tests {
             limiter.allow("one", 1_000 + PROPOSAL_RATE_WINDOW_MS),
             "the first entry left the window"
         );
+    }
+
+    /// Issue 117: the card is read by the owner, so its words name no verb an assistant calls. Every action's sentence,
+    /// rows (with each fact a card can carry) and undo line are checked against every gated verb name.
+    #[test]
+    fn no_card_word_is_a_verb_name() {
+        let args = json!({
+            "name": "blog", "template": crate::service::DATABASE_TEMPLATE, "image": PINNED_IMAGE,
+            "templateDigest": "ab".repeat(32), "start": false, "from": "web", "to": "blog", "reach": "tailnet",
+            "instance": "web", "project": "default", "pci": "0000:01:00.0", "kind": "container", "id": "t-1",
+            "deploy": "d-1", "pool": "snapshots", "snapshot": "s-1"
+        });
+        let facts = [
+            None,
+            Some(DATABASE_PASSWORD_GENERATED),
+            Some("its template needs the secret POSTGRES_PASSWORD, which is not set yet"),
+        ];
+        for kind in ActionKind::ALL {
+            let mut words = vec![kind.summary(&args), kind.undo_words().to_string()];
+            for fact in facts {
+                words.extend(
+                    kind.details_with_gpu(&args, fact)
+                        .into_iter()
+                        .map(|row| row.value),
+                );
+            }
+            words.push(start_words(false).to_string());
+            for word in &words {
+                for verb in ActionKind::ALL {
+                    assert!(
+                        !word.contains(verb.as_str()),
+                        "{}: {word:?} names {}",
+                        kind.as_str(),
+                        verb.as_str()
+                    );
+                }
+            }
+            assert!(!kind.undo_words().is_empty(), "{}", kind.as_str());
+        }
+    }
+
+    /// Issue 117: a database's card leads with what the owner gets, not with the image it is made from.
+    #[test]
+    fn a_database_card_says_a_postgres_database_called_its_name() {
+        let args = json!({ "name": "blog", "template": crate::service::DATABASE_TEMPLATE, "image": PINNED_IMAGE });
+        assert_eq!(
+            ActionKind::PostgresCreate.summary(&args),
+            "Create a Postgres database called blog"
+        );
+        assert_eq!(
+            ActionKind::PostgresCreate.undo_words(),
+            "Ask your assistant to remove it. Removing it deletes the database with its data."
+        );
+    }
+
+    /// Issue 117: what a create from a template takes of the node, read from the template its fingerprint is of.
+    #[test]
+    fn a_create_says_what_it_uses_of_the_node() {
+        let template = |extra: Value| -> crate::service::Template {
+            let mut base = json!({ "name": "t", "kind": "oci", "image": "docker.io/library/nats" });
+            for (key, value) in extra.as_object().expect("an object") {
+                base[key] = value.clone();
+            }
+            serde_json::from_value(base).expect("a template")
+        };
+        assert_eq!(
+            uses_words(&template(json!({}))),
+            "No set share: it uses what it needs of this node's CPUs and memory, and the disk its files take."
+        );
+        assert_eq!(
+            uses_words(&template(
+                json!({ "limits": { "cpu": "2", "memory": "4GiB" } })
+            )),
+            "Up to 2 CPUs and 4GiB of memory, and the disk its files take."
+        );
+        assert_eq!(
+            uses_words(&template(
+                json!({ "limits": { "cpu": "1" }, "data": { "path": "/data", "size": "10GiB" } })
+            )),
+            "Up to 1 CPU and what it needs of this node's memory, and a 10GiB disk for its data."
+        );
+        assert_eq!(
+            uses_words(&template(json!({
+                "kind": "virtual-machine", "limits": { "cpu": "4", "memory": "8GiB" }, "rootSize": "40GiB"
+            }))),
+            "4 CPUs, 8GiB of memory and a 40GiB disk."
+        );
+    }
+
+    /// A proposal keeps what its create uses through the journal, so the card says it after the kernel opens again.
+    #[test]
+    fn what_a_create_uses_is_kept_with_its_proposal() {
+        let dir = Temp::new("uses");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let proposed = store
+            .propose_using(
+                ActionKind::ServiceCreate,
+                create_args("web"),
+                1_000,
+                None,
+                Some("Up to 2 CPUs".to_string()),
+            )
+            .expect("proposed");
+        assert_eq!(proposed.uses.as_deref(), Some("Up to 2 CPUs"));
+        let reopened = ActionProposalStore::open(&dir.0, 1_001, None);
+        assert_eq!(reopened.waiting()[0].uses.as_deref(), Some("Up to 2 CPUs"));
+        let other = store
+            .propose(ActionKind::ServiceCreate, create_args("db"), 1_000, None)
+            .expect("proposed");
+        assert_eq!(other.uses, None);
     }
 }
