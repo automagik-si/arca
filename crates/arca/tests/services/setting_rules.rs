@@ -334,3 +334,57 @@ fn the_shipped_gitlab_pool_templates_state_what_their_script_refuses() {
         }
     }
 }
+
+/// The GitHub pool template as it ships states one rule, which its own script refuses on the machine's console
+/// (`settings: maxSlots is ...` in `templates/github-runner-pool.sh`): the cap is at least the number of classes. Its
+/// defaults pass, and the rule refuses the first value outside it and takes the last value inside it. It is the
+/// plain rule: one class with a cap of nothing is refused too, though the script runs such a pool with one place.
+#[test]
+fn the_shipped_github_pool_template_states_that_the_cap_is_at_least_the_number_of_classes() {
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let template = service::load_template(&shipped, "github-runner-pool")
+        .unwrap_or_else(|error| panic!("it loads with its rule: {}", error.message));
+    assert_eq!(template.setting_rules.len(), 1);
+    let classes = |count: usize| {
+        json!(
+            (0..count)
+                .map(|n| json!({ "name": format!("c{n}"), "labels": ["self-hosted", format!("arca-c{n}")],
+                    "cpu": 2, "memory": "4GiB", "slots": 1 }))
+                .collect::<Vec<_>>()
+        )
+    };
+    for (settings, starts) in [
+        // The template's own two classes.
+        (
+            json!({ "maxSlots": 1 }),
+            "settings: settings.maxSlots is 1, below the number of entries in settings.classes (2): ",
+        ),
+        // The template's own cap of four.
+        (
+            json!({ "classes": classes(5) }),
+            "settings: settings.maxSlots is 4, below the number of entries in settings.classes (5): ",
+        ),
+        (
+            json!({ "classes": classes(1), "maxSlots": 0 }),
+            "settings: settings.maxSlots is 0, below the number of entries in settings.classes (1): ",
+        ),
+    ] {
+        let said = service::create_settings(&template, Some(&settings))
+            .expect_err("refused")
+            .message;
+        assert!(said.starts_with(starts), "{settings}: {said}");
+        assert!(
+            said.ends_with("set maxSlots to the number of classes or more, or name fewer classes"),
+            "the template's reason follows: {said}"
+        );
+    }
+    for settings in [
+        json!({ "maxSlots": 2 }),
+        json!({ "classes": classes(4) }),
+        json!({ "classes": classes(1), "maxSlots": 1 }),
+        json!({ "classes": classes(6), "maxSlots": 6 }),
+    ] {
+        service::create_settings(&template, Some(&settings))
+            .unwrap_or_else(|error| panic!("{settings}: {}", error.message));
+    }
+}

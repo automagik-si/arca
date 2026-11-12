@@ -3489,7 +3489,9 @@ the wrong type, when an amount has another form, or when the template's own defa
 virtual-machine template has rules. They are asked of a create only: a service that exists is not checked again.
 The machine's own script keeps its checks; the rules repeat only what it refuses. The two GitLab runner pool
 templates state six: `concurrent` and `jobCpu` of 1 or more, `memoryOvercommitPercent` from 100 to 200, and 1 to
-12 entries in `runners`.
+12 entries in `runners`. The GitHub runner pool template states one: `maxSlots` at least the number of entries in
+`classes`. It is the plain rule, so it also refuses a pool of one class with `maxSlots` 0, which the pool's script
+ran with one place and still does for a pool that exists.
 
 **Which image a machine was made from.** A template may name its image by an alias (`images:debian/13/cloud`), which
 does not say which build that was. `service_status` adds `baseImage`, the fingerprint (SHA-256) Incus recorded on the
@@ -3979,7 +3981,7 @@ since it is where the pool's credential will be used.
 | `url` | yes | The organisation the runners belong to, or one repository (`https://github.com/example-org/example-repo`; read step 2 first). A plain `https` address on the template's own host, `github.com`: a create changes the path only, and Arca refuses another host, a port, a user name, a query or a fragment, as the pool does. |
 | `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
 | `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
-| `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. Never below the number of classes: a pool created with less does not start ("A place for every class" below). |
+| `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. Never below the number of classes: a create with less is refused ("A place for every class" below). |
 | `allowDefaultRunnerGroup` | no | `true` lets the pool start on the organisation's default runner group. Leave it out. |
 | `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |
 | `dockerCache`, `dependencyCache` | no | The disk the Docker layer caches and the dependency caches may use, over all slots. |
@@ -4016,9 +4018,11 @@ that ask for its labels wait for ever: the controller says that too, as a `WARNI
 keeps its place until a job ends. So that no class is left without a runner behind the idle runners of the others,
 the pool keeps every class one place under the cap:
 
-- `maxSlots` is never below the number of classes. A pool created with less does not start, and its console says
-  both numbers and what to set: `settings: maxSlots is 2 and classes names 3 classes. ... Set maxSlots to 3 or more,
-  or name fewer classes`.
+- `maxSlots` is never below the number of classes. A create with less is refused when it is proposed, before any
+  card: `settings: settings.maxSlots is 2, below the number of entries in settings.classes (3): every class is kept
+  one place under the cap: ...`. The pool's own script refuses it too, for a pool made from a template that does not
+  state the rule: such a pool does not start, and its console says both numbers and what to set (`settings: maxSlots
+  is 2 and classes names 3 classes. ... Set maxSlots to 3 or more, or name fewer classes`).
 - A free place goes to the class that has the fewest runners, so every class has one runner before any has two.
   Among classes that have equally many, and among the slots of one class, the places go round-robin.
 - When a class has no runner and every place is held, the pool retires one runner that waits for a job and the class
@@ -4125,13 +4129,16 @@ A pool with more than one class and more slots than `maxSlots` says in every blo
 class is kept one place under the cap of 4: ...`). While a class has no runner and every place is held, one more line
 names the class (`class large: no runner, and every place under the cap of 4 is held. ...`) and says what the pool
 does about it: which slot gives up its idle runner's place, or, as a `WARNING`, why none does: no class that holds
-two or more places has a runner that waits for a job, or the class's slot would still lack its memory. Each retired
+two or more places has a runner that can be asked, or the class's slot would still lack its memory. Each retired
 runner is one line of its own (`slot 0 (standard): its idle runner is retired and its place goes to class large,
 ...`), and so is a runner that GitHub kept because it had a job. If GitHub answers the request to take a runner off
 with anything but its yes or that refusal (a 5xx, 401, 403 or 404), or not at all, nothing is retired: the pool says
 GitHub's answer once, keeps it in the class's line, and asks again after a pause that starts at five seconds and
-doubles up to five minutes. If the runner then stops because GitHub had taken it off after all, the pool says so and
-counts no failure. The last ten
+doubles up to five minutes. If GitHub answered with an error and that runner then stops before it took a job, the
+pool takes it as retired, says so and counts no failure: it cannot tell why the runner stopped, and GitHub having
+taken it off after all is the likely cause. It does not read a stop so when no answer came at all, or when GitHub
+has told the runner to update itself since. A runner that was updating itself when it was asked is asked again once
+its update is over. The last ten
 finished jobs are repeated in every block (`recent job`), so `service_logs` still reaches them after many blocks. All
 job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish
 time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name. Past 4MiB (some

@@ -64,6 +64,11 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik-workspace.sh",
         "8653ffd10e0c6962306818e74cfdfdd1b18f3d20828cae7eba17d6f47a801b90",
     ),
+    // 0.8.0 to 0.13.0: before it stated that maxSlots is at least the number of classes.
+    (
+        "github-runner-pool.json",
+        "637dc24185c7c301c45ed92a2b2b7ac94b78db3de2a9e2ab7d7f12d03af9c63c",
+    ),
     // 0.8.0 to 0.12.0: before a pool obeyed a stop in every loop.
     (
         "github-runner-pool.sh",

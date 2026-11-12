@@ -784,10 +784,12 @@ slot_cycle() {
   else
     slot_reap "$slot"
     slot_abandon "$slot" "$runner_id"
-    if [ -n "$asked" ]; then
+    if [ -n "$asked" ] && [ -z "$updating" ]; then
       # GitHub was asked to take this runner off and its answer was lost or said nothing (slot_retire). GitHub can
       # have taken it off all the same, and the runner then stops like this. That is no failure of the pool: nothing
-      # is counted, no slot pauses, and the runners keep their layered files.
+      # is counted, no slot pauses, and the runners keep their layered files. Why it stopped is not known: this is
+      # the likely cause, not a seen one. A runner GitHub has since told to update itself is not read so: that word
+      # is proof GitHub still had it, and its stop is the failure it would be for any runner.
       say "slot $slot ($class): its runner stopped (exit $code) before it took a job, after GitHub was asked to take it off and gave no clear answer. It is taken as retired: its place is free, and it is not counted as a failure"
       return 0
     fi
@@ -827,18 +829,21 @@ slot_cycle() {
 # - `retired`: GitHub took the runner off, or no longer had it, and it took no job. Returns 0, and the slot ends.
 # - `job`: the runner has a job, or has had its one job: the slot has seen it take one, GitHub says so, or its output
 #   shows one after GitHub's yes. It is kept and is not asked again.
-# - `kept`: GitHub is not asked, and the runner is not asked again: it is replacing its own files (GitHub tells a
-#   runner to update itself before it takes a job), or GitHub gave no id for it, and a request without one names no
-#   runner.
+# - `updating`: GitHub is not asked: the runner is replacing its own files (GitHub tells a runner to update itself
+#   before it takes a job). It is kept, and may be asked again once its update is over.
+# - `kept`: GitHub is not asked, and the runner is not asked again: GitHub gave no id for it, and a request without
+#   one names no runner.
 # - `error` and words: GitHub could not be asked, or answered something else. The runner is kept and may be asked
-#   again. When the request went out, $asked is set for the slot: GitHub can have acted on a request whose answer
-#   was lost.
+#   again. When GitHub answered, $asked is set for the slot: it can have acted on a request it then answered with an
+#   error. It is not set when no answer came at all (no request went out, or GitHub could not be reached).
 slot_retire() {
   local slot=$1 runner_id=$2 runner=$3 busy=$4 updating=$5 class=${SLOT_CLASS[$1]} for_class answer
   for_class=$(cat "$POOL_RUN/retire/$slot" 2>/dev/null)
   if [ -n "$busy" ]; then
     answer=job
-  elif [ "$updating" = 1 ] || [ -z "$runner_id" ] || [ -n "${runner_id//[0-9]/}" ]; then
+  elif [ "$updating" = 1 ]; then
+    answer=updating
+  elif [ -z "$runner_id" ] || [ -n "${runner_id//[0-9]/}" ]; then
     answer=kept
   elif ! github_token; then
     answer="error GitHub sign-in failed: $TOKEN_ERROR"
@@ -855,7 +860,7 @@ slot_retire() {
   else
     # A token GitHub no longer takes is not kept.
     [ "$API_CODE" != 401 ] || rm -f "$POOL_RUN/token"
-    asked=1
+    [ "$API_CODE" = 000 ] || asked=1
     answer="error $API_ERROR"
   fi
   TOKEN=''
@@ -1218,6 +1223,13 @@ give_a_place() {
           RETIRE_ERROR=''
           RETIRE_PAUSE=0
           ;;
+        updating)
+          # It is asked again once its update is over: until then its phase keeps it from being chosen.
+          rm -f "$POOL_RUN/retire/$RETIRING.answer"
+          RETIRING=''
+          RETIRE_ERROR=''
+          RETIRE_PAUSE=0
+          ;;
         'error '*)
           # The next runner is asked after a pause that grows as the pause after a failed registration does: five
           # seconds, then twice as long each time, up to POOL_BACKOFF_MAX. It is this request's own pause: no slot
@@ -1281,7 +1293,7 @@ give_a_place() {
     done
   done
   if [ -z "$give" ]; then
-    CLASS_NOTE="WARNING: $names, and no class that holds two or more has a runner that waits for a job. A runner that has a job, or that is starting, is never retired: the class waits until a job ends"
+    CLASS_NOTE="WARNING: $names, and no class that holds two or more has a runner that can be asked to give its place up. A runner that has a job, that is starting or updating itself, or that GitHub gave no id for, is never retired: the class waits until a job ends"
     return 0
   fi
   # The class the place is asked for: the first of those without a runner whose slot would have its memory.
