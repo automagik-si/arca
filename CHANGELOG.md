@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.18.0 (2026-11-12)
+
 On a node that only looks, a read that worked no longer begins with "this node only looks: nothing here can be
 changed ...": the answer comes first and that note after it, so an assistant that reads only the first text block no
 longer reports a refusal. The text of `watch_report`, `service_list` and `arca_status` now carries the answer itself
@@ -19,6 +21,11 @@ restart keeps it. A failure at any step puts the old version back and the answer
 `doctor` token and no owner approval, and works inside a tenant. It does this for `automagik-server`; there is no
 update path for `automagik-workspace`, a virtual machine, yet. This replaces moving such a service by a remove and a
 create, which deleted its data.
+
+- Merge PR 132: the README's link row puts the Website first
+- Merge PR 127: service_update rebuilds a running service on a new image digest and rolls back on a failed health check
+- Merge PR 130: watch-only reports put the answer first
+- Merge PR 125 delta: the real-Chromium RS256 test reaches the page and proves an RSA passkey enrols and approves
 
 ## 0.17.0 (2026-11-12)
 
