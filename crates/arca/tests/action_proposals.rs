@@ -231,9 +231,8 @@ fn a_viewer_may_propose_and_nothing_changes() {
         rig.list()["plans"][0].get("statement").is_none(),
         "plan_list leaves the action statement to the approval page"
     );
-    assert_eq!(
-        arca_api::may_call(Scope::Viewer, verb("approval_submit").expect("present")),
-        false,
+    assert!(
+        !arca_api::may_call(Scope::Viewer, verb("approval_submit").expect("present")),
         "a viewer can never approve"
     );
     for name in [

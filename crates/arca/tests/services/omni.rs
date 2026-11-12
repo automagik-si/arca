@@ -47,6 +47,9 @@ struct Instance {
     telegram: Option<String>,
 }
 
+/// An answer of the fake Omni: status, body, extra headers.
+type Answer = (u16, Value, Vec<(String, String)>);
+
 #[derive(Default)]
 struct OmniState {
     seen: Vec<Seen>,
@@ -54,7 +57,7 @@ struct OmniState {
     /// The key Omni took at its first start.
     key: String,
     /// The next answer, in place of the usual one: status, body, extra headers.
-    next: Option<(u16, Value, Vec<(String, String)>)>,
+    next: Option<Answer>,
     /// Omni has the request and keeps its answer back until this is false again, or for twice the default timeout.
     held: bool,
     made: u64,

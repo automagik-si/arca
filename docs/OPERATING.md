@@ -5201,7 +5201,7 @@ from a fork.
 | Job | Command | Pool class |
 |-----|---------|------------|
 | `fmt` | `cargo fmt --all --check` | `standard` |
-| `clippy` | `cargo clippy --workspace -- -D warnings` | `large` |
+| `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | `large` |
 | `test` | `cargo test --workspace` | `large` |
 | `canvas` | in `packages/arca-canvas-dsh`: `npm ci`, `npx playwright install --with-deps chromium`, `node --test` (on the pool with `--test-concurrency`, see below) | `standard` |
 

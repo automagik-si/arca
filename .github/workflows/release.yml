@@ -166,7 +166,7 @@ jobs:
           sudo apt-get install -y -qq attr
           scripts/version.sh check
           cargo fmt --all --check
-          cargo clippy --workspace -- -D warnings
+          cargo clippy --workspace --all-targets -- -D warnings
           # Built first, and what the build left to write is written out before a test runs: a test's store commits
           # with fsync, the node counts a commit of over a second as a slow commit and shows it in the text a golden
           # file is compared with, and straight after a build an fsync waits behind the build's gigabytes (see the

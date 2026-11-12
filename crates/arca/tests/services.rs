@@ -901,7 +901,7 @@ fn the_tools_operator_scope_read_only_reads_a_viewer_reads_and_changes_nothing()
     let status = verb("service_status").expect("status");
     assert!(create.writes);
     assert!(!create.destructive);
-    assert!(list.writes == false && status.writes == false);
+    assert!(!list.writes && !status.writes);
     assert!(list.min_scope == Scope::Viewer && status.min_scope == Scope::Viewer);
     assert!(!may_call(Scope::Viewer, create));
     assert!(may_call(Scope::Viewer, list));

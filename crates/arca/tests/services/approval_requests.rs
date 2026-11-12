@@ -1905,7 +1905,7 @@ fn enroll_confirm_refuses_a_wrong_target_wrong_args_an_expired_approval_and_a_ba
     ));
     assert!(spent_nonces(&late).is_empty());
     assert_eq!(
-        late.mine(&late.list()[0]["id"].as_str().unwrap().to_string())["state"],
+        late.mine(late.list()[0]["id"].as_str().unwrap())["state"],
         "expired"
     );
 
