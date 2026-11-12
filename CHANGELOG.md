@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU
+assignment no longer hold the word `watch-only`, which they did in 0.12.0: they carry the same sentence as every other
+refusal and every answer of such a node, `this node only looks: nothing here can be changed until the node is running
+with changes turned on (arca init --enable-changes, then restart the node if init did not)`. Their codes are unchanged
+(`InstanceLifecycleDisabled`, `StorageDisabled`, `GpuDisabled`): match on the code, not on the words.
+
 ## 0.12.0 (2026-11-12)
 
 - the installer shows the one line that connects an assistant, arca status says who approves and which tokens do not wait, and a machine with no screen is told what to run

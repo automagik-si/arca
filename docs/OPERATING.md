@@ -429,10 +429,11 @@ the node's own records and Incus, exactly as on a node that makes changes. What 
 - Every tool that would change an instance, a service, a database, a tenant, storage or a GPU assignment is refused
   with that same sentence, before an approval is spent and before anything is saved: a tenant's own calls, the
   `deploy_*` tools, `tenant_create` and `tenant_remove` included. A refusal of an instance start or stop, of a
-  storage change or of a GPU assignment keeps its own code (`InstanceLifecycleDisabled`, `StorageDisabled`) and
-  carries the same sentence. The tools that only keep a note for the owner (`action_propose`,
-  `owner_approval_request`, `plan_decline`, `peer_keys_sync`) still record it: what they record cannot run until
-  changes are turned on.
+  storage change or of a GPU assignment keeps its own code (`InstanceLifecycleDisabled`, `StorageDisabled`,
+  `GpuDisabled`) and carries the same sentence. The tools that only keep or settle a note for the owner
+  (`action_propose`, `owner_approval_request`, `owner_approval_status`, `approval_submit`, `enroll_confirm`,
+  `plan_decline`, `peer_keys_sync`) still record it: what they record cannot change the node until changes are turned
+  on.
 
 A node that only looks and holds records of services it ran, but whose config lost `kernel.serviceCidr` too, shows them
 the same way: the records are enough to tell which instances are its services. A node that never had a service config
