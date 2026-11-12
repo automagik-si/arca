@@ -85,6 +85,8 @@ pub struct Server {
     pub(crate) handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     /// Each GET route: its path, the verb whose scope and tool list admit a caller to it, and its handler.
     gets: Vec<(&'static str, &'static str, Arc<dyn GetHandler>)>,
+    /// Whether the node only looks: it reads and answers, and changes nothing. Every answer of such a node says so.
+    pub(crate) only_looks: bool,
 }
 
 /// Answers one GET route with a body. The server runs it on a blocking thread, after the bearer check.
@@ -119,7 +121,16 @@ impl Server {
             tokens,
             handlers: HashMap::new(),
             gets: Vec::new(),
+            only_looks: false,
         }
+    }
+
+    /// Marks the node as one that only looks (or not). Every tool answer of such a node carries one sentence that says
+    /// so, in its text and in its structured content, so a reader never takes what it is shown for something it can
+    /// change here.
+    pub fn only_looks(mut self, yes: bool) -> Self {
+        self.only_looks = yes;
+        self
     }
 
     /// Answers `verb` with `h`. A verb with no handler answers `not_found`.

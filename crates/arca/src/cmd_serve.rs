@@ -302,7 +302,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     });
     // peer_keys_sync is served only to a kernel whose config keeps another machine's page host's passkeys.
     let keeps_peer_keys = !peers.is_empty();
+    // A node that only looks says so in every answer: what a reader is shown is there, and none of it can be changed here.
     let mut server = Server::new(served_verbs(relayed, keeps_peer_keys), tokens.clone())
+        .only_looks(!kernel_mode)
         .handle(
             "arca_status",
             Arc::new(StatusHandler {

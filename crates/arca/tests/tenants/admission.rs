@@ -54,6 +54,55 @@ fn a_node_that_still_holds_a_tenant_never_answers_an_empty_list_when_its_config_
 }
 
 #[test]
+fn a_node_set_back_to_watch_only_still_shows_its_tenants_and_databases() {
+    let rig = Rig::new(Some(policy()));
+    rig.create_tenant(json!({ "id": A })).expect("the tenant");
+    let reads = [
+        ("tenant_list", json!({})),
+        ("tenant_status", json!({ "id": A })),
+        ("tenant_usage", json!({ "id": A })),
+        ("postgres_list", json!({})),
+        ("service_list", json!({ "tenant": A })),
+        ("service_list", json!({})),
+    ];
+    let before: Vec<Value> = reads
+        .iter()
+        .map(|(verb, args)| {
+            rig.call(verb, args.clone())
+                .unwrap_or_else(|e| panic!("{verb}: {e:?}"))
+        })
+        .collect();
+    // The node as `arca init --watch-only` leaves it: the same records, and no kernel project.
+    let mut cfg = (*rig.cfg).clone();
+    cfg.kernel.projects.clear();
+    let cfg = Arc::new(cfg);
+    let time: arca::handlers::Clock = Arc::new(|| NOW);
+    let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> =
+        tenant_handlers(rig.kernel.clone(), time.clone(), cfg.clone())
+            .into_iter()
+            .chain(service_handlers(
+                rig.kernel.clone(),
+                time.clone(),
+                cfg.clone(),
+            ))
+            .chain(postgres_handlers(rig.kernel.clone(), time, cfg))
+            .collect();
+    let doctor = Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    let entries = rig.entries();
+    for ((verb, args), before) in reads.iter().zip(&before) {
+        let now = handlers[verb]
+            .call(args.clone(), &doctor)
+            .unwrap_or_else(|e| panic!("{verb} on a node that only looks: {e:?}"));
+        assert_eq!(&now, before, "{verb}: what is there is shown as it was");
+    }
+    assert_eq!(rig.entries(), entries, "reading wrote no record");
+}
+
+#[test]
 fn a_node_without_the_key_has_no_tenants_whatever_the_verb() {
     let rig = Rig::new(None);
     rig.template("app", app_template("app"));

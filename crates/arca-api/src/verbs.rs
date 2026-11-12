@@ -2164,6 +2164,11 @@ pub fn service_view_schema() -> Value {
     json!({
         "additionalProperties": false,
         "properties": {
+            "note": {
+                "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
+                "maxLength": 200,
+                "type": "string"
+            },
             "ipv4": {
                 "description": "Its fixed address on the service bridge.",
                 "maxLength": 15,
@@ -2610,7 +2615,12 @@ pub fn cut_service_logs(v: &Value) -> Option<Value> {
         out.push(Value::String(cut));
     }
     if start > 0 || out.iter().zip(&lines[start..]).any(|(a, b)| a != b) {
-        Some(json!({ "lines": out }))
+        let mut cut = json!({ "lines": out });
+        // What the answer says about where its lines came from stays with the lines that are left.
+        if let Some(note) = v.get("note") {
+            cut["note"] = note.clone();
+        }
+        Some(cut)
     } else {
         None
     }
@@ -2687,6 +2697,11 @@ fn service_logs_result() -> Value {
                 "items": { "maxLength": 2000, "type": "string" },
                 "maxItems": 200,
                 "type": "array"
+            },
+            "note": {
+                "description": "Present when the lines are not the service's journal: on a node that only looks they are the instance's console log, since the journal is read by running a command inside the instance.",
+                "maxLength": 300,
+                "type": "string"
             }
         },
         "required": ["lines"],

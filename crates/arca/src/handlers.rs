@@ -4443,6 +4443,36 @@ pub(crate) fn no_service_project_asked(cfg: &NodeConfig) -> bool {
             .any(|project| project == arca_netproject::PROJECT)
 }
 
+/// What a log answer of a node that only looks says about its lines.
+pub const CONSOLE_LOG_NOTE: &str = "these lines are the instance's console log, not the service's journal: the journal is read by running a command inside the instance, and this node only looks";
+
+/// What marks an instance of the service project that this node holds no record of.
+pub const NOT_RECORDED_NOTE: &str = "not recorded by this node";
+
+/// `view`, marked as an instance this node holds no record of.
+fn not_recorded(mut view: Value) -> Value {
+    view["note"] = json!(NOT_RECORDED_NOTE);
+    view
+}
+
+/// The refusal of a writing call on a node that only looks, when the call got as far as asking for the service project.
+fn only_looks() -> CallError {
+    service_refused(format!(
+        "this node only looks: nothing here can be changed until changes are turned on again ({ENABLE_CHANGES})"
+    ))
+}
+
+/// The command that turns changes on.
+const ENABLE_CHANGES: &str = "arca init --enable-changes";
+
+/// The refusal of a call that would change something, or run a command inside a service, on a node that only looks.
+/// `does` says what the verb would have done.
+pub(crate) fn only_looks_refusal(verb: &str, does: &str) -> CallError {
+    service_refused(format!(
+        "this node only looks: {verb} {does}, and nothing here can be changed until changes are turned on again ({ENABLE_CHANGES})"
+    ))
+}
+
 /// Whether the node's desired state holds a record of anything in the service project: a service, a database, a consumer,
 /// or the project and network themselves. A node whose config no longer asks for the project may still hold them.
 fn holds_service_records(entries: &[arca_kernel::desired::Entry]) -> bool {
@@ -4473,7 +4503,7 @@ fn no_service_subnet(cfg: &NodeConfig) -> CallError {
         )
     } else if cfg.kernel.projects.is_empty() {
         format!(
-            "no service project: this node only looks, and its config sets up no services. To let it run them, {fix}"
+            "no service project: this node only looks, and its config sets up no services. To let it run them: {ENABLE_CHANGES}"
         )
     } else {
         format!(
@@ -4500,6 +4530,11 @@ fn service_project(cfg: &NodeConfig) -> Result<(String, String), CallError> {
         .ok_or_else(|| no_service_subnet(cfg))?;
     let gateway = crate::service::gateway(cidr)
         .map_err(|_| service_refused("no service project: the service CIDR is invalid"))?;
+    // A node with no kernel project only looks. Its service config is whole and its services may well be there; what it
+    // lacks is the leave to change them, and the refusal says that, not that a project is missing.
+    if cfg.kernel.projects.is_empty() {
+        return Err(only_looks());
+    }
     if !cfg
         .kernel
         .projects
@@ -4521,6 +4556,9 @@ fn service_project(cfg: &NodeConfig) -> Result<(String, String), CallError> {
 
 /// A bridged node's service project, or a refusal before any Incus read. It has no CIDR and no gateway.
 fn bridged_project(cfg: &NodeConfig) -> Result<(), CallError> {
+    if cfg.kernel.projects.is_empty() {
+        return Err(only_looks());
+    }
     if !cfg
         .kernel
         .projects
@@ -5391,16 +5429,34 @@ impl ToolHandler for ServiceHandler {
         // A node whose config asks for no service project, and whose desired state holds nothing of one, has no service:
         // the list is empty, and Incus is not asked. A node that still holds records of what it ran has not, so no call
         // answers for it as if it had none. Every other verb, and every half-made service config, still refuses below.
+        //
+        // A node that only looks (no kernel project: a fresh install, or one set back with `arca init --watch-only`) still
+        // answers the three reads whenever there is something to read: a service config, or records of services it ran.
+        // They read the node's own records and Incus, as they do on a node that makes changes, and nothing else: no
+        // instance is adopted and no command is run inside one. So a person can always see what is there.
+        let only_looks = self.cfg.kernel.projects.is_empty();
+        let reading = matches!(
+            self.verb,
+            "service_list" | "service_status" | "service_logs"
+        );
+        let mut reads_as_it_is = only_looks && reading && tenant.is_none();
         if tenant.is_none() && no_service_project_asked(&self.cfg) {
-            if holds_service_records(lock(&self.kernel)?.entries()) {
+            let records = holds_service_records(lock(&self.kernel)?.entries());
+            if records && !reads_as_it_is {
                 return Err(service_records_without_config());
             }
-            if self.verb == "service_list" {
-                return Ok(json!({ "services": [] }));
+            if !records {
+                if self.verb == "service_list" {
+                    return Ok(json!({ "services": [] }));
+                }
+                // Nothing to read and nothing set up: the refusal below says what the config needs.
+                reads_as_it_is = false;
             }
         }
         let (cidr, gateway) = match bridged {
             _ if tenant.is_some() => tenants::network(&self.cfg)?,
+            // The reads use neither the subnet nor its gateway.
+            _ if reads_as_it_is => (String::new(), String::new()),
             Some(_) if !managed => {
                 bridged_project(&self.cfg)?;
                 (String::new(), String::new())
@@ -5413,7 +5469,9 @@ impl ToolHandler for ServiceHandler {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
         };
-        if managed && tenant.is_none() {
+        // Adopting writes a record into the desired state, which a node that only looks never does: an instance it holds
+        // no record of is shown as it is, and marked.
+        if managed && tenant.is_none() && !only_looks {
             adopt_services(
                 &self.kernel,
                 &self.cfg,
@@ -5487,7 +5545,13 @@ impl ToolHandler for ServiceHandler {
                         && !names.contains(name)
                         && owned(row)
                     {
-                        let view = if row["config"][crate::service::TEMPLATE_KEY].is_string() {
+                        let view = if reads_as_it_is {
+                            // Not judged a failed create, and not adopted: only shown, and said to be unrecorded.
+                            (row["project"].as_str() == Some(project))
+                                .then(|| crate::service::unknown_view(row))
+                                .flatten()
+                                .map(not_recorded)
+                        } else if row["config"][crate::service::TEMPLATE_KEY].is_string() {
                             crate::service::failed_view(row)
                         } else if row["project"].as_str() == Some(project) {
                             crate::service::unknown_view(row)
@@ -5551,10 +5615,13 @@ impl ToolHandler for ServiceHandler {
                         == Some(crate::service::instance_name(tenant_id, &name).as_str())
                         && owned(row)
                 }) {
-                    if let Some(view) = crate::service::failed_view(row) {
+                    if reads_as_it_is {
+                        if let Some(view) = crate::service::unknown_view(row) {
+                            return Ok(not_recorded(view));
+                        }
+                    } else if let Some(view) = crate::service::failed_view(row) {
                         return Ok(view);
-                    }
-                    if let Some(view) = crate::service::unknown_view(row) {
+                    } else if let Some(view) = crate::service::unknown_view(row) {
                         return Ok(view);
                     }
                 }
@@ -5586,7 +5653,9 @@ impl ToolHandler for ServiceHandler {
                     config.instance, config.project
                 );
                 // A virtual machine's log is its console: an exec needs a guest agent the image may not run.
-                let journal = if !config.adopted
+                // A node that only looks runs no command inside an instance, so it reads the console log, and says so.
+                let journal = if !reads_as_it_is
+                    && !config.adopted
                     && config.vm.is_none()
                     && config.tenant.is_none()
                     && config.source["protocol"] != "oci"
@@ -5647,7 +5716,11 @@ impl ToolHandler for ServiceHandler {
                     }
                 }
                 let start = lines_out.len().saturating_sub(lines as usize);
-                Ok(json!({ "lines": &lines_out[start..] }))
+                let mut answer = json!({ "lines": &lines_out[start..] });
+                if reads_as_it_is {
+                    answer["note"] = json!(CONSOLE_LOG_NOTE);
+                }
+                Ok(answer)
             }
             "service_remove" => {
                 let name = service_name(&args)?;
@@ -6188,13 +6261,31 @@ mod service_project_tests {
     }
 
     #[test]
+    fn a_node_that_only_looks_with_a_service_subnet_is_refused_changes_in_those_words() {
+        // What `arca init --watch-only` leaves: the subnet, and no kernel project.
+        let cfg = config(json!({ "serviceCidr": "192.0.2.0/24", "droiddProjects": [] }));
+        assert!(!no_service_project_asked(&cfg));
+        assert_eq!(
+            refused(&cfg),
+            "this node only looks: nothing here can be changed until changes are turned on again (arca init --enable-changes)"
+        );
+        // A node that makes changes elsewhere and left the service project out is told that, as before.
+        assert_eq!(
+            refused(&config(json!({
+                "serviceCidr": "192.0.2.0/24",
+                "projects": ["elsewhere"],
+                "droiddProjects": ["droid"]
+            }))),
+            "no service project: the service project is excluded by kernel configuration"
+        );
+    }
+
+    #[test]
     fn a_missing_subnet_is_refused_in_the_words_of_what_the_node_is() {
         let keys = "its config must set kernel.serviceCidr to an IPv4 /24 and list arcak-svc in kernel.projects (with kernel.droiddProjects), and the node be restarted";
         assert_eq!(
             refused(&config(json!({ "droiddProjects": [] }))),
-            format!(
-                "no service project: this node only looks, and its config sets up no services. To let it run them, {keys}"
-            )
+            "no service project: this node only looks, and its config sets up no services. To let it run them: arca init --enable-changes"
         );
         assert_eq!(
             refused(&config(

@@ -500,6 +500,15 @@ impl ToolHandler for OmniHandler {
                 verb: self.verb.into(),
             });
         }
+        // Each of these verbs runs a command inside the service, the status too. A node that only looks runs none.
+        if self.cfg.kernel.projects.is_empty() {
+            let does = if self.verb == "omni_status" {
+                "answers by running a command inside the service, which a node that only looks does not do"
+            } else {
+                "changes a service by running a command inside it"
+            };
+            return Err(super::only_looks_refusal(self.verb, does));
+        }
         service_project(&self.cfg)?;
         let name = service_name(&args)?;
         match self.verb {

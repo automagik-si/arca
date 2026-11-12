@@ -411,6 +411,25 @@ still makes changes until it is restarted. Once restarted, the node only looks: 
 removed: the Incus project `arcak-svc`, its bridge, the services in it and the owner's passkeys stay as they are.
 Running `--enable-changes` again adds the project back and keeps the network and the page.
 
+**A node that only looks still shows what is there.** After `--watch-only` the reading tools answer as they did:
+`service_list`, `service_status`, `service_logs`, `postgres_list`, `tenant_list`, `tenant_status` and `tenant_usage` read
+the node's own records and Incus, exactly as on a node that makes changes. What differs:
+
+- Every answer says what the node is. Its text, and its structured content under `watchOnly`, carry `this node only
+  looks: nothing here can be changed until changes are turned on again (arca init --enable-changes)`.
+- Nothing is adopted. An instance in `arcak-svc` that the node holds no record of is shown as it is, with the state
+  `unknown` and the note `not recorded by this node`; a node that makes changes would have written a record for a
+  marked one.
+- `service_logs` reads the instance's console log, and its `note` says so: the journal is read by running a command
+  inside the instance, and a node that only looks runs none.
+- `omni_status` is refused, with that reason: it answers by running a command inside the service.
+- Every tool that would change something is refused in the same words, `this node only looks: nothing here can be
+  changed until changes are turned on again (arca init --enable-changes)`.
+
+A node that only looks and holds records of services it ran, but whose config lost `kernel.serviceCidr` too, shows them
+the same way: the records are enough to tell which instances are its services. A node that never had a service config
+and holds no record answers an empty list.
+
 **What this step does not do:**
 
 - It does not enrol a passkey. The owner does, on the page, with a setup code from the node's own screen or from
@@ -427,8 +446,6 @@ Running `--enable-changes` again adds the project back and keeps the network and
 - It does not check that Incus can fetch a template's image; a create that cannot answers in Incus's own words.
 - It grants no access to Incus. The node's user must already be able to open the Incus socket, which is the
   machine's administrator's to grant, as is keeping the service running without a login session.
-- On a node set back to watch-only, `service_list` answers "no service project", though the services are still
-  there; `watch_report` lists them.
 
 ## The link
 

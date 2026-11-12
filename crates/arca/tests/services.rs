@@ -1070,6 +1070,140 @@ fn lists_the_service_project_with_each_instances_own_config_and_devices_none_whe
         && request.status == 200));
 }
 
+/// What a writing service call is refused with on a node that only looks.
+const ONLY_LOOKS: &str = "this node only looks: nothing here can be changed until changes are turned on again (arca init --enable-changes)";
+
+/// The handlers of `rig`'s node as `arca init --watch-only` leaves it: the same kernel, the same records, the same
+/// service subnet, and a config whose `kernel.projects` is empty.
+fn set_back_to_watch_only(rig: &Rig) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
+    let mut cfg = (*rig.cfg).clone();
+    cfg.kernel.projects.clear();
+    service_handlers(rig.kernel.clone(), Arc::new(|| NOW), Arc::new(cfg))
+        .into_iter()
+        .collect()
+}
+
+fn doctor() -> Caller {
+    Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
+    }
+}
+
+#[test]
+fn a_node_set_back_to_watch_only_still_shows_its_services_and_changes_nothing() {
+    // A node that makes changes runs one service, and its service project also holds an instance made by hand.
+    let hand = hand_instance(
+        "hand",
+        PROJECT,
+        json!({"eth0":{"type":"nic","ipv4.address":"192.0.2.13"}}),
+    );
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![json!({"name":PROJECT,"config":{}})],
+            instances: vec![hand],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+    );
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("nats create");
+    let before_list = rig.call("service_list", json!({})).expect("list");
+    let before_status = rig
+        .call("service_status", json!({"name":"nats"}))
+        .expect("status");
+    rig.fake
+        .set_console_log(PROJECT, "nats", "line one\nline two\n");
+
+    // The node is set back to watch-only. Everything that was there is still there.
+    let looks = set_back_to_watch_only(&rig);
+    let entries = rig.entries();
+    let asked = rig.fake.requests().len();
+    let writes = rig.fake.writes().len();
+
+    // The list is the one the node gave before, row for row, and the hand-made instance says it is not this node's.
+    let list = looks["service_list"]
+        .call(json!({}), &doctor())
+        .expect("the list on a node that only looks");
+    let row = |list: &Value, name: &str| {
+        list["services"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no row for {name}: {list}"))
+    };
+    assert_eq!(row(&list, "nats"), row(&before_list, "nats"));
+    let unrecorded = row(&list, "hand");
+    assert_eq!(unrecorded["state"], "unknown");
+    assert_eq!(unrecorded["ipv4"], "192.0.2.13");
+    assert_eq!(unrecorded["note"], arca::handlers::NOT_RECORDED_NOTE);
+    assert_eq!(list["services"].as_array().expect("rows").len(), 2);
+
+    // One service, as before; and the hand-made one, marked.
+    assert_eq!(
+        looks["service_status"]
+            .call(json!({"name":"nats"}), &doctor())
+            .expect("status"),
+        before_status
+    );
+    assert_eq!(
+        looks["service_status"]
+            .call(json!({"name":"hand"}), &doctor())
+            .expect("status of the unrecorded one")["note"],
+        arca::handlers::NOT_RECORDED_NOTE
+    );
+
+    // The log is the console log, and the answer says so and why. No command was run inside the instance.
+    let logs = looks["service_logs"]
+        .call(json!({"name":"nats"}), &doctor())
+        .expect("logs");
+    assert_eq!(logs["lines"], json!(["line one", "line two"]));
+    assert_eq!(logs["note"], arca::handlers::CONSOLE_LOG_NOTE);
+
+    // Reading changed nothing: no record was added (nothing adopted), and Incus got GETs only.
+    assert_eq!(rig.entries(), entries, "no record was written");
+    assert_eq!(rig.fake.writes().len(), writes, "Incus was not written to");
+    let since = &rig.fake.requests()[asked..];
+    assert!(!since.is_empty(), "the reads asked Incus");
+    assert!(
+        since.iter().all(|request| request.method == "GET"),
+        "{since:?}"
+    );
+
+    // Every call that would change something is refused, in words.
+    for (verb, args) in [
+        ("service_create", json!({"name":"web","template":"nats"})),
+        ("service_remove", json!({"name":"nats","approval":"x"})),
+        (
+            "service_secret_set",
+            json!({"name":"nats","key":"k","value":"v"}),
+        ),
+        ("service_connect", json!({"from":"nats","to":"nats"})),
+    ] {
+        match looks[verb].call(args, &doctor()) {
+            Err(CallError::Refused { message, .. }) => assert_eq!(message, ONLY_LOOKS, "{verb}"),
+            other => panic!("{verb}: expected a refusal, got {other:?}"),
+        }
+    }
+    // A status that is answered by running a command inside the service is not a read a looking node can make.
+    match looks["omni_status"].call(json!({"name":"nats"}), &doctor()) {
+        Err(CallError::Refused { message, .. }) => assert_eq!(
+            message,
+            "this node only looks: omni_status answers by running a command inside the service, which a node that only looks does not do, and nothing here can be changed until changes are turned on again (arca init --enable-changes)"
+        ),
+        other => panic!("omni_status: expected a refusal, got {other:?}"),
+    }
+    assert_eq!(rig.entries(), entries);
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
 /// What every refusal for want of a service subnet ends with: the config keys that would let the node run services.
 const SERVICE_KEYS: &str = "its config must set kernel.serviceCidr to an IPv4 /24 and list arcak-svc in kernel.projects (with kernel.droiddProjects), and the node be restarted";
 
@@ -1096,7 +1230,7 @@ fn a_node_never_set_up_for_services_lists_none_and_every_other_service_call_says
             Err(CallError::Refused { message, .. }) => assert_eq!(
                 message,
                 format!(
-                    "no service project: this node only looks, and its config sets up no services. To let it run them, {SERVICE_KEYS}"
+                    "no service project: this node only looks, and its config sets up no services. To let it run them: arca init --enable-changes"
                 ),
                 "{verb}"
             ),
@@ -1122,30 +1256,30 @@ fn a_node_never_set_up_for_services_lists_none_and_every_other_service_call_says
             other => panic!("{verb}: expected a refusal, got {other:?}"),
         }
     }
-    // A subnet with the service project left out of the kernel's projects is the other half: it refuses as before.
-    let excluded = Rig::with(state(), vec![], Some("192.0.2.0/24"));
+    // A service subnet and no kernel project is a node set back to watch-only: it reads what is there (here, nothing),
+    // and still changes nothing.
+    let looks = Rig::with(state(), vec![], Some("192.0.2.0/24"));
+    assert_eq!(
+        looks.call("service_list", json!({})).expect("the list"),
+        json!({ "services": [] })
+    );
     assert!(matches!(
-        excluded.call("service_list", json!({})),
-        Err(CallError::Refused { message, .. })
-            if message == "no service project: the service project is excluded by kernel configuration"
+        looks.call("service_create", json!({"name":"nats","template":"nats"})),
+        Err(CallError::Refused { message, .. }) if message == ONLY_LOOKS
     ));
 }
 
 #[test]
-fn a_node_that_still_holds_service_records_never_answers_an_empty_list_when_its_config_loses_the_keys()
+fn a_node_that_holds_service_records_and_lost_its_service_config_shows_them_and_never_an_empty_list()
  {
     // A node set up for services runs one.
     let rig = Rig::new();
     rig.template("nats", nats_template());
     rig.call("service_create", json!({"name":"nats","template":"nats"}))
         .expect("nats create");
-    assert!(
-        rig.entries()
-            .iter()
-            .any(|entry| entry.plugin.0 == "arca.service"),
-        "the desired state holds the service's record"
-    );
-    // The same node, started again from a config that lost the service subnet and the service project.
+    let before = rig.call("service_list", json!({})).expect("list");
+    // The same node, started again from a config that lost the service subnet and every kernel project: it only looks,
+    // and its config says nothing of services. Its records are enough to tell which instances are its services.
     let mut cfg = (*rig.cfg).clone();
     cfg.kernel.service_cidr = None;
     cfg.kernel.projects.clear();
@@ -1153,32 +1287,30 @@ fn a_node_that_still_holds_service_records_never_answers_an_empty_list_when_its_
         service_handlers(rig.kernel.clone(), Arc::new(|| NOW), Arc::new(cfg))
             .into_iter()
             .collect();
-    let doctor = Caller {
-        token_id: "doctor".into(),
-        scope: Scope::Doctor,
-        tools: None,
-    };
-    let asked = rig.fake.requests().len();
-    for (verb, args) in [
-        ("service_list", json!({})),
-        ("service_status", json!({"name":"nats"})),
-    ] {
-        match handlers[verb].call(args, &doctor) {
-            Err(CallError::Refused { message, .. }) => assert_eq!(
-                message,
-                format!(
-                    "no service project: this node's config sets up no services, but the node still holds records of services it ran. To reach them again, {SERVICE_KEYS}"
-                ),
-                "{verb}"
-            ),
-            other => panic!("{verb}: expected a refusal, got {other:?}"),
-        }
+    let list = handlers["service_list"]
+        .call(json!({}), &doctor())
+        .expect("the list is read from the records");
+    assert_eq!(list, before, "the service is shown, as it was");
+    assert_eq!(
+        handlers["service_status"]
+            .call(json!({"name":"nats"}), &doctor())
+            .expect("status")["name"],
+        "nats"
+    );
+    // A call that would change something is refused, and says the records are there and what the config needs.
+    match handlers["service_create"].call(json!({"name":"web","template":"nats"}), &doctor()) {
+        Err(CallError::Refused { message, .. }) => assert_eq!(
+            message,
+            format!(
+                "no service project: this node's config sets up no services, but the node still holds records of services it ran. To reach them again, {SERVICE_KEYS}"
+            )
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
     }
-    assert_eq!(rig.fake.requests().len(), asked, "Incus was not asked");
 }
 
 #[test]
-fn refuses_every_service_call_without_a_service_project_asking_incus_nothing() {
+fn a_node_with_a_service_subnet_and_no_kernel_project_reads_and_refuses_every_change() {
     let rig = Rig::with(
         FakeState {
             server: json!({}),
@@ -1190,17 +1322,22 @@ fn refuses_every_service_call_without_a_service_project_asking_incus_nothing() {
         vec![],
         Some("192.0.2.0/24"),
     );
-    for (verb, args) in [
-        ("service_create", json!({"name":"nats","template":"nats"})),
-        ("service_list", json!({})),
-        ("service_status", json!({"name":"nats"})),
-    ] {
-        assert!(matches!(
-            rig.call(verb, args),
-            Err(CallError::Refused { message, .. }) if message.contains("no service project")
-        ));
-    }
-    assert!(rig.fake.requests().is_empty());
+    // It only looks: the reads answer from what is there, which is nothing.
+    assert_eq!(
+        rig.call("service_list", json!({})).expect("the list"),
+        json!({ "services": [] })
+    );
+    assert!(matches!(
+        rig.call("service_status", json!({"name":"nats"})),
+        Err(CallError::Refused { code, .. }) if code == "not_found"
+    ));
+    // A change is refused before Incus is written to, in the words of what the node is.
+    let writes = rig.fake.writes().len();
+    assert!(matches!(
+        rig.call("service_create", json!({"name":"nats","template":"nats"})),
+        Err(CallError::Refused { message, .. }) if message == ONLY_LOOKS
+    ));
+    assert_eq!(rig.fake.writes().len(), writes);
 }
 
 #[test]
