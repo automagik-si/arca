@@ -2789,12 +2789,23 @@ pub fn summary_service_list(v: &Value) -> String {
         .into_iter()
         .flatten()
         .map(|service| {
+            let named = |key: &str, none: &'static str| match service[key].as_str() {
+                Some(text) if !text.is_empty() => text.to_string(),
+                _ => none.to_string(),
+            };
+            // A machine on a host bridge has an empty address in the list: it is only in the live state.
+            let address = match service["ipv4"].as_str() {
+                Some(ipv4) if !ipv4.is_empty() => format!(" at {ipv4}"),
+                _ if service["ipv4In"] == "state" => {
+                    ", address in its live state (service_status reads it)".to_string()
+                }
+                _ => ", no address".to_string(),
+            };
             format!(
-                "{} ({}): {} at {}",
-                service["name"].as_str().unwrap_or("?"),
-                service["template"].as_str().unwrap_or("?"),
-                service["state"].as_str().unwrap_or("?"),
-                service["ipv4"].as_str().unwrap_or("no address")
+                "{} ({}): {}{address}",
+                named("name", "?"),
+                named("template", "no template"),
+                named("state", "?"),
             )
         })
         .collect();
