@@ -1529,11 +1529,11 @@ fn the_text_of_a_watch_report_a_service_list_and_a_status_carries_the_answer() {
         summary(
             "service_list",
             json!({ "services": [
-            { "name": "nats", "template": "nats", "state": "running", "ipv4": "10.88.0.2" },
+            { "name": "nats", "template": "nats", "state": "running", "ipv4": "192.0.2.20" },
             { "name": "wiki", "template": "automagik-workspace", "state": "stopped" },
         ] })
         ),
-        "2 service(s)\n- nats (nats): running at 10.88.0.2\n- wiki (automagik-workspace): stopped at no address"
+        "2 service(s)\n- nats (nats): running at 192.0.2.20\n- wiki (automagik-workspace): stopped at no address"
     );
     assert_eq!(
         summary("service_list", json!({ "services": [] })),
