@@ -385,6 +385,7 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
             "limits.memory",
             "user.arca.template",
             KERNEL_ENTRY_KEY,
+            "volatile.last_state.power",
             "volatile.uuid"
         ]
     );
