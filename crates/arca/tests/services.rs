@@ -1092,6 +1092,92 @@ fn doctor() -> Caller {
 }
 
 #[test]
+fn a_local_image_that_carries_a_digest_is_held_to_it_and_one_that_carries_none_is_not() {
+    let template = |digest: Option<&str>| {
+        let mut template = json!({
+            "name":"dash","kind":"system","image":"local:dash-image",
+            "ports":[],"env":{},"publishable":false
+        });
+        if let Some(digest) = digest {
+            template["digest"] = json!(format!("sha256:{digest}"));
+        }
+        template
+    };
+    let refused = |result: Result<Value, CallError>| match result {
+        Err(CallError::Refused { message, .. }) => message,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let other = "0".repeat(64);
+
+    // A node with no service yet has no service project, so no image can be in it: the pin cannot be met, and the
+    // refusal says what comes first.
+    let fresh = Rig::new();
+    fresh.template("dash", template(Some(&other)));
+    assert_eq!(
+        refused(fresh.call("service_create", json!({"name":"dash","template":"dash"}))),
+        format!(
+            "template dash: its image dash-image is pinned to sha256:{other}, and the service project {PROJECT} does not exist yet: it is made with this node's first service, so no image can be in it. Create another service first, put the pinned image in the project under the alias dash-image, then create this one"
+        )
+    );
+    assert!(fresh.entries().is_empty(), "no record was saved");
+
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("the first service makes the project");
+    let held = rig.fake.add_image(PROJECT, "dash-image");
+    let create = |name: &str| {
+        rig.call(
+            "service_create",
+            json!({ "name": name, "template": "dash" }),
+        )
+    };
+    let entries = rig.entries();
+    let writes = rig.fake.writes().len();
+
+    // The alias holds another image than the template pins: refused with both, and nothing is created.
+    rig.template("dash", template(Some(&other)));
+    assert_eq!(
+        refused(create("dash")),
+        format!(
+            "template dash: its image dash-image is pinned to sha256:{other}, and the image under that alias in the service project {PROJECT} is sha256:{held}. Nothing was created. Put the pinned image under the alias, or change the template's digest"
+        )
+    );
+    // A pinned alias that is not there at all.
+    let mut absent = template(Some(&held));
+    absent["image"] = json!("local:no-such-image");
+    rig.template("dash", absent);
+    assert!(
+        refused(create("dash"))
+            .starts_with("template dash: its image no-such-image is not on this node"),
+    );
+    // A digest that is not one, and one in upper case, are refused when the template is read: the pin is compared
+    // with the fingerprint as Incus writes it.
+    let malformed = "template dash: the digest of a local image is sha256: and 64 lowercase hex digits, as Incus writes a fingerprint";
+    for digest in ["abc".to_string(), held.to_uppercase()] {
+        rig.template("dash", template(Some(&digest)));
+        assert_eq!(refused(create("dash")), malformed, "{digest}");
+    }
+    assert_eq!(rig.entries(), entries, "no record was saved");
+    assert_eq!(rig.fake.writes().len(), writes, "Incus was not written to");
+
+    // The pinned image under the alias: created, and Incus is given the fingerprint, which decides the image.
+    rig.template("dash", template(Some(&held)));
+    create("dash").expect("the pinned create");
+    assert_eq!(
+        rig.service_config("dash").source,
+        json!({ "type": "image", "alias": "dash-image", "fingerprint": held })
+    );
+    // A template with no digest is as it was: the alias is enough.
+    rig.template("dash", template(None));
+    create("dash2").expect("an unpinned local image");
+    assert_eq!(
+        rig.service_config("dash2").source,
+        json!({ "type": "image", "alias": "dash-image" })
+    );
+}
+
+#[test]
 fn a_node_set_back_to_watch_only_still_shows_its_services_and_changes_nothing() {
     // A node that makes changes runs one service, and its service project also holds an instance made by hand.
     let hand = hand_instance(
