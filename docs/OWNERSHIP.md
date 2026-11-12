@@ -1640,12 +1640,14 @@ and `registry_owner` in `crates/arca-providers/src/incus.rs`; `crates/arca/src/r
 in `crates/arca-incus/src/function_run.rs`. Tests in `crates/arca/tests/functions.rs`
 (`an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_rests_in_incus_alone`,
 `a_registrys_credential_never_reaches_another_host_or_a_functions_environment`,
-`the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_old_orphan`),
+`the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_old_orphan`,
+`a_sweep_round_goes_on_past_an_image_that_incus_will_not_change`),
 `crates/arca/tests/tenants/isolation.rs` (`a_tenants_image_is_fetched_without_the_nodes_registry_credential`),
 `crates/arca-providers/tests/incus_provider.rs`
 (`a_registrys_credential_has_a_name_of_its_own_goes_to_its_own_host_and_is_no_entrys_to_name`) and
 `crates/arca-incus/tests/function_run.rs`
-(`a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_deleted`).
+(`a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_deleted`,
+`the_turn_off_after_a_rebuild_goes_on_past_an_image_that_incus_will_not_change`).
 
 ## Out of scope
 

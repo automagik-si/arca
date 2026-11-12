@@ -4607,8 +4607,10 @@ secrets. So:
   (a local one, one imported by hand) or one from an address without a credential, and never deletes an image a
   service or a function is made from, a stopped function's included. Each thing it does, and each image deleted
   at a removal, is one line in `registry-images.jsonl` in the state directory: when, the project, the fingerprint,
-  what and why, and never the address. A round that fails says so once on the log of `arca serve` and is tried
-  again at the next; it stops nothing and no create or run waits for it;
+  what and why, and never the address. A round goes on past an image Incus will not let it change, so one such
+  image does not leave the others as they were, and the quarter of an hour is counted on a clock that only goes
+  forward, whatever the machine's own clock does. A round that fails says so once on the log of `arca serve` and
+  is tried again at the next; it stops nothing and no create or run waits for it;
 - **what this does not give:** between a fetch and the turn-off that follows it, `auto_update` is on: for seconds,
   or for up to ten minutes when the turn-off failed. Incus's own round for cached images is hours apart, and what
   it would do in it is ask the same registry for the same digest with the address it keeps. Closing that at the

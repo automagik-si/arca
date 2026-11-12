@@ -90,8 +90,8 @@ pub struct Swept {
 pub struct ImageSweep {
     cfg: Arc<NodeConfig>,
     clock: crate::handlers::Clock,
-    /// When each image was first seen with no instance made from it.
-    unused_since: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// When each image was first seen with no instance made from it, on a clock that only goes forward.
+    unused_since: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Whether the last round failed: a failure is said once, not at every round.
     failing: std::sync::atomic::AtomicBool,
 }
@@ -108,6 +108,16 @@ impl ImageSweep {
 
     /// One round. On a node where no registry credential was ever set it asks Incus nothing.
     pub fn round(&self) -> Result<Swept, String> {
+        self.round_at(std::time::Instant::now())
+    }
+
+    /// [`Self::round`] at the moment `now` of the clock an orphan's age is counted on. That clock only goes
+    /// forward: a step of the wall clock neither deletes an orphan before its quarter of an hour nor keeps it past
+    /// it. The wall clock gives the lines their time and nothing else.
+    ///
+    /// A round goes on past an image it could not settle: one image Incus will not change does not leave the ones
+    /// after it with `auto_update` on. What failed is the round's error, said after every image was tried.
+    pub fn round_at(&self, now: std::time::Instant) -> Result<Swept, String> {
         let mut swept = Swept::default();
         if !ever_set(&self.cfg) {
             return Ok(swept);
@@ -118,12 +128,11 @@ impl ImageSweep {
             self.cfg.kernel.droidd_projects.iter().map(String::as_str),
         )?;
         let run = arca_incus::function_run::FunctionRun::new(self.cfg.incus.socket.clone(), family);
+        let at = (self.clock)();
         // Incus's words are never said whole: only that it did not do what was asked.
-        let said = |what: &str| format!("Incus did not {what}");
-        let now = (self.clock)();
         let images = run
             .fetched_with_credential(project)
-            .map_err(|_| said("list the images of the node's own project"))?;
+            .map_err(|_| "Incus did not list the images of the node's own project".to_string())?;
         let mut unused = self
             .unused_since
             .lock()
@@ -133,44 +142,54 @@ impl ImageSweep {
                 .iter()
                 .any(|image| image.fingerprint == *fingerprint && !image.used)
         });
+        let (mut left_on, mut left_there) = (0usize, 0usize);
         for image in &images {
             if image.auto_update {
-                run.auto_update_off(project, &image.fingerprint)
-                    .map_err(|_| {
-                        said("turn auto_update off on an image fetched with a credential")
-                    })?;
-                image_line(
-                    &self.cfg,
-                    now,
-                    project,
-                    &image.fingerprint,
-                    "autoUpdateOff",
-                    "sweep",
-                );
-                swept.turned_off.push(image.fingerprint.clone());
+                if run.auto_update_off(project, &image.fingerprint).is_ok() {
+                    image_line(
+                        &self.cfg,
+                        at,
+                        project,
+                        &image.fingerprint,
+                        "autoUpdateOff",
+                        "sweep",
+                    );
+                    swept.turned_off.push(image.fingerprint.clone());
+                } else {
+                    left_on += 1;
+                }
             }
             if image.used {
                 continue;
             }
             let since = *unused.entry(image.fingerprint.clone()).or_insert(now);
-            if now.saturating_sub(since) >= ORPHAN_AGE_MS
-                && run
-                    .drop_unused_image(project, &image.fingerprint)
-                    .map_err(|_| {
-                        said("delete an image fetched with a credential that nothing uses")
-                    })?
+            if now.saturating_duration_since(since)
+                < std::time::Duration::from_millis(ORPHAN_AGE_MS)
             {
-                image_line(
-                    &self.cfg,
-                    now,
-                    project,
-                    &image.fingerprint,
-                    "deleted",
-                    "sweep: no instance was made from it",
-                );
-                unused.remove(&image.fingerprint);
-                swept.deleted.push(image.fingerprint.clone());
+                continue;
             }
+            match run.drop_unused_image(project, &image.fingerprint) {
+                Ok(true) => {
+                    image_line(
+                        &self.cfg,
+                        at,
+                        project,
+                        &image.fingerprint,
+                        "deleted",
+                        "sweep: no instance was made from it",
+                    );
+                    unused.remove(&image.fingerprint);
+                    swept.deleted.push(image.fingerprint.clone());
+                }
+                Ok(false) => {}
+                Err(_) => left_there += 1,
+            }
+        }
+        if left_on + left_there > 0 {
+            return Err(format!(
+                "Incus did not turn auto_update off on {left_on} and did not delete {left_there} of the {} images fetched with a credential; every other one was settled",
+                images.len()
+            ));
         }
         Ok(swept)
     }

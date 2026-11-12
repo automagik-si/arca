@@ -358,7 +358,7 @@ impl ServiceHandler {
                     Ok(false) => {}
                     Err(_) => eprintln!(
                         "arca: the image {} was fetched with a registry's credential and could not be deleted after its last user was removed: Incus still holds that credential with it until the next sweep",
-                        &fingerprint[..fingerprint.len().min(12)]
+                        fingerprint.chars().take(12).collect::<String>()
                     ),
                 }
             }

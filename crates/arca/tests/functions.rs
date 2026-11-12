@@ -2032,8 +2032,10 @@ fn the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_o
         .expect("removed");
 
     // The first round turns auto_update off, and deletes nothing: the orphan was only just seen.
+    let first = Instant::now();
+    let age = Duration::from_millis(ORPHAN_AGE_MS);
     assert_eq!(
-        sweep.round(),
+        sweep.round_at(first),
         Ok(Swept {
             turned_off: vec![kept.clone()],
             deleted: vec![]
@@ -2041,13 +2043,17 @@ fn the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_o
     );
     assert_eq!(image(&kept).unwrap()["auto_update"], false);
     assert!(image(&orphan).is_some());
-    // A minute short of the age: still there. Past it: deleted.
-    rig.now.fetch_add(ORPHAN_AGE_MS - 60_000, Ordering::SeqCst);
-    assert_eq!(sweep.round(), Ok(Swept::default()));
-    assert!(image(&orphan).is_some());
-    rig.now.fetch_add(60_000, Ordering::SeqCst);
+    // The age is counted on a clock that only goes forward. The wall clock stepping ten ages ahead deletes
+    // nothing a minute short of the age; stepping back a day does not keep the orphan past it.
+    rig.now.fetch_add(10 * ORPHAN_AGE_MS, Ordering::SeqCst);
     assert_eq!(
-        sweep.round(),
+        sweep.round_at(first + age - Duration::from_secs(60)),
+        Ok(Swept::default())
+    );
+    assert!(image(&orphan).is_some());
+    rig.now.fetch_sub(24 * 60 * 60 * 1000, Ordering::SeqCst);
+    assert_eq!(
+        sweep.round_at(first + age),
         Ok(Swept {
             turned_off: vec![],
             deleted: vec![orphan.clone()]
@@ -2055,8 +2061,7 @@ fn the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_o
     );
     assert!(image(&orphan).is_none());
     // The image a stopped function was made from stays however long it has been: its next run is rebuilt from it.
-    rig.now.fetch_add(10 * ORPHAN_AGE_MS, Ordering::SeqCst);
-    assert_eq!(sweep.round(), Ok(Swept::default()));
+    assert_eq!(sweep.round_at(first + 10 * age), Ok(Swept::default()));
     assert!(image(&kept).is_some());
     assert_eq!(rig.run("relay")["root"], "store");
     // The two that are not the sweep's are as they were, auto_update and all.
@@ -2095,6 +2100,78 @@ fn the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_o
         .expect_err("Incus is not there");
     assert!(failed.starts_with("Incus did not "), "{failed}");
     assert_eq!(sweep.round(), Ok(Swept::default()));
+}
+
+/// A round of the sweep goes on past an image it cannot settle. Of three images fetched with a credential and left
+/// with `auto_update` on, the second cannot be changed, round after round: the first and the third are turned off
+/// all the same, and the round's error says how many were not.
+#[test]
+fn a_sweep_round_goes_on_past_an_image_that_incus_will_not_change() {
+    use arca::registry::{IMAGES_LOG, ImageSweep};
+    let rig = Rig::new();
+    rig.nats();
+    let ticking = Arc::clone(&rig.now);
+    let clock: Clock = Arc::new(move || ticking.load(Ordering::SeqCst));
+    let sweep = ImageSweep::new(Arc::clone(&rig.cfg), clock);
+    let word = ["pull", "only", "word", "7788"].join("-");
+    rig.call(
+        "registry_secret_set",
+        json!({ "server": "https://registry.example", "username": "puller", "password": word }),
+    )
+    .expect("set");
+    for name in ["one", "two", "three"] {
+        let mut args = relay_args();
+        args["name"] = json!(name);
+        args["image"] = json!(format!("registry.example/acme/{name}"));
+        rig.approved("function_create", args).expect("created");
+    }
+    // The three, in the order Incus lists them, each with auto_update turned back on by hand.
+    let listed: Vec<String> = rig
+        .get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+        .and_then(|images| images.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|image| {
+            image["update_source"]["server"]
+                .as_str()
+                .is_some_and(|address| address.contains('@'))
+        })
+        .map(|image| image["fingerprint"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(listed.len(), 3);
+    for fingerprint in &listed {
+        send(
+            &rig,
+            "PATCH",
+            &format!("/1.0/images/{fingerprint}?project={PROJECT}"),
+            &json!({ "auto_update": true }),
+        );
+    }
+    let on = |fingerprint: &str| {
+        rig.get(&format!("/1.0/images/{fingerprint}?project={PROJECT}"))
+            .expect("the image")["auto_update"]
+            .clone()
+    };
+    // From now on Incus refuses every change of the second.
+    rig.fake
+        .set_reject_patch(&format!("/1.0/images/{}", listed[1]));
+    for _ in 0..2 {
+        let failed = sweep.round().expect_err("one image was not settled");
+        assert!(
+            failed.starts_with(
+                "Incus did not turn auto_update off on 1 and did not delete 0 of the 3 images"
+            ),
+            "{failed}"
+        );
+        assert_eq!(
+            (on(&listed[0]), on(&listed[1]), on(&listed[2])),
+            (json!(false), json!(true), json!(false))
+        );
+    }
+    // One line for each image that was turned off, and none for the one that was not.
+    let log = fs::read_to_string(rig.dir.join(IMAGES_LOG)).expect("the log");
+    assert_eq!(log.lines().count(), 2, "{log}");
+    assert!(log.contains(&listed[0]) && log.contains(&listed[2]) && !log.contains(&listed[1]));
 }
 
 /// An edit made by an Incus operator, outside the kernel's writer.

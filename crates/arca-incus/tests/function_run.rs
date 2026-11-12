@@ -461,6 +461,46 @@ fn a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_
     ));
 }
 
+/// After a rebuild that was sent a credential, the turn-off is tried on every image fetched that way: one that
+/// Incus will not change does not leave the next one with `auto_update` on.
+#[test]
+fn the_turn_off_after_a_rebuild_goes_on_past_an_image_that_incus_will_not_change() {
+    let rig = Rig::new();
+    let never = || false;
+    let credential = arca_incus::RegistryCredential {
+        username: "puller".to_string(),
+        password: ["a", "word", "for", "pulls"].join("-"),
+    };
+    let server = "https://registry.example";
+    let alias = |name: &str| format!("acme/{name}@sha256:{}", "a".repeat(64));
+    let source = |name: &str| json!({ "type": "image", "mode": "pull", "protocol": "oci", "server": server, "alias": alias(name) });
+    // The fake names a fetched image by the address and the alias it was asked with.
+    let address = credential.address(server).expect("an address");
+    let first =
+        arca_kernel::canon::Digest::of(format!("{address}|{}", alias("first")).as_bytes()).to_hex();
+    // Incus refuses every change of the first image, from before it is fetched.
+    rig.fake.set_reject_patch(&format!("/1.0/images/{first}"));
+    let seen = rig.run.read(PROJECT, "relay").expect("a function");
+    let state = |rig: &Rig| -> Vec<(bool, bool)> {
+        rig.run
+            .fetched_with_credential(PROJECT)
+            .expect("listed")
+            .iter()
+            .map(|image| (image.fingerprint == first, image.auto_update))
+            .collect()
+    };
+    for name in ["first", "second"] {
+        assert_eq!(
+            rig.run
+                .fresh_root(&seen, None, &source(name), Some(&credential), &never)
+                .expect("rebuilt"),
+            FreshRoot::Registry
+        );
+    }
+    // The first is listed before the second and is still on; the second was turned off all the same.
+    assert_eq!(state(&rig), [(true, true), (false, false)]);
+}
+
 #[test]
 fn a_function_outside_the_family_or_recreated_is_refused() {
     let rig = Rig::new();

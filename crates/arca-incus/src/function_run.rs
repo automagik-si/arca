@@ -206,17 +206,20 @@ impl FunctionRun {
     /// It is turned off on every such image of the project, so Incus does not go back to the registry with that
     /// address by itself. A failure is said on the log: the periodic sweep tries again.
     fn fetched_images_stay_put(&self, rebuilt: &InstanceState) {
+        // Every one of them is tried: one that Incus will not change does not leave the others on.
         let settled = self
             .fetched_with_credential(&rebuilt.project)
-            .and_then(|images| {
+            .map(|images| {
                 images
                     .iter()
                     .filter(|image| image.auto_update)
-                    .try_for_each(|image| {
+                    .filter(|image| {
                         self.auto_update_off(&rebuilt.project, &image.fingerprint)
+                            .is_err()
                     })
+                    .count()
             });
-        if settled.is_err() {
+        if settled != Ok(0) {
             eprintln!(
                 "arca: auto_update could not be turned off on the image {} was rebuilt from: Incus may ask its registry again by itself until the next sweep",
                 rebuilt.name
