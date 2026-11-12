@@ -64,6 +64,13 @@ struct State {
     seen: Vec<(String, String)>,
     /// Requests that were not the token check.
     other: Vec<String>,
+    /// Whether GitLab keeps every token check without an answer: a signal sent meanwhile finds the controller's curl
+    /// running. `held` counts the checks that came to wait, `passed` the ones let go.
+    hold: bool,
+    held: usize,
+    passed: usize,
+    /// A check was kept so long that it was answered without the test's word: the test was too slow, not the pool.
+    hold_ran_out: bool,
 }
 
 struct Gitlab {
@@ -101,6 +108,57 @@ impl Gitlab {
     fn seen(&self) -> Vec<(String, String)> {
         self.state.lock().expect("the state").seen.clone()
     }
+
+    /// How many token checks have come to wait for the test's word.
+    fn held(&self) -> usize {
+        self.state.lock().expect("the state").held
+    }
+
+    /// Lets every check that waits now have its answer; the ones that come later wait again.
+    fn let_go(&self) {
+        self.change(|state| state.passed = state.held);
+    }
+
+    /// Keeps no check any longer.
+    fn release(&self) {
+        self.change(|state| {
+            assert!(
+                !state.hold_ran_out,
+                "a token check was held for {HOLD_SECONDS} seconds before the test went on: this test was too slow, \
+                 the pool was not"
+            );
+            state.hold = false;
+        });
+    }
+}
+
+/// The seconds a token check is kept at most: less than the thirty the controller's curl gives an answer.
+const HOLD_SECONDS: u64 = 25;
+
+/// Keeps a token check the test wants kept until the test lets it go, and not for ever.
+fn hold(state: &Mutex<State>) {
+    let deadline = Instant::now() + Duration::from_secs(HOLD_SECONDS);
+    let mut place = None;
+    loop {
+        {
+            let mut state = state.lock().expect("the state");
+            if !state.hold {
+                return;
+            }
+            if place.is_none() {
+                state.held += 1;
+                place = Some(state.held);
+            }
+            if place.is_some_and(|place| place <= state.passed) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                state.hold_ran_out = true;
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn serve(mut stream: TcpStream, state: &Mutex<State>) {
@@ -135,6 +193,9 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
         // Longer than the controller waits in these tests, and not for ever.
         std::thread::sleep(Duration::from_secs(4));
         return;
+    }
+    if request == "POST /api/v4/runners/verify HTTP/1.1" {
+        hold(state);
     }
     let (code, answer) = {
         let mut state = state.lock().expect("the state");
@@ -588,8 +649,20 @@ impl Pool {
 
     /// Stops the controller as systemd does, with SIGTERM, and returns its exit code.
     fn stop(&mut self) -> Option<i32> {
+        self.child.as_ref()?;
+        let sent = self.term();
+        self.stopped(sent)
+    }
+
+    /// Sends the controller SIGTERM, as systemd does, and says whether it was sent.
+    fn term(&self) -> bool {
+        let child = self.child.as_ref().expect("a controller that runs");
+        signal("TERM", i64::from(child.id()))
+    }
+
+    /// Waits for a controller that was sent SIGTERM, and returns its exit code.
+    fn stopped(&mut self, sent: bool) -> Option<i32> {
         let mut child = self.child.take()?;
-        let sent = signal("TERM", i64::from(child.id()));
         let deadline = Instant::now() + Duration::from_secs(STOP_SECONDS);
         let code = loop {
             if let Some(status) = child.try_wait().expect("the controller's status") {
@@ -2179,4 +2252,171 @@ fn a_first_boot_names_the_commands_that_are_missing_on_the_console() {
         )
     );
     let _ = fs::remove_dir_all(scratch);
+}
+
+/// A pool whose pauses after a refusal are five minutes, as the shipped ones are: a controller that does not obey a stop
+/// then passes the bound `stop` gives it, and one that obeys is not slowed.
+fn long_pauses(pool: &mut Pool) {
+    for name in ["POOL_BACKOFF_MAX", "POOL_REFUSE_EVERY"] {
+        pool.env.push((name, "300".into()));
+    }
+}
+
+/// A stop sent while the controller pauses ends the pause, and the controller then begins nothing: no image is pulled
+/// again, the tailnet node is not asked again and GitLab is not asked again. Every loop that pauses is stopped here,
+/// in its pause.
+#[test]
+fn a_stop_during_a_pause_ends_it_and_nothing_is_begun_after() {
+    let good = token("pause");
+    let gitlab = Gitlab::start(std::slice::from_ref(&good));
+
+    // Jobs that do not fit the machine: the reason is told again every five minutes.
+    let mut large = settings(one_runner(), 8);
+    large["jobCpu"] = json!(4);
+    large["jobMemory"] = json!("8GiB");
+    let mut pool = Pool::new(&large, REPORTED_32GIB);
+    long_pauses(&mut pool);
+    pool.secret("GITLAB_RUNNER_TOKEN_1", &good);
+    pool.start(&gitlab.url);
+    wait_for_words(
+        &pool,
+        "arca-gitlab-pool: the pool does not start: its jobs could take ",
+    );
+    assert_eq!(pool.stop(), Some(1));
+    drop(pool);
+
+    // A registration without its secret: it looks again every five seconds.
+    let mut pool = Pool::new(&settings(one_runner(), 4), REPORTED_32GIB);
+    pool.start(&gitlab.url);
+    wait_for_words(&pool, "arca-gitlab-pool: waiting for secrets: ");
+    assert_eq!(pool.stop(), Some(0));
+    assert!(pool.read("docker/calls.log").is_empty() && gitlab.seen().is_empty());
+    drop(pool);
+
+    // An image that cannot be pulled: thirty seconds, and no pull after the stop.
+    let mut pool = Pool::new(&settings(one_runner(), 4), REPORTED_32GIB);
+    pool.secret("GITLAB_RUNNER_TOKEN_1", &good);
+    fs::write(pool.dir.join("docker/no-images"), "").expect("no images");
+    pool.start(&gitlab.url);
+    wait_for_words(&pool, " could not be pulled; trying again in 30 seconds\n");
+    let calls = pool.read("docker/calls.log");
+    assert_eq!(pool.stop(), Some(0));
+    assert_eq!(pool.read("docker/calls.log"), calls);
+    assert!(gitlab.seen().is_empty());
+    drop(pool);
+
+    // A tailnet that does not show the node the settings name: the node is looked for again after a pause, and not
+    // after a stop.
+    let mut on_tailnet = settings(one_runner(), 4);
+    on_tailnet["reach"] = json!("tailnet");
+    on_tailnet["gitlabNode"] = json!("gitlab-vm");
+    let mut pool = Pool::new(&on_tailnet, REPORTED_32GIB);
+    long_pauses(&mut pool);
+    pool.secret("GITLAB_RUNNER_TOKEN_1", &good);
+    pool.secret("TAILSCALE_AUTHKEY", KEY);
+    fs::write(
+        pool.dir.join("docker/tailnet-status.json"),
+        tailnet_status(&[DATABASE]),
+    )
+    .expect("the node's state");
+    pool.start(&gitlab.url);
+    wait_for_words(&pool, ". Looking again in 5 seconds\n");
+    let calls = pool.read("docker/calls.log");
+    assert_eq!(pool.stop(), Some(0));
+    assert_eq!(pool.read("docker/calls.log"), calls);
+    assert!(gitlab.seen().is_empty());
+    drop(pool);
+
+    // A token GitLab does not take: it is asked again after a pause, and not after a stop.
+    let mut pool = Pool::new(&settings(one_runner(), 4), REPORTED_32GIB);
+    long_pauses(&mut pool);
+    pool.secret("GITLAB_RUNNER_TOKEN_1", &token("stale"));
+    pool.start(&gitlab.url);
+    wait_for_words(&pool, "Asking again in 5 seconds\n");
+    let asked = gitlab.seen().len();
+    assert_eq!(pool.stop(), Some(0));
+    assert_eq!(gitlab.seen().len(), asked);
+    drop(pool);
+
+    // The pool at work, five minutes from its next pass.
+    let mut pool = Pool::new(&settings(one_runner(), 4), REPORTED_32GIB);
+    pool.env.push(("POOL_TICK", "300".into()));
+    pool.secret("GITLAB_RUNNER_TOKEN_1", &good);
+    pool.start(&gitlab.url);
+    wait_for_runner(&pool, &[RUNNER]);
+    wait_for(&pool, "the first status", || !totals(&pool).is_empty());
+    assert_eq!(pool.stop(), Some(0));
+    assert!(pool.output().ends_with("arca-gitlab-pool: stopped\n"));
+}
+
+/// A stop sent while the controller waits for GitLab's answer is read when the answer is there, and the pause that
+/// would follow is not begun. GitLab keeps the check until the signal has been sent, so the signal finds the
+/// controller's curl running.
+#[test]
+fn a_stop_while_gitlab_is_asked_is_obeyed_when_the_answer_comes_and_no_pause_follows() {
+    let good = token("asked");
+
+    // Three registrations: GitLab is asked about each token in turn, and each answer may take as long as GitLab is
+    // given. A stop that comes during the first is read before the second is asked.
+    let three = settings(
+        json!([{ "name": "build" }, { "name": "test" }, { "name": "docs" }]),
+        3,
+    );
+    let secrets = |pool: &Pool, value: &str| {
+        for place in 1..=3 {
+            pool.secret(&format!("GITLAB_RUNNER_TOKEN_{place}"), value);
+        }
+    };
+
+    // Before the start: tokens GitLab does not take. Nobody waits to be told "asking again" now, so it is not said.
+    let gitlab = Gitlab::start(std::slice::from_ref(&good));
+    gitlab.change(|state| state.hold = true);
+    let mut pool = Pool::new(&three, REPORTED_32GIB);
+    long_pauses(&mut pool);
+    secrets(&pool, &token("stale"));
+    pool.start(&gitlab.url);
+    wait_for(&pool, "the token check on its way", || gitlab.held() == 1);
+    let sent = pool.term();
+    gitlab.release();
+    assert_eq!(pool.stopped(sent), Some(0));
+    let output = pool.output();
+    assert!(
+        !output.contains("Asking again") && !output.contains("Trying again"),
+        "{output}"
+    );
+    assert_eq!(gitlab.seen().len(), 1);
+    assert_eq!(pool.containers(), Vec::<String>::new());
+    drop(pool);
+
+    // The pool at work: a pass that asks GitLab about the tokens again, and five minutes until the next pass. The
+    // checks of the start are let through; the first one after GitLab Runner is started is the pass's.
+    let gitlab = Gitlab::start(std::slice::from_ref(&good));
+    gitlab.change(|state| state.hold = true);
+    let mut pool = Pool::new(&three, REPORTED_32GIB);
+    pool.env.push(("POOL_TICK", "300".into()));
+    pool.env.push(("POOL_VERIFY_EVERY", "0".into()));
+    secrets(&pool, &good);
+    pool.start(&gitlab.url);
+    let mut start = 0;
+    wait_for(&pool, "the start", || {
+        // Counted before the output is read: a check counted here came before whatever the output lacks.
+        let held = gitlab.held();
+        if pool.output().contains("; starting GitLab Runner\n") {
+            return true;
+        }
+        start = held;
+        gitlab.let_go();
+        false
+    });
+    wait_for(&pool, "the pass that asks GitLab again", || {
+        gitlab.held() > start
+    });
+    let sent = pool.term();
+    gitlab.release();
+    assert_eq!(pool.stopped(sent), Some(0));
+    let output = pool.output();
+    assert!(output.ends_with("arca-gitlab-pool: stopped\n"), "{output}");
+    // The pass asked about one token and no more, and a check cut short is no failure of GitLab's.
+    assert_eq!(gitlab.seen().len(), start + 1);
+    assert!(!output.contains("WARNING: "), "{output}");
 }

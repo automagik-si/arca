@@ -86,10 +86,19 @@ POOL_PACKAGES='docker.io docker-cli curl jq ca-certificates coreutils libc-bin h
 
 say() { printf 'arca-gitlab-pool: %s\n' "$*"; }
 now() { date +%s; }
-# A pause a signal can end at once.
+# A pause a stop ends at once, wherever the signal lands. bash runs a trap only between two commands, so a signal that
+# comes while a command runs is read after it: the pause that follows is then not begun. One that comes while the pause
+# is being started, or while it runs, ends it: the trap calls wake. Without both, a signal that came during a command
+# was followed by the whole pause, five minutes of it where GitLab or the machine refuses the pool.
+NAP=''
+wake() { [ -z "$NAP" ] || kill "$NAP" 2>/dev/null; }
 nap() {
+  [ -z "${STOP-}" ] || return 0
   sleep "$1" &
-  wait $! 2>/dev/null
+  NAP=$!
+  [ -z "${STOP-}" ] || wake
+  wait "$NAP" 2>/dev/null
+  NAP=''
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -658,6 +667,9 @@ check_token() {
 check_tokens() {
   local i verdict
   for i in "${!R_NAME[@]}"; do
+    # A stop is read between two registrations: each check may take as long as GitLab is given to answer, and twelve
+    # of them are more than a stop is given.
+    [ -z "$STOP" ] || return 2
     check_token $((i + 1))
     verdict=$?
     [ "$verdict" != 2 ] || return 2
@@ -753,6 +765,7 @@ prepare_images() {
       [ -z "$STOP" ] || return 1
       say "the image $image could not be pulled; trying again in 30 seconds"
       nap 30
+      [ -z "$STOP" ] || return 1
     done
   done
 }
@@ -873,6 +886,7 @@ tailnet_wait() {
   local waited backend state status pause=0
   while [ -z "$STOP" ]; do
     if ! tailnet_start; then
+      [ -z "$STOP" ] || return 1
       say "the tailnet node could not be started; trying again in 30 seconds"
       nap 30
       continue
@@ -901,6 +915,7 @@ tailnet_wait() {
         [ "$pause" -gt "$POOL_BACKOFF_MAX" ] && pause=$POOL_BACKOFF_MAX
         say "$LOCATE_WORDS. Looking again in $pause seconds"
         nap "$pause"
+        [ -z "$STOP" ] || return 1
         state=$(container_state "$TAILNET")
         [ "${state%% *}" = true ] || break
         status=$(tailnet_cli status --json)
@@ -1064,7 +1079,7 @@ hold() {
 
 run_pool() {
   STOP=''
-  trap 'STOP=1' TERM INT
+  trap 'STOP=1; wake' TERM INT
   load_settings || {
     say "the pool does not start until its settings are right: they were fixed when the machine was created, so create the pool again with the right ones"
     while [ -z "$STOP" ]; do nap 300; done
@@ -1107,6 +1122,8 @@ run_pool() {
   [ -z "$unused" ] || say "set and not used, since runners has ${#R_NAME[@]} entries: $unused"
 
   prepare_images || return 0
+  # A stop is read after every wait and every pause, before anything else is begun.
+  [ -z "$STOP" ] || return 0
   clean_leftovers
   if [ "$REACH" = tailnet ]; then
     tailnet_wait || return 0
@@ -1119,6 +1136,7 @@ run_pool() {
     secrets=$(secrets_tag)
     check_tokens
     verdict=$?
+    [ -z "$STOP" ] || return 0
     if [ "$verdict" = 0 ] && [ "$(accepted)" -gt 0 ]; then break; fi
     pause=$((pause == 0 ? 5 : pause * 2))
     [ "$pause" -gt "$POOL_BACKOFF_MAX" ] && pause=$POOL_BACKOFF_MAX
@@ -1175,6 +1193,8 @@ run_pool() {
         [ -z "$GITLAB_NOTE" ] || say "GitLab answers again"
         GITLAB_NOTE=''
       else
+        # Cut short by a stop, or failed while one came: nothing is said about GitLab, and the pool stops.
+        [ -z "$STOP" ] || break
         next_check=$((at + POOL_RECHECK))
         note="WARNING: $CHECK_WORDS. The registrations stay as they were, and GitLab is asked again"
         [ "$note" = "$GITLAB_NOTE" ] || {

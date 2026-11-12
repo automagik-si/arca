@@ -85,6 +85,8 @@ struct Seen {
     path: String,
     authorization: String,
     body: String,
+    /// When the request came.
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -116,6 +118,13 @@ struct State {
     repo_public: bool,
     /// Whether a runner group is answered without its `default` field, as no real GitHub does.
     group_without_default: bool,
+    /// The end of the path of the requests GitHub keeps without an answer, when it keeps any: a signal sent meanwhile
+    /// finds the controller's curl running. `held` counts the requests that came to wait, `passed` the ones let go.
+    hold: Option<&'static str>,
+    held: usize,
+    passed: usize,
+    /// A request was kept so long that it was answered without the test's word: the test was too slow, not the pool.
+    hold_ran_out: bool,
 }
 
 struct Github {
@@ -175,6 +184,28 @@ impl Github {
             name: name.to_string(),
             seconds,
         });
+    }
+
+    /// How many requests have come to wait for the test's word.
+    fn held(&self) -> usize {
+        self.state().held
+    }
+
+    /// Lets every request that waits now have its answer; the ones that come later wait again.
+    fn let_go(&self) {
+        let mut state = self.state();
+        state.passed = state.held;
+    }
+
+    /// Keeps no request any longer.
+    fn release(&self) {
+        let mut state = self.state();
+        assert!(
+            !state.hold_ran_out,
+            "a request was held for {HOLD_SECONDS} seconds before the test went on: this test was too slow, the pool \
+             was not"
+        );
+        state.hold = None;
     }
 
     /// The runners that are registered, connected and still waiting for or running their job.
@@ -402,6 +433,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, scratch: &Path) {
         }
     }
     let body = String::from_utf8_lossy(&body).into_owned();
+    hold(state, &path);
     let (code, answer) = answer(state, scratch, &method, &path, &authorization, &body);
     let text = answer.map(|value| value.to_string()).unwrap_or_default();
     let _ = write!(
@@ -409,6 +441,35 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, scratch: &Path) {
         "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
         text.len()
     );
+}
+
+/// The seconds a request is kept at most: less than the thirty the controller's curl gives an answer.
+const HOLD_SECONDS: u64 = 25;
+
+/// Keeps a request the test wants kept until the test lets it go, and not for ever.
+fn hold(state: &Mutex<State>, path: &str) {
+    let deadline = Instant::now() + Duration::from_secs(HOLD_SECONDS);
+    let mut place = None;
+    loop {
+        {
+            let mut state = state.lock().expect("state");
+            if !state.hold.is_some_and(|end| path.ends_with(end)) {
+                return;
+            }
+            if place.is_none() {
+                state.held += 1;
+                place = Some(state.held);
+            }
+            if place.is_some_and(|place| place <= state.passed) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                state.hold_ran_out = true;
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn message(code: u16, text: &str) -> (u16, Option<Value>) {
@@ -529,6 +590,7 @@ fn answer(
             path: path.to_string(),
             authorization: authorization.to_string(),
             body: body.to_string(),
+            at: Instant::now(),
         });
     }
     let scope = state.lock().expect("state").scope.clone();
@@ -927,8 +989,20 @@ impl Pool {
 
     /// Stops the controller as systemd does, with SIGTERM, and returns its exit code.
     fn stop(&mut self) -> Option<i32> {
+        self.child.as_ref()?;
+        let sent = self.term();
+        self.stopped(sent)
+    }
+
+    /// Sends the controller SIGTERM, as systemd does, and says whether it was sent.
+    fn term(&self) -> bool {
+        let child = self.child.as_ref().expect("a controller that runs");
+        signal("TERM", i64::from(child.id()))
+    }
+
+    /// Waits for a controller that was sent SIGTERM, and returns its exit code.
+    fn stopped(&mut self, sent: bool) -> Option<i32> {
         let mut child = self.child.take()?;
-        let sent = signal("TERM", i64::from(child.id()));
         let deadline = Instant::now() + Duration::from_secs(STOP_SECONDS);
         let code = loop {
             if let Some(status) = child.try_wait().expect("the controller's status") {
@@ -1638,10 +1712,6 @@ fn failures_are_counted_said_without_the_credential_and_paused_and_leftovers_are
     wait_for(&pool, "the refusal of the wrong key", || {
         pool.output().contains("GitHub sign-in failed: the App is not installed on https://github.com/example-org/example-repo, or its client ID or key is wrong: GitHub answered 401 (A JSON web token could not be decoded). Trying again in 1 seconds")
     });
-    // The pause holds: within the next half second GitHub is not asked again.
-    let asked = github.state().seen.len();
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(github.state().seen.len(), asked);
     assert!(github.registrations().is_empty());
 
     // The right key, on one line. It is what service_secret_set and the next instance_start would write.
@@ -1652,6 +1722,26 @@ fn failures_are_counted_said_without_the_credential_and_paused_and_leftovers_are
     wait_for(&pool, "a registered runner", || github.live().len() == 1);
     {
         let state = github.state();
+        // The pause held: after each refusal the pool said one second, and it asked for its installation again no
+        // sooner than that. It is read from when the requests came, so a slow machine cannot make it false: this was
+        // once "not asked again within half a second", which a test that was kept waiting itself could fail.
+        let refused = pool
+            .output()
+            .matches("GitHub sign-in failed: the App is not installed")
+            .count();
+        let asked: Vec<Instant> = state
+            .seen
+            .iter()
+            .filter(|seen| seen.path.ends_with("/installation"))
+            .map(|seen| seen.at)
+            .collect();
+        assert!(refused >= 1 && asked.len() > refused, "{refused} {asked:?}");
+        assert!(
+            asked[..=refused]
+                .windows(2)
+                .all(|pair| pair[1].duration_since(pair[0]) >= Duration::from_secs(1)),
+            "{refused} {asked:?}"
+        );
         let stale = |id: u64| {
             state
                 .runners
@@ -2545,6 +2635,296 @@ fn a_running_job_is_shown_as_busy_and_is_timed_from_when_it_began() {
             .read("docker/calls.log")
             .lines()
             .any(|call| call.starts_with("top "))
+    );
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// A pool whose pauses after a refusal are five minutes, as the shipped ones are: a controller that does not obey a stop
+/// then passes the bound `stop` gives it, and one that obeys is not slowed.
+fn long_pauses(pool: &mut Pool) {
+    for name in ["POOL_BACKOFF_MAX", "POOL_REFUSE_EVERY"] {
+        pool.env.push((name, "300".to_string()));
+    }
+}
+
+/// A private key that is nobody's App's: GitHub refuses what it signs.
+fn another_key(scratch: &Path) -> String {
+    let other = scratch.join("other.pem");
+    run_ok(
+        Command::new("openssl")
+            .args(["genrsa", "-out"])
+            .arg(&other)
+            .arg("2048"),
+    );
+    fs::read_to_string(&other).expect("the other key")
+}
+
+/// A pool signed in as the App, whose installation token is used once: the controller asks for its installation again
+/// every time it needs a token, and GitHub keeps each of those requests until the test lets it go. The start is let
+/// through; what comes back is a controller whose second sign-in, the one before the runner group is read, waits.
+fn pool_whose_second_sign_in_waits(github: &Github) -> Pool {
+    let key = github.app_key();
+    github.state().hold = Some("/installation");
+    let mut pool = Pool::new(
+        &settings(json!([small(1)]), 1, &format!("https://github.com/{ORG}")),
+        64 * GIB,
+        60 * GIB,
+    );
+    long_pauses(&mut pool);
+    pool.env.push(("POOL_TOKEN_TTL", "0".to_string()));
+    pool.secret("GITHUB_APP_CLIENT_ID", CLIENT_ID);
+    pool.secret("GITHUB_APP_PRIVATE_KEY", &key);
+    pool.start(github);
+    wait_for(&pool, "the first sign-in", || github.held() == 1);
+    github.let_go();
+    wait_for(&pool, "the sign-in before the runner group", || {
+        github.held() == 2
+    });
+    // GitHub takes the App's key no longer: this sign-in fails.
+    github.state().public_key = None;
+    pool
+}
+
+/// A stop sent while the controller pauses ends the pause, and the controller then begins nothing: GitHub is not asked
+/// again and no image is pulled again. Every loop of the start that pauses is stopped here, in its pause.
+#[test]
+fn a_stop_during_a_pause_of_the_start_ends_it_and_nothing_is_begun_after() {
+    let scratch = scratch_dir();
+    let good = settings(json!([small(1)]), 1, &format!("https://github.com/{ORG}"));
+
+    // Settings that cannot be used: the controller stays up five minutes at a time, to keep the reason on the console.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut bad = good.clone();
+    bad["url"] = json!("github.com/example-org");
+    let mut pool = Pool::new(&bad, 64 * GIB, 60 * GIB);
+    pool.start(&github);
+    wait_for(&pool, "the settings refused", || {
+        pool.output()
+            .contains("the pool does not start until its settings are right")
+    });
+    assert_eq!(pool.stop(), Some(1));
+    drop(pool);
+
+    // No credential yet: it looks again every five seconds.
+    let mut pool = Pool::new(&good, 64 * GIB, 60 * GIB);
+    pool.start(&github);
+    wait_for(&pool, "the wait for a credential", || {
+        pool.output().contains("waiting for a credential")
+    });
+    assert_eq!(pool.stop(), Some(0));
+    assert!(github.state().seen.is_empty());
+    drop(pool);
+
+    // An image that cannot be pulled: thirty seconds, and no pull after the stop.
+    let mut pool = one_slot_pool(&github, |_| {});
+    fs::write(pool.dir.join("docker/no-images"), "").expect("no images");
+    pool.start(&github);
+    wait_for(&pool, "the pull that failed", || {
+        pool.output()
+            .contains("could not be pulled; trying again in 30 seconds")
+    });
+    let calls = pool.read("docker/calls.log");
+    assert_eq!(pool.stop(), Some(0));
+    assert_eq!(pool.read("docker/calls.log"), calls);
+    assert!(github.state().seen.is_empty());
+    drop(pool);
+
+    // A sign-in GitHub refuses: the pool pauses, and after the stop it does not sign in once more.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.app_key();
+    let mut pool = Pool::new(&good, 64 * GIB, 60 * GIB);
+    long_pauses(&mut pool);
+    pool.secret("GITHUB_APP_CLIENT_ID", CLIENT_ID);
+    pool.secret("GITHUB_APP_PRIVATE_KEY", &another_key(&scratch));
+    pool.start(&github);
+    wait_for(&pool, "the sign-in refused", || {
+        pool.output().contains("Trying again in 5 seconds")
+    });
+    let asked = github.state().seen.len();
+    assert_eq!(pool.stop(), Some(0));
+    assert_eq!(github.state().seen.len(), asked);
+    drop(pool);
+
+    // A runner group the pool refuses: told again every five minutes.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |settings| settings["runnerGroupId"] = json!(1));
+    long_pauses(&mut pool);
+    pool.start(&github);
+    wait_for(&pool, "the group refused", || {
+        pool.output()
+            .contains("the pool does not start on the organisation's default runner group")
+    });
+    let asked = github.state().seen.len();
+    assert_eq!(pool.stop(), Some(0));
+    assert_eq!(github.state().seen.len(), asked);
+    drop(pool);
+
+    // A sign-in that fails once the pool had signed in, before the runner group is read: five minutes.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = pool_whose_second_sign_in_waits(&github);
+    github.let_go();
+    wait_for(&pool, "the second sign-in refused", || {
+        pool.output().contains("Trying again in 300 seconds")
+    });
+    let asked = github.state().seen.len();
+    assert_eq!(pool.stop(), Some(0));
+    assert_eq!(github.state().seen.len(), asked);
+    github.release();
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// A stop sent while the controller waits for GitHub's answer is read when the answer is there, and the pause that
+/// would follow is not begun: a pool that paused its five minutes then, as it once did, passes the bound of the stop.
+/// GitHub keeps the request until the signal has been sent, so the signal finds the controller's curl running.
+#[test]
+fn a_stop_while_github_is_asked_is_obeyed_when_the_answer_comes_and_no_pause_follows() {
+    let scratch = scratch_dir();
+    let good = settings(json!([small(1)]), 1, &format!("https://github.com/{ORG}"));
+
+    // The first sign-in, which GitHub refuses.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.app_key();
+    github.state().hold = Some("/installation");
+    let mut pool = Pool::new(&good, 64 * GIB, 60 * GIB);
+    long_pauses(&mut pool);
+    pool.secret("GITHUB_APP_CLIENT_ID", CLIENT_ID);
+    pool.secret("GITHUB_APP_PRIVATE_KEY", &another_key(&scratch));
+    pool.start(&github);
+    wait_for(&pool, "the sign-in on its way", || github.held() == 1);
+    let sent = pool.term();
+    github.release();
+    assert_eq!(pool.stopped(sent), Some(0));
+    assert!(!pool.output().contains("Trying again"), "{}", pool.output());
+    assert_eq!(github.state().seen.len(), 1);
+    drop(pool);
+
+    // The runner group, which the pool refuses: the refusal is not told, since nobody waits for it now.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().hold = Some("/runner-groups/1");
+    let mut pool = one_slot_pool(&github, |settings| settings["runnerGroupId"] = json!(1));
+    long_pauses(&mut pool);
+    pool.start(&github);
+    wait_for(&pool, "the runner group asked for", || github.held() == 1);
+    let sent = pool.term();
+    github.release();
+    assert_eq!(pool.stopped(sent), Some(0));
+    assert!(
+        !pool.output().contains("the pool does not start on"),
+        "{}",
+        pool.output()
+    );
+    assert!(github.registrations().is_empty());
+    drop(pool);
+
+    // The sign-in before the runner group is read, which fails.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = pool_whose_second_sign_in_waits(&github);
+    let sent = pool.term();
+    github.release();
+    assert_eq!(pool.stopped(sent), Some(0));
+    assert!(!pool.output().contains("Trying again"), "{}", pool.output());
+    drop(pool);
+
+    // The pool at work: a pass that reads the runner group again, and five minutes until the next pass. The requests
+    // of the start are let through one by one; the first one after the pool says it registers runners is the pass's.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().hold = Some("/runner-groups/7");
+    let mut pool = one_slot_pool(&github, |_| {});
+    pool.env.push(("POOL_TICK", "300".to_string()));
+    pool.env.push(("POOL_GROUP_EVERY", "0".to_string()));
+    pool.start(&github);
+    let mut start = 0;
+    wait_for(&pool, "the start", || {
+        // Counted before the output is read: a request counted here came before whatever the output lacks.
+        let held = github.held();
+        if pool.output().contains("registering runners in") {
+            return true;
+        }
+        start = held;
+        github.let_go();
+        false
+    });
+    wait_for(&pool, "the pass that reads the runner group", || {
+        github.held() > start
+    });
+    let sent = pool.term();
+    github.release();
+    assert_eq!(pool.stopped(sent), Some(0));
+    assert!(pool.output().ends_with("arca-runner-pool: stopped\n"));
+    assert_eq!(pool.containers(), Vec::<String>::new());
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// A slot that pauses between two looks at its runner obeys the stop as the controller does: its runner is taken off
+/// GitHub and its containers are removed, though the next look was five minutes away.
+#[test]
+fn a_stop_ends_the_pause_of_the_pool_at_work_and_of_its_slots() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |_| {});
+    pool.env.push(("POOL_TICK", "300".to_string()));
+    pool.env.push(("POOL_POLL", "300".to_string()));
+    pool.start(&github);
+    wait_for(&pool, "an idle runner", || github.live().len() == 1);
+    wait_for(&pool, "the slot shown as idle", || {
+        pool.read("run/slots/0").starts_with("idle\t")
+    });
+    assert_eq!(pool.stop(), Some(0));
+    assert!(pool.output().ends_with("arca-runner-pool: stopped\n"));
+    assert_eq!(pool.containers(), Vec::<String>::new());
+    assert!(github.live().is_empty());
+    assert!(github.state().runners.iter().all(|runner| runner.deleted));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// A stop that comes in a pass before the slots are looked at starts none: no runner is registered on GitHub and no
+/// container is started, where a slot was once begun and then told to stop. The pass's look at the backoff file, which
+/// comes before the slots, is kept by a stand-in `cat` until the signal has been sent.
+#[test]
+fn a_stop_that_comes_before_the_slots_are_looked_at_starts_none() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |_| {});
+    let (hold, held, ran_out) = (
+        pool.dir.join("cat-hold"),
+        pool.dir.join("cat-held"),
+        pool.dir.join("cat-ran-out"),
+    );
+    fs::write(&hold, "").expect("the hold");
+    // At most 25 seconds, and said when it ran out: the test was too slow then, not the pool.
+    executable(
+        &pool.dir.join("bin/cat"),
+        &format!(
+            "#!/bin/sh\ncase \"${{1-}}\" in */backoff-until)\n  if [ -e '{0}' ]; then\n    : >'{1}'\n    n=0\n    \
+             while [ -e '{0}' ]; do\n      [ \"$n\" -lt 500 ] || {{ : >'{2}'; break; }}\n      sleep 0.05\n      \
+             n=$((n + 1))\n    done\n  fi\n  ;;\nesac\nexec '{3}' \"$@\"\n",
+            hold.display(),
+            held.display(),
+            ran_out.display(),
+            which("cat").display()
+        ),
+    );
+    pool.start(&github);
+    wait_for(&pool, "the pass's look at the backoff file", || {
+        held.exists()
+    });
+    let sent = pool.term();
+    fs::remove_file(&hold).expect("the hold");
+    assert_eq!(pool.stopped(sent), Some(0));
+    assert!(
+        !ran_out.exists(),
+        "the look at the backoff file was held for 25 seconds before the test went on: this test was too slow, the \
+         pool was not"
+    );
+    assert!(pool.output().ends_with("arca-runner-pool: stopped\n"));
+    assert!(github.registrations().is_empty());
+    assert!(
+        !pool
+            .read("docker/calls.log")
+            .lines()
+            .any(|call| call.starts_with("run ")),
+        "{}",
+        pool.read("docker/calls.log")
     );
     let _ = fs::remove_dir_all(scratch);
 }
