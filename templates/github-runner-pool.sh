@@ -1164,7 +1164,7 @@ run_pool() {
 
   PIDS=()
   WAIT=()
-  local slot live reserved pending available next=0 n last_status=0 until_at at
+  local slot live reserved pending available next=0 first n last_status=0 until_at at
   while [ -z "$STOP" ]; do
     live=0
     reserved=0
@@ -1187,11 +1187,14 @@ run_pool() {
     pending=0
     # Admission. A slot starts only while there is a place under the cap and memory for its whole size: memory that
     # no other slot has reserved, and memory the machine has free now. CPU is not reserved. The search starts after
-    # the slot admitted last, so every class gets its turn.
+    # the slot admitted last, so every class gets its turn. Where it starts is read once for the pass and every slot
+    # is looked at once: a pass that moved its start while it walked left slots out, and gave a place a job had freed
+    # back to the slot that had just ended, past one that waited.
+    first=$next
     for ((n = 0; n < SLOTS; n++)); do
       # No slot is begun once the controller is told to stop.
       [ -z "$STOP" ] || break
-      slot=$(((next + n) % SLOTS))
+      slot=$(((first + n) % SLOTS))
       [ -z "${PIDS[$slot]:-}" ] || continue
       if [ -z "$(credential_kind)" ]; then
         WAIT[slot]='waiting for a credential'
