@@ -7,6 +7,13 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Four sentences in the README and the guide said more, or less, than Arca does. Arca cannot run an app you name as a
+service, but a small program in an image you name can run on a timer as a function once you approve its card. Each
+machine runs its own Arca; machines you pair form a group, and an assistant can call a paired machine with a token that
+machine made, but Arca does not yet spread services across machines by itself. `arca init` does find the default
+config when `--config` is left out, like every command that writes. A function's image is pulled with the credential
+set for its registry, if there is one.
+
 On a node that only looks, a read that worked no longer begins with "this node only looks: nothing here can be
 changed ...": the answer comes first and that note after it, so an assistant that reads only the first text block no
 longer reports a refusal. The text of `watch_report`, `service_list` and `arca_status` now carries the answer itself
