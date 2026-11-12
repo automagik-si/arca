@@ -3459,9 +3459,31 @@ fn caps_refusal(
     None
 }
 
+/// Why creating `name` from `template` would pass a cap, or `None`: the node's caps on virtual machines first
+/// ([`caps_refusal`]), then the caps of the tenant the create names. `entries` are all the node's records. The
+/// proposal and the create both ask here, so a proposal the node has no room for is refused when it is made, in
+/// the words the create would use, and the create asks again because the node can fill up while a card waits.
+fn create_room_refusal(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+    tenant: Option<&tenants::TenantScope>,
+    name: &str,
+    template: &crate::service::Template,
+) -> Option<CallError> {
+    // A node that sets no caps for virtual machines creates none: both callers refuse that first, in its own words.
+    if template.is_vm()
+        && let Some(caps) = cfg.kernel.vm_caps()
+        && let Some(refusal) = caps_refusal(cfg, caps, entries, tenant.is_none(), name, template)
+    {
+        return Some(refusal);
+    }
+    tenant.and_then(|scope| tenants::service_caps_refusal(scope, entries, name, template))
+}
+
 /// The checks a proposed `service_create` must pass on this node before the owner is asked: the template's kind fits the
 /// node's networks, the config fits the desired state, and a virtual machine's bridge is an allowed one. On a bridged
-/// node an omitted bridge is filled in, so the owner's card names it; a virtual machine for the managed network names none. A template that does not load is left for the create itself to refuse.
+/// node an omitted bridge is filled in, so the owner's card names it; a virtual machine for the managed network names none.
+/// Last, the create must fit under the node's caps and its tenant's ([`create_room_refusal`]).
 fn enrich_service_create(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
@@ -3568,6 +3590,9 @@ fn enrich_service_create(
         }
         crate::service::create_settings(&template, payload.get("settings"))
             .map_err(service_template_error)?;
+        if let Some(refusal) = proposed_room_refusal(cfg, entries, payload, &template)? {
+            return Err(refusal);
+        }
         let mut payload = payload.clone();
         if let (Some(stated), Some(object)) = (stated, payload.as_object_mut()) {
             object.insert("kernelAccess".to_string(), stated);
@@ -3604,7 +3629,30 @@ fn enrich_service_create(
             }
         }
     }
+    // Last, as in the create: a machine the node has no room for is refused now, so the owner is never asked to
+    // approve it.
+    if let Some(refusal) = proposed_room_refusal(cfg, entries, &payload, &template)? {
+        return Err(refusal);
+    }
     Ok(payload)
+}
+
+/// The room check of a proposed `service_create` ([`create_room_refusal`]), for the tenant the proposal names. A
+/// tenant this node does not hold is refused in the create's words: its caps cannot be read.
+fn proposed_room_refusal(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+    payload: &Value,
+    template: &crate::service::Template,
+) -> Result<Option<CallError>, CallError> {
+    let tenant = tenants::tenant_arg(cfg, payload, entries)?;
+    Ok(create_room_refusal(
+        cfg,
+        entries,
+        tenant.as_ref(),
+        payload["name"].as_str().unwrap_or_default(),
+        template,
+    ))
 }
 
 /// What a `service_create` call brings to a template that declares kernel access: what it stated as `kernelAccess`, and
@@ -6531,9 +6579,9 @@ impl ToolHandler for ServiceHandler {
                     if template.local_image_pin().is_some() {
                         local_image_present(&read, &template, project)?;
                     }
-                    let Some(caps) = self.cfg.kernel.vm_caps() else {
+                    if self.cfg.kernel.vm_caps().is_none() {
                         return Err(service_refused(no_vm_caps(template_name)));
-                    };
+                    }
                     // Every refusal below comes before any write, so a refused create leaves nothing behind.
                     if let Some(why) = mode_refusal(&self.cfg, &all_entries) {
                         return Err(service_refused(why));
@@ -6589,20 +6637,13 @@ impl ToolHandler for ServiceHandler {
                             "the MAC {mac} is already held by another instance"
                         )));
                     }
-                    if let Some(refusal) = caps_refusal(
+                    if let Some(refusal) = create_room_refusal(
                         &self.cfg,
-                        caps,
                         &all_entries,
-                        tenant.is_none(),
+                        tenant.as_ref(),
                         &name,
                         &template,
                     ) {
-                        return Err(refusal);
-                    }
-                    if let Some(scope) = &tenant
-                        && let Some(refusal) =
-                            tenants::service_caps_refusal(scope, &all_entries, &name, &template)
-                    {
                         return Err(refusal);
                     }
                     // A project that exists must be the one its owning entry made: the bridged entry's on a node whose
@@ -6724,7 +6765,7 @@ impl ToolHandler for ServiceHandler {
                         )));
                     }
                     if let Some(refusal) =
-                        tenants::service_caps_refusal(scope, &all_entries, &name, &template)
+                        create_room_refusal(&self.cfg, &all_entries, Some(scope), &name, &template)
                     {
                         return Err(refusal);
                     }

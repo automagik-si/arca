@@ -10,6 +10,12 @@ Write under this comment only what a reader needs beyond those lines; the releas
 A card that waits while the node is upgraded to the version that binds a template's content (a create, or a database
 made from the template) is now refused when its approval is submitted, and the approval is not used; propose it
 again. Before, the approval was accepted and the create then refused.
+A `service_create` the node has no room for is now refused when it is proposed, in the words the create uses (what is
+in use, what is asked, what is allowed, and the config key), so the owner is never shown a card for it. Before, the
+card was shown, the approval was accepted and used up, and only then did the create refuse. This covers the node's
+caps on virtual machines (`kernel.vmLimits`, `kernel.bridged.limits`) and a tenant's caps. The approved create still
+checks them, because the node can fill up while a card waits. One refusal for room can still follow an approval: no
+free address in the service subnet.
 
 A template whose image is `local:<alias>` and that already carried a `digest` was accepted before, and the digest was
 ignored. It is enforced now: a create from such a template is refused unless the image under the alias has that
