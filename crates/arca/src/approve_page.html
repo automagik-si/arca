@@ -555,6 +555,28 @@ function expiryText(expiresAt) {
   return "Expires at " + clock;
 }
 
+// The Approve button of every card. With no passkey trusted yet an approval cannot work, so the button says what comes
+// first and takes the owner to the setup instead. The page draws the cards again once a passkey is trusted.
+function approveButton(label, run) {
+  const button = el("button", "btn btn-primary btn-big approve");
+  button.type = "button";
+  if (document.body.dataset.trusted === "no") {
+    button.setAttribute("aria-label", "Set up your passkey first, then approve: " + label);
+    button.append(icon("key"), "Set up your passkey first");
+    button.addEventListener("click", toSetup);
+    return button;
+  }
+  button.setAttribute("aria-label", "Approve: " + label);
+  button.append(icon("key"), "Approve");
+  button.addEventListener("click", () => run(button));
+  return button;
+}
+
+function toSetup() {
+  document.querySelector("section.setup").scrollIntoView({ behavior: "smooth", block: "start" });
+  document.getElementById("get-code").focus({ preventScroll: true });
+}
+
 function planCard(plan) {
   const card = el("article", "card plan");
   const objects = Array.isArray(plan.objects) ? plan.objects : [];
@@ -613,11 +635,7 @@ function planCard(plan) {
   row.append(el("span", "digest-label", "Fingerprint"), chip, copy);
   digest.append(row, full);
 
-  const button = el("button", "btn btn-primary btn-big approve");
-  button.type = "button";
-  button.setAttribute("aria-label", "Approve: " + title);
-  button.append(icon("key"), "Approve");
-  button.addEventListener("click", () => approve(plan, button));
+  const button = approveButton(title, (button) => approve(plan, button));
 
   card.append(meta, heading);
   if (count) card.append(list);
@@ -653,15 +671,11 @@ function actionCard(plan) {
   fact("Fingerprint", digest.slice(0, 8) + "…" + digest.slice(-4), true);
 
   const buttons = el("div", "actions");
-  const approveButton = el("button", "btn btn-primary btn-big approve");
-  approveButton.type = "button";
-  approveButton.setAttribute("aria-label", "Approve: " + plan.summary);
-  approveButton.append(icon("key"), "Approve");
-  approveButton.addEventListener("click", () => approve(plan, approveButton));
+  const approving = approveButton(plan.summary, (button) => approve(plan, button));
   const declineButton = el("button", "btn btn-secondary", "Decline");
   declineButton.type = "button";
   declineButton.addEventListener("click", () => decline(plan, declineButton));
-  buttons.append(approveButton, declineButton);
+  buttons.append(approving, declineButton);
 
   card.append(meta, heading, facts, buttons);
   return card;
@@ -682,11 +696,7 @@ function peerKeysCard(card) {
   }
   const heading = el("h3", "", card.title);
   const text = el("p", "notice-text", card.linkedHost + " will trust " + card.keys + " passkey" + (card.keys === 1 ? "" : "s") + " from this page for approvals. Confirm with a passkey it already trusts.");
-  const button = el("button", "btn btn-primary btn-big approve");
-  button.type = "button";
-  button.setAttribute("aria-label", card.title);
-  button.append(icon("key"), "Approve");
-  button.addEventListener("click", () => trustPeerKeys(card, button));
+  const button = approveButton(card.title, (button) => trustPeerKeys(card, button));
   node.append(meta, heading, text, button);
   return node;
 }
@@ -757,15 +767,11 @@ function requestCard(request) {
   fact("Fingerprint", digest.slice(0, 8) + "…" + digest.slice(-4), true);
 
   const buttons = el("div", "actions");
-  const approveButton = el("button", "btn btn-primary btn-big approve");
-  approveButton.type = "button";
-  approveButton.setAttribute("aria-label", "Approve: " + title);
-  approveButton.append(icon("key"), "Approve");
-  approveButton.addEventListener("click", () => approveRequest(request, approveButton));
+  const approving = approveButton(title, (button) => approveRequest(request, button));
   const denyButton = el("button", "btn btn-secondary", "Decline");
   denyButton.type = "button";
   denyButton.addEventListener("click", () => denyRequest(request, denyButton));
-  buttons.append(approveButton, denyButton);
+  buttons.append(approving, denyButton);
 
   card.append(meta, heading, ...(code ? [code] : []), facts, buttons);
   return card;

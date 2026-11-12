@@ -105,8 +105,8 @@ RELAY_NET=automagik-relay
 
 # What this script takes from the Automagik server image, each in this one place, as the Automagik repository has
 # them at commit 5fe0be6 (server/compose.gate.yml, server/gate-entrypoint.mjs, server/gate-access.mjs,
-# server/gate-claim.mjs): the build the shipped template pins. A later build that changes one of them changes one
-# line here.
+# server/gate-claim.mjs). Those four files are the same at 7aaa512, the commit of release 3.136.4, the build the
+# shipped template pins. A later build that changes one of them changes one line here.
 SERVER_PORT=3081                                  # the server's own port, fixed in the image
 GATE_PORT=3082                                    # the gate's port, the one upstream's compose file fixes
 IMAGE_NODE=/nodejs/bin/node                       # the image's node

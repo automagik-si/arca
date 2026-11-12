@@ -7,6 +7,25 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A new Automagik starts from Automagik's published image: `automagik-server` and `automagik-workspace` now pin
+Automagik's release 3.136.4 by its digest (they pinned 3.95.0 and a build of commit `5fe0be6`), with nothing built on
+the node: Incus pulls the server's image at the create, and a workspace's Docker pulls it after `instance_start`. Omni channels are not in 3.136.4; they come through Automagik's welcome once
+Automagik's fixed release is pinned. The hand-built `automagik` template and its build script stay as they were, for
+the Omni channels plugin until then and for publishing on the tailnet. An installed
+copy nobody edited is brought up to date by the upgrade; a service made before keeps running its own image, and
+`service_status` shows the newer release under `update`. Keep such a service on its release: moving it today is a
+remove and a create, and the remove deletes its data.
+
+On the approval page, while no passkey is trusted, a waiting card's button says "Set up your passkey first" instead of
+"Approve", and a tap on it takes the owner to the passkey setup, which is at the top of the page. Before, it asked for a
+passkey there was none of and failed. Once a passkey is trusted the cards are drawn again with their Approve buttons.
+
+Passkeys can now be RSA keys (RS256) as well as P-256 keys (ES256). Some Windows Hello and TPM authenticators make only
+RSA keys, and setting up such a passkey failed at its last step. The page now offers both, enrols either, and checks
+either's signature on every approval and sign-in. A passkeys line names its key's `alg`, `ES256` or `RS256`.
+
+## 0.16.0 (2026-11-12)
+
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
 what to propose it now reads the tenants (with what each instance uses and the deploy it came from) and the functions
@@ -21,9 +40,11 @@ hand. The template changed, so an installed copy nobody edited is brought up to 
 before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
 that image is built with `templates/automagik.build.sh`.
 
-Passkeys can now be RSA keys (RS256) as well as P-256 keys (ES256). Some Windows Hello and TPM authenticators make only
-RSA keys, and setting up such a passkey failed at its last step. The page now offers both, enrols either, and checks
-either's signature on every approval and sign-in. A passkeys line names its key's `alg`, `ES256` or `RS256`.
+- Merge PR 120: v0.15.0's automagik.json is on the list of earlier versions, so an upgrade replaces it
+- Merge PR 109: the Automagik image is named after every input of its build, so changing any pin builds a new image beside the old one
+- Merge dev at v0.15.0 into set G
+- Merge PR 107: the tenant removal card says the tenant's address block, when it was made, and the services it holds as of the proposal, and that services made later go too
+- Merge PR 103: the canvas Doctor proposes all 22 kernel actions and reads tenants and functions, with the kernel's untrusted note first in what it reads
 
 ## 0.15.0 (2026-11-12)
 

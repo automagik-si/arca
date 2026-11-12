@@ -2258,6 +2258,49 @@ fn wrong_code(code: &str) -> &str {
     }
 }
 
+/// Issue 116: with no passkey trusted, an Approve cannot work, so every card's button says the passkey comes first and
+/// takes the owner to the setup. Static source check; the browser ceremony at http://localhost clicks it at runtime.
+#[test]
+fn with_no_passkey_trusted_every_card_button_says_set_up_your_passkey_first() {
+    let html = include_str!("../src/approve_page.html");
+    let script = &html[html.find("<script>").expect("the script")..];
+    assert!(
+        script.contains(r#"document.body.dataset.trusted === "no""#)
+            && script.contains(r#""Set up your passkey first""#),
+        "the button reads the trusted count the page last saw"
+    );
+    let to_setup = script
+        .split("function toSetup()")
+        .nth(1)
+        .expect("the way to the setup");
+    assert!(
+        to_setup.contains("scrollIntoView") && to_setup.contains(r#"getElementById("get-code")"#),
+        "the button scrolls to the setup and puts the owner on its first step"
+    );
+    assert_eq!(
+        script.matches(r#"icon("key"), "Approve""#).count(),
+        1,
+        "one place draws an Approve button, and it is the one that checks for a passkey"
+    );
+    for card in [
+        "function planCard(",
+        "function actionCard(",
+        "function peerKeysCard(",
+        "function requestCard(",
+    ] {
+        let body = script
+            .split(card)
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("the card");
+        assert!(body.contains("approveButton("), "{card} uses approveButton");
+    }
+    assert!(
+        html.contains(r#"body[data-trusted="no"] .setup { order: -1; }"#),
+        "the setup comes first while no passkey is trusted"
+    );
+}
+
 #[test]
 fn owner_page_hides_the_developer_line_and_requires_a_checked_code() {
     let (rig, _) = Rig::new_empty("page-owner-source");
