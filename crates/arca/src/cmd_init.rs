@@ -14,7 +14,9 @@
 //!
 //! It opens no door: where the config has no loopback door and no approval page, it stops and says so. It asks before it
 //! writes, keeps a copy of the config as it was, installs the shipped templates, restarts the installer's own service and
-//! no other, and ends with what Arca may now touch, the page, and the one command that goes back.
+//! no other, and ends in five lines: what changed, who does not wait for the page, the ONE thing to do next, where a
+//! database comes from, and one pointer. Everything else it could say (what Arca may touch, the page's cautions, the
+//! way to the page from another computer) is said by `arca status --security`, which the pointer names.
 //!
 //! `init --watch-only` empties `kernel.projects` and nothing else. Nothing in Incus is removed and no passkey is touched.
 //!
@@ -313,87 +315,21 @@ impl Node<'_> {
             self.write(&document)?;
         }
 
-        let templates =
-            crate::cmd_templates::install_into(&self.cfg.state_dir.join("templates"), false)?;
-        let installed = templates["installed"].as_array().map_or(0, Vec::len);
+        crate::cmd_templates::install_into(&self.cfg.state_dir.join("templates"), false)?;
         let restarted = self.restart("kernel");
 
-        if matches!(restarted, Restart::Answered(_)) {
-            say("Arca may now make changes on this machine.");
-        } else {
-            say(
-                "The config now lets Arca make changes on this machine. The node takes that up when it next starts.",
-            );
+        // The first screen: what changed, who does not wait, the one next thing, and one pointer. Everything else
+        // init used to print here is in `arca status --security`, which reads this same config.
+        for line in enabled_report(
+            &restarted,
+            &direct,
+            &origin,
+            &self.path,
+            self.passkey_is_trusted(),
+            crate::cmd_status::has_screen(),
+        ) {
+            say(&line);
         }
-        say("");
-        say(&format!(
-            "  It may touch: the Incus project {PROJECT}, and the bridge {} on {cidr}.",
-            arca_netproject::BRIDGE
-        ));
-        say(
-            "  And, each only from a card you approve: snapshots (the pools they are kept in and the project",
-        );
-        say("  arcak-snapshots) and the GPU devices of its own instances. Nothing else.");
-        say(&format!(
-            "  Arca never writes in \"{DEFAULT_PROJECT}\"; the entry in kernel.droiddProjects only names it as not Arca's."
-        ));
-        say(
-            "  What an assistant proposes waits for you: nothing of it runs until you approve it with your",
-        );
-        say(&format!("  passkey on the page: {origin}/approve"));
-        for line in direct.words(&self.path, self.cfg.kernel.tenants.is_some()) {
-            say(&format!("  {line}"));
-        }
-        if self.passkey_is_trusted() {
-            say("  A passkey is already trusted on this node: it approves.");
-        } else {
-            say(
-                "  No passkey is trusted yet, so nothing can be approved until you enrol the first one. Open the page and",
-            );
-            say("  press \"Get a setup code\"; on a machine with no screen, this prints the code:");
-            say(&format!(
-                "    arca setup-code --config {}",
-                self.path.display()
-            ));
-        }
-        if let Some(port) = arca_approval::localhost_origin_port(&origin) {
-            say(
-                "  That page is for a machine where every account is trusted. Before you type a setup code or approve for",
-            );
-            say("  the first time, check that the node says the page is open:");
-            say(&format!("    arca status --config {}", self.path.display()));
-            // A machine with no screen and no browser: the page comes to the person's own computer.
-            say("  No browser on this machine? On your own computer run:");
-            say(&format!(
-                "    ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>"
-            ));
-            say(&format!(
-                "  Then open {origin}/approve in its browser: the page is this node's. If ssh warns that it could not bind\n  the port, close it: another port will not work, since the page's address names this one."
-            ));
-            say(
-                "  A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet",
-            );
-            say("  or a domain; the guide's section \"The approval page\" says how.");
-        }
-        if installed > 0 {
-            say(&format!(
-                "  The shipped templates are in {} ({installed} new).",
-                self.cfg.state_dir.join("templates").display()
-            ));
-        }
-        self.say_restart(&restarted);
-        if !nothing_to_write {
-            say(&format!(
-                "  The config as it was is kept at {}.",
-                self.backup().display()
-            ));
-        }
-        say("");
-        say("To turn it back to a node that only looks:");
-        say(&format!(
-            "  arca init --watch-only --config {}",
-            self.path.display()
-        ));
         Ok(None)
     }
 
@@ -415,39 +351,9 @@ impl Node<'_> {
         self.write(&document)?;
         let restarted = self.restart("watch-only");
 
-        // The node's own word, or none: a node that was not restarted, or did not answer, still runs on the config as it
-        // was, and may still be changing things.
-        if matches!(restarted, Restart::Answered(_)) {
-            say("Arca now only looks on this machine: it changes nothing.");
-        } else {
-            say(
-                "The config now says watch-only. The node that is running STILL MAKES CHANGES until it is restarted:",
-            );
-            say("it reads its config only when it starts.");
+        for line in watching_report(&restarted, &self.path) {
+            say(&line);
         }
-        say("");
-        say(&format!(
-            "  Nothing was removed. The Incus project {PROJECT}, its bridge, the services in it and your passkeys are"
-        ));
-        say(
-            "  as they were, and so is every other key of the config. Arca no longer starts, stops, creates or removes",
-        );
-        say("  anything, and a proposal that waits can no longer run.");
-        say(
-            "  One thing reads oddly on such a node: service_list answers \"no service project\", though the services",
-        );
-        say("  are still there; watch_report lists them.");
-        self.say_restart(&restarted);
-        say(&format!(
-            "  The config as it was is kept at {}.",
-            self.backup().display()
-        ));
-        say("");
-        say("To let it make changes again:");
-        say(&format!(
-            "  arca init --enable-changes --config {}",
-            self.path.display()
-        ));
         Ok(None)
     }
 
@@ -706,47 +612,124 @@ impl Node<'_> {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+}
 
-    fn say_restart(&self, restarted: &Restart) {
-        let start = format!("arca serve --config {}", self.path.display());
-        match restarted {
-            Restart::Answered(status) => {
-                say(&format!(
-                    "  The node was restarted and says: mode {}.",
-                    status["mode"].as_str().unwrap_or("not stated")
-                ));
-                if status["loopback"]["page"]["open"] == json!(false) {
-                    say("  Its approval page is CLOSED right now:");
-                    say(&format!(
-                        "  {}",
-                        status["loopback"]["page"]["reason"]
-                            .as_str()
-                            .unwrap_or("the node does not say why")
-                    ));
-                }
-            }
-            Restart::Unasked => say(
-                "  The node was restarted. There is no token to ask it with, so ask it yourself: arca status",
-            ),
-            Restart::Silent => {
-                say(
-                    "  The node was restarted and has not answered with its new mode yet. Look at:",
-                );
-                say(&format!("    systemctl --user status {UNIT}"));
-            }
-            Restart::Failed => {
-                say(&format!(
-                    "  `systemctl --user restart {UNIT}` failed, so the node still runs on the config as it was. Run it yourself."
-                ));
-            }
-            Restart::NotOurs => {
-                say(
-                    "  The node reads its config when it starts, and this is not the installer's service, so init did not",
-                );
-                say("  restart it. Stop the node and start it again for this to take effect:");
-                say(&format!("    {start}"));
-            }
+/// What `--enable-changes` says when it is done, in a handful of lines: what changed, who does not wait for the page
+/// (by name, when anyone), the ONE thing to do next, where a database comes from, and one pointer to the rest. What it
+/// may touch, who can reach the page, the way to the page from another computer and where the old config is kept are
+/// not said here: `arca status --security` says them, from the same config.
+fn enabled_report(
+    restarted: &Restart,
+    direct: &DirectTokens,
+    origin: &str,
+    config: &Path,
+    passkey: bool,
+    screen: bool,
+) -> Vec<String> {
+    let url = format!("{origin}/approve");
+    let path = config.display();
+    let headline = match restarted {
+        Restart::Answered(_) => {
+            "Arca may now make changes on this machine: the node was restarted and says so."
         }
+        Restart::Unasked => {
+            "The config now lets Arca make changes on this machine, and the node was restarted. There is no token to ask it with, so init cannot say that it took this up."
+        }
+        Restart::Silent => {
+            "The config now lets Arca make changes on this machine. The node was restarted and has not answered with its new mode yet."
+        }
+        Restart::Failed => {
+            "The config now lets Arca make changes on this machine. The node still runs on the config as it was."
+        }
+        Restart::NotOurs => {
+            "The config now lets Arca make changes on this machine. The node takes that up when it next starts."
+        }
+    };
+    // The node's own word on its page, when it gave one: a page it does not hold is not a page to type a code into.
+    let closed = match restarted {
+        Restart::Answered(status) => [&status["approvalPage"], &status["loopback"]["page"]]
+            .into_iter()
+            .find(|page| page["open"] == json!(false))
+            .map(|page| {
+                page["reason"]
+                    .as_str()
+                    .unwrap_or("the node does not say why")
+                    .to_string()
+            }),
+        _ => None,
+    };
+    let next = if let Some(step) = restart_step(restarted, config) {
+        step
+    } else if let Some(reason) = closed {
+        format!(
+            "the approval page is CLOSED: {reason}. Type no setup code and approve nothing there until `arca status --config {path}` says it is open."
+        )
+    } else if passkey {
+        format!(
+            "ask your assistant for something. A passkey is already trusted on this node; what is proposed waits for you at {url}"
+        )
+    } else {
+        crate::cmd_status::enrol_step(&url, &path.to_string(), screen)
+    };
+    vec![
+        headline.to_string(),
+        direct.closing_line(config),
+        format!("Next: {next}"),
+        "A database: ask your assistant for the postgres-autopg service.".to_string(),
+        format!(
+            "More: `arca status --config {path}` says what is open and what comes next; with --security, what Arca may touch and who can reach it. To go back to a node that only looks: arca init --watch-only --config {path}"
+        ),
+    ]
+}
+
+/// What `--watch-only` says when it is done. Only the node's own answer makes it say "now only looks": a node that
+/// was not restarted, or did not answer, still runs on the config as it was and may still be changing things, and
+/// that sentence is the first line.
+fn watching_report(restarted: &Restart, config: &Path) -> Vec<String> {
+    let path = config.display();
+    let headline = match restarted {
+        Restart::Answered(_) => {
+            "Arca now only looks on this machine: it changes nothing. The node was restarted and says so.".to_string()
+        }
+        Restart::Unasked => format!(
+            "The config now says watch-only, and the node was restarted. There is no token to ask it with, so take it that the node STILL MAKES CHANGES until `arca status --config {path}` says watch-only."
+        ),
+        Restart::Silent => format!(
+            "The config now says watch-only. The node was restarted and has not answered yet: take it that it STILL MAKES CHANGES until `arca status --config {path}` says watch-only."
+        ),
+        Restart::Failed | Restart::NotOurs => {
+            "The config now says watch-only. The node that is running STILL MAKES CHANGES until it is restarted: it reads its config only when it starts.".to_string()
+        }
+    };
+    let mut lines = vec![headline];
+    if let Some(step) = restart_step(restarted, config) {
+        lines.push(format!("Next: {step}"));
+    }
+    lines.push(format!(
+        "Nothing was removed: the Incus project {PROJECT}, its bridge, the services in it and your passkeys are as they were."
+    ));
+    lines.push(format!(
+        "More: `arca status --config {path}`; with --security, what was kept and where. To let it make changes again: arca init --enable-changes --config {path}"
+    ));
+    lines
+}
+
+/// The one step that makes the running node take up the config init wrote, where init did not see that happen. None
+/// where the node was restarted: then the next step is whatever comes after.
+fn restart_step(restarted: &Restart, config: &Path) -> Option<String> {
+    let path = config.display();
+    let then = format!("Then `arca status --config {path}` says what comes next.");
+    match restarted {
+        Restart::Answered(_) | Restart::Unasked => None,
+        Restart::Silent => Some(format!(
+            "see why the node has not answered since its restart: systemctl --user status {UNIT}. {then}"
+        )),
+        Restart::Failed => Some(format!(
+            "restart the node yourself, since `systemctl --user restart {UNIT}` failed when init ran it. {then}"
+        )),
+        Restart::NotOurs => Some(format!(
+            "restart the node. This is not the installer's service, so init did not: stop the node and start it again with: arca serve --config {path}. {then}"
+        )),
     }
 }
 
@@ -783,8 +766,28 @@ pub(crate) enum DirectTokens {
 }
 
 impl DirectTokens {
-    /// What init says of them before it asks and after it wrote: who may change things with no card and no passkey.
-    fn words(&self, config: &Path, tenants: bool) -> Vec<String> {
+    /// After init wrote: the same fact in one line, with every such token by name. It stays on the first screen,
+    /// because "each change waits for you" is false while one of these exists.
+    fn closing_line(&self, config: &Path) -> String {
+        match self {
+            Self::Read(tokens) if tokens.is_empty() => {
+                "No token of this node may do more than look and propose, so every change waits for your passkey.".to_string()
+            }
+            Self::Read(tokens) => format!(
+                "NOT every change waits for you: these tokens change things directly, with no card and no passkey: {}. To take one away: arca token revoke <id> --config {}",
+                tokens.join(", "),
+                config.display()
+            ),
+            Self::Unread(dir) => format!(
+                "The tokens in {} could not be read, so init cannot say whether one of them changes things directly, with no card and no passkey: a doctor or an operator token does.",
+                dir.display()
+            ),
+        }
+    }
+
+    /// What init says of them before it asks, and `arca status --security` at any time: who may change things with
+    /// no card and no passkey, and what such a token may do.
+    pub(crate) fn words(&self, config: &Path, tenants: bool) -> Vec<String> {
         match self {
             Self::Read(tokens) if tokens.is_empty() => vec![
                 "No token of this node may do more than look and propose, so every change waits for your passkey."
@@ -1310,6 +1313,204 @@ mod tests {
             )
         );
         assert!(asked[0].ends_with("[y/N] "));
+    }
+
+    const CONFIG: &str = "/home/u/.config/arca/node.json";
+    const LOCAL: &str = "http://localhost:7471";
+
+    fn nobody() -> DirectTokens {
+        DirectTokens::Read(Vec::new())
+    }
+
+    /// The report after `--enable-changes` is five lines when the terminal has a screen: what changed, who waits, ONE
+    /// next step, where a database comes from, and one pointer. Nothing of the page's cautions, the ssh line, the
+    /// phone, the scope or the kept config is on it; `arca status --security` has those.
+    #[test]
+    fn the_report_after_enabling_is_what_changed_one_next_step_and_one_pointer() {
+        let answered =
+            Restart::Answered(json!({ "mode": "kernel", "approvalPage": { "open": true } }));
+        let lines = enabled_report(&answered, &nobody(), LOCAL, Path::new(CONFIG), false, true);
+        assert_eq!(
+            lines,
+            [
+                "Arca may now make changes on this machine: the node was restarted and says so.",
+                "No token of this node may do more than look and propose, so every change waits for your passkey.",
+                "Next: enrol your passkey: open http://localhost:7471/approve and press \"Get a setup code\". Until one is trusted, nothing can be approved.",
+                "A database: ask your assistant for the postgres-autopg service.",
+                "More: `arca status --config /home/u/.config/arca/node.json` says what is open and what comes next; with --security, what Arca may touch and who can reach it. To go back to a node that only looks: arca init --watch-only --config /home/u/.config/arca/node.json",
+            ]
+        );
+        let text = lines.join("\n");
+        assert_eq!(text.matches("Next: ").count(), 1, "{text}");
+        for gone in [
+            "ssh ",
+            "phone",
+            "It may touch",
+            "droiddProjects",
+            "before-init",
+            "every account is trusted",
+        ] {
+            assert!(
+                !text.contains(gone),
+                "{gone:?} is on the first screen:\n{text}"
+            );
+        }
+
+        // No screen at this terminal: the code comes from here, and the way to the page from the person's own
+        // computer, with what a phone needs, is now the next step.
+        let text =
+            enabled_report(&answered, &nobody(), LOCAL, Path::new(CONFIG), false, false).join("\n");
+        assert!(
+            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve there.\n      A phone cannot open this page:"),
+            "{text}"
+        );
+        // A page under a name of the owner's own: no ssh line and no word about a phone, screen or not.
+        let text = enabled_report(
+            &answered,
+            &nobody(),
+            "https://arca.example.com",
+            Path::new(CONFIG),
+            false,
+            false,
+        )
+        .join("\n");
+        assert!(
+            text.contains("arca setup-code --config")
+                && !text.contains("ssh ")
+                && !text.contains("phone"),
+            "{text}"
+        );
+
+        // A passkey is already trusted: the next step is the first change itself.
+        let text =
+            enabled_report(&answered, &nobody(), LOCAL, Path::new(CONFIG), true, true).join("\n");
+        assert!(
+            text.contains("Next: ask your assistant for something. A passkey is already trusted on this node; what is proposed waits for you at http://localhost:7471/approve"),
+            "{text}"
+        );
+        assert!(!text.contains("setup code"), "{text}");
+    }
+
+    /// Three things never leave the first screen: the tokens that change things without the page, by name; a page
+    /// the node does not hold; and a node that has not taken the config up, whose restart is then the one next step.
+    #[test]
+    fn the_report_after_enabling_keeps_its_warnings_on_the_first_screen() {
+        let answered = Restart::Answered(json!({ "mode": "kernel" }));
+        let direct = DirectTokens::Read(vec![
+            "ops (doctor)".to_string(),
+            "boss (operator)".to_string(),
+        ]);
+        let lines = enabled_report(&answered, &direct, LOCAL, Path::new(CONFIG), false, true);
+        assert_eq!(
+            lines[1],
+            "NOT every change waits for you: these tokens change things directly, with no card and no passkey: ops (doctor), boss (operator). To take one away: arca token revoke <id> --config /home/u/.config/arca/node.json"
+        );
+        assert!(
+            !lines
+                .join("\n")
+                .contains("every change waits for your passkey")
+        );
+        let unread = DirectTokens::Unread(PathBuf::from("/home/u/tokens"));
+        let lines = enabled_report(&answered, &unread, LOCAL, Path::new(CONFIG), false, true);
+        assert!(
+            lines[1].starts_with("The tokens in /home/u/tokens could not be read"),
+            "{lines:?}"
+        );
+
+        // The node answered, and does not hold its page: no code is typed there.
+        let closed = Restart::Answered(json!({
+            "mode": "kernel",
+            "approvalPage": { "open": false, "reason": "address already in use" }
+        }));
+        let lines = enabled_report(&closed, &nobody(), LOCAL, Path::new(CONFIG), false, true);
+        assert_eq!(
+            lines[2],
+            "Next: the approval page is CLOSED: address already in use. Type no setup code and approve nothing there until `arca status --config /home/u/.config/arca/node.json` says it is open."
+        );
+
+        // A node init did not restart, or did not hear from: that is the headline, and the restart is the one step.
+        for (restarted, headline, step) in [
+            (
+                Restart::NotOurs,
+                "The config now lets Arca make changes on this machine. The node takes that up when it next starts.",
+                "Next: restart the node. This is not the installer's service, so init did not: stop the node and start it again with: arca serve --config /home/u/.config/arca/node.json. Then `arca status --config /home/u/.config/arca/node.json` says what comes next.",
+            ),
+            (
+                Restart::Failed,
+                "The config now lets Arca make changes on this machine. The node still runs on the config as it was.",
+                "Next: restart the node yourself, since `systemctl --user restart arca.service` failed when init ran it. Then `arca status --config /home/u/.config/arca/node.json` says what comes next.",
+            ),
+            (
+                Restart::Silent,
+                "The config now lets Arca make changes on this machine. The node was restarted and has not answered with its new mode yet.",
+                "Next: see why the node has not answered since its restart: systemctl --user status arca.service. Then `arca status --config /home/u/.config/arca/node.json` says what comes next.",
+            ),
+        ] {
+            let lines =
+                enabled_report(&restarted, &nobody(), LOCAL, Path::new(CONFIG), false, true);
+            assert_eq!((lines[0].as_str(), lines[2].as_str()), (headline, step));
+            assert_eq!(lines.len(), 5);
+            assert!(
+                !lines.join("\n").contains("may now make changes"),
+                "{lines:?}"
+            );
+        }
+        // Restarted, with no token to ask it: said, and the next step is the passkey.
+        let lines = enabled_report(
+            &Restart::Unasked,
+            &nobody(),
+            LOCAL,
+            Path::new(CONFIG),
+            false,
+            true,
+        );
+        assert!(lines[0].ends_with(
+            "There is no token to ask it with, so init cannot say that it took this up."
+        ));
+        assert!(
+            lines[2].starts_with("Next: enrol your passkey: open "),
+            "{lines:?}"
+        );
+    }
+
+    /// On the way back, "now only looks" is the node's own word. Without it the first line says the running node
+    /// STILL MAKES CHANGES, and the restart is the next step.
+    #[test]
+    fn the_report_after_watch_only_says_the_node_still_changes_things_until_it_says_otherwise() {
+        let lines = watching_report(
+            &Restart::Answered(json!({ "mode": "watch-only" })),
+            Path::new(CONFIG),
+        );
+        assert_eq!(
+            lines,
+            [
+                "Arca now only looks on this machine: it changes nothing. The node was restarted and says so.",
+                "Nothing was removed: the Incus project arcak-svc, its bridge, the services in it and your passkeys are as they were.",
+                "More: `arca status --config /home/u/.config/arca/node.json`; with --security, what was kept and where. To let it make changes again: arca init --enable-changes --config /home/u/.config/arca/node.json",
+            ]
+        );
+        for restarted in [
+            Restart::NotOurs,
+            Restart::Failed,
+            Restart::Silent,
+            Restart::Unasked,
+        ] {
+            let asked = matches!(restarted, Restart::Unasked);
+            let lines = watching_report(&restarted, Path::new(CONFIG));
+            assert!(lines[0].contains("STILL MAKES CHANGES"), "{lines:?}");
+            assert!(!lines.join("\n").contains("now only looks"), "{lines:?}");
+            assert_eq!(lines[1].starts_with("Next: "), !asked, "{lines:?}");
+            assert_eq!(lines.len(), if asked { 3 } else { 4 });
+        }
+        let lines = watching_report(&Restart::NotOurs, Path::new(CONFIG));
+        assert_eq!(
+            lines[0],
+            "The config now says watch-only. The node that is running STILL MAKES CHANGES until it is restarted: it reads its config only when it starts."
+        );
+        assert!(
+            lines[1].contains("arca serve --config /home/u/.config/arca/node.json"),
+            "{lines:?}"
+        );
     }
 
     #[test]

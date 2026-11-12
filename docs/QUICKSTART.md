@@ -236,6 +236,11 @@ network, and the approval page on this machine's own door, `http://localhost:747
 templates and restarts the installer's service. `sh install.sh --enable-changes` does the same at install time,
 with the flag as your yes.
 
+It ends in five lines: what changed, which tokens (if any) do not wait for you, one line that starts `Next:` with
+the one thing to do, where a database comes from, and one line that starts `More:`. Do the `Next:` line. Everything
+else it could say is one command away, `arca status --security --config ~/.config/arca/node.json`, and `arca status`
+always ends with the next step.
+
 What comes after is yours:
 
 1. **Enrol your passkey.** Open `http://localhost:7471/approve` in a browser on the machine and press **Get a setup
@@ -243,6 +248,10 @@ What comes after is yours:
    terminal. Until a passkey is trusted, nothing can be approved.
 2. **Ask your assistant for something**, such as a NATS service. It proposes; nothing runs.
 3. **Approve it on the page** with your passkey. Arca runs it and writes it in its journal.
+
+**A database:** ask your assistant for the `postgres-autopg` service. It is one of the shipped templates, it fetches
+its own pinned image, and it waits for your approval like any change. (`postgres_create`, proposed, is refused on
+this node: the step sets no image for it, and the refusal names `postgres-autopg`.)
 
 That page is for a machine where every account is trusted, and it cannot be opened from a phone; read
 ["The page on this machine alone"](OPERATING.md#the-page-on-this-machine-alone-with-no-domain-and-no-certificate)

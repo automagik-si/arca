@@ -56,7 +56,11 @@ fn arca() -> Command {
     command
         .env("HOME", "/nonexistent/arca-test-home")
         .env_remove("ARCA_CONFIG")
-        .env_remove("ARCA_TOKEN_FILE");
+        .env_remove("ARCA_TOKEN_FILE")
+        // No screen, unless a test says there is one: what `init` and `status` say next depends on it, and must not
+        // depend on where the tests run.
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
     command
 }
 
@@ -2470,6 +2474,15 @@ fn status_says_whether_changes_are_on_which_page_approves_and_what_to_do_next_fr
     ] {
         assert!(words.contains(&said), "{said:?} is missing:\n{words}");
     }
+    // One next step, and one pointer to the rest as the last line.
+    assert_eq!(words.matches("Next: ").count(), 1, "{words}");
+    assert!(
+        words.trim_end().ends_with(&format!(
+            "\nMore: arca status --security --config {}",
+            node.display()
+        )),
+        "{words}"
+    );
     // The page itself names the exact line for a machine with no screen, with this node's config by its whole path.
     let html = reply_of(
         at,

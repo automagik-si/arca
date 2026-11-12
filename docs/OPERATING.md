@@ -81,15 +81,15 @@ node takes a new token after `arca token reload` or a restart.
 
 | Command | Reads | Prints |
 |---------|-------|--------|
-| `arca status [--json \| --security] [--config <file>] [--token-file <file>]` | the running node, with the same call as `arca call arca_status` | the node in words: version, mode, uptime, whether Incus answers, the unix socket it answered on, the loopback door as the node itself reports it (open with its URL, or CLOSED with the reason), the other listeners the config file names (not checked); then approvals, from the node's own answer: whether changes are on, the page that approves and whether it is open, whether a passkey is trusted yet, and the next step (enrol with `arca setup-code`, or open the page; a node that only looks names `arca init`). With `--json`, the `arca_status` result as it came. With `--security`, what to know before sharing the machine or a token: the cautions for each door this config opens, from the config alone, so the node need not be running |
+| `arca status [--json \| --security] [--config <file>] [--token-file <file>]` | the running node, with the same call as `arca call arca_status` | the node in words: version, mode, uptime, whether Incus answers, the unix socket it answered on, the loopback door as the node itself reports it (open with its URL, or CLOSED with the reason), the other listeners the config file names (not checked); then approvals, from the node's own answer: whether changes are on, the page that approves and whether it is open, whether a passkey is trusted yet, and then two last lines: `Next:`, the ONE thing to do (a node that only looks names `arca init`; with no passkey, the page and its button at a terminal with a screen, and `arca setup-code` with the `ssh` line at one without), and `More:`, which names `arca status --security`. With `--json`, the `arca_status` result as it came. With `--security`, everything that is not the next step, from the config and the token directory alone, so the node need not be running: the cautions for each door this config opens, what a node that may change things may touch, which tokens do not wait for the page and what they may do, where the templates and the config `arca init` kept are, the way to the page from another computer, what a phone needs, and what a node set back to watch-only keeps |
 | `arca watch --once --json [--config <file>]` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
 | `arca store check [--config <file>]` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
 | `arca templates install [--config <file>] [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> [--config <file>]` / `remove --name <n> [--config <file>]` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve [--config <file>]` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
-| `arca init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan, two questions, and what Arca may now touch, in words; it writes the config's missing keys after a yes. See "Turning on changes" |
-| `arca init --watch-only [--config <file>]` | the config | what it wrote and what stays, in words; it empties `kernel.projects` and nothing else |
+| `arca init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan and two questions; it writes the config's missing keys after a yes, and ends in five lines: what changed, who does not wait for the page, the one next step, where a database comes from, and one pointer to the rest. See "Turning on changes" |
+| `arca init --watch-only [--config <file>]` | the config | it empties `kernel.projects` and nothing else, and says in a few lines whether the running node took that up; until it has, the first line says the node still makes changes |
 | `arca setup-code [--config <file>]` | asks the running node, on its unix socket, for the setup code of the first passkey; for a machine with no screen | `{ "code", "expiresInSeconds", "page" }` as JSON on stdout, and one sentence on stderr; see "The page on this machine alone" |
 | `arca link serve [--config <file>]` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair [--config <file>] [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
@@ -155,7 +155,7 @@ refused without the value being echoed back.
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
 | `kernel.droiddProjects` | yes | droidd's projects. Required, and it must not be empty while `kernel.projects` is not. |
 | `kernel.serviceCidr` | no | Service bridge `<ipv4-network>/24`, outside every `kernel.reservedCidrs` range. Required for Postgres creation and probe consumer add; no default. |
-| `kernel.postgresImage` | no | A digest-pinned image (`name@sha256:<64 hex>`). A proposed `postgres_create` uses exactly this image and may not choose another; without it, a proposed database create is refused. |
+| `kernel.postgresImage` | no | A digest-pinned image (`name@sha256:<64 hex>`). A proposed `postgres_create` uses exactly this image and may not choose another; without it, a proposed database create is refused. `arca init` sets none, because the node creates that database from an image Incus already holds and fetches none. On such a node a database is the shipped `postgres-autopg` service: propose `service_create` with that template, which fetches its own pinned image; the refusal says the same |
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
 | `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
@@ -362,8 +362,27 @@ the node refuses.
 
 Then it installs the shipped templates into the state directory (`arca templates install`), and restarts the node
 only when the node is the installer's own service for this config (`arca.service`, written by `scripts/install.sh`).
-A node started any other way is the owner's to restart, and the step says so. It ends with what Arca may now touch,
-the page, how to get the first passkey, and the command that goes back.
+A node started any other way is the owner's to restart, and the step says so.
+
+**What it says when it is done** is five lines, so the one thing to do is not lost among the rest:
+
+1. what changed, and whether the running node took it up. "Arca may now make changes" is said only when the
+   restarted node answered so itself;
+2. who waits for the page: either that no token of this node may do more than look and propose, or every `doctor`
+   and `operator` token by name, with the line that revokes one. This line never leaves the report;
+3. `Next:`, the ONE thing to do. A node that was not restarted: restart it, with the command. A page the node does
+   not hold: type no code there. Otherwise the passkey: at a terminal with a screen (`DISPLAY` or `WAYLAND_DISPLAY`
+   is set), the page and its "Get a setup code" button; at one without, `arca setup-code`, and for the page of this
+   machine alone the `ssh` line that brings the page to your own computer and the sentence that a phone cannot
+   open it. With a passkey already trusted: ask your assistant for something;
+4. `A database: ask your assistant for the postgres-autopg service.`;
+5. `More:`, one pointer: `arca status` for what is open and what comes next, `arca status --security` for
+   everything else, and `arca init --watch-only` to go back.
+
+Nothing the longer report used to say is gone. What Arca may touch, that it never writes in `default`, what a
+`doctor` or `operator` token may do, the cautions of the page of one machine, the `ssh` line, the phone, the
+templates' directory and where the config as it was is kept are all said by `arca status --security --config
+<file>`, from the config, with the node running or not.
 
 **How the service network is chosen.** It is read from the machine, never guessed. The step takes the first of
 `10.47.0.0/24` to `10.47.255.0/24` that meets none of these, and names each source in what it prints:
@@ -405,9 +424,11 @@ It takes `--config` as a flag and reads no default, like every command that writ
 arca init --watch-only --config ~/.config/arca/node.json
 ```
 
-empties `kernel.projects` and changes nothing else, then restarts the installer's service as above. It says "Arca
-now only looks" only when the restarted node answered so itself; otherwise it says that the node that is running
-still makes changes until it is restarted. Once restarted, the node only looks: it starts, stops, creates and removes nothing, and a proposal that waits can no longer run. Nothing is
+empties `kernel.projects` and changes nothing else, then restarts the installer's service as above. Its report is
+three or four lines. It says "Arca now only looks" only when the restarted node answered so itself; otherwise its
+first line says that the node that is running still makes changes until it is restarted, and its `Next:` line is
+that restart. Then that nothing was removed, and one pointer: `arca status`, `arca status --security` for what was
+kept, and `arca init --enable-changes` to turn changes on again. Once restarted, the node only looks: it starts, stops, creates and removes nothing, and a proposal that waits can no longer run. Nothing is
 removed: the Incus project `arcak-svc`, its bridge, the services in it and the owner's passkeys stay as they are.
 Running `--enable-changes` again adds the project back and keeps the network and the page.
 
@@ -445,8 +466,13 @@ and holds no record answers an empty list.
   `arca setup-code`; see "The page on this machine alone".
 - The page it names is the page of one machine, for a machine where every account is trusted. Approving from a
   phone or from another machine needs an `https://` origin, set by hand.
-- It sets no `kernel.postgresImage`, so a proposed `postgres_create` stays refused; a database is created from the
-  `postgres-autopg` service template instead. That is about what is proposed: a `doctor` or `operator` token's own
+- It sets no `kernel.postgresImage`, so a proposed `postgres_create` stays refused. **A database after this step
+  is the shipped `postgres-autopg` service:** ask the assistant for it, or propose `service_create` with
+  `"template": "postgres-autopg"`. That template fetches its own pinned image and waits for the owner's card like
+  any change; the refusal of the proposed `postgres_create` names it, and so does the step's own report. The step
+  does not write the key because the node creates a `postgres_create` database from an image Incus already holds,
+  by its fingerprint, and fetches none: the key alone would turn a refusal at the proposal into a failure after
+  the owner approved. That is about what is proposed: a `doctor` or `operator` token's own
   `postgres_create` names its image itself and needs only the service network, and its `postgres_delete` removes a
   database's record, password and links without a card. It sets no `kernel.vmLimits`, so no virtual machine is created.
   Tenants, adoption and import are not turned on. A node that may change things also runs its snapshot writer

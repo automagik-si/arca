@@ -26,8 +26,12 @@ pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
                     .to_string(),
             ));
         }
-        // What to know about this node's doors is in its config: the node is not asked, and need not be running.
-        println!("{}", security(&cfg, &config.path));
+        // What to know about this node is in its config and its token directory: the node is not asked, and need
+        // not be running.
+        println!(
+            "{}",
+            security(&cfg, &config.path, &crate::cmd_init::direct_tokens(&cfg))
+        );
         return Ok(None);
     }
     let node = Addressed::new(&config, false);
@@ -39,14 +43,22 @@ pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
     // Which tokens change things without the page is in the node's token directory, read as `serve` reads it.
     let tokens = crate::cmd_init::direct_tokens(&cfg);
-    println!("{}", words(&answer, &cfg, &config.path, &tokens));
+    println!(
+        "{}",
+        words(&answer, &cfg, &config.path, &tokens, has_screen())
+    );
     Ok(None)
 }
 
 /// `status --security`: what a person should know before sharing this machine, or a token of this node, with anyone
 /// else. The installer's report shows one line to connect an assistant and names this command for the rest. Every line
 /// is about a door the config opens; a config that opens none says so.
-pub fn security(cfg: &NodeConfig, config: &Path) -> String {
+///
+/// It is also where the rest of `arca init`'s words live. Init's report is a handful of lines and one pointer here:
+/// what the node may touch, which tokens do not wait for the page and what they may do, where the templates and the
+/// config as it was are kept, the way to the page from another computer, and what a node set back to watch-only
+/// keeps.
+pub(crate) fn security(cfg: &NodeConfig, config: &Path, tokens: &DirectTokens) -> String {
     let mut lines = vec![format!(
         "What to know about the doors of the node that {} describes.",
         config.display()
@@ -83,9 +95,61 @@ pub fn security(cfg: &NodeConfig, config: &Path) -> String {
             );
         }
     }
+    if !cfg.kernel.projects.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "This node may change things. It may touch the Incus project {} and the bridge {}{}.",
+            arca_netproject::PROJECT,
+            arca_netproject::BRIDGE,
+            cfg.kernel
+                .service_cidr
+                .as_deref()
+                .map(|cidr| format!(" on {cidr}"))
+                .unwrap_or_default()
+        ));
+        for more in [
+            "And, each only from a card you approve: snapshots (the pools they are kept in and the project arcak-snapshots) and the GPU devices of its own instances. Nothing else.".to_string(),
+            "Arca never writes in \"default\"; that entry in kernel.droiddProjects only names it as not Arca's.".to_string(),
+            format!(
+                "The service templates it creates from are in {}. A database comes from the postgres-autopg one.",
+                cfg.state_dir.join("templates").display()
+            ),
+            "What an assistant proposes runs only after you approve it with your passkey on the approval page.".to_string(),
+        ] {
+            lines.push(format!("  - {more}"));
+        }
+        // Who does not wait for the page, by name, and what such a token may do: init says it before it asks, and
+        // this is where it stays readable afterwards.
+        lines.push(String::new());
+        for line in tokens.words(config, cfg.kernel.tenants.is_some()) {
+            lines.push(line.replace(" may then change ", " may change "));
+        }
+    } else if cfg.kernel.service_cidr.is_some() {
+        // A node that was set back to watch-only: what `arca init --watch-only` no longer prints.
+        lines.push(String::new());
+        lines.push(format!(
+            "This node only looks: it starts, stops, creates and removes nothing, and a proposal that waits cannot run. If it made changes before, nothing was removed: the Incus project {}, its bridge, the services in it, your passkeys and every other key of the config are as they were.",
+            arca_netproject::PROJECT
+        ));
+        lines.push(
+            "  - The reading tools still show what is there (service_list, service_status, service_logs and the others), and every answer says that the node only looks. Every tool that would change something is refused with that same sentence.".to_string(),
+        );
+    }
+    let kept = {
+        let mut name = config.as_os_str().to_owned();
+        name.push(".before-init");
+        std::path::PathBuf::from(name)
+    };
+    if kept.is_file() {
+        lines.push(String::new());
+        lines.push(format!(
+            "arca init kept the config as it was before its last change at {}.",
+            kept.display()
+        ));
+    }
     if let Some(origin) = &cfg.approval_origin {
         lines.push(String::new());
-        if arca_approval::localhost_origin_port(origin).is_some() {
+        if let Some(port) = arca_approval::localhost_origin_port(origin) {
             lines.push(format!(
                 "The approval page, {origin}/approve, is the page of this machine alone."
             ));
@@ -93,10 +157,13 @@ pub fn security(cfg: &NodeConfig, config: &Path) -> String {
                 "It is for a machine where every account, and every agent that shares its network, is trusted: a program that holds the page's port while the node does not is the page, and what you type or sign there is that program's.",
                 "Before you type a setup code or approve for the first time, check that `arca status` says the page is open.",
                 "Other accounts of this machine can read the waiting cards and decline them. They cannot approve.",
-                "A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain.",
+                "A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain; the guide's section \"The approval page\" says how.",
             ] {
                 lines.push(format!("  - {caution}"));
             }
+            lines.push(format!(
+                "  - To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>, then open {origin}/approve in its browser. If ssh warns that it could not bind the port, close it: another port will not work, since the page's address names this one."
+            ));
         } else {
             lines.push(format!(
                 "The approval page is {origin}/approve. Who can reach it is decided by what serves that name in front of the node."
@@ -123,6 +190,7 @@ pub(crate) fn words(
     cfg: &NodeConfig,
     config: &Path,
     tokens: &DirectTokens,
+    screen: bool,
 ) -> String {
     let text = |key: &str| status[key].as_str().unwrap_or("unknown");
     let watch_only = text("mode") == "watch-only";
@@ -239,13 +307,25 @@ pub(crate) fn words(
     }
     lines.push(format!(
         "Next: {}",
-        next_step(watch_only, incus, page, config)
+        next_step(watch_only, incus, page, config, screen)
+    ));
+    // One pointer to everything that is not the next step: who can reach what, what Arca may touch, the way to the
+    // page from another computer, and what a phone needs.
+    lines.push(format!(
+        "More: arca status --security --config {}",
+        config.display()
     ));
     lines.join("\n")
 }
 
 /// The one thing to do next: the fault first, then what stands between the owner and the first approved change.
-fn next_step(watch_only: bool, incus: Option<bool>, page: Option<&Value>, config: &Path) -> String {
+fn next_step(
+    watch_only: bool,
+    incus: Option<bool>,
+    page: Option<&Value>,
+    config: &Path,
+    screen: bool,
+) -> String {
     let config = config.display();
     if incus == Some(false) {
         return "Incus does not answer on incus.socket of the config. Check that Incus runs and that this user may use its socket.".to_string();
@@ -260,24 +340,44 @@ fn next_step(watch_only: bool, incus: Option<bool>, page: Option<&Value>, config
     };
     let url = page["url"].as_str().unwrap_or_default();
     if page["open"] != json!(true) {
-        return "the approval page is closed. Type no setup code and approve nothing at that address until this says it is open.".to_string();
+        return "the approval page is closed. Type no setup code and approve nothing at that address until `arca status` says it is open.".to_string();
     }
     if page["passkeys"].as_u64() == Some(0) {
-        let mut step = format!(
-            "enrol your passkey: until one is trusted, nothing can be approved. Open {url} and press \"Get a setup code\". On a machine with no screen, this prints the code: arca setup-code --config {config}"
-        );
-        // The page of this machine alone: how to bring it to the person's own computer, and what it cannot do.
-        if let Some(port) = url
-            .strip_suffix("/approve")
-            .and_then(arca_approval::localhost_origin_port)
-        {
-            step.push_str(&format!(
-                "\n      No browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>\n      Then open {url} in its browser: the page is this node's. If ssh warns that it could not bind the port, close it: another port will not work, since the page's address names this one.\n      A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain; the guide's section \"The approval page\" says how."
-            ));
-        }
-        return step;
+        return enrol_step(url, &config.to_string(), screen);
     }
     format!("nothing is needed. Ask your assistant; what it proposes waits for you at {url}")
+}
+
+/// The one step that enrols the first passkey, for the person at this terminal. With a screen it is the page and its
+/// button. Without one, the code comes from this terminal, and for the page of this machine alone the way to open it
+/// from the person's own computer is part of the step, with what it cannot do; with a screen those lines are not
+/// the next step, and `arca status --security` has them.
+pub(crate) fn enrol_step(url: &str, config: &str, screen: bool) -> String {
+    if screen {
+        return format!(
+            "enrol your passkey: open {url} and press \"Get a setup code\". Until one is trusted, nothing can be approved."
+        );
+    }
+    let mut step = format!(
+        "enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config {config}"
+    );
+    if let Some(port) = url
+        .strip_suffix("/approve")
+        .and_then(arca_approval::localhost_origin_port)
+    {
+        step.push_str(&format!(
+            "\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>, then open {url} there.\n      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain."
+        ));
+    }
+    step
+}
+
+/// Whether the person at this terminal has a screen here: a graphical session names its display. A terminal reached
+/// over ssh, or a machine with no desktop, names none. It decides which next step is shown, nothing else.
+pub(crate) fn has_screen() -> bool {
+    ["DISPLAY", "WAYLAND_DISPLAY"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
 }
 
 /// A count of seconds as the two largest units that are not zero.
@@ -307,6 +407,9 @@ fn uptime(seconds: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last line of every status: the one pointer to the rest.
+    const MORE: &str = "\nMore: arca status --security --config /home/u/.config/arca/node.json";
 
     /// A node none of whose tokens does more than look and propose.
     fn quiet() -> DirectTokens {
@@ -351,6 +454,7 @@ mod tests {
             &config(json!({})),
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert_eq!(
             text,
@@ -363,7 +467,8 @@ mod tests {
              MCP door: open, on the unix socket /run/user/1000/arca.sock\n\
              Changes: off. This node only looks\n\
              Approval page: none\n\
-             Next: this node only looks. To let it make changes, with what is proposed waiting for your approval: arca init --enable-changes --config /home/u/.config/arca/node.json"
+             Next: this node only looks. To let it make changes, with what is proposed waiting for your approval: arca init --enable-changes --config /home/u/.config/arca/node.json\n\
+             More: arca status --security --config /home/u/.config/arca/node.json"
         );
     }
 
@@ -374,6 +479,7 @@ mod tests {
             &config(json!({})),
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert!(
             text.contains("Mode: kernel (it may make changes)"),
@@ -381,7 +487,7 @@ mod tests {
         );
         assert!(text.contains("Incus: does not answer"), "{text}");
         assert!(
-            text.ends_with("Next: Incus does not answer on incus.socket of the config. Check that Incus runs and that this user may use its socket."),
+            text.ends_with(&format!("{}{MORE}", "Next: Incus does not answer on incus.socket of the config. Check that Incus runs and that this user may use its socket.")),
             "{text}"
         );
     }
@@ -391,7 +497,7 @@ mod tests {
         let cfg = config(json!({ "loopback": "127.0.0.1:7471" }));
         let mut open = answer("watch-only", true);
         open["loopback"] = json!({ "addr": "127.0.0.1:7471", "open": true, "reason": null });
-        let text = words(&open, &cfg, Path::new(CONFIG), &quiet());
+        let text = words(&open, &cfg, Path::new(CONFIG), &quiet(), true);
         assert!(
             text.contains(
                 "MCP door for a client on this machine: open, at http://127.0.0.1:7471/mcp"
@@ -405,7 +511,7 @@ mod tests {
             "addr": "127.0.0.1:7471", "open": false,
             "reason": "address in use: another program holds this port"
         });
-        let text = words(&closed, &cfg, Path::new(CONFIG), &quiet());
+        let text = words(&closed, &cfg, Path::new(CONFIG), &quiet(), true);
         assert!(
             text.contains("MCP door for a client on this machine: CLOSED. The node does not hold 127.0.0.1:7471 (address in use: another program holds this port). Send no token there; the node keeps trying the address"),
             "{text}"
@@ -417,6 +523,7 @@ mod tests {
             &cfg,
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert!(
             text.contains("Config also names: the loopback address 127.0.0.1:7471 (from the config file, not checked)"),
@@ -428,6 +535,7 @@ mod tests {
             &config(json!({ "loopback": null })),
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert!(
             !text.contains("loopback") && !text.contains("client on this machine"),
@@ -441,7 +549,13 @@ mod tests {
             "tailnet": "100.64.0.1:8443",
             "proxy": { "addr": "127.0.0.1:8080", "peer": "127.0.0.1" }
         }));
-        let text = words(&answer("kernel", true), &cfg, Path::new(CONFIG), &quiet());
+        let text = words(
+            &answer("kernel", true),
+            &cfg,
+            Path::new(CONFIG),
+            &quiet(),
+            true,
+        );
         assert!(
             text.contains("Config also names: the tailnet address 100.64.0.1:8443 (from the config file, not checked)"),
             "{text}"
@@ -456,7 +570,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with("Next: changes are on, and this node has no approval page, so nothing can be approved. The guide's section \"The approval page\" says how to give it one."),
+            text.ends_with(&format!("{}{MORE}", "Next: changes are on, and this node has no approval page, so nothing can be approved. The guide's section \"The approval page\" says how to give it one.")),
             "{text}"
         );
     }
@@ -475,31 +589,47 @@ mod tests {
         let cfg = config(json!({ "loopback": "127.0.0.1:7471" }));
         let page = "http://localhost:7471/approve";
 
-        // No passkey yet: the page, that nothing can be approved, how to enrol, the line for a machine with no
-        // screen with this node's own config, the way from the person's own computer, and no promise of a phone.
+        // No passkey yet, at a terminal with a screen: the next step is ONE line, the page and its button. The way
+        // from another computer and the sentence about a phone are not the next step here, so they are not printed:
+        // the pointer names where they are.
         let text = words(
             &with_page(page, true, None, Some(0)),
             &cfg,
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert!(
-            text.contains(
-                "Changes: on. Each one waits for the owner's approval with a passkey: no token of this node may do more than look and propose\n\
-                 Approval page: http://localhost:7471/approve (open)\n\
+            text.ends_with(&format!(
+                "{}{MORE}",
+                "Approval page: http://localhost:7471/approve (open)\n\
                  Passkeys: none trusted yet, so nothing can be approved\n\
-                 Next: enrol your passkey: until one is trusted, nothing can be approved. Open http://localhost:7471/approve and press \"Get a setup code\". On a machine with no screen, this prints the code: arca setup-code --config /home/u/.config/arca/node.json\n"
-            ),
+                 Next: enrol your passkey: open http://localhost:7471/approve and press \"Get a setup code\". Until one is trusted, nothing can be approved."
+            )),
             "{text}"
+        );
+        assert!(!text.contains("ssh ") && !text.contains("phone"), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("Next: "))
+                .count(),
+            1
+        );
+
+        // The same node from a terminal with no screen: the code comes from this terminal, and now the way to open
+        // the page from the person's own computer, and what a phone needs, are the next step and are said.
+        let text = words(
+            &with_page(page, true, None, Some(0)),
+            &cfg,
+            Path::new(CONFIG),
+            &quiet(),
+            false,
         );
         assert!(
-            text.contains("No browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>"),
+            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve there.\n      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain."),
             "{text}"
         );
-        assert!(
-            text.ends_with("A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain; the guide's section \"The approval page\" says how."),
-            "{text}"
-        );
+        assert!(text.ends_with(MORE), "{text}");
 
         // A passkey is trusted: nothing is needed, and the page is where proposals wait.
         let text = words(
@@ -507,10 +637,11 @@ mod tests {
             &cfg,
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert!(text.contains("Passkeys: 2 trusted\n"), "{text}");
         assert!(
-            text.ends_with("Next: nothing is needed. Ask your assistant; what it proposes waits for you at http://localhost:7471/approve"),
+            text.ends_with(&format!("{}{MORE}", "Next: nothing is needed. Ask your assistant; what it proposes waits for you at http://localhost:7471/approve")),
             "{text}"
         );
         assert!(!text.contains("ssh "), "{text}");
@@ -522,6 +653,7 @@ mod tests {
             &cfg,
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert!(
             text.contains(&format!(
@@ -530,7 +662,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with("Next: the approval page is closed. Type no setup code and approve nothing at that address until this says it is open."),
+            text.ends_with(&format!("{}{MORE}", "Next: the approval page is closed. Type no setup code and approve nothing at that address until `arca status` says it is open.")),
             "{text}"
         );
         assert!(!text.contains("press \"Get a setup code\""), "{text}");
@@ -541,9 +673,10 @@ mod tests {
             &cfg,
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert!(
-            text.contains("Open https://arca.example.com/approve and press"),
+            text.contains("open https://arca.example.com/approve and press"),
             "{text}"
         );
         assert!(!text.contains("ssh ") && !text.contains("phone"), "{text}");
@@ -554,6 +687,7 @@ mod tests {
             &cfg,
             Path::new(CONFIG),
             &quiet(),
+            true,
         );
         assert!(
             text.contains("Passkeys: the node is busy with a change and did not say\n"),
@@ -563,7 +697,13 @@ mod tests {
         // A node that says nothing of a page while its config names one: said as exactly that, never as open.
         let mut named: NodeConfig = config(json!({ "loopback": "127.0.0.1:7471" }));
         named.approval_origin = Some("http://localhost:7471".to_string());
-        let text = words(&answer("kernel", true), &named, Path::new(CONFIG), &quiet());
+        let text = words(
+            &answer("kernel", true),
+            &named,
+            Path::new(CONFIG),
+            &quiet(),
+            true,
+        );
         assert!(
             text.contains("Approval page: the config names http://localhost:7471/approve, and the node did not say whether it serves it"),
             "{text}"
@@ -574,8 +714,15 @@ mod tests {
     #[test]
     fn changes_on_says_each_one_waits_only_where_no_token_changes_things_without_the_page() {
         let cfg = config(json!({}));
-        let on =
-            |tokens: &DirectTokens| words(&answer("kernel", true), &cfg, Path::new(CONFIG), tokens);
+        let on = |tokens: &DirectTokens| {
+            words(
+                &answer("kernel", true),
+                &cfg,
+                Path::new(CONFIG),
+                tokens,
+                true,
+            )
+        };
         // A doctor or operator token does not wait for the page: it is named, with the way to take it away, and the
         // plain sentence, which would be false, is not printed. This holds on a node with no page too.
         let text = on(&DirectTokens::Read(vec![
@@ -606,6 +753,7 @@ mod tests {
             &cfg,
             Path::new(CONFIG),
             &DirectTokens::Read(vec!["doctor-1 (doctor)".to_string()]),
+            true,
         );
         assert!(
             text.contains("Changes: off. This node only looks\n"),
@@ -620,6 +768,7 @@ mod tests {
         let text = security(
             &config(json!({ "loopback": "127.0.0.1:7471" })),
             Path::new(CONFIG),
+            &quiet(),
         );
         for said in [
             "What to know about the doors of the node that /home/u/.config/arca/node.json describes.",
@@ -635,7 +784,7 @@ mod tests {
         assert!(!text.contains("approval page"), "{text}");
 
         // No door: no caution about one.
-        let text = security(&config(json!({})), Path::new(CONFIG));
+        let text = security(&config(json!({})), Path::new(CONFIG), &quiet());
         assert!(
             text.contains("This node has no HTTP door on this machine"),
             "{text}"
@@ -645,7 +794,7 @@ mod tests {
         // The page of this machine alone brings its own.
         let mut local: NodeConfig = config(json!({ "loopback": "127.0.0.1:7471" }));
         local.approval_origin = Some("http://localhost:7471".to_string());
-        let text = security(&local, Path::new(CONFIG));
+        let text = security(&local, Path::new(CONFIG), &quiet());
         for said in [
             "The approval page, http://localhost:7471/approve, is the page of this machine alone.",
             "every account, and every agent that shares its network, is trusted",
@@ -653,6 +802,89 @@ mod tests {
         ] {
             assert!(text.contains(said), "{said:?} is missing:\n{text}");
         }
+    }
+
+    /// `arca init` ends in a handful of lines and one pointer here. Every sentence that left its report is in these
+    /// words: what the node may touch, the tokens that do not wait and what they may do, where the templates and the
+    /// old config are, the way to the page from another computer, and what a node set back to watch-only keeps.
+    #[test]
+    fn what_left_inits_report_is_said_by_status_security() {
+        let scratch = std::env::temp_dir().join(format!(
+            "arca-status-security-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        std::fs::create_dir_all(&scratch).expect("a scratch directory");
+        let path = scratch.join("node.json");
+
+        let mut changing: NodeConfig = config(json!({ "loopback": "127.0.0.1:7471" }));
+        changing.approval_origin = Some("http://localhost:7471".to_string());
+        changing.kernel.projects = vec![arca_netproject::PROJECT.to_string()];
+        changing.kernel.droidd_projects = vec!["default".to_string()];
+        changing.kernel.service_cidr = Some("10.47.0.0/24".to_string());
+        let direct = DirectTokens::Read(vec!["ops (doctor)".to_string()]);
+
+        let text = security(&changing, &path, &direct);
+        for said in [
+            format!(
+                "This node may change things. It may touch the Incus project {} and the bridge {} on 10.47.0.0/24.",
+                arca_netproject::PROJECT,
+                arca_netproject::BRIDGE
+            ),
+            "each only from a card you approve: snapshots (the pools they are kept in and the project arcak-snapshots) and the GPU devices of its own instances. Nothing else.".to_string(),
+            "Arca never writes in \"default\"; that entry in kernel.droiddProjects only names it as not Arca's.".to_string(),
+            "The service templates it creates from are in /nonexistent/state/templates. A database comes from the postgres-autopg one.".to_string(),
+            "NOT every change waits for you. This node has 1 token(s) that may change things directly,".to_string(),
+            "    ops (doctor)".to_string(),
+            "create a database".to_string(),
+            format!("To take one away first: arca token revoke <id> --config {}", path.display()),
+            "To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve in its browser. If ssh warns that it could not bind the port, close it".to_string(),
+            "A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain".to_string(),
+            "check that `arca status` says the page is open".to_string(),
+        ] {
+            assert!(text.contains(&said), "{said:?} is missing:\n{text}");
+        }
+        // No config was kept yet, so none is named; once init kept one, it is.
+        assert!(!text.contains(".before-init"), "{text}");
+        std::fs::write(scratch.join("node.json.before-init"), "{}").expect("the kept config");
+        let text = security(&changing, &path, &direct);
+        assert!(
+            text.contains(&format!(
+                "arca init kept the config as it was before its last change at {}.before-init.",
+                path.display()
+            )),
+            "{text}"
+        );
+
+        // With no such token, that is said, and nothing is named.
+        let text = security(&changing, &path, &quiet());
+        assert!(
+            text.contains("No token of this node may do more than look and propose, so every change waits for your passkey."),
+            "{text}"
+        );
+        assert!(!text.contains("NOT every change"), "{text}");
+
+        // Set back to watch-only: what was kept, and that the reading tools still answer.
+        changing.kernel.projects.clear();
+        let text = security(&changing, &path, &direct);
+        for said in [
+            "This node only looks: it starts, stops, creates and removes nothing, and a proposal that waits cannot run.",
+            "nothing was removed: the Incus project arcak-svc, its bridge, the services in it, your passkeys and every other key of the config are as they were.",
+            "The reading tools still show what is there (service_list, service_status, service_logs and the others), and every answer says that the node only looks. Every tool that would change something is refused with that same sentence.",
+        ] {
+            assert!(text.contains(said), "{said:?} is missing:\n{text}");
+        }
+        assert!(!text.contains("may change things"), "{text}");
+
+        // A node that never changed anything is told none of it.
+        let text = security(&config(json!({})), &path, &quiet());
+        assert!(
+            !text.contains("only looks") && !text.contains("may change things"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[test]

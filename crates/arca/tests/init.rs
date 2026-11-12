@@ -54,7 +54,11 @@ fn arca() -> Command {
     command
         .env("HOME", "/nonexistent/arca-test-home")
         .env_remove("ARCA_CONFIG")
-        .env_remove("ARCA_TOKEN_FILE");
+        .env_remove("ARCA_TOKEN_FILE")
+        // No screen, unless a test says there is one: what `init` and `status` say next depends on it, and must not
+        // depend on where the tests run.
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
     command
 }
 
@@ -515,6 +519,12 @@ impl Said {
         self
     }
 
+    /// The last `count` lines of what it printed: its closing report.
+    fn report(&self, count: usize) -> Vec<&str> {
+        let lines: Vec<&str> = self.out.lines().collect();
+        lines[lines.len().saturating_sub(count)..].to_vec()
+    }
+
     fn never_says(&self, words: &str) -> &Said {
         assert!(
             !self.all().contains(words),
@@ -584,8 +594,8 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         "the shipped templates"
     );
 
-    // What it said: what was read to call the network free, what Arca may now touch, that the owner's passkey is
-    // still the gate, that no passkey exists yet and how to get the first, and the one line that goes back.
+    // What it said: before the question, what was read to call the network free. After it, five lines: what
+    // changed, who waits, ONE next step, where a database comes from, and one pointer to the rest.
     let config = node.config.display().to_string();
     said.says(&format!("kernel.serviceCidr: {cidr}"))
         .says("route(s) in /proc/net/route")
@@ -595,34 +605,57 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         // Nobody restarted the node, so the words do not claim it has taken the change up.
         .says("The config now lets Arca make changes on this machine. The node takes that up when it next starts.")
         .never_says("Arca may now make changes on this machine.")
+        .never_says("import");
+    assert_eq!(
+        said.report(5),
+        [
+            "The config now lets Arca make changes on this machine. The node takes that up when it next starts.".to_string(),
+            "No token of this node may do more than look and propose, so every change waits for your passkey.".to_string(),
+            // The node was not restarted, so that is the one next step; the passkey comes after it.
+            format!("Next: restart the node. This is not the installer's service, so init did not: stop the node and start it again with: arca serve --config {config}. Then `arca status --config {config}` says what comes next."),
+            "A database: ask your assistant for the postgres-autopg service.".to_string(),
+            format!("More: `arca status --config {config}` says what is open and what comes next; with --security, what Arca may touch and who can reach it. To go back to a node that only looks: arca init --watch-only --config {config}"),
+        ],
+        "{}",
+        said.all()
+    );
+    // What is no longer on that screen: what Arca may touch, the page's cautions, the way from another computer,
+    // the phone, where the old config is.
+    for gone in [
+        "It may touch",
+        "the GPU devices",
+        "every account is trusted",
+        "ssh ",
+        "phone",
+        "before-init",
+        "setup-code",
+    ] {
+        said.never_says(gone);
+    }
+    // Nothing was deleted: the one command the report names says each of them, from the config alone.
+    let mut security = arca();
+    let rest = node.run(security.args(["status", "--security"]), "");
+    rest.ok()
         .says(&format!(
-            "It may touch: the Incus project arcak-svc, and the bridge arcak-svcbr on {cidr}."
+            "This node may change things. It may touch the Incus project arcak-svc and the bridge arcak-svcbr on {cidr}."
         ))
         .says("And, each only from a card you approve: snapshots")
         .says("and the GPU devices of its own instances. Nothing else.")
+        .says("Arca never writes in \"default\"; that entry in kernel.droiddProjects only names it as not Arca's.")
+        .says("A database comes from the postgres-autopg one.")
         .says("No token of this node may do more than look and propose, so every change waits for your passkey.")
-        .says("Arca never writes in \"default\"; the entry in kernel.droiddProjects only names it as not Arca's.")
-        .says("What an assistant proposes waits for you: nothing of it runs until you approve it with your")
-        .says(&format!("passkey on the page: http://localhost:{}/approve", node.port))
-        .says("No passkey is trusted yet, so nothing can be approved until you enrol the first one.")
-        .says(&format!("arca setup-code --config {config}"))
-        .says("That page is for a machine where every account is trusted.")
-        .says(&format!("    arca status --config {config}"))
-        // A machine with no screen: the one line that brings the page to the person's own computer, and no phone.
-        .says("No browser on this machine? On your own computer run:")
+        .says("It is for a machine where every account, and every agent that shares its network, is trusted")
+        .says("check that `arca status` says the page is open")
         .says(&format!(
-            "    ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>",
+            "To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>, then open http://localhost:{0}/approve in its browser.",
             node.port
         ))
+        .says("If ssh warns that it could not bind the port, close it")
+        .says("A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain")
         .says(&format!(
-            "Then open http://localhost:{}/approve in its browser: the page is this node's.",
-            node.port
-        ))
-        .says("A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet")
-        .says("this is not the installer's service, so init did not")
-        .says(&format!("arca serve --config {config}"))
-        .says(&format!("arca init --watch-only --config {config}"))
-        .never_says("import");
+            "arca init kept the config as it was before its last change at {}.",
+            node.backup().display()
+        ));
 
     // The node itself: it may change things, an assistant's token may only propose, and a proposal runs nothing.
     let mut serve = Serve::start(&node.config, node.scratch.at("serve-1.log"));
@@ -658,6 +691,33 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         !instance_exists(&node.fake, "nats"),
         "a proposal runs nothing"
     );
+    // A database, on the node init leaves. Init sets no image for a proposed postgres_create, so that proposal is
+    // refused, and the refusal names the way that works here today; that way is taken, and waits like any change.
+    let refused = mcp(
+        &node.socket,
+        &viewer,
+        "action_propose",
+        json!({ "action": "postgres_create", "args": { "name": "db1" } }),
+    );
+    let why = refused.to_string();
+    assert!(
+        why.contains("kernel.postgresImage")
+            && why.contains("propose service_create with the template postgres-autopg"),
+        "the refusal names what works: {why}"
+    );
+    result(
+        &mcp(
+            &node.socket,
+            &viewer,
+            "action_propose",
+            json!({ "action": "service_create", "args": { "name": "db1", "template": "postgres-autopg" } }),
+        ),
+        "action_propose",
+    );
+    assert!(
+        !instance_exists(&node.fake, "db1"),
+        "a proposal runs nothing"
+    );
     assert_eq!(serve.terminate(), Some(0), "{}", serve.log_text());
 
     // A second run finds everything said already, asks nothing and writes nothing.
@@ -673,11 +733,26 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
     let back = node.init(&["--watch-only"], "");
     back.ok()
         // Nobody restarted the node: the words must not say it only looks while it may still be changing things.
-        .says("The config now says watch-only. The node that is running STILL MAKES CHANGES until it is restarted:")
         .never_says("Arca now only looks on this machine")
-        .says("Nothing was removed.")
-        .says("service_list answers \"no service project\"")
-        .says(&format!("arca init --enable-changes --config {config}"));
+        .never_says("service_list");
+    assert_eq!(
+        back.report(4),
+        [
+            "The config now says watch-only. The node that is running STILL MAKES CHANGES until it is restarted: it reads its config only when it starts.".to_string(),
+            format!("Next: restart the node. This is not the installer's service, so init did not: stop the node and start it again with: arca serve --config {config}. Then `arca status --config {config}` says what comes next."),
+            "Nothing was removed: the Incus project arcak-svc, its bridge, the services in it and your passkeys are as they were.".to_string(),
+            format!("More: `arca status --config {config}`; with --security, what was kept and where. To let it make changes again: arca init --enable-changes --config {config}"),
+        ],
+        "{}",
+        back.all()
+    );
+    // What left that report is where it points.
+    let mut security = arca();
+    node.run(security.args(["status", "--security"]), "")
+        .ok()
+        .says("This node only looks: it starts, stops, creates and removes nothing, and a proposal that waits cannot run.")
+        .says("The reading tools still show what is there (service_list, service_status, service_logs and the others), and every answer says that the node only looks. Every tool that would change something is refused with that same sentence.")
+        .says(&format!("{}.", node.backup().display()));
     let mut expected = serde_json::from_str::<Value>(&enabled).expect("JSON");
     expected["kernel"]["projects"] = json!([]);
     assert_eq!(node.read(), expected);
@@ -693,6 +768,16 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
             "arca_status"
         )["mode"],
         json!("watch-only")
+    );
+    // What `arca status --security` said of such a node is the node's own behaviour: a reading tool still answers,
+    // and its answer carries the one sentence of a node that only looks.
+    let listed = mcp(&node.socket, &viewer, "service_list", json!({}));
+    result(&listed, "service_list");
+    assert!(
+        listed.to_string().contains(
+            "this node only looks: nothing here can be changed until the node is running with changes turned on"
+        ),
+        "{listed}"
     );
     assert_eq!(serve.terminate(), Some(0));
     let watching = node.text();
@@ -749,13 +834,26 @@ fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks
     assert_eq!(node.text(), before);
     assert!(!node.backup().exists());
 
-    // After a yes the closing words say it again: the passkey gates what is proposed, not what such a token does.
+    // After a yes the short report says it again, by name, on its second line: the passkey gates what is proposed,
+    // not what such a token does. That line never leaves the first screen.
     let said = node.init(&["--enable-changes"], "y\n\n");
-    said.ok()
-        .says("What an assistant proposes waits for you: nothing of it runs until you approve it with your")
-        .says("  NOT every change waits for you. This node has 1 token(s) that may then change things directly,")
-        .says("      doctor-1 (doctor)")
-        .never_says("every change waits for your passkey");
+    said.ok().never_says("every change waits for your passkey");
+    assert_eq!(
+        said.report(5)[1],
+        format!(
+            "NOT every change waits for you: these tokens change things directly, with no card and no passkey: doctor-1 (doctor). To take one away: arca token revoke <id> --config {}",
+            node.config.display()
+        ),
+        "{}",
+        said.all()
+    );
+    // And the pointer's command says what such a token may do.
+    let mut security = arca();
+    node.run(security.args(["status", "--security"]), "")
+        .ok()
+        .says("NOT every change waits for you. This node has 1 token(s) that may change things directly,")
+        .says("    doctor-1 (doctor)")
+        .says("create a database");
 
     // With only tokens that look and propose, the plain sentence is true, and it is the one printed.
     let node = Installed::new("no-direct-tokens");
@@ -1079,7 +1177,6 @@ fn an_approval_page_the_config_already_names_is_kept_whichever_kind_it_is() {
     let said = node.init(&["--enable-changes", "--yes"], "");
     said.ok()
         .says("https://arca.example.com/approve, the page this config already names: it is kept as it is")
-        .says("passkey on the page: https://arca.example.com/approve")
         .never_says("localhost")
         .never_says("ssh ")
         .never_says("A phone cannot open this page")
@@ -1157,14 +1254,15 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
     .expect("the unit");
     run(&["--enable-changes", "--yes"])
         .ok()
-        .says("this is not the installer's service, so init did not");
+        .says("This is not the installer's service, so init did not");
     assert_eq!(calls(), "");
 
     // The installer's unit runs this config: it is restarted, once, and with no token there is nobody to ask.
     fs::write(units.join("arca.service"), unit(&node.config)).expect("the unit");
     run(&["--watch-only"])
         .ok()
-        .says("The node was restarted. There is no token to ask it with");
+        .says("The config now says watch-only, and the node was restarted. There is no token to ask it with, so take it that the node STILL MAKES CHANGES until")
+        .never_says("Arca now only looks");
     assert_eq!(calls(), "--user restart arca.service\n");
 
     // A unit that is not the installer's, though it has the same name and runs this config, is the owner's.
@@ -1175,12 +1273,65 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
     .expect("the unit");
     run(&["--enable-changes", "--yes"])
         .ok()
-        .says("this is not the installer's service, so init did not");
+        .says("This is not the installer's service, so init did not");
     assert_eq!(
         calls(),
         "--user restart arca.service\n",
         "no second restart"
     );
+
+    // The installer's own unit again, so the node is restarted and the next step is the passkey. At a terminal with
+    // a screen that is ONE line, the page and its button; the way from another computer and the phone are not said.
+    fs::write(units.join("arca.service"), unit(&node.config)).expect("the unit");
+    let config = node.config.display().to_string();
+    let page = format!("http://localhost:{}/approve", node.port);
+    let screen = |display: Option<&str>| {
+        let mut command = arca();
+        command
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .args(["init", "--enable-changes", "--yes"]);
+        if let Some(display) = display {
+            command.env("DISPLAY", display);
+        }
+        node.run(&mut command, "")
+    };
+    let said = screen(Some(":0"));
+    said.ok()
+        .never_says("ssh ")
+        .never_says("phone")
+        .never_says("setup-code");
+    assert_eq!(
+        said.report(5)[2],
+        format!(
+            "Next: enrol your passkey: open {page} and press \"Get a setup code\". Until one is trusted, nothing can be approved."
+        ),
+        "{}",
+        said.all()
+    );
+    assert_eq!(said.out.matches("Next: ").count(), 1, "{}", said.all());
+
+    // No screen: the code comes from this terminal, and the way to the page from the person's own computer, with
+    // what a phone needs, is the next step and is said.
+    let said = screen(None);
+    said.ok()
+        .says(&format!(
+            "Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config {config}"
+        ))
+        .says(&format!(
+            "      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>, then open {page} there.",
+            node.port
+        ))
+        .says("      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain.");
+    assert_eq!(said.out.matches("Next: ").count(), 1, "{}", said.all());
+    assert_eq!(calls().lines().count(), 3, "one restart per run");
 }
 
 /// `arca status` on a node that may change things: a doctor token does not wait for the approval page, so status names

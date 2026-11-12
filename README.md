@@ -64,6 +64,8 @@ This gives you a node that only looks: it reads your machines and changes nothin
 
 Your agents and everything around them: **Postgres** · **NATS** · **Omni** · **Automagik** · **tunnels** · **workspaces** · **build runners**.
 
+Each comes from a template Arca ships. After `arca init --enable-changes`, ask your assistant for one by its name, and approve it on the page: a database is the `postgres-autopg` service.
+
 ## Yours
 
 Open source, Apache-2.0. Self-hosted. Arca itself needs no outside service to work.
