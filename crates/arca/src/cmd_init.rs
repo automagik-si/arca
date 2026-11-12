@@ -686,7 +686,9 @@ impl Node<'_> {
             path: self.path.clone(),
             origin: Origin::Flag,
         };
-        let addressed = Addressed::new(&chosen, &self.cfg, false);
+        // The hints this builds name the node by its config alone: the command that makes a node read its tokens again
+        // is `arca token reload --config <path>`, which needs no state directory.
+        let addressed = Addressed::new(&chosen, false);
         let Ok(token) =
             crate::token_path(self.flags).and_then(|file| read_token(&file, &addressed))
         else {
