@@ -3486,16 +3486,23 @@ Where a virtual machine's secret is, and is not:
   answer or refusal. `service_logs`, a failed command's words and a function's output replace a stored value with
   `[secret]`: whole, and for a value of several lines (a key file) each of its lines of 16 characters or more, since a
   log shows it one line at a time. A shorter line of such a value is not hidden by its value: a line of a few
-  characters is ordinary text that a log holds in many places. A piece of 16 or more characters of a stored key's
-  base64 body is hidden too, printed at another width or with each `/` written `\/`. A PEM block in those texts is
-  replaced whole before the text is cut into lines, a stored secret or not, and whatever its label (`RSA PRIVATE KEY`,
-  `OpenVPN Static key V1`): from its `-----BEGIN ...-----` line to its `-----END ...-----` line; when no END line
-  follows, over the lines after the BEGIN line that look like a key (base64 of 16 characters or more, or a PEM header),
-  so what follows the key stays shown; and when a text begins inside a key (an END line with no BEGIN before it), from
-  its start to that END line, so a window of a container's journal that starts inside a key shows none of it.
-  `function_runs` redacts a kept output and a
-  run's line again when it reads them. Still shown: the last line of a key printed without its END line when it is
-  shorter than 16 characters. Certificates, public keys and other public PEM blocks are hidden as `[secret]` too.
+  characters is ordinary text that a log holds in many places. A run of 16 or more base64 characters that lies inside
+  a stored key's body is hidden too, printed at another width or with each `/` written `\/`. A PEM block in those
+  texts is replaced whole before the text is cut into lines, a stored secret or not, and whatever its label (`RSA
+  PRIVATE KEY`, `OpenVPN Static key V1`): from its `-----BEGIN ...-----` line to the next `-----END ...-----` line, of
+  any block; when no END line follows, over the lines after the BEGIN line that look like a key (base64 of 16
+  characters or more, or a PEM header), so what follows the key stays shown; and when a text begins inside a key (an
+  END line with no BEGIN before it), from its start to that END line. So a window of a container's journal that
+  starts inside a key shows none of the key when the key's END line is inside the window. `function_runs` redacts a
+  kept output and a run's line again when it reads them. Certificates, public keys and other public PEM blocks are
+  hidden as `[secret]` too.
+- Known gaps. Still shown: the last line of a key printed without its END line, when it is shorter than 16 characters;
+  for a key that is not a stored secret, after a BEGIN line with no END, its lines that each carry a prefix (a journal's
+  timestamp, a colour code, `key: `), and a key longer than a journal window when neither its BEGIN nor its END line is
+  inside the window; a stored key's base64 printed at another width, where a run of it touches other base64 characters
+  (`key=...`); and a stored key whose letters were changed in case. Hidden beyond a key: a stray END line with no BEGIN
+  before it hides the text from its start, so a function's result that names such a line is hidden too; and a stray
+  BEGIN line hides everything up to the next END line.
 
 **Settings for one service.** A template may let a create replace some of its settings, so that two services of one
 template differ without a second template file. It lists their names in `createSettings`, each a key of its
