@@ -2600,7 +2600,7 @@
           "type": "object"
         }
       },
-      "summary": "Create a service database.",
+      "summary": "Create a Postgres database on the node's service network, in the node's own project: one instance from a digest-pinned image (name@sha256:<64 hex>), with a password Arca generates and keeps; no tool shows it. Returns its name, its entry and the status pending; postgres_list shows when it runs. Nothing reaches it until postgres_link links a consumer. Inside a tenant a database is the postgres service template instead (service_create, then service_connect).",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -2671,7 +2671,7 @@
           "type": "object"
         }
       },
-      "summary": "List a service database.",
+      "summary": "The Postgres databases in the node's own project, each with its name, its entry, its status (pending until it has an address), its address, its port and the consumers linked to it. A node with no database answers an empty list. Never a password or a connection URL. A tenant's databases are services: service_list shows them.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
@@ -2732,7 +2732,7 @@
           "type": "object"
         }
       },
-      "summary": "Link a service database.",
+      "summary": "Link a consumer to a Postgres database: the database's network ACL lets the consumer reach it, and the consumer is given the connection URL under DATABASE_URL for its first database, or DATABASE_URL_<NAME> for each other. Returns the variable names only, never the URL. The consumer is one the node already records (arca probe consumer add); a service is linked with service_connect instead.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -2793,7 +2793,7 @@
           "type": "object"
         }
       },
-      "summary": "Unlink a service database.",
+      "summary": "Remove the link between a consumer and a Postgres database: the database's network ACL stops letting the consumer in, and the consumer loses the connection URL it was given. Returns the names of the variables removed. The database and its data stay.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -2923,7 +2923,7 @@
           "type": "object"
         }
       },
-      "summary": "Delete a service database.",
+      "summary": "Delete a Postgres database and its data. Every consumer's link to it goes, and so do its password and the connection URLs Arca kept. Returns removed: true when it is gone, or the delete plan that waits for the owner's approval (plan_list shows it, approval_submit carries the approval).",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -3797,7 +3797,7 @@
           "type": "object"
         }
       },
-      "summary": "One service's address, ports, links and state.",
+      "summary": "One service, named by its name: its address, its ports, its links and its state, and for a virtual machine the settings it was created with. Never a secret. Use service_list first when the name is not known.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
