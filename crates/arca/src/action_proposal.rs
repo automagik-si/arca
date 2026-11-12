@@ -834,7 +834,8 @@ impl ActionProposal {
 /// The summary and details to show for a proposal read from the journal. A GPU proposal's product is not in its arguments:
 /// the inventory that named it at proposal time may be gone when the kernel next opens. The journal is the kernel's own
 /// private file, so its words are kept for a GPU action when they still carry the proposal's instance and PCI address;
-/// otherwise the rows are rebuilt without a product. Every other action is rebuilt from its arguments, as before.
+/// otherwise the rows are rebuilt without a product. A deploy's parts, why a create is stopped, and what the node
+/// read from its database template are kept the same way. Every other action is rebuilt from its arguments.
 fn loaded_words(
     action: ActionKind,
     args: &Value,
@@ -874,6 +875,27 @@ fn loaded_words(
         let fits = args.get("start") != Some(&Value::Bool(false))
             && stored_start.is_some_and(|row| row.value.starts_with(STOPPED_BECAUSE))
             && without_start(stored_details) == without_start(&rebuilt);
+        return (
+            action.summary(args),
+            if fits {
+                stored_details.to_vec()
+            } else {
+                rebuilt
+            },
+        );
+    }
+    // What the node read from its database template when a database was proposed (that the template generates the
+    // password, or why the database is created stopped) is not in the arguments either: the journal's rows are kept
+    // when they are the rows this action writes for these arguments, with that claim or with such a `Start` row.
+    if action == ActionKind::PostgresCreate && args.get("template").is_some() {
+        let rebuilt = action.details(args);
+        let generated = action.details_with_gpu(args, Some(DATABASE_PASSWORD_GENERATED));
+        let stopped = stored_details.split_last().is_some_and(|(start, rest)| {
+            start.label == "Start"
+                && start.value.starts_with(STOPPED_BECAUSE)
+                && rest == rebuilt.as_slice()
+        });
+        let fits = stopped || stored_details == generated.as_slice();
         return (
             action.summary(args),
             if fits {
@@ -1688,6 +1710,60 @@ mod tests {
         );
         assert!(!path.exists(), "the journal was moved aside");
         assert!(quarantined(&dir.0), "the invalid journal was quarantined");
+    }
+
+    #[test]
+    fn a_databases_card_keeps_what_the_node_read_from_its_template_on_replay() {
+        let action = ActionKind::PostgresCreate;
+        let args = json!({
+            "name": "orders",
+            "template": crate::service::DATABASE_TEMPLATE,
+            "image": PINNED_IMAGE
+        });
+        let reason = "its template needs the secret POSTGRES_PASSWORD, which is not set yet";
+        // Proposed from a template that generates no password: the journal's rows carry the Start row, and a replay
+        // keeps it, so the owner still sees that the database is created stopped.
+        let stopped = action.details_with_gpu(&args, Some(reason));
+        assert_eq!(stopped.last().map(|row| row.label.as_str()), Some("Start"));
+        assert_eq!(stopped.last().unwrap().value, stopped_words(reason));
+        assert_eq!(loaded_words(action, &args, "", &stopped).1, stopped);
+        // Proposed from a template that generates it: the claim is kept too.
+        let generated = action.details_with_gpu(&args, Some(DATABASE_PASSWORD_GENERATED));
+        assert_ne!(generated, action.details(&args));
+        assert_eq!(loaded_words(action, &args, "", &generated).1, generated);
+        // Rows with neither are the rows the arguments give, and stay.
+        let plain = action.details(&args);
+        assert_eq!(loaded_words(action, &args, "", &plain).1, plain);
+        // Rows that do not fit the arguments, a Start row in other words, a second Start row, and a claim on a row
+        // that also says stopped are rebuilt from the arguments alone: no claim, no row.
+        let other = json!({
+            "name": "other",
+            "template": crate::service::DATABASE_TEMPLATE,
+            "image": PINNED_IMAGE
+        });
+        assert_eq!(
+            loaded_words(action, &other, "", &stopped).1,
+            action.details(&other)
+        );
+        assert_eq!(
+            loaded_words(action, &other, "", &generated).1,
+            action.details(&other)
+        );
+        let mut forged = stopped.clone();
+        forged.last_mut().unwrap().value = "Yes: anything".to_string();
+        assert_eq!(loaded_words(action, &args, "", &forged).1, plain);
+        let mut twice = stopped.clone();
+        twice.push(stopped.last().unwrap().clone());
+        assert_eq!(loaded_words(action, &args, "", &twice).1, plain);
+        let mut both = generated.clone();
+        both.push(stopped.last().unwrap().clone());
+        assert_eq!(loaded_words(action, &args, "", &both).1, plain);
+        // A database of the old kind has no such rows: its card is rebuilt from its arguments, as before.
+        let old_kind = json!({ "name": "orders", "image": PINNED_IMAGE });
+        assert_eq!(
+            loaded_words(action, &old_kind, "", &stopped).1,
+            action.details(&old_kind)
+        );
     }
 
     #[test]
