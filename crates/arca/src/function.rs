@@ -753,7 +753,12 @@ mod tests {
             "It can reach pg1 on tcp port 5432 and nats on tcp port 4222, and no other service"
         );
         assert!(row("Private network").starts_with("No:"));
-        assert!(row("Internet").starts_with("No:"));
+        assert!(
+            row("Internet").starts_with("No: it can open no connection to a public address.")
+                && row("Internet").contains("names are looked up through this node's DNS"),
+            "{}",
+            row("Internet")
+        );
         // A private destination, filled in from the node's config when the proposal is made, is said in words.
         args["destinations"] = json!([{ "address": "10.4.0.9", "port": 443 }]);
         let rows = create_rows(&args);

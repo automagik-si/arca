@@ -237,6 +237,11 @@ impl Rig {
     /// Proposes `action` as a viewer, has the owner approve it, and runs it once through the executor.
     fn approved(&self, action: &str, args: Value) -> Result<Value, CallError> {
         let proposal = self.propose(action, args)?;
+        self.approve(action, &proposal)
+    }
+
+    /// Has the owner approve a proposal that waits, and runs it once through the executor.
+    fn approve(&self, action: &str, proposal: &Value) -> Result<Value, CallError> {
         let id = proposal["id"].as_str().expect("an id").to_string();
         let nonce = self.nonce.fetch_add(1, Ordering::SeqCst);
         let statement = arca::handlers::action_statement(
@@ -431,7 +436,15 @@ fn a_function_is_created_only_from_an_approved_proposal_whose_card_names_what_it
         "It can reach nats on tcp port 4222, and no other service"
     );
     assert!(rows["Private network"].starts_with("No:"));
-    assert!(rows["Internet"].starts_with("No:"));
+    // The row says the one way out that stays: names are looked up through the node, which asks the internet.
+    assert!(rows["Internet"].starts_with("No: it can open no connection to a public address."));
+    assert!(
+        rows["Internet"].contains(
+            "names are looked up through this node's DNS, which asks the internet's name servers"
+        ) && rows["Internet"].contains("send a little data out in the names it asks for"),
+        "{}",
+        rows["Internet"]
+    );
 
     let created = rig
         .approved("function_create", relay_args())
@@ -1102,7 +1115,7 @@ fn a_linked_services_secret_never_enters_a_functions_environment() {
 fn a_service_a_function_links_to_is_not_removed_until_the_function_is() {
     let rig = Rig::new();
     rig.relay();
-    let said = "remove service nats: the function relay links to it, and what a function reaches is part of what its owner approved. Remove the function relay first (function_remove); nothing was removed and no approval was spent";
+    let said = "remove service nats: the function relay links to it, and what a function reaches is part of what its owner approved. Remove the function relay first (function_remove); nothing was removed, and no approval was spent";
     // Refused when it is proposed, so the owner is never shown the card.
     let (_, message) = refusal(rig.propose("service_remove", json!({ "name": "nats" })));
     assert_eq!(message, said);
@@ -1135,6 +1148,86 @@ fn a_service_a_function_links_to_is_not_removed_until_the_function_is() {
 }
 
 #[test]
+fn two_approved_actions_in_either_order_never_leave_a_function_linked_to_nothing() {
+    let rig = Rig::new();
+    rig.nats();
+    // The owner is shown the removal of nats while no function links to it, and the card waits.
+    let removal = rig
+        .propose("service_remove", json!({ "name": "nats" }))
+        .expect("the removal is proposed");
+    // Meanwhile a function that links to nats is created.
+    rig.approved("function_create", relay_args())
+        .expect("the function relay");
+    let before = rig.entries();
+    // The kernel itself refuses the removal, whoever calls it and whatever was checked before: it is asked directly
+    // here, as the removal's handler asks it once it holds the write gate.
+    let refused = {
+        let mut kernel = rig.kernel.lock().expect("kernel");
+        let spent = kernel.spend_service_removal_authorized(&arca_kernel::desired::EntryId(
+            "service-nats".to_string(),
+        ));
+        kernel.remove_service_spent(spent, NOW)
+    };
+    assert!(
+        matches!(&refused, Err(arca::kernel::ServiceRemovalError::LinkedFunctions(names)) if names == &["relay".to_string()]),
+        "the kernel refuses, and names the function"
+    );
+    assert_eq!(rig.entries(), before, "no record changed");
+    // Now the owner approves the card that waited. The approval is used up, and the refusal says so.
+    let (_, message) = refusal(rig.approve("service_remove", &removal));
+    assert_eq!(
+        message,
+        "The approval was accepted, but service_remove did not complete: remove service nats: the function relay links to it, and what a function reaches is part of what its owner approved. Remove the function relay first (function_remove); nothing was removed, and the owner's approval is spent, so another try needs a new one"
+    );
+    assert_eq!(rig.entries(), before);
+    assert_eq!(rig.instance("nats")["status"], "Running");
+    // The function is whole: its record is applied as it stands, and it runs.
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    assert_eq!(rig.run("relay")["outcome"], "ok");
+    let egress = rules(&rig.acl("relay"), "egress");
+    assert!(
+        egress
+            .iter()
+            .any(|rule| rule["action"] == "allow" && rule["destination_port"] == "4222")
+    );
+}
+
+#[test]
+fn a_create_that_fails_is_said_as_a_functions_with_the_verbs_that_act_on_one() {
+    let rig = Rig::new();
+    rig.nats();
+    // Incus refuses the new instance.
+    rig.fake.set_reject_config_on_post("/1.0/instances");
+    let (_, message) = refusal(rig.approved("function_create", relay_args()));
+    assert!(
+        message.starts_with(
+            "The approval was accepted, but function_create did not complete: create function relay: "
+        ),
+        "{message}"
+    );
+    for word in [
+        "service relay",
+        "template function",
+        "instance_start",
+        "service_remove",
+        "service_status",
+    ] {
+        assert!(!message.contains(word), "{word} is in: {message}");
+    }
+    assert!(message.ends_with("nothing was left behind"), "{message}");
+    assert!(
+        rig.get(&format!("/1.0/instances/relay?project={PROJECT}"))
+            .is_none()
+    );
+    assert!(
+        rig.call("function_list", json!({})).expect("list")["functions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn a_secret_the_program_prints_escaped_or_spaced_is_in_no_line_result_or_output() {
     let rig = Rig::new();
     rig.nats();
@@ -1142,7 +1235,7 @@ fn a_secret_the_program_prints_escaped_or_spaced_is_in_no_line_result_or_output(
     args["secrets"] = json!(["TOKEN", "PHRASE"]);
     rig.approved("function_create", args).expect("created");
     // One value a JSON encoder must escape, one with two spaces in a row.
-    let token = r#"Tr0ub4dor&3"x\yz"#;
+    let token = r#"Tr0ub4dor&3"x\yz+a='b"#;
     let phrase = "correct  horse battery";
     for (key, value) in [("TOKEN", token), ("PHRASE", phrase)] {
         rig.call(
@@ -1158,7 +1251,7 @@ fn a_secret_the_program_prints_escaped_or_spaced_is_in_no_line_result_or_output(
             "auth failed for {token}\nphrase was {phrase}\n{}\n",
             json!({ "ok": false, "error": format!("auth failed for {token}"), token: 1, "nested": [{ "p": phrase }] })
         ),
-        "{\"ok\":false,\"error\":\"auth failed for Tr0ub4dor\\u00263\\\"x\\\\yz\"}\n".to_string(),
+        "{\"ok\":false,\"error\":\"auth failed for Tr0ub4dor\\u00263\\\"x\\\\yz\\u002Ba\\u003d\\u0027b\"}\n".to_string(),
     ];
     for output in outputs {
         rig.fake.exit_after_start(PROJECT, "relay", 0, &output);
@@ -1190,7 +1283,7 @@ fn a_secret_the_program_prints_escaped_or_spaced_is_in_no_line_result_or_output(
             kept,
             month,
         ] {
-            for part in ["Tr0ub4dor", "x\\yz", "horse"] {
+            for part in ["Tr0ub4dor", "x\\yz", "horse", "a='b", "003d"] {
                 assert!(!text.contains(part), "{part} is in: {text}");
             }
         }

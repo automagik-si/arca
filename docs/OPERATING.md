@@ -4246,8 +4246,9 @@ Arca reads no vault. Whoever holds a value sets it into Arca by name, `function_
 run is given the secrets its definition names and no other, as environment values: nothing else writes a name into a
 function's environment, a linked service's own connection value least of all. A value is write-only: no verb shows
 it again. A program that prints one does not put it in the run log as it stands: each stored value is taken out of
-the output and of every string of the decoded result, in its plain form and as a JSON encoder writes it. That is a
-search for known text, not a proof: a program that prints a secret cut in pieces, or encoded another way, prints it. A value is **one line of 8 to 4096 characters**: a credentials file or a PEM
+the output and of every string of the decoded result, in its plain form and with any of its characters written as a
+JSON escape. That is a search for known text, not a proof: a program that prints a secret cut in pieces or across
+two lines, or encoded another way (base64, a URL's escapes), prints it. A value is **one line of 8 to 4096 characters**: a credentials file or a PEM
 certificate of several lines is not a secret a function can be given. A function with a secret not yet set does not
 run: its run line says `notStarted` and names the secret.
 
@@ -4323,7 +4324,14 @@ by Incus itself (`boot.autostart` is `false`), so a host that comes back up star
 - A function is created in the node's own project only: not in a tenant, and not on a bridged node without the managed
   service network.
 - A service a function links to is not removed while the function is there: `service_remove` is refused, when it is
-  proposed and when it runs, and names the function. Remove the function first.
+  proposed and when it runs, and names the function. Remove the function first. The kernel itself refuses, so two
+  approved actions in any order never leave a function linked to nothing; a removal refused after its card was
+  approved has used that approval up, and says so.
+- When `arca serve` cannot make the function runner at its start it says so on its log ("this node runs no
+  functions", and why) and serves everything else. Until the cause is put right and `serve` is started again, the
+  function verbs answer that the node runs no functions, `function_remove` among them, so a service a function links
+  to cannot be removed either; and a run that a kernel which stopped left going is not stopped, since the sweep that
+  stops it is the runner's. Starting `serve` again with the cause put right does all of it.
 - A function's container has no size limit on its root disk beyond the pool's own.
 - A run that cannot start writes a line each time it is tried. A function that is stuck on a 10-second timer writes
   8,640 lines a day, and the run log is never cut.

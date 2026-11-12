@@ -1503,7 +1503,8 @@ Source: `FunctionRun` and `is_function` in `crates/arca-incus/src/function_run.r
 
 `function_create` and `function_remove` run only from a proposal the owner approved; a removal is the removal of a
 service (the instance is deleted before its ACL), after the run that is going has been stopped. A service a function
-links to is not removed while the function exists: the removal is refused when it is proposed and when it runs.
+links to is not removed while the function exists: the removal is refused when it is proposed, when it runs, and by
+`Kernel::remove_service_spent` itself, under the kernel's lock, on the entries it is about to change.
 
 ## Out of scope
 

@@ -91,8 +91,13 @@ pub(super) fn enrich_function_create(
 
 /// Why the service `name` of the node's own project is not removed now: a function links to it. A function's links
 /// are part of the definition its owner approved, so a service is never taken from under one: the function goes
-/// first. `None` when no function links to it. The same words refuse the proposal and the removal itself.
-pub(super) fn linked_service_refusal(entries: &[Entry], name: &str) -> Option<CallError> {
+/// first. `None` when no function links to it. `spent` says whether an owner's approval was already used up for this
+/// removal, so the words about it are true on every path.
+pub(super) fn linked_service_refusal(
+    entries: &[Entry],
+    name: &str,
+    spent: bool,
+) -> Option<CallError> {
     let functions: Vec<String> = service_entries(entries)
         .into_iter()
         .filter(|(_, config)| {
@@ -102,20 +107,29 @@ pub(super) fn linked_service_refusal(entries: &[Entry], name: &str) -> Option<Ca
         })
         .map(|(_, config)| config.name)
         .collect();
-    let (first, more) = functions.split_first()?;
-    Some(service_refused(format!(
-        "remove service {name}: {} to it, and what a function reaches is part of what its owner approved. Remove {} first (function_remove); nothing was removed and no approval was spent",
-        if more.is_empty() {
-            format!("the function {first} links")
+    (!functions.is_empty()).then(|| linked_functions_refusal(name, &functions, spent))
+}
+
+/// The refusal of a removal of the service `name` that `functions` link to.
+pub(super) fn linked_functions_refusal(name: &str, functions: &[String], spent: bool) -> CallError {
+    let (links, them) = match functions {
+        [one] => (
+            format!("the function {one} links"),
+            format!("the function {one}"),
+        ),
+        many => (
+            format!("the functions {} link", many.join(", ")),
+            "them".to_string(),
+        ),
+    };
+    service_refused(format!(
+        "remove service {name}: {links} to it, and what a function reaches is part of what its owner approved. Remove {them} first (function_remove); nothing was removed, {}",
+        if spent {
+            "and the owner's approval is spent, so another try needs a new one"
         } else {
-            format!("the functions {} link", functions.join(", "))
-        },
-        if more.is_empty() {
-            format!("the function {first}")
-        } else {
-            "them".to_string()
-        },
-    )))
+            "and no approval was spent"
+        }
+    ))
 }
 
 /// A `function_remove` proposal for a name that is not a function's is refused when it is made.
@@ -371,6 +385,10 @@ impl ServiceHandler {
                 };
                 let removal = match removal {
                     Ok(removal) => removal,
+                    Err(crate::kernel::ServiceRemovalError::LinkedFunctions(functions)) => {
+                        runner.restore(&name);
+                        return Err(linked_functions_refusal(&name, &functions, true));
+                    }
                     Err(_) => {
                         runner.restore(&name);
                         return Err(service_removal_refused(read, &config));
@@ -528,33 +546,7 @@ impl ServiceHandler {
             "arca.service",
             serde_json::to_value(&config).map_err(|_| internal())?,
         )));
-        self.settle_create(read, &name, function::TEMPLATE, changes, &config, None, now)
-            .map_err(|error| match error {
-                CallError::Refused { code, message } => CallError::Refused {
-                    code,
-                    message: message
-                        .replacen(
-                            &format!("create service {name} from template function"),
-                            &format!("create function {name}"),
-                            1,
-                        )
-                        .replacen(
-                            &format!("start service {name}"),
-                            &format!("create function {name}"),
-                            1,
-                        )
-                        // What to do next is a function's own: the instance and service verbs refuse one.
-                        .replace(
-                            "instance_start starts it once the cause is fixed, and service_remove removes it",
-                            "function_remove removes it, and the create is proposed again once the cause is fixed",
-                        )
-                        .replace(
-                            "service_status shows it, and service_remove removes it",
-                            "function_list shows it, and function_remove removes it",
-                        ),
-                },
-                other => other,
-            })?;
+        self.settle_create(read, &name, function::TEMPLATE, changes, &config, None, now)?;
         // The function exists, stopped. Each linked service now lets it in: one rule on that service's NIC, bound to
         // this instance's uuid and address, exactly as a link between two services is.
         let created = lock(&self.kernel)?.entries().to_vec();

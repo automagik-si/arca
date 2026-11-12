@@ -1623,6 +1623,7 @@ impl ToolHandler for ActionPropose {
             if let Some(refusal) = function_handlers::linked_service_refusal(
                 &entries,
                 payload["name"].as_str().unwrap_or_default(),
+                false,
             ) {
                 return Err(refusal);
             }
@@ -5269,6 +5270,12 @@ impl ServiceHandler {
                         ),
                         _ => "Its instance exists, in a state Incus did not report: service_status shows it, and service_remove removes it".to_string(),
                     };
+                    // A function is said as one, with the verbs that act on one.
+                    if config.function.is_some() {
+                        return Err(service_refused(format!(
+                            "create function {name}: {why}. Its instance exists: function_list shows the function, function_remove removes it, and the create is proposed again once the cause is fixed"
+                        )));
+                    }
                     return Err(service_refused(format!(
                         "start service {name}: {why}. {left}"
                     )));
@@ -5296,6 +5303,11 @@ impl ServiceHandler {
                 &service_secret_values(&self.cfg.state_dir.join("secrets")),
             );
             let left = service_wiring::left_behind(removal.ok().as_deref(), &id);
+            if config.function.is_some() {
+                return Err(service_refused(format!(
+                    "create function {name}: {why}; {left}"
+                )));
+            }
             return Err(service_refused(format!(
                 "create service {name} from template {template_name}: {why}; {left}"
             )));
@@ -5777,9 +5789,10 @@ impl ToolHandler for ServiceHandler {
                 }
                 // A service a function links to stays until the function is gone: said before any approval is
                 // spent.
+                // A removal that runs from an approved card has used that approval up by now, and says so.
                 if tenant.is_none()
                     && let Some(refusal) =
-                        function_handlers::linked_service_refusal(&all_entries, &name)
+                        function_handlers::linked_service_refusal(&all_entries, &name, preapproved)
                 {
                     return Err(refusal);
                 }
@@ -5820,6 +5833,11 @@ impl ToolHandler for ServiceHandler {
                         }
                         crate::kernel::ServiceRemovalError::Proposal(_) => {
                             service_removal_refused(&read, &config)
+                        }
+                        // A function came to link to it after the check above: the kernel refused under its own
+                        // lock, and the approval this removal ran on is spent.
+                        crate::kernel::ServiceRemovalError::LinkedFunctions(functions) => {
+                            function_handlers::linked_functions_refusal(&name, &functions, true)
                         }
                     })?;
                 let changed = removal

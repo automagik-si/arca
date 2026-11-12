@@ -115,6 +115,9 @@ pub struct SpentServiceRemoval {
 pub enum ServiceRemovalError {
     Approval(ApprovalRefusal),
     Proposal(KernelError),
+    /// A function of the same project links to the service: its names. Nothing was proposed and nothing changed. A
+    /// function's links are part of the definition its owner approved, so the function is removed first.
+    LinkedFunctions(Vec<String>),
 }
 
 impl Kernel {
@@ -866,6 +869,28 @@ impl Kernel {
         );
         let name = name.as_str();
         let project = removed.map(|record| record.project);
+        // A service a function links to is not removed while the function exists. The check is made here, on the
+        // entries the removal itself changes and under the lock that changes them, so no path and no order of two
+        // approved actions gets round it: a function's record with a link to nothing is one the plugin refuses.
+        let linked: Vec<String> = self
+            .entries()
+            .iter()
+            .filter(|other| &other.id != entry && other.plugin.0 == "arca.service")
+            .filter_map(|other| {
+                serde_json::from_value::<crate::service::ServiceConfig>(other.config.clone()).ok()
+            })
+            .filter(|cfg| {
+                cfg.function.is_some()
+                    && project
+                        .as_ref()
+                        .is_none_or(|project| *project == cfg.project)
+                    && cfg.links.iter().any(|link| link.to == name)
+            })
+            .map(|cfg| cfg.name)
+            .collect();
+        if !linked.is_empty() {
+            return Err(ServiceRemovalError::LinkedFunctions(linked));
+        }
         let mut changes = Vec::new();
         for other in self.entries() {
             if &other.id == entry || other.plugin.0 != "arca.service" {

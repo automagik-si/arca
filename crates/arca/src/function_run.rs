@@ -797,7 +797,16 @@ pub fn function_entries(entries: &[Entry]) -> Vec<(Entry, ServiceConfig)> {
 /// A run's output as it is kept and shown: each line cleaned of control sequences, with every known secret value
 /// taken out, and only its end when it is long.
 pub fn clean_output(output: &str, secrets: &[String]) -> String {
-    let forms = secret_forms(secrets);
+    let patterns = secret_patterns(secrets);
+    let redact = |text: &str| -> String {
+        let mut out = text.to_string();
+        for pattern in &patterns {
+            out = pattern
+                .replace_all(&out, regex::NoExpand("[secret]"))
+                .into_owned();
+        }
+        crate::service::redact_log(&out, secrets)
+    };
     let mut lines = Vec::new();
     for line in output.split(['\n', '\r']) {
         if line.trim().is_empty() {
@@ -805,10 +814,10 @@ pub fn clean_output(output: &str, secrets: &[String]) -> String {
         }
         // A value is taken out of the line as the program wrote it, before its white space is folded: a value
         // that holds two spaces in a row would not be found afterwards. And once more after the folding.
-        let redacted = crate::service::redact_log(line, &forms);
+        let redacted = redact(line);
         let clean = crate::service::clean_log(&redacted);
         if !clean.is_empty() {
-            lines.push(crate::service::redact_log(&clean, &forms));
+            lines.push(redact(&clean));
         }
     }
     let mut kept = Vec::new();
@@ -859,53 +868,39 @@ fn redact_value(value: &mut Value, secrets: &[String]) {
     }
 }
 
-/// Every form a secret value may take in what a program prints: the value itself, and the value as a JSON encoder
-/// writes it inside a string. Encoders differ, so each common form is here: `"` and `\` escaped; `&`, `<` and `>`
-/// written as `\u0026`, `\u003c` and `\u003e` as well; every character outside ASCII written as `\uXXXX`; a `/`
-/// written as `\/`; and those together.
-pub fn secret_forms(secrets: &[String]) -> Vec<String> {
-    let mut forms = std::collections::BTreeSet::new();
-    for secret in secrets {
-        forms.insert(secret.clone());
-        for html in [false, true] {
-            for ascii in [false, true] {
-                for slash in [false, true] {
-                    for upper in [false, true] {
-                        forms.insert(json_escaped(secret, html, ascii, slash, upper));
-                    }
-                }
-            }
-        }
-    }
-    forms.into_iter().collect()
-}
-
-/// `text` as it stands inside a JSON string, with the choices an encoder makes.
-fn json_escaped(text: &str, html: bool, ascii: bool, slash: bool, upper: bool) -> String {
-    let unit = |unit: u16| {
-        if upper {
-            format!("\\u{unit:04X}")
-        } else {
-            format!("\\u{unit:04x}")
-        }
-    };
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '/' if slash => out.push_str("\\/"),
-            '&' | '<' | '>' if html => out.push_str(&unit(ch as u16)),
-            ch if ascii && !ch.is_ascii() => {
+/// One pattern for each secret value of 8 characters or more, longest first. A pattern finds the value as it is
+/// and as any JSON encoder may write it inside a string: each character stands as itself or as an escape of it, a
+/// `\\uXXXX` with its hex digits in either case (two of them for a character outside the basic plane) or, for the
+/// characters that have one, the short escape (`\\"`, `\\\\`, `\\/`, `\\'`). Encoders differ in which characters they
+/// escape (some write `&`, `<`, `>`, `=`, `'`, `+` or a back quote as `\\uXXXX`, some everything outside ASCII), so the
+/// pattern asks for none of them and takes all. A value whose pattern cannot be built is still looked for as it is.
+fn secret_patterns(secrets: &[String]) -> Vec<regex::Regex> {
+    let mut values: Vec<&String> = secrets.iter().filter(|value| value.len() >= 8).collect();
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+        .into_iter()
+        .filter_map(|value| {
+            let mut pattern = String::new();
+            for ch in value.chars() {
                 let mut units = [0u16; 2];
-                for one in ch.encode_utf16(&mut units) {
-                    out.push_str(&unit(*one));
-                }
+                let escaped: String = ch
+                    .encode_utf16(&mut units)
+                    .iter()
+                    .map(|unit| format!(r"\\u(?i:{unit:04x})"))
+                    .collect();
+                let plain = regex::escape(&ch.to_string());
+                let short = match ch {
+                    '"' | '\\' | '/' | '\'' => format!(r"|\\{plain}"),
+                    _ => String::new(),
+                };
+                pattern.push_str(&format!("(?:{plain}|{escaped}{short})"));
             }
-            ch => out.push(ch),
-        }
-    }
-    out
+            regex::RegexBuilder::new(&pattern)
+                .size_limit(64 * 1024 * 1024)
+                .build()
+                .ok()
+        })
+        .collect()
 }
 
 /// Whether `run` is an id this module gives: `fr-<milliseconds>-<number>`.
@@ -1114,29 +1109,43 @@ mod tests {
 
     #[test]
     fn a_secret_is_taken_out_in_each_form_an_encoder_writes_and_out_of_the_decoded_result() {
-        let secret = "p\u{e4}55&w<rd/\"x\\y".to_string();
-        let forms = secret_forms(std::slice::from_ref(&secret));
+        // A value with everything an encoder may choose to escape: a letter outside ASCII, the characters some write
+        // as \\uXXXX to be safe in HTML or in a script, a slash, a quote, an apostrophe, a back quote and a backslash.
+        let secret = "p\u{e4}55&w<rd/=+'`\"x\\y".to_string();
+        let known = std::slice::from_ref(&secret);
         for written in [
-            "p\u{e4}55&w<rd/\\\"x\\\\y",
-            "p\u{e4}55\\u0026w\\u003crd/\\\"x\\\\y",
-            "p\\u00e455&w<rd/\\\"x\\\\y",
-            "p\\u00E455\\u0026w\\u003Crd\\/\\\"x\\\\y",
+            // Only what JSON requires.
+            "p\u{e4}55&w<rd/=+'`\\\"x\\\\y",
+            // & < > as \\u, lower case; then upper case with the slash escaped.
+            "p\u{e4}55\\u0026w\\u003crd/=+'`\\\"x\\\\y",
+            "p\\u00E455\\u0026w\\u003Crd\\/=+'`\\\"x\\\\y",
+            // = and ' as \\u as well.
+            "p\u{e4}55\\u0026w\\u003crd/\\u003d+\\u0027`\\\"x\\\\y",
+            // The quote, the apostrophe, + and the back quote as \\u, upper case.
+            "p\\u00E455\\u0026w\\u003Crd/=\\u002B\\u0027\\u0060\\u0022x\\\\y",
+            // Every character as \\u.
+            "\\u0070\\u00e4\\u0035\\u0035\\u0026\\u0077\\u003c\\u0072\\u0064\\u002f\\u003d\\u002b\\u0027\\u0060\\u0022\\u0078\\u005c\\u0079",
         ] {
-            assert!(
-                forms.iter().any(|form| form == written),
-                "{written} is not among {forms:?}"
-            );
             let line = format!(
                 "{{\"ok\":false,\"error\":\"denied for {written}\",\"{written}\":[\"{written}\"]}}"
             );
-            let clean = clean_output(&line, std::slice::from_ref(&secret));
-            assert!(!clean.contains("55"), "{clean}");
+            let clean = clean_output(&line, known);
+            assert!(
+                !clean.contains("55") && !clean.contains("0035"),
+                "{written}: {clean}"
+            );
+            assert_eq!(clean.matches("[secret]").count(), 3, "{written}: {clean}");
             // The decoded object holds the value plainly again, as a value, a name and an element: none is kept.
-            let result = result_line(&line, std::slice::from_ref(&secret)).expect("a result");
+            let result = result_line(&line, known).expect("a result");
             assert!(!result.to_string().contains("55"), "{result}");
             assert_eq!(result["ok"], false);
             assert_eq!(result["error"], "denied for [secret]");
         }
+        // The value as it is, outside any JSON.
+        assert_eq!(
+            clean_output(&format!("token {secret} refused"), known),
+            "token [secret] refused"
+        );
         // Two spaces in a row inside a value are not folded away before it is looked for.
         let phrase = "correct  horse battery".to_string();
         let clean = clean_output(
@@ -1144,6 +1153,8 @@ mod tests {
             std::slice::from_ref(&phrase),
         );
         assert_eq!(clean, "said: [secret]");
+        // A short value is not looked for: it would take ordinary words with it.
+        assert_eq!(clean_output("ok then", &["ok".to_string()]), "ok then");
     }
 
     #[test]
