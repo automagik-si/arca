@@ -2451,6 +2451,15 @@ fn postgres_create_params_base() -> Value {
                 "Filled in by the node: the template a database is made from when its config names no image (postgres-autopg). A caller leaves it out.",
             ),
         ),
+        (
+            "templateDigest",
+            false,
+            json!({
+                "description": "Filled in by the node with the template: SHA-256, in hex, of the template's file and of each script it names. The create runs only while the template on the node is still exactly that one. A caller leaves it out.",
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+            }),
+        ),
     ])
 }
 fn postgres_create_result() -> Value {
@@ -2931,6 +2940,17 @@ fn service_create_params_base() -> Value {
             "template": {
                 "description": "The template's name.",
                 "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                "type": "string"
+            },
+            "image": {
+                "description": "Filled in by the node when a create is proposed: the image the template names, <image>@sha256:<digest> when it gives a digest and the bare name when it gives none; a virtual machine that names a version adds \" running <version>\". The owner's card shows it and the approval binds it. A caller leaves it out; one that states it must state the node's own.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+            },
+            "templateDigest": {
+                "description": "Filled in by the node when a create is proposed: SHA-256, in hex, of the template's file and of each script it names, as the node holds them then. The create runs only while the template on the node is still exactly that one. A caller leaves it out; one that states it must state the node's own.",
+                "pattern": "^[0-9a-f]{64}$",
                 "type": "string"
             },
             "bridge": {

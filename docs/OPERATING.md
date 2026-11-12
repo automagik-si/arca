@@ -670,6 +670,9 @@ stands under it. With it the fingerprint decides, and the alias is only the name
   says so and to create another service first.
 - The instance is made from the pinned image: Incus is given the fingerprint, and with a fingerprint Incus never looks
   the alias up.
+- The owner's card shows the pinned image in its `Image` row, as `local:<alias>@sha256:<fingerprint>`, and the
+  approval binds it with the rest of the template (see "What the owner saw is what is created"). An unpinned local
+  image is shown as `local:<alias>` with the words that say it has no digest.
 - A digest in upper case, or one that is not 64 hex digits, is refused when the template is read.
 
 **Creating a service stopped.** A secret (`service_secret_set`) and a link (`service_connect`) reach a container's
@@ -785,11 +788,11 @@ is the service that `service_create` makes from the node's `postgres-autopg` tem
 - Its name must be one no database and no service holds.
 - A token with a tool list needs `service_create` in it beside `postgres_create`: the database is a service.
 
-A proposal is given the template's name and the image it pins when it is made. The card shows the image by digest,
-the template and a `Made as` row, which says that the template generates the password only when it does, and the
-approval binds the image and the template: if the template on the node names another image when the owner
-approves, the create is refused and nothing is made; propose it again. The card binds the image, not the template's
-entrypoint script, which is the node's own file in its state directory.
+A proposal is given the template's name, the image it pins and the fingerprint of the template's content when it is
+made. The card shows the image by digest, the template, a `Made as` row, which says that the template generates the
+password only when it does, and last a `Template content` row. The approval binds all of it: if the template on the
+node is another one when the owner approves (another image, or an edit of the script that opens the database), the
+create is refused and nothing is made; propose it again. See "What the owner saw is what is created".
 
 If the template is not installed, the create and the proposal are refused in words that name `arca templates
 install`. An image or a template stated in a call must be exactly the node's own, or the call is refused; the
@@ -1736,6 +1739,29 @@ record. A proposal cannot choose a container image: `postgres_create` uses the i
 template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is
 refused (see "A database"). `service_create` names a template from the kernel's catalog, whose name the schema constrains;
 its card has a `Start` row whenever the service will be created stopped, with the reason, so the owner approves a stopped service knowingly.
+
+**What the owner saw is what is created.** When a `service_create` or a `postgres_create` is proposed, the node
+reads the template and gives the proposal two things, which no caller gives:
+
+- `image`: the image the template names. The card's `Image` row shows it: `<image>@sha256:<digest>` when the template
+  gives a digest. When it gives none the row says so: `images:debian/13 (no digest: Incus takes what that name gives
+  when the service is created)`. For a virtual machine that names the version it runs, the row names the machine's
+  own system image first and then `running <version>`.
+- `templateDigest`: a fingerprint (SHA-256) of the template's file and of each script it names. The card's last row,
+  `Template content`, shows it whole, with the words "Arca creates this only if the template on the node is still
+  exactly this one".
+
+The approved create reads the template once and is made from that read. If the template is no longer exactly the one
+the card showed, nothing is created and the answer says "propose it again". That covers an edit of the template's
+file, even of one space, an edit of a script it names, and a template installed again: a card that waits while an
+upgrade replaces a shipped template is refused, and the next proposal shows the new one. A proposal lives fifteen
+minutes, so this is a short wait. A proposal for a template that is not installed, or whose script is missing, is
+refused when it is made.
+
+A token's own `service_create` shows no card and binds nothing, as before. It may state `templateDigest` or `image`
+itself, and is then refused when the node's template differs. Not part of the fingerprint: why a service is created
+stopped (the card's `Start` row is read from the stored secrets), the node's config, and whatever an image name
+without a digest points at.
 A GPU proposal names an existing Incus instance and the card's PCI address. The kernel resolves the instance's project,
 type and `volatile.uuid` when the proposal is made and puts them in the arguments, so the owner's digest binds them. Only a
 kernel-mode node writes, and only an instance in `kernel.projects` whose own config classifies as a kernel object: a

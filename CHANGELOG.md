@@ -17,6 +17,14 @@ created, or from the registry by the approved digest when that copy is gone. So 
 wrote, which replaces the limit 0.13.0 named. A root that cannot be rebuilt is a run that does not start, and its
 line says why. A run's line gains `root`, `rootImage` and `rootMs`.
 
+What the owner approves on a card is now what is created. A proposed `service_create` or `postgres_create` is given,
+by the node, the image its template names and a fingerprint of the template's content (its file and the scripts it
+names). The card shows an `Image` row and ends with a `Template content` row, and the approved create runs only while
+the template on the node is still exactly that one: an edit, or a template installed again by an upgrade, refuses the
+create with "propose it again". An image named without a digest is shown with words that say so. Two new optional
+arguments, `image` and `templateDigest`, are filled in by the node; a caller that states one must state the node's
+own. A proposal for a template that is not installed, or whose script is missing, is now refused when it is made.
+
 ## 0.13.0 (2026-11-12)
 
 ## 0.13.0 (2026-11-12)

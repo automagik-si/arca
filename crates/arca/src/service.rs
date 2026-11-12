@@ -1221,6 +1221,11 @@ impl TemplateError {
 }
 
 pub fn load_template(dir: &Path, name: &str) -> Result<Template, TemplateError> {
+    read_template(dir, name).map(|(template, _)| template)
+}
+
+/// The template `name` and the text of its file, from one read of it.
+fn read_template(dir: &Path, name: &str) -> Result<(Template, String), TemplateError> {
     if !template_name_ok(name) {
         return Err(TemplateError::refused("template: invalid name"));
     }
@@ -1242,8 +1247,137 @@ pub fn load_template(dir: &Path, name: &str) -> Result<Template, TemplateError> 
         )));
     }
     validate_template(&template, dir)?;
-    Ok(template)
+    Ok((template, text))
 }
+
+/// A template as this node holds it at one moment: its file and every script it names, each read once, and the
+/// fingerprint of exactly those bytes. A create that is made from this value is made from what the fingerprint
+/// names, with no second read between the check and the create.
+#[derive(Debug, Clone)]
+pub struct TemplateContent {
+    pub template: Template,
+    /// The scripts the template names, by file name, as they were read, or why one could not be.
+    scripts: BTreeMap<String, Result<String, std::io::ErrorKind>>,
+    /// SHA-256, in hex, of the template's file and of each script it names ([`template_digest`]). `None` when a
+    /// script it names could not be read: such a template is no content a card can show.
+    pub digest: Option<String>,
+}
+
+impl TemplateContent {
+    /// The entrypoint, from the scripts read with the template ([`entrypoint`]).
+    pub fn entrypoint(&self) -> Result<Option<String>, TemplateError> {
+        entrypoint_with(&self.template, &mut |file| self.script(file))
+    }
+
+    /// The first-boot script, from the scripts read with the template ([`first_boot`]).
+    pub fn first_boot(&self) -> Result<Option<String>, TemplateError> {
+        first_boot_with(&self.template, &mut |file| self.script(file))
+    }
+
+    /// The fingerprint of the content, or the refusal a create gives for the script that stands in its way: one
+    /// that is missing, cannot be read, or is not what its place takes.
+    pub fn bound(&self) -> Result<&str, TemplateError> {
+        self.entrypoint()?;
+        self.first_boot()?;
+        self.digest
+            .as_deref()
+            .ok_or_else(|| TemplateError::refused("a script of the template could not be read"))
+    }
+
+    fn script(&self, file: &str) -> std::io::Result<String> {
+        match self.scripts.get(file) {
+            Some(Ok(script)) => Ok(script.clone()),
+            Some(Err(kind)) => Err(std::io::Error::from(*kind)),
+            None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        }
+    }
+}
+
+/// The template `name` with everything it is made of on this node: its file, and the script its entrypoint or its
+/// first boot names, each read once. A script that cannot be read does not fail the load: the builder that needs it
+/// refuses in its own words, where a create has always met it ([`TemplateContent::entrypoint`],
+/// [`TemplateContent::first_boot`]), and the content then has no fingerprint.
+pub fn load_template_content(dir: &Path, name: &str) -> Result<TemplateContent, TemplateError> {
+    let (template, text) = read_template(dir, name)?;
+    let scripts: BTreeMap<String, Result<String, std::io::ErrorKind>> = script_files(&template)
+        .into_iter()
+        .map(|file| {
+            let read = std::fs::read_to_string(dir.join(&file)).map_err(|error| error.kind());
+            (file, read)
+        })
+        .collect();
+    let read: Option<BTreeMap<&str, &str>> = scripts
+        .iter()
+        .map(|(file, script)| Some((file.as_str(), script.as_deref().ok()?)))
+        .collect();
+    let digest = read.map(|scripts| template_digest(name, &text, &scripts));
+    Ok(TemplateContent {
+        template,
+        scripts,
+        digest,
+    })
+}
+
+/// The plain file names a template names: the `{ "file": ... }` parts of its entrypoint, and its first-boot script.
+/// A name that is not a plain file name is left out here and refused by the builder that meets it.
+fn script_files(template: &Template) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    for part in template.entrypoint.iter().flatten() {
+        if let Some(file) = part
+            .get("file")
+            .and_then(Value::as_str)
+            .filter(|file| script_name_ok(file))
+        {
+            files.insert(file.to_string());
+        }
+    }
+    if let Some(file) = template.first_boot.as_ref().and_then(first_boot_file) {
+        files.insert(file.to_string());
+    }
+    files
+}
+
+/// The fingerprint of a template as a node holds it: SHA-256 over the bytes of its file and of each script it
+/// names, lowest file name first. Every part is framed by its name and its length, so no byte can pass from one part
+/// to another, and the bytes are hashed as they stand: any edit, a changed space among them, gives another value.
+pub fn template_digest(name: &str, text: &str, scripts: &BTreeMap<&str, &str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"arca-template-content-v1\0");
+    let mut part = |name: &str, bytes: &[u8]| {
+        hash.update((name.len() as u64).to_be_bytes());
+        hash.update(name.as_bytes());
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    };
+    part(&format!("{name}.json"), text.as_bytes());
+    for (file, script) in scripts {
+        part(file, script.as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The image of the services made from a template, as a proposal binds it and a card shows it: what Incus makes the
+/// instance from, `<image>@<digest>` when the template gives a digest (an OCI image by its registry digest, a system
+/// or local image by its fingerprint) and the bare `<image>` when it gives none. A virtual machine whose template
+/// names a version (`update.pin`) adds ` running <version>`: the machine's own system image first, then what it
+/// runs. No image name holds a space, so the two parts are told apart by that word alone.
+pub fn template_image(template: &Template) -> String {
+    let boots = match &template.digest {
+        Some(digest) => format!("{}@{digest}", template.image),
+        None => template.image.clone(),
+    };
+    match template_pin(template).filter(|_| template.is_vm()) {
+        Some(version) => format!("{boots}{IMAGE_RUNNING}{version}"),
+        None => boots,
+    }
+}
+
+/// What stands between a machine's own image and the version it runs in [`template_image`].
+pub const IMAGE_RUNNING: &str = " running ";
 
 fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateError> {
     let name = &template.name;
@@ -1525,13 +1659,23 @@ fn first_boot_file(first_boot: &Value) -> Option<&str> {
 /// text cloud-init is given as user data, so it begins `#!` (a script, run once at the first boot) or `#cloud-config`.
 /// `None` for a template without one.
 pub fn first_boot(template: &Template, dir: &Path) -> Result<Option<String>, TemplateError> {
+    first_boot_with(template, &mut |file| {
+        std::fs::read_to_string(dir.join(file))
+    })
+}
+
+/// [`first_boot`], with the script given by `read`: the file itself, or what was read with the template.
+fn first_boot_with(
+    template: &Template,
+    read: &mut dyn FnMut(&str) -> std::io::Result<String>,
+) -> Result<Option<String>, TemplateError> {
     let Some(first_boot) = &template.first_boot else {
         return Ok(None);
     };
     let name = &template.name;
     let file = first_boot_file(first_boot)
         .ok_or_else(|| TemplateError::refused(format!("template {name}: invalid firstBoot")))?;
-    let script = std::fs::read_to_string(dir.join(file)).map_err(|error| {
+    let script = read(file).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             TemplateError::refused(format!(
                 "template {name}: its first-boot script is not installed (templates/{file} does not exist). \
@@ -2277,6 +2421,95 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_templates_fingerprint_is_of_its_bytes_as_they_stand_and_no_byte_passes_between_parts() {
+        let digest = |name: &str, text: &str, scripts: &[(&str, &str)]| {
+            template_digest(name, text, &scripts.iter().copied().collect())
+        };
+        let base = digest("app", "{\"name\":\"app\"}", &[("app.sh", "exec app\n")]);
+        assert_eq!(base.len(), 64);
+        assert!(
+            base.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_eq!(
+            base,
+            digest("app", "{\"name\":\"app\"}", &[("app.sh", "exec app\n")])
+        );
+        // Any edit gives another value: a space in the file, a byte in the script, a script more or less, another
+        // name for the template or for the script.
+        for other in [
+            digest("app", "{\"name\": \"app\"}", &[("app.sh", "exec app\n")]),
+            digest("app", "{\"name\":\"app\"}\n", &[("app.sh", "exec app\n")]),
+            digest("app", "{\"name\":\"app\"}", &[("app.sh", "exec app")]),
+            digest("app", "{\"name\":\"app\"}", &[]),
+            digest(
+                "app",
+                "{\"name\":\"app\"}",
+                &[("app.sh", "exec app\n"), ("b.sh", "")],
+            ),
+            digest("apq", "{\"name\":\"app\"}", &[("app.sh", "exec app\n")]),
+            digest("app", "{\"name\":\"app\"}", &[("apq.sh", "exec app\n")]),
+        ] {
+            assert_ne!(other, base);
+        }
+        // The same bytes cut at another place are another template: a byte moved from the file's end to the
+        // script's name, or from one script to the next, does not give the same value.
+        assert_ne!(
+            digest("a", "xy", &[("s", "z")]),
+            digest("a", "x", &[("ys", "z")])
+        );
+        assert_ne!(
+            digest("a", "x", &[("s", "yz"), ("t", "")]),
+            digest("a", "x", &[("s", "y"), ("t", "z")])
+        );
+        // The scripts are taken lowest name first, whatever order they were named in.
+        assert_eq!(
+            digest("a", "x", &[("b.sh", "2"), ("a.sh", "1")]),
+            digest("a", "x", &[("a.sh", "1"), ("b.sh", "2")])
+        );
+    }
+
+    #[test]
+    fn the_image_of_a_template_is_what_boots_and_then_the_version_a_machine_runs() {
+        let template =
+            |value: Value| -> Template { serde_json::from_value(value).expect("a template") };
+        let digest = format!("sha256:{}", "a".repeat(64));
+        // A registry image by its digest: the reference the instance is fetched by.
+        let oci = template(json!({
+            "name": "app", "kind": "oci", "image": "docker.io/library/app", "digest": digest
+        }));
+        assert_eq!(
+            template_image(&oci),
+            format!("docker.io/library/app@{digest}")
+        );
+        assert_eq!(Some(template_image(&oci)), template_pin(&oci));
+        // A system image: with the fingerprint the template gives, or bare when it gives none.
+        let bare = template(
+            json!({ "name": "vm", "kind": "virtual-machine", "image": "images:debian/13" }),
+        );
+        assert_eq!(template_image(&bare), "images:debian/13");
+        let pinned = template(json!({
+            "name": "vm", "kind": "virtual-machine", "image": "images:debian/13", "digest": digest
+        }));
+        assert_eq!(
+            template_image(&pinned),
+            format!("images:debian/13@{digest}")
+        );
+        let local = template(json!({ "name": "built", "kind": "system", "image": "local:built" }));
+        assert_eq!(template_image(&local), "local:built");
+        // A machine that names the version it runs: its own image first, then that version.
+        let running = template(json!({
+            "name": "ws", "kind": "virtual-machine", "image": "images:debian/13/cloud",
+            "update": { "pin": "serverImage" },
+            "settings": { "serverImage": format!("registry.example/server@{digest}") }
+        }));
+        assert_eq!(
+            template_image(&running),
+            format!("images:debian/13/cloud running registry.example/server@{digest}")
+        );
+    }
+
+    #[test]
     fn generated_secrets_reject_biased_bytes_refill_and_stop_at_length() {
         let mut calls = 0;
         let secret = generated_secret_with("key_", |bytes| {
@@ -2371,6 +2604,16 @@ pub fn render(
 
 /// A template entrypoint, with a `{ "file": "name.sh" }` element read from the template directory.
 pub fn entrypoint(template: &Template, dir: &Path) -> Result<Option<String>, TemplateError> {
+    entrypoint_with(template, &mut |file| {
+        std::fs::read_to_string(dir.join(file))
+    })
+}
+
+/// [`entrypoint`], with each script given by `read`: the file itself, or what was read with the template.
+fn entrypoint_with(
+    template: &Template,
+    read: &mut dyn FnMut(&str) -> std::io::Result<String>,
+) -> Result<Option<String>, TemplateError> {
     let Some(parts) = &template.entrypoint else {
         return Ok(None);
     };
@@ -2397,9 +2640,8 @@ pub fn entrypoint(template: &Template, dir: &Path) -> Result<Option<String>, Tem
                          letters, digits, dots, dashes and underscores, not starting with a dot)",
                     ));
                 }
-                let path = dir.join(file);
-                let script = std::fs::read_to_string(&path)
-                    .map_err(|error| script_unreadable(&template.name, file, &error))?;
+                let script =
+                    read(file).map_err(|error| script_unreadable(&template.name, file, &error))?;
                 out.push(shell_quote(script.trim_end_matches('\n')));
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),

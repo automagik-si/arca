@@ -602,7 +602,8 @@ fn an_approved_create_that_fails_at_start_reports_its_message_and_leaves_a_defin
         .expect("kernel")
         .propose_action(
             ActionKind::ServiceCreate,
-            json!({"name":"ws1","template":"ws"}),
+            // Bound as the node binds a proposal when it is made.
+            common::bound_create(&rig.dir, json!({"name":"ws1","template":"ws"})),
             NOW,
             None,
         )

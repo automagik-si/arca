@@ -1516,9 +1516,9 @@ links to is not removed while the function exists: the removal is refused when i
 **Rule 74.** No call chooses the image a database runs. `postgres_create` takes its image from the node alone, through
 both doors, a token's own call and a proposal the owner approves. On a node whose config sets no
 `kernel.postgresImage` the database is the service that `service_create` makes from the node's `postgres-autopg`
-template: `postgres_create` calls that handler with the name, the template and the image the template named when the
-call was checked, and nothing else. So the image is fetched by registry and digest as every template's is (Rule 11),
-the handler compares that image with the template it reads for the create, and a token's own `postgres_create` makes
+template: `postgres_create` calls that handler with the name, the template, and the image and the content of the
+template as they were when the call was checked (Rule 75), and nothing else. So the image is fetched by registry and digest as every template's is (Rule 11),
+the handler compares both with the template it reads for the create, and a token's own `postgres_create` makes
 no more than its own `service_create` of that template makes: a token whose tool list leaves out `service_create`
 makes no database this way. A proposal is given the template's name and the image it pins when it is made, by the
 node and by no caller, so the card shows the image and the approval binds it; one that states another image is
@@ -1532,13 +1532,12 @@ from a template that generates none the service is created stopped, the card car
 has, and the answer says why.
 
 A record of the old kind is not touched by any of this: the `arca.postgres` plugin and its record are as they were,
-so an existing database's entry, digest, instance and ACL are the same after an upgrade. The binding is of the image:
-the template's entrypoint script, environment and ports are the node's own files and are read when the service is
-created.
+so an existing database's entry, digest, instance and ACL are the same after an upgrade. A database's proposal binds
+the content of its template as every create's does (Rule 75): the script that opens the database, its environment
+and its ports are part of what the card's last row names.
 
 Source: `database_source`, `database_image_changed`, `enrich_postgres_create`, `database_card_fact`,
-`PostgresHandler::create_from_template`, `PostgresHandler::call` and the `pin` check of `service_create` in
-`crates/arca/src/handlers.rs`; `ActionKind::prepare`, `database_service_words` and the `PostgresCreate` rows in
+`PostgresHandler::create_from_template` and `PostgresHandler::call` in `crates/arca/src/handlers.rs`; `ActionKind::prepare`, `database_service_words` and the `PostgresCreate` rows in
 `crates/arca/src/action_proposal.rs`. Tests in `crates/arca/tests/tenants/databases.rs`
 (`the_shipped_database_template_generates_its_password`,
 `on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_fetched_by_digest`,
@@ -1549,12 +1548,58 @@ Source: `database_source`, `database_image_changed`, `enrich_postgres_create`, `
 `a_database_takes_a_name_nothing_holds_and_a_failed_create_leaves_no_password`,
 `a_template_that_generates_no_password_makes_a_stopped_database_and_the_card_says_so`,
 `a_token_whose_tool_list_leaves_out_service_create_makes_no_database_from_the_template`,
-`the_image_checked_and_the_image_created_from_are_one_read_of_the_template`,
+`what_a_database_was_checked_against_and_what_it_is_created_from_are_one_read_of_the_template`,
 `a_create_the_service_handler_refuses_leaves_no_password_behind`,
 `a_node_whose_config_sets_up_no_services_refuses_a_database_in_those_words`) and in
 `crates/arca/src/action_proposal.rs`
 (`a_proposed_database_names_the_configured_image_or_the_template_the_kernel_filled_in`). That a clean node's Incus
 fetches the template's image by digest is under "Assumptions to confirm".
+
+## What the owner saw is what is created
+
+**Rule 75.** A create that the owner approves is made from the template the card showed, and from no other. When a
+`service_create` or a `postgres_create` is proposed, the node gives the proposal two things it reads from the
+template then, and no caller does: `image`, the image the template names (`<image>@sha256:<digest>` when it gives a
+digest, the bare name when it gives none, and for a virtual machine that names a version, ` running <version>` after
+its own system image), and `templateDigest`, the fingerprint of the template's content: SHA-256 over the bytes of its
+file and of each script it names (its entrypoint's, a machine's first-boot script), each part framed by its name and
+its length. The bytes are hashed as they stand, so any edit, a changed space among them, is another template. Both
+are arguments, so the approval's digest binds them and a restart keeps them; a caller that states either is only
+compared with the node's own, and refused when it differs.
+
+The card ends with them: an `Image` row, which for an image with no digest says in words that Incus takes what that
+name gives when the service is created, and last a `Template content` row with the fingerprint whole. The create reads
+the template's file and its scripts once (`load_template_content`), compares what the call states with that read, and
+builds the service from that same read: its entrypoint and its first-boot script are the ones that were hashed, so
+nothing stands between the check and the create. A template that was edited, or installed again by an upgrade, since
+the card was shown creates nothing, and the refusal says to propose it again. An approved create whose proposal names
+no `templateDigest` (one recorded before the node bound it) creates nothing either. A token's own create has no card
+and binds nothing; one that states a `templateDigest` or an `image` is held to it the same way. A proposal for a
+template that does not load, or whose script cannot be read, is refused when it is made, so no card is shown for it.
+
+Not bound, because they are not the template's: why a service is created stopped (that is read from the stored
+secrets when the create runs), the node's own config, and what stands behind an image name that has no digest. The
+kernel access and the private destinations of a create are bound by their own arguments (Rules 69 and 70).
+
+Source: `TemplateContent`, `load_template_content`, `template_digest`, `template_image`, `entrypoint_with` and
+`first_boot_with` in `crates/arca/src/service.rs`; `enrich_service_create`, `enrich_postgres_create`,
+`database_source`, `template_not_the_one_stated`, `template_not_bound` and the compare in `service_create` in
+`crates/arca/src/handlers.rs`; `image_words`, `template_content_words` and the closing rows of
+`ActionKind::details_with_gpu` in `crates/arca/src/action_proposal.rs`. Tests in
+`crates/arca/tests/tenants/template_binding.rs`
+(`a_proposed_create_is_given_its_templates_image_and_content_and_the_card_shows_both`,
+`a_pinned_local_image_is_on_the_card_by_its_fingerprint_and_is_what_the_instance_is_made_from`,
+`a_template_changed_after_the_card_was_shown_is_not_created`,
+`a_card_that_waits_across_an_upgrade_of_the_shipped_templates_is_refused_and_proposed_again`,
+`a_database_proposal_binds_the_content_of_its_template_too`, `the_binding_holds_across_a_restart_of_the_node`,
+`an_approval_given_on_a_card_that_bound_no_content_creates_nothing`,
+`a_tokens_own_create_has_no_card_and_one_that_states_the_content_is_held_to_it`,
+`a_create_that_could_not_be_made_from_its_template_is_refused_when_it_is_proposed`), in
+`crates/arca/src/service.rs`
+(`a_templates_fingerprint_is_of_its_bytes_as_they_stand_and_no_byte_passes_between_parts`,
+`the_image_of_a_template_is_what_boots_and_then_the_version_a_machine_runs`) and in
+`crates/arca/src/action_proposal.rs`
+(`the_image_row_says_what_boots_what_its_name_leaves_open_and_what_a_machine_runs`).
 
 ## Out of scope
 

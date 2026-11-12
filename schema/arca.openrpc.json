@@ -2652,6 +2652,15 @@
           }
         },
         {
+          "name": "templateDigest",
+          "required": false,
+          "schema": {
+            "description": "Filled in by the node with the template: SHA-256, in hex, of the template's file and of each script it names. The create runs only while the template on the node is still exactly that one. A caller leaves it out.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
           "name": "tenant",
           "required": false,
           "schema": {
@@ -3231,6 +3240,16 @@
           }
         },
         {
+          "name": "image",
+          "required": false,
+          "schema": {
+            "description": "Filled in by the node when a create is proposed: the image the template names, <image>@sha256:<digest> when it gives a digest and the bare name when it gives none; a virtual machine that names a version adds \" running <version>\". The owner's card shows it and the approval binds it. A caller leaves it out; one that states it must state the node's own.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
           "name": "kernelAccess",
           "required": false,
           "schema": {
@@ -3272,6 +3291,15 @@
           "schema": {
             "description": "Optional. Absent or true: the service is started once it is created, as without the field. A container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets, are created stopped whatever this says, and the answer's stoppedBecause says why. False: it is created stopped, the answer's state is \"stopped\", and its create carries no boot.autostart, so a host restart does not boot it before its first instance_start and afterwards restores the state it was in. service_secret_set and service_connect then apply to it, and instance_start starts it for the first time: a container with every secret and link in its environment. A virtual machine's secrets are never in its environment: instance_start writes them into the guest as files once it has booted, in a tenant's machine as in one of the node's own.",
             "type": "boolean"
+          }
+        },
+        {
+          "name": "templateDigest",
+          "required": false,
+          "schema": {
+            "description": "Filled in by the node when a create is proposed: SHA-256, in hex, of the template's file and of each script it names, as the node holds them then. The create runs only while the template on the node is still exactly that one. A caller leaves it out; one that states it must state the node's own.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
           }
         },
         {
