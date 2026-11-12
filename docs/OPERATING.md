@@ -3439,7 +3439,12 @@ Where a virtual machine's secret is, and is not:
   asked. Root inside the machine can read it, and a snapshot or a copy of the machine's disk carries it.
 - It is not in the instance's config in Incus (so `incus config show` does not show it), in Arca's desired state, in
   the effect journal, in `instance-actions.jsonl` (which names the secrets written), in `exec-audit.jsonl`, or in any
-  answer or refusal. `service_logs` replaces a stored value with `[secret]` when it fits on one line.
+  answer or refusal. `service_logs`, a failed command's words and a function's output replace a stored value with
+  `[secret]`: whole, and for a value of several lines (a key file) each of its lines of 16 characters or more, since a
+  log shows it one line at a time. A shorter line of such a value is not hidden by its value: a line of a few
+  characters is ordinary text that a log holds in many places. A PEM block, from its `-----BEGIN ...-----` line to its
+  `-----END ...-----` line, is replaced whole wherever it is printed, a stored secret or not; one whose END line was not
+  printed is hidden to the end of the text.
 
 **Settings for one service.** A template may let a create replace some of its settings, so that two services of one
 template differ without a second template file. It lists their names in `createSettings`, each a key of its

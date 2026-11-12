@@ -860,6 +860,7 @@ pub fn function_entries(entries: &[Entry]) -> Vec<(Entry, ServiceConfig)> {
 /// taken out, and only its end when it is long.
 pub fn clean_output(output: &str, secrets: &[String]) -> String {
     let patterns = secret_patterns(secrets);
+    let hidden = crate::service::values_to_hide(secrets);
     let redact = |text: &str| -> String {
         let mut out = text.to_string();
         for pattern in &patterns {
@@ -867,8 +868,10 @@ pub fn clean_output(output: &str, secrets: &[String]) -> String {
                 .replace_all(&out, regex::NoExpand("[secret]"))
                 .into_owned();
         }
-        crate::service::redact_log(&out, secrets)
+        crate::service::redact_hidden(&out, &hidden)
     };
+    // A PEM block is hidden whole before the output is cut into lines: cut first, its lines are no longer one block.
+    let output = crate::service::redact_blocks(output);
     let mut lines = Vec::new();
     for line in output.split(['\n', '\r']) {
         if line.trim().is_empty() {

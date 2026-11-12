@@ -3211,16 +3211,121 @@ fn credential_patterns() -> &'static [(regex::Regex, &'static str)] {
     })
 }
 
-/// Replaces every stored/rendered secret value (longest first) and then every credential pattern.
-pub fn redact_log(text: &str, secrets: &[String]) -> String {
-    let mut out = text.to_string();
-    let mut values: Vec<&String> = secrets.iter().filter(|value| value.len() >= 8).collect();
+/// The shortest line of a secret of several lines that is hidden by its value wherever it is shown, in characters.
+///
+/// A secret of several lines (a key file) is shown one line at a time in a log, so each of its lines is hidden as a
+/// value of its own. A short line is not: a line of a few characters (`}`, `[server]`, `port = 5432`) is ordinary
+/// text that a log holds in many places, and hiding it would blank lines that hold no secret. At 16 characters a line
+/// of random text carries 96 bits of a base64 key, more than anyone finds in a log by chance, and a line of a key
+/// file (64 characters, or the last one) is hidden whole. What a shorter line can leave shown is at most the last
+/// few characters of such a file, too few to rebuild anything from; a PEM block is also hidden whole by its shape.
+pub const SECRET_LINE_MIN: usize = 16;
+
+/// A PEM block, from its BEGIN line to its END line, whatever is between; one whose END was not printed is hidden
+/// to the end of the text.
+fn pem_block() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static PEM: OnceLock<regex::Regex> = OnceLock::new();
+    PEM.get_or_init(|| {
+        regex::Regex::new(
+            r"(?s)-----BEGIN [A-Z0-9 ]{1,64}-----.*?(?:-----END [A-Z0-9 ]{1,64}-----|\z)",
+        )
+        .expect("the PEM pattern is valid")
+    })
+}
+
+/// Hides each whole PEM block in a text as it came, before it is cut into lines or cleaned: a key printed on a
+/// console is hidden whatever it is, a stored secret or not.
+pub fn redact_blocks(text: &str) -> std::borrow::Cow<'_, str> {
+    pem_block().replace_all(text, "[secret]")
+}
+
+/// The texts that hide `secrets`: each value whole, each value as [`clean_log`] shows it, and for a value of several
+/// lines each of its lines of at least [`SECRET_LINE_MIN`] characters, as it is and as it is shown cleaned. Longest first.
+/// Made once for a text of many lines and given to [`redact_hidden`] for each line.
+pub fn values_to_hide(secrets: &[String]) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    let mut add = |value: &str, shortest_chars: usize| {
+        if value.len() >= 8
+            && value.chars().count() >= shortest_chars
+            && !values.iter().any(|v| v == value)
+        {
+            values.push(value.to_string());
+        }
+    };
+    for secret in secrets {
+        add(secret, 0);
+        add(&clean_log(secret), 0);
+        if secret.contains(['\n', '\r']) {
+            for line in secret.split(['\n', '\r']) {
+                add(line.trim(), SECRET_LINE_MIN);
+                add(&clean_log(line), SECRET_LINE_MIN);
+            }
+        }
+    }
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    for value in values {
-        out = out.replace(value, "[secret]");
+    values
+}
+
+/// Hides each PEM block, then every stored/rendered secret value (whole and, for one of several lines, line by line;
+/// longest first), then every credential pattern.
+pub fn redact_log(text: &str, secrets: &[String]) -> String {
+    redact_hidden(text, &values_to_hide(secrets))
+}
+
+/// [`redact_log`] with the values to hide already made by [`values_to_hide`].
+pub fn redact_hidden(text: &str, hidden: &[String]) -> String {
+    let mut out = redact_blocks(text).into_owned();
+    for value in hidden {
+        out = out.replace(value.as_str(), "[secret]");
     }
     for (pattern, replacement) in credential_patterns() {
         out = pattern.replace_all(&out, *replacement).into_owned();
     }
     out
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// Lines of letters made from a counter: no value of a real secret.
+    fn lines(seed: u32, count: usize, width: usize) -> Vec<String> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                (0..width)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        (b'a' + (state >> 24) as u8 % 26) as char
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_failures_words_hide_a_secret_of_several_lines_that_cleaning_would_join() {
+        // A stored secret of three lines, printed by a failing command on its error stream with the lines apart.
+        let secret = format!("{}\n", lines(7, 3, 40).join("\n"));
+        let stderr = format!("cannot load:\n{secret}giving up\n");
+        let shown = crate::service_exec::failure_text(&stderr, &[secret.clone()]);
+        let leaks = secret.lines().any(|line| shown.contains(line));
+        assert!(!leaks, "a line of the secret is in the failure's words");
+        assert!(shown.starts_with("cannot load:") && shown.ends_with("giving up"));
+    }
+
+    #[test]
+    fn a_short_line_of_a_secret_of_several_lines_is_not_hidden_by_its_value() {
+        let long = lines(9, 1, SECRET_LINE_MIN).remove(0);
+        let short = lines(11, 1, SECRET_LINE_MIN - 1).remove(0);
+        let secret = format!("{long}\n{short}\n");
+        let hidden = redact_log(&format!("a {long} b"), &[secret.clone()]);
+        assert!(
+            hidden == "a [secret] b",
+            "a line of the shortest length hidden is not hidden"
+        );
+        let kept = redact_log(&format!("a {short} b"), &[secret]);
+        assert!(kept == format!("a {short} b"), "a shorter line is hidden");
+    }
 }

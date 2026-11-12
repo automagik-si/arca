@@ -6738,6 +6738,10 @@ impl ToolHandler for ServiceHandler {
                         secrets.push(value.to_string());
                     }
                 }
+                // A PEM block is hidden whole before the log is cut into lines: cut first, its lines are no longer
+                // one block. Each line is then cleaned and hidden again, a secret of several lines line by line.
+                let text = crate::service::redact_blocks(&text);
+                let hidden = crate::service::values_to_hide(&secrets);
                 let mut lines_out = Vec::new();
                 for line in text.split(['\n', '\r']) {
                     if line.trim().is_empty() {
@@ -6745,7 +6749,7 @@ impl ToolHandler for ServiceHandler {
                     }
                     let clean = crate::service::clean_log(line);
                     if !clean.is_empty() {
-                        lines_out.push(json!(crate::service::redact_log(&clean, &secrets)));
+                        lines_out.push(json!(crate::service::redact_hidden(&clean, &hidden)));
                     }
                 }
                 let start = lines_out.len().saturating_sub(lines as usize);

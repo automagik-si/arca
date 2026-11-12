@@ -553,6 +553,97 @@ fn the_longest_secret_and_one_of_many_bytes_are_taken_out_of_a_services_log() {
     }
 }
 
+/// The answer of a `service_logs` call: its lines, each as shown.
+fn log_lines(door: &Door, service: &str) -> Vec<String> {
+    let reply = door.call("service_logs", json!({"name":service,"lines":200}));
+    assert_eq!(answer(&reply), "ok", "{service}");
+    reply["result"]["structuredContent"]["lines"]
+        .as_array()
+        .expect("the lines")
+        .iter()
+        .map(|line| line.as_str().expect("a line").to_string())
+        .collect()
+}
+
+#[test]
+fn a_key_file_on_a_machines_console_is_hidden_whole_and_line_by_line() {
+    let rig = machine_and_container();
+    let door = Door::over(&rig);
+    let key = key_file(1700, true);
+    let reply = door.call(
+        "service_secret_set",
+        json!({"name":"p1","key":"SIGNING_KEY","value":key}),
+    );
+    assert_eq!(answer(&reply), "ok");
+    let body: Vec<&str> = key
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    // No line of the key, of the length that is hidden by value, is anywhere in what a log shows.
+    let shows_a_line = |lines: &[String]| {
+        lines.iter().any(|shown| {
+            body.iter().any(|line| {
+                line.chars().count() >= service::SECRET_LINE_MIN && shown.contains(line)
+            })
+        })
+    };
+
+    // 1. The guest prints the key file whole, as it is stored: one PEM block, hidden whole.
+    rig.fake
+        .set_console_log(PROJECT, "p1", &format!("booting\n{key}ready\n"));
+    let lines = log_lines(&door, "p1");
+    let whole = lines == ["booting", "[secret]", "ready"];
+    assert!(whole, "the key file printed whole is not one hidden line");
+
+    // 2. A program prints the key's lines without its BEGIN and END lines, each after a prefix of its own: no block,
+    // so each line of the stored secret is hidden by its value.
+    let printed: String = body
+        .iter()
+        .map(|line| format!("\u{1b}[0;32mkey:\u{1b}[0m {line}\r\n"))
+        .collect();
+    rig.fake
+        .set_console_log(PROJECT, "p1", &format!("booting\n{printed}ready\n"));
+    let lines = log_lines(&door, "p1");
+    assert!(!shows_a_line(&lines), "a line of the key is shown");
+    let long = body
+        .iter()
+        .filter(|line| line.chars().count() >= service::SECRET_LINE_MIN)
+        .count();
+    let hidden = lines.iter().filter(|line| *line == "key: [secret]").count();
+    assert_eq!(hidden, long, "each long line of the key is one hidden line");
+    assert!(long > 20, "the key has its lines of 64");
+
+    // 3. A key that is no stored secret, made here from another seed, printed on the container's console: hidden by
+    // its shape, a block with its END and one whose END was never printed.
+    let other: String = key_file(900, true)
+        .lines()
+        .map(|line| match line.starts_with("-----") {
+            true => format!("{line}\n"),
+            false => format!("{}\n", line.chars().rev().collect::<String>()),
+        })
+        .collect();
+    let cut: String = other.chars().take(500).collect();
+    for (case, text) in [
+        ("whole", format!("start\n{other}done\n")),
+        ("without its end", format!("start\n{cut}\n")),
+    ] {
+        rig.fake.set_console_log(PROJECT, "tok", &text);
+        let lines = log_lines(&door, "tok");
+        let shown = lines.iter().any(|shown| {
+            other
+                .lines()
+                .skip(1)
+                .any(|line| line.len() >= 8 && !line.starts_with("-----") && shown.contains(line))
+        });
+        assert!(!shown, "{case}: a line of the block is shown");
+        assert!(
+            lines.iter().any(|line| line == "[secret]"),
+            "{case}: no block is hidden"
+        );
+        assert_eq!(lines.first().map(String::as_str), Some("start"), "{case}");
+    }
+}
+
 #[test]
 fn one_machine_whose_live_state_is_slow_holds_up_only_its_own_status_and_that_still_answers() {
     let rig = machine_and_container();

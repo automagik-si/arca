@@ -409,8 +409,11 @@ pub fn writer_for(
     .with_total_budget(budget))
 }
 
+/// A failure's words as they are shown: every secret and PEM block hidden in the text as it came, before cleaning
+/// joins its lines (a value of several lines is only found while its lines are apart), and again after.
 pub fn failure_text(text: &str, secrets: &[String]) -> String {
-    crate::service::redact_log(&crate::service::clean_log(text), secrets)
+    let redacted = crate::service::redact_log(text, secrets);
+    crate::service::redact_log(&crate::service::clean_log(&redacted), secrets)
         .chars()
         .take(300)
         .collect()

@@ -17,6 +17,12 @@ the upgrade is refused and proposed again.
 A create is refused when the instance it would get has the name of another service's instance on the node: the
 node's own service `x-<tenant id>` and that tenant's service `x`. Before, the second one was recorded and Incus
 refused it.
+A secret of several lines, such as a key file a virtual machine reads, is now hidden in `service_logs`, in a failed
+command's words and in a function's output. Before, a log was cleaned line by line before the stored values were looked
+for, so a value of several lines was never found and a key the guest printed on its console was shown to any token
+that may read logs. Each line of such a secret of 16 characters or more is now hidden as a value of its own, and every
+PEM block (BEGIN to END) is hidden whole before the log is cut into lines, a stored secret or not. A PEM block whose
+END line was not printed is hidden to the end of the text, so a log after such a line shows `[secret]` and nothing more.
 
 More of what a `service_create` would refuse is now refused when it is proposed, in the create's words, so no card is
 shown for it: a name that is taken, a deploy the approved create could not add to, a tenant's machine on a host
