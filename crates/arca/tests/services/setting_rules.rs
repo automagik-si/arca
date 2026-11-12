@@ -290,6 +290,45 @@ fn a_template_whose_rules_cannot_be_read_or_whose_defaults_fail_them_is_refused_
     );
 }
 
+/// A name in a template's `createSettings` is told back in a create's refusal ("it lets a create set ..."), so it is
+/// held to what a rule's names are held to: 1 to 64 plain characters. One that is not is refused when the template is
+/// read, and the refusal does not show it.
+#[test]
+fn a_template_whose_create_settings_name_a_setting_too_long_or_not_plainly_is_refused_when_it_is_read()
+ {
+    let rig = ruled_rig();
+    let dir = rig.dir.join("templates");
+    let load = |name: &str| {
+        let mut value = ruled_template();
+        value["name"] = json!("bad");
+        value["settings"][name] = json!(1);
+        value["createSettings"]
+            .as_array_mut()
+            .expect("a list")
+            .push(json!(name));
+        rig.template("bad", value);
+        service::load_template(&dir, "bad")
+    };
+    for name in [
+        "x".repeat(65),
+        "max\u{202e}stolS".to_string(),
+        String::new(),
+    ] {
+        let error = load(&name).expect_err("refused");
+        assert_eq!(
+            error.message,
+            "template bad: createSettings names each setting in 1 to 64 plain characters",
+            "{name:?}"
+        );
+        assert!(
+            name.is_empty() || !error.message.contains(&name),
+            "{name:?}"
+        );
+    }
+    // At 64 plain characters the name is read.
+    load(&"z".repeat(64)).expect("a name of 64 characters loads");
+}
+
 /// The two GitLab pool templates as they ship state eight rules, each one the pool's own script refuses on the
 /// machine's console (`settings: ...` in `templates/gitlab-runner-pool.sh`). Their defaults pass, each rule refuses
 /// the first value outside it and takes the last value inside it.

@@ -1771,6 +1771,17 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     {
         return refused("settings is one JSON object of at most 16KiB");
     }
+    // A name createSettings lists is told back in a create's refusal ("it lets a create set ..."): it is held to
+    // what a rule's names are held to, and one that is not is refused without being shown.
+    if template
+        .create_settings
+        .iter()
+        .any(|key| key.is_empty() || key.chars().count() > SETTING_NAME_MAX || !plain_text(key))
+    {
+        return refused(&format!(
+            "createSettings names each setting in 1 to {SETTING_NAME_MAX} plain characters"
+        ));
+    }
     let mut listed = BTreeSet::new();
     if template.create_settings.len() > 32
         || !template.create_settings.iter().all(|key| {

@@ -1064,7 +1064,8 @@ enter Incus's instance config.
   unchanged. Neither may hold a secret, and nothing is changed on a virtual machine after its create (Rule 59), so a changed
   script or setting applies to a machine created after the change.
 - `createSettings` lists the top-level keys of `settings` that one `service_create` may replace with its own `settings`
-  argument. The value in the template is the default and gives the shape. `create_settings` refuses, before any write and
+  argument, each named in 1 to 64 plain characters (`validate_vm_template`, as a rule's names are), since a refusal
+  tells them back. The value in the template is the default and gives the shape. `create_settings` refuses, before any write and
   again when a create is proposed, and names the place down to a list's element (`setting_refusal`): a key that is not
   listed; at any level a value of another JSON type than the default, an element of a list unlike the default's first,
   or a key the default's object does not have; a number that does not read back the same from the canonical JSON an

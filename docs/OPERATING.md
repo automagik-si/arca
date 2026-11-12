@@ -3453,7 +3453,8 @@ Where a virtual machine's secret is, and is not:
 
 **Settings for one service.** A template may let a create replace some of its settings, so that two services of one
 template differ without a second template file. It lists their names in `createSettings`, each a key of its
-`settings`, whose value there is the default:
+`settings`, whose value there is the default. A refusal of a create tells these names back, so each is 1 to 64 plain
+characters; a template that lists another is refused when it is read, without the name:
 
 ```json
 "settings": { "url": "https://github.com/example-org", "maxSlots": 5, "pin": "registry.example/tool@sha256:..." },
