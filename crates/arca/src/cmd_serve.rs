@@ -1,5 +1,5 @@
-//! `serve --config <file>`: the Arca MCP server on the unix socket, and on the tailnet and proxy addresses and the services
-//! socket when the config names them.
+//! `serve --config <file>`: the Arca MCP server on the unix socket, and on the loopback, tailnet and proxy addresses and
+//! the services socket when the config names them.
 //! The server runs until SIGTERM or SIGINT, then removes its own socket and exits 0.
 
 use std::collections::BTreeSet;
@@ -29,7 +29,8 @@ use arca_kernel::KernelError;
 use arca_kernel::identity::NodeKey;
 use arca_kernel::plugin::Provider;
 use arca_mcp::{
-    Server, TokenStore, TokenStoreError, serve_proxy, serve_services, serve_tailnet, serve_unix,
+    Server, TokenStore, TokenStoreError, serve_loopback, serve_proxy, serve_services,
+    serve_tailnet, serve_unix,
 };
 use arca_metrics::ProbeTarget;
 use arca_providers::ReadOnlyIncusProvider;
@@ -266,6 +267,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // kernel's passkeys file. Without one it is not in the served table, so tools/list never lists it and a call answers
     // not_found, exactly as before the verb existed.
     let relayed = accepts_relayed_approvals(&cfg);
+    // The loopback door's state: the listener reports each bind it tries, and arca_status says what the last one found.
+    let door = cfg.listen.loopback.map(crate::handlers::LoopbackDoor::new);
     // peer_keys_sync is served only to a kernel whose config keeps another machine's page host's passkeys.
     let keeps_peer_keys = !peers.is_empty();
     let mut server = Server::new(served_verbs(relayed, keeps_peer_keys), tokens.clone())
@@ -288,6 +291,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                     peer: peers.first().cloned(),
                     peer_sources: peer_sources.clone(),
                 }),
+                loopback: door.clone(),
             }),
         )
         .handle(
@@ -541,6 +545,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The services socket serves the MCP routes alone: a service with kernel access connects to it, and it never
     // carries the approval page, whose routes need no token. It is taken here, before the page is merged anywhere.
     let services_router = router.clone();
+    // The loopback listener is a TCP port every process of the machine can reach, so it carries the MCP routes alone
+    // too: every one of them needs a bearer token, and the page's routes need none.
+    let loopback_router = router.clone();
     let proxy_router = match &page {
         Some(page) => router.clone().merge(page.router(true)),
         None => router.clone(),
@@ -589,7 +596,19 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }
         };
         // A listener the config does not name is a future that never ends, so the first listener to fail, or the first
-        // signal, stops them all.
+        // signal, stops them all. The loopback listener is the exception: its port is one any program of the machine
+        // can hold first, so a bind that fails is reported and tried again, and never stops the others.
+        let loopback = async {
+            match (cfg.listen.loopback, door) {
+                (Some(addr), Some(door)) => {
+                    serve_loopback(loopback_router.clone(), addr, move |error| {
+                        door.report(error)
+                    })
+                    .await
+                }
+                _ => std::future::pending().await,
+            }
+        };
         let tailnet = async {
             match cfg.listen.tailnet {
                 Some(addr) => serve_tailnet(router.clone(), addr).await,
@@ -610,6 +629,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         };
         tokio::select! {
             result = serve_unix(router.clone(), &unix_path) => result,
+            result = loopback => result,
             result = tailnet => result,
             result = proxy => result,
             result = services => result,

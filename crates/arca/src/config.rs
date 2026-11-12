@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 // The adoption types come from the writer, whose feature reaches this crate through `arca-providers`, the one crate that
 // enables it (docs/OWNERSHIP.md, Rule 28).
 pub use arca_incus::adopt::AdoptTarget;
-use arca_mcp::{proxy_addr_ok, services_path_ok, tailnet_addr_ok};
+use arca_mcp::{loopback_addr_ok, proxy_addr_ok, services_path_ok, tailnet_addr_ok};
 use serde::Deserialize;
 use serde_json::error::Category;
 
@@ -180,11 +180,17 @@ impl IncusConfig {
     }
 }
 
-/// The listeners: the unix socket, and one tailnet address, one proxy address and the services socket when each is named.
+/// The listeners: the unix socket, and one loopback address, one tailnet address, one proxy address and the services
+/// socket when each is named.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListenConfig {
     pub unix: PathBuf,
+    /// The loopback listener: one loopback address and port, for a client on the same machine that takes an MCP server
+    /// URL. It serves the MCP routes alone, each behind a bearer token, to loopback peers that name it by its own address
+    /// or as `localhost`. Any other address is refused here: it is `tailnet`'s or `proxy`'s.
+    #[serde(default)]
+    pub loopback: Option<SocketAddr>,
     #[serde(default)]
     pub tailnet: Option<SocketAddr>,
     #[serde(default)]
@@ -368,6 +374,8 @@ pub enum ConfigError {
         path: String,
         why: Box<ConfigError>,
     },
+    /// The loopback address is not a loopback address, or its port fails the port rules.
+    LoopbackAddr(String),
     /// The tailnet address fails the tailnet rules.
     TailnetAddr(String),
     /// The proxy address fails the proxy rules, or its peer is not one address.
@@ -414,6 +422,7 @@ impl fmt::Display for ConfigError {
                 Self::Parse(why) => write!(f, "in the config file {path}: {why}"),
                 why => write!(f, "in the config file {path}: {why}"),
             },
+            Self::LoopbackAddr(why) => write!(f, "listen.loopback is refused: {why}"),
             Self::TailnetAddr(why) => write!(f, "listen.tailnet is refused: {why}"),
             Self::ProxyAddr(why) => write!(f, "listen.proxy is refused: {why}"),
             Self::ServicesSocket(why) => write!(f, "listen.services is refused: {why}"),
@@ -500,6 +509,9 @@ fn parse(text: &str) -> Result<NodeConfig, String> {
 pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     if let Some(link) = &config.link {
         link.check().map_err(|e| ConfigError::Link(e.to_string()))?;
+    }
+    if let Some(addr) = config.listen.loopback {
+        loopback_addr_ok(&addr).map_err(ConfigError::LoopbackAddr)?;
     }
     if let Some(addr) = config.listen.tailnet {
         tailnet_addr_ok(&addr).map_err(ConfigError::TailnetAddr)?;
@@ -1156,6 +1168,41 @@ mod tests {
             value["approvalHost"] = serde_json::json!(host);
         }
         serde_json::from_value(value).expect("the fixture config parses")
+    }
+
+    #[test]
+    fn the_loopback_listener_takes_a_loopback_address_and_no_other() {
+        let with = |addr: &str| {
+            let mut config = config_with(None);
+            config.listen.loopback = Some(addr.parse().expect("a socket address"));
+            check(&config)
+        };
+        assert_eq!(config_with(None).listen.loopback, None, "absent by default");
+        for good in ["127.0.0.1:7471", "127.0.0.2:7471", "[::1]:7471"] {
+            assert_eq!(with(good), Ok(()), "{good}");
+        }
+        for bad in [
+            "0.0.0.0:7471",
+            "[::]:7471",
+            "192.0.2.1:7471",
+            "100.64.0.1:7471",
+            "[::ffff:127.0.0.1]:7471",
+            "127.0.0.1:0",
+            "127.0.0.1:443",
+        ] {
+            let error = with(bad).expect_err(bad);
+            assert!(
+                matches!(error, ConfigError::LoopbackAddr(_)),
+                "{bad}: {error:?}"
+            );
+            let said = error.to_string();
+            assert!(said.starts_with("listen.loopback is refused: "), "{said}");
+            // The refusal names the rule, never the address it was given.
+            assert!(
+                !said.contains(bad.rsplit_once(':').expect("a port").0),
+                "{said}"
+            );
+        }
     }
 
     #[test]

@@ -70,6 +70,32 @@ pub fn words(status: &Value, cfg: &NodeConfig) -> String {
             cfg.listen.unix.display()
         ),
     ];
+    // The loopback door is the one other listener the node speaks for: its answer says whether it holds the address.
+    // A port another program took first leaves the node running and this door closed, and whatever answers there is
+    // not this node.
+    match status.get("loopback").filter(|door| door.is_object()) {
+        Some(door) => {
+            let addr = door["addr"]
+                .as_str()
+                .unwrap_or("an address the node did not name");
+            lines.push(if door["open"] == json!(true) {
+                format!("MCP door for a client on this machine: open, at http://{addr}/mcp")
+            } else {
+                format!(
+                    "MCP door for a client on this machine: CLOSED. The node does not hold {addr} ({}). Send no token there; the node keeps trying the address",
+                    door["reason"].as_str().unwrap_or("it does not say why")
+                )
+            });
+        }
+        // A node from before the door's report, or one started before the config named the door.
+        None => {
+            if let Some(addr) = cfg.listen.loopback {
+                lines.push(format!(
+                    "Config also names: the loopback address {addr} (from the config file, not checked)"
+                ));
+            }
+        }
+    }
     if let Some(addr) = cfg.listen.tailnet {
         lines.push(format!(
             "Config also names: the tailnet address {addr} (from the config file, not checked)"
@@ -178,6 +204,48 @@ mod tests {
         assert!(text.contains("Incus: does not answer"), "{text}");
         assert!(
             text.ends_with("Next: Incus does not answer on incus.socket of the config. Check that Incus runs and that this user may use its socket."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_loopback_door_is_what_the_node_says_of_it_open_or_closed_and_never_a_guess() {
+        let cfg = config(json!({ "loopback": "127.0.0.1:7471" }));
+        let mut open = answer("watch-only", true);
+        open["loopback"] = json!({ "addr": "127.0.0.1:7471", "open": true, "reason": null });
+        let text = words(&open, &cfg);
+        assert!(
+            text.contains(
+                "MCP door for a client on this machine: open, at http://127.0.0.1:7471/mcp"
+            ),
+            "{text}"
+        );
+        // Another program holds the port: the node runs, the door is closed, and the words say not to send the
+        // token to whatever answers there.
+        let mut closed = answer("watch-only", true);
+        closed["loopback"] = json!({
+            "addr": "127.0.0.1:7471", "open": false,
+            "reason": "address in use: another program holds this port"
+        });
+        let text = words(&closed, &cfg);
+        assert!(
+            text.contains("MCP door for a client on this machine: CLOSED. The node does not hold 127.0.0.1:7471 (address in use: another program holds this port). Send no token there; the node keeps trying the address"),
+            "{text}"
+        );
+        assert!(!text.contains("http://127.0.0.1:7471/mcp"), "{text}");
+        // A node that says nothing of its door (an older one): only what the config names, marked as not checked.
+        let text = words(&answer("watch-only", true), &cfg);
+        assert!(
+            text.contains("Config also names: the loopback address 127.0.0.1:7471 (from the config file, not checked)"),
+            "{text}"
+        );
+        // And no line at all for a config with no door.
+        let text = words(
+            &answer("watch-only", true),
+            &config(json!({ "loopback": null })),
+        );
+        assert!(
+            !text.contains("loopback") && !text.contains("client on this machine"),
             "{text}"
         );
     }

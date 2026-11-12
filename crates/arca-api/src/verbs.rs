@@ -1423,6 +1423,15 @@ fn arca_status_result() -> Value {
                 ("peerKeySources", false, array(peer_keys_status())),
             ]),
         ),
+        (
+            "loopback",
+            false,
+            result(vec![
+                ("addr", true, string()),
+                ("open", true, boolean()),
+                ("reason", true, nullable(string())),
+            ]),
+        ),
     ])
 }
 

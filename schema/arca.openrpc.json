@@ -126,6 +126,28 @@
             "incusReachable": {
               "type": "boolean"
             },
+            "loopback": {
+              "properties": {
+                "addr": {
+                  "type": "string"
+                },
+                "open": {
+                  "type": "boolean"
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "addr",
+                "open",
+                "reason"
+              ],
+              "type": "object"
+            },
             "metricsSource": {
               "enum": [
                 "local",

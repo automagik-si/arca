@@ -49,14 +49,20 @@ to run their services.
   `sh install.sh --version <version>` names another; without it, an older release is never put over a newer program.
   The program is checked against that release's `SHA256SUMS`. That catches a download that was damaged or cut short. It
   does not catch a release that was tampered with, because the checksums come from the same release.
-- **It writes the quickstart's config and mints one `viewer` token**, only where there is no config. A config that
-  exists is not changed.
+- **It writes the quickstart's config and mints one `viewer` token**, only where there is no config. The config opens
+  the HTTP MCP door on this machine only: `127.0.0.1`, port 7471, or the next free port up to 7480, and the report
+  says which. A config it did not write is not changed. Its own config from before the door gains the door, and
+  nothing else, on the run that replaces a program from before the door with one that has it.
+- **`sh install.sh --no-door` opens no TCP port at all.** It writes `"loopback": null` into the config, which is the
+  config's own word for no door, and no later run or upgrade opens one in a config that says so, or in one whose door
+  you took out by hand. `sh install.sh --door` opens it again. A config the script did not write is not changed by
+  either flag.
 - **It runs the node as a service**, `arca.service`, a systemd user unit, and only for a config it wrote. For a config
   it did not write, and where `systemctl --user` does not answer, it starts nothing, prints the one command that starts
   the node, and ends with exit code 3: the program is installed and no node was started.
 - **It ends with the node's own answer** to `arca_status`: the mode (`watch-only`), where the token's file is (never the
-  token), and the two ways to connect an assistant from step 4 below. Exit code 0 means the node runs, answered, and
-  reaches Incus.
+  token), and the two ways to connect an assistant from step 4 below, with the one line that adds the node to Claude
+  Code. Exit code 0 means the node runs, answered, and reaches Incus.
 - **A second run** replaces the program in place and restarts the service. `sh install.sh --uninstall` removes the
   service and the program, while the program is still the file it installed, and keeps the config, the tokens and the
   state.
@@ -112,7 +118,7 @@ cat > ~/.config/arca/node.json <<EOF
 {
   "stateDir": "$HOME/.local/state/arca-node",
   "incus": { "socket": "/var/lib/incus/unix.socket" },
-  "listen": { "unix": "$XDG_RUNTIME_DIR/arca.sock" },
+  "listen": { "unix": "$XDG_RUNTIME_DIR/arca.sock", "loopback": "127.0.0.1:7471" },
   "tokens": { "hashDir": "$HOME/.config/arca/tokens" },
   "kernel": { "droiddProjects": [] }
 }
@@ -121,7 +127,9 @@ EOF
 
 `kernel.droiddProjects` names the Incus projects that belong to droidd, another manager Arca stays out of; leave it empty
 when the host has none. `listen.unix` is a unix socket path, so it must stay under about 100 characters; a login
-session sets `XDG_RUNTIME_DIR`.
+session sets `XDG_RUNTIME_DIR`. `listen.loopback` is the HTTP MCP door for this machine only; take another port when
+7471 is in use, and write `"loopback": null` to have no TCP port at all (the installer reads `null` as your no and
+keeps it; a config that only leaves the key out reads as one from before the door).
 
 **3. Mint a token and start the node.** `serve` reads its tokens when it starts, so mint first.
 
@@ -153,39 +161,59 @@ bearer token on every request. It speaks protocol version `2026-07-28` (no hands
 and still `2025-11-25` (`initialize` first), so a client of either connects with no setting; `server/discover` names
 both. ["The MCP server"](OPERATING.md#the-mcp-server) in the operating guide has the details. With the `viewer` token
 from step 3, this read-only node lists 18 tools, among them `arca_status`, `node_metrics`, `watch_report`, `alerts_list`
-and `service_list`. Two ways to reach it work today:
+and `service_list`. Three ways to reach it work today:
 
-- **An assistant with a shell on the node** runs `arca call <verb>` as in step 3. `arca call` is an MCP client over the
-  unix socket, and the socket answers only the user who runs `serve`.
-- **An assistant that takes an MCP server URL** (any client with an HTTP transport and a custom header) needs a TCP
-  address, and the node opens one only when the config names it: `listen.tailnet`, one address on the host's tailnet, or
-  `listen.proxy`, one address for a reverse proxy on the same host that adds TLS and a host name. The client's entry is
-  then the URL and the token:
+- **An assistant that takes an MCP server URL** (any client with an HTTP transport and a custom header) uses the
+  door the config above opens, `http://127.0.0.1:7471/mcp`, from this machine. For Claude Code it is one line; the
+  shell reads the token from its file:
+
+  ```sh
+  claude mcp add --transport http arca http://127.0.0.1:7471/mcp --header "Authorization: Bearer $(cat ~/.config/arca/assistant-1.secret)"
+  ```
+
+  Any other client takes this entry, with the content of `assistant-1.secret` in place of `<token>`:
 
   ```json
   {
     "mcpServers": {
       "arca": {
         "type": "http",
-        "url": "http://<tailnet address>:<port>/mcp",
-        "headers": { "Authorization": "Bearer <content of assistant-1.secret>" }
+        "url": "http://127.0.0.1:7471/mcp",
+        "headers": { "Authorization": "Bearer <token>" }
       }
     }
   }
   ```
 
-  Behind a reverse proxy the URL is `https://<host name>/mcp`. Both listeners are off in the config above;
+  The client then keeps the token in its own config, in clear text: whoever can read that file can ask the node
+  whatever the token may ask. Running the `claude mcp add` line also puts the token in that command's arguments for
+  a moment, where other users of the machine can read it; pasting the entry into the client's config avoids that.
+
+  Use the address `127.0.0.1` in the URL, not the name `localhost`: the name can also mean `::1`, where the node does
+  not listen and another program could. The door answers this machine only. It refuses a request that carries an
+  `Origin` header, so a web page cannot call the node, and a request whose `Host` is not `127.0.0.1:7471` or
+  `localhost:7471`, so a name that was pointed at this machine cannot either. Every program of this machine can
+  connect to the port; none gets an answer without the token.
+
+  On a machine shared with other accounts, another account can take the port while the node is not running, and
+  would then receive what a client sends there, the token included. `arca call` below is not exposed to that. To
+  have no door, write `"loopback": null`, or run `sh install.sh --no-door`. A port that is taken does not stop the
+  node: it runs without the door, keeps trying the port, and `arca_status` says `"loopback": { "open": false, ... }`
+  meanwhile.
+- **An assistant with a shell on the node** runs `arca call <verb>` as in step 3. `arca call` is an MCP client over the
+  unix socket, and the socket answers only the user who runs `serve`.
+- **An assistant on another machine** needs an address that machine can reach, and the node opens one only when the
+  config names it: `listen.tailnet`, one address on the host's tailnet, or `listen.proxy`, one address for a reverse
+  proxy on the same host that adds TLS and a host name. Both are off in the config above;
   ["The config file"](OPERATING.md#the-config-file) and
   ["Publishing through a reverse proxy"](OPERATING.md#publishing-through-a-reverse-proxy-each-step-approved-by-the-owner-at-that-moment)
-  in the operating guide say what each address may be and how to turn it on. A request that carries an `Origin` header
-  is refused, so a web page cannot call the node.
+  in the operating guide say what each address may be and how to turn it on.
 
 Streamable HTTP is the node's one MCP transport. A client connects to the node's socket or to an address the node
 serves; the node is not started as a client's local command.
 
-**Not yet:** there is no `arca init`, so the config and its directories are written by hand as above; no TCP address is
-open until the config names one, so an assistant that takes a URL cannot connect to the node as this page leaves it;
-and Linux x86_64 is the only published binary.
+**Not yet:** there is no `arca init`, so the config and its directories are written by hand as above; and Linux x86_64
+is the only published binary.
 
 ## Next: a node that changes things
 

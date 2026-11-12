@@ -10,9 +10,10 @@
 //! read it.
 //!
 //! So this proves the script's own logic: the checks and their reasons, the one named release and its checksum, what
-//! is written where and at which mode, that a config that exists is not changed and that no node is started for one
-//! the script did not write, the service's commands in order, the report and how the script ends, the uninstall,
-//! and that the token reaches no output. It does not prove GitHub, a real download, the
+//! is written where and at which mode, that a config the script did not write is not changed and that no node is
+//! started for one, the HTTP door's port and the connect lines, that the script's own earlier config gains the door
+//! and loses it again under an older program, the service's commands in order, the report and how the script ends,
+//! the uninstall, and that the token reaches no output. It does not prove GitHub, a real download, the
 //! real `arca`, systemd, Incus or a machine that never had Arca.
 //!
 //! The tests need `sh`, `bash` and the usual core utilities on the machine that runs them, and a user who is not
@@ -102,6 +103,34 @@ fn constant(name: &str) -> String {
 fn current() -> String {
     constant("ARCA_VERSION")
 }
+
+/// The first release whose program has the HTTP door, as the script names it.
+fn door_since() -> String {
+    constant("DOOR_SINCE")
+}
+
+/// Whether the program of release `version` has the HTTP door: the release that brought it, or a later one. A
+/// pre-release comes before its release. These tests hold on both sides of that release, so each says which side its
+/// program is on.
+fn has_door(version: &str) -> bool {
+    let numbers = |text: &str| -> (Vec<u64>, bool) {
+        let (core, pre) = match text.split_once('-') {
+            Some((core, _)) => (core, true),
+            None => (text, false),
+        };
+        let core = core
+            .split('.')
+            .map(|part| part.parse().expect("a number in a version"))
+            .collect();
+        (core, pre)
+    };
+    let (have, pre) = numbers(version);
+    let (since, _) = numbers(&door_since());
+    have > since || (have == since && !pre)
+}
+
+/// A release older than the door, whatever release the script installs today.
+const BEFORE_DOOR: &str = "0.10.0";
 
 fn uid() -> String {
     let output = Command::new(which("id")).arg("-u").output().expect("id");
@@ -300,6 +329,34 @@ impl Machine {
         fs::write(dir.join("SHA256SUMS"), sums).expect("the checksums");
     }
 
+    /// The machine's listening TCP sockets, as the kernel's two tables list them: `v4` ports on 127.0.0.1 and `v6`
+    /// ports on the IPv6 wildcard. A socket that is connected, not listening, on the door's first port is listed too:
+    /// it takes no port from a listener.
+    fn listening(&self, v4: &[u16], v6: &[u16]) {
+        let mut tcp = String::from(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        );
+        tcp.push_str(
+            "   0: 0100007F:1D2F 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 11 1 0 20 4 30 10 -1\n",
+        );
+        for (row, port) in v4.iter().enumerate() {
+            tcp.push_str(&format!(
+                "{:4}: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12 1 0 100 0 0 10 0\n",
+                row + 1
+            ));
+        }
+        let mut tcp6 = String::from(
+            "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        );
+        for (row, port) in v6.iter().enumerate() {
+            tcp6.push_str(&format!(
+                "{row:4}: 00000000000000000000000000000000:{port:04X} 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 13 1 0 100 0 0 10 0\n"
+            ));
+        }
+        fs::write(self.dir.join("fake/tcp"), tcp).expect("the IPv4 table");
+        fs::write(self.dir.join("fake/tcp6"), tcp6).expect("the IPv6 table");
+    }
+
     /// Makes or removes one of the stand-ins' switches, a file under `fake/`.
     fn switch(&self, name: &str, on: bool) {
         let path = self.dir.join("fake").join(name);
@@ -333,6 +390,14 @@ impl Machine {
             .env("INCUS_SOCKET", self.dir.join("incus.socket"))
             .env("ARCA_INSTALL_WAIT", "1")
             .env("ARCA_INSTALL_RUN_ROOT", self.dir.join("run-root"))
+            .env(
+                "ARCA_INSTALL_TCP_TABLES",
+                format!(
+                    "{} {}",
+                    self.dir.join("fake/tcp").display(),
+                    self.dir.join("fake/tcp6").display()
+                ),
+            )
             .env("FAKE_DIR", self.dir.join("fake"))
             .env("FAKE_PATH", std::env::var_os("PATH").expect("PATH"))
             .env("FAKE_ARCA_SECRET", TOKEN);
@@ -446,14 +511,62 @@ impl Drop for Machine {
 }
 
 /// The config of the quickstart (`docs/QUICKSTART.md`), for this machine.
-fn quickstart_config(machine: &Machine) -> Value {
-    json!({
+/// The config the script writes: with the HTTP door on `door`, or with none.
+fn quickstart_config(machine: &Machine, door: Option<u16>) -> Value {
+    let mut config = json!({
         "stateDir": machine.home(".local/state/arca-node"),
         "incus": { "socket": machine.dir.join("incus.socket") },
         "listen": { "unix": machine.runtime_dir().join("arca.sock") },
         "tokens": { "hashDir": machine.home(".config/arca/tokens") },
         "kernel": { "droiddProjects": [] }
-    })
+    });
+    if let Some(port) = door {
+        config["listen"]["loopback"] = json!(format!("127.0.0.1:{port}"));
+    }
+    config
+}
+
+fn config_on_disk(machine: &Machine) -> Value {
+    serde_json::from_str(
+        &fs::read_to_string(machine.home(".config/arca/node.json")).expect("the config"),
+    )
+    .expect("the config is JSON")
+}
+
+/// The report of a node whose door is on `port`: where it is, the one line for Claude Code, which reads the token
+/// from its file, the entry for any other client, which holds no token, and what the client then keeps.
+fn says_the_door(machine: &Machine, run: &Run, port: u16) {
+    let secret = machine.home(".config/arca/assistant-1.secret");
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    run.says(&format!("  door      {url}, from this machine only"))
+        .says(&format!(
+            "claude mcp add --transport http arca {url} --header \"Authorization: Bearer $(cat '{}')\"",
+            secret.display()
+        ))
+        .says("keeps the token in its own config, in clear text")
+        // What running the line shows other users, why the address is the IP, and who else can take the port.
+        .says("puts the token in that command's")
+        .says("pasting the entry into the")
+        .says("The address is 127.0.0.1 and not the name localhost")
+        .says("On a machine shared with other accounts: while the node is not running, another account can take")
+        .says(&format!("port {port}, and would then receive what a client sends there, the token included."))
+        .says("sh install.sh --no-door")
+        .never_says("listen.tailnet");
+    let entry = run
+        .out
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("{ \"mcpServers\""))
+        .unwrap_or_else(|| panic!("the entry for other clients:\n{}", run.all()));
+    let entry: Value = serde_json::from_str(entry).expect("the entry is JSON");
+    assert_eq!(
+        entry,
+        json!({ "mcpServers": { "arca": {
+            "type": "http",
+            "url": url,
+            "headers": { "Authorization": "Bearer <token>" }
+        } } })
+    );
 }
 
 /// What a finished install leaves, whichever way the script was started.
@@ -474,11 +587,9 @@ fn is_the_quickstarts_node(machine: &Machine, run: &Run, version: &str) {
         machine.home_names()
     );
 
-    let config: Value = serde_json::from_str(
-        &fs::read_to_string(machine.home(".config/arca/node.json")).expect("the config"),
-    )
-    .expect("the config is JSON");
-    assert_eq!(config, quickstart_config(machine));
+    // The door is on its first port: nothing listens on this machine.
+    let door = has_door(version).then_some(7471);
+    assert_eq!(config_on_disk(machine), quickstart_config(machine, door));
     assert_eq!(mode(&machine.home(".config/arca/tokens")), 0o700);
     assert_eq!(mode(&machine.home(".local/state/arca-node")), 0o700);
     // What the script makes is this user's alone, but for the program and the unit, whose modes it sets.
@@ -530,9 +641,16 @@ fn is_the_quickstarts_node(machine: &Machine, run: &Run, version: &str) {
             bin.display(),
             machine.home(".config/arca/node.json").display(),
             secret.display()
-        ))
-        .says("listen.tailnet")
-        .says("Authorization: Bearer <the content of");
+        ));
+    match door {
+        Some(port) => says_the_door(machine, run, port),
+        None => {
+            run.says("door      none: this program is older than")
+                .says("listen.tailnet")
+                .says("Authorization: Bearer <the content of")
+                .never_says("claude mcp add");
+        }
+    }
     assert!(
         !run.all().contains(TOKEN),
         "the token was printed:\n{}",
@@ -674,10 +792,16 @@ fn a_second_run_upgrades_the_program_in_place_and_restarts_the_service() {
         .says(&format!("it was: Automagik Arca {}", current()));
     let mut after = machine.home_tree();
     let mut expected = before.clone();
-    for changed in [
+    let mut changes = vec![
         ".local/bin/arca",
         ".local/state/arca-install/program.sha256",
-    ] {
+    ];
+    // The script's own config follows the program across the release that brought the door (the helper above has
+    // checked which config is there now); between two programs on the same side of it, the config stays.
+    if has_door(&current()) != has_door(NEXT) {
+        changes.push(".config/arca/node.json");
+    }
+    for changed in changes {
         after.remove(changed);
         expected.remove(changed);
     }
@@ -760,7 +884,7 @@ fn a_config_this_script_did_not_write_is_not_changed_and_no_node_is_started_for_
     // ends with 3 and the one command.
     let run = machine.run(&[]);
     run.not_started()
-        .says("kept as it was: this script changes nothing in a config that exists")
+        .says("kept as it was: this script changes nothing in a config it did not write")
         .says("this script mints no token for a config that exists")
         .says("No node was started or restarted")
         .says("it starts no node it cannot ask")
@@ -817,6 +941,418 @@ fn a_config_this_script_did_not_write_is_not_changed_and_no_node_is_started_for_
 }
 
 #[test]
+fn a_program_with_the_door_gets_it_on_loopback_and_the_report_gives_the_connect_lines() {
+    let version = door_since();
+    for shell in ["sh", "bash"] {
+        let machine = Machine::new();
+        machine.release(&version);
+        // From a pipe, as `curl ... | sh` runs it: the door's steps read nothing from it either.
+        let run = machine.piped(shell, &["--version", &version]);
+        is_the_quickstarts_node(&machine, &run, &version);
+        says_the_door(&machine, &run, 7471);
+        run.never_says("was in use")
+            .never_says("This script started no node");
+        assert!(
+            !machine.dir.join("fake/stdin-read.log").exists(),
+            "something the script started could read its standard input"
+        );
+        // The door is loopback and nothing else: the config names one address, and it is 127.0.0.1.
+        assert_eq!(
+            config_on_disk(&machine)["listen"],
+            json!({
+                "unix": machine.runtime_dir().join("arca.sock"),
+                "loopback": "127.0.0.1:7471"
+            })
+        );
+
+        // A second run keeps the config and its port, though the node itself now listens there.
+        machine.listening(&[7471], &[]);
+        let before = machine.home_tree();
+        let again = machine.piped(shell, &["--version", &version]);
+        again
+            .ok()
+            .says("kept as it was: the config this script writes, from an earlier run");
+        says_the_door(&machine, &again, 7471);
+        again.never_says("was in use");
+        assert_eq!(machine.home_tree(), before);
+    }
+}
+
+#[test]
+fn the_door_takes_the_next_free_port_and_says_so_or_stays_shut_when_none_is_free() {
+    let version = door_since();
+
+    // 7471 is taken on IPv4 and 7472 on the IPv6 wildcard, which holds the IPv4 port too: 7473 is the door.
+    let machine = Machine::new();
+    machine.release(&version);
+    machine.listening(&[7471], &[7472]);
+    let run = machine.run(&["--version", &version]);
+    run.ok();
+    assert_eq!(
+        config_on_disk(&machine),
+        quickstart_config(&machine, Some(7473))
+    );
+    says_the_door(&machine, &run, 7473);
+    run.says("port 7471 was in use, so the next free one was taken")
+        .never_says(TOKEN);
+    // The next run finds its own config on that port and keeps it.
+    let again = machine.run(&["--version", &version]);
+    again.ok().says("kept as it was");
+    says_the_door(&machine, &again, 7473);
+    assert_eq!(
+        config_on_disk(&machine),
+        quickstart_config(&machine, Some(7473))
+    );
+
+    // Every port of the script's list is taken: the node is installed without a door, and the report says why.
+    let machine = Machine::new();
+    machine.release(&version);
+    let ports: Vec<u16> = constant("DOOR_PORTS")
+        .split_whitespace()
+        .map(|port| port.parse().expect("a port"))
+        .collect();
+    assert_eq!(ports.first(), Some(&7471));
+    assert!(ports.len() >= 2 && ports.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    machine.listening(&ports, &[]);
+    let run = machine.run(&["--version", &version]);
+    run.ok()
+        .says(&format!(
+            "door      none: something listens on every port from 7471 to {}",
+            ports.last().expect("a port")
+        ))
+        .says("node      mode watch-only")
+        .never_says("claude mcp add");
+    assert_eq!(config_on_disk(&machine), quickstart_config(&machine, None));
+}
+
+#[test]
+fn the_scripts_own_earlier_config_gains_the_door_and_loses_it_under_an_older_program() {
+    let version = door_since();
+    let machine = Machine::new();
+    machine.release(BEFORE_DOOR);
+    machine.release(&version);
+    assert!(!has_door(BEFORE_DOOR) && has_door(&version));
+
+    // An install from before the door: the config every earlier release of the script wrote, letter for letter.
+    let first = machine.run(&["--version", BEFORE_DOOR]);
+    is_the_quickstarts_node(&machine, &first, BEFORE_DOOR);
+    let config = machine.home(".config/arca/node.json");
+    let earlier = fs::read_to_string(&config).expect("the config");
+    assert_eq!(
+        earlier,
+        format!(
+            "{{\n  \"stateDir\": \"{}\",\n  \"incus\": {{ \"socket\": \"{}\" }},\n  \"listen\": {{ \"unix\": \"{}\" }},\n  \"tokens\": {{ \"hashDir\": \"{}\" }},\n  \"kernel\": {{ \"droiddProjects\": [] }}\n}}\n",
+            machine.home(".local/state/arca-node").display(),
+            machine.dir.join("incus.socket").display(),
+            machine.runtime_dir().join("arca.sock").display(),
+            machine.home(".config/arca/tokens").display(),
+        )
+    );
+    let token = fs::read(machine.home(".config/arca/assistant-1.secret")).expect("the token");
+
+    // The upgrade: the same config with the door, the same token, and the service on the new program.
+    let upgrade = machine.run(&["--version", &version]);
+    is_the_quickstarts_node(&machine, &upgrade, &version);
+    upgrade
+        .says("written again: it was this script's own, from before the HTTP door; the door is all that was added")
+        .says("enabled and started");
+    assert_eq!(
+        mode(&config) & 0o077,
+        0,
+        "the config is still this user's alone"
+    );
+    assert_eq!(
+        fs::read(machine.home(".config/arca/assistant-1.secret")).expect("the token"),
+        token
+    );
+    assert_eq!(machine.arca_calls("token"), 1, "one token in two runs");
+    let restarts = machine
+        .service_calls()
+        .iter()
+        .filter(|line| *line == "--user restart arca.service")
+        .count();
+    assert_eq!(restarts, 2, "the node was started again on the new config");
+
+    // Back to the older program, which refuses a config that names the door: the earlier text, letter for letter.
+    let back = machine.run(&["--version", BEFORE_DOOR]);
+    is_the_quickstarts_node(&machine, &back, BEFORE_DOOR);
+    back.says("written again without the HTTP door");
+    assert_eq!(fs::read_to_string(&config).expect("the config"), earlier);
+
+    // A config of the user's own is neither: one changed letter, and the script leaves it alone.
+    let machine = Machine::new();
+    machine.release(BEFORE_DOOR);
+    machine.release(&version);
+    machine.run(&["--version", BEFORE_DOOR]).ok();
+    let config = machine.home(".config/arca/node.json");
+    let own = fs::read_to_string(&config)
+        .expect("the config")
+        .replace("\"droiddProjects\": []", "\"droiddProjects\": [ ]");
+    fs::write(&config, &own).expect("the user's config");
+    let run = machine.run(&["--version", &version]);
+    run.ok()
+        .says("kept as it was: this script changes nothing in a config it did not write")
+        .never_says("door      ")
+        .never_says("claude mcp add")
+        .says("listen.loopback");
+    assert_eq!(fs::read_to_string(&config).expect("the config"), own);
+}
+
+/// The config with the owner's no: the key is there, and it says null.
+fn config_without_a_door(machine: &Machine) -> Value {
+    let mut config = quickstart_config(machine, None);
+    config["listen"]["loopback"] = Value::Null;
+    config
+}
+
+#[test]
+fn no_door_is_a_choice_the_config_states_and_no_later_run_or_upgrade_undoes() {
+    let version = door_since();
+    let later = "99.0.0";
+    assert!(has_door(later));
+    let machine = Machine::new();
+    machine.release(&version);
+    machine.release(later);
+
+    // --no-door on a machine that never had Arca: the node runs, and its config says there is no door.
+    let run = machine.run(&["--version", &version, "--no-door"]);
+    run.ok()
+        .says("node      mode watch-only")
+        .says("door      none: the config says so (\"loopback\": null). To open it: sh install.sh --door")
+        .never_says("claude mcp add")
+        .never_says("http://127.0.0.1:");
+    assert_eq!(config_on_disk(&machine), config_without_a_door(&machine));
+    let said_no = fs::read_to_string(machine.home(".config/arca/node.json")).expect("the config");
+    assert!(said_no.contains("\"loopback\": null"), "{said_no}");
+
+    // A run with no flag, and an upgrade with no flag, keep the no: the config is not touched.
+    for release in [version.as_str(), later] {
+        let run = machine.run(&["--version", release]);
+        run.ok()
+            .says("kept as it was: the config this script writes, from an earlier run")
+            .says("door      none: the config says so")
+            .never_says("written again")
+            .never_says("claude mcp add");
+        assert_eq!(
+            fs::read_to_string(machine.home(".config/arca/node.json")).expect("the config"),
+            said_no
+        );
+    }
+
+    // --door is the owner's yes: the door opens, and stays open on the runs after it.
+    let run = machine.run(&["--version", later, "--door"]);
+    run.ok()
+        .says("written again with the HTTP door: --door asked for it");
+    says_the_door(&machine, &run, 7471);
+    assert_eq!(
+        config_on_disk(&machine),
+        quickstart_config(&machine, Some(7471))
+    );
+    let run = machine.run(&["--version", later]);
+    run.ok().says("kept as it was");
+    says_the_door(&machine, &run, 7471);
+
+    // --no-door on a node that has the door: it is shut, in the config's own words.
+    let run = machine.run(&["--version", later, "--no-door"]);
+    run.ok()
+        .says("written again with no HTTP door (\"loopback\": null): --no-door asked for none")
+        .says("enabled and started")
+        .never_says("claude mcp add");
+    assert_eq!(config_on_disk(&machine), config_without_a_door(&machine));
+
+    // The two flags together are refused before anything is changed.
+    let before = machine.home_tree();
+    machine
+        .run(&["--door", "--no-door"])
+        .refused()
+        .says("--door and --no-door are not both given.");
+    assert_eq!(machine.home_tree(), before);
+}
+
+#[test]
+fn a_door_the_owner_took_out_by_hand_is_not_put_back() {
+    let version = door_since();
+    let later = "99.0.0";
+    for by_hand in ["the key removed", "the key set to null"] {
+        let machine = Machine::new();
+        machine.release(&version);
+        machine.release(later);
+        let first = machine.run(&["--version", &version]);
+        first.ok();
+        says_the_door(&machine, &first, 7471);
+
+        // The owner edits the config this script wrote: the key goes, or says null. Either way the text is one this
+        // script could have written itself, which is exactly why it must not read it as "from before the door".
+        let config = machine.home(".config/arca/node.json");
+        let with_door = fs::read_to_string(&config).expect("the config");
+        let edited = if by_hand == "the key removed" {
+            with_door.replace(", \"loopback\": \"127.0.0.1:7471\"", "")
+        } else {
+            with_door.replace("\"loopback\": \"127.0.0.1:7471\"", "\"loopback\": null")
+        };
+        assert_ne!(edited, with_door);
+        fs::write(&config, &edited).expect("the edited config");
+
+        // The same release again, and an upgrade: the program in place already had the door, so neither run is the
+        // upgrade that brings it, and the config stays as the owner left it.
+        for release in [version.as_str(), later] {
+            let run = machine.run(&["--version", release]);
+            run.ok()
+                .says("kept as it was: the config this script writes, from an earlier run")
+                .says("door      none: the config")
+                .says("sh install.sh --door")
+                .never_says("written again")
+                .never_says("claude mcp add");
+            assert_eq!(
+                fs::read_to_string(&config).expect("the config"),
+                edited,
+                "{by_hand}, then {release}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_no_written_by_hand_survives_a_downgrade_to_a_program_from_before_the_door_and_the_upgrade_back()
+ {
+    let version = door_since();
+    for by_hand in ["the key removed", "the key set to null"] {
+        let machine = Machine::new();
+        machine.release(BEFORE_DOOR);
+        machine.release(&version);
+        machine.run(&["--version", &version]).ok();
+        let config = machine.home(".config/arca/node.json");
+        let with_door = fs::read_to_string(&config).expect("the config");
+        let edited = if by_hand == "the key removed" {
+            with_door.replace(", \"loopback\": \"127.0.0.1:7471\"", "")
+        } else {
+            with_door.replace("\"loopback\": \"127.0.0.1:7471\"", "\"loopback\": null")
+        };
+        assert_ne!(edited, with_door);
+        fs::write(&config, &edited).expect("the edited config");
+
+        // The older program refuses a config that names the key, so a null is dropped from it. The no is not: it
+        // goes into the script's note, as --no-door's does.
+        machine.run(&["--version", BEFORE_DOOR]).ok();
+        assert_eq!(
+            config_on_disk(&machine),
+            quickstart_config(&machine, None),
+            "{by_hand}"
+        );
+        assert!(
+            machine.home(".local/state/arca-install/no-door").exists(),
+            "{by_hand}: the no is kept in the note"
+        );
+
+        // Back on a program with the door: the config says the no again, and no door is opened.
+        let run = machine.run(&["--version", &version]);
+        run.ok()
+            .says("door      none: the config says so")
+            .never_says("claude mcp add")
+            .never_says("the door is all that was added");
+        assert_eq!(
+            config_on_disk(&machine),
+            config_without_a_door(&machine),
+            "{by_hand}"
+        );
+    }
+
+    // A door that was open makes the same trip and comes back open: a downgrade is not a no.
+    let machine = Machine::new();
+    machine.release(BEFORE_DOOR);
+    machine.release(&version);
+    machine.run(&["--version", &version]).ok();
+    machine.run(&["--version", BEFORE_DOOR]).ok();
+    assert!(!machine.home(".local/state/arca-install/no-door").exists());
+    let run = machine.run(&["--version", &version]);
+    run.ok();
+    says_the_door(&machine, &run, 7471);
+}
+
+#[test]
+fn a_no_said_under_a_program_from_before_the_door_is_kept_by_the_upgrade_that_brings_it() {
+    let version = door_since();
+    let machine = Machine::new();
+    machine.release(BEFORE_DOOR);
+    machine.release(&version);
+
+    // The older program refuses a config that names the key, so the config cannot say null yet: the no is kept in
+    // the script's own note.
+    let run = machine.run(&["--version", BEFORE_DOOR, "--no-door"]);
+    run.ok().says("door      none: this program is older than");
+    assert_eq!(config_on_disk(&machine), quickstart_config(&machine, None));
+    assert!(machine.home(".local/state/arca-install/no-door").exists());
+
+    // The upgrade that would add the door to this script's earlier config does not: the config now says the no.
+    let run = machine.run(&["--version", &version]);
+    run.ok()
+        .says("door      none: the config says so")
+        .never_says("claude mcp add")
+        .never_says("the door is all that was added");
+    assert_eq!(config_on_disk(&machine), config_without_a_door(&machine));
+
+    // And --door takes the no back, in the note too.
+    let run = machine.run(&["--version", &version, "--door"]);
+    run.ok();
+    says_the_door(&machine, &run, 7471);
+    assert!(!machine.home(".local/state/arca-install/no-door").exists());
+}
+
+#[test]
+fn a_flag_changes_nothing_in_a_config_the_script_did_not_write_and_a_closed_door_is_said() {
+    let version = door_since();
+    let machine = Machine::new();
+    machine.release(&version);
+    machine.run(&["--version", &version]).ok();
+
+    // The node reports that another program holds its port: the report says the door is closed and why, and that
+    // the token must not be sent there meanwhile. The node itself runs, so the script still ends with 0.
+    machine.switch("node-door-closed", true);
+    let run = machine.run(&["--version", &version]);
+    run.ok()
+        .says("door      CLOSED: the node could not take http://127.0.0.1:7471/mcp")
+        .says("(address in use: another program holds this port). It runs without the door and keeps trying the port.")
+        .says("The HTTP door is CLOSED: the node could not take port 7471 (address in use: another program holds this port).")
+        .says("run this script again then, and it prints the line.")
+        .says("call arca_status --config")
+        .says("node      mode watch-only")
+        // Nothing that would send the token to whatever holds the port: no line to run, no entry to paste, no URL
+        // to copy out of one.
+        .never_says("claude mcp add")
+        .never_says("mcpServers")
+        .never_says("Authorization: Bearer")
+        .never_says(TOKEN);
+    // Once the node has the port, the same run prints the line again.
+    machine.switch("node-door-closed", false);
+    let run = machine.run(&["--version", &version]);
+    run.ok();
+    says_the_door(&machine, &run, 7471);
+    machine.switch("node-door-closed", true);
+    machine
+        .run(&["--version", &version])
+        .ok()
+        .never_says("claude mcp add");
+    machine.switch("node-door-closed", false);
+
+    // A config with one letter of the owner's own: neither flag touches it, and the report says so.
+    let config = machine.home(".config/arca/node.json");
+    let own = fs::read_to_string(&config)
+        .expect("the config")
+        .replace("\"droiddProjects\": []", "\"droiddProjects\": [ ]");
+    fs::write(&config, &own).expect("the user's config");
+    for flag in ["--no-door", "--door"] {
+        let run = machine.run(&["--version", &version, flag]);
+        run.ok()
+            .says("kept as it was: this script changes nothing in a config it did not write")
+            .says(&format!(
+                "{flag} changed nothing: this config is not one this script wrote."
+            ))
+            .says("\"loopback\": null");
+        assert_eq!(fs::read_to_string(&config).expect("the config"), own);
+    }
+}
+
+#[test]
 fn a_service_from_an_earlier_run_is_restarted_only_where_the_node_can_be_asked() {
     let restarts = |machine: &Machine| {
         machine
@@ -839,7 +1375,7 @@ fn a_service_from_an_earlier_run_is_restarted_only_where_the_node_can_be_asked()
     machine.release(NEXT);
     let run = machine.run(&["--version", NEXT]);
     run.ok()
-        .says("kept as it was: this script changes nothing in a config that exists")
+        .says("kept as it was: this script changes nothing in a config it did not write")
         .says("enabled and started")
         .says(&format!("node      mode watch-only, version {NEXT}"))
         .never_says("read-only node");

@@ -19,8 +19,9 @@ pub mod version;
 
 pub use auth::{Caller, TokenStore, TokenStoreError, mint, mint_with_tools};
 pub use http::{
-    GetHandler, GetReply, Server, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy,
-    serve_services, serve_tailnet, serve_unix, services_path_ok, tailnet_addr_ok,
+    GetHandler, GetReply, Server, loopback_addr_ok, peer_allowed, proxy_addr_ok, serve_filtered,
+    serve_loopback, serve_loopback_with, serve_proxy, serve_services, serve_tailnet, serve_unix,
+    services_path_ok, tailnet_addr_ok,
 };
 pub use tools::{CallError, ToolHandler};
 pub use version::{PROTOCOL_VERSION, STATELESS_PROTOCOL_VERSION, SUPPORTED_VERSIONS};

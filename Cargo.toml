@@ -31,6 +31,7 @@ arca-vm = { path = "crates/arca-vm" }
 arca-watch = { path = "crates/arca-watch" }
 arca-wit = { path = "crates/arca-wit" }
 axum = "=0.8.9"
+hyper-util = { version = "=0.1.21", default-features = false, features = ["server-auto", "service", "tokio", "http1"] }
 base64 = "=0.23.1"
 ed25519-dalek = "=2.2.0"
 getrandom = "=0.4.3"

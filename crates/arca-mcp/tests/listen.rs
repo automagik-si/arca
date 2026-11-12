@@ -1,5 +1,5 @@
-//! The four listeners: the unix socket at mode 0600, the tailnet address and its peer filter, the proxy address and its
-//! exact peer, and the services socket. Only loopback and temporary unix sockets are used. The tailnet ranges are checked as addresses; no test binds
+//! The five listeners: the unix socket at mode 0600, the tailnet address and its peer filter, the proxy address and its
+//! exact peer, the loopback address and its `Host` rule, and the services socket. Only loopback and temporary unix sockets are used. The tailnet ranges are checked as addresses; no test binds
 //! a tailnet address.
 
 mod common;
@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 use arca_api::Scope;
 use arca_mcp::{
-    Server, TokenStore, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy, serve_services,
-    serve_tailnet, serve_unix, services_path_ok, tailnet_addr_ok,
+    Server, TokenStore, loopback_addr_ok, peer_allowed, proxy_addr_ok, serve_filtered,
+    serve_loopback, serve_loopback_with, serve_proxy, serve_services, serve_tailnet, serve_unix,
+    services_path_ok, tailnet_addr_ok,
 };
 use common::{
     Scratch, bearer, connect_tcp, connect_unix, exchange, mint_into, own_uid, post, post_bytes,
@@ -767,6 +768,380 @@ fn a_proxy_peer_other_than_the_configured_one_is_closed_with_no_bytes() {
 }
 
 // The services socket: a second unix socket, for the node's own services, that serves the MCP router alone.
+
+// Loopback address: a fixed, unreserved port on a loopback address, and a request that names the listener.
+
+#[test]
+fn loopback_addr_ok_takes_a_loopback_address_on_a_fixed_free_port_and_nothing_else() {
+    for text in ["127.0.0.1:7471", "127.0.0.2:7471", "[::1]:7471"] {
+        assert_eq!(loopback_addr_ok(&addr(text)), Ok(()), "accepted: {text}");
+    }
+    for text in [
+        "0.0.0.0:7471",
+        "[::]:7471",
+        "192.0.2.1:7471",
+        "100.64.0.1:7471",
+        "[fd7a:115c:a1e0::1]:7471",
+        "[2001:db8::1]:7471",
+        "[::ffff:127.0.0.1]:7471",
+        "127.0.0.1:0",
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:7443",
+        "127.0.0.1:9443",
+    ] {
+        assert!(
+            loopback_addr_ok(&addr(text)).is_err(),
+            "a loopback address must be refused: {text}"
+        );
+    }
+}
+
+#[test]
+fn serve_loopback_refuses_a_refused_address_before_it_binds() {
+    let rt = Runtime::new().expect("runtime");
+    for text in ["0.0.0.0:7471", "192.0.2.1:7471", "127.0.0.1:443"] {
+        let err = rt
+            .block_on(serve_loopback(
+                empty_router("loopback-refused"),
+                addr(text),
+                |_| panic!("a refused address is never tried"),
+            ))
+            .expect_err("a refused address is never bound");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{text}");
+    }
+}
+
+#[test]
+fn a_loopback_port_another_program_holds_is_reported_and_tried_again_and_never_ends_the_listener() {
+    // Any program of the machine can hold the port first. The listener's future must not end for that: in `serve` the
+    // first listener to end stops them all, the unix socket among them.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
+    let at = held.local_addr().expect("its address");
+    let rt = Runtime::new().expect("runtime");
+    let (tried, tries) = std::sync::mpsc::channel::<Option<ErrorKind>>();
+    let serving = rt.spawn(serve_loopback(
+        empty_router("loopback-held"),
+        at,
+        move |error| {
+            let _ = tried.send(error.map(std::io::Error::kind));
+        },
+    ));
+    assert_eq!(
+        tries.recv_timeout(Duration::from_secs(5)),
+        Ok(Some(ErrorKind::AddrInUse)),
+        "the first try finds the port held, and says so"
+    );
+    assert_eq!(
+        tries.recv_timeout(Duration::from_secs(5)),
+        Ok(Some(ErrorKind::AddrInUse)),
+        "it is tried again while it is held"
+    );
+    assert!(
+        !serving.is_finished(),
+        "a held port does not end the listener"
+    );
+
+    // The other program lets go: a later try takes the port, says so, and the door answers.
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match tries.recv_timeout(Duration::from_secs(20)) {
+            Ok(None) => break,
+            Ok(Some(_)) => assert!(
+                Instant::now() < deadline,
+                "the port is taken once it is free"
+            ),
+            Err(error) => panic!("the bind was not tried again: {error}"),
+        }
+    }
+    let reply = raw(
+        at,
+        &[
+            "POST /mcp HTTP/1.1".to_string(),
+            format!("Host: {at}"),
+            "Content-Type: application/json".to_string(),
+        ],
+        &rpc(json!(1), "initialize", json!({})),
+    );
+    assert_eq!(reply.status, 401, "the door is open and wants its token");
+    assert!(!serving.is_finished());
+}
+
+#[test]
+fn a_loopback_peer_that_sends_no_request_head_in_time_is_closed() {
+    let rt = Runtime::new().expect("runtime");
+    let at = free_loopback_port();
+    rt.spawn(serve_loopback_with(
+        empty_router("loopback-idle"),
+        at,
+        |_| {},
+        Duration::from_millis(300),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(at).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the loopback listener never came up"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Whether the peer's end was closed: a read that ends, rather than one that is still waiting at its deadline.
+    let closed = |stream: &mut std::net::TcpStream| {
+        let mut rest = Vec::new();
+        match stream.read_to_end(&mut rest) {
+            Ok(_) => true,
+            Err(err) => !matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+        }
+    };
+
+    // A peer that connects and says nothing, and one that starts a head and never ends it.
+    let mut silent = connect_tcp(at);
+    assert!(
+        closed(&mut silent),
+        "a silent peer is closed, not left holding a slot"
+    );
+    let mut slow = connect_tcp(at);
+    slow.write_all(b"POST /mcp HTTP/1.1\r\nHost: ")
+        .expect("send half a head");
+    assert!(closed(&mut slow), "a head that never ends is closed");
+
+    // A peer that was answered and then keeps the connection open and idle.
+    let mut kept = connect_tcp(at);
+    kept.write_all(format!("GET /no/such/route HTTP/1.1\r\nHost: {at}\r\n\r\n").as_bytes())
+        .expect("send a request");
+    let mut head = [0u8; 12];
+    kept.read_exact(&mut head)
+        .expect("the answer's first bytes");
+    assert_eq!(&head, b"HTTP/1.1 404");
+    assert!(closed(&mut kept), "an idle kept connection is closed too");
+
+    // A peer that sends its head in time is served as before.
+    let reply = raw(
+        at,
+        &[
+            "POST /mcp HTTP/1.1".to_string(),
+            format!("Host: {at}"),
+            "Content-Type: application/json".to_string(),
+        ],
+        &rpc(json!(1), "initialize", json!({})),
+    );
+    assert_eq!(reply.status, 401);
+}
+
+/// Starts `serve_loopback` on a free loopback port and waits until it accepts a connection.
+fn start_loopback(rt: &Runtime, router: axum::Router) -> SocketAddr {
+    let at = free_loopback_port();
+    rt.spawn(serve_loopback(router, at, |_| {}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(at).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the loopback listener never came up"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    at
+}
+
+/// One request, written as given, and the reply. `lines` are the request line and the headers; `body` follows them.
+fn raw(at: SocketAddr, lines: &[String], body: &[u8]) -> common::Reply {
+    let mut bytes = lines.join("\r\n").into_bytes();
+    bytes.extend_from_slice(
+        format!(
+            "\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(body);
+    exchange(&mut connect_tcp(at), &bytes)
+}
+
+/// The MCP router with one more route that needs no token, as an approval page's routes need none: what a browser page
+/// that reached the listener could read without any credential.
+fn router_with_an_open_route(tokens: TokenStore) -> axum::Router {
+    Server::new(arca_api::verbs(), tokens).router().merge(
+        axum::Router::new().route("/approve/plans", axum::routing::get(|| async { "cards" })),
+    )
+}
+
+#[test]
+fn the_loopback_listener_answers_its_own_two_names_as_the_unix_socket_does() {
+    let scratch = Scratch::new("loopback-own");
+    let viewer = mint_into(scratch.path(), "loopback-viewer", Scope::Viewer);
+    let tokens = TokenStore::load(scratch.path()).expect("loads");
+    let rt = Runtime::new().expect("runtime");
+    let at = start_loopback(&rt, router_with_an_open_route(tokens));
+    let port = at.port();
+    let initialize = rpc(
+        json!(1),
+        "initialize",
+        json!({ "protocolVersion": "2025-11-25" }),
+    );
+    let (name, value) = bearer(&viewer);
+    let authorization = format!("{name}: {value}");
+
+    for host in [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("LOCALHOST:{port}"),
+    ] {
+        let post = |more: &[String]| {
+            let mut lines = vec![
+                "POST /mcp HTTP/1.1".to_string(),
+                format!("Host: {host}"),
+                "Content-Type: application/json".to_string(),
+            ];
+            lines.extend_from_slice(more);
+            raw(at, &lines, &initialize)
+        };
+        assert_eq!(post(&[]).status, 401, "{host}: no bearer is 401");
+        assert_eq!(
+            post(&[authorization.clone(), format!("Origin: http://{host}")]).status,
+            403,
+            "{host}: an Origin is 403 on an MCP route, its own name included"
+        );
+        let reply = post(&[authorization.clone()]);
+        assert_eq!(reply.status, 200, "{host}: a viewer's initialize is 200");
+        assert_eq!(reply.json()["result"]["protocolVersion"], "2025-11-25");
+
+        let open = raw(
+            at,
+            &[
+                "GET /approve/plans HTTP/1.1".to_string(),
+                format!("Host: {host}"),
+            ],
+            b"",
+        );
+        assert_eq!(open.status, 200, "{host}: the open route answers");
+        assert_eq!(open.body, "cards");
+    }
+}
+
+#[test]
+fn a_request_that_names_another_host_is_refused_on_every_route_of_the_loopback_listener() {
+    let scratch = Scratch::new("loopback-rebound");
+    let viewer = mint_into(scratch.path(), "loopback-viewer", Scope::Viewer);
+    let tokens = TokenStore::load(scratch.path()).expect("loads");
+    let rt = Runtime::new().expect("runtime");
+    let at = start_loopback(&rt, router_with_an_open_route(tokens));
+    let port = at.port();
+    let initialize = rpc(json!(1), "initialize", json!({}));
+    let (name, value) = bearer(&viewer);
+    let authorization = format!("{name}: {value}");
+    let own = format!("Host: 127.0.0.1:{port}");
+
+    // DNS rebinding: a page a browser loaded from a foreign name, which was then pointed at 127.0.0.1, is same-origin
+    // with this listener as far as the browser can tell. Its requests carry the foreign name as their Host. The POST
+    // is refused although it carries a valid token and no Origin; the GET is refused although the route needs no token
+    // and a same-origin GET carries no Origin.
+    let rebound = format!("Host: rebound.example:{port}");
+    let post = raw(
+        at,
+        &[
+            "POST /mcp HTTP/1.1".to_string(),
+            rebound.clone(),
+            "Content-Type: application/json".to_string(),
+            authorization.clone(),
+        ],
+        &initialize,
+    );
+    assert_eq!(post.status, 403, "a rebound POST is refused");
+    assert_eq!(post.body, "", "and told nothing");
+    let get = raw(
+        at,
+        &["GET /approve/plans HTTP/1.1".to_string(), rebound.clone()],
+        b"",
+    );
+    assert_eq!(get.status, 403, "a rebound GET is refused");
+    assert_eq!(get.body, "", "and reads nothing");
+    let missing = raw(
+        at,
+        &["GET /no/such/route HTTP/1.1".to_string(), rebound.clone()],
+        b"",
+    );
+    assert_eq!(
+        missing.status, 403,
+        "a route that is not there says so to nobody else"
+    );
+
+    // The refusal comes before the body is read: a foreign Host with a body announced and never sent, larger than any
+    // body the door takes, is answered at once. A check that ran after the body was read would wait for it instead.
+    for extra in ["", "Origin: http://rebound.example\r\n"] {
+        let unsent = format!(
+            "POST /mcp HTTP/1.1\r\nHost: rebound.example:{port}\r\nContent-Type: application/json\r\n{extra}Content-Length: 1048576\r\n\r\n"
+        );
+        let started = Instant::now();
+        let reply = exchange(&mut connect_tcp(at), unsent.as_bytes());
+        assert_eq!(
+            reply.status, 403,
+            "a foreign Host is refused with its body unread"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the refusal did not wait for the body"
+        );
+    }
+
+    // Every other way of not naming this listener.
+    let refused: Vec<(&str, Vec<String>)> = vec![
+        (
+            "the right address on another port",
+            vec![
+                "GET /approve/plans HTTP/1.1".into(),
+                format!("Host: 127.0.0.1:{}", port.wrapping_add(1).max(1)),
+            ],
+        ),
+        (
+            "localhost with no port",
+            vec![
+                "GET /approve/plans HTTP/1.1".into(),
+                "Host: localhost".into(),
+            ],
+        ),
+        (
+            "a name that only starts like this listener's",
+            vec![
+                "GET /approve/plans HTTP/1.1".into(),
+                format!("Host: localhost:{port}.rebound.example"),
+            ],
+        ),
+        (
+            "an empty Host",
+            vec!["GET /approve/plans HTTP/1.1".into(), "Host:".into()],
+        ),
+        ("no Host at all", vec!["GET /approve/plans HTTP/1.0".into()]),
+        (
+            "a second Host beside the right one",
+            vec![
+                "GET /approve/plans HTTP/1.1".into(),
+                own.clone(),
+                rebound.clone(),
+            ],
+        ),
+        (
+            "a target that names another host beside the right Host",
+            vec![
+                format!("GET http://rebound.example:{port}/approve/plans HTTP/1.1"),
+                own.clone(),
+            ],
+        ),
+    ];
+    for (what, lines) in refused {
+        let reply = raw(at, &lines, b"");
+        assert!(
+            reply.status == 403 || reply.status == 400,
+            "{what}: {} is not a refusal",
+            reply.status
+        );
+        assert_ne!(reply.body, "cards", "{what}: the open route was read");
+    }
+
+    // The same listener still answers its own name afterwards.
+    let reply = raw(at, &["GET /approve/plans HTTP/1.1".to_string(), own], b"");
+    assert_eq!(reply.status, 200);
+}
 
 #[test]
 fn services_path_ok_takes_a_plain_absolute_file_path_and_nothing_else() {

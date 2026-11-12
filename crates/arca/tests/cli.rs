@@ -399,6 +399,18 @@ fn a_config_the_kernel_must_not_start_with_is_refused_before_any_read() {
             with(&|v| v["listen"]["proxy"] = json!({ "addr": "192.0.2.1:7460" })),
         ),
         (
+            "a loopback address that is not loopback",
+            with(&|v| v["listen"]["loopback"] = json!("192.0.2.1:7471")),
+        ),
+        (
+            "a loopback address of 0.0.0.0",
+            with(&|v| v["listen"]["loopback"] = json!("0.0.0.0:7471")),
+        ),
+        (
+            "a loopback address on a reserved port",
+            with(&|v| v["listen"]["loopback"] = json!("127.0.0.1:443")),
+        ),
+        (
             "a proxy with an unknown key",
             with(&|v| {
                 v["listen"]["proxy"] =
@@ -1090,29 +1102,26 @@ fn child_listens_on(pid: u32, port: u16) -> bool {
     })
 }
 
-#[test]
+/// Starts `arca serve` with a TCP listener that `listen` writes into the config for a free loopback port, and returns the
+/// server once it listens there, with the address.
 #[cfg(target_os = "linux")]
-fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
-    let scratch = Scratch::new("serve-proxy");
-    let rig = rig(&scratch);
-    let state = scratch.at("state");
-    fs::create_dir_all(&state).expect("create the state directory");
-    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let tokens = scratch.at("tokens");
-    fs::create_dir_all(&tokens).expect("create the token directory");
-    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+fn serve_on_a_free_port(
+    scratch: &Scratch,
+    incus: &Path,
+    listen: &dyn Fn(&mut Value, std::net::SocketAddr),
+) -> (std::process::Child, std::net::SocketAddr) {
     // A port is free when it is probed, but another process can take it before `serve` binds it. Then `serve` exits with
     // "Address already in use", and a connect to that port reaches the other process's listener, so a connect proves nothing
     // about the owner. The loop waits for the child's own listening socket on the port (`child_listens_on`). A `serve` that
     // exits first, because the address is already in use, is started again on a fresh port, at most five times. Any other
     // early exit fails at once with the server's stderr.
     let mut attempts = 0;
-    let (mut child, at, mut stream) = loop {
+    loop {
         attempts += 1;
         let at = free_loopback_port();
-        let mut value = config(&scratch, rig.shim.socket());
-        value["listen"]["proxy"] = json!({ "addr": at.to_string(), "peer": "127.0.0.1" });
-        let path = write_config(&scratch, "node.json", &value);
+        let mut value = config(scratch, incus);
+        listen(&mut value, at);
+        let path = write_config(scratch, "node.json", &value);
         let mut child = arca()
             .args(["serve", "--config"])
             .arg(&path)
@@ -1137,18 +1146,34 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
                 );
                 assert!(
                     attempts < 5,
-                    "the proxy port was taken five times: {status}\n{stderr}"
+                    "the port was taken five times: {status}\n{stderr}"
                 );
                 break false;
             }
-            assert!(Instant::now() < deadline, "the proxy listener comes up");
+            assert!(Instant::now() < deadline, "the listener comes up");
             thread::sleep(Duration::from_millis(20));
         };
         if owned {
-            let stream = std::net::TcpStream::connect(at).expect("connect to the proxy listener");
-            break (child, at, stream);
+            return (child, at);
         }
-    };
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
+    let scratch = Scratch::new("serve-proxy");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let (mut child, at) = serve_on_a_free_port(&scratch, rig.shim.socket(), &|value, at| {
+        value["listen"]["proxy"] = json!({ "addr": at.to_string(), "peer": "127.0.0.1" });
+    });
+    let mut stream = std::net::TcpStream::connect(at).expect("connect to the proxy listener");
     stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let request = format!(
@@ -1684,4 +1709,228 @@ fn a_config_with_a_mistyped_field_names_the_field_and_the_file() {
         )),
         "{refusal}"
     );
+}
+
+/// One HTTP/1.1 request to `at`, with `Connection: close`, and the reply's status line.
+#[cfg(target_os = "linux")]
+fn status_of(at: std::net::SocketAddr, head: &str, body: &str) -> String {
+    let mut stream = std::net::TcpStream::connect(at).expect("connect to the listener");
+    stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
+    let request = format!(
+        "{head}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("send the request");
+    let mut reply = String::new();
+    let _ = stream.read_to_string(&mut reply);
+    reply.lines().next().unwrap_or_default().to_string()
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn serve_answers_on_the_loopback_listener_only_by_its_own_name_and_with_a_token() {
+    let scratch = Scratch::new("serve-loopback");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let secret_file = scratch.at("viewer-1.secret");
+    let minted = arca()
+        .args(["token", "mint", "--scope", "viewer", "--id", "viewer-1"])
+        .arg("--hash-dir")
+        .arg(&tokens)
+        .arg("--out")
+        .arg(&secret_file)
+        .output()
+        .expect("mint a token");
+    assert!(minted.status.success(), "the token is minted");
+    let secret = fs::read_to_string(&secret_file).expect("the secret");
+    let secret = secret.trim();
+
+    let (mut child, at) = serve_on_a_free_port(&scratch, rig.shim.socket(), &|value, at| {
+        value["listen"]["loopback"] = json!(at.to_string());
+    });
+    let port = at.port();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let post = |host: &str, bearer: bool| {
+        let mut head = format!("POST /mcp HTTP/1.1\r\nHost: {host}");
+        if bearer {
+            head.push_str(&format!("\r\nAuthorization: Bearer {secret}"));
+        }
+        status_of(at, &head, body)
+    };
+
+    // The listener's own two names reach the door, which wants the token.
+    for own in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+        assert!(
+            post(&own, false).starts_with("HTTP/1.1 401"),
+            "{own}: no bearer"
+        );
+        assert!(
+            post(&own, true).starts_with("HTTP/1.1 200"),
+            "{own}: the viewer"
+        );
+    }
+    // Any other name is refused before the token is looked at: a rebound name, the right name on another port, and a
+    // name with no port.
+    for foreign in [
+        format!("rebound.example:{port}"),
+        "127.0.0.1:1".to_string(),
+        "localhost".to_string(),
+    ] {
+        assert!(
+            post(&foreign, true).starts_with("HTTP/1.1 403"),
+            "{foreign}: a valid token does not help a foreign Host"
+        );
+    }
+    // The approval page is not on this listener, and a GET is under the same rule.
+    let get = |host: &str| status_of(at, &format!("GET /approve HTTP/1.1\r\nHost: {host}"), "");
+    assert!(get(&format!("127.0.0.1:{port}")).starts_with("HTTP/1.1 404"));
+    assert!(get(&format!("rebound.example:{port}")).starts_with("HTTP/1.1 403"));
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(
+        wait_exit(&mut child).code(),
+        Some(0),
+        "serve exits 0 on SIGTERM"
+    );
+    assert!(
+        std::net::TcpStream::connect(at).is_err(),
+        "the loopback listener is closed once serve stops"
+    );
+    let summary = rig.shim.stop().expect("stop the shim");
+    assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_loopback_port_another_program_holds_does_not_stop_the_node_and_the_status_says_why() {
+    let scratch = Scratch::new("serve-loopback-held");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let secret_file = scratch.at("viewer-1.secret");
+    let minted = arca()
+        .args(["token", "mint", "--scope", "viewer", "--id", "viewer-1"])
+        .arg("--hash-dir")
+        .arg(&tokens)
+        .arg("--out")
+        .arg(&secret_file)
+        .output()
+        .expect("mint a token");
+    assert!(minted.status.success(), "the token is minted");
+
+    // Another program holds the door's port before the node starts. It stands for any process of any user.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("another program's listener");
+    let at = held.local_addr().expect("its address");
+    let mut value = config(&scratch, rig.shim.socket());
+    value["listen"]["loopback"] = json!(at.to_string());
+    let path = write_config(&scratch, "node.json", &value);
+    let log = scratch.at("serve.log");
+    let mut child = arca()
+        .args(["serve", "--config"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&log).expect("the server's log"))
+        .spawn()
+        .expect("start arca serve");
+    let status = || -> Option<Value> {
+        let out = arca()
+            .args(["call", "arca_status", "--config"])
+            .arg(&path)
+            .arg("--token-file")
+            .arg(&secret_file)
+            .args(["--args", "{}"])
+            .output()
+            .expect("run arca call");
+        out.status
+            .success()
+            .then(|| serde_json::from_slice(&out.stdout).expect("the status is JSON"))
+    };
+    let until = |what: &str, wait: Duration, done: &dyn Fn(&Value) -> bool| -> Value {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(answer) = status()
+                && done(&answer)
+            {
+                return answer;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}; the server's log:\n{}",
+                fs::read_to_string(&log).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // The node starts and answers on its unix socket, and says that its door is closed and why.
+    let answer = until("the node answers on its unix socket", WAIT, &|_| true);
+    assert_eq!(answer["loopback"]["addr"], json!(at.to_string()));
+    assert_eq!(answer["loopback"]["open"], json!(false), "{answer}");
+    assert!(
+        answer["loopback"]["reason"]
+            .as_str()
+            .is_some_and(|why| why.starts_with("address in use")),
+        "{answer}"
+    );
+    let said = fs::read_to_string(&log).expect("the server's log");
+    assert!(
+        said.contains(&format!("the loopback door {at} is closed: address in use")),
+        "{said}"
+    );
+    assert_eq!(
+        said.matches("is closed").count(),
+        1,
+        "a port that stays held is said once: {said}"
+    );
+
+    // The other program lets go: the node takes the port without being started again, and says so.
+    drop(held);
+    let answer = until(
+        "the door opens once the port is free",
+        Duration::from_secs(40),
+        &|answer| answer["loopback"]["open"] == json!(true),
+    );
+    assert_eq!(answer["loopback"]["reason"], Value::Null);
+    assert!(
+        status_of(
+            at,
+            &format!("POST /mcp HTTP/1.1\r\nHost: {at}"),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        )
+        .starts_with("HTTP/1.1 401"),
+        "the door wants its token"
+    );
+    assert!(
+        fs::read_to_string(&log)
+            .expect("the server's log")
+            .contains(&format!("the loopback door {at} is open"))
+    );
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(
+        wait_exit(&mut child).code(),
+        Some(0),
+        "serve exits 0 on SIGTERM"
+    );
+    let summary = rig.shim.stop().expect("stop the shim");
+    assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
 }
