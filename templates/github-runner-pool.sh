@@ -72,19 +72,21 @@ DOCKER_GID=123
 
 say() { printf 'arca-runner-pool: %s\n' "$*"; }
 now() { date +%s; }
-# A pause a stop ends at once, wherever the signal lands. bash runs a trap only between two commands, so a signal that
-# comes while a command runs is read after it: the pause that follows is then not begun. One that comes while the pause
-# is being started, or while it runs, ends it: the trap calls wake. Without both, a signal that came during a command
-# was followed by the whole pause, five minutes of it where GitHub refuses the sign-in or the runner group.
-NAP=''
-wake() { [ -z "$NAP" ] || kill "$NAP" 2>/dev/null; }
+# The stop is a line that is read, not a flag that a trap sets. The process that takes the signal (run_pool) holds the
+# line open through one program and ends that program when it is told to stop; from then on whoever reads the line
+# finds its end. So `stopping` is true from that moment, in the controller and in every slot, and a pause, which is a
+# read of the line with a limit of time, ends at once, wherever the signal landed: one that comes while a command runs
+# is found when the pause after it is begun.
+#
+# Neither the controller nor a slot has a trap, because bash 5.2 can lose the signal a trap with a command in it was to
+# take. When the signal comes just before bash looks for the end of a $( ) in a word, bash runs the trap there and
+# reads the trap's own text as if it stood inside that $( ): the text does not parse, its command is not run, and the
+# script runs on as if nothing had been sent, or ends at once without its stop. Both are full of $( ).
+STOP_LINE=''
+stopping() { read -r -t 0 -u "$STOP_LINE"; }
 nap() {
-  [ -z "${STOP-}${ABORT-}" ] || return 0
-  sleep "$1" &
-  NAP=$!
-  [ -z "${STOP-}${ABORT-}" ] || wake
-  wait "$NAP" 2>/dev/null
-  NAP=''
+  read -r -t "$1" -u "$STOP_LINE" _
+  return 0
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -603,11 +605,9 @@ slot_cycle() {
   local class=${SLOT_CLASS[$slot]} dir runner daemon slice token name body jit runner_id tries state code
   local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' home=() lines
   local retired='' asked=''
-  ABORT=''
-  # The controller's own flag is not the slot's: a slot begun as the controller is told to stop would find it set, and
-  # none of its pauses would be taken until the controller's signal reached it.
-  STOP=''
-  trap 'ABORT=1; wake' TERM INT
+  # A slot takes no signal. It reads the same line as the controller: a slot begun as the controller is told to stop
+  # finds the stop at once.
+  trap - TERM INT
   dir=$(slot_dir "$slot")
   runner="$POOL_NAME-s$slot-run"
   daemon="$POOL_NAME-s$slot-dind"
@@ -669,9 +669,9 @@ slot_cycle() {
   tries=0
   until docker exec "$daemon" docker info >/dev/null 2>&1; do
     tries=$((tries + 1))
-    if [ -n "$ABORT" ] || [ "$tries" -gt "$POOL_READY_WAIT" ]; then
+    if stopping || [ "$tries" -gt "$POOL_READY_WAIT" ]; then
       slot_abandon "$slot" "$runner_id"
-      [ -n "$ABORT" ] || slot_failed "$slot" "the slot's Docker daemon did not come up within $POOL_READY_WAIT seconds"
+      stopping || slot_failed "$slot" "the slot's Docker daemon did not come up within $POOL_READY_WAIT seconds"
       return 0
     fi
     nap 1
@@ -705,7 +705,7 @@ slot_cycle() {
   started=$(now)
   set_state "$slot" idle "$name"
 
-  while [ -z "$ABORT" ]; do
+  while ! stopping; do
     state=$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$runner" 2>/dev/null) || state='false 255'
     [ "${state%% *}" = true ] || break
     # A runner that has taken its job says so in its own output, with the job's name and the time: "Running job:".
@@ -746,7 +746,7 @@ slot_cycle() {
     return 0
   fi
 
-  if [ -n "$ABORT" ]; then
+  if stopping; then
     # The controller is stopping. A runner that has no job is taken off GitHub; one with a job is lost with it.
     [ -n "$busy_since" ] || slot_abandon "$slot" "$runner_id"
     docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
@@ -913,10 +913,10 @@ prepare_images() {
   local image tag
   for image in "$RUNNER_IMAGE" "$DOCKER_IMAGE"; do
     until docker image inspect "$image" >/dev/null 2>&1 || docker pull -q "$image" >/dev/null 2>&1; do
-      [ -z "$STOP" ] || return 1
+      ! stopping || return 1
       say "the image $image could not be pulled; trying again in 30 seconds"
       nap 30
-      [ -z "$STOP" ] || return 1
+      ! stopping || return 1
     done
   done
   # The runner's own files, copied out of the pinned image once, with their owners: every runner starts from them.
@@ -1158,7 +1158,7 @@ print_status() {
 # What this is not: a cap on running jobs. A just-in-time runner cannot be told to wait, so every registered runner may
 # take a job at any moment, and a runner that has one is never retired: a class whose place is held by runners at work
 # waits until one ends. Nor is a place memory: a slot still starts only when its whole size fits.
-# These functions read and change the controller's own variables (run_pool's): bash lets a function it calls do so.
+# These functions read and change the controller's own variables (pool's): bash lets a function it calls do so.
 
 # The pass that hands out places looks at every slot without a runner once. round_begin lists them for each class in
 # the order of the round, which starts at $first; next_slot then gives the one to look at next, in $slot: of the slots
@@ -1302,13 +1302,16 @@ give_a_place() {
   CLASS_NOTE="$names. Slot $give (${SLOT_CLASS[$give]}) gives up its idle runner's place for it$last"
 }
 
-run_pool() {
-  STOP=''
-  trap 'STOP=1; wake' TERM INT
+# The controller: everything the pool does, as a child of run_pool. It takes no signal. It learns of a stop from the
+# line, and then stops in its own order. A SIGTERM sent to this process itself ends it at once with no stop; nothing
+# sends one under the unit's KillMode=mixed. It does not ignore the signal instead, because everything it starts,
+# its slots first, would then ignore it too, and nothing of the pool could be ended with that signal any more.
+pool() {
+  trap - TERM INT
   load_settings || {
     say "the pool does not start until its settings are right: they were fixed when the machine was created, so create the pool again with the right ones"
     # Stay up, so the reason stays on the console instead of a restart loop.
-    while [ -z "$STOP" ]; do nap 300; done
+    while ! stopping; do nap 300; done
     return 1
   }
   mkdir -p "$POOL_STATE/slots" "$POOL_LOGS" "$POOL_RUN/slots" "$POOL_RUN/tmp" "$POOL_RUN/jit" "$POOL_RUN/retire"
@@ -1356,57 +1359,57 @@ run_pool() {
   write_slices
 
   local waited=0
-  while [ -z "$STOP" ] && [ -z "$(credential_kind)" ]; do
+  while ! stopping && [ -z "$(credential_kind)" ]; do
     if [ $((waited % 60)) = 0 ]; then
       say "waiting for a credential: set GITHUB_APP_CLIENT_ID and GITHUB_APP_PRIVATE_KEY, or GITHUB_TOKEN, with service_secret_set, then run instance_start"
     fi
     nap 5
     waited=$((waited + 5))
   done
-  [ -z "$STOP" ] || return 0
+  ! stopping || return 0
   if [ "$(credential_kind)" = app ] && [ -s "$(secret_file GITHUB_TOKEN)" ]; then
     say "signing in as the GitHub App: GITHUB_TOKEN is set too and is not used"
   fi
   until prepare_images; do
-    [ -z "$STOP" ] || return 0
+    ! stopping || return 0
     nap 30
-    [ -z "$STOP" ] || return 0
+    ! stopping || return 0
   done
   # A stop is read after every wait and every pause below, before anything else is begun: GitHub is not asked again.
-  [ -z "$STOP" ] || return 0
+  ! stopping || return 0
   clean_containers
   # No slot starts before GitHub takes the credential: a wrong one is said here, once per pause, not once per slot.
   local pause=0
   until github_token; do
-    [ -z "$STOP" ] || return 0
+    ! stopping || return 0
     printf x >>"$POOL_RUN/failures"
     pause=$((pause == 0 ? 5 : pause * 2))
     [ "$pause" -gt "$POOL_BACKOFF_MAX" ] && pause=$POOL_BACKOFF_MAX
     say "GitHub sign-in failed: $TOKEN_ERROR. Trying again in $pause seconds"
     nap "$pause"
-    [ -z "$STOP" ] || return 0
+    ! stopping || return 0
   done
-  [ -z "$STOP" ] || return 0
+  ! stopping || return 0
   # Nor before its runner group is one a pool may use. A refusal is told again every POOL_REFUSE_EVERY seconds, so it
   # stays on the console; only a pool created with other settings ends it.
   local verdict
   while :; do
     github_token || {
-      [ -z "$STOP" ] || return 0
+      ! stopping || return 0
       printf x >>"$POOL_RUN/failures"
       say "GitHub sign-in failed: $TOKEN_ERROR. Trying again in $POOL_BACKOFF_MAX seconds"
       nap "$POOL_BACKOFF_MAX"
-      [ -z "$STOP" ] || return 0
+      ! stopping || return 0
       continue
     }
     check_runner_group "$TOKEN"
     verdict=$?
-    [ -z "$STOP" ] || return 0
+    ! stopping || return 0
     [ "$verdict" != 0 ] || break
     printf x >>"$POOL_RUN/failures"
     say "$GROUP_WORDS"
     if [ "$verdict" = 1 ]; then nap "$POOL_REFUSE_EVERY"; else nap "$POOL_BACKOFF_MAX"; fi
-    [ -z "$STOP" ] || return 0
+    ! stopping || return 0
   done
   say "registering runners in $GROUP_NOTE"
   clean_runners "$TOKEN"
@@ -1425,7 +1428,7 @@ run_pool() {
   RETIRE_PAUSE=0
   RETIRE_AFTER=0
   local slot live reserved pending available next=0 first n last_status=0 until_at at class_live=() round=()
-  while [ -z "$STOP" ]; do
+  while ! stopping; do
     live=0
     reserved=0
     for ((n = 0; n < CLASSES; n++)); do class_live[n]=0; done
@@ -1459,7 +1462,7 @@ run_pool() {
     round_begin
     while next_slot; do
       # No slot is begun once the controller is told to stop.
-      [ -z "$STOP" ] || break
+      ! stopping || break
       if [ -z "$(credential_kind)" ]; then
         WAIT[slot]='waiting for a credential'
       elif [ -n "$GROUP_HOLD" ]; then
@@ -1513,10 +1516,9 @@ run_pool() {
     nap "$POOL_TICK"
   done
 
+  # The slots have read the same line: each is cleaning up already. They are sent no signal, which would end them
+  # in the middle of it.
   say "stopping: runners without a job are taken off GitHub, and a job that is running is lost"
-  for slot in "${!PIDS[@]}"; do
-    [ -z "${PIDS[$slot]}" ] || kill -TERM "${PIDS[$slot]}" 2>/dev/null
-  done
   local deadline=$(($(now) + POOL_STOP_WAIT))
   for slot in "${!PIDS[@]}"; do
     [ -n "${PIDS[$slot]}" ] || continue
@@ -1524,6 +1526,35 @@ run_pool() {
     while kill -0 "${PIDS[$slot]}" 2>/dev/null && [ "$(now)" -lt "$deadline" ]; do sleep 0.2; done
   done
   say "stopped"
+}
+
+# The process systemd stops. From the line that sets its trap on it runs NO command substitution, so its trap is
+# always read as it is written: it only starts the controller, waits for it, and lets go of the line when it is told to
+# stop. The controller then stops in its own order, and this process ends with the controller's code.
+run_pool() {
+  local code again ended=''
+  exec {STOP_LINE}< <(exec sleep infinity)
+  STOP_HOLD=$!
+  LET_GO=''
+  # Once only: a second signal must not reach whatever has the holder's process number by then.
+  trap '[ -n "$LET_GO" ] || { LET_GO=1; kill "$STOP_HOLD" 2>/dev/null; }' TERM INT
+  pool &
+  POOL=$!
+  while [ -z "$ended" ]; do
+    wait "$POOL"
+    code=$?
+    # wait also returns when the trap ran. The controller's code is the one wait gives once the controller is gone;
+    # a wait that the trap cut short just as the controller ended is asked again.
+    if ! kill -0 "$POOL" 2>/dev/null; then
+      wait "$POOL"
+      again=$?
+      [ "$again" = 127 ] || code=$again
+      ended=$code
+    fi
+  done
+  # A controller that ended by itself leaves the line held.
+  [ -n "$LET_GO" ] || kill "$STOP_HOLD" 2>/dev/null
+  return "$ended"
 }
 
 case ${1-} in

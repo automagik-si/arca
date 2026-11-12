@@ -40,8 +40,13 @@ was killed too, after two and a half minutes, and that kill reached the controll
 jobs' containers are Docker's, not the service's. So GitLab Runner was never told to stop taking jobs and went on
 taking them, with no controller, until Docker stopped it as the machine went down or the pool's next start removed
 it. Both scripts now take the signal in a process that does nothing else and stops the work from there, so the stop
-cannot be dropped. A machine made from an earlier release keeps the script it was made with. The GitHub runner
-pool's script has the same fault; its change is a separate one.
+cannot be dropped. A machine made from an earlier release keeps the script it was made with.
+
+The GitHub runner pool's script had the same fault, in its controller and in every slot, and has the same change. A
+lost stop there left runner containers running and registered on GitHub with no controller. The controller and its
+slots now read their stop from a line that the one process holding the signal lets go of, and none of them has a
+trap. The controller no longer signals its slots at a stop: each has read the same line and is cleaning up, and is
+given the same minute to finish.
 
 A card that waits while the node is upgraded to the version that binds a template's content (a create, or a database
 made from the template) is now refused when its approval is submitted, and the approval is not used; propose it

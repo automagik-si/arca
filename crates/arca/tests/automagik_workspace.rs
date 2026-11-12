@@ -996,9 +996,9 @@ fn unsafe_traps(file: &str, text: &str) -> Vec<String> {
 /// a few instructions wide, and this one fails on any machine as soon as a script is written that way again.
 #[test]
 fn no_shipped_script_takes_a_signal_in_a_process_that_runs_a_substitution() {
-    // The GitHub runner pool still sets such traps, in its controller and in each slot. It is left out by name until
-    // its own change, and only until then.
-    const NOT_YET: [&str; 1] = ["github-runner-pool.sh"];
+    // No script is left out now. A name goes here only for a script that is known to have the fault and is being
+    // changed elsewhere; the test fails once such a script no longer has it.
+    const NOT_YET: [&str; 0] = [];
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut scripts: Vec<PathBuf> = fs::read_dir(&dir)
         .expect("the templates")
@@ -1016,7 +1016,11 @@ fn no_shipped_script_takes_a_signal_in_a_process_that_runs_a_substitution() {
                 .to_string()
         })
         .collect();
-    for script in ["automagik-workspace.sh", "gitlab-runner-pool.sh"] {
+    for script in [
+        "automagik-workspace.sh",
+        "gitlab-runner-pool.sh",
+        "github-runner-pool.sh",
+    ] {
         assert!(names.contains(&script.to_string()), "{script} is read");
     }
     let mut found = Vec::new();
