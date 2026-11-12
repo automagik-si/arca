@@ -17,7 +17,7 @@ Automagik Arca runs your services on machines you own. Set up the way the quicks
 
 | Works today | Not yet |
 |---|---|
-| Ready to run today: Postgres, NATS, Omni, Automagik, a Cloudflare tunnel and a workspace virtual machine. | The installer sets up a read-only node only: letting Arca change things is still set up by hand. |
+| Ready to run today: Postgres, NATS, Omni, Automagik, a Cloudflare tunnel and a workspace virtual machine. | The installer leaves a node that only looks, and one step lets it change things: `arca init --enable-changes`, or `--enable-changes` on the install line. That step does not turn on virtual machines (the workspace and the GitHub and GitLab runner pools), tenants, or taking over a service that already runs on the machine: each is set in the config by hand ([Turning on changes](#turning-on-changes)). |
 | Arca can save snapshots of a service onto a disk you plug in. | Arca cannot yet restore a snapshot for you: restoring is done by hand with Incus. |
 | Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run any app or container image you name: a service comes from a ready template, or Arca takes over one that already runs on the machine. |
 | Two machines can be paired with a one-time code. | The ChatGPT and Claude apps cannot connect to Arca in one click yet. |
