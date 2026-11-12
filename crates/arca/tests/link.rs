@@ -366,3 +366,81 @@ fn a_running_link_survives_token_reload_and_token_revoke_on_its_own_config() {
         "no node was there to signal"
     );
 }
+
+#[test]
+fn the_variable_alone_never_picks_the_node_a_peer_is_joined_or_paired_on() {
+    let arca = || {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_arca"));
+        command.env_remove("ARCA_TOKEN_FILE");
+        command
+    };
+    // Two nodes: the one the installer's default path names, and one the variable was left set for.
+    let installed = Temp::new();
+    let other = Temp::new();
+    let other_config = other.config();
+    let home = installed.0.join("home");
+    let default = home.join(".config/arca/node.json");
+    fs::create_dir_all(default.parent().unwrap()).unwrap();
+    fs::copy(installed.config(), &default).unwrap();
+    // A pairing link that parses: a code of the right length and a ticket for an endpoint nobody runs.
+    let silent = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let id = State::new(installed.0.join("silent"))
+        .unwrap()
+        .secret()
+        .unwrap()
+        .public();
+    let peer = arca_link::Peer {
+        id: id.to_string(),
+        name: "silent".to_string(),
+        paired: 1,
+        seen: 1,
+        ticket: None,
+    };
+    let ticket = EndpointTicket::new(
+        peer.addr()
+            .unwrap()
+            .with_ip_addr(silent.local_addr().unwrap()),
+    );
+    let link = format!(
+        "arca://pair?v=1&n=silent&c={}&t={ticket}",
+        URL_SAFE_NO_PAD.encode([7u8; 16])
+    );
+    let refusal = format!(
+        "arca: ARCA_CONFIG names {other_config}, not the default config ({}). This command hands out, removes or rewrites something on one node, so the variable alone does not choose that node, and nothing was done. To act on the node ARCA_CONFIG names, run the same command with: --config {other_config}\n",
+        default.display()
+    );
+    for args in [vec!["link", "join", link.as_str()], vec!["link", "pair"]] {
+        let out = arca()
+            .args(&args)
+            .env("HOME", &home)
+            .env("ARCA_CONFIG", &other_config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{:?}: {out:?}", &args[..2]);
+        assert!(out.stdout.is_empty(), "{:?}", &args[..2]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            refusal,
+            "{:?}",
+            &args[..2]
+        );
+    }
+    assert!(
+        !other.0.join("state").exists(),
+        "nothing was made on the node the variable names"
+    );
+    // The variable names the default file itself: pairing goes on, says so, and then finds no link running.
+    let out = arca()
+        .args(["link", "pair"])
+        .env("HOME", &home)
+        .env("ARCA_CONFIG", &default)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with(&format!(
+            "arca: using the config {} (from ARCA_CONFIG)\n",
+            default.display()
+        )),
+        "{out:?}"
+    );
+}
