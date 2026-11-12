@@ -21,6 +21,10 @@ hand. The template changed, so an installed copy nobody edited is brought up to 
 before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
 that image is built with `templates/automagik.build.sh`.
 
+On the approval page, while no passkey is trusted, a waiting card's button says "Set up your passkey first" instead of
+"Approve", and a tap on it takes the owner to the passkey setup, which is at the top of the page. Before, it asked for a
+passkey there was none of and failed. Once a passkey is trusted the cards are drawn again with their Approve buttons.
+
 ## 0.15.0 (2026-11-12)
 
 The `automagik` image is now named after the harness too: `arca-automagik-<commit>-dsh-<harness>`, 12 hex digits of the

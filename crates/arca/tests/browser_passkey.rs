@@ -1213,6 +1213,30 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool) {
         "the page says what this browser needs, and the other way in"
     );
 
+    // 0. No passkey is trusted yet, so no approval can work: the setup comes first on the page, and the waiting card's
+    //    button says what comes first and takes the owner to the setup instead of asking for a passkey there is none of.
+    assert_eq!(
+        chrome.eval(
+            "document.querySelector('section.setup').getBoundingClientRect().top < document.getElementById('plans').getBoundingClientRect().top"
+        ),
+        json!(true),
+        "the passkey setup is above the waiting card"
+    );
+    assert_eq!(
+        chrome.eval("document.querySelector('#plans button.approve').textContent"),
+        json!("Set up your passkey first"),
+        "the card's button says the passkey comes first"
+    );
+    chrome.click("#plans button.approve");
+    assert_eq!(
+        chrome.eval(
+            "[document.activeElement && document.activeElement.id, document.getElementById('status').dataset.tone || '']"
+        ),
+        json!(["get-code", ""]),
+        "the button takes the owner to the setup's first step, and nothing failed"
+    );
+    assert!(!instance_exists(&fake, "nats"), "nothing ran");
+
     // 1. The machine has no screen: the page says so, and names the command for the terminal.
     chrome.click("#get-code");
     let deadline = Instant::now() + WAIT;
@@ -1254,6 +1278,19 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool) {
     assert_eq!(kept.len(), 1, "one passkey is trusted");
     assert_eq!(kept[0].rp_id, "localhost");
     assert_eq!(kept[0].origin, origin);
+    // The page draws the cards again once the passkey is trusted, and the button then approves.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let said = chrome.eval("document.querySelector('#plans button.approve').textContent");
+        if said == json!("Approve") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "with a passkey trusted, the card's button approves; it says {said}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 
     // 3. The first approved change: the owner approves the assistant's proposal, and it runs once.
     chrome.click("#plans button.approve");
