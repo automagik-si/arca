@@ -483,6 +483,15 @@ fn arca_status_schemas_equal_its_table_row() {
                         },
                     },
                     "required": ["linkedHosts", "trustedKeyFiles"],
+                },
+                "loopback": {
+                    "type": "object",
+                    "properties": {
+                        "addr": { "type": "string" },
+                        "open": { "type": "boolean" },
+                        "reason": { "type": ["string", "null"] },
+                    },
+                    "required": ["addr", "open", "reason"],
                 }
             }),
             &[

@@ -528,6 +528,7 @@ fn an_unreadable_trust_file_adds_no_key_and_arca_status_says_why() {
             peer: None,
             peer_sources: None,
         }),
+        loopback: None,
     }
     .call(json!({}), &caller(Scope::Viewer))
     .expect("arca_status answers");

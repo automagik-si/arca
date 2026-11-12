@@ -206,6 +206,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "getrandom 0.4.3",
+ "hyper-util",
  "serde_json",
  "sha2 0.11.1",
  "tokio",

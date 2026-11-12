@@ -1810,3 +1810,127 @@ fn serve_answers_on_the_loopback_listener_only_by_its_own_name_and_with_a_token(
     let summary = rig.shim.stop().expect("stop the shim");
     assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_loopback_port_another_program_holds_does_not_stop_the_node_and_the_status_says_why() {
+    let scratch = Scratch::new("serve-loopback-held");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let secret_file = scratch.at("viewer-1.secret");
+    let minted = arca()
+        .args(["token", "mint", "--scope", "viewer", "--id", "viewer-1"])
+        .arg("--hash-dir")
+        .arg(&tokens)
+        .arg("--out")
+        .arg(&secret_file)
+        .output()
+        .expect("mint a token");
+    assert!(minted.status.success(), "the token is minted");
+
+    // Another program holds the door's port before the node starts. It stands for any process of any user.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("another program's listener");
+    let at = held.local_addr().expect("its address");
+    let mut value = config(&scratch, rig.shim.socket());
+    value["listen"]["loopback"] = json!(at.to_string());
+    let path = write_config(&scratch, "node.json", &value);
+    let log = scratch.at("serve.log");
+    let mut child = arca()
+        .args(["serve", "--config"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&log).expect("the server's log"))
+        .spawn()
+        .expect("start arca serve");
+    let status = || -> Option<Value> {
+        let out = arca()
+            .args(["call", "arca_status", "--config"])
+            .arg(&path)
+            .arg("--token-file")
+            .arg(&secret_file)
+            .args(["--args", "{}"])
+            .output()
+            .expect("run arca call");
+        out.status
+            .success()
+            .then(|| serde_json::from_slice(&out.stdout).expect("the status is JSON"))
+    };
+    let until = |what: &str, wait: Duration, done: &dyn Fn(&Value) -> bool| -> Value {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(answer) = status()
+                && done(&answer)
+            {
+                return answer;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}; the server's log:\n{}",
+                fs::read_to_string(&log).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // The node starts and answers on its unix socket, and says that its door is closed and why.
+    let answer = until("the node answers on its unix socket", WAIT, &|_| true);
+    assert_eq!(answer["loopback"]["addr"], json!(at.to_string()));
+    assert_eq!(answer["loopback"]["open"], json!(false), "{answer}");
+    assert!(
+        answer["loopback"]["reason"]
+            .as_str()
+            .is_some_and(|why| why.starts_with("address in use")),
+        "{answer}"
+    );
+    let said = fs::read_to_string(&log).expect("the server's log");
+    assert!(
+        said.contains(&format!("the loopback door {at} is closed: address in use")),
+        "{said}"
+    );
+    assert_eq!(
+        said.matches("is closed").count(),
+        1,
+        "a port that stays held is said once: {said}"
+    );
+
+    // The other program lets go: the node takes the port without being started again, and says so.
+    drop(held);
+    let answer = until(
+        "the door opens once the port is free",
+        Duration::from_secs(40),
+        &|answer| answer["loopback"]["open"] == json!(true),
+    );
+    assert_eq!(answer["loopback"]["reason"], Value::Null);
+    assert!(
+        status_of(
+            at,
+            &format!("POST /mcp HTTP/1.1\r\nHost: {at}"),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        )
+        .starts_with("HTTP/1.1 401"),
+        "the door wants its token"
+    );
+    assert!(
+        fs::read_to_string(&log)
+            .expect("the server's log")
+            .contains(&format!("the loopback door {at} is open"))
+    );
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(
+        wait_exit(&mut child).code(),
+        Some(0),
+        "serve exits 0 on SIGTERM"
+    );
+    let summary = rig.shim.stop().expect("stop the shim");
+    assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
+}

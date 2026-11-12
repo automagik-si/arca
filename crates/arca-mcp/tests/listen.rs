@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use arca_api::Scope;
 use arca_mcp::{
     Server, TokenStore, loopback_addr_ok, peer_allowed, proxy_addr_ok, serve_filtered,
-    serve_loopback, serve_proxy, serve_services, serve_tailnet, serve_unix, services_path_ok,
-    tailnet_addr_ok,
+    serve_loopback, serve_loopback_with, serve_proxy, serve_services, serve_tailnet, serve_unix,
+    services_path_ok, tailnet_addr_ok,
 };
 use common::{
     Scratch, bearer, connect_tcp, connect_unix, exchange, mint_into, own_uid, post, post_bytes,
@@ -798,38 +798,141 @@ fn loopback_addr_ok_takes_a_loopback_address_on_a_fixed_free_port_and_nothing_el
 }
 
 #[test]
-fn serve_loopback_refuses_a_refused_address_before_it_binds_and_a_port_in_use_at_once() {
+fn serve_loopback_refuses_a_refused_address_before_it_binds() {
     let rt = Runtime::new().expect("runtime");
     for text in ["0.0.0.0:7471", "192.0.2.1:7471", "127.0.0.1:443"] {
         let err = rt
-            .block_on(serve_loopback(empty_router("loopback-refused"), addr(text)))
+            .block_on(serve_loopback(
+                empty_router("loopback-refused"),
+                addr(text),
+                |_| panic!("a refused address is never tried"),
+            ))
             .expect_err("a refused address is never bound");
         assert_eq!(err.kind(), ErrorKind::InvalidInput, "{text}");
     }
+}
 
+#[test]
+fn a_loopback_port_another_program_holds_is_reported_and_tried_again_and_never_ends_the_listener() {
+    // Any program of the machine can hold the port first. The listener's future must not end for that: in `serve` the
+    // first listener to end stops them all, the unix socket among them.
     let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
     let at = held.local_addr().expect("its address");
-    let outcome = rt.block_on(async {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            serve_loopback(empty_router("loopback-in-use"), at),
-        )
-        .await
-    });
-    let err = outcome
-        .expect("the bind is not tried again")
-        .expect_err("a port in use is never bound");
-    assert_eq!(err.kind(), ErrorKind::AddrInUse);
-    assert!(
-        err.to_string().contains(&at.to_string()),
-        "the failure names the address: {err}"
+    let rt = Runtime::new().expect("runtime");
+    let (tried, tries) = std::sync::mpsc::channel::<Option<ErrorKind>>();
+    let serving = rt.spawn(serve_loopback(
+        empty_router("loopback-held"),
+        at,
+        move |error| {
+            let _ = tried.send(error.map(std::io::Error::kind));
+        },
+    ));
+    assert_eq!(
+        tries.recv_timeout(Duration::from_secs(5)),
+        Ok(Some(ErrorKind::AddrInUse)),
+        "the first try finds the port held, and says so"
     );
+    assert_eq!(
+        tries.recv_timeout(Duration::from_secs(5)),
+        Ok(Some(ErrorKind::AddrInUse)),
+        "it is tried again while it is held"
+    );
+    assert!(
+        !serving.is_finished(),
+        "a held port does not end the listener"
+    );
+
+    // The other program lets go: a later try takes the port, says so, and the door answers.
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match tries.recv_timeout(Duration::from_secs(20)) {
+            Ok(None) => break,
+            Ok(Some(_)) => assert!(
+                Instant::now() < deadline,
+                "the port is taken once it is free"
+            ),
+            Err(error) => panic!("the bind was not tried again: {error}"),
+        }
+    }
+    let reply = raw(
+        at,
+        &[
+            "POST /mcp HTTP/1.1".to_string(),
+            format!("Host: {at}"),
+            "Content-Type: application/json".to_string(),
+        ],
+        &rpc(json!(1), "initialize", json!({})),
+    );
+    assert_eq!(reply.status, 401, "the door is open and wants its token");
+    assert!(!serving.is_finished());
+}
+
+#[test]
+fn a_loopback_peer_that_sends_no_request_head_in_time_is_closed() {
+    let rt = Runtime::new().expect("runtime");
+    let at = free_loopback_port();
+    rt.spawn(serve_loopback_with(
+        empty_router("loopback-idle"),
+        at,
+        |_| {},
+        Duration::from_millis(300),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(at).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the loopback listener never came up"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Whether the peer's end was closed: a read that ends, rather than one that is still waiting at its deadline.
+    let closed = |stream: &mut std::net::TcpStream| {
+        let mut rest = Vec::new();
+        match stream.read_to_end(&mut rest) {
+            Ok(_) => true,
+            Err(err) => !matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+        }
+    };
+
+    // A peer that connects and says nothing, and one that starts a head and never ends it.
+    let mut silent = connect_tcp(at);
+    assert!(
+        closed(&mut silent),
+        "a silent peer is closed, not left holding a slot"
+    );
+    let mut slow = connect_tcp(at);
+    slow.write_all(b"POST /mcp HTTP/1.1\r\nHost: ")
+        .expect("send half a head");
+    assert!(closed(&mut slow), "a head that never ends is closed");
+
+    // A peer that was answered and then keeps the connection open and idle.
+    let mut kept = connect_tcp(at);
+    kept.write_all(format!("GET /no/such/route HTTP/1.1\r\nHost: {at}\r\n\r\n").as_bytes())
+        .expect("send a request");
+    let mut head = [0u8; 12];
+    kept.read_exact(&mut head)
+        .expect("the answer's first bytes");
+    assert_eq!(&head, b"HTTP/1.1 404");
+    assert!(closed(&mut kept), "an idle kept connection is closed too");
+
+    // A peer that sends its head in time is served as before.
+    let reply = raw(
+        at,
+        &[
+            "POST /mcp HTTP/1.1".to_string(),
+            format!("Host: {at}"),
+            "Content-Type: application/json".to_string(),
+        ],
+        &rpc(json!(1), "initialize", json!({})),
+    );
+    assert_eq!(reply.status, 401);
 }
 
 /// Starts `serve_loopback` on a free loopback port and waits until it accepts a connection.
 fn start_loopback(rt: &Runtime, router: axum::Router) -> SocketAddr {
     let at = free_loopback_port();
-    rt.spawn(serve_loopback(router, at));
+    rt.spawn(serve_loopback(router, at, |_| {}));
     let deadline = Instant::now() + Duration::from_secs(5);
     while std::net::TcpStream::connect(at).is_err() {
         assert!(
@@ -962,6 +1065,24 @@ fn a_request_that_names_another_host_is_refused_on_every_route_of_the_loopback_l
         missing.status, 403,
         "a route that is not there says so to nobody else"
     );
+
+    // The refusal comes before the body is read: a foreign Host with a body announced and never sent, larger than any
+    // body the door takes, is answered at once. A check that ran after the body was read would wait for it instead.
+    for extra in ["", "Origin: http://rebound.example\r\n"] {
+        let unsent = format!(
+            "POST /mcp HTTP/1.1\r\nHost: rebound.example:{port}\r\nContent-Type: application/json\r\n{extra}Content-Length: 1048576\r\n\r\n"
+        );
+        let started = Instant::now();
+        let reply = exchange(&mut connect_tcp(at), unsent.as_bytes());
+        assert_eq!(
+            reply.status, 403,
+            "a foreign Host is refused with its body unread"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the refusal did not wait for the body"
+        );
+    }
 
     // Every other way of not naming this listener.
     let refused: Vec<(&str, Vec<String>)> = vec![

@@ -450,6 +450,59 @@ pub struct StatusHandler {
     pub metrics_source: Arc<Mutex<HostModeChoice>>,
     /// The `approval` config, when the node has one: its linked hosts and the other kernels' passkeys files it trusts.
     pub approval: Option<ApprovalStatus>,
+    /// The loopback listener, when the config names one: whether it holds its address, and why not while it does not.
+    pub loopback: Option<LoopbackDoor>,
+}
+
+/// The loopback listener's state: its address, and why it is closed while it is. `serve` shares one value between the
+/// listener, which reports each bind it tries, and `arca_status`, which says what the last try found. A closed door
+/// never stops the node: its other listeners serve, and the address is tried again.
+#[derive(Clone)]
+pub struct LoopbackDoor {
+    addr: std::net::SocketAddr,
+    closed: Arc<Mutex<Option<String>>>,
+}
+
+impl LoopbackDoor {
+    /// The door of `addr`, closed until its first bind succeeds.
+    pub fn new(addr: std::net::SocketAddr) -> Self {
+        Self {
+            addr,
+            closed: Arc::new(Mutex::new(Some("not opened yet".to_string()))),
+        }
+    }
+
+    /// Records one try of the bind: `Some(error)` for a try that failed, `None` for the one that succeeded. A change
+    /// is said once on stderr, so a port that stays held does not fill the log.
+    pub fn report(&self, error: Option<&std::io::Error>) {
+        let reason = error.map(|error| match error.kind() {
+            std::io::ErrorKind::AddrInUse => {
+                "address in use: another program holds this port".to_string()
+            }
+            std::io::ErrorKind::AddrNotAvailable => {
+                "the address is not assigned to this machine".to_string()
+            }
+            std::io::ErrorKind::PermissionDenied => "this user may not take this port".to_string(),
+            other => other.to_string(),
+        });
+        let mut closed = self.closed.lock().unwrap_or_else(PoisonError::into_inner);
+        if *closed != reason {
+            match &reason {
+                Some(why) => eprintln!(
+                    "arca: the loopback door {} is closed: {why}. The node runs without it and tries the address again",
+                    self.addr
+                ),
+                None => eprintln!("arca: the loopback door {} is open", self.addr),
+            }
+        }
+        *closed = reason;
+    }
+
+    /// What `arca_status` says of the door: its address, whether it is open, and the reason while it is not.
+    pub fn json(&self) -> Value {
+        let closed = self.closed.lock().unwrap_or_else(PoisonError::into_inner);
+        json!({ "addr": self.addr.to_string(), "open": closed.is_none(), "reason": *closed })
+    }
 }
 
 /// How old the trusted files' last read may be for `arca_status` to report it rather than read the files again.
@@ -545,6 +598,9 @@ impl ToolHandler for StatusHandler {
         });
         if let Some(approval) = &self.approval {
             status["approval"] = approval.json();
+        }
+        if let Some(door) = &self.loopback {
+            status["loopback"] = door.json();
         }
         Ok(status)
     }
