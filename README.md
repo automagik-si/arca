@@ -17,7 +17,7 @@
 
 <div align="center">
 
-[**Quickstart**](docs/QUICKSTART.md) · [**Guide**](docs/OPERATING.md)
+[**Website**](https://automagik.si/arca/) · [**Quickstart**](docs/QUICKSTART.md) · [**Guide**](docs/OPERATING.md)
 
 </div>
 
