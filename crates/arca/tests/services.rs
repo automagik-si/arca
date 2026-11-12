@@ -3252,7 +3252,7 @@ fn the_server_and_the_workspace_pin_automagiks_published_release_by_one_digest()
     );
 }
 
-/// A node that installed `automagik-server` as 0.1.0-alpha.7 to 0.15.0 shipped it (Automagik 3.95.0) and runs a
+/// A node that installed `automagik-server` as 0.1.0-alpha.7 to 0.16.0 shipped it (Automagik 3.95.0) and runs a
 /// service from it. The upgrade replaces the template, since nobody edited it; the service keeps its own instance and
 /// is offered the newer release, which the owner takes or leaves. A new service pulls 3.136.4 by its digest.
 #[test]

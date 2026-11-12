@@ -63,7 +63,7 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik.json",
         "6c6998f5908b506131de8d1ce617db34d70aa70c7b1baecc738600ecc55d7b20",
     ),
-    // 0.1.0-alpha.7 to 0.15.0: Automagik 3.95.0, before it pinned Automagik's release 3.136.4.
+    // 0.1.0-alpha.7 to 0.16.0: Automagik 3.95.0, before it pinned Automagik's release 3.136.4.
     (
         "automagik-server.json",
         "b080f0b2a51d50c8b052bdc6075385b6fb177ca6a82757ea6ac63127cba07819",
@@ -73,12 +73,12 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik-workspace.json",
         "658fc9eb7fc4337cea1fcf891c4fe3db124b973ce5ec0bcebef1a97ebba64085",
     ),
-    // 0.10.0 to 0.15.0: the server build of commit 5fe0be6, before it pinned Automagik's release 3.136.4.
+    // 0.10.0 to 0.16.0: the server build of commit 5fe0be6, before it pinned Automagik's release 3.136.4.
     (
         "automagik-workspace.json",
         "d30cf55d0c3de85be17a4e726aefd5018213d2bb4e5798b97837cbda826f22a9",
     ),
-    // 0.14.0 and 0.15.0: before it said that the gate's files are the same in release 3.136.4.
+    // 0.14.0 to 0.16.0: before it said that the gate's files are the same in release 3.136.4.
     (
         "automagik-workspace.sh",
         "824ccac3cd627b5341918f0f025a7a82ec0152bb76e99ad84f11e13b112ddd6d",
