@@ -10,7 +10,8 @@
 #
 #   ~/.local/bin/arca                        the program, checked against the release's SHA256SUMS
 #   ~/.config/arca/node.json                 the quickstart's smallest config; it names no kernel project, so the node
-#                                            only reads: it sends Incus nothing but GET
+#                                            only reads: it sends Incus nothing but GET. It opens the HTTP MCP door
+#                                            on this machine only: 127.0.0.1, port 7471 or the next free one
 #   ~/.config/arca/tokens/                   mode 0700; holds the hash of the one token
 #   ~/.config/arca/assistant-1.secret        one `viewer` token, readable by this user only; never printed
 #   ~/.local/state/arca-node/                mode 0700; the node's state
@@ -18,10 +19,13 @@
 #   ~/.local/state/arca-install/             this script's own note of the program it installed, for --uninstall
 #
 # What it never does: it never runs sudo or su and refuses to run as root, never writes outside this user's home and
-# runtime directory (XDG_RUNTIME_DIR), never changes a config that exists, never prints the token, never reads its
-# standard input (so `curl ... | sh` works), never puts an older program over a newer one unless `--version` asks,
-# and never repairs the machine: when something is missing it says what and how to fix it, and stops before it has
-# changed anything.
+# runtime directory (XDG_RUNTIME_DIR), never changes a config it did not write, never prints the token, never reads
+# its standard input (so `curl ... | sh` works), never puts an older program over a newer one unless `--version`
+# asks, and never repairs the machine: when something is missing it says what and how to fix it, and stops before it
+# has changed anything.
+#
+# The one config it writes again is its own, letter for letter, from an earlier run: to add the HTTP door for a
+# program that has one, or to take it out for an older program, which refuses a config that names it.
 #
 # It starts a node only for a config it wrote, or through a service it wrote earlier, and only where it can ask the
 # node afterwards what it is. For any other config it installs the program, starts nothing and says so.
@@ -33,9 +37,10 @@
 #
 # A second run downloads the release again, replaces the program in place and restarts the service.
 #
-# Three values come from the environment: INCUS_SOCKET, the Incus socket when it is not /var/lib/incus/unix.socket
+# Four values come from the environment: INCUS_SOCKET, the Incus socket when it is not /var/lib/incus/unix.socket
 # (the name the Incus client itself reads); ARCA_INSTALL_WAIT, how many seconds to wait for the started node's first
-# answer (30); and ARCA_INSTALL_RUN_ROOT, where per-user runtime directories live (/run/user), for the tests.
+# answer (30); and, for the tests, ARCA_INSTALL_RUN_ROOT, where per-user runtime directories live (/run/user), and
+# ARCA_INSTALL_TCP_TABLES, the files that list this machine's TCP sockets (/proc/net/tcp and /proc/net/tcp6).
 set -eu
 
 # The release this script installs. `--version` names another. The script never asks GitHub which release is the
@@ -49,6 +54,11 @@ UNIT_MARK='# Automagik Arca: written by scripts/install.sh.'
 # The two units the operating guide installs by hand. A user who has them already runs the node as a service.
 GUIDE_UNITS='arca-watch.service arca-shim.service'
 TOKEN_ID=assistant-1
+# The first release whose program reads `listen.loopback`, the HTTP MCP door. An older program refuses a config that
+# names the key, so for one this script writes the config without it.
+DOOR_SINCE=0.11.0
+# The ports the door may take, in this order: the first that nothing on this machine listens on.
+DOOR_PORTS='7471 7472 7473 7474 7475 7476 7477 7478 7479 7480'
 # The oldest glibc the published program starts on.
 GLIBC_MAJOR=2
 GLIBC_MINOR=34
@@ -95,6 +105,8 @@ Install Automagik Arca as a read-only node for this user.
 
 It needs Linux on x86_64 with glibc $GLIBC_MAJOR.$GLIBC_MINOR or newer, curl, sha256sum, and an Incus this user can reach.
 It never runs sudo, and it changes nothing outside this user's home and runtime directory.
+The node answers MCP clients of this machine at http://127.0.0.1:<port>/mcp (port ${DOOR_PORTS%% *}, or the next
+free one), with a token. It opens no address another machine can reach.
 
 It ends with 0 when the node runs and answered, with 1 when it refused or failed, and with $NOT_STARTED when the program
 is installed and it started no node.
@@ -276,17 +288,64 @@ find_runtime_dir() {
     runtime_derived=1
 }
 
-# The config of the quickstart (docs/QUICKSTART.md), for this user and this machine.
+# The config of the quickstart (docs/QUICKSTART.md), for this user and this machine: with the HTTP door on
+# 127.0.0.1:$door_port, or with none while $door_port is empty. The text with no door is, letter for letter, what
+# every release of this script before DOOR_SINCE wrote.
 config_text() {
+    if [ -n "$door_port" ]; then
+        config_listen="{ \"unix\": \"$node_socket\", \"loopback\": \"127.0.0.1:$door_port\" }"
+    else
+        config_listen="{ \"unix\": \"$node_socket\" }"
+    fi
     cat <<EOF
 {
   "stateDir": "$state_dir",
   "incus": { "socket": "$incus_socket" },
-  "listen": { "unix": "$node_socket" },
+  "listen": $config_listen,
   "tokens": { "hashDir": "$config_dir/tokens" },
   "kernel": { "droiddProjects": [] }
 }
 EOF
+}
+
+# Whether a TCP socket of this machine listens on port $1, on any address, read from the kernel's own tables: no
+# connection is made. A table that cannot be read lists nothing.
+port_taken() {
+    port_hex=$(printf '%04X' "$1")
+    for tcp_table in $tcp_tables; do
+        [ -r "$tcp_table" ] || continue
+        while read -r _slot local_address _remote tcp_state _rest; do
+            case $local_address in
+                *":$port_hex") [ "$tcp_state" != 0A ] || return 0 ;;
+            esac
+        done <"$tcp_table"
+    done
+    return 1
+}
+
+# The door's port: the first of DOOR_PORTS that nothing listens on.
+free_door_port() {
+    for door_try in $DOOR_PORTS; do
+        if ! port_taken "$door_try"; then
+            printf '%s\n' "$door_try"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Whether the program this run installed reads `listen.loopback`: its own version line says which release it is.
+program_has_door() {
+    door_program=$(said_version "$is") || return 1
+    [ "$door_program" = "$DOOR_SINCE" ] || newer "$door_program" "$DOOR_SINCE"
+}
+
+# Writes the config for $door_port, in one step.
+put_config() {
+    tmp_file=$(mktemp "$config_dir/.node.json.XXXXXX")
+    config_text >"$tmp_file"
+    mv -f "${tmp_file:?}" "${config:?}"
+    tmp_file=
 }
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -498,21 +557,56 @@ install_program() {
 # ----------------------------------------------------------------------------------------------------------------------
 
 write_config() {
+    door_port=
+    door_note=
+    door_moved=
     if exists "$config"; then
-        # A config this script would write letter for letter is its own from an earlier run. Any other is the
-        # user's: this script says nothing about what it makes the node do, and starts no node for it.
-        if [ "$(cat "$config" 2>/dev/null)" = "$(config_text)" ]; then
+        # A config this script would write letter for letter, with the door on one of its ports or with none, is its
+        # own from an earlier run. Any other is the user's: this script changes nothing in it, says nothing about
+        # what it makes the node do, and starts no node for it.
+        config_ours=0
+        config_note="kept as it was: this script changes nothing in a config it did not write"
+        config_has=$(cat "$config" 2>/dev/null) || config_has=
+        if [ "$config_has" = "$(config_text)" ]; then
             config_ours=1
-            config_note="kept as it was: the config this script writes, from an earlier run"
         else
-            config_ours=0
-            config_note="kept as it was: this script changes nothing in a config that exists"
+            for door_port in $DOOR_PORTS; do
+                if [ "$config_has" = "$(config_text)" ]; then
+                    config_ours=1
+                    break
+                fi
+            done
+            [ "$config_ours" = 1 ] || door_port=
+        fi
+        if [ "$config_ours" = 1 ]; then
+            config_note="kept as it was: the config this script writes, from an earlier run"
+            if program_has_door; then
+                if [ -z "$door_port" ]; then
+                    # Its own config from before the door: the same config, with the door.
+                    if door_port=$(free_door_port); then
+                        put_config
+                        door_moved=new
+                        config_note="written again: it was this script's own, from before the HTTP door; the door is all that was added"
+                    else
+                        door_port=
+                        door_note="none: something listens on every port from ${DOOR_PORTS%% *} to ${DOOR_PORTS##* } on this machine"
+                    fi
+                fi
+            else
+                door_note="none: this program is older than $DOOR_SINCE, the first release that has one"
+                if [ -n "$door_port" ]; then
+                    door_port=
+                    put_config
+                    config_note="written again without the HTTP door: this program is older than $DOOR_SINCE and refuses a config that names one"
+                fi
+            fi
         fi
         if exists "$token_file"; then
             token_note="kept as it was"
         else
             token_note="missing: this script mints no token for a config that exists"
         fi
+        door_words
         return 0
     fi
 
@@ -532,12 +626,32 @@ write_config() {
         token_note="minted now, scope viewer"
     fi
 
-    tmp_file=$(mktemp "$config_dir/.node.json.XXXXXX")
-    config_text >"$tmp_file"
-    mv -f "${tmp_file:?}" "${config:?}"
-    tmp_file=
+    if program_has_door; then
+        if door_port=$(free_door_port); then
+            door_moved=new
+        else
+            door_port=
+            door_note="none: something listens on every port from ${DOOR_PORTS%% *} to ${DOOR_PORTS##* } on this machine"
+        fi
+    else
+        door_note="none: this program is older than $DOOR_SINCE, the first release that has one"
+    fi
+    put_config
     config_ours=1
     config_note="written now: it names no kernel project, so the node only reads"
+    door_words
+}
+
+# What the report says about the door of a config that is this script's. A config that is not gets no line: this
+# script says nothing about what such a config opens.
+door_words() {
+    door_url=
+    [ -n "$door_port" ] || return 0
+    door_url=http://127.0.0.1:$door_port/mcp
+    door_note="$door_url, from this machine only"
+    if [ "$door_moved" = new ] && [ "$door_port" != "${DOOR_PORTS%% *}" ]; then
+        door_note="$door_note; port ${DOOR_PORTS%% *} was in use, so the next free one was taken"
+    fi
 }
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -674,6 +788,9 @@ report() {
         say "  state     $state_dir"
     fi
     say "  service   $service_note"
+    if [ -n "$door_note" ]; then
+        say "  door      $door_note"
+    fi
     if [ "$answered" = 1 ]; then
         mode=$(json_text "$status" mode) || mode="not stated"
         node_version=$(json_text "$status" version) || node_version="not stated"
@@ -771,13 +888,32 @@ report() {
 
     say "Connect an assistant. Two ways work today:"
     say
+    if [ -n "$door_url" ]; then
+        say "  1. An assistant that takes an MCP server URL reaches the node over HTTP on this machine, with the token"
+        say "     as its bearer. For Claude Code, run this one line; the shell reads the token from its file, so it is"
+        say "     not shown here:"
+        say "       claude mcp add --transport http arca $door_url --header \"Authorization: Bearer \$(cat $token_file)\""
+        say "     Any other client takes this entry, with the content of $token_file"
+        say "     in place of <token>:"
+        say "       { \"mcpServers\": { \"arca\": { \"type\": \"http\", \"url\": \"$door_url\", \"headers\": { \"Authorization\": \"Bearer <token>\" } } } }"
+        say "     The client then keeps the token in its own config, in clear text: whoever can read that file can ask"
+        say "     this node whatever the token may ask. The door answers this machine only, never another one."
+        if [ "$service" != unit ]; then
+            say "     This script started no node: the door is open once a node has started with this config."
+        fi
+        say
+        say "  2. An assistant with a shell on this machine, as the user $user, runs \`arca call <verb>\`:"
+        say "       $status_command"
+        say "     \`watch_report\` in place of \`arca_status\` lists every project and instance with its owner."
+        return "$result"
+    fi
     say "  1. An assistant with a shell on this machine, as the user $user, runs \`arca call <verb>\`:"
     say "       $status_command"
     say "     \`watch_report\` in place of \`arca_status\` lists every project and instance with its owner."
     say
     say "  2. An assistant that takes an MCP server URL needs a TCP address. The node opens one only when its"
-    say "     config names \`listen.tailnet\` or \`listen.proxy\`, and the config this script writes names neither."
-    say "     The operating guide says how to turn one on: $GUIDE#the-config-file"
+    say "     config names \`listen.loopback\`, \`listen.tailnet\` or \`listen.proxy\`, and this script wrote none of"
+    say "     them here. The operating guide says how to turn one on: $GUIDE#the-config-file"
     say "     The client's entry is then the URL http://<address>:<port>/mcp and the header"
     say "     \"Authorization: Bearer <the content of $token_file>\"."
     return "$result"
@@ -900,6 +1036,7 @@ main() {
     unit_file=$unit_dir/$UNIT
     unit_wanted=$unit_dir/default.target.wants/$UNIT
     incus_socket=${INCUS_SOCKET:-/var/lib/incus/unix.socket}
+    tcp_tables=${ARCA_INSTALL_TCP_TABLES:-/proc/net/tcp /proc/net/tcp6}
     node_socket=
     wait_seconds=${ARCA_INSTALL_WAIT:-30}
     case $wait_seconds in
@@ -931,7 +1068,7 @@ main() {
     fi
 
     if exists "$config"; then
-        say "Installing Automagik Arca $version for the user $user. The config at $config is kept as it is."
+        say "Installing Automagik Arca $version for the user $user, with the config that is at $config."
     else
         say "Installing Automagik Arca $version as a read-only node for the user $user."
     fi
