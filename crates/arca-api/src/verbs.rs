@@ -1618,10 +1618,43 @@ pub fn summary_done(_: &Value) -> String {
     "done".to_string()
 }
 
-/// A short line for a successful `arca_status`.
+/// How many rows a summary lists before it says how many more there are. The structured answer always has them all.
+const SUMMARY_ROWS: usize = 50;
+
+/// The rows of a summary, one to a line, the first `SUMMARY_ROWS` and then a count of the rest. A client that shows
+/// only text gets the answer itself, not just a count.
+fn summary_rows(head: String, rows: Vec<String>) -> String {
+    let more = rows.len().saturating_sub(SUMMARY_ROWS);
+    let mut text = head;
+    for row in rows.into_iter().take(SUMMARY_ROWS) {
+        text.push_str("\n- ");
+        text.push_str(&row);
+    }
+    if more > 0 {
+        text.push_str(&format!("\n- and {more} more"));
+    }
+    text
+}
+
+/// A short answer for a successful `arca_status`: the version and mode, then whether Incus answers and how long the
+/// node has run.
 pub fn summary_status(v: &Value) -> String {
+    let incus = match v["incusReachable"].as_bool() {
+        Some(true) => "Incus answers",
+        Some(false) => "Incus does not answer",
+        None => "Incus unknown",
+    };
+    let up = v["uptimeS"].as_u64().map_or_else(
+        || "uptime unknown".to_string(),
+        |seconds| match seconds {
+            0..60 => format!("up {seconds} s"),
+            60..3_600 => format!("up {} min", seconds / 60),
+            3_600..86_400 => format!("up {} h {} min", seconds / 3_600, seconds % 3_600 / 60),
+            _ => format!("up {} d {} h", seconds / 86_400, seconds % 86_400 / 3_600),
+        },
+    );
     format!(
-        "arca {} ({} mode)",
+        "arca {} ({} mode)\n{incus}; {up}",
         v["version"].as_str().unwrap_or("?"),
         v["mode"].as_str().unwrap_or("?")
     )
@@ -1632,15 +1665,25 @@ pub fn summary_metrics(v: &Value) -> String {
     format!("host metrics for {} minute(s)", v["minutes"])
 }
 
-/// A short line for a successful `watch_report`.
+/// A short answer for a successful `watch_report`: the count, then each instance with its project, kind and status.
 pub fn summary_watch_report(v: &Value) -> String {
     let projects = v["projects"].as_array().map_or(0, Vec::len);
-    let instances: usize = v["projects"].as_array().map_or(0, |list| {
-        list.iter()
-            .map(|project| project["instances"].as_array().map_or(0, Vec::len))
-            .sum()
-    });
-    format!("{instances} instance(s) in {projects} project(s)")
+    let mut rows = Vec::new();
+    for project in v["projects"].as_array().into_iter().flatten() {
+        let name = project["project"].as_str().unwrap_or("?");
+        for instance in project["instances"].as_array().into_iter().flatten() {
+            rows.push(format!(
+                "{} in {name}: {}, {}",
+                instance["name"].as_str().unwrap_or("?"),
+                instance["kind"].as_str().unwrap_or("?"),
+                instance["status"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    summary_rows(
+        format!("{} instance(s) in {projects} project(s)", rows.len()),
+        rows,
+    )
 }
 
 /// A short line for a successful `token_list`.
@@ -2739,12 +2782,23 @@ pub fn summary_service_create(v: &Value) -> String {
     )
 }
 
-/// A short line for a successful `service_list`.
+/// A short answer for a successful `service_list`: the count, then each service with its template, state and address.
 pub fn summary_service_list(v: &Value) -> String {
-    format!(
-        "{} service(s)",
-        v["services"].as_array().map_or(0, Vec::len)
-    )
+    let rows: Vec<String> = v["services"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|service| {
+            format!(
+                "{} ({}): {} at {}",
+                service["name"].as_str().unwrap_or("?"),
+                service["template"].as_str().unwrap_or("?"),
+                service["state"].as_str().unwrap_or("?"),
+                service["ipv4"].as_str().unwrap_or("no address")
+            )
+        })
+        .collect();
+    summary_rows(format!("{} service(s)", rows.len()), rows)
 }
 
 /// A short line for a successful `service_status`.
