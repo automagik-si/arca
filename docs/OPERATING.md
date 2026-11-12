@@ -1789,6 +1789,25 @@ upgrade replaces a shipped template is refused, and the next proposal shows the 
 minutes, so this is a short wait. A proposal for a template that is not installed, or whose script is missing, is
 refused when it is made.
 
+**A proposal the node has no room for is refused when it is made.** A `service_create` is held to two sets of caps:
+the node's caps on virtual machines (`kernel.vmLimits`, or `kernel.bridged.limits` on a node that sets
+`kernel.bridged`: `virtualMachines`, `cpu`, `memory`, `disk`), and, when it names a tenant, that tenant's caps
+(`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk`).
+Both are checked when the proposal is made, from the node's config, its own records and the template, without asking
+Incus. A proposal that would pass a cap is refused then, with the code `capacity` and the sentence the create itself
+uses: `creating <name> would exceed this node's cap on CPUs (kernel.bridged.limits.cpu): 2 in use, 2 asked, 3
+allowed`. No card is recorded, so the owner is never asked to approve it. A proposal exactly at a cap is recorded. A
+proposal that names a tenant the node does not hold is refused when it is made too.
+
+The approved create checks the same caps again, with the same code. The node can fill up in the fifteen minutes a card
+waits: another create, or a config that lowers a cap. The owner's approval is then accepted and used up, the card is
+retired, and the answer begins "The approval was accepted, but service_create did not complete:" and carries
+`proposeAgain: true`. Proposed again while the node is still full, it is refused when it is made.
+
+One refusal for want of room can still come after an approval on a node where nothing changed: the service subnet, or
+a tenant's block, has no free address. Addresses in use are read from Incus, and a proposal is answered without
+Incus. `function_create` and `postgres_create` are held to no cap; only the free address applies to them.
+
 A token's own `service_create` shows no card and binds nothing, as before. It may state `templateDigest` or `image`
 itself, and is then refused when the node's template differs. Not part of the fingerprint: why a service is created
 stopped (the card's `Start` row is read from the stored secrets), the node's config, and whatever an image name
@@ -3228,8 +3247,9 @@ proposed with `action_propose`, and writes the same journal records. A proposal 
 owner is never asked to approve a create the node is sure to refuse: the template's kind must fit the node's mode, the
 mode must fit the desired state, and the bridge must be an allowed one. A bridge the request leaves out is filled in
 then. The owner's card says "Create the virtual machine <name> from template <template> on the host bridge <bridge>"
-and lists the bridge and the MAC. The caps and the MAC are checked when the approved create runs, because both can
-change while a proposal waits. `service_remove` needs the owner's approval and retires the virtual machine through the same delete plan.
+and lists the bridge and the MAC. The caps are checked when the proposal is made too (see "A proposal the node has
+no room for is refused when it is made"), and again when the approved create runs, because the node can fill up while
+a proposal waits. The MAC is checked when the approved create runs. `service_remove` needs the owner's approval and retires the virtual machine through the same delete plan.
 `service_logs` returns the virtual machine's console log.
 
 What a bridged node refuses, and why:

@@ -994,15 +994,18 @@ Source: `mode_refusal` in `crates/arca/src/handlers.rs` and `check_bridged_start
 **Rule 58.** The virtual-machine caps (count, CPUs, memory, root disk) are one set per node and cover every virtual machine Arca
 holds, on either network: `kernel.bridged.limits` when the node sets `kernel.bridged`, and `kernel.vmLimits` on a managed node
 that does not. A node with neither creates no virtual machine. `service_create` adds up the virtual-machine records it holds and
-refuses a create that would pass a cap, before any write. Incus enforces them too only where it can do so for virtual machines
+refuses a create that would pass a cap, before any write. A proposed create is refused the same way when the proposal is made,
+by the same function, so no card is recorded for it; the approved create asks again. Incus enforces them too only where it can do so for virtual machines
 alone: on a bridged node the project carries all four as `limits.*` and `limits.containers` is `0`; on a mixed or managed node
 the project carries `limits.virtual-machines` only, because Incus's `limits.cpu`, `limits.memory` and `limits.disk` count the
 containers of the project as well. So on those nodes the CPU, memory and disk caps are Arca's check alone, and a virtual machine
 made by hand in the project is outside them. Containers have no node cap: each keeps the service profile's own limits (or its
 template's), and the address plan bounds containers, databases and managed virtual machines together at 230.
-Source: `KernelConfig::vm_caps`, `check_bridged` and `check_vm_limits` in `crates/arca/src/config.rs`; `caps_refusal` in
-`crates/arca/src/handlers.rs`; tests `the_caps_count_virtual_machines_on_both_networks_and_no_container` and
-`vm_limits_are_the_caps_of_a_managed_node_without_host_bridges`.
+Source: `KernelConfig::vm_caps`, `check_bridged` and `check_vm_limits` in `crates/arca/src/config.rs`; `caps_refusal` and
+`create_room_refusal` in `crates/arca/src/handlers.rs`; tests
+`the_caps_count_virtual_machines_on_both_networks_and_no_container`,
+`vm_limits_are_the_caps_of_a_managed_node_without_host_bridges` and
+`a_proposal_over_a_cap_of_the_node_is_refused_when_it_is_made_and_no_card_waits`.
 
 **Rule 59.** Every virtual machine Arca creates carries the device `agent` (`{"type":"disk","source":"agent:config"}`), the NIC
 name `enp5s0` on its `eth0` device and `agent.nic_config` set to `true`. Incus 7.6 offers the guest its config share over 9p

@@ -518,5 +518,7 @@ mod kernel_access;
 mod real_incus;
 #[path = "tenants/refusal_codes.rs"]
 mod refusal_codes;
+#[path = "tenants/room_at_propose.rs"]
+mod room_at_propose;
 #[path = "tenants/template_binding.rs"]
 mod template_binding;
