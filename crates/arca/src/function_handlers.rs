@@ -340,23 +340,27 @@ impl ServiceHandler {
         for image in images.as_array().into_iter().flatten() {
             let from = &image["update_source"];
             let kept = from["server"].as_str().unwrap_or_default();
-            let with_credential = kept
-                .strip_prefix("https://")
-                .and_then(|rest| rest.split(['/', '?', '#']).next())
-                .is_some_and(|authority| authority.contains('@'));
             if from["protocol"] == "oci"
                 && from["alias"].as_str() == Some(alias)
                 && function::registry_host(kept).as_deref() == Some(host.as_str())
-                && with_credential
+                && arca_incus::address_holds_credential(kept)
                 && let Some(fingerprint) = image["fingerprint"].as_str()
-                && writer
-                    .drop_unused_image(&config.project, fingerprint)
-                    .is_err()
             {
-                eprintln!(
-                    "arca: the image {} was fetched with a registry's credential and could not be deleted after its last user was removed: Incus still holds that credential with it",
-                    &fingerprint[..fingerprint.len().min(12)]
-                );
+                match writer.drop_unused_image(&config.project, fingerprint) {
+                    Ok(true) => crate::registry::image_line(
+                        &self.cfg,
+                        (self.clock)(),
+                        &config.project,
+                        fingerprint,
+                        "deleted",
+                        "its last function or service was removed",
+                    ),
+                    Ok(false) => {}
+                    Err(_) => eprintln!(
+                        "arca: the image {} was fetched with a registry's credential and could not be deleted after its last user was removed: Incus still holds that credential with it until the next sweep",
+                        &fingerprint[..fingerprint.len().min(12)]
+                    ),
+                }
             }
         }
     }

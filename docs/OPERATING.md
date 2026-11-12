@@ -4596,8 +4596,24 @@ secrets. So:
   approved proposal: a direct `service_create` is refused with `NotApproved`, whether it names the registry or
   not. The proposal fills the row in. A card approved after the credential was removed does not run;
 - Incus is told not to go back to the registry for the image by itself (`auto_update` is turned off on it): an image
-  by digest never changes;
+  by digest never changes. Arca turns it off right after every create and every rebuild that was sent the
+  credential, whatever that create or rebuild answered;
 - the image, and the credential with it, leaves Incus when its last function or service is removed;
+- **every ten minutes**, and when `arca serve` starts, the node looks at the images its own project fetched with a
+  credential. It turns `auto_update` off on one that has it on, and deletes one that no service or function is made
+  from once it has seen it so for **fifteen minutes** (a create may still be between its fetch and its instance
+  before that). It knows such an image by the image's own record in Incus, the address kept there, and not by what
+  the secret store holds: removing a credential forgets no image. It never touches an image with no source address
+  (a local one, one imported by hand) or one from an address without a credential, and never deletes an image a
+  service or a function is made from, a stopped function's included. Each thing it does, and each image deleted
+  at a removal, is one line in `registry-images.jsonl` in the state directory: when, the project, the fingerprint,
+  what and why, and never the address. A round that fails says so once on the log of `arca serve` and is tried
+  again at the next; it stops nothing and no create or run waits for it;
+- **what this does not give:** between a fetch and the turn-off that follows it, `auto_update` is on: for seconds,
+  or for up to ten minutes when the turn-off failed. Incus's own round for cached images is hours apart, and what
+  it would do in it is ask the same registry for the same digest with the address it keeps. Closing that at the
+  source takes a key on the project itself (`images.auto_update_cached`), a change to the config of a project that
+  already exists: planned as its own change, after it is seen to work on the Incus the nodes run;
 - a new credential replaces the old one for every later fetch. An image already fetched keeps the address it was
   fetched with until it is removed.
 

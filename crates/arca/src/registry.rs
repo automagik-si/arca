@@ -30,6 +30,181 @@ pub const REGISTRY_VERBS: [&str; 3] = [
 /// named as its secrets are, holding the registry's address. It holds no secret.
 const REGISTRIES_DIR: &str = "registries";
 
+/// How often the node looks at the images its own project fetched with a credential.
+pub const SWEEP_EVERY_MS: u64 = 10 * 60 * 1000;
+/// How long such an image must have been seen with no instance made from it before it is deleted. A create waits at
+/// most ten minutes between its fetch and its instance, so an image that young may still be getting its user.
+pub const ORPHAN_AGE_MS: u64 = 15 * 60 * 1000;
+/// The file, in the state directory, with one line for each thing done to such an image.
+pub const IMAGES_LOG: &str = "registry-images.jsonl";
+
+/// One line of [`IMAGES_LOG`]: an image fetched with a credential had `auto_update` turned off (`autoUpdateOff`) or
+/// was deleted (`deleted`), when and why. It names the project and the fingerprint, and never an address.
+pub fn image_line(
+    cfg: &NodeConfig,
+    at: u64,
+    project: &str,
+    fingerprint: &str,
+    did: &str,
+    why: &str,
+) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let line =
+        json!({ "at": at, "project": project, "fingerprint": fingerprint, "did": did, "why": why });
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(cfg.state_dir.join(IMAGES_LOG))
+        .and_then(|mut file| {
+            let mut bytes = serde_json::to_vec(&line).map_err(std::io::Error::other)?;
+            bytes.push(b'\n');
+            file.write_all(&bytes)?;
+            file.sync_data()
+        });
+    if let Err(error) = written {
+        eprintln!("arca: {IMAGES_LOG} could not be written ({error}); what was done: {line}");
+    }
+}
+
+/// What one round of the sweep did, by fingerprint.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    pub turned_off: Vec<String>,
+    pub deleted: Vec<String>,
+}
+
+/// The sweep of the images the node's own service project fetched with a registry's credential.
+///
+/// Incus keeps, in the record of such an image, the address it was fetched from with the credential in it, and
+/// makes the record with `auto_update` on. The writer turns that off right after a create and after a rebuild from
+/// the registry; this sweep is what catches the rest: a turn-off that failed, an image whose create failed after
+/// its fetch and that nothing uses. An image counts by its own record, the address Incus keeps for it, and not by
+/// what the secret store holds today: removing a credential forgets nothing here. An image with no source address
+/// (a local one, one imported by hand) and one from an address without a credential are never touched, and an
+/// image an instance of the project is made from is never deleted, a stopped function's included.
+///
+/// What it does not give: between a fetch and the turn-off that follows it `auto_update` is on, for seconds, or
+/// until the next round ([`SWEEP_EVERY_MS`]) when the turn-off failed. Incus's own round for it is hours apart.
+pub struct ImageSweep {
+    cfg: Arc<NodeConfig>,
+    clock: crate::handlers::Clock,
+    /// When each image was first seen with no instance made from it.
+    unused_since: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Whether the last round failed: a failure is said once, not at every round.
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl ImageSweep {
+    pub fn new(cfg: Arc<NodeConfig>, clock: crate::handlers::Clock) -> ImageSweep {
+        ImageSweep {
+            cfg,
+            clock,
+            unused_since: std::sync::Mutex::new(std::collections::HashMap::new()),
+            failing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// One round. On a node where no registry credential was ever set it asks Incus nothing.
+    pub fn round(&self) -> Result<Swept, String> {
+        let mut swept = Swept::default();
+        if !ever_set(&self.cfg) {
+            return Ok(swept);
+        }
+        let project = arca_netproject::PROJECT;
+        let family = arca_incus::ProjectFamily::new(
+            [project],
+            self.cfg.kernel.droidd_projects.iter().map(String::as_str),
+        )?;
+        let run = arca_incus::function_run::FunctionRun::new(self.cfg.incus.socket.clone(), family);
+        // Incus's words are never said whole: only that it did not do what was asked.
+        let said = |what: &str| format!("Incus did not {what}");
+        let now = (self.clock)();
+        let images = run
+            .fetched_with_credential(project)
+            .map_err(|_| said("list the images of the node's own project"))?;
+        let mut unused = self
+            .unused_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unused.retain(|fingerprint, _| {
+            images
+                .iter()
+                .any(|image| image.fingerprint == *fingerprint && !image.used)
+        });
+        for image in &images {
+            if image.auto_update {
+                run.auto_update_off(project, &image.fingerprint)
+                    .map_err(|_| {
+                        said("turn auto_update off on an image fetched with a credential")
+                    })?;
+                image_line(
+                    &self.cfg,
+                    now,
+                    project,
+                    &image.fingerprint,
+                    "autoUpdateOff",
+                    "sweep",
+                );
+                swept.turned_off.push(image.fingerprint.clone());
+            }
+            if image.used {
+                continue;
+            }
+            let since = *unused.entry(image.fingerprint.clone()).or_insert(now);
+            if now.saturating_sub(since) >= ORPHAN_AGE_MS
+                && run
+                    .drop_unused_image(project, &image.fingerprint)
+                    .map_err(|_| {
+                        said("delete an image fetched with a credential that nothing uses")
+                    })?
+            {
+                image_line(
+                    &self.cfg,
+                    now,
+                    project,
+                    &image.fingerprint,
+                    "deleted",
+                    "sweep: no instance was made from it",
+                );
+                unused.remove(&image.fingerprint);
+                swept.deleted.push(image.fingerprint.clone());
+            }
+        }
+        Ok(swept)
+    }
+
+    /// One round for the timer: a failure is said on the log once, and again only after a round that worked.
+    pub fn tick(&self) {
+        use std::sync::atomic::Ordering;
+        match self.round() {
+            Ok(_) => self.failing.store(false, Ordering::SeqCst),
+            Err(why) => {
+                if !self.failing.swap(true, Ordering::SeqCst) {
+                    eprintln!(
+                        "arca: the sweep of images fetched with a registry's credential failed: {why}. It is tried again every ten minutes; this is not said again until a round has worked"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Runs a round now and one every [`SWEEP_EVERY_MS`], on a thread of its own: it holds no lock a create or a
+    /// run takes, and nothing waits on it.
+    pub fn spawn(self: Arc<Self>) -> std::io::Result<()> {
+        std::thread::Builder::new()
+            .name("arca-image-sweep".to_string())
+            .spawn(move || {
+                loop {
+                    self.tick();
+                    std::thread::sleep(std::time::Duration::from_millis(SWEEP_EVERY_MS));
+                }
+            })
+            .map(|_| ())
+    }
+}
+
 pub fn registry_handlers(cfg: Arc<NodeConfig>) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     REGISTRY_VERBS
         .into_iter()

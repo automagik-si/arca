@@ -450,6 +450,15 @@ fn a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_
             .expect("asked")
     );
     assert!(rig.run.drop_unused_image(PROJECT, "../x").is_err());
+    // The list of images fetched with a credential is of the family's own projects, and of no other.
+    assert!(matches!(
+        rig.run.fetched_with_credential("other"),
+        Err(IncusError::Refused(_))
+    ));
+    assert!(matches!(
+        rig.run.auto_update_off(PROJECT, "../x"),
+        Err(IncusError::Refused(_))
+    ));
 }
 
 #[test]

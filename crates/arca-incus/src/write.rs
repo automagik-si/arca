@@ -382,29 +382,54 @@ impl UnixIncusWriter {
         if let Some(source) = with_credential {
             sent.insert("source".to_string(), source);
         }
-        self.mutate("POST", &urls.collection, None, Some(&Value::Object(sent)))?;
-        let owned = self.confirm(target, |_| Ok(()))?;
+        let posted = self.mutate("POST", &urls.collection, None, Some(&Value::Object(sent)));
         if fetched {
-            // The image's record now holds the address it was fetched from. An image by digest never changes, so
-            // Incus has no reason to go back to the registry for it with that address.
-            if let Some(image) = owned
-                .config()
-                .get("volatile.base_image")
-                .filter(|text| text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()))
+            // Whatever the create answered: the fetch may be done when the create is not (an instance Incus made
+            // and did not start, a read-back that did not confirm), and the image's record then holds the address.
+            self.fetched_images_stay_put(&target.project, &target.name);
+        }
+        posted?;
+        self.confirm(target, |_| Ok(()))
+    }
+
+    /// Turns `auto_update` off on every cached image of `project` whose record says it was fetched with a
+    /// credential and that still has it on. An image by digest never changes, so Incus has no reason to go back to
+    /// the registry for it with the address it keeps. A failure is said on the log and nothing else: the periodic
+    /// sweep of such images tries again.
+    fn fetched_images_stay_put(&self, project: &str, for_whom: &str) {
+        let listed = self
+            .send(
+                "GET",
+                &format!("/1.0/images?project={project}&recursion=1"),
+                None,
+                None,
+            )
+            .and_then(|framed| checked_envelope(&framed.into_raw()));
+        let mut failed = listed.is_err();
+        for image in listed
+            .iter()
+            .flat_map(|envelope| envelope["metadata"].as_array().into_iter().flatten())
+        {
+            let on = image["cached"] == true
+                && image["auto_update"] != false
+                && image["update_source"]["server"]
+                    .as_str()
+                    .is_some_and(address_holds_credential);
+            if let (true, Some(fingerprint)) = (on, image["fingerprint"].as_str())
+                && fingerprint.len() == 64
+                && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
-                let url = format!("/1.0/images/{image}?project={}", target.project);
-                if self
+                let url = format!("/1.0/images/{fingerprint}?project={project}");
+                failed |= self
                     .mutate("PATCH", &url, None, Some(&json!({ "auto_update": false })))
-                    .is_err()
-                {
-                    eprintln!(
-                        "arca: auto_update could not be turned off on the image of {}: Incus may ask its registry again by itself",
-                        target.name
-                    );
-                }
+                    .is_err();
             }
         }
-        Ok(owned)
+        if failed {
+            eprintln!(
+                "arca: auto_update could not be turned off on the image of {for_whom}: Incus may ask its registry again by itself until the next sweep"
+            );
+        }
     }
 
     /// Sets and removes config keys of an object this entry owns, under the ETag of `owned`. The change must leave the object
@@ -1184,6 +1209,15 @@ impl RegistryCredential {
         address.push_str(host);
         Some(address)
     }
+}
+
+/// Whether a registry address as Incus keeps it holds a user name and a password before its host. This is how an
+/// image says, in its own record, that it was fetched with a credential: nothing of Arca's is asked.
+pub fn address_holds_credential(server: &str) -> bool {
+    server
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 /// An OCI registry server: `https://` and a host, with an optional port. No path, credentials or query.

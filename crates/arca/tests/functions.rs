@@ -1763,6 +1763,14 @@ fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_r
         credentialed(&rig).is_empty(),
         "the image went with its last function"
     );
+    let gone = fs::read_to_string(rig.dir.join(arca::registry::IMAGES_LOG)).expect("the log");
+    assert_eq!(gone.lines().count(), 1, "{gone}");
+    assert!(
+        gone.contains("\"did\":\"deleted\"")
+            && gone.contains("its last function or service was removed")
+            && !gone.contains(&word),
+        "{gone}"
+    );
 
     // A function that has run, and whose stored image is then gone: its next run's root is fetched again from the
     // registry, with the credential. (A function that never ran is given no rebuild, so it runs once first.)
@@ -1951,6 +1959,142 @@ fn a_registrys_credential_never_reaches_another_host_or_a_functions_environment(
     );
     let said = format!("{made:?}{:?}", rig.entries());
     assert!(!said.contains(&word));
+}
+
+/// The sweep of the images the node's own project fetched with a credential. It knows such an image by the image's
+/// own record, so a credential removed since changes nothing; it turns `auto_update` off where it is on; it deletes
+/// one that no instance is made from, and only after a quarter of an hour; it never touches an image with no source
+/// address or one from an address without a credential, and never deletes one a stopped function was made from.
+/// Each thing it does is one line that names the project and the fingerprint.
+#[test]
+fn the_sweep_settles_only_images_fetched_with_a_credential_and_deletes_only_an_old_orphan() {
+    use arca::registry::{IMAGES_LOG, ImageSweep, ORPHAN_AGE_MS, Swept};
+    let rig = Rig::new();
+    rig.nats();
+    let ticking = Arc::clone(&rig.now);
+    let clock: Clock = Arc::new(move || ticking.load(Ordering::SeqCst));
+    let sweep = ImageSweep::new(Arc::clone(&rig.cfg), clock.clone());
+    let image =
+        |fingerprint: &str| rig.get(&format!("/1.0/images/{fingerprint}?project={PROJECT}"));
+
+    // A node where no credential was ever set: the sweep asks Incus nothing.
+    let asked = rig.fake.requests().len();
+    assert_eq!(sweep.round(), Ok(Swept::default()));
+    assert_eq!(rig.fake.requests().len(), asked);
+
+    let server = "https://registry.example";
+    let word = ["pull", "only", "word", "6543"].join("-");
+    rig.call(
+        "registry_secret_set",
+        json!({ "server": server, "username": "puller", "password": word }),
+    )
+    .expect("set");
+    // Two functions, each on an image of its own. One runs and stops; the other's container is deleted by an
+    // operator behind Arca's back, which leaves its image with no instance made from it.
+    rig.approved("function_create", relay_args())
+        .expect("relay");
+    let mut lost = relay_args();
+    lost["name"] = json!("lost");
+    lost["image"] = json!("registry.example/acme/lost");
+    rig.approved("function_create", lost).expect("lost");
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    assert_eq!(rig.run("relay")["outcome"], "ok");
+    let (kept, orphan) = (rig.fingerprint("relay"), rig.fingerprint("lost"));
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/instances/lost?project={PROJECT}"),
+        &json!({}),
+    );
+    // Someone turns auto_update back on on the image the stopped function was made from.
+    send(
+        &rig,
+        "PATCH",
+        &format!("/1.0/images/{kept}?project={PROJECT}"),
+        &json!({ "auto_update": true }),
+    );
+    // Two images that are not the sweep's: one with no source address, one from an address without a credential.
+    let local = rig.fake.add_image(PROJECT, "a-local-image");
+    let bare = rig
+        .get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+        .and_then(|images| images.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .find(|image| image["update_source"]["server"] == "https://docker.io")
+        .expect("the image of nats")["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let others = (image(&local), image(&bare));
+    assert_eq!(others.1.as_ref().unwrap()["auto_update"], true);
+    // The credential is removed before the sweep ever looks: the images say by themselves what they were fetched with.
+    rig.call("registry_secret_remove", json!({ "server": server }))
+        .expect("removed");
+
+    // The first round turns auto_update off, and deletes nothing: the orphan was only just seen.
+    assert_eq!(
+        sweep.round(),
+        Ok(Swept {
+            turned_off: vec![kept.clone()],
+            deleted: vec![]
+        })
+    );
+    assert_eq!(image(&kept).unwrap()["auto_update"], false);
+    assert!(image(&orphan).is_some());
+    // A minute short of the age: still there. Past it: deleted.
+    rig.now.fetch_add(ORPHAN_AGE_MS - 60_000, Ordering::SeqCst);
+    assert_eq!(sweep.round(), Ok(Swept::default()));
+    assert!(image(&orphan).is_some());
+    rig.now.fetch_add(60_000, Ordering::SeqCst);
+    assert_eq!(
+        sweep.round(),
+        Ok(Swept {
+            turned_off: vec![],
+            deleted: vec![orphan.clone()]
+        })
+    );
+    assert!(image(&orphan).is_none());
+    // The image a stopped function was made from stays however long it has been: its next run is rebuilt from it.
+    rig.now.fetch_add(10 * ORPHAN_AGE_MS, Ordering::SeqCst);
+    assert_eq!(sweep.round(), Ok(Swept::default()));
+    assert!(image(&kept).is_some());
+    assert_eq!(rig.run("relay")["root"], "store");
+    // The two that are not the sweep's are as they were, auto_update and all.
+    assert_eq!((image(&local), image(&bare)), others);
+
+    // One line for each thing done: the project and the fingerprint, and nothing of the address.
+    let log = fs::read_to_string(rig.dir.join(IMAGES_LOG)).expect("the log");
+    let lines: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let said: Vec<(&str, &str, &str)> = lines
+        .iter()
+        .map(|line| {
+            (
+                line["did"].as_str().unwrap(),
+                line["project"].as_str().unwrap(),
+                line["fingerprint"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("autoUpdateOff", PROJECT, kept.as_str()),
+            ("deleted", PROJECT, orphan.as_str())
+        ]
+    );
+    assert!(!log.contains(&word) && !log.contains("registry.example"));
+
+    // A round that cannot reach Incus is an error in words of Arca's own, and a later round works.
+    let mut away = (*rig.cfg).clone();
+    away.incus.socket = rig.dir.join("no-such-socket");
+    let failed = ImageSweep::new(Arc::new(away), clock)
+        .round()
+        .expect_err("Incus is not there");
+    assert!(failed.starts_with("Incus did not "), "{failed}");
+    assert_eq!(sweep.round(), Ok(Swept::default()));
 }
 
 /// An edit made by an Incus operator, outside the kernel's writer.

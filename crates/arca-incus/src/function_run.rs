@@ -187,44 +187,58 @@ impl FunctionRun {
         if let Some(address) = address {
             sent["server"] = json!(address);
         }
-        match self
+        let rebuilt = self
             .changer
-            .rebuild(&fresh.project, &fresh.name, &json!({ "source": sent }))
-        {
-            Ok(()) => {
-                if with_credential {
-                    self.keep_from_the_registry(&fresh, fingerprint);
-                }
-                Ok(FreshRoot::Registry)
-            }
+            .rebuild(&fresh.project, &fresh.name, &json!({ "source": sent }));
+        if with_credential {
+            self.fetched_images_stay_put(&fresh);
+        }
+        match rebuilt {
+            Ok(()) => Ok(FreshRoot::Registry),
             Err(remote) => Err(refused(&format!(
                 "the node's own copy of the image is gone, and the registry did not give it again: {remote}"
             ))),
         }
     }
 
-    /// After a rebuild that fetched the image again with a registry's credential: Incus made a new record for it, with
-    /// the address it was fetched from and `auto_update` on, as it does for every image it fetches. It is turned off,
-    /// as the writer turns it off at a create, so Incus does not go back to the registry with that address by
-    /// itself. The image is the one the instance names now, or the one its function's record took.
-    fn keep_from_the_registry(&self, rebuilt: &InstanceState, recorded: Option<&str>) {
-        let named = self
-            .changer
-            .read(&rebuilt.project, &rebuilt.name)
-            .ok()
-            .and_then(|now| now.own_config.get("volatile.base_image").cloned())
-            .filter(|image| self::fingerprint(image));
-        let done = named.as_deref().or(recorded).is_some_and(|image| {
-            self.changer
-                .image_auto_update_off(&rebuilt.project, image)
-                .is_ok()
-        });
-        if !done {
+    /// After a rebuild that was sent a registry's credential, done or not: Incus makes a record for the image it
+    /// fetched, with the address it was fetched from and `auto_update` on, as it does for every image it fetches.
+    /// It is turned off on every such image of the project, so Incus does not go back to the registry with that
+    /// address by itself. A failure is said on the log: the periodic sweep tries again.
+    fn fetched_images_stay_put(&self, rebuilt: &InstanceState) {
+        let settled = self
+            .fetched_with_credential(&rebuilt.project)
+            .and_then(|images| {
+                images
+                    .iter()
+                    .filter(|image| image.auto_update)
+                    .try_for_each(|image| {
+                        self.auto_update_off(&rebuilt.project, &image.fingerprint)
+                    })
+            });
+        if settled.is_err() {
             eprintln!(
-                "arca: auto_update could not be turned off on the image {} was rebuilt from: Incus may ask its registry again by itself",
+                "arca: auto_update could not be turned off on the image {} was rebuilt from: Incus may ask its registry again by itself until the next sweep",
                 rebuilt.name
             );
         }
+    }
+
+    /// The cached images of the project's store whose own record says they were fetched with a credential, each
+    /// with whether Incus would fetch it again by itself and whether an instance of the project is made from it.
+    pub fn fetched_with_credential(
+        &self,
+        project: &str,
+    ) -> Result<Vec<crate::lifecycle::FetchedImage>, IncusError> {
+        self.changer.fetched_with_credential(project)
+    }
+
+    /// Tells Incus not to go back by itself to where the cached image `fingerprint` came from.
+    pub fn auto_update_off(&self, project: &str, fingerprint: &str) -> Result<(), IncusError> {
+        if !self::fingerprint(fingerprint) {
+            return Err(refused("not an image fingerprint"));
+        }
+        self.changer.image_auto_update_off(project, fingerprint)
     }
 
     /// Deletes a cached image the project's store holds, when no instance of the project was made from it any more.

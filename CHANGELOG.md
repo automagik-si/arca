@@ -40,8 +40,10 @@ node's secret store; no record, proposal, card or journal line holds it. Incus i
 when the image is fetched, and Incus keeps that address with the image for as long as it keeps the image, where
 whoever may use Incus on the machine can read it: so set only a credential that can read, and only what the node
 pulls. A create whose image is fetched that way says so on its card and runs only from an approved proposal; the
-image, and the credential with it, leaves Incus with its last function or service. `docs/OPERATING.md`, "A registry
-that asks for a credential", has the whole of it.
+image, and the credential with it, leaves Incus with its last function or service. Every ten minutes the node looks
+at the images it fetched that way, turns off Incus's own re-fetching of them where it is on, and deletes one that
+nothing has been made from for fifteen minutes; each such step is a line in `registry-images.jsonl`.
+`docs/OPERATING.md`, "A registry that asks for a credential", has the whole of it.
 
 ## 0.13.0 (2026-11-12)
 
