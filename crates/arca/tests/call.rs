@@ -726,6 +726,51 @@ fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
     );
 }
 
+/// A node installed before the installer named its token `assistant-1.secret` keeps its viewer token beside the
+/// config under another name. `arca status` with no flag finds that one, and the first command after an upgrade answers
+/// instead of telling the owner to mint a token. A doctor token beside it is never taken in a viewer's place.
+#[test]
+fn status_on_an_upgraded_node_uses_the_viewer_token_beside_the_config() {
+    let node = start_node("status-upgraded");
+    let home = node.scratch.path("upgraded-home");
+    let dir = home.join(".config/arca");
+    fs::create_dir_all(&dir).expect("the config directory");
+    fs::copy(&node.config, dir.join("node.json")).expect("the config");
+    let copy = |from: &Path, name: &str| {
+        let secret = fs::read_to_string(from).expect("the minted secret");
+        write_mode(&dir.join(name), &secret, 0o600);
+    };
+    copy(&node.doctor, "doctor.secret");
+    // Ordinary files beside it are passed over: a note and a file that holds no token.
+    write_mode(&dir.join("notes.txt"), "not a token\n", 0o600);
+    write_mode(&dir.join("broken.secret"), "not a token\n", 0o600);
+    let status = || {
+        arca()
+            .arg("status")
+            .env("HOME", &home)
+            .output()
+            .expect("run arca")
+    };
+    // A doctor token alone: no viewer is beside the config, so the refusal is the one it always was.
+    let out = status();
+    assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("assistant-1.secret, where the installer writes it, does not exist"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The viewer's token under its older name: status answers.
+    copy(&node.viewer, "viewer.secret");
+    let out = status();
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("Automagik Arca "),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// How long a test waits for `serve` to write its pid file, and for a reload to take effect: generous, since the test
 /// machine may be busy and neither is a judgement of speed.
 const PID_WAIT: Duration = Duration::from_secs(120);
