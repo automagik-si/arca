@@ -153,8 +153,10 @@ impl Rig {
     }
 }
 
+/// A create as a proposal holds it: bound to its template's content, as the node binds it when it is proposed. An
+/// unbound one is never approved.
 fn create_args(name: &str) -> Value {
-    json!({ "name": name, "template": "nats" })
+    json!({ "name": name, "template": "nats", "templateDigest": "ab".repeat(32) })
 }
 
 /// Two identical cards, as the second RTX 4060 Ti will be: the same product string, two PCI addresses.
@@ -206,7 +208,7 @@ fn a_viewer_may_propose_and_nothing_changes() {
     assert!(
         proposed["details"]
             .as_array()
-            .is_some_and(|rows| rows.len() == 2),
+            .is_some_and(|rows| rows.len() == 3),
         "the owner sees every argument"
     );
     assert_eq!(proposed["action"], json!("service_create"));

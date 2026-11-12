@@ -93,6 +93,9 @@ pub enum ActionApprovalError {
     Expired,
     /// The owner's statement or proof was refused.
     Approval(ApprovalRefusal),
+    /// The proposal is a create from the named template that does not bind the template's content: one recorded
+    /// before the node did. It is refused before the approval is checked, so no approval is spent on it.
+    Unbound(String),
     /// The proposals journal could not be read or made durable.
     Store(KernelError),
 }
@@ -350,6 +353,11 @@ impl Kernel {
                 path: ACTION_PROPOSALS_FILE.to_string(),
                 why: "the waiting proposal's digest does not match its arguments".to_string(),
             }));
+        }
+        // A create that binds no template content can never run: it is refused here, before the owner's approval
+        // is checked and its nonce spent.
+        if let Some(template) = action.unbound_template(&proposal.args) {
+            return Err(ActionApprovalError::Unbound(template.to_string()));
         }
         let statement_action = ArcaAction::from_name(&proposal.action).ok_or_else(|| {
             ActionApprovalError::Store(KernelError::Io {

@@ -242,7 +242,8 @@ fn propose(kernel: &Arc<Mutex<Kernel>>) -> String {
         .expect("the kernel lock")
         .propose_action(
             arca::action_proposal::ActionKind::ServiceCreate,
-            json!({ "name": "nats", "template": "nats" }),
+            // Bound, as the node binds a create when it is proposed: an unbound one is never approved.
+            json!({ "name": "nats", "template": "nats", "templateDigest": "ab".repeat(32) }),
             NOW,
             None,
         )

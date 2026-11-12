@@ -1793,6 +1793,15 @@ A token's own `service_create` shows no card and binds nothing, as before. It ma
 itself, and is then refused when the node's template differs. Not part of the fingerprint: why a service is created
 stopped (the card's `Start` row is read from the stored secrets), the node's config, and whatever an image name
 without a digest points at.
+
+A card made before the node bound a template's content (one that waits while the node is upgraded to this version)
+has no `Template content` row. It is refused when its approval is submitted, with "propose it again", and the
+approval is not used: nothing is signed away. That holds for a create and for a database made from the template.
+
+The binding covers the create only. What acts on a service afterwards reads the template as it is installed then:
+`service_connect` (the variables a link gives, and the secrets the template declares), the Omni verbs, and
+`instance_start` when it writes a machine's secrets. Editing a template after a service was created changes what
+those do for it.
 A GPU proposal names an existing Incus instance and the card's PCI address. The kernel resolves the instance's project,
 type and `volatile.uuid` when the proposal is made and puts them in the arguments, so the owner's digest binds them. Only a
 kernel-mode node writes, and only an instance in `kernel.projects` whose own config classifies as a kernel object: a

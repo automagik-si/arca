@@ -216,6 +216,17 @@ impl ActionKind {
         schema
     }
 
+    /// The template of a create whose proposal names no fingerprint of the template's content: a `service_create`,
+    /// or a `postgres_create` made from the node's template, recorded before the node bound it (or by a handler that
+    /// was given no node). Such a proposal is never approved: what its card showed cannot be held to. `None` for
+    /// every other action, and for a database of the old kind, which is made from no template.
+    pub fn unbound_template(self, args: &Value) -> Option<&str> {
+        let template = args.get("template")?.as_str()?;
+        (matches!(self, Self::ServiceCreate | Self::PostgresCreate)
+            && args.get("templateDigest").is_none())
+        .then_some(template)
+    }
+
     /// Checks `args` against the verb's own schema (without `approval`) and the verb's semantic rules, and returns the
     /// normalized arguments the owner will approve.
     ///
