@@ -56,7 +56,7 @@ play_runner() {
       # GitHub wants a newer runner: the runner downloads it and replaces its own bin and externals directories.
       echo "Runner update in progress, do not shutdown runner." >>"$dir/log"
       echo "Downloading 9.999.0 runner" >>"$dir/log"
-      sleep 0.4
+      sleep "${FAKE_UPDATE_SECONDS:-0.4}"
       [ -d "$dir" ] || return
       if [ -n "$tools_mounted" ]; then
         echo "mv: cannot move '/home/runner/externals' to '/home/runner/externals.old': Device or resource busy" >>"$dir/log"

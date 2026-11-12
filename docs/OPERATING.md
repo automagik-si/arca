@@ -3884,15 +3884,24 @@ the pool keeps every class one place under the cap:
   Among classes that have equally many, and among the slots of one class, the places go round-robin.
 - When a class has no runner and every place is held, the pool retires one runner that waits for a job and the class
   gets its place. The runner is one of the class that holds the most places, among the classes that hold two or more.
-  The pool first asks GitHub to take the runner off, and removes it only on GitHub's yes: GitHub refuses that for a
-  runner that has a job, so a job that reached the runner in that moment is kept and runs to its end.
+  The pool first asks GitHub to take the runner off, and removes it only on GitHub's yes. What GitHub was seen to
+  answer, for an organisation's runners:
+
+  - A refusal for a runner that is running a job (status 422, "is currently running a job and cannot be deleted").
+    So a job that reached the runner in that moment is kept and runs to its end.
+  - Yes (204) for every other runner, also for one it no longer has or never had. A just-in-time runner that took a
+    job and ended it in that moment is one it no longer has. So after a yes the pool reads the runner's own output:
+    a runner that has taken a job is left to end, its job is recorded as every job is, and it is not called retired.
+
+  Every other answer retires nothing, a 404 as well: GitHub does not answer 404 for a runner that is gone, so a 404
+  says the request did not reach the runner, and GitHub may still hold it and hand it a job.
 
 What this is not:
 
 - It is not a cap on running jobs, and it promises no job a start time. A just-in-time runner cannot be told to wait:
   every registered runner may take a job at any moment. A runner that has a job is never retired, and neither is a
-  class's only runner. So when every runner that could give its place up is at work, the class waits until a job
-  ends.
+  class's only runner, nor one that is updating itself. So when every runner that could give its place up is at
+  work, the class waits until a job ends.
 - A place is not memory. A slot still starts only when its whole memory fits (above), and the pool retires nothing
   for a class whose slot would still lack its memory.
 - It is one place a class, not a share. Beyond that one place, the busiest classes can hold all the others.
@@ -3980,8 +3989,10 @@ does about it: which slot gives up its idle runner's place, or, as a `WARNING`, 
 two or more places has a runner that waits for a job, or the class's slot would still lack its memory. Each retired
 runner is one line of its own (`slot 0 (standard): its idle runner is retired and its place goes to class large,
 ...`), and so is a runner that GitHub kept because it had a job. If GitHub answers the request to take a runner off
-with an error, or not at all, nothing is retired: the pool says GitHub's answer once, keeps it in the class's line,
-and asks again every few seconds. A runner GitHub no longer has is cleaned up, and its place is free. The last ten
+with anything but its yes or that refusal (a 5xx, 401, 403 or 404), or not at all, nothing is retired: the pool says
+GitHub's answer once, keeps it in the class's line, and asks again after a pause that starts at five seconds and
+doubles up to five minutes. If the runner then stops because GitHub had taken it off after all, the pool says so and
+counts no failure. The last ten
 finished jobs are repeated in every block (`recent job`), so `service_logs` still reaches them after many blocks. All
 job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish
 time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name. Past 4MiB (some

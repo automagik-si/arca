@@ -602,7 +602,7 @@ slot_cycle() {
   local slot=$1
   local class=${SLOT_CLASS[$slot]} dir runner daemon slice token name body jit runner_id tries state code
   local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' home=() lines
-  local retired=''
+  local retired='' asked=''
   ABORT=''
   # The controller's own flag is not the slot's: a slot begun as the controller is told to stop would find it set, and
   # none of its pauses would be taken until the controller's signal reached it.
@@ -733,7 +733,7 @@ slot_cycle() {
       [ -n "$busy_since" ] || set_state "$slot" idle "$name"
     fi
     # The controller asks a runner that waits for a job to give its place to a class that has none.
-    if [ -e "$POOL_RUN/retire/$slot" ] && slot_retire "$slot" "$runner_id" "$runner" "$busy_since"; then
+    if [ -e "$POOL_RUN/retire/$slot" ] && slot_retire "$slot" "$runner_id" "$runner" "$busy_since" "$updating"; then
       retired=1
       break
     fi
@@ -741,7 +741,7 @@ slot_cycle() {
   done
 
   if [ -n "$retired" ]; then
-    # GitHub has taken the runner off, or no longer had it: it ran no job and is cleaned up as one that ended.
+    # GitHub has taken the runner off, or no longer had it: it took no job and is cleaned up as one that ended.
     slot_reap "$slot"
     return 0
   fi
@@ -784,6 +784,13 @@ slot_cycle() {
   else
     slot_reap "$slot"
     slot_abandon "$slot" "$runner_id"
+    if [ -n "$asked" ]; then
+      # GitHub was asked to take this runner off and its answer was lost or said nothing (slot_retire). GitHub can
+      # have taken it off all the same, and the runner then stops like this. That is no failure of the pool: nothing
+      # is counted, no slot pauses, and the runners keep their layered files.
+      say "slot $slot ($class): its runner stopped (exit $code) before it took a job, after GitHub was asked to take it off and gave no clear answer. It is taken as retired: its place is free, and it is not counted as a failure"
+      return 0
+    fi
     case $updating in
       1)
         slot_failed "$slot" "its runner stopped (exit $code) while it was updating itself, before it took a job"
@@ -805,51 +812,58 @@ slot_cycle() {
 
 # Gives up the place of a runner that waits for a job, when the controller asks for it (give_a_place). That a runner
 # is idle is read at one moment and its container is removed at another, and GitHub can hand it a job in between. So
-# GitHub is asked first to take the registration off: it refuses that for a runner that has a job (422), and after its
-# yes the runner gets none. Only then is the place given up. What came of it is written for the controller:
-# - `retired`: GitHub took the runner off. Returns 0, and the slot ends.
-# - `gone`: GitHub no longer had the runner (404) and it ran no job. Returns 0, and the slot ends the same way.
-# - `job`: the runner has a job, or has had its one job: the slot has seen it take one, or GitHub says so. It is kept
-#   and is not asked again.
-# - `error` and words: GitHub could not be asked, or answered something else. The runner is kept and may be asked again.
+# GitHub is asked first to take the registration off, and the container is removed only on its yes. What the real
+# service was seen to answer, at an organisation:
+# - 422 for a runner that is running a job. It is kept.
+# - 204 for every other runner: one that waits for a job, and also one GitHub no longer has or never had. So its yes
+#   is not yet a retirement: a just-in-time runner that took a job and ended it while this was asked has been removed
+#   by GitHub itself, and the answer is the same 204. The runner's own output tells the two apart, and it is read
+#   after the answer: a runner that has taken a job is left to end, so its job is recorded as every job is.
+# After a yes for a runner that has taken no job, the runner gets none, and only then is its place given up.
+# Every other answer is no yes, a 404 too: GitHub does not answer 404 for a runner that is gone, so a 404 says that
+# the request did not reach the runner (a credential that no longer sees it, the address), and GitHub may still hold
+# the registration and hand it a job. No answer's text is read, only its status.
+# What came of it is written for the controller:
+# - `retired`: GitHub took the runner off, or no longer had it, and it took no job. Returns 0, and the slot ends.
+# - `job`: the runner has a job, or has had its one job: the slot has seen it take one, GitHub says so, or its output
+#   shows one after GitHub's yes. It is kept and is not asked again.
+# - `kept`: GitHub is not asked, and the runner is not asked again: it is replacing its own files (GitHub tells a
+#   runner to update itself before it takes a job), or GitHub gave no id for it, and a request without one names no
+#   runner.
+# - `error` and words: GitHub could not be asked, or answered something else. The runner is kept and may be asked
+#   again. When the request went out, $asked is set for the slot: GitHub can have acted on a request whose answer
+#   was lost.
 slot_retire() {
-  local slot=$1 runner_id=$2 runner=$3 busy=$4 class=${SLOT_CLASS[$1]} for_class answer
+  local slot=$1 runner_id=$2 runner=$3 busy=$4 updating=$5 class=${SLOT_CLASS[$1]} for_class answer
   for_class=$(cat "$POOL_RUN/retire/$slot" 2>/dev/null)
   if [ -n "$busy" ]; then
     answer=job
+  elif [ "$updating" = 1 ] || [ -z "$runner_id" ] || [ -n "${runner_id//[0-9]/}" ]; then
+    answer=kept
   elif ! github_token; then
     answer="error GitHub sign-in failed: $TOKEN_ERROR"
   elif api DELETE "$SCOPE/actions/runners/$runner_id" "$TOKEN"; then
-    answer=retired
-    say "slot $slot ($class): its idle runner is retired and its place goes to class $for_class, which had no runner while every place under the cap of $MAX_SLOTS was held"
+    if [[ $(docker logs "$runner" 2>&1) == *'Running job: '* ]]; then
+      answer=job
+    else
+      answer=retired
+      say "slot $slot ($class): its idle runner is retired and its place goes to class $for_class, which had no runner while every place under the cap of $MAX_SLOTS was held"
+    fi
+  elif [ "$API_CODE" = 422 ]; then
+    answer=job
+    say "slot $slot ($class): its runner is kept: it was asked to give its place to class $for_class, and GitHub says it has a job ($API_ERROR)"
   else
-    case $API_CODE in
-      422)
-        answer=job
-        say "slot $slot ($class): its runner is kept: it was asked to give its place to class $for_class, and GitHub says it has a job ($API_ERROR)"
-        ;;
-      404)
-        # GitHub removes a runner that has ended its one job, too: that one is left to end and be recorded.
-        if [[ $(docker logs "$runner" 2>&1) == *'Running job: '* ]]; then
-          answer=job
-        else
-          answer=gone
-          say "slot $slot ($class): GitHub no longer has its runner, which took no job: it is cleaned up and its place goes to class $for_class"
-        fi
-        ;;
-      *)
-        # A token GitHub no longer takes is not kept.
-        [ "$API_CODE" != 401 ] || rm -f "$POOL_RUN/token"
-        answer="error $API_ERROR"
-        ;;
-    esac
+    # A token GitHub no longer takes is not kept.
+    [ "$API_CODE" != 401 ] || rm -f "$POOL_RUN/token"
+    asked=1
+    answer="error $API_ERROR"
   fi
   TOKEN=''
   rm -f "$API_OUT"
   printf '%s\n' "$answer" >"$POOL_RUN/retire/$slot.answer.new" &&
     mv "$POOL_RUN/retire/$slot.answer.new" "$POOL_RUN/retire/$slot.answer"
   rm -f "$POOL_RUN/retire/$slot"
-  case $answer in retired | gone) return 0 ;; esac
+  [ "$answer" != retired ] || return 0
   return 1
 }
 
@@ -1185,7 +1199,8 @@ next_slot() {
 # the class that holds the most places among the classes that hold two or more and have an idle runner: never a
 # class's only runner, or the two classes would trade the place at every pass. Nothing is asked while the place is not
 # the one thing the class lacks: while no runner can be registered at all, or when the class's slot would still not
-# have its memory with the idle runner gone. A runner would then be retired at every pass, for nothing.
+# have its memory with the idle runner gone. A runner would then be retired at every pass, for nothing. After an
+# answer of GitHub's that was neither yes nor no, the next runner is asked after a pause.
 give_a_place() {
   local c s phase rest answer names='' waiting=() want='' give='' most=1 need error='' last=''
   if [ -n "$RETIRING" ]; then
@@ -1193,21 +1208,32 @@ give_a_place() {
       # It has ended: retired, or by itself.
       RETIRING=''
       RETIRE_ERROR=''
+      RETIRE_PAUSE=0
     elif answer=$(cat "$POOL_RUN/retire/$RETIRING.answer" 2>/dev/null) && [ -n "$answer" ]; then
       case $answer in
-        job)
+        job | kept)
           rm -f "$POOL_RUN/retire/$RETIRING.answer"
           KEPT[RETIRING]=1
           RETIRING=''
           RETIRE_ERROR=''
+          RETIRE_PAUSE=0
           ;;
         'error '*)
+          # The next runner is asked after a pause that grows as the pause after a failed registration does: five
+          # seconds, then twice as long each time, up to POOL_BACKOFF_MAX. It is this request's own pause: no slot
+          # waits for it.
           rm -f "$POOL_RUN/retire/$RETIRING.answer"
           error=${answer#error }
           RETIRING=''
+          RETIRE_PAUSE=$((RETIRE_PAUSE == 0 ? 5 : RETIRE_PAUSE * 2))
+          [ "$RETIRE_PAUSE" -le "$POOL_BACKOFF_MAX" ] || RETIRE_PAUSE=$POOL_BACKOFF_MAX
+          RETIRE_AFTER=$((at + RETIRE_PAUSE))
           ;;
-        # Retired, or gone from GitHub: the slot is cleaning up, and its place is free when it has ended.
-        *) RETIRE_ERROR='' ;;
+        # Retired: the slot is cleaning up, and its place is free when it has ended.
+        *)
+          RETIRE_ERROR=''
+          RETIRE_PAUSE=0
+          ;;
       esac
     fi
   fi
@@ -1221,13 +1247,14 @@ give_a_place() {
   fi
   if [ ${#waiting[@]} = 0 ]; then
     RETIRE_ERROR=''
+    RETIRE_PAUSE=0
     return 0
   fi
   names="class $names: no runner, and every place under the cap of $MAX_SLOTS is held"
   if [ -n "$error" ] && [ "$error" != "$RETIRE_ERROR" ]; then
     # Said once, and kept for the status block: the next pass asks again.
     RETIRE_ERROR=$error
-    say "$names. An idle runner was asked to give its place up and is kept, because GitHub did not take it off: $error. It is asked again"
+    say "$names. An idle runner was asked to give its place up and is kept, because GitHub did not take it off: $error. One is asked again after a pause, of $RETIRE_PAUSE seconds now"
   fi
   [ -z "$RETIRE_ERROR" ] || last=". The last time one was asked, GitHub did not take the runner off: $RETIRE_ERROR"
   if [ -n "$RETIRING" ]; then
@@ -1236,6 +1263,10 @@ give_a_place() {
   fi
   if [ -z "$(credential_kind)" ] || [ -n "$GROUP_HOLD" ] || [ "$until_at" -gt "$at" ]; then
     CLASS_NOTE="$names. No idle runner is retired for it while no new runner can be registered (the slots' own lines say why)"
+    return 0
+  fi
+  if [ "$RETIRE_PAUSE" != 0 ] && [ "$at" -lt "$RETIRE_AFTER" ]; then
+    CLASS_NOTE="$names. An idle runner is asked again in $((RETIRE_AFTER - at))s$last"
     return 0
   fi
   for ((c = 0; c < CLASSES; c++)); do
@@ -1386,11 +1417,13 @@ run_pool() {
 
   PIDS=()
   WAIT=()
-  # The slot whose idle runner is asked to give its place up, when one is; the slots whose runner GitHub kept because
-  # it has a job; and what GitHub last answered when it did not take a runner off.
+  # The slot whose idle runner is asked to give its place up, when one is; the slots whose runner is not asked again;
+  # what GitHub last answered when it did not take a runner off, and the pause before the next one is asked.
   RETIRING=''
   KEPT=()
   RETIRE_ERROR=''
+  RETIRE_PAUSE=0
+  RETIRE_AFTER=0
   local slot live reserved pending available next=0 first n last_status=0 until_at at class_live=() round=()
   while [ -z "$STOP" ]; do
     live=0

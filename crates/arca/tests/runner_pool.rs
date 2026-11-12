@@ -124,9 +124,14 @@ struct State {
     /// Whether every request to take a runner off is kept the same way.
     hold_deletes: bool,
     /// What GitHub answers to every request to take a runner off, instead of doing it, while the test says so: a
-    /// status GitHub can answer when it is not well (500) or does not take the credential (401, 403), or 404, for a
-    /// runner it has removed by itself.
+    /// status GitHub can answer when it is not well (500), does not take the credential (401, 403), or does not find
+    /// what the request names (404: the real service does not answer that for a runner that is gone).
     delete_answer: Option<u16>,
+    /// Whether the next such request is carried out all the same: GitHub takes the runner off and its answer is lost.
+    /// Once.
+    delete_acts: bool,
+    /// Whether a runner is registered without its id in the answer, as no real GitHub does.
+    register_without_id: bool,
     held: usize,
     passed: usize,
     /// A request was kept so long that it was answered without the test's word: the test was too slow, not the pool.
@@ -719,6 +724,12 @@ fn answer(
             connected: false,
             updated: false,
         });
+        if state.register_without_id {
+            return (
+                201,
+                Some(json!({ "runner": { "name": name }, "encoded_jit_config": jit })),
+            );
+        }
         return (
             201,
             Some(json!({ "runner": { "id": id, "name": name }, "encoded_jit_config": jit })),
@@ -741,34 +752,40 @@ fn answer(
             .strip_prefix(&format!("{runners}/"))
             .and_then(|id| id.parse::<u64>().ok())
     {
-        let forced = state.delete_answer;
-        return match state.runners.iter_mut().find(|runner| runner.id == id) {
-            // GitHub has removed the runner by itself: it has none of that id any more.
-            Some(runner) if forced == Some(404) => {
+        // What the real service was seen to answer: 422 for a runner that is running a job, and 204 for every
+        // other id, whether it took the runner off with this request, had removed it before (a just-in-time runner
+        // that has ended its one job, or one taken off already), or never had it. It does not answer 404 here.
+        if state.delete_acts {
+            state.delete_acts = false;
+            state.delete_answer = None;
+            if let Some(runner) = state.runners.iter_mut().find(|runner| runner.id == id) {
                 runner.deleted = true;
-                message(404, "Not Found")
             }
-            Some(_) if forced == Some(500) => message(500, "Server Error"),
-            Some(_) if forced == Some(401) => message(401, "Bad credentials"),
-            Some(_) if forced == Some(403) => {
-                message(403, "Resource not accessible by integration")
-            }
-            Some(_) if forced.is_some() => panic!("the fake GitHub has no such answer: {forced:?}"),
-            // GitHub does not take off a runner that has a job, and says so with this status and these words.
-            Some(runner) if runner.jobs > 0 && !runner.done => message(
-                422,
-                &format!(
-                    "Bad request - Runner \"{}\" is still running a job",
-                    runner.name
+            return message(500, "Server Error");
+        }
+        return match state.delete_answer {
+            Some(404) => message(404, "Not Found"),
+            Some(500) => message(500, "Server Error"),
+            Some(401) => message(401, "Bad credentials"),
+            Some(403) => message(403, "Resource not accessible by integration"),
+            Some(other) => panic!("the fake GitHub has no such answer: {other}"),
+            None => match state.runners.iter_mut().find(|runner| runner.id == id) {
+                Some(runner) if runner.jobs > 0 && !runner.done => message(
+                    422,
+                    &format!(
+                        "Bad request - Runner {} is currently running a job and cannot be deleted.",
+                        runner.name
+                    ),
                 ),
-            ),
-            // An ephemeral runner that has ended its one job is no longer on GitHub.
-            Some(runner) if runner.done => message(404, "Not Found"),
-            Some(runner) => {
-                runner.deleted = true;
-                (204, None)
-            }
-            None => message(404, "Not Found"),
+                Some(runner) => {
+                    // One that has ended its job is gone already: nothing is taken off.
+                    if !runner.done {
+                        runner.deleted = true;
+                    }
+                    (204, None)
+                }
+                None => (204, None),
+            },
         };
     }
     message(404, "Not Found")
@@ -3480,64 +3497,93 @@ fn a_runner_that_takes_a_job_as_it_is_asked_to_give_its_place_up_keeps_its_job()
     let _ = fs::remove_dir_all(scratch);
 }
 
-/// GitHub answers that it has no such runner: it removed the runner by itself, so the runner will never get a job.
-/// The slot is cleaned up as one whose runner ended, its place is free, and it is no failure of the pool.
+/// GitHub's yes is not yet a retirement. It answers 204 also for a runner it no longer has, and it removes a
+/// just-in-time runner that has ended its one job: a runner that took a job and ended it while it was asked to give
+/// its place up gets the same 204 as one that was taken off. The pool reads the runner's own output after the
+/// answer: the job is recorded as every job is, and nothing is called a retirement.
 #[test]
-fn a_runner_github_no_longer_has_is_cleaned_up_and_its_place_is_free() {
+fn a_runner_that_ended_its_job_while_it_was_asked_has_its_job_recorded_and_is_not_retired() {
     let scratch = scratch_dir();
     let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
     github.state().tokens.push(PAT.to_string());
     let mut pool = pool_whose_large_class_has_no_place(&github, &[class_of("small", "4GiB", 2)], 2);
-    github.state().delete_answer = Some(404);
+    // GitHub keeps the request to take a runner off, and meanwhile both runners take a short job and end it.
+    github.state().hold_deletes = true;
     pool.memory(64 * GIB, 60 * GIB);
+    wait_for(&pool, "the request to take a runner off", || {
+        github.held() == 1
+    });
+    github.queue(&["arca-small"], "ended in between", 0.3);
+    github.queue(&["arca-small"], "ended in between too", 0.3);
+    wait_for(&pool, "both jobs ended on GitHub", || {
+        github.state().finished.len() == 2
+    });
+    github.release();
+
+    // Both jobs are in the pool's record, the one of the runner that was asked among them.
+    wait_for(&pool, "both jobs in the pool's record", || {
+        pool.jobs().len() == 2
+    });
+    let mut ran: Vec<(String, String)> = pool
+        .jobs()
+        .iter()
+        .map(|job| (job[1].clone(), job[5].clone()))
+        .collect();
+    ran.sort();
+    assert_eq!(
+        ran,
+        [
+            ("0".to_string(), "Succeeded".to_string()),
+            ("1".to_string(), "Succeeded".to_string())
+        ]
+    );
     wait_for(&pool, "a runner of the large class", || {
         live_of(&github, "large") == 1
     });
-    github.state().delete_answer = None;
-    let gone = "arca-runner-pool: slot 0 (small): GitHub no longer has its runner, which took no job: it is cleaned \
-                up and its place goes to class large\n";
-    assert!(pool.output().contains(gone), "{}", pool.output());
-    assert_eq!(github.deletes().len(), 1, "{}", pool.output());
-    assert!(
-        !pool
-            .containers()
-            .iter()
-            .any(|name| name.starts_with("pool1-s0-"))
-    );
-    assert_eq!(live_of(&github, "small"), 1);
-    wait_for(&pool, "a status with both classes served", || {
-        let status = pool.read("logs/status.txt");
-        status.contains("slot 2 large 8192MiB/2cpu idle ")
-            && !status.contains("class large: no runner")
+    wait_for(&pool, "both jobs counted", || {
+        totals(&pool).contains(" jobs_done=2 ")
     });
+    // GitHub was asked, answered yes, and took nothing off; the pool called nothing a retirement or a failure.
+    assert!(!github.deletes().is_empty(), "{}", pool.output());
+    assert!(github.state().runners.iter().all(|runner| !runner.deleted));
+    assert!(
+        !pool.output().contains("retired and its place"),
+        "{}",
+        pool.output()
+    );
     assert!(totals(&pool).contains(" failures=0 "), "{}", totals(&pool));
-    assert!(!pool.output().contains("failed"), "{}", pool.output());
     assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
 }
 
-/// GitHub answers neither yes nor no to taking a runner off: it is not well (500), or it does not take the
-/// credential (403, 401). Nothing is retired: the runner stays registered and may take a job. The pool says so once
-/// for each answer, keeps it in the status, and asks again at every pass until GitHub answers.
+/// GitHub answers neither yes nor no to taking a runner off: it is not well (500), it does not take the credential
+/// (403, 401), or it does not find what the request names (404). A 404 is no "gone": the real service answers 204
+/// for a runner that is gone, so a 404 says the request did not reach the runner, and GitHub may still hold it.
+/// Nothing is retired: the runner stays registered and may take a job. The pool says so once for each answer, keeps
+/// it in the status, and asks again after a pause until GitHub answers.
 #[test]
-fn an_answer_that_is_neither_yes_nor_no_retires_nothing_is_said_once_and_is_asked_again() {
+fn an_answer_that_is_neither_yes_nor_no_retires_nothing_is_said_once_and_is_asked_again_after_a_pause()
+ {
     let scratch = scratch_dir();
     let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
     github.state().tokens.push(PAT.to_string());
     let mut pool = pool_whose_large_class_has_no_place(&github, &[class_of("small", "4GiB", 2)], 2);
+    // The pause is the pool's longest after a failure, which is one second in these tests.
     let said = |answer: &str| {
         format!(
             "arca-runner-pool: class large: no runner, and every place under the cap of 2 is held. An idle runner \
              was asked to give its place up and is kept, because GitHub did not take it off: GitHub answered \
-             {answer}. It is asked again\n"
+             {answer}. One is asked again after a pause, of 1 seconds now\n"
         )
     };
-    let mut asked = 0;
-    for (code, answer) in [
+    let answers = [
         (500, "500 (Server Error)"),
+        (404, "404 (Not Found)"),
         (403, "403 (Resource not accessible by integration)"),
         (401, "401 (Bad credentials)"),
-    ] {
+    ];
+    for (code, answer) in answers {
+        let asked = github.deletes().len();
         github.state().delete_answer = Some(code);
         if code == 500 {
             pool.memory(64 * GIB, 60 * GIB);
@@ -3545,19 +3591,27 @@ fn an_answer_that_is_neither_yes_nor_no_retires_nothing_is_said_once_and_is_aske
         wait_for(&pool, "the line that says the runner is kept", || {
             pool.output().contains(&said(answer))
         });
-        // It is asked again at every pass, and the answer is not said again.
-        wait_for(&pool, "three more requests", || {
-            github.deletes().len() >= asked + 3
+        // It is asked again, with a pause between: four requests in a row take more than two seconds. Without the
+        // pause one went out at every pass, some five a second here.
+        wait_for(&pool, "four requests", || {
+            github.deletes().len() >= asked + 4
         });
-        asked = github.deletes().len();
+        let times: Vec<Instant> = github.deletes()[asked..asked + 4]
+            .iter()
+            .map(|seen| seen.at)
+            .collect();
+        assert!(
+            times[3].duration_since(times[0]) > Duration::from_secs(2),
+            "four requests within {:?}",
+            times[3].duration_since(times[0])
+        );
         let last = format!(
-            "arca-runner-pool: class large: no runner, and every place under the cap of 2 is held. Slot 0 (small) \
-             gives up its idle runner's place for it. The last time one was asked, GitHub did not take the runner \
-             off: GitHub answered {answer}\n"
+            "The last time one was asked, GitHub did not take the runner off: GitHub answered {answer}\n"
         );
         wait_for(&pool, "the answer in a status block", || {
             pool.read("logs/status.txt").contains(&last)
         });
+        // The answer is not said again.
         assert_eq!(
             pool.output().matches(&said(answer)).count(),
             1,
@@ -3569,6 +3623,7 @@ fn an_answer_that_is_neither_yes_nor_no_retires_nothing_is_said_once_and_is_aske
         assert_eq!(live_of(&github, "large"), 0);
         assert!(github.state().runners.iter().all(|runner| !runner.deleted));
         assert!(totals(&pool).contains(" idle=2 "), "{}", totals(&pool));
+        assert_eq!(pool.containers().len(), 4, "{:?}", pool.containers());
     }
     // GitHub answers again: the runner is retired and the class has its place.
     github.state().delete_answer = None;
@@ -3581,11 +3636,7 @@ fn an_answer_that_is_neither_yes_nor_no_retires_nothing_is_said_once_and_is_aske
         "{}",
         pool.output()
     );
-    for answer in [
-        "500 (Server Error)",
-        "403 (Resource not accessible by integration)",
-        "401 (Bad credentials)",
-    ] {
+    for (_, answer) in answers {
         assert_eq!(
             pool.output().matches(&said(answer)).count(),
             1,
@@ -3593,6 +3644,177 @@ fn an_answer_that_is_neither_yes_nor_no_retires_nothing_is_said_once_and_is_aske
             pool.output()
         );
     }
+    // None of it was a failure of the pool.
+    assert!(totals(&pool).contains(" failures=0 "), "{}", totals(&pool));
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// Nothing is retired while no new runner can be registered: without a credential, during the pause after a failure,
+/// and while the runner group is refused. The class would not get the place the runner gave up. The status says so,
+/// and GitHub is not asked; when the last of the three is over, the runner is retired.
+#[test]
+fn no_runner_is_retired_while_no_new_runner_can_be_registered() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    let mut pool = pool_whose_large_class_has_no_place(&github, &[class_of("small", "4GiB", 2)], 2);
+    let note = "arca-runner-pool: class large: no runner, and every place under the cap of 2 is held. No idle runner \
+                is retired for it while no new runner can be registered (the slots' own lines say why)\n";
+    // Two more status blocks with the note, written after `from`: the controller has made its passes meanwhile.
+    let two_more_blocks = |pool: &Pool, what: &str| {
+        let from = pool.output().matches(note).count();
+        wait_for(pool, what, || {
+            pool.output().matches(note).count() >= from + 2
+        });
+    };
+
+    // No credential.
+    fs::remove_file(pool.dir.join("secrets/GITHUB_TOKEN")).expect("the secret taken away");
+    pool.memory(64 * GIB, 60 * GIB);
+    two_more_blocks(&pool, "the status without a credential");
+    assert!(github.deletes().is_empty(), "{}", pool.output());
+
+    // The pause after a failure: it is written where a failed slot writes it, an hour long.
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the time")
+        .as_secs()
+        + 3600;
+    fs::write(pool.dir.join("run/backoff-until"), format!("{later}\n")).expect("the pause");
+    pool.secret("GITHUB_TOKEN", PAT);
+    wait_for(&pool, "the slot that says it pauses", || {
+        pool.read("logs/status.txt")
+            .contains("slot 2 large 8192MiB/2cpu queued (pausing ")
+    });
+    two_more_blocks(&pool, "the status during the pause");
+    assert!(github.deletes().is_empty(), "{}", pool.output());
+
+    // The runner group is refused.
+    github.state().groups[1].default = true;
+    wait_for(&pool, "the group refused", || {
+        pool.read("logs/status.txt")
+            .contains("REFUSED: runner group 7 \"arca pool\" is the organisation's default group")
+    });
+    fs::remove_file(pool.dir.join("run/backoff-until")).expect("the pause over");
+    wait_for(&pool, "the slot that says it is held", || {
+        pool.read("logs/status.txt")
+            .contains("slot 2 large 8192MiB/2cpu queued (held: ")
+    });
+    two_more_blocks(&pool, "the status while the group is refused");
+    assert!(github.deletes().is_empty(), "{}", pool.output());
+    assert_eq!(live_of(&github, "small"), 2);
+
+    // All three are over: the runner is retired and the class has its place.
+    github.state().groups[1].default = false;
+    wait_for(&pool, "a runner of the large class", || {
+        live_of(&github, "large") == 1
+    });
+    assert_eq!(github.deletes().len(), 1, "{}", pool.output());
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// GitHub takes the runner off and its answer is lost: the pool hears an error, keeps the runner, and the runner,
+/// gone from GitHub, stops. That is not a failure of the pool: nothing is counted, no slot pauses, the runners keep
+/// their layered files, and the class gets the place.
+#[test]
+fn a_runner_that_stops_after_a_lost_answer_is_taken_as_retired_and_is_no_failure() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    // The pause before the next runner is asked is the pool's own five seconds here, not these tests' one: the slot
+    // sees its runner stopped long before. (With one second the next request can come first; GitHub then answers
+    // yes for the runner it no longer has, and the slot is retired the usual way, which is as good and says another
+    // line.)
+    let mut pool = pool_whose_large_class_has_no_place_with(
+        &github,
+        &[class_of("small", "4GiB", 2)],
+        2,
+        &[("POOL_BACKOFF_MAX", "300")],
+    );
+    github.state().delete_acts = true;
+    pool.memory(64 * GIB, 60 * GIB);
+    wait_for(&pool, "a runner of the large class", || {
+        live_of(&github, "large") == 1
+    });
+    let taken = "arca-runner-pool: slot 0 (small): its runner stopped (exit 1) before it took a job, after GitHub was \
+                 asked to take it off and gave no clear answer. It is taken as retired: its place is free, and it is \
+                 not counted as a failure\n";
+    assert!(pool.output().contains(taken), "{}", pool.output());
+    wait_for(&pool, "a status with both classes served", || {
+        let status = pool.read("logs/status.txt");
+        status.contains("slot 2 large 8192MiB/2cpu idle ")
+            && !status.contains("class large: no runner")
+    });
+    assert!(totals(&pool).contains(" failures=0 "), "{}", totals(&pool));
+    let output = pool.output();
+    assert!(
+        !output.contains("Slots start again") && !output.contains("image's own files"),
+        "{output}"
+    );
+    // The one runner GitHub took off is the only one that went: no second runner was asked for the class.
+    assert_eq!(
+        github
+            .state()
+            .runners
+            .iter()
+            .filter(|runner| runner.deleted)
+            .count(),
+        1,
+        "{output}"
+    );
+    assert_eq!(live_of(&github, "small"), 1);
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// A request to take a runner off names the runner by its id. A runner GitHub gave no id for is never asked: a
+/// request without an id names no runner, and nobody knows what it would do.
+#[test]
+fn a_runner_without_an_id_is_never_asked_of_github() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    github.state().register_without_id = true;
+    let mut pool = pool_whose_large_class_has_no_place(&github, &[class_of("small", "4GiB", 2)], 2);
+    pool.memory(64 * GIB, 60 * GIB);
+    // Both runners are kept, so the class waits.
+    let waits = "arca-runner-pool: WARNING: class large: no runner, and every place under the cap of 2 is held, and \
+                 no class that holds two or more has a runner that waits for a job.";
+    wait_for(&pool, "the status that says the class waits", || {
+        pool.read("logs/status.txt").contains(waits)
+    });
+    assert!(github.deletes().is_empty(), "{:?}", github.deletes());
+    assert_eq!(live_of(&github, "small"), 2);
+    // Read before the stop, which finds no id either and asks nothing.
+    assert_eq!(pool.stop(), Some(0));
+    assert!(github.deletes().is_empty(), "{:?}", github.deletes());
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// A runner that is replacing its own files is not asked of GitHub: GitHub tells a runner to update itself before it
+/// takes a job. The controller asks only slots it reads as idle, but a slot can find the request and the update in
+/// the same look; this test writes the request as the controller would, while the runner updates.
+#[test]
+fn a_runner_that_is_updating_itself_is_kept_and_github_is_not_asked() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().update_required = true;
+    let mut pool = one_slot_pool(&github, |_| {});
+    pool.env.push(("FAKE_UPDATE_SECONDS", "5".to_string()));
+    pool.start(&github);
+    wait_for(&pool, "the runner updating itself", || {
+        pool.read("logs/status.txt")
+            .contains("slot 0 small 4096MiB/2cpu updating ")
+    });
+    fs::write(pool.dir.join("run/retire/0"), "large\n").expect("the request");
+    wait_for(&pool, "the slot's answer", || {
+        !pool.read("run/retire/0.answer").is_empty()
+    });
+    assert_eq!(pool.read("run/retire/0.answer"), "kept\n");
+    assert!(github.deletes().is_empty(), "{:?}", github.deletes());
+    assert_eq!(github.live().len(), 1);
     assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
 }
