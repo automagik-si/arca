@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
+removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
+what to propose it now reads the tenants (with what each instance uses and the deploy it came from) and the functions
+with their newest runs. A removal of a tenant, a deploy or a function deletes data or secrets for good, so its card and
+its Approve button are drawn in the alert colour.
+
 The metrics sampler no longer reads the listing of every instance with its live state each tick. On a node where one
 running virtual machine's guest agent is slow, that listing took up to its 10 second deadline, so a tick often had no
 instance readings at all, and it slowed every service create made at the same time. Each tick now lists the instances

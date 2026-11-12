@@ -1827,12 +1827,12 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of seventeen gated service,
-database, GPU, storage, snapshot or instance verbs: `service_create`, `service_remove`, `service_import`, `service_release`
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-two gated service,
+database, GPU, storage, snapshot, instance, function or tenant verbs: `service_create`, `service_remove`, `service_import`, `service_release`
 (see [Importing a service another manager created](#importing-a-service-another-manager-created)), `service_publish`, `service_unpublish`,
 `service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create`,
 `snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`, `instance_stop` or
-`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `function_create` and `function_remove` (see [Functions](#functions)) are proposed the same way. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and `deploy_remove` (see [Tenants](#tenants)), are proposed the same way. The canvas Doctor proposes all twenty-two; it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
 the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses the image the node's `postgres-autopg`
 template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is

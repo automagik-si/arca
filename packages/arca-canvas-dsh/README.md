@@ -301,21 +301,29 @@ the Doctor message that proposed it. A delete plan keeps the count-and-link card
 to the configured `approvalUrl`. When `journal_list` is unavailable Steps says so
 without fabricating activity.
 
-The Doctor has the ten read-only Arca tools (`arca_status`, `watch_report`,
+The Doctor has the fifteen read-only Arca tools (`arca_status`, `watch_report`,
 `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`, `journal_list`,
-`service_list`, `storage_list`, `snapshot_list`) plus one non-read tool,
+`service_list`, `storage_list`, `snapshot_list`, `tenant_list`, `tenant_status`,
+`tenant_usage`, `function_list`, `function_runs`) plus one non-read tool,
 `arca_propose`. `arca_propose` calls the kernel's `action_propose` viewer verb and
-records an inert proposal for one of seventeen actions (`service_create`,
+records an inert proposal for one of twenty-two actions (`service_create`,
 `service_remove`, `service_import`, `service_release`, `service_publish`,
 `service_unpublish`, `service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`,
 `storage_add`, `snapshot_create`, `snapshot_delete`, `instance_start`,
-`instance_stop`, `instance_restart`); it changes nothing and a
+`instance_stop`, `instance_restart`, `tenant_create`, `tenant_remove`,
+`deploy_remove`, `function_create`, `function_remove`); it changes nothing and a
 database delete cannot be proposed. `service_import` and `service_release` take
 `{name}`: an import takes over, where it stands, a service another manager
 created, and a release gives it back. The three instance actions take
 `{project, instance}` and only for an instance Arca owns or has adopted; a stop
 and a restart are graceful, and their cards wait up to 180 seconds for the
-kernel's answer. A `storage_add` card for a whole disk always
+kernel's answer. `tenant_status` and `tenant_usage` take a tenant's `id`, and
+`function_runs` a function's `name` (with an optional `limit` of at most 100 or
+one `run`); each read sends the kernel only those. `tenant_usage` names the
+deploy each instance came from, which is what a `deploy_remove {tenant, deploy}`
+needs. The cards of `tenant_remove`, `deploy_remove` and `function_remove` delete
+data or secrets for good and are drawn in the alert colour (`data-destructive`),
+summary and Approve button included. A `storage_add` card for a whole disk always
 says "Everything on this disk will be erased." The `storage_list` and
 `snapshot_list` sizes reach the model as decimal GB. `arca_propose` may
 target `pageHost`, the host whose kernel serves this canvas and its approval
@@ -327,7 +335,7 @@ the plain reason "this machine is not linked for approvals yet"; a page host
 whose status cannot be read links nothing. The proposal is recorded by the
 target host's own kernel, which later verifies the owner's passkey itself. The tools are
 registered globally with a per-session `when` condition, the Doctor's scope is
-restricted with `restrict({ allow: DOCTOR_TOOLS })` (the ten reads plus
+restricted with `restrict({ allow: DOCTOR_TOOLS })` (the fifteen reads plus
 `arca_propose`), and scoped `tools/pre-execute` and `tools.guard` checks deny every
 other name (including the reserved `run_code`) at dispatch. A setup that cannot
 install the restriction and guard, or enumerate its tools, fails after the
@@ -496,7 +504,7 @@ SSE events, in order. Every `data` is one JSON object.
 | --- | --- | --- |
 | `start` | `{ "session": "Doctor", "sessionId"?: "<dsh-session-id>" }` | Always first, sent before agent or model work so the kernel's idle timer never starts on a silent socket. `sessionId` is present when a persisted session is already known. |
 | `text` | `{ "text": "<delta>" }` | One assistant text delta; concatenate in arrival order. |
-| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"?, "proposal"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the ten reads or `arca_propose`. `proposal` is `{ "id": "act-<12 hex>" }` when the kernel accepted an action proposal. |
+| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"?, "proposal"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the fifteen reads or `arca_propose`. `proposal` is `{ "id": "act-<12 hex>" }` when the kernel accepted an action proposal. |
 | `usage` | `{ "turnToolCalls", "turnOutputTokens", "dailyTokens", "dailyBudget", "day" }` | Token accounting from the model's own usage; `dailyTokens` counts input plus output for the UTC day. |
 | `budget` | `{ "scope": "daily", "used", "budget", "message" }` | Daily budget reached; the message is `Daily budget reached, try tomorrow.`. The turn then ends. |
 | `cap` | `{ "reason", "limit", "message" }` | Per-turn cap reached: `reason` is `tool-calls` (40) or `output-tokens` (64000). |
