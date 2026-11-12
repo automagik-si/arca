@@ -7,7 +7,7 @@ pub mod openrpc;
 pub mod refusals;
 pub mod verbs;
 
-pub use check::conforms;
+pub use check::{closest, conforms, unknown_field};
 pub use openrpc::openrpc;
 pub use verbs::{Scope, Verb, VerbClass, may_call, verb, verbs};
 

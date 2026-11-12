@@ -1,4 +1,4 @@
-//! `init --enable-changes --config <file>` and `init --watch-only --config <file>`: one step from a node that only looks to
+//! `init --enable-changes [--config <file>]` and `init --watch-only [--config <file>]`: one step from a node that only looks to
 //! a node that may change things, and one step back.
 //!
 //! A node may change things when its config names the project it writes in and the network its services join. Every
@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 use crate::cmd_call::{Addressed, read_token, run_call};
 use crate::config::{self, NodeConfig};
-use crate::{Chosen, Failure, Flags, Origin};
+use crate::{Chosen, Does, Failure, Flags, Origin};
 
 /// The project Arca's services live in, and the bridge they join.
 const PROJECT: &str = arca_netproject::PROJECT;
@@ -63,18 +63,16 @@ pub fn init(flags: &Flags) -> Result<Option<Value>, Failure> {
             "--service-cidr and --yes belong to --enable-changes".to_string(),
         ));
     }
-    let Some(path) = flags.value("config").map(PathBuf::from) else {
-        return Err(Failure::Usage(
-            "--config is required: init writes a node's config, so it reads no default config"
-                .to_string(),
-        ));
-    };
     if arca_approval::effective_uid().is_ok_and(|uid| uid == 0) {
         return Err(Failure::Refused(
             "this is root, and Arca's node belongs to an ordinary user: run init as the user who runs the node, without sudo"
                 .to_string(),
         ));
     }
+    // Init rewrites what a node is, so its config is found as every command's is, except that the variable alone never
+    // picks the node: a variable left set for another node would turn that one to watch-only, or let it make changes.
+    let chosen = crate::node_config_path(flags)?;
+    let path = chosen.path.clone();
     // Init replaces the config by rename. A config that is a link would be replaced by a file while the link's target,
     // which the node may be reading, stayed as it was.
     if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -83,7 +81,10 @@ pub fn init(flags: &Flags) -> Result<Option<Value>, Failure> {
             path.display()
         )));
     }
-    let cfg = config::load(&path)?;
+    // Going back to watch-only cuts the node off from what it changed; enabling changes writes to it. Either way init
+    // says which config it found when the flag did not name it, before it reads or writes anything.
+    let does = if back { Does::Removes } else { Does::Acts };
+    let (_, cfg) = crate::load_found(chosen, does)?;
     let text = fs::read_to_string(&path).map_err(|error| {
         Failure::Runtime(format!(
             "the config {} cannot be read ({})",

@@ -34,7 +34,18 @@ pub fn probe(args: &[String]) -> Result<Option<Value>, Failure> {
     if !arca_netproject::name_ok(name, "consumer", 63) {
         return Err(Failure::Config("invalid consumer name".into()));
     }
-    let cfg = crate::load_named_config(&flags, "probe consumer changes a node's desired state")?;
+    // Adding a consumer writes to the node's desired state; removing one takes it away.
+    let does = if action == "remove" {
+        crate::Does::Removes
+    } else {
+        crate::Does::Acts
+    };
+    // Removing a consumer takes it from one node, so the variable alone never picks that node.
+    let (_, cfg) = if does == crate::Does::Removes {
+        crate::load_node_config_to(&flags, does)?
+    } else {
+        crate::load_config_to(&flags, does)?
+    };
     let key = NodeKey::load_or_create(&cfg.state_dir.join("node.key"))
         .map_err(|_| Failure::Runtime("node key unavailable".into()))?;
     let mut store =

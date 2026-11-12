@@ -288,27 +288,17 @@ fn check_object(
             }
         }
     }
-    // An unknown key is never echoed, here or in a path: a client may have put a secret in the key. The refusal names
-    // the place and the fields the schema does take, which are the schema's own words.
+    // An unknown key is named, so the caller sees which of its fields is wrong, but only when it is shaped like a field
+    // name ([`name_shaped`]): a key that is long or holds other characters may be a secret a client put there, and is
+    // never repeated. It is never put in a path either.
     match map.get("additionalProperties") {
         Some(Value::Bool(false)) => {
             for name in fields.keys() {
                 if !props.is_some_and(|p| p.contains_key(name)) {
-                    let named: Vec<&str> = props
+                    let known: Vec<&str> = props
                         .map(|p| p.keys().map(String::as_str).collect())
                         .unwrap_or_default();
-                    return Err(if named.is_empty() {
-                        format!(
-                            "{}: a field the schema does not name; it takes no field",
-                            here(at)
-                        )
-                    } else {
-                        format!(
-                            "{}: a field the schema does not name; the fields it takes are {}",
-                            here(at),
-                            named.join(", ")
-                        )
-                    });
+                    return Err(unknown_field(at, name, &known));
                 }
             }
         }
@@ -356,6 +346,85 @@ fn is_type(name: &str, value: &Value) -> bool {
 /// The JSON Pointer segment for a property name (RFC 6901: `~` and `/` are escaped).
 fn child(at: &str, name: &str) -> String {
     format!("{at}/{}", name.replace('~', "~0").replace('/', "~1"))
+}
+
+/// The longest unknown key a refusal repeats. The longest field name a verb takes is 19 characters; common service tokens
+/// that are all letters, digits and `_` start at 32. So 24 names every real field and repeats none of those.
+const LONGEST_NAMED_KEY: usize = 24;
+
+/// Whether an unknown key is shaped like a field name, and so may be repeated in a refusal: it starts with a letter,
+/// holds only letters, digits, `_` and `-`, and is at most [`LONGEST_NAMED_KEY`] characters. A token, a key or a
+/// sentence a client put in the place of a field name is longer or holds other characters, and is never repeated.
+fn name_shaped(key: &str) -> bool {
+    let mut chars = key.chars();
+    key.len() <= LONGEST_NAMED_KEY
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The refusal of a field an object does not take: the one sentence every verb's refusal of an unknown field is, whether
+/// the schema check or a handler makes it. `at` is the object's place (empty for the arguments themselves), `key` the
+/// field that was sent, and `known` the fields the object takes.
+///
+/// It names the field when it is [`name_shaped`], lists the fields that are taken, and offers the closest one when one
+/// is close: `unknown field 'nmae'; this verb takes: instance, name, project; did you mean name?`.
+pub fn unknown_field(at: &str, key: &str, known: &[&str]) -> String {
+    let place = if at.is_empty() {
+        String::new()
+    } else {
+        format!("{at}: ")
+    };
+    let subject = if at.is_empty() {
+        "this verb takes"
+    } else {
+        "it takes"
+    };
+    let shaped = name_shaped(key);
+    let named = if shaped {
+        format!("unknown field '{key}'")
+    } else {
+        "a field the schema does not name".to_string()
+    };
+    let takes = if known.is_empty() {
+        format!("{subject} no field")
+    } else {
+        format!("{subject}: {}", known.join(", "))
+    };
+    let hint = match closest(key, known.iter().copied()) {
+        Some(near) if shaped => format!("; did you mean {near}?"),
+        _ => String::new(),
+    };
+    format!("{place}{named}; {takes}{hint}")
+}
+
+/// The number of single-character edits (insert, remove, replace) that turn `a` into `b`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.chars().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let replaced = previous + usize::from(x != *y);
+            previous = row[j + 1];
+            row[j + 1] = replaced.min(previous + 1).min(row[j] + 1);
+        }
+    }
+    row[b.len()]
+}
+
+/// The known word closest to `word`, when one is close enough to be what was meant: at most two edits away, or a third of
+/// the word's length when that is more. Two words equally close give the first in `known`'s order.
+pub fn closest<'a>(word: &str, known: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let limit = (word.chars().count() / 3).max(2);
+    known
+        .into_iter()
+        .map(|candidate| (edit_distance(word, candidate), candidate))
+        .filter(|(distance, candidate)| *distance <= limit && *distance < candidate.chars().count())
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
 }
 
 /// How an error names its location: the pointer, or the whole value at the root.
@@ -454,31 +523,110 @@ mod tests {
             "additionalProperties": false
         });
         assert!(conforms(&schema, &json!({ "a": 1 })).is_ok());
-        let err =
-            conforms(&schema, &json!({ "a": 1, "extra-key-7": 2 })).expect_err("extra refused");
+        // A key that could be a secret (not shaped like a field name) is refused and never repeated.
+        let err = conforms(&schema, &json!({ "a": 1, "extra key: s3cret/7": 2 }))
+            .expect_err("extra refused");
         assert!(
-            !err.contains("extra-key-7"),
-            "the unknown key is not echoed: {err}"
+            !err.contains("s3cret"),
+            "a key that is not a field name is not echoed: {err}"
         );
-        // The refusal names the place and the fields the schema does take.
-        assert_eq!(
-            err,
-            "the value: a field the schema does not name; the fields it takes are a"
-        );
+        // A key shaped like no field name is never repeated: the refusal names the place and the fields that are taken.
+        assert_eq!(err, "a field the schema does not name; this verb takes: a");
         let nested = json!({
             "type": "object",
             "properties": { "args": schema.clone() },
             "additionalProperties": false
         });
         assert_eq!(
-            conforms(&nested, &json!({ "args": { "extra-key-7": 2 } })).expect_err("extra refused"),
-            "/args: a field the schema does not name; the fields it takes are a"
+            conforms(
+                &nested,
+                &json!({ "args": { "arca_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA": 2 } })
+            )
+            .expect_err("extra refused"),
+            "/args: a field the schema does not name; it takes: a"
         );
         let empty = json!({ "type": "object", "additionalProperties": false });
         assert_eq!(
-            conforms(&empty, &json!({ "extra-key-7": 2 })).expect_err("extra refused"),
-            "the value: a field the schema does not name; it takes no field"
+            conforms(&empty, &json!({ "not a name": 2 })).expect_err("extra refused"),
+            "a field the schema does not name; this verb takes no field"
         );
+    }
+
+    #[test]
+    fn an_unknown_field_is_named_with_the_fields_that_are_taken_and_the_closest_one() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "instance": { "type": "string" },
+                "project": { "type": "string" },
+                "args": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        });
+        // The field is named, and the fields the verb takes are listed.
+        assert_eq!(
+            conforms(&schema, &json!({ "project": "p", "name": "x" })).expect_err("refused"),
+            "unknown field 'name'; this verb takes: args, instance, project"
+        );
+        // A field close to one that is taken gets the one that was meant.
+        assert_eq!(
+            conforms(&schema, &json!({ "instnace": "x" })).expect_err("refused"),
+            "unknown field 'instnace'; this verb takes: args, instance, project; did you mean instance?"
+        );
+        // Inside an object, with its place.
+        assert_eq!(
+            conforms(&schema, &json!({ "args": { "nmae": "x" } })).expect_err("refused"),
+            "/args: unknown field 'nmae'; it takes: name; did you mean name?"
+        );
+        // The value of the field is never repeated.
+        let err = conforms(&schema, &json!({ "name": "secret-value-123" })).expect_err("refused");
+        assert!(!err.contains("secret-value-123"), "{err}");
+    }
+
+    #[test]
+    fn only_a_key_shaped_like_a_field_name_is_repeated() {
+        // Every field name in the verb schemas is shorter than the limit; the longest is confirmSnapshotLoss.
+        for key in [
+            "name",
+            "serviceCidr",
+            "http-path",
+            "plan_digest",
+            "a",
+            "confirmSnapshotLoss",
+        ] {
+            assert!(name_shaped(key), "{key}");
+        }
+        let long = "a".repeat(25);
+        // The shapes of common service tokens are all letters, digits and `_`, so only their length tells them from a
+        // field name. They are put together here, so that no line of this file holds something shaped like a token.
+        let prefixed = |prefix: &str, rest: usize| format!("{prefix}{}", "A".repeat(rest));
+        let (arca, github, stripe) = (
+            prefixed("arca_", 43),
+            prefixed("ghp_", 36),
+            prefixed("sk_live_", 24),
+        );
+        for key in [
+            "",
+            "9lives",
+            "has space",
+            "semi;colon",
+            "with/other+chars=",
+            arca.as_str(),
+            github.as_str(),
+            stripe.as_str(),
+            long.as_str(),
+        ] {
+            assert!(!name_shaped(key), "{key}");
+            let refusal = unknown_field("", key, &["name"]);
+            assert_eq!(
+                refusal,
+                "a field the schema does not name; this verb takes: name"
+            );
+        }
     }
 
     #[test]

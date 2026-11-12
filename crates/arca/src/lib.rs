@@ -1,7 +1,8 @@
 //! The `arca` binary: one node's one-shot watch and metrics reads, scoped token minting, the recording shim, and the Arca MCP
-//! server. Every command that needs the node reads one config file. A command that only reads a node takes the one
+//! server. Every command that needs the node reads one config file, and every command finds it the same way: the one
 //! `--config` names, else the one the `ARCA_CONFIG` variable names, else the file the installer writes. A command that
-//! writes to a node, starts one or calls a peer takes it from `--config` alone.
+//! writes to a node or acts on one, and did not get its config from the flag, says on stderr which file it uses before it
+//! does anything; one that removes or cuts something off names the node's state directory too.
 //!
 //! Exit codes: 0 for success; 1 for a runtime failure (a socket, a read or a write that failed); 2 for a usage or config
 //! failure (a bad command line, a refused config, or a token directory that is unsafe or missing); 3 for a tool error, whose
@@ -58,38 +59,43 @@ const USAGE: &str = "usage: arca <command>
   status [--json] [--config <file>] [--token-file <file>]
   watch --once --json [--config <file>]
   metrics --json [--sample-for <seconds, 0 to 60>] [--config <file>]
-  link serve --config <file> (forwards arca/mcp/1 to listen.unix by default)
-  link pair --config <file> [--minutes <n>]
-  link join [--] <link> --config <file>
+  link serve [--config <file>] (forwards arca/mcp/1 to listen.unix by default)
+  link pair [--config <file>] [--minutes <n>]
+  link join [--] <link> [--config <file>]
   link peers [--config <file>]
-  link remove [--] <name> --config <file>
-  probe consumer add --name <n> --image <fingerprint> --config <file>
-  probe consumer remove --name <n> --config <file>
-  serve --config <file>
-  init --enable-changes --config <file> [--yes] [--service-cidr <a.b.c.0/24>] (let this node make changes; what is proposed waits for the owner's approval)
-  init --watch-only --config <file> (back to a node that only looks)
-  setup-code --config <file> (the code for the first passkey, on this terminal, for a machine with no screen)
+  link remove [--] <name> [--config <file>]
+  probe consumer add --name <n> --image <fingerprint> [--config <file>]
+  probe consumer remove --name <n> [--config <file>]
+  serve [--config <file>]
+  init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>] (let this node make changes; what is proposed waits for the owner's approval)
+  init --watch-only [--config <file>] (back to a node that only looks)
+  setup-code [--config <file>] (the code for the first passkey, on this terminal, for a machine with no screen)
   call <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
-  call --peer <name> <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
+  call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]
   call (alone: lists the verbs)
-  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] (--config <file> | --hash-dir <dir>)
-  token revoke <id> (--config <file> | --hash-dir <dir>)
-  token reload --config <file> (the running node reads its tokens again)
-  store check --config <file>
-  templates install --config <file> [--replace]
+  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] [--config <file> | --hash-dir <dir>]
+  token revoke <id> [--config <file> | --hash-dir <dir>]
+  token reload [--config <file>] (the running node reads its tokens again)
+  store check [--config <file>]
+  templates install [--config <file>] [--replace]
   service import plan --name <service> [--config <file>]
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
-  adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
-  adopt apply --instance <name> --plan-digest <hex> [--expect-ip <ipv4>] [--dry-run] --config <file>
-  adopt release --instance <name> [--dry-run] --config <file>
-  adopt verify --instance <name> [--port <n> [--http-path <path>] | --url <http url>] [--wait <seconds>] --config <file>
-  adopt status --instance <name> --json --config <file>
+  adopt plan --instance <name> --expect-ip <ipv4> --json [--config <file>]
+  adopt apply --instance <name> --plan-digest <hex> [--expect-ip <ipv4>] [--dry-run] [--config <file>]
+  adopt release --instance <name> [--dry-run] [--config <file>]
+  adopt verify --instance <name> [--port <n> [--http-path <path>] | --url <http url>] [--wait <seconds>] [--config <file>]
+  adopt status --instance <name> --json [--config <file>]
 
 defaults, the files the installer writes:
   --config      ~/.config/arca/node.json
   --token-file  ~/.config/arca/assistant-1.secret
   The order is: the flag, then the variable (ARCA_CONFIG, ARCA_TOKEN_FILE), then the default.
-  Only a command that reads a node takes them; one that writes to a node, starts one or calls a peer takes the flag alone.";
+  Every command finds its config this way. One that writes to a node or acts on it, without --config, first says on
+  stderr which config it uses; one that removes or cuts something off also names the node's state directory.
+  A call with --peer sends its token to another node, so its --token-file is always named: it has no default.
+  token mint, token revoke, call --peer, link remove, probe consumer remove, adopt apply, adopt release and init hand
+  out, remove or rewrite something on one node, so the variable alone never picks it: when ARCA_CONFIG names another
+  file than the default, they refuse and say the --config to run them with.";
 
 /// The variable that names the config when `--config` is not given.
 pub const CONFIG_VARIABLE: &str = "ARCA_CONFIG";
@@ -221,33 +227,9 @@ fn with_usage(failure: Failure, command: &str, action: Option<&str>) -> Failure 
     Failure::Usage(format!("{text}\nusage:\n{}", lines.join("\n")))
 }
 
-/// The number of single-character edits (insert, remove, replace) that turn `a` into `b`.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for (i, x) in a.chars().enumerate() {
-        let mut previous = row[0];
-        row[0] = i + 1;
-        for (j, y) in b.iter().enumerate() {
-            let replaced = previous + usize::from(x != *y);
-            previous = row[j + 1];
-            row[j + 1] = replaced.min(previous + 1).min(row[j] + 1);
-        }
-    }
-    row[b.len()]
-}
-
-/// The known word closest to `word`, when one is close enough to be what was meant: at most two edits away, or a third of
-/// the word's length when that is more. Two words equally close give the first in `known`'s order.
-pub fn closest<'a>(word: &str, known: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    let limit = (word.chars().count() / 3).max(2);
-    known
-        .into_iter()
-        .map(|candidate| (edit_distance(word, candidate), candidate))
-        .filter(|(distance, candidate)| *distance <= limit && *distance < candidate.chars().count())
-        .min_by_key(|(distance, _)| *distance)
-        .map(|(_, candidate)| candidate)
-}
+/// The known word closest to a mistyped one, when one is close enough to be what was meant. It is the verb table's own
+/// measure, so a mistyped command, flag, verb or field is answered the same way.
+pub use arca_api::closest;
 
 /// The refusal of a word that is not one of `known`: what kind of word it is, the closest known one when there is one,
 /// and all of them. The word itself is never echoed.
@@ -288,22 +270,33 @@ fn chosen(flags: &Flags, flag: &str, variable: &str, file: &str) -> Result<Chose
             origin: Origin::Flag,
         });
     }
-    let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
-    if let Some(path) = set(variable) {
+    if let Some(path) = set_variable(variable) {
+        // A relative path in the variable is kept, shown and handed on as the whole path it names from here.
+        let path = PathBuf::from(path);
         return Ok(Chosen {
-            path: PathBuf::from(path),
+            path: std::path::absolute(&path).unwrap_or(path),
             origin: Origin::Variable,
         });
     }
-    let home = set("HOME").ok_or_else(|| {
+    let path = installed_path(file).ok_or_else(|| {
         Failure::Usage(format!(
             "--{flag} is required here: neither {variable} nor HOME is set, so there is no default to read"
         ))
     })?;
     Ok(Chosen {
-        path: Path::new(&home).join(INSTALL_DIR).join(file),
+        path,
         origin: Origin::Default,
     })
+}
+
+/// The value of an environment variable that is set to something.
+fn set_variable(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+/// Where the installer writes `file`, when there is a home directory to hold it.
+fn installed_path(file: &str) -> Option<PathBuf> {
+    set_variable("HOME").map(|home| Path::new(&home).join(INSTALL_DIR).join(file))
 }
 
 /// The config a command reads: `--config`, else `ARCA_CONFIG`, else the installer's.
@@ -316,34 +309,158 @@ pub(crate) fn token_path(flags: &Flags) -> Result<Chosen, Failure> {
     chosen(flags, "token-file", TOKEN_VARIABLE, INSTALL_TOKEN)
 }
 
-/// Reads and checks the config of a command that only reads a node, and says where it came from. A default that is not
-/// there is not a read failure: nothing was installed for this user, and the refusal says so.
-pub(crate) fn load_chosen_config(flags: &Flags) -> Result<(Chosen, NodeConfig), Failure> {
-    let chosen = config_path(flags)?;
+/// What a command does to the node its config names, which decides what it says before it does it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Does {
+    /// It only reads the node. It says nothing.
+    Reads,
+    /// It writes to the node, starts something on it or acts through it.
+    Acts,
+    /// It removes something from the node, cuts something off from it or overwrites what was there.
+    Removes,
+}
+
+/// The line a command that acts says before it does, when nobody named its config with the flag: which config file it
+/// uses and how it was found, and for a command that removes, the node's state directory too. `None` for a command that
+/// only reads, and for a config the flag named: the caller wrote that path themselves.
+fn announcement(chosen: &Chosen, config: &NodeConfig, does: Does) -> Option<String> {
+    let found = match chosen.origin {
+        Origin::Flag => return None,
+        Origin::Variable => format!("from {CONFIG_VARIABLE}"),
+        Origin::Default => "the default".to_string(),
+    };
+    let using = format!("using the config {} ({found})", chosen.path.display());
+    match does {
+        Does::Reads => None,
+        Does::Acts => Some(using),
+        Does::Removes => Some(format!(
+            "{using}; this node's state directory is {}",
+            config.state_dir.display()
+        )),
+    }
+}
+
+/// The name of the user with the id `uid`, as `/etc/passwd` has it, or the id itself.
+fn user_of(uid: u32) -> String {
+    std::fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|users| {
+            users.lines().find_map(|line| {
+                let mut fields = line.split(':');
+                let name = fields.next()?;
+                (fields.nth(1)?.parse::<u32>().ok()? == uid).then(|| name.to_string())
+            })
+        })
+        .unwrap_or_else(|| format!("the user with the id {uid}"))
+}
+
+/// Whether a config the flag did not name is one a writing command refuses: it belongs to another user. A reading
+/// command reads it; a command the flag named a config for acts on what it was told to.
+fn another_users(owner: u32, caller: u32, origin: Origin, does: Does) -> bool {
+    owner != caller && origin != Origin::Flag && does != Does::Reads
+}
+
+/// Refuses a writing command a config that it found by itself and that belongs to another user. This is root with
+/// another user's home directory kept (`sudo` without `-H`, `su` without `-`): the default path, or the variable, then
+/// leads to that user's node, and nothing said so.
+fn refuse_another_users_config(chosen: &Chosen, does: Does) -> Result<(), Failure> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(&chosen.path) else {
+        // A file that cannot be read is refused by the load, in its own words.
+        return Ok(());
+    };
+    let caller = rustix::process::geteuid().as_raw();
+    if !another_users(meta.uid(), caller, chosen.origin, does) {
+        return Ok(());
+    }
+    let owner = user_of(meta.uid());
+    Err(Failure::Config(format!(
+        "the config {} belongs to {owner}, not to the user running this command, and --config did not name it, so nothing was done. Run this as {owner}, or name the config: --config {}",
+        chosen.path.display(),
+        chosen.path.display()
+    )))
+}
+
+/// The config at the path `chosen`, read and checked, with the line a command that acts says first.
+pub(crate) fn load_found(chosen: Chosen, does: Does) -> Result<(Chosen, NodeConfig), Failure> {
     if chosen.origin == Origin::Default && std::fs::symlink_metadata(&chosen.path).is_err() {
         return Err(Failure::Config(format!(
             "there is no config at {}, where the installer writes it: install Arca for this user, or name another config with --config <file> or {CONFIG_VARIABLE}",
             chosen.path.display()
         )));
     }
+    refuse_another_users_config(&chosen, does)?;
     let config = config::load(&chosen.path)?;
+    if let Some(line) = announcement(&chosen, &config, does) {
+        eprintln!("arca: {line}");
+    }
     Ok((chosen, config))
 }
 
-/// The config of a command that only reads a node: `--config`, else `ARCA_CONFIG`, else the installer's.
-pub(crate) fn load_config(flags: &Flags) -> Result<NodeConfig, Failure> {
-    load_chosen_config(flags).map(|(_, config)| config)
+/// The config a command uses, found the one way every command finds it. A command that acts on the node, or removes
+/// something from it, and was not given its config by the flag, says on stderr which node it is about to touch, as the
+/// first thing it prints and before it does anything.
+pub(crate) fn load_config_to(flags: &Flags, does: Does) -> Result<(Chosen, NodeConfig), Failure> {
+    load_found(config_path(flags)?, does)
 }
 
-/// Reads and checks the config of a command that writes to a node, starts one or calls a peer. Such a command takes it
-/// from `--config` alone, never from a variable or a default; `why` says so in the refusal.
-pub(crate) fn load_named_config(flags: &Flags, why: &str) -> Result<NodeConfig, Failure> {
-    let path = flags.value("config").ok_or_else(|| {
-        Failure::Usage(format!(
-            "--config is required: {why}, so it reads no default config"
-        ))
-    })?;
-    Ok(config::load(Path::new(path))?)
+/// Whether two paths name one file. Both are resolved when they exist; otherwise they are compared as written, which can
+/// only miss a match, never make one.
+fn same_file(left: &Path, right: &Path) -> bool {
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved(left) == resolved(right)
+}
+
+/// Whether the variable alone may choose the node: only when it names the very file the default names. `default` is the
+/// installer's config, when there is a home directory to hold one.
+fn variable_names_the_default(variable: &Path, default: Option<&Path>) -> bool {
+    default.is_some_and(|default| same_file(variable, default))
+}
+
+/// The config of a command that hands out, sends or removes a credential, a peer or an instance, or rewrites what a node
+/// is: `token mint`, `token revoke`, `call --peer`, `link remove`, `probe consumer remove`, `adopt apply`, `adopt
+/// release` and both modes of `init`. It is found as every
+/// command finds it, with one exception: THE VARIABLE ALONE NEVER PICKS THE NODE. A variable left set for another node
+/// would send such a command there, it would succeed, and the line on stderr is not something a script or an assistant
+/// stops for. So with the variable set and no flag, the command goes on only when the variable names the same file as
+/// the default; when it names another, the command refuses before it reads anything and says the flag to run it with.
+pub(crate) fn load_node_config_to(
+    flags: &Flags,
+    does: Does,
+) -> Result<(Chosen, NodeConfig), Failure> {
+    load_found(node_config_path(flags)?, does)
+}
+
+/// Where the config of such a command is, or the refusal of a variable that names another node than the default. It
+/// reads nothing: a command with checks of its own to make before the config is read (`init`) takes the path, makes
+/// them, and then calls [`load_found`].
+pub(crate) fn node_config_path(flags: &Flags) -> Result<Chosen, Failure> {
+    let chosen = config_path(flags)?;
+    if chosen.origin == Origin::Variable {
+        let default = installed_path(INSTALL_CONFIG);
+        if !variable_names_the_default(&chosen.path, default.as_deref()) {
+            let elsewhere = match &default {
+                Some(default) => format!("not the default config ({})", default.display()),
+                None => "and there is no default config to compare it with".to_string(),
+            };
+            return Err(Failure::Usage(format!(
+                "{CONFIG_VARIABLE} names {}, {elsewhere}. This command hands out, removes or rewrites something on one node, so the variable alone does not choose that node, and nothing was done. To act on the node {CONFIG_VARIABLE} names, run the same command with: --config {}",
+                chosen.path.display(),
+                chosen.path.display()
+            )));
+        }
+    }
+    Ok(chosen)
+}
+
+/// The config of a command that only reads a node, and where it came from.
+pub(crate) fn load_chosen_config(flags: &Flags) -> Result<(Chosen, NodeConfig), Failure> {
+    load_config_to(flags, Does::Reads)
+}
+
+/// The config of a command that only reads a node.
+pub(crate) fn load_config(flags: &Flags) -> Result<NodeConfig, Failure> {
+    load_config_to(flags, Does::Reads).map(|(_, config)| config)
 }
 
 /// The flags of one command: the named values and the bare switches, each given at most once.
@@ -619,7 +736,7 @@ mod tests {
         );
         assert_eq!(
             refused.message(),
-            "--minutes needs a value\nusage:\n  arca link pair --config <file> [--minutes <n>]"
+            "--minutes needs a value\nusage:\n  arca link pair [--config <file>] [--minutes <n>]"
         );
         // A refusal that is not about a flag stays one line, and so does one of another kind.
         let plain = with_usage(
@@ -630,6 +747,84 @@ mod tests {
         assert_eq!(plain.message(), "the arguments are not a JSON object");
         let config = with_usage(Failure::Config("--x".to_string()), "call", None);
         assert_eq!(config.message(), "--x");
+    }
+
+    #[test]
+    fn a_command_says_its_config_only_when_it_acts_and_the_flag_did_not_name_it() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock" },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": { "droiddProjects": [] }
+        }))
+        .expect("the fixture config parses");
+        let chosen = |origin: Origin| Chosen {
+            path: PathBuf::from("/nonexistent/node.json"),
+            origin,
+        };
+        let says = |origin: Origin, does: Does| announcement(&chosen(origin), &config, does);
+        // A config the flag named is never said back, whatever the command does.
+        for does in [Does::Reads, Does::Acts, Does::Removes] {
+            assert_eq!(says(Origin::Flag, does), None);
+        }
+        // A command that only reads says nothing, wherever its config came from.
+        assert_eq!(says(Origin::Default, Does::Reads), None);
+        assert_eq!(says(Origin::Variable, Does::Reads), None);
+        // A command that acts says the file and how it was found.
+        assert_eq!(
+            says(Origin::Default, Does::Acts).as_deref(),
+            Some("using the config /nonexistent/node.json (the default)")
+        );
+        assert_eq!(
+            says(Origin::Variable, Does::Acts).as_deref(),
+            Some("using the config /nonexistent/node.json (from ARCA_CONFIG)")
+        );
+        // A command that removes names the node's state directory too.
+        assert_eq!(
+            says(Origin::Variable, Does::Removes).as_deref(),
+            Some(
+                "using the config /nonexistent/node.json (from ARCA_CONFIG); this node's state directory is /nonexistent/state"
+            )
+        );
+    }
+
+    #[test]
+    fn a_writing_command_refuses_a_config_it_found_by_itself_and_does_not_own() {
+        // Root with another user's home kept: the default, or the variable, leads to that user's config.
+        assert!(another_users(1000, 0, Origin::Default, Does::Acts));
+        assert!(another_users(1000, 0, Origin::Variable, Does::Removes));
+        assert!(another_users(1000, 1001, Origin::Default, Does::Acts));
+        // The caller's own config, a config the flag named, and a command that only reads are let through.
+        assert!(!another_users(1000, 1000, Origin::Default, Does::Removes));
+        assert!(!another_users(1000, 0, Origin::Flag, Does::Removes));
+        assert!(!another_users(1000, 0, Origin::Default, Does::Reads));
+        // The owner is named as the system names it.
+        assert_eq!(user_of(0), "root");
+        assert_eq!(user_of(4_294_967_000), "the user with the id 4294967000");
+    }
+
+    #[test]
+    fn the_variable_chooses_alone_only_when_it_names_the_default_file() {
+        let dir = std::env::temp_dir().join(format!("arca-same-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let default = dir.join("node.json");
+        let other = dir.join("other.json");
+        std::fs::write(&default, "{}").expect("default");
+        std::fs::write(&other, "{}").expect("other");
+        assert!(variable_names_the_default(&default, Some(&default)));
+        // The same file by another spelling, and through a link.
+        assert!(variable_names_the_default(
+            &dir.join("./node.json"),
+            Some(&default)
+        ));
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&default, &link).expect("link");
+        assert!(variable_names_the_default(&link, Some(&default)));
+        // Another file, and no default at all.
+        assert!(!variable_names_the_default(&other, Some(&default)));
+        assert!(!variable_names_the_default(&default, None));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

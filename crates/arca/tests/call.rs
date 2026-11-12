@@ -882,3 +882,65 @@ fn token_reload_says_so_when_the_node_could_not_read_its_tokens_and_exits_non_ze
     let still = call(&node, &node.viewer, "arca_status", &[]);
     assert_eq!(code(&still), 0, "the node keeps the tokens it had");
 }
+
+#[test]
+fn a_hangup_that_arrives_while_the_node_starts_is_answered_and_its_record_stays() {
+    let mut node = start_node("reload-during-start");
+    // The same node, started again; this time a hangup is sent at the first moment the new process can take one.
+    node.stop();
+    let serve = arca()
+        .args(["serve", "--config"])
+        .arg(&node.config)
+        .env(
+            "ARCA_TEST_OWNER_SIGNERS",
+            node.scratch.path("owner-signers"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start arca serve again");
+    node.serve = serve;
+    let pid = node.serve.id();
+    let deadline = Instant::now() + PID_WAIT;
+    let catches = || {
+        fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| {
+                let mask = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigCgt:"))?;
+                u64::from_str_radix(mask.trim(), 16).ok()
+            })
+            .is_some_and(|mask| mask & 1 == 1)
+    };
+    while !catches() {
+        assert!(Instant::now() < deadline, "serve takes SIGHUP as it starts");
+        thread::yield_now();
+    }
+    let sent = Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .status()
+        .expect("send the hangup");
+    assert!(sent.success());
+    wait_for(&mut node);
+
+    // The node answered the hangup with one reload once it was up, and the record of it is still there: it was not
+    // taken for an older node's record and removed when the socket was bound.
+    let record = node.scratch.path("state").join("serve.reload");
+    let want = format!("{pid} 1 ok 3\n");
+    while fs::read_to_string(&record).ok().as_deref() != Some(want.as_str()) {
+        assert!(
+            Instant::now() < deadline,
+            "the record of the reload stays: {:?}",
+            fs::read_to_string(&record)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // A reload asked for now is the node's second, and is told apart from the first.
+    let out = token_reload(&node);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        fs::read_to_string(&record).expect("the record"),
+        format!("{pid} 2 ok 3\n")
+    );
+}

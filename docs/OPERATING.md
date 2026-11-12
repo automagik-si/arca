@@ -53,35 +53,56 @@ states what the kernel may touch.
 
 `--config` and `--token-file` have defaults, the files the installer writes: `~/.config/arca/node.json` and
 `~/.config/arca/assistant-1.secret`. The order is the flag, then the variable (`ARCA_CONFIG`, `ARCA_TOKEN_FILE`), then
-the default. Only a command that reads a node takes them, and the table shows those flags in brackets. A command that
-writes to a node, starts one or calls a peer takes `--config` as a flag alone. `token mint` writes the hash and sends no
-signal: a node reads its tokens when it starts and on SIGHUP, so a running node takes a new token after
-`arca token reload --config <file>` or a restart.
+the default, and every command finds its config this way. A command that writes to a node or acts on it, and was not
+given `--config`, first says on stderr which config it uses and how it was found (`arca: using the config <path> (the
+default)` or `(from ARCA_CONFIG)`). A command that removes or cuts something off (`token revoke`, `link remove`, `probe
+consumer remove`, `adopt apply`, `adopt release`, `init --watch-only`, `templates install --replace`) also names the node's
+state directory in that line. A command that
+only reads says nothing, and a config named with `--config` is not said back. One thing has no default: a call with
+`--peer` sends its token to another node, so its `--token-file` is always named. `token mint` and `token revoke` with
+`--hash-dir` alone read no config at all, not even the variable's.
+
+**The variable alone never picks the node for a command that hands out, removes or rewrites something.** `token mint`,
+`token revoke`, `call --peer`, `link remove`, `probe consumer remove`, `adopt apply`, `adopt release` and both modes of
+`init` would succeed on whatever node `ARCA_CONFIG` was left set for, and the installer mints the same token id on every
+node. So with the
+variable set and no `--config`, they go on only when the variable names the same file as the default. When it names
+another file they refuse with exit 2, do nothing, and say the flag to run them with:
+`ARCA_CONFIG names <path>, not the default config (<default>). ... run the same command with: --config <path>`. With
+`--config`, or with no variable set, nothing changes. `templates install --replace` overwrites templates that were
+edited, so it names the node's state directory in its first line as the removing commands do.
+
+A writing command also refuses a config it found by itself that belongs to another user, and says whose it is. This is
+root with a user's home directory kept (`sudo` without `-H`): the default path would lead to that user's node. Run the
+command as that user, or name the config with `--config`.
+
+`token mint` writes the hash and sends no signal: a node reads its tokens when it starts and on SIGHUP, so a running
+node takes a new token after `arca token reload` or a restart.
 
 | Command | Reads | Prints |
 |---------|-------|--------|
 | `arca status [--json] [--config <file>] [--token-file <file>]` | the running node, with the same call as `arca call arca_status` | the node in words: version, mode, uptime, whether Incus answers, the unix socket it answered on, the loopback door as the node itself reports it (open with its URL, or CLOSED with the reason), the other listeners the config file names (not checked) and a next step; with `--json`, the `arca_status` result as it came |
 | `arca watch --once --json [--config <file>]` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
-| `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
-| `arca templates install --config <file> [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
-| `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
-| `arca serve --config <file>` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
-| `arca init --enable-changes --config <file> [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan, two questions, and what Arca may now touch, in words; it writes the config's missing keys after a yes. See "Turning on changes" |
-| `arca init --watch-only --config <file>` | the config | what it wrote and what stays, in words; it empties `kernel.projects` and nothing else |
-| `arca setup-code --config <file>` | asks the running node, on its unix socket, for the setup code of the first passkey; for a machine with no screen | `{ "code", "expiresInSeconds", "page" }` as JSON on stdout, and one sentence on stderr; see "The page on this machine alone" |
-| `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
-| `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
-| `arca link join [--] <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
+| `arca store check [--config <file>]` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
+| `arca templates install [--config <file>] [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
+| `arca probe consumer add --name <n> --image <fingerprint> [--config <file>]` / `remove --name <n> [--config <file>]` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
+| `arca serve [--config <file>]` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
+| `arca init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan, two questions, and what Arca may now touch, in words; it writes the config's missing keys after a yes. See "Turning on changes" |
+| `arca init --watch-only [--config <file>]` | the config | what it wrote and what stays, in words; it empties `kernel.projects` and nothing else |
+| `arca setup-code [--config <file>]` | asks the running node, on its unix socket, for the setup code of the first passkey; for a machine with no screen | `{ "code", "expiresInSeconds", "page" }` as JSON on stdout, and one sentence on stderr; see "The page on this machine alone" |
+| `arca link serve [--config <file>]` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
+| `arca link pair [--config <file>] [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
+| `arca link join [--] <link> [--config <file>]` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
 | `arca link peers [--config <file>]` | the paired peers file | the peers array, as JSON |
-| `arca link remove [--] <name> --config <file>` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
+| `arca link remove [--] <name> [--config <file>]` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call <verb> [--config <file>] [--token-file <file>]`, with `--args <json>` or `--args-file <file>`; `arca call` alone lists the verbs | one tool call against the local node | the verb's result, as JSON |
-| `arca call --peer <name> <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and both flags are required: this node's own token is never sent by default | the verb's result, as JSON |
-| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>]` with `--config <file>` or `--hash-dir <dir>` | nothing | the id, scope and tool list |
-| `arca token revoke <id>` with `--config <file>` or `--hash-dir <dir>` | the token's hash file | the id and `revoked: true` |
-| `arca token reload --config <file>` | the pid file and the reload record in the state directory, and `/proc` | one line: `reloaded: the node on this config (pid <n>) read its tokens again and holds <k> token(s)`. It exits non-zero, with the reason on stderr, when no node runs on the config, when the node could not read its token directory, or when it cannot tell |
+| `arca call --peer <name> <verb> [--config <file>] --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and `--token-file` is always named: this node's own token is never sent by default | the verb's result, as JSON |
+| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id, scope and tool list |
+| `arca token revoke <id>` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | the token's hash file | the id and `revoked: true` |
+| `arca token reload [--config <file>]` | the pid file and the reload record in the state directory, and `/proc` | one line: `reloaded: the node on this config (pid <n>) read its tokens again and holds <k> token(s)`. It exits non-zero, with the reason on stderr, when no node runs on the config, when the node could not read its token directory, or when it cannot tell |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
-| `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
+| `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... [--config <file>]` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
 | `arca --version`, `arca version` or `arca -V` | nothing | one line: `Automagik Arca <version> (<short commit>, <target triple>)`; the commit reads `unknown` when the binary was built with no git checkout |
 | `arca service import plan --name <service> [--config <file>]` | one instance `kernel.importServices` lists, and the instance listing, through Incus GET | the import's dry run as JSON: every check, the one write and the pre-image digest; see "Importing a service another manager created" |
 

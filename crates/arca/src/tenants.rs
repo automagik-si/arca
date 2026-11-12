@@ -1130,10 +1130,10 @@ impl ToolHandler for TenantHandler {
         let object = args
             .as_object()
             .ok_or_else(|| CallError::Invalid("arguments: expected an object".into()))?;
-        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-            return Err(CallError::Invalid(
-                "arguments: a field the schema does not name".into(),
-            ));
+        if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(CallError::Invalid(arca_api::unknown_field(
+                "", key, allowed,
+            )));
         }
         // A node that was never set up for services or tenants, and whose desired state holds no tenant, has none: the
         // list is empty. A node that still holds tenant records, every other tenant verb, and a node set up for services
