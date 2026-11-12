@@ -9,6 +9,9 @@
   "firstBoot": { "file": "github-runner-pool.sh" },
   "secrets": ["GITHUB_APP_CLIENT_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_TOKEN"],
   "createSettings": ["url", "runnerGroupId", "classes", "maxSlots"],
+  "settingRules": [
+    { "need": "maxSlots", "atLeast": { "count": "classes" }, "why": "every class is kept one place under the cap: set maxSlots to the number of classes or more, or name fewer classes" }
+  ],
   "settings": {
     "url": "https://github.com/example-org",
     "runnerGroupId": 1,

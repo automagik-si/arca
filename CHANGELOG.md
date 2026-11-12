@@ -140,6 +140,12 @@ both numbers and what to set. It is still a cap on registered runners, not on ru
 memory: "A place for every class" in `docs/OPERATING.md` says what is kept and what is not. Pools that exist keep the
 script they were created with; a pool of one class works as before.
 
+The GitHub runner pool template now states that rule (`settingRules`), so a create with `maxSlots` below the number
+of classes is refused when it is proposed, before any card, and no machine is made for it. The rule is the plain
+one: a pool of one class created with `maxSlots` 0, which ran with one place, is refused at create too; set 1. The
+template's file changed, so an installed copy that was not edited is brought up to date by the upgrade, and a card
+for it that waits across the upgrade is refused and proposed again.
+
 ## 0.13.0 (2026-11-12)
 
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU
