@@ -99,6 +99,13 @@ counter, `arca_store_slow_commits_total`, and its own alert, the warning `store-
 dashboard or an outside alert built on `arca_store_write_failures_total`, or on `store-write-failed`, stops firing for a slow
 disk: watch the new counter or the new alert for that. Both counters start at 0 when the server starts, as before.
 
+A GitHub runner pool now keeps every class one place under `maxSlots`. A free place goes to the class with the fewest
+runners, and when a class has no runner while every place is held, one runner that waits for a job is retired for it;
+a runner that has a job never is. A pool created with `maxSlots` below the number of classes does not start, and says
+both numbers and what to set. It is still a cap on registered runners, not on running jobs, and a place is not
+memory: "A place for every class" in `docs/OPERATING.md` says what is kept and what is not. Pools that exist keep the
+script they were created with; a pool of one class works as before.
+
 ## 0.13.0 (2026-11-12)
 
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU
