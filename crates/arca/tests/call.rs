@@ -100,6 +100,17 @@ fn start_node_with(tag: &str, signers: &str) -> Node {
 /// A served node whose owner signers file holds exactly `signers`, and whose test passkeys file, when `passkeys` names one,
 /// holds exactly that text at mode `0600`.
 fn start_node_keys(tag: &str, signers: &str, passkeys: Option<&str>) -> Node {
+    start_node_prepared(tag, signers, passkeys, &|_, _| {})
+}
+
+/// [`start_node_keys`], with `prepare` run on the token directory after the node's three tokens are minted and
+/// before the node starts.
+fn start_node_prepared(
+    tag: &str,
+    signers: &str,
+    passkeys: Option<&str>,
+    prepare: &dyn Fn(&Scratch, &Path),
+) -> Node {
     let scratch = Scratch::new(tag);
     let fake = start_fake(&scratch);
     let owner = SkKey::from_seed(1);
@@ -115,6 +126,7 @@ fn start_node_keys(tag: &str, signers: &str, passkeys: Option<&str>) -> Node {
     let viewer = mint(&scratch, &hash_dir, "viewer", "viewer-1");
     let doctor = mint(&scratch, &hash_dir, "doctor", "doctor-1");
     let operator = mint(&scratch, &hash_dir, "operator", "operator-1");
+    prepare(&scratch, &hash_dir);
 
     let socket = scratch.path("arca.sock");
     let config = scratch.path("node.json");
@@ -812,6 +824,122 @@ fn a_token_minted_while_the_node_runs_is_refused_until_the_reload_the_refusal_na
         0,
         "{}",
         String::from_utf8_lossy(&after.stderr)
+    );
+}
+
+/// The name an approved action runs under: no token's.
+const APPROVED: &str = "owner-approval";
+
+/// Puts a whole, well-formed token file under the name approved actions run under, as a release that still let one
+/// be minted would have left it: a token minted under another id, then renamed. Returns its secret file.
+fn old_reserved_token(scratch: &Scratch, hash_dir: &Path, id: &str) -> PathBuf {
+    let secret = mint(scratch, hash_dir, "operator", id);
+    fs::rename(
+        hash_dir.join(format!("{id}.hash")),
+        hash_dir.join(format!("{APPROVED}.hash")),
+    )
+    .expect("rename the hash file");
+    secret
+}
+
+/// A token store that holds a file under the name approved actions run under, left by an older release. The node
+/// starts; its other tokens work; the secret of that file is refused exactly as a secret no file holds, so the
+/// answer tells a caller nothing about the name; and the node says once, each time it reads its tokens, that the
+/// file is ignored and how it is removed. `token revoke` removes it.
+#[test]
+fn a_token_file_under_the_name_of_approved_actions_is_ignored_and_the_node_says_so_once_a_load() {
+    let owner = SkKey::from_seed(1);
+    let mut node = start_node_prepared(
+        "reserved-token",
+        &format!("{}\n", owner.line(NAMESPACE)),
+        None,
+        &|scratch, hash_dir| {
+            old_reserved_token(scratch, hash_dir, "old-1");
+        },
+    );
+    let old = node.scratch.path("old-1.secret");
+    let hash_dir = node.scratch.path("tokens");
+    assert!(hash_dir.join(format!("{APPROVED}.hash")).exists());
+    // A secret of the right shape that no file holds: what any unknown token is told.
+    let elsewhere = node.scratch.path("elsewhere");
+    fs::create_dir(&elsewhere).expect("another token directory");
+    fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    let unknown = mint(&node.scratch, &elsewhere, "operator", "nobody");
+    let stranger = call(&node, &unknown, "arca_status", &[]);
+    assert_eq!(code(&stranger), 4);
+    let refused_as_unknown = |node: &Node| {
+        let answer = call(node, &old, "arca_status", &[]);
+        assert_eq!(code(&answer), code(&stranger));
+        assert_eq!(
+            String::from_utf8_lossy(&answer.stderr),
+            String::from_utf8_lossy(&stranger.stderr),
+            "the answer is the one an unknown token gets"
+        );
+        assert_eq!(answer.stdout, stranger.stdout);
+    };
+    refused_as_unknown(&node);
+    let good = call(&node, &node.doctor, "arca_status", &[]);
+    assert_eq!(code(&good), 0, "{}", String::from_utf8_lossy(&good.stderr));
+
+    // A reload reads the directory again: the same three tokens, the same file left out.
+    let ran = token_reload(&node);
+    assert_eq!(code(&ran), 0, "{}", String::from_utf8_lossy(&ran.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&ran.stdout),
+        format!(
+            "reloaded: the node on this config (pid {}) read its tokens again and holds 3 token(s)\n",
+            node.serve.id()
+        )
+    );
+    refused_as_unknown(&node);
+    let good = call(&node, &node.viewer, "arca_status", &[]);
+    assert_eq!(code(&good), 0, "{}", String::from_utf8_lossy(&good.stderr));
+
+    // No token is minted under the name, and the refusal says why.
+    let minted = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", APPROVED, "--out",
+        ])
+        .arg(node.scratch.path("never.secret"))
+        .arg("--config")
+        .arg(&node.config)
+        .output()
+        .expect("run token mint");
+    assert_eq!(
+        code(&minted),
+        2,
+        "{}",
+        String::from_utf8_lossy(&minted.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&minted.stderr).contains(
+            "--id owner-approval is the name an action runs under once the owner approved it, and no token takes it: choose another id"
+        ),
+        "{}",
+        String::from_utf8_lossy(&minted.stderr)
+    );
+    assert!(!node.scratch.path("never.secret").exists());
+
+    // The file is removed with the command the node's line names.
+    let revoked = arca()
+        .args(["token", "revoke", APPROVED, "--config"])
+        .arg(&node.config)
+        .output()
+        .expect("run token revoke");
+    assert_eq!(
+        code(&revoked),
+        0,
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    assert!(!hash_dir.join(format!("{APPROVED}.hash")).exists());
+
+    let log = node.stop();
+    let line = "arca: token file owner-approval.hash is ignored: it uses the name an action runs under once the owner approved it, so no token of that name is accepted. Remove it with: arca token revoke owner-approval";
+    assert_eq!(
+        log.matches(line).count(),
+        2,
+        "once at the start and once at the reload, and not after the file is gone: {log}"
     );
 }
 

@@ -2224,8 +2224,9 @@ impl ActionExecutor {
     }
 }
 
-/// The token an approved action's handler is called as: no token a person holds.
-const APPROVED_CALLER: &str = "owner-approval";
+/// The token an approved action's handler is called as: no token a person holds, since no token may be minted
+/// under it.
+const APPROVED_CALLER: &str = arca_mcp::auth::APPROVED_ACTION_ID;
 
 /// The kernel's write gate, shared by the service, database and tenant handlers and by the front pass.
 fn write_gate(kernel: &Mutex<Kernel>) -> Arc<Mutex<()>> {
@@ -3618,8 +3619,8 @@ fn enrich_service_create(
             return Err(refusal);
         }
         // The node's own project and network are written with the first service that needs them: a write the
-        // create would refuse is refused now.
-        if tenant.is_none() {
+        // create would refuse is refused now. Not on a node that only looks, whose proposal is recorded as before.
+        if tenant.is_none() && !node_only_looks(cfg) {
             ensure_netproject(entries, cfg).map_err(no_service_project)?;
         }
         tenants::joinable_deploy(cfg, tenant.as_ref(), payload, APPROVED_CALLER, now)?;
@@ -3690,8 +3691,9 @@ fn enrich_service_create(
         return Err(refusal);
     }
     // Last, the write of the node's own project that the create would refuse: its entry would carry a count of
-    // virtual machines below what the node holds.
-    if tenant.is_none() {
+    // virtual machines below what the node holds. Not on a node that only looks, whose proposal is recorded as
+    // before.
+    if tenant.is_none() && !node_only_looks(cfg) {
         project_changes(
             entries,
             cfg,
@@ -3713,7 +3715,8 @@ fn enrich_service_create(
 /// create: a deploy named outside a tenant, a config that sets up no service project for it, a name a function
 /// holds, and a name a service holds. All of it is read from the node's config and its records. Whether an instance
 /// Arca holds no record of has the name is read from Incus, and the create asks that. A node that only looks
-/// records the proposal as before, and its create refuses.
+/// records the proposal as before, and its create refuses: neither its config's service project nor the write of
+/// that project ([`enrich_service_create`]) is asked about there.
 fn proposed_before_template(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],

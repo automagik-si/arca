@@ -14,6 +14,14 @@ service project. A proposal with a bad name is told about the name first. What i
 an instance Arca does not know, a local image) is still asked by the approved create alone; `docs/OPERATING.md`
 lists it.
 
+No token can be minted with the id `owner-approval` any more: it is the name an approved action runs under. If your
+token directory holds `owner-approval.hash` from an earlier release, the node still starts, ignores that file and says
+so in its log; remove it with `arca token revoke owner-approval`.
+
+The refusal of a create that names a deploy somebody else opened is reworded, so it is true for every caller: "deploy
+<id> was opened by another caller: only the caller that opened a deploy adds to it, and an approved action runs as the
+owner's approval, never as the token that proposed it". A client that matched the old sentence must match this one.
+
 A card that waits while the node is upgraded to the version that binds a template's content (a create, or a database
 made from the template) is now refused when its approval is submitted, and the approval is not used; propose it
 again. Before, the approval was accepted and the create then refused.

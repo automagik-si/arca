@@ -362,9 +362,7 @@ pub(super) fn joinable_deploy(
         })?;
     if let Some(open) = deploys(cfg)?.get(&(scope.id.clone(), id.to_string())) {
         if open.token != token {
-            return Err(service_refused(format!(
-                "deploy {id} was opened by another token: only the token that opened a deploy adds to it"
-            )));
+            return Err(service_refused(deploy_of_another_caller(id)));
         }
         if !open.provisional(now) {
             return Err(service_refused(format!(
@@ -373,6 +371,15 @@ pub(super) fn joinable_deploy(
         }
     }
     Ok(Some(id.to_string()))
+}
+
+/// Why a create does not join a deploy another caller opened. One sentence for every reader of it: a token that
+/// names a deploy another token opened, a token that names a deploy a card opened, and a card (when it is proposed
+/// and when its approved create runs) that names a deploy a token opened, the proposing token's own included.
+fn deploy_of_another_caller(id: &str) -> String {
+    format!(
+        "deploy {id} was opened by another caller: only the caller that opened a deploy adds to it, and an approved action runs as the owner's approval, never as the token that proposed it"
+    )
 }
 
 /// The deploy an entry of a tenant was created in, when it names one.

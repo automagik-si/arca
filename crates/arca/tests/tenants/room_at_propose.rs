@@ -386,7 +386,7 @@ fn a_tenants_data_volume_with_no_stated_size_is_refused_when_it_is_proposed() {
 }
 
 /// Every file under the node's state directory, with its bytes.
-fn state(rig: &Rig) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+pub(super) fn state(rig: &Rig) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     fn walk(dir: &std::path::Path, found: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
         for entry in fs::read_dir(dir).expect("the directory").flatten() {
             let path = entry.path();

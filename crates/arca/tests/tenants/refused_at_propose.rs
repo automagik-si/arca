@@ -39,16 +39,38 @@ fn approve(rig: &Rig, proposal: &Value) -> Result<Value, CallError> {
     .run(&approved.action, &approved.args, &approved.grant)
 }
 
-/// The proposal is refused with exactly what the create answers a token for the same arguments, no card waits and
-/// nothing is written.
-fn refused_as_the_create(rig: &Rig, args: Value, words: &str) {
+/// The create as the approved action runs it: under the approval's own name, never under a token's.
+fn as_the_approved_create(rig: &Rig, args: Value) -> Result<Value, CallError> {
+    rig.call_token("owner-approval", "service_create", args, &TOOLS)
+}
+
+/// Runs a proposal that must be refused, and checks that it left no card, wrote nothing to Incus and changed no
+/// file under the node's state directory (the proposals' journal, the deploy journal and the kernel's own among
+/// them).
+fn untouched(
+    rig: &Rig,
+    proposal: impl FnOnce() -> Result<Value, CallError>,
+) -> Result<Value, CallError> {
     let cards = waiting(rig);
     let writes = rig.fake().writes().len();
-    let create = refusal(rig.call("service_create", args.clone()));
-    assert_eq!(create.1, words, "the create's own words");
-    assert_eq!(refusal(propose(rig, args)), create);
+    let before = room_at_propose::state(rig);
+    let answer = proposal();
+    assert!(answer.is_err(), "the proposal is refused: {answer:?}");
     assert_eq!(waiting(rig), cards, "no card waits");
     assert_eq!(rig.fake().writes().len(), writes, "nothing was written");
+    assert!(
+        room_at_propose::state(rig) == before,
+        "a refused proposal changed a file"
+    );
+    answer
+}
+
+/// The proposal is refused with exactly what the create answers a token for the same arguments, no card waits and
+/// nothing is written: not to Incus, and no file under the node's state directory changes.
+fn refused_as_the_create(rig: &Rig, args: Value, words: &str) {
+    let create = refusal(rig.call("service_create", args.clone()));
+    assert_eq!(create.1, words, "the create's own words");
+    assert_eq!(refusal(untouched(rig, || propose(rig, args))), create);
 }
 
 /// A node with the service network, one host bridge and room for virtual machines; with tenants when asked.
@@ -115,14 +137,14 @@ fn a_deploy_named_outside_a_tenant_is_refused_when_it_is_proposed() {
         matches!(&create, CallError::Invalid(why) if why == "deploy: only a call inside a tenant names a deploy"),
         "{create:?}"
     );
-    let proposed = propose(&rig, args).expect_err("refused");
+    let proposed = untouched(&rig, || propose(&rig, args)).expect_err("refused");
     assert_eq!(format!("{proposed:?}"), format!("{create:?}"));
-    assert_eq!(waiting(&rig), 0);
 }
 
 /// The approved create runs as the approval's own caller, never as a token. So a card may open a deploy, and a
 /// second card may add to it while it is provisional; a card that names a deploy a token opened is refused when it
-/// is proposed, and so is one that names a deploy that is closed.
+/// is proposed, and so is one that names a deploy that is closed. Each refusal is compared with what the approved
+/// create itself answers for the same arguments.
 #[test]
 fn a_deploy_the_approved_create_could_not_add_to_is_refused_when_it_is_proposed() {
     let rig = two_tenants(policy());
@@ -133,17 +155,30 @@ fn a_deploy_the_approved_create_could_not_add_to_is_refused_when_it_is_proposed(
         &TOOLS,
     )
     .expect("a token opens the deploy d1");
-    let before = (waiting(&rig), rig.fake().writes().len());
-    let (code, message) = refusal(propose(
-        &rig,
-        json!({ "name": "web", "template": "app", "tenant": A, "deploy": "d1" }),
-    ));
-    assert_eq!(code, "refused");
+    let args = json!({ "name": "web", "template": "app", "tenant": A, "deploy": "d1" });
+    let create = refusal(as_the_approved_create(&rig, args.clone()));
     assert_eq!(
-        message,
-        "deploy d1 was opened by another token: only the token that opened a deploy adds to it"
+        create,
+        (
+            "refused".to_string(),
+            "deploy d1 was opened by another caller: only the caller that opened a deploy adds to it, and an approved action runs as the owner's approval, never as the token that proposed it".to_string()
+        )
     );
-    assert_eq!((waiting(&rig), rig.fake().writes().len()), before);
+    assert_eq!(
+        refusal(untouched(&rig, || propose(&rig, args.clone()))),
+        create
+    );
+    // A proposal by the very token that opened the deploy gets the same sentence, and it is true for that token too.
+    let by_its_opener = untouched(&rig, || {
+        rig.call_token(
+            "cloud",
+            "action_propose",
+            json!({ "action": "service_create", "args": args }),
+            &["action_propose"],
+        )
+    });
+    assert_eq!(refusal(by_its_opener), create);
+
     // A card opens a deploy of its own, and a second card adds to it.
     let first = propose(
         &rig,
@@ -157,19 +192,30 @@ fn a_deploy_the_approved_create_could_not_add_to_is_refused_when_it_is_proposed(
     )
     .expect("a card adds to the deploy a card opened");
     approve(&rig, &second).expect("and its create joins d2");
-    // Fifteen minutes later d2 is closed: a third card for it is refused when proposed.
-    rig.clock.fetch_add(16 * 60 * 1000, Ordering::SeqCst);
-    let before = (waiting(&rig), rig.fake().writes().len());
-    let (code, message) = refusal(propose(
-        &rig,
-        json!({ "name": "late", "template": "app", "tenant": A, "deploy": "d2" }),
+    // A token does not add to the deploy a card opened, and is told the same sentence.
+    let (_, message) = refusal(rig.call_token(
+        "cloud",
+        "service_create",
+        json!({ "name": "more", "template": "app", "tenant": A, "deploy": "d2" }),
+        &TOOLS,
     ));
-    assert_eq!(code, "refused");
-    assert_eq!(
-        message,
-        "deploy d2 is closed: it was confirmed, rolled back, or opened more than 15 minutes ago. Use a new deploy id"
+    assert!(
+        message.starts_with("deploy d2 was opened by another caller:"),
+        "{message}"
     );
-    assert_eq!((waiting(&rig), rig.fake().writes().len()), before);
+
+    // Fifteen minutes later d2 is closed: a third card for it is refused when proposed, as its create would be.
+    rig.clock.fetch_add(16 * 60 * 1000, Ordering::SeqCst);
+    let args = json!({ "name": "late", "template": "app", "tenant": A, "deploy": "d2" });
+    let create = refusal(as_the_approved_create(&rig, args.clone()));
+    assert_eq!(
+        create,
+        (
+            "refused".to_string(),
+            "deploy d2 is closed: it was confirmed, rolled back, or opened more than 15 minutes ago. Use a new deploy id".to_string()
+        )
+    );
+    assert_eq!(refusal(untouched(&rig, || propose(&rig, args))), create);
 }
 
 #[test]
@@ -232,16 +278,18 @@ fn a_mac_another_record_holds_is_refused_when_it_is_proposed() {
         json!({ "name": "m1", "template": "bare", "bridge": "br0", "mac": "02:00:00:00:00:01" }),
     )
     .expect("the machine that holds the MAC");
-    // Stated in upper case: it is the same address.
     refused_as_the_create(
         &rig,
         json!({ "name": "m2", "template": "bare", "bridge": "br0", "mac": "02:00:00:00:00:01" }),
         "the MAC 02:00:00:00:00:01 is already held by another instance",
     );
-    let (_, message) = refusal(propose(
-        &rig,
-        json!({ "name": "m2", "template": "bare", "bridge": "br0", "mac": "02:00:00:00:00:01".to_uppercase() }),
-    ));
+    // Stated in upper case: it is the same address.
+    let (_, message) = refusal(untouched(&rig, || {
+        propose(
+            &rig,
+            json!({ "name": "m2", "template": "bare", "bridge": "br0", "mac": "02:00:00:00:00:01".to_uppercase() }),
+        )
+    }));
     assert_eq!(
         message,
         "the MAC 02:00:00:00:00:01 is already held by another instance"
@@ -256,24 +304,24 @@ fn a_mac_another_record_holds_is_refused_when_it_is_proposed() {
 /// A node whose config makes changes but leaves the service project out, or sets up no service network.
 #[test]
 fn a_config_with_no_service_project_is_refused_when_a_create_is_proposed() {
-    for (kernel, words) in [(
+    let rig = Rig::with_kernel(
         json!({ "projects": ["elsewhere"], "droiddProjects": ["other"], "serviceCidr": CIDR }),
+        empty_state(),
+    );
+    rig.template("app", app_template("app"));
+    refused_as_the_create(
+        &rig,
+        json!({ "name": "one", "template": "app" }),
         "no service project: the service project is excluded by kernel configuration",
-    )] {
-        let rig = Rig::with_kernel(kernel, empty_state());
-        rig.template("app", app_template("app"));
-        refused_as_the_create(&rig, json!({ "name": "one", "template": "app" }), words);
-    }
+    );
     // No service network at all: the words name the keys the config needs.
     let rig = Rig::with_kernel(
         json!({ "projects": ["elsewhere"], "droiddProjects": ["other"] }),
         empty_state(),
     );
     rig.template("app", app_template("app"));
-    let create = refusal(rig.call(
-        "service_create",
-        json!({ "name": "one", "template": "app" }),
-    ));
+    let args = json!({ "name": "one", "template": "app" });
+    let create = refusal(rig.call("service_create", args.clone()));
     assert!(
         create
             .1
@@ -281,11 +329,65 @@ fn a_config_with_no_service_project_is_refused_when_a_create_is_proposed() {
         "{}",
         create.1
     );
-    assert_eq!(
-        refusal(propose(&rig, json!({ "name": "one", "template": "app" }))),
-        create
+    assert_eq!(refusal(untouched(&rig, || propose(&rig, args))), create);
+}
+
+/// A node that ran services, restarted with a config that sets up none: it still holds their records, and it can
+/// serve none of them. The create says so, and now the proposal does.
+#[test]
+fn records_of_services_without_a_config_for_them_refuse_a_proposed_create() {
+    let mut rig = Rig::with_kernel(
+        json!({ "projects": [PROJECT], "droiddProjects": ["other"], "serviceCidr": CIDR }),
+        empty_state(),
     );
-    assert_eq!(waiting(&rig), 0);
+    rig.template("app", app_template("app"));
+    rig.call(
+        "service_create",
+        json!({ "name": "one", "template": "app" }),
+    )
+    .expect("a service while the config sets services up");
+    rig.kernel_config = json!({ "projects": ["elsewhere"], "droiddProjects": ["other"] });
+    let rig = rig.restart();
+    let args = json!({ "name": "two", "template": "app" });
+    let create = refusal(rig.call("service_create", args.clone()));
+    assert!(
+        create.1.starts_with(
+            "no service project: this node's config sets up no services, but the node still holds records of services it ran."
+        ),
+        "{}",
+        create.1
+    );
+    assert_eq!(refusal(untouched(&rig, || propose(&rig, args))), create);
+}
+
+/// A node that only looks is left as it was: a proposed create is recorded there, for a container and for a machine
+/// on the service network alike, and it is the create that answers that the node only looks. Nothing about the
+/// node's project is asked when the proposal is made.
+#[test]
+fn a_node_that_only_looks_still_records_a_proposed_create() {
+    let rig = Rig::with_kernel(
+        json!({
+            "droiddProjects": [],
+            "serviceCidr": CIDR,
+            "vmLimits": { "virtualMachines": 4, "cpu": 16, "memory": "64GiB", "disk": "1TiB" }
+        }),
+        empty_state(),
+    );
+    rig.template("app", app_template("app"));
+    rig.template("vm", vm_template());
+    for (name, template) in [("one", "app"), ("box", "vm")] {
+        let args = json!({ "name": name, "template": template });
+        let card = propose(&rig, args.clone())
+            .unwrap_or_else(|error| panic!("{template}: a card is recorded as before: {error:?}"));
+        assert_eq!(card["args"]["name"], name);
+        let (code, message) = refusal(rig.call("service_create", args));
+        assert_eq!(code, "refused");
+        assert!(
+            message.starts_with("this node only looks: nothing here can be changed"),
+            "{template}: {message}"
+        );
+    }
+    assert_eq!(waiting(&rig), 2);
 }
 
 /// The node's config is changed to allow fewer virtual machines than the node holds, and the node is restarted. The
@@ -305,14 +407,11 @@ fn a_count_of_virtual_machines_below_what_the_node_holds_is_refused_when_a_creat
     let rig = rig.restart();
     rig.template("app", app_template("app"));
     let args = json!({ "name": "one", "template": "app" });
-    let writes = rig.fake().writes().len();
     let create = listed(rig.call("service_create", args.clone()));
     assert_eq!(create.0, "capacity");
     assert_eq!(
         create.1,
         "this node holds 2 virtual machines, but kernel.bridged.limits.virtualMachines is 1: raise it to at least 2, or remove virtual machines first. Nothing was written"
     );
-    assert_eq!(listed(propose(&rig, args)), create);
-    assert_eq!(waiting(&rig), 0, "no card waits");
-    assert_eq!(rig.fake().writes().len(), writes, "nothing was written");
+    assert_eq!(listed(untouched(&rig, || propose(&rig, args))), create);
 }

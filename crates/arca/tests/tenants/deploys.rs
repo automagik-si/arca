@@ -153,10 +153,12 @@ fn a_rollback_inside_the_window_removes_exactly_the_deploys_own_things() {
     ] {
         let (code, message) = refusal(by(&rig, "other", verb, args));
         assert_eq!(code, "refused", "{verb}");
-        assert!(
-            message.contains("only the token that opened"),
-            "{verb}: {message}"
-        );
+        let words = if verb == "service_create" {
+            "only the caller that opened a deploy adds to it"
+        } else {
+            "only the token that opened"
+        };
+        assert!(message.contains(words), "{verb}: {message}");
     }
     // A deploy is one tenant's: the same id in B, or an id nobody opened, is not found.
     for args in [
