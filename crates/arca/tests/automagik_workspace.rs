@@ -312,6 +312,19 @@ impl Workspace {
         fs::remove_file(dir.join("running")).expect("stopped");
     }
 
+    /// Whether this container's `nth` `docker run` has finished starting it. The fake docker writes the call down
+    /// first and the container's `running` file last, so a count of calls alone can be seen while the run is still
+    /// under way: the container is not there to end yet, and a run that joins another one has not yet looked at it.
+    fn started(&self, name: &str, nth: usize) -> bool {
+        self.runs(name).len() == nth
+            && self
+                .dir
+                .join("docker/containers")
+                .join(name)
+                .join("running")
+                .exists()
+    }
+
     /// The `docker run` calls that named this container, in order.
     fn runs(&self, name: &str) -> Vec<String> {
         self.read("docker/calls.log")
@@ -379,11 +392,12 @@ fn bash_version() -> String {
 }
 
 fn wait_for(workspace: &Workspace, what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let waited = Duration::from_secs(30);
+    let deadline = Instant::now() + waited;
     while !ready() {
         assert!(
             Instant::now() < deadline,
-            "waited for {what}; the keeper said:\n{}\nand docker was asked:\n{}",
+            "waited {waited:?} for {what}; the keeper said:\n{}\nand docker was asked:\n{}",
             workspace.output(),
             workspace.read("docker/calls.log")
         );
@@ -1081,8 +1095,8 @@ fn a_new_token_replaces_the_tunnel_only_and_the_others_follow_the_server() {
         &workspace,
         "TUNNEL_TOKEN changed: the tunnel is started again with the new one",
     );
-    wait_for(&workspace, "the second tunnel", || {
-        workspace.runs("automagik-tunnel").len() == 2
+    wait_for(&workspace, "the second tunnel to be running", || {
+        workspace.started("automagik-tunnel", 2)
             && workspace
                 .read("docker/containers/automagik-tunnel/token.sha256")
                 .trim()
@@ -1098,8 +1112,8 @@ fn a_new_token_replaces_the_tunnel_only_and_the_others_follow_the_server() {
         &workspace,
         "the tunnel stopped (exit code 1); it is started again after a pause. When it keeps stopping, the usual cause is a token Cloudflare does not accept: set TUNNEL_TOKEN again",
     );
-    wait_for(&workspace, "the third tunnel", || {
-        workspace.runs("automagik-tunnel").len() == 3
+    wait_for(&workspace, "the third tunnel to be running", || {
+        workspace.started("automagik-tunnel", 3)
     });
 
     // The gate ends, as it does on a server image that has no gate: said, and started again; the others stay.
@@ -1108,8 +1122,8 @@ fn a_new_token_replaces_the_tunnel_only_and_the_others_follow_the_server() {
         &workspace,
         "the gate stopped (exit code 1); it is started again after a pause.",
     );
-    wait_for(&workspace, "the second gate", || {
-        workspace.runs("automagik-gate").len() == 2
+    wait_for(&workspace, "the second gate to be running", || {
+        workspace.started("automagik-gate", 2)
     });
     assert_eq!(workspace.runs("automagik-server").len(), 1);
     assert_eq!(workspace.runs("automagik-tunnel").len(), 3);
