@@ -346,7 +346,7 @@ fn mcp_output_schema(v: &Verb) -> Value {
         }
         props.insert(
             ONLY_LOOKS_KEY.to_string(),
-            json!({ "type": "string", "description": "Present on a node that only looks (watch-only): what is shown is there, and nothing of it can be changed through this node until changes are turned on again." }),
+            json!({ "type": "string", "description": "Present on a node that only looks (watch-only): what is shown is there, and nothing of it can be changed through this node until the node is running with changes turned on (arca init --enable-changes, then a restart of the node if init did not restart it)." }),
         );
         props.insert(
             "truncated".to_string(),

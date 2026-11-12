@@ -663,3 +663,166 @@ fn one_owner_approval_removes_everything_a_confirmed_deploy_created_and_nothing_
         "remove deploy d1: nothing of it is left in tenant aaaaaaaa"
     );
 }
+
+/// Every regular file under `dir`, with its content: the node's records, its journal, its secret files.
+fn files_under(dir: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut left = vec![dir.to_path_buf()];
+    while let Some(at) = left.pop() {
+        for entry in fs::read_dir(&at)
+            .expect("read the state directory")
+            .flatten()
+        {
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).expect("stat");
+            if meta.is_dir() {
+                left.push(path);
+            } else if meta.is_file() {
+                files.insert(path.clone(), fs::read(&path).unwrap_or_default());
+            }
+        }
+    }
+    files
+}
+
+/// Writes that would all succeed on a node that makes changes: the tenant, the services, the template, the deploy and
+/// the approved grant are all real. On the same node set back to watch-only each is refused, and nothing changes.
+#[test]
+fn on_a_node_set_back_to_watch_only_writes_that_would_succeed_are_refused_and_change_nothing() {
+    // Tenant A holds `old`, the deploy d1 (`db`, `web`, opened by the token `cloud`) and a link; tenant B is there too.
+    let rig = deployed();
+    // A service with a secret that is set: its file is on disk.
+    let mut keyed = app_template("keyed");
+    keyed["secrets"] = json!(["API_TOKEN"]);
+    rig.template("keyed", keyed);
+    rig.call(
+        "service_create",
+        json!({ "name": "keyed", "template": "keyed", "tenant": A }),
+    )
+    .expect("a service with a secret");
+    rig.call(
+        "service_secret_set",
+        json!({ "name": "keyed", "key": "API_TOKEN", "value": "the-first-value-0123456789", "tenant": A }),
+    )
+    .expect("the secret is stored");
+    // An approval the owner really gave, for removing tenant B, not yet used.
+    let remove_b = json!({ "id": B });
+    let proposed = rig
+        .call(
+            "action_propose",
+            json!({ "action": "tenant_remove", "args": remove_b }),
+        )
+        .expect("the proposal");
+    let id = proposed["id"].as_str().expect("the proposal's id");
+    let digest = proposed["argsDigest"].as_str().expect("its digest");
+    let nonce = format!("{:064x}", rig.nonce.fetch_add(1, Ordering::SeqCst) + 1);
+    let statement =
+        arca::handlers::action_statement("node1", id, "tenant_remove", digest, rig.now(), &nonce)
+            .expect("the statement");
+    let approval = common::approve_statement(&rig.key, &statement);
+    let approved = arca::handlers::approve_action(
+        &mut rig.kernel.lock().expect("kernel"),
+        &json!({ "plan": id, "approval": approval }),
+        rig.now(),
+    )
+    .expect("the owner's approval");
+
+    // The node as `arca init --watch-only` leaves it: the same records, tenants policy and subnet, no kernel project.
+    let mut cfg = (*rig.cfg).clone();
+    cfg.kernel.projects.clear();
+    let cfg = Arc::new(cfg);
+    let time: arca::handlers::Clock = Arc::new(|| NOW);
+    let looks: HashMap<&'static str, Arc<dyn ToolHandler>> =
+        tenant_handlers(rig.kernel.clone(), time.clone(), cfg.clone())
+            .into_iter()
+            .chain(service_handlers(rig.kernel.clone(), time, cfg))
+            .collect();
+    let entries = rig.entries();
+    let files = files_under(&rig.dir);
+    let writes = rig.fake().writes().len();
+    assert!(
+        files
+            .keys()
+            .any(|path| path.to_string_lossy().contains("secrets")),
+        "a secret file is there to be kept: {:?}",
+        files.keys().collect::<Vec<_>>()
+    );
+
+    let sentence = arca_mcp::jsonrpc::ONLY_LOOKS_NOTE;
+    let cloud = Caller {
+        token_id: "cloud".into(),
+        scope: Scope::Doctor,
+        tools: Some(TOOLS.iter().map(|tool| tool.to_string()).collect()),
+    };
+    let doctor = Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    for (verb, args, caller) in [
+        (
+            "service_secret_set",
+            json!({ "name": "keyed", "key": "API_TOKEN", "value": "another-value-9876543210", "tenant": A }),
+            &doctor,
+        ),
+        (
+            "service_create",
+            json!({ "name": "more", "template": "app", "tenant": A }),
+            &doctor,
+        ),
+        (
+            "service_connect",
+            json!({ "from": "old", "to": "db", "tenant": A }),
+            &cloud,
+        ),
+        (
+            "deploy_confirm",
+            json!({ "tenant": A, "deploy": "d1" }),
+            &cloud,
+        ),
+    ] {
+        let (code, message) = refusal(looks[verb].call(args, caller));
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("refused", sentence),
+            "{verb}"
+        );
+    }
+    // The approved removal, run as the approval page runs it, with the owner's grant.
+    let run = |handlers: &HashMap<&'static str, Arc<dyn ToolHandler>>| {
+        ActionExecutor::new(
+            handlers
+                .iter()
+                .map(|(verb, handler)| (*verb, Arc::clone(handler))),
+        )
+        .run(&approved.action, &approved.args, &approved.grant)
+    };
+    let (code, message) = refusal(run(&looks));
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("refused", sentence),
+        "tenant_remove"
+    );
+
+    // Nothing changed: every record, every file in the state directory (the secret among them), and Incus.
+    assert_eq!(rig.entries(), entries, "no record was saved");
+    assert_eq!(
+        files_under(&rig.dir),
+        files,
+        "no file changed, the secret's included"
+    );
+    assert_eq!(
+        rig.fake().writes().len(),
+        writes,
+        "Incus was not written to"
+    );
+
+    // The grant is still there: on the node that makes changes, the same approval removes tenant B, once.
+    run(&rig.handlers).expect("the grant was not spent by the refusal");
+    assert!(
+        !rig.entries()
+            .iter()
+            .any(|entry| entry.id.0 == format!("tenant-{B}")),
+        "tenant B is removed by the approval the refusal left unspent"
+    );
+}
