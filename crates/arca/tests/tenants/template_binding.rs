@@ -595,15 +595,40 @@ fn a_card_that_bound_no_content_is_refused_before_the_approval_is_spent() {
         let proposal = serde_json::to_value(&recorded).expect("json");
         assert!(proposal["args"].get("templateDigest").is_none());
         let writes = rig.fake().writes().len();
-        let (code, message) = refusal(approve(&rig, &proposal));
-        assert_eq!(code, "refused", "{template}");
-        assert_eq!(
-            message,
-            format!(
-                "this card was shown before this node bound a create to the content of its template ({template}), so it cannot be approved. Nothing was created and the approval was not used; propose it again"
-            )
-        );
-        // The approval was not spent: the proposal still waits, unapproved, and no grant was armed for it.
+        // One approval, signed once by the owner's passkey, submitted twice. An approval that had been checked would
+        // have spent its nonce the first time, and the second answer would be that of a replay. Both answers are
+        // the same refusal, so the approval was never checked and never spent.
+        let id = proposal["id"].as_str().expect("the proposal's id");
+        let nonce = format!("{:064x}", rig.nonce.fetch_add(1, Ordering::SeqCst) + 1);
+        let statement = arca::handlers::action_statement(
+            "node1",
+            id,
+            proposal["action"].as_str().expect("its action"),
+            proposal["argsDigest"].as_str().expect("its digest"),
+            rig.now(),
+            &nonce,
+        )
+        .expect("the statement");
+        let approval = common::approve_statement(&rig.key, &statement);
+        for attempt in ["first", "second"] {
+            let submitted = arca::handlers::approve_action(
+                &mut rig.kernel.lock().expect("kernel"),
+                &json!({ "plan": id, "approval": approval }),
+                rig.now(),
+            );
+            let Err(CallError::Refused { code, message }) = submitted else {
+                panic!("{template}, {attempt}: the unbound card is refused");
+            };
+            assert_eq!(code, "refused", "{template}, {attempt}");
+            assert_eq!(
+                message,
+                format!(
+                    "this card was shown before this node bound a create to the content of its template ({template}), so it cannot be approved. Nothing was created and the approval was not used; propose it again"
+                ),
+                "{template}, {attempt}"
+            );
+        }
+        // The proposal was not retired by either: it still waits, unapproved.
         let waiting = rig.call("plan_list", json!({})).expect("plans")["plans"]
             .as_array()
             .expect("plans")
@@ -611,13 +636,6 @@ fn a_card_that_bound_no_content_is_refused_before_the_approval_is_spent() {
         assert!(
             waiting.iter().any(|plan| plan["id"] == proposal["id"]),
             "{template}: it still waits"
-        );
-        assert!(
-            rig.kernel
-                .lock()
-                .expect("kernel")
-                .action_grant_id("anything")
-                .is_none()
         );
         assert!(!has_entry(&rig, "service-old"), "{template}");
         assert_eq!(rig.fake().writes().len(), writes, "{template}");
