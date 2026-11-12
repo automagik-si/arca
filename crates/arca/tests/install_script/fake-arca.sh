@@ -12,6 +12,10 @@
 #                  `"incusReachable":false` while $FAKE_DIR/node-cannot-reach-incus is there, and the loopback door
 #                  closed, as a node whose port another program holds reports it, while $FAKE_DIR/node-door-closed is; it
 #                  fails when no node runs, when the config is missing and when the token file is not private.
+#   --help         the usage, with the line for `init` unless $FAKE_DIR/program-without-init is there
+#   init           `init --enable-changes --yes --config <file>`: it refuses in words while $FAKE_DIR/init-refuses is
+#                  there; otherwise the node's mode becomes kernel, the config gains a key (so it is no longer the
+#                  installer's text) and it prints the first line of the real report. It restarts nothing here.
 #   serve          the installer must never start the node in the foreground: recorded, and it fails.
 #
 # The installer runs on a PATH of its own listed programs; the stand-in finds its tools on $FAKE_PATH.
@@ -44,6 +48,30 @@ flag() {
 case "${1-} ${2-}" in
   "--version "*)
     echo "Automagik Arca $version (fake000, x86_64-unknown-linux-gnu)"
+    ;;
+  "--help "*)
+    echo "usage: arca <command>"
+    echo "  serve --config <file>"
+    [ -e "$root/program-without-init" ] ||
+      echo "  init --enable-changes --config <file> [--yes] [--service-cidr <a.b.c.0/24>]"
+    ;;
+  "init --enable-changes")
+    [ "${3-}" = --yes ] || fail "the installer must answer init's question itself: --yes"
+    config=$(flag --config "$@") || fail "usage"
+    [ -f "$config" ] || fail "the config file cannot be read"
+    if [ -e "$root/init-refuses" ]; then
+      echo "arca: init changed nothing: this config has no approval page and no loopback door for one" >&2
+      exit 2
+    fi
+    sed -i 's/"droiddProjects": \[\]/"droiddProjects": ["default"], "projects": ["arcak-svc"]/' "$config"
+    echo kernel >"$root/node-mode"
+    echo "Arca may now make changes on this machine."
+    echo ""
+    echo "  Each change still waits for you: nothing runs until you approve it with your passkey."
+    echo "  No passkey is trusted yet, so nothing can be approved until you enrol the first one."
+    echo "    arca setup-code --config $config"
+    echo "To turn it back to a node that only looks:"
+    echo "  arca init --watch-only --config $config"
     ;;
   "token mint")
     scope=$(flag --scope "$@") || fail "usage"

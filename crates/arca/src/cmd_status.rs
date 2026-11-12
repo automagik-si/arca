@@ -116,7 +116,7 @@ fn next_step(watch_only: bool, incus: Option<bool>) -> &'static str {
     if incus == Some(false) {
         "Incus does not answer on incus.socket of the config. Check that Incus runs and that this user may use its socket."
     } else if watch_only {
-        "this node only looks. To let it make changes, the config must name kernel.projects (and kernel.serviceCidr for services); then restart the node."
+        "this node only looks. To let it make changes, with what is proposed waiting for your approval, run: arca init --enable-changes --config <this node's config>"
     } else {
         "nothing is needed. Ask your assistant, or read the node with: arca call watch_report"
     }
@@ -190,7 +190,7 @@ mod tests {
              Last applied change: none yet\n\
              Host metrics: read from the local host (Incus runs on this host)\n\
              MCP door: open, on the unix socket /run/user/1000/arca.sock\n\
-             Next: this node only looks. To let it make changes, the config must name kernel.projects (and kernel.serviceCidr for services); then restart the node."
+             Next: this node only looks. To let it make changes, with what is proposed waiting for your approval, run: arca init --enable-changes --config <this node's config>"
         );
     }
 
