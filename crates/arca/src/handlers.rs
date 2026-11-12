@@ -6701,8 +6701,10 @@ impl ToolHandler for ServiceHandler {
                 {
                     if let Some(_permit) = self.exec.journal_permit() {
                         let target = self.exec_target(&entry, &config)?;
+                        // The journal is always read at its most lines, and cut to the lines asked for only after
+                        // it is redacted: cut first, a caller could pick a window that starts inside a key.
                         let cmd = arca_incus::exec::ExecCommand::Journal(
-                            arca_incus::exec::JournalLines::new(lines).map_err(|_| {
+                            arca_incus::exec::JournalLines::new(200).map_err(|_| {
                                 CallError::Invalid("lines: expected 1 to 200".into())
                             })?,
                         );

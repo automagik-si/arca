@@ -3238,30 +3238,79 @@ fn credential_patterns() -> &'static [(regex::Regex, &'static str)] {
 /// few characters of such a file, too few to rebuild anything from; a PEM block is also hidden whole by its shape.
 pub const SECRET_LINE_MIN: usize = 16;
 
-/// A PEM block, from its BEGIN line to its END line, whatever is between; one whose END was not printed is hidden
-/// to the end of the text.
+/// A PEM label as RFC 7468 allows it: printable characters other than `-`, joined by single spaces or hyphens, so
+/// `RSA PRIVATE KEY`, `OpenVPN Static key V1` and `OpenVPN tls-crypt-v2 server key` are all labels.
+const PEM_LABEL: &str = r"[\x21-\x2C\x2E-\x7E](?:[- ]?[\x21-\x2C\x2E-\x7E]){0,63}";
+
+/// What may follow the BEGIN line of a PEM block whose END line was not printed: line breaks (also written as `\n`
+/// inside a string), and lines that are only base64 of at least 16 characters (a `/` may be written `\/`) or a PEM
+/// header (`Proc-Type: ...`). Ordinary text after it is not taken, so a log or a function's result after such a line
+/// stays shown; what can stay shown of a key is a last line shorter than 16 characters.
+const PEM_BODY: &str = r"(?:(?:\r\n|\r|\n|\\r|\\n|[ \t])*(?:(?:[A-Za-z0-9+=]|\\?/){16,}|(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset)[ \t]*:[^\r\n\\]*))*";
+
+/// A PEM block: from its BEGIN line to the next END line, whatever is between; or, when no END line follows, from its
+/// BEGIN line over the lines that look like a key's ([`PEM_BODY`]).
 fn pem_block() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static PEM: OnceLock<regex::Regex> = OnceLock::new();
     PEM.get_or_init(|| {
-        regex::Regex::new(
-            r"(?s)-----BEGIN [A-Z0-9 ]{1,64}-----.*?(?:-----END [A-Z0-9 ]{1,64}-----|\z)",
-        )
+        regex::Regex::new(&format!(
+            r"-----BEGIN {PEM_LABEL}-----(?:(?s:.*?)-----END {PEM_LABEL}-----|{PEM_BODY})"
+        ))
         .expect("the PEM pattern is valid")
     })
 }
 
+/// A PEM BEGIN line, and a PEM END line.
+fn pem_marker(kind: &str) -> regex::Regex {
+    regex::Regex::new(&format!(r"-----{kind} {PEM_LABEL}-----"))
+        .expect("the PEM marker pattern is valid")
+}
+
 /// Hides each whole PEM block in a text as it came, before it is cut into lines or cleaned: a key printed on a
-/// console is hidden whatever it is, a stored secret or not.
-pub fn redact_blocks(text: &str) -> std::borrow::Cow<'_, str> {
-    pem_block().replace_all(text, "[secret]")
+/// console is hidden whatever it is, a stored secret or not. A text that begins inside a block (its END line comes
+/// before any BEGIN line, as when the start of a log was cut away) is hidden from its start to that END line.
+pub fn redact_blocks(text: &str) -> String {
+    use std::sync::OnceLock;
+    static MARKERS: OnceLock<(regex::Regex, regex::Regex)> = OnceLock::new();
+    let (begin, end) = MARKERS.get_or_init(|| (pem_marker("BEGIN"), pem_marker("END")));
+    let mut text = std::borrow::Cow::Borrowed(text);
+    if let Some(first_end) = end.find(&text) {
+        let begins_before = begin
+            .find(&text)
+            .is_some_and(|first_begin| first_begin.start() < first_end.start());
+        if !begins_before {
+            text = std::borrow::Cow::Owned(format!("[secret]{}", &text[first_end.end()..]));
+        }
+    }
+    pem_block().replace_all(&text, "[secret]").into_owned()
+}
+
+/// What hides the stored secrets in a text: the values to replace, longest first, and the base64 body of each secret
+/// of several lines with its line breaks taken out. Made once by [`values_to_hide`] for a text of many lines and given
+/// to [`redact_hidden`] for each line.
+#[derive(Debug, Clone, Default)]
+pub struct Hidden {
+    values: Vec<String>,
+    bodies: Vec<String>,
+}
+
+/// A run of base64 of at least 16 characters, a `/` written as `\/` too, as a key's body is printed.
+fn base64_run() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static RUN: OnceLock<regex::Regex> = OnceLock::new();
+    RUN.get_or_init(|| {
+        regex::Regex::new(r"(?:[A-Za-z0-9+=]|\\?/){16,}").expect("the base64 pattern is valid")
+    })
 }
 
 /// The texts that hide `secrets`: each value whole, each value as [`clean_log`] shows it, and for a value of several
-/// lines each of its lines of at least [`SECRET_LINE_MIN`] characters, as it is and as it is shown cleaned. Longest first.
-/// Made once for a text of many lines and given to [`redact_hidden`] for each line.
-pub fn values_to_hide(secrets: &[String]) -> Vec<String> {
+/// lines each of its lines of at least [`SECRET_LINE_MIN`] characters, as it is and as it is shown cleaned. For a value
+/// of several lines, also its base64 body without line breaks, so a piece of it printed at another width, or with each
+/// `/` written `\/`, is found too.
+pub fn values_to_hide(secrets: &[String]) -> Hidden {
     let mut values: Vec<String> = Vec::new();
+    let mut bodies: Vec<String> = Vec::new();
     let mut add = |value: &str, shortest_chars: usize| {
         if value.len() >= 8
             && value.chars().count() >= shortest_chars
@@ -3278,23 +3327,50 @@ pub fn values_to_hide(secrets: &[String]) -> Vec<String> {
                 add(line.trim(), SECRET_LINE_MIN);
                 add(&clean_log(line), SECRET_LINE_MIN);
             }
+            let body: String = secret
+                .split(['\n', '\r'])
+                .filter(|line| !line.trim_start().starts_with("-----"))
+                .flat_map(str::chars)
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+                .collect();
+            if body.len() >= SECRET_LINE_MIN {
+                bodies.push(body);
+            }
         }
     }
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    values
+    Hidden { values, bodies }
 }
 
 /// Hides each PEM block, then every stored/rendered secret value (whole and, for one of several lines, line by line;
-/// longest first), then every credential pattern.
+/// longest first), then each run of base64 that is a piece of a stored body, then every credential pattern.
 pub fn redact_log(text: &str, secrets: &[String]) -> String {
     redact_hidden(text, &values_to_hide(secrets))
 }
 
-/// [`redact_log`] with the values to hide already made by [`values_to_hide`].
-pub fn redact_hidden(text: &str, hidden: &[String]) -> String {
-    let mut out = redact_blocks(text).into_owned();
-    for value in hidden {
+/// [`redact_log`] with what to hide already made by [`values_to_hide`].
+pub fn redact_hidden(text: &str, hidden: &Hidden) -> String {
+    let mut out = redact_blocks(text);
+    for value in &hidden.values {
         out = out.replace(value.as_str(), "[secret]");
+    }
+    if !hidden.bodies.is_empty() {
+        out = base64_run()
+            .replace_all(&out, |found: &regex::Captures| {
+                let piece = found[0].replace("\\/", "/");
+                let held = |piece: &str| hidden.bodies.iter().any(|body| body.contains(piece));
+                if held(&piece) {
+                    return "[secret]".to_string();
+                }
+                // A line break written `\n` or `\r` inside a string leaves its letter at the start of the next piece.
+                match piece.strip_prefix(['n', 'r']) {
+                    Some(rest) if rest.len() >= SECRET_LINE_MIN && held(rest) => {
+                        format!("{}[secret]", &piece[..1])
+                    }
+                    _ => found[0].to_string(),
+                }
+            })
+            .into_owned();
     }
     for (pattern, replacement) in credential_patterns() {
         out = pattern.replace_all(&out, *replacement).into_owned();
@@ -3326,7 +3402,7 @@ mod redaction_tests {
         // A stored secret of three lines, printed by a failing command on its error stream with the lines apart.
         let secret = format!("{}\n", lines(7, 3, 40).join("\n"));
         let stderr = format!("cannot load:\n{secret}giving up\n");
-        let shown = crate::service_exec::failure_text(&stderr, &[secret.clone()]);
+        let shown = crate::service_exec::failure_text(&stderr, std::slice::from_ref(&secret));
         let leaks = secret.lines().any(|line| shown.contains(line));
         assert!(!leaks, "a line of the secret is in the failure's words");
         assert!(shown.starts_with("cannot load:") && shown.ends_with("giving up"));
@@ -3337,12 +3413,142 @@ mod redaction_tests {
         let long = lines(9, 1, SECRET_LINE_MIN).remove(0);
         let short = lines(11, 1, SECRET_LINE_MIN - 1).remove(0);
         let secret = format!("{long}\n{short}\n");
-        let hidden = redact_log(&format!("a {long} b"), &[secret.clone()]);
+        let hidden = redact_log(&format!("a {long} b"), std::slice::from_ref(&secret));
         assert!(
             hidden == "a [secret] b",
             "a line of the shortest length hidden is not hidden"
         );
         let kept = redact_log(&format!("a {short} b"), &[secret]);
         assert!(kept == format!("a {short} b"), "a shorter line is hidden");
+    }
+
+    /// A key file of `lines` body lines of `width` base64 characters between its BEGIN and END lines, from a counter.
+    fn key(label: &str, seed: u32, lines: usize, width: usize) -> (String, Vec<String>) {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut state = seed;
+        let body: Vec<String> = (0..lines)
+            .map(|_| {
+                (0..width)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        ALPHABET[(state >> 24) as usize % ALPHABET.len()] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let text = format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            body.join("\n")
+        );
+        (text, body)
+    }
+
+    /// Whether `shown` holds any 16 characters of `body` in a row.
+    fn shows_any(shown: &str, body: &[String]) -> bool {
+        let joined: String = body.concat();
+        let shown = shown.replace("\\/", "/");
+        (0..joined.len().saturating_sub(15)).any(|at| shown.contains(&joined[at..at + 16]))
+    }
+
+    #[test]
+    fn a_begin_line_without_its_end_hides_the_key_after_it_and_not_the_text_after_the_key() {
+        let word = ["PRI", "VATE"].concat();
+        // A line that only names the marker: the marker goes, the words stay.
+        let usage =
+            "usage: paste a key that starts with -----BEGIN CERTIFICATE----- here\nnext line";
+        assert_eq!(
+            redact_blocks(usage),
+            "usage: paste a key that starts with [secret] here\nnext line"
+        );
+        // A key cut before its END line: its lines go, the line after it stays.
+        let (whole, body) = key(&format!("RSA {word} KEY"), 3, 4, 64);
+        let cut: String = whole.lines().take(5).collect::<Vec<_>>().join("\n");
+        let shown = redact_blocks(&format!("{cut}\nready"));
+        assert!(!shows_any(&shown, &body), "a piece of the cut key is shown");
+        assert!(
+            shown.ends_with("\nready"),
+            "the line after the key is hidden"
+        );
+        // A function's result after such a line is still one JSON object.
+        let result = r#"{"ok":false,"error":"no -----BEGIN CERTIFICATE----- found"}"#;
+        assert_eq!(
+            redact_blocks(result),
+            r#"{"ok":false,"error":"no [secret] found"}"#
+        );
+    }
+
+    #[test]
+    fn a_text_that_begins_inside_a_key_is_hidden_from_its_start_to_the_end_line() {
+        let word = ["PRI", "VATE"].concat();
+        let (whole, body) = key(&format!("EC {word} KEY"), 5, 4, 64);
+        let inside: String = whole.lines().skip(2).collect::<Vec<_>>().join("\n");
+        let shown = redact_blocks(&format!("{inside}\nlistening\n"));
+        assert!(!shows_any(&shown, &body), "a piece of the key is shown");
+        assert_eq!(shown, "[secret]\nlistening\n");
+        // An END line after its BEGIN line is an ordinary block.
+        assert_eq!(redact_blocks(&format!("a\n{whole}b")), "a\n[secret]\nb");
+    }
+
+    #[test]
+    fn a_label_with_lowercase_letters_or_hyphens_is_a_pem_label() {
+        for label in ["OpenVPN Static key V1", "OpenVPN tls-crypt-v2 server key"] {
+            let (whole, body) = key(label, 7, 3, 32);
+            let shown = redact_blocks(&format!("start\n{whole}done"));
+            assert!(
+                !shows_any(&shown, &body),
+                "{label}: a piece of the key is shown"
+            );
+            assert_eq!(shown, "start\n[secret]\ndone", "{label}");
+        }
+    }
+
+    #[test]
+    fn a_stored_key_printed_at_another_width_or_with_escaped_slashes_is_hidden() {
+        let word = ["PRI", "VATE"].concat();
+        let (stored, body) = key(&format!("RSA {word} KEY"), 11, 8, 64);
+        let joined = body.concat();
+        // The body alone, without its marker lines, wrapped at 76 as another tool prints it.
+        let rewrapped: Vec<String> = joined
+            .as_bytes()
+            .chunks(76)
+            .map(|chunk| format!("key: {}", String::from_utf8_lossy(chunk)))
+            .collect();
+        let hidden = values_to_hide(std::slice::from_ref(&stored));
+        for line in &rewrapped {
+            let shown = redact_hidden(line, &hidden);
+            assert!(
+                !shows_any(&shown, &body),
+                "a re-wrapped piece of the key is shown"
+            );
+        }
+        // The body as one JSON string whose encoder writes each / as \/.
+        let escaped = format!(r#"{{"key":"{}"}}"#, body.join(r"\n").replace('/', r"\/"));
+        let shown = redact_hidden(&escaped, &hidden);
+        assert!(
+            !shows_any(&shown, &body),
+            "an escaped piece of the key is shown"
+        );
+        // A run of base64 that is no piece of the key stays.
+        let other = "sha256:0123456789abcdef0123456789abcdef";
+        assert_eq!(redact_hidden(other, &hidden), other);
+    }
+
+    #[test]
+    fn a_failures_words_hide_a_secret_with_two_spaces_inside_a_line() {
+        let line = lines(13, 1, 20).remove(0);
+        let secret = format!(
+            "{}  {}\n{}\n",
+            &line[..10],
+            &line[10..],
+            lines(17, 1, 30).remove(0)
+        );
+        let stderr = format!("cannot load:\n{secret}giving up\n");
+        let shown = crate::service_exec::failure_text(&stderr, std::slice::from_ref(&secret));
+        let first = secret.lines().next().expect("a first line");
+        let folded = clean_log(first);
+        assert!(
+            !shown.contains(first) && !shown.contains(&folded),
+            "the line with two spaces is in the failure's words"
+        );
     }
 }

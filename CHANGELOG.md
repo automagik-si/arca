@@ -17,12 +17,23 @@ the upgrade is refused when approved, and must be proposed again.
 A create is refused when the instance it would get has the name of another service's instance on the node: the
 node's own service `x-<tenant id>` and that tenant's service `x`. Before, the second one was recorded and Incus
 refused it.
+
 A secret of several lines, such as a key file a virtual machine reads, is now hidden in `service_logs`, in a failed
 command's words and in a function's output. Before, a log was cleaned line by line before the stored values were looked
 for, so a value of several lines was never found and a key the guest printed on its console was shown to any token
-that may read logs. Each line of such a secret of 16 characters or more is now hidden as a value of its own, and every
-PEM block (BEGIN to END) is hidden whole before the log is cut into lines, a stored secret or not. A PEM block whose
-END line was not printed is hidden to the end of the text, so a log after such a line shows `[secret]` and nothing more.
+that may read logs. Each line of such a secret of 16 characters or more is now hidden as a value of its own, and so is
+any piece of 16 or more of its base64 body, printed at another width or with each `/` written `\/`. A PEM block printed
+in a log, a failed command's words or a function's output is hidden whole before the text is cut into lines, a stored
+secret or not: from its BEGIN line to its END line; when no END line follows, over the lines after the BEGIN line that
+look like a key (base64 of 16 characters or more, or a PEM header), so the text after the key, and a function's result,
+stay shown; and when the text begins inside a key (an END line with no BEGIN line before it), from its start to that
+END line. A label may hold lowercase letters and hyphens (`OpenVPN Static key V1`). `service_logs` of a container now
+always reads the last 200 lines of its journal and cuts to the lines asked for only after they are redacted, so no
+window can start inside a key. A function's kept outputs and its runs' lines are redacted again when `function_runs`
+reads them, with the secrets stored then, so an output kept by an earlier release, or before a secret was set, shows
+none of them. What is still shown: the last line of a key printed without its END line when it is shorter than 16
+characters, and a stored key whose letters were changed in case. Certificates, public keys and other public PEM
+blocks are hidden too.
 
 More of what a `service_create` would refuse is now refused when it is proposed, in the create's words, so no card is
 shown for it: a name that is taken, a deploy the approved create could not add to, a tenant's machine on a host

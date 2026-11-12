@@ -2467,3 +2467,56 @@ fn a_private_destination_comes_from_the_nodes_config_and_is_on_the_card() {
         ]
     );
 }
+
+#[test]
+fn a_kept_output_is_redacted_again_when_it_is_read() {
+    let rig = Rig::new();
+    rig.nats();
+    let mut args = relay_args();
+    args["secrets"] = json!(["TOKEN"]);
+    rig.approved("function_create", args).expect("created");
+    // Made here, from a counter.
+    let token: String = (0u8..24)
+        .map(|i| (b'a' + (i * 7 + 3) % 26) as char)
+        .collect();
+    rig.call(
+        "function_secret_set",
+        json!({ "name": "relay", "key": "TOKEN", "value": token }),
+    )
+    .expect("set");
+    rig.fake.exit_after_start(PROJECT, "relay", 0, "hello\n");
+    let line = rig.run("relay");
+    // The output as a release that redacted less would have kept it: the value, and a key printed whole.
+    let word = ["PRI", "VATE"].concat();
+    let body: String = (0u32..64)
+        .map(|i| (b'A' + ((i * 11 + 5) % 26) as u8) as char)
+        .collect();
+    let kept = rig
+        .dir
+        .join(RUNS_DIR)
+        .join("output/relay")
+        .join(format!("{}.log", line["run"].as_str().expect("a run id")));
+    fs::write(
+        &kept,
+        format!(
+            "using {token}\n-----BEGIN EC {word} KEY-----\n{body}\n-----END EC {word} KEY-----\nbye"
+        ),
+    )
+    .expect("write the kept output");
+    let shown = rig
+        .call_as(
+            Scope::Viewer,
+            "function_runs",
+            json!({ "name": "relay", "run": line["run"] }),
+        )
+        .expect("the run");
+    let text = shown.to_string();
+    assert!(
+        !text.contains(&token[..16]) && !text.contains(&body[..16]),
+        "the kept output is shown as it was kept"
+    );
+    assert_eq!(
+        shown["output"],
+        json!(["using [secret]", "[secret]", "bye"])
+    );
+}
