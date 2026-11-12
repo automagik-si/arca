@@ -1938,7 +1938,10 @@ one `anyOf` branch per action, titled with the action's name, holding that verb'
 fields it requires, and an example (`examples`, and in its `description`), so an assistant reads what each action takes
 before its first call. The union sits inside `args`, never at the top of the input schema, where a model's API refuses
 one. `x-arca-by: "action"` tells the door to hold `args` to the branch `action` names, so a refusal is in that branch's
-own words (`/args: missing required field name`), not "matches none". An unknown action is an invalid call and leaves no
+own words (`/args: missing required field name`), not "matches none". A field the kernel fills in when the proposal is
+made (a GPU verb's `project`, `kind` and `uuid`; `storage_add`'s disk facts; the snapshot verbs' `name`, `kind`, pools
+and folder facts) takes any value in its branch and says so: the kernel removes or replaces what was sent, as it did
+before the branches. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses the image the node's `postgres-autopg`
 template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is
 refused (see "A database"). `service_create` names a template from the kernel's catalog, whose name the schema constrains;

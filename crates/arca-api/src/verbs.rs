@@ -2404,7 +2404,59 @@ fn action_propose_params() -> Value {
     ])
 }
 
-/// One `args` of each action, as an assistant proposes it: the fields it must name, and no field the node fills in.
+/// The fields of an action's `args` the kernel fills in when the proposal is made: whatever the caller sends there is
+/// removed or overwritten before the action's own check runs (the GPU verbs from the instance, storage_add from the
+/// disk survey, the snapshot verbs from the source or the snapshot). A branch takes any value for them, as the door did
+/// before it held `args` to a branch, and says so.
+pub const KERNEL_FILLED: [(&str, &[&str]); 5] = [
+    ("gpu_attach", &["project", "kind", "uuid"]),
+    ("gpu_detach", &["project", "kind", "uuid"]),
+    (
+        "storage_add",
+        &[
+            "disk",
+            "model",
+            "serial",
+            "transport",
+            "size",
+            "contents",
+            "mount",
+            "fsUuid",
+            "inUseCheck",
+        ],
+    ),
+    (
+        "snapshot_create",
+        &[
+            "name",
+            "kind",
+            "uuid",
+            "sourcePool",
+            "fsUuid",
+            "size",
+            "allocated",
+            "files",
+            "unreadable",
+            "separate",
+            "separateCount",
+            "poolFree",
+        ],
+    ),
+    ("snapshot_delete", &["kind", "pool", "source"]),
+];
+
+/// What a branch says of a field in [`KERNEL_FILLED`].
+pub const KERNEL_FILLS_IN: &str = "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced.";
+
+/// The fields of `action`'s `args` the kernel fills in, from [`KERNEL_FILLED`].
+pub fn kernel_filled(action: &str) -> &'static [&'static str] {
+    KERNEL_FILLED
+        .iter()
+        .find(|(name, _)| *name == action)
+        .map_or(&[], |(_, fields)| fields)
+}
+
+/// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
 const ACTION_EXAMPLES: [(&str, &str); 22] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
@@ -2415,23 +2467,14 @@ const ACTION_EXAMPLES: [(&str, &str); 22] = [
     ("service_connect", r#"{"from":"api","to":"nats"}"#),
     ("service_disconnect", r#"{"from":"api","to":"nats"}"#),
     ("postgres_create", r#"{"name":"orders"}"#),
-    (
-        "gpu_attach",
-        r#"{"project":"arcak-gpu","instance":"llm","pci":"0000:01:00.0"}"#,
-    ),
-    (
-        "gpu_detach",
-        r#"{"project":"arcak-gpu","instance":"llm","pci":"0000:01:00.0"}"#,
-    ),
+    ("gpu_attach", r#"{"instance":"llm","pci":"0000:01:00.0"}"#),
+    ("gpu_detach", r#"{"instance":"llm","pci":"0000:01:00.0"}"#),
     ("storage_add", r#"{"name":"usb1","device":"sdb"}"#),
     (
         "snapshot_create",
         r#"{"project":"shop","instance":"web","pool":"usb1"}"#,
     ),
-    (
-        "snapshot_delete",
-        r#"{"name":"shop--web--20261030T1200","pool":"usb1"}"#,
-    ),
+    ("snapshot_delete", r#"{"name":"shop--web--20261030T1200"}"#),
     (
         "instance_start",
         r#"{"project":"arcak-svc","instance":"web"}"#,
@@ -2473,6 +2516,15 @@ fn action_args() -> Value {
             }
             if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
                 properties.remove("approval");
+                for field in kernel_filled(name) {
+                    if let Some(own) = properties.get_mut(*field) {
+                        let words = own["description"]
+                            .as_str()
+                            .map(|said| format!("{said} "))
+                            .unwrap_or_default();
+                        *own = json!({ "description": format!("{words}{KERNEL_FILLS_IN}") });
+                    }
+                }
             }
             let example: Value = ACTION_EXAMPLES
                 .iter()
@@ -3155,11 +3207,18 @@ fn gpu_params() -> Value {
     params(vec![
         ("instance", true, instance_name_schema()),
         ("pci", true, pci_schema()),
-        ("project", false, instance_name_schema()),
+        ("project", false, gpu_project_schema()),
         ("kind", false, one_of(&["container", "virtual-machine"])),
         ("uuid", false, nullable(string())),
         ("approval", true, approval_schema()),
     ])
+}
+
+/// The Incus project of a GPU verb's instance: an instance name's grammar, described as the project it is.
+fn gpu_project_schema() -> Value {
+    let mut schema = instance_name_schema();
+    schema["description"] = json!("The Incus project the instance is in.");
+    schema
 }
 
 fn gpu_attach_params() -> Value {

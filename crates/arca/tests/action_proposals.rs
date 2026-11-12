@@ -1859,3 +1859,40 @@ fn every_example_in_the_schema_of_action_propose_is_one_its_action_takes() {
         }
     }
 }
+
+/// A field the kernel fills in when the proposal is made passes the door with a value off its own rule, as on 0.17.0:
+/// the kernel removes or replaces it before the action's own check. Whatever the node answers next, it is not the
+/// door's `invalid_arguments`. Review M1 of PR 136.
+#[test]
+fn a_field_the_kernel_fills_in_passes_the_door_with_any_value() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-mcp-kernel-filled", &key);
+    let (_runtime, socket, secret) = propose_door(&rig);
+    let params = (verb("action_propose").expect("the verb").params)();
+    let branches = params["properties"]["args"]["anyOf"]
+        .as_array()
+        .expect("one branch per action");
+    let passes = |action: &str, args: Value| {
+        let reply = propose_through(&socket, &secret, json!({ "action": action, "args": args }));
+        assert_ne!(
+            reply["result"]["_meta"]["droidd/error"],
+            json!("invalid_arguments"),
+            "{action}: {reply}"
+        );
+    };
+    for (action, fields) in arca_api::verbs::KERNEL_FILLED {
+        let branch = branches
+            .iter()
+            .find(|branch| branch["title"] == json!(action))
+            .expect("a branch");
+        for field in fields {
+            let mut args = branch["examples"][0].clone();
+            args[*field] = json!({ "off": "rule" });
+            passes(action, args);
+        }
+    }
+    passes(
+        "snapshot_delete",
+        json!({ "name": "shop--web--20261030T1200", "pool": "usb1", "kind": "container" }),
+    );
+}

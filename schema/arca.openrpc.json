@@ -2229,12 +2229,11 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The args of gpu_attach: Attach a physical GPU card to an Incus instance, by PCI address, with the owner's signed approval. A card bound to vfio-pci is refused for a container. Example: {\"instance\":\"llm\",\"pci\":\"0000:01:00.0\",\"project\":\"arcak-gpu\"}",
+                "description": "The args of gpu_attach: Attach a physical GPU card to an Incus instance, by PCI address, with the owner's signed approval. A card bound to vfio-pci is refused for a container. Example: {\"instance\":\"llm\",\"pci\":\"0000:01:00.0\"}",
                 "examples": [
                   {
                     "instance": "llm",
-                    "pci": "0000:01:00.0",
-                    "project": "arcak-gpu"
+                    "pci": "0000:01:00.0"
                   }
                 ],
                 "properties": {
@@ -2246,11 +2245,7 @@
                     "type": "string"
                   },
                   "kind": {
-                    "enum": [
-                      "container",
-                      "virtual-machine"
-                    ],
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "pci": {
                     "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
@@ -2258,17 +2253,10 @@
                     "type": "string"
                   },
                   "project": {
-                    "description": "The Incus instance name.",
-                    "maxLength": 63,
-                    "minLength": 1,
-                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
-                    "type": "string"
+                    "description": "The Incus project the instance is in. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "uuid": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   }
                 },
                 "required": [
@@ -2280,12 +2268,11 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The args of gpu_detach: Detach a physical GPU card from an Incus instance, by PCI address, with the owner's signed approval. Example: {\"instance\":\"llm\",\"pci\":\"0000:01:00.0\",\"project\":\"arcak-gpu\"}",
+                "description": "The args of gpu_detach: Detach a physical GPU card from an Incus instance, by PCI address, with the owner's signed approval. Example: {\"instance\":\"llm\",\"pci\":\"0000:01:00.0\"}",
                 "examples": [
                   {
                     "instance": "llm",
-                    "pci": "0000:01:00.0",
-                    "project": "arcak-gpu"
+                    "pci": "0000:01:00.0"
                   }
                 ],
                 "properties": {
@@ -2301,11 +2288,7 @@
                     "type": "string"
                   },
                   "kind": {
-                    "enum": [
-                      "container",
-                      "virtual-machine"
-                    ],
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "pci": {
                     "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
@@ -2313,17 +2296,10 @@
                     "type": "string"
                   },
                   "project": {
-                    "description": "The Incus instance name.",
-                    "maxLength": 63,
-                    "minLength": 1,
-                    "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
-                    "type": "string"
+                    "description": "The Incus project the instance is in. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "uuid": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   }
                 },
                 "required": [
@@ -2348,8 +2324,7 @@
                     "type": "boolean"
                   },
                   "contents": {
-                    "maxLength": 4096,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "device": {
                     "description": "A whole free disk, such as sdb or /dev/sdb. Incus wipes and formats it as btrfs; the pool is named arca-snapshots-<name> (at most 32 characters).",
@@ -2357,27 +2332,19 @@
                     "type": "string"
                   },
                   "disk": {
-                    "maxLength": 64,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "fsUuid": {
-                    "maxLength": 128,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "inUseCheck": {
-                    "enum": [
-                      "exclusive open",
-                      "system lists"
-                    ],
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "model": {
-                    "maxLength": 256,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "mount": {
-                    "maxLength": 1024,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "name": {
                     "description": "The storage pool name (1-32 of a-z, 0-9 and inner \"-\", starting with a letter).",
@@ -2392,15 +2359,13 @@
                     "type": "string"
                   },
                   "serial": {
-                    "maxLength": 256,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "size": {
-                    "type": "integer"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "transport": {
-                    "maxLength": 32,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   }
                 },
                 "required": [
@@ -2421,10 +2386,10 @@
                 ],
                 "properties": {
                   "allocated": {
-                    "type": "integer"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "files": {
-                    "type": "integer"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "folder": {
                     "description": "A host folder to copy, such as /home: absolute, with no link in its path, and not /, /proc, /sys, /dev, /run, /boot, /tmp or /var/lib/incus. Incus copies it read-only through a short-lived helper container.",
@@ -2434,8 +2399,7 @@
                     "type": "string"
                   },
                   "fsUuid": {
-                    "maxLength": 128,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "instance": {
                     "description": "The Incus instance name.",
@@ -2445,20 +2409,10 @@
                     "type": "string"
                   },
                   "kind": {
-                    "enum": [
-                      "container",
-                      "virtual-machine",
-                      "volume",
-                      "folder"
-                    ],
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "name": {
-                    "description": "The snapshot's name, set by the kernel.",
-                    "maxLength": 128,
-                    "minLength": 1,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
-                    "type": "string"
+                    "description": "The snapshot's name, set by the kernel. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "pool": {
                     "description": "The storage pool name (1-32 of a-z, 0-9 and inner \"-\", starting with a letter).",
@@ -2466,7 +2420,7 @@
                     "type": "string"
                   },
                   "poolFree": {
-                    "type": "integer"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "project": {
                     "description": "The source's Incus project (an app or a data volume).",
@@ -2476,25 +2430,16 @@
                     "type": "string"
                   },
                   "separate": {
-                    "items": {
-                      "maxLength": 4096,
-                      "type": "string"
-                    },
-                    "maxItems": 100,
-                    "type": "array"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "separateCount": {
-                    "type": "integer"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "size": {
-                    "type": "integer"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "sourcePool": {
-                    "description": "A source volume's pool.",
-                    "maxLength": 128,
-                    "minLength": 1,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
-                    "type": "string"
+                    "description": "A source volume's pool. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "tenant": {
                     "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
@@ -2502,13 +2447,10 @@
                     "type": "string"
                   },
                   "unreadable": {
-                    "type": "integer"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "uuid": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "volume": {
                     "description": "The source custom volume.",
@@ -2526,11 +2468,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The args of snapshot_delete: Delete one snapshot copy from the arcak-snapshots project, with the owner's signed approval. Nothing outside that project is touched. Example: {\"name\":\"shop--web--20261030T1200\",\"pool\":\"usb1\"}",
+                "description": "The args of snapshot_delete: Delete one snapshot copy from the arcak-snapshots project, with the owner's signed approval. Nothing outside that project is touched. Example: {\"name\":\"shop--web--20261030T1200\"}",
                 "examples": [
                   {
-                    "name": "shop--web--20261030T1200",
-                    "pool": "usb1"
+                    "name": "shop--web--20261030T1200"
                   }
                 ],
                 "properties": {
@@ -2539,11 +2480,7 @@
                     "type": "boolean"
                   },
                   "kind": {
-                    "enum": [
-                      "instance",
-                      "volume"
-                    ],
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "name": {
                     "description": "The snapshot's name.",
@@ -2553,15 +2490,10 @@
                     "type": "string"
                   },
                   "pool": {
-                    "description": "The snapshot's pool.",
-                    "maxLength": 128,
-                    "minLength": 1,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
-                    "type": "string"
+                    "description": "The snapshot's pool. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "source": {
-                    "maxLength": 512,
-                    "type": "string"
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "tenant": {
                     "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
@@ -6957,7 +6889,7 @@
           "name": "project",
           "required": false,
           "schema": {
-            "description": "The Incus instance name.",
+            "description": "The Incus project the instance is in.",
             "maxLength": 63,
             "minLength": 1,
             "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
@@ -7072,7 +7004,7 @@
           "name": "project",
           "required": false,
           "schema": {
-            "description": "The Incus instance name.",
+            "description": "The Incus project the instance is in.",
             "maxLength": 63,
             "minLength": 1,
             "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",

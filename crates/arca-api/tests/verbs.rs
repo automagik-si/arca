@@ -2,6 +2,7 @@
 //! the table, so a typo in the constructors fails here.
 
 use arca_api::openrpc::{check_document, check_released_document, openrpc};
+use arca_api::verbs::{KERNEL_FILLED, KERNEL_FILLS_IN, kernel_filled};
 use arca_api::{API_VERSION, Scope, VerbClass, conforms, may_call, verb, verbs};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1608,10 +1609,26 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         }
         let fields = own["properties"].as_object_mut().expect("properties");
         fields.remove("approval");
+        for field in kernel_filled(action) {
+            let said = fields[*field]["description"]
+                .as_str()
+                .map(|said| format!("{said} "))
+                .unwrap_or_default();
+            fields.insert(
+                (*field).to_string(),
+                json!({ "description": format!("{said}{KERNEL_FILLS_IN}") }),
+            );
+        }
         assert_eq!(branch["properties"], own["properties"], "{action}");
         assert_eq!(branch["required"], own["required"], "{action}");
         assert_eq!(branch["additionalProperties"], json!(false), "{action}");
         let example = &branch["examples"][0];
+        for field in kernel_filled(action) {
+            assert!(
+                example.get(*field).is_none(),
+                "{action}: the example holds {field}, which the kernel fills in"
+            );
+        }
         let description = branch["description"].as_str().expect("a description");
         assert!(
             description.starts_with(&format!("The args of {action}: "))
@@ -1676,4 +1693,51 @@ fn no_input_schema_has_a_union_at_its_top_level() {
         }
         assert_eq!(params["type"], json!("object"), "{}", v.name);
     }
+}
+
+/// A field the kernel fills in when the proposal is made takes any value at the door, as it did before `args` was held
+/// to a branch: the kernel removes or replaces it before the action's own check runs. Each one is sent with a value
+/// its verb's own rule refuses, and the call conforms. Review M1 of PR 136.
+#[test]
+fn a_field_the_kernel_fills_in_is_taken_at_the_door_with_any_value() {
+    let params = (verb("action_propose").expect("the verb").params)();
+    let branches = params["properties"]["args"]["anyOf"]
+        .as_array()
+        .expect("one branch per action");
+    let off_rule = json!({ "off": "rule" });
+    for (action, fields) in KERNEL_FILLED {
+        let own = (verb(action).expect("a verb").params)();
+        let branch = branches
+            .iter()
+            .find(|branch| branch["title"] == json!(action))
+            .expect("a branch");
+        for field in fields {
+            let rule = &own["properties"][*field];
+            assert!(rule.is_object(), "{action} takes {field}");
+            assert!(
+                conforms(rule, &off_rule).is_err(),
+                "{action}/{field}: off its rule"
+            );
+            let said = branch["properties"][*field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(said.ends_with(KERNEL_FILLS_IN), "{action}/{field}: {said}");
+            let mut args = branch["examples"][0].clone();
+            args[*field] = off_rule.clone();
+            assert_eq!(
+                conforms(&params, &json!({ "action": action, "args": args })),
+                Ok(()),
+                "{action}/{field}"
+            );
+        }
+    }
+    // A snapshot_list row's kind, copied into a delete.
+    let row = json!({ "name": "shop--web--20261030T1200", "pool": "usb1", "kind": "container" });
+    assert_eq!(
+        conforms(
+            &params,
+            &json!({ "action": "snapshot_delete", "args": row })
+        ),
+        Ok(())
+    );
 }
