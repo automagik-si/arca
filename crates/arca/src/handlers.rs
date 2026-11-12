@@ -1788,6 +1788,14 @@ impl ToolHandler for ActionPropose {
                 return Err(propose_failure(error));
             }
         };
+        // What the owner does next is said with the answer, so an assistant can guide them: where the card is, until
+        // when, and that a passkey must be enrolled first while none is trusted.
+        let passkeys = kernel.owner_passkey_count();
+        let page = self
+            .node
+            .as_ref()
+            .and_then(|node| node.approval_origin.as_ref())
+            .map(|origin| format!("{origin}/approve"));
         let mut answer = json!({
             "kind": "action",
             "id": proposal.id,
@@ -1798,10 +1806,52 @@ impl ToolHandler for ActionPropose {
             "argsDigest": proposal.args_digest,
             "createdAt": proposal.created_ms,
             "expiresAt": proposal.expires_at,
+            "passkeysTrusted": passkeys,
+            "nextStep": propose_next_step(page.as_deref(), passkeys, proposal.created_ms, proposal.expires_at),
         });
         card_words(&mut answer, &proposal);
+        if let Some(url) = page {
+            answer["approvalUrl"] = json!(url);
+        }
         Ok(answer)
     }
+}
+
+/// What the owner does next with a proposal just made, in words: where to approve it and until when, after enrolling a
+/// passkey when none is trusted yet. Nothing here is refused or changed; the words only say what the node knows.
+pub(crate) fn propose_next_step(
+    page: Option<&str>,
+    passkeys: usize,
+    created_ms: u64,
+    expires_ms: u64,
+) -> String {
+    let iso = iso_utc(expires_ms);
+    let minutes = expires_ms.saturating_sub(created_ms) / 60_000;
+    let until = format!(
+        "The card expires at {} UTC on {}, {minutes} minutes after it was proposed; after that it must be proposed again.",
+        &iso[11..16],
+        &iso[..10]
+    );
+    let Some(url) = page else {
+        return format!(
+            "This node has no approval page, so nothing can be approved here: the guide's section \"The approval page\" says how to give it one. {until}"
+        );
+    };
+    if passkeys > 0 {
+        return format!("The owner approves it at {url}. {until}");
+    }
+    let mut enrol = format!(
+        "No passkey is trusted on this node yet, so nothing can be approved until the owner enrols one: open {url} and press \"Get a setup code\", or, on a machine with no screen, print the code there with arca setup-code and type it on the page. Then approve it at {url}. {until}"
+    );
+    if let Some(port) = url
+        .strip_suffix("/approve")
+        .and_then(arca_approval::localhost_origin_port)
+    {
+        enrol.push_str(&format!(
+            " The page is on this machine only: from another computer, open it through ssh -L localhost:{port}:127.0.0.1:{port} and this machine's name or address."
+        ));
+    }
+    enrol
 }
 
 /// A resolved GPU target: the instance the project-bound action names, and the card when the inventory knows it.
