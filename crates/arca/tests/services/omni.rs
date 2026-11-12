@@ -55,7 +55,7 @@ struct OmniState {
     key: String,
     /// The next answer, in place of the usual one: status, body, extra headers.
     next: Option<(u16, Value, Vec<(String, String)>)>,
-    /// Omni has the request and keeps its answer back until this is false again.
+    /// Omni has the request and keeps its answer back until this is false again, or for twice the default timeout.
     held: bool,
     made: u64,
 }
@@ -124,7 +124,11 @@ fn handle(stream: TcpStream, state: &Mutex<OmniState>) {
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     let body: Option<Value> = (!body.is_empty()).then(|| serde_json::from_slice(&body).unwrap());
-    while state.lock().unwrap().held {
+    // A test that fails before it lets the answer go must not leave this thread asking for ever. The hold ends by
+    // itself after twice the node's default timeout: long enough that no node, whichever timeout it uses, is answered
+    // by the hold running out.
+    let let_go = Instant::now() + 2 * TIMEOUT;
+    while state.lock().unwrap().held && Instant::now() < let_go {
         std::thread::sleep(Duration::from_millis(5));
     }
     let (status, answer, headers) = answer(state, &method, &url, key.clone(), body.clone());
