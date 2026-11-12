@@ -1,10 +1,11 @@
 //! The Incus readings a host sample carries: the host totals of the machine Incus serves, the storage pools the allow-filter
-//! admits, with each one's space, and the instances, with each one's state, starts and usage. All are GET requests through
-//! [`IncusRead`]. An answer that fails is `None`, so the caller can tell an unreachable Incus from an empty one. The sample's
+//! admits, with each one's space, and the instances, with each one's status and starts, and each running one's usage from its
+//! own state. All are GET requests through [`IncusRead`]. An answer that fails is `None`, so the caller can tell an unreachable Incus from an empty one. The sample's
 //! own lists stay empty on a failure, because the `node_metrics` schema has no nullable list; the alerts read the `None`
 //! through [`crate::Readings`].
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use arca_incus::IncusRead;
 use serde_json::Value;
@@ -15,9 +16,57 @@ use crate::sample::{Pool, ProjectCount};
 /// runs on when the socket is a proxy to a remote Incus.
 pub const RESOURCES_PATH: &str = "/1.0/resources";
 
-/// The instance list every tick reads: every project, recursed twice, so that each row carries its `state`. One GET serves the
-/// instance readings and the project counts.
-pub const INSTANCES_PATH: &str = "/1.0/instances?all-projects=true&recursion=2";
+/// The instance list every tick reads: every project, recursed once, so that each row carries its status and `last_used_at`
+/// and no live `state`. One GET serves the instance rows and the project counts, and it is answered at once: Incus takes a
+/// running virtual machine's live state from its guest's agent, which can take seconds, and a listing with every
+/// instance's state is as slow as the slowest. A running instance's usage is read from its own state instead
+/// ([`state_path`]), one after another, each under [`STATE_DEADLINE`].
+pub const INSTANCES_PATH: &str = "/1.0/instances?all-projects=true&recursion=1";
+
+/// The deadline of one instance's state read.
+pub const STATE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The time one tick gives all its state reads together. A read starts only while some of it is left, and has no more
+/// than what is left.
+pub const STATE_BUDGET: Duration = Duration::from_secs(4);
+
+/// Why an instance's usage was not read at a tick. The words are fixed: Incus's own text is never shown.
+pub const NOT_ANSWERED: &str = "Incus did not answer within 2 seconds";
+pub const ANSWERED_AN_ERROR: &str = "Incus answered with an error";
+pub const BUDGET_SPENT: &str = "the tick's time for state reads was spent";
+
+/// The live state of one instance, which holds its usage.
+pub fn state_path(project: &str, name: &str) -> String {
+    format!("/1.0/instances/{name}/state?project={project}")
+}
+
+/// The CPU time in seconds and the memory in bytes a state document holds, each `None` when absent.
+pub fn usage_of(state: &Value) -> (Option<f64>, Option<u64>) {
+    (
+        state
+            .pointer("/cpu/usage")
+            .and_then(Value::as_u64)
+            .map(|nanoseconds| nanoseconds as f64 / 1e9),
+        state.pointer("/memory/usage").and_then(Value::as_u64),
+    )
+}
+
+/// Reads the state of one instance under `within`, and says why in fixed words when it could not: a read cut short by
+/// what was left of the tick's budget is [`BUDGET_SPENT`], not [`NOT_ANSWERED`].
+pub fn read_usage<R: IncusRead>(
+    incus: &R,
+    project: &str,
+    name: &str,
+    within: Duration,
+    deadline: Duration,
+) -> Result<(Option<f64>, Option<u64>), &'static str> {
+    match incus.get_within(&state_path(project, name), within) {
+        Ok(state) => Ok(usage_of(&state)),
+        Err(arca_incus::IncusError::Timeout) if within < deadline => Err(BUDGET_SPENT),
+        Err(arca_incus::IncusError::Timeout) => Err(NOT_ANSWERED),
+        Err(_) => Err(ANSWERED_AN_ERROR),
+    }
+}
 
 /// The host totals Incus reports: its logical CPUs (threads), its memory total and its used memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +170,8 @@ pub fn read_instances<R: IncusRead>(incus: &R) -> Option<Vec<Listed>> {
     Some(rows.iter().filter_map(listed).collect())
 }
 
-/// One row as an instance. The starts are zero here: the sampler counts them against the previous tick.
+/// One row as an instance. The starts are zero here: the sampler counts them against the previous tick. The usage is what
+/// a row's `state` holds, which a row of [`INSTANCES_PATH`] has not: the sampler reads it from each running instance's own state.
 fn listed(row: &Value) -> Option<Listed> {
     let project = row.get("project")?.as_str()?;
     let name = row.get("name")?.as_str()?;

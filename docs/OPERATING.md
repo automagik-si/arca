@@ -1178,6 +1178,10 @@ Among the service verbs, only these read live state:
 - `service_create` and `function_create`, and `tenant_create`: a new instance's address, MAC or block must not be one
   that an instance holds live without a record of it.
 
+Outside the service verbs, the metrics sampler reads each running instance's own state for its CPU and memory, one
+instance at a time with a short deadline, and never the listing with every instance's state (see "Instances" under
+"Host metrics").
+
 A read that failed fast (the socket was not reached, or Incus answered with a server error) is made once more after a
 fifth of a second, inside the same 10 seconds. One that got no answer by its deadline is not made again. When the
 listing still fails, and when one of the reads a create makes for an address, for its project or for its new instance
@@ -1347,6 +1351,21 @@ sample ring and its rate counters, so the window mean and the next rate cover on
   integer in the schema, so its `0` is a placeholder a consumer must not show as a count. `cpu.reason` and `memory.reason`
   say `the Incus resources read failed`. The node never falls back to its own `/proc`: a failed read is unknown, not the wrong
   machine. `load.reason` still says `not available for a remote host`.
+
+### Instances
+
+Each sample lists the node's instances once, without their live state: the listing holds each one's status and
+`last_used_at` (the project counts and the starts that `crash_loop` reads) and is answered at once. An instance's CPU time
+and memory are in its **live state**, which Incus takes from a running virtual machine's guest agent and which can take
+seconds for one busy machine. So the sampler reads each running instance's own state, one after another, never two at
+once: 2 seconds each and 4 seconds for all of them in one sample. The ones asked longest ago go first, so on a node with
+more slow machines than one sample reaches, each is still read within a few samples. A stopped instance is not asked.
+
+An instance whose state was not read keeps its row (it counts in `projects` and in `arca_instance_running`), its CPU and
+memory are left out of that sample's export, and the sample's `instancesNotRead` names it with one of three fixed reasons:
+`Incus did not answer within 2 seconds`, `Incus answered with an error`, or `the tick's time for state reads was spent`.
+Incus's own text is never shown. In `mean`, `instancesNotRead` is the newest sample's. No alert reads an instance's CPU or
+memory, so a machine that was not read changes no alert.
 
 ### GPUs
 
@@ -3117,8 +3136,8 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_drift_entries` | gauge | `kind` (`marked_without_entry`, `entry_without_object`) | the drift entries of the newest watch sweep |
 | `arca_instance_running` | gauge | `project`, `incus_instance`, `type` (`container`, `vm`) | 1 when an instance runs |
 | `arca_instance_starts_total` | counter | `project`, `incus_instance` | the starts of an instance since the server started |
-| `arca_instance_cpu_seconds_total` | counter | `project`, `incus_instance` | the CPU time an instance has used |
-| `arca_instance_memory_used_bytes` | gauge | `project`, `incus_instance` | the memory an instance uses |
+| `arca_instance_cpu_seconds_total` | counter | `project`, `incus_instance` | the CPU time an instance has used, from its own live state; absent for a sample that did not read it (see "Instances" under "Host metrics") |
+| `arca_instance_memory_used_bytes` | gauge | `project`, `incus_instance` | the memory an instance uses, read as the CPU time is |
 | `arca_latency_seconds` | gauge | `target` (`gateway`, `internet`, `relay`) | the TCP connect time to a probe target |
 | `arca_secureboot_enabled` | gauge | | 1 when Secure Boot is enabled |
 | `arca_tpm_present` | gauge | | 1 only when incus-osd reports the TPM status `ok`; see "incus-osd readings" |

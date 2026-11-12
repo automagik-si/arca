@@ -709,8 +709,8 @@ impl FakeIncus {
             .insert(name.to_string(), forced_too);
     }
 
-    /// Sets the CPU time, in nanoseconds, and the memory, in bytes, that the instance `name` in `project` reports in its `state`
-    /// on the `recursion=2` listing. Panics when no such instance is held. It records no write.
+    /// Sets the CPU time, in nanoseconds, and the memory, in bytes, that the running instance `name` in `project` reports in
+    /// its `state`, on its own `/state` and on the `recursion=2` listing. Panics when no such instance is held. It records no write.
     pub fn set_instance_usage(&self, project: &str, name: &str, cpu_ns: u64, memory_bytes: u64) {
         let mut store = lock(&self.shared.store);
         assert!(
@@ -2938,9 +2938,19 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
         .get(&(object.project.clone(), object.name.clone()))
         .filter(|_| running);
     let network = live.cloned().unwrap_or(Value::Object(network));
-    sync(
-        json!({ "status": status, "status_code": if running { 103 } else { 102 }, "network": network }),
-    )
+    let (cpu_ns, memory) = store
+        .usage
+        .get(&(object.project.clone(), object.name.clone()))
+        .copied()
+        .filter(|_| running)
+        .unwrap_or((0, 0));
+    sync(json!({
+        "status": status,
+        "status_code": if running { 103 } else { 102 },
+        "network": network,
+        "cpu": { "usage": cpu_ns },
+        "memory": { "usage": memory },
+    }))
 }
 
 /// Rebuilds a stopped instance's root from an image, as an operation, and records which image the request named: the

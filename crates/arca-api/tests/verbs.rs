@@ -948,9 +948,11 @@ fn a_host_sample_with_nulls_conforms_to_the_result_schema() {
         "gpu": { "reason": null, "skipped": null, "cards": [] },
         "pools": [{ "name": "p", "usedBytes": null, "totalBytes": 9, "freeBytes": null }],
         "network": null,
-        "projects": [{ "project": "p", "total": 2, "running": 1 }]
+        "projects": [{ "project": "p", "total": 2, "running": 1 }],
+        "instancesNotRead": [{ "project": "p", "name": "vm1", "why": "Incus did not answer within 2 seconds" }]
     });
-    let value = json!({ "at": 1, "minutes": 1, "latest": sample, "mean": null });
+    let value =
+        json!({ "at": 1, "minutes": 1, "latest": sample, "mean": null, "instancesNotRead": [] });
     assert!(conforms(&result, &value).is_ok());
 }
 
@@ -1175,10 +1177,30 @@ fn host_sample() -> Value {
                     }),
                     &["project", "total", "running"]
                 )
+            },
+            "instancesNotRead": {
+                "type": "array",
+                "items": open(
+                    json!({
+                        "project": { "type": "string", "maxLength": 64 },
+                        "name": { "type": "string", "maxLength": 64 },
+                        "why": {
+                            "type": "string",
+                            "enum": [
+                                "Incus did not answer within 2 seconds",
+                                "Incus answered with an error",
+                                "the tick's time for state reads was spent"
+                            ]
+                        }
+                    }),
+                    &["project", "name", "why"]
+                ),
+                "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read."
             }
         },
         "required": [
-            "at", "cpu", "load", "memory", "psi", "cpuTempC", "gpuBusyPct", "gpu", "pools", "network", "projects"
+            "at", "cpu", "load", "memory", "psi", "cpuTempC", "gpuBusyPct", "gpu", "pools", "network", "projects",
+            "instancesNotRead"
         ]
     })
 }

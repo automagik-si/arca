@@ -124,6 +124,10 @@ pub struct HostSample {
     pub network: Option<Network>,
     /// The instances per project. A project with no instance is absent, which the mean reads as zero.
     pub projects: Vec<ProjectCount>,
+    /// The running instances whose CPU and memory this sample's tick did not read, and why. In the mean, the newest
+    /// sample's.
+    #[serde(default)]
+    pub instances_not_read: Vec<NotRead>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -267,6 +271,15 @@ struct StartTrack {
     starts: VecDeque<u64>,
 }
 
+/// A running instance whose usage a tick did not read, and why, in fixed words ([`incus::NOT_ANSWERED`],
+/// [`incus::ANSWERED_AN_ERROR`] or [`incus::BUDGET_SPENT`]). Its row is still counted, with its CPU and memory `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotRead {
+    pub project: String,
+    pub name: String,
+    pub why: String,
+}
+
 /// The counters a sample is measured against: when they were read, and the CPU and NIC totals.
 #[derive(Debug, Clone, Copy)]
 struct Previous {
@@ -320,6 +333,17 @@ pub struct Sampler<R: IncusRead> {
     gpu_known: BTreeMap<String, GpuCard>,
     /// The cards gone from the newest successful inventory, by PCI address.
     gpu_gone: Vec<GpuCard>,
+    /// The ticks counted since the process began; the first is 1.
+    ticks: u64,
+    /// The tick at which each running instance's state read was last started, by project and name. A tick starts with
+    /// those asked longest ago (never first), so a node with more slow machines than one tick's budget still reads each
+    /// of them within a few ticks.
+    state_tried: BTreeMap<(String, String), u64>,
+    /// The running instances the newest tick did not read the usage of.
+    not_read: Vec<NotRead>,
+    /// The deadline of one state read, and the time a tick gives them all.
+    state_deadline: Duration,
+    state_budget: Duration,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -349,7 +373,81 @@ impl<R: IncusRead> Sampler<R> {
             nvidia: Arc::new(NvidiaSmi::new()),
             gpu_known: BTreeMap::new(),
             gpu_gone: Vec::new(),
+            ticks: 0,
+            state_tried: BTreeMap::new(),
+            not_read: Vec::new(),
+            state_deadline: incus::STATE_DEADLINE,
+            state_budget: incus::STATE_BUDGET,
         }
+    }
+
+    /// Uses `deadline` for each instance's state read and `budget` for a tick's reads together, instead of
+    /// [`incus::STATE_DEADLINE`] and [`incus::STATE_BUDGET`]. A test shortens them; a build never needs to.
+    pub fn with_state_reads(mut self, deadline: Duration, budget: Duration) -> Self {
+        self.state_deadline = deadline;
+        self.state_budget = budget;
+        self
+    }
+
+    /// The running instances the newest tick did not read the usage of, and why.
+    pub fn instances_not_read(&self) -> &[NotRead] {
+        &self.not_read
+    }
+
+    /// Reads the usage of each running instance from its own state, one after another, the ones asked longest ago first,
+    /// each under the state deadline and all under the tick's budget. One that does not answer, or that the budget does
+    /// not reach, keeps its CPU and memory `None` for this tick and is named in [`Sampler::instances_not_read`].
+    fn read_usages(&mut self, instances: &mut [InstanceReading]) {
+        self.ticks += 1;
+        let tick = self.ticks;
+        let key = |instance: &InstanceReading| (instance.project.clone(), instance.name.clone());
+        let held: BTreeSet<(String, String)> = instances.iter().map(key).collect();
+        self.state_tried.retain(|known, _| held.contains(known));
+        let mut order: Vec<usize> = (0..instances.len())
+            .filter(|&index| instances[index].running)
+            .collect();
+        order.sort_by_key(|&index| {
+            let instance = &instances[index];
+            (
+                self.state_tried.get(&key(instance)).copied().unwrap_or(0),
+                key(instance),
+            )
+        });
+        let began = Instant::now();
+        let mut not_read = Vec::new();
+        for index in order {
+            let instance = &mut instances[index];
+            let left = self.state_budget.saturating_sub(began.elapsed());
+            let outcome = if left.is_zero() {
+                Err(incus::BUDGET_SPENT)
+            } else {
+                self.state_tried.insert(key(instance), tick);
+                incus::read_usage(
+                    &self.incus,
+                    &instance.project,
+                    &instance.name,
+                    left.min(self.state_deadline),
+                    self.state_deadline,
+                )
+            };
+            match outcome {
+                Ok((cpu_seconds, memory_bytes)) => {
+                    instance.cpu_seconds = cpu_seconds;
+                    instance.memory_bytes = memory_bytes;
+                }
+                Err(why) => {
+                    instance.cpu_seconds = None;
+                    instance.memory_bytes = None;
+                    not_read.push(NotRead {
+                        project: instance.project.clone(),
+                        name: instance.name.clone(),
+                        why: why.to_string(),
+                    });
+                }
+            }
+        }
+        not_read.sort_by(|a, b| (&a.project, &a.name).cmp(&(&b.project, &b.name)));
+        self.not_read = not_read;
     }
 
     /// Shares the startup mode choice with `arca_status`, so a retry that succeeds replaces the provisional answer there too.
@@ -392,8 +490,14 @@ impl<R: IncusRead> Sampler<R> {
         let previous = self.previous;
         let host = read_host(&self.cfg, &self.incus, previous, now_ms);
         let pools = incus::read_pools(&self.incus, &self.cfg.pools);
-        let instances =
-            incus::read_instances(&self.incus).map(|listed| self.count_starts(listed, now_ms));
+        let instances = incus::read_instances(&self.incus).map(|listed| {
+            let mut instances = self.count_starts(listed, now_ms);
+            self.read_usages(&mut instances);
+            instances
+        });
+        if instances.is_none() {
+            self.not_read.clear();
+        }
         let projects = instances.as_deref().map(incus::project_counts);
         let gpu = self.read_gpu(instances.as_deref());
         let latency = if self.probe_due(now_ms) {
@@ -444,6 +548,7 @@ impl<R: IncusRead> Sampler<R> {
             pools: rows,
             network: host.network,
             projects: projects.clone().unwrap_or_default(),
+            instances_not_read: self.not_read.clone(),
         };
         self.readings = Readings {
             pools,
@@ -989,6 +1094,7 @@ pub fn mean(samples: &[HostSample]) -> Option<HostSample> {
         pools: mean_pools(samples),
         network: mean_network(samples),
         projects: mean_projects(samples),
+        instances_not_read: last.instances_not_read.clone(),
     })
 }
 

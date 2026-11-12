@@ -14,8 +14,11 @@ use arca_metrics::{
 };
 use serde_json::{Value, json};
 
-const INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=2";
+const INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=1";
 const POOLS: &str = "/1.0/storage-pools?recursion=1";
+/// The two running instances' own states, each read once a tick for its usage.
+const STATE_A1: &str = "/1.0/instances/a1/state?project=apps";
+const STATE_B1: &str = "/1.0/instances/b1/state?project=svc";
 /// The incus-osd documents the sampler reads at its first tick and every 5 min after.
 const OSD_SECURITY: &str = "/os/1.0/system/security";
 const OSD_STORAGE: &str = "/os/1.0/system/storage";
@@ -182,6 +185,7 @@ fn bare(at: u64) -> HostSample {
         pools: Vec::new(),
         network: None,
         projects: Vec::new(),
+        instances_not_read: Vec::new(),
     }
 }
 
@@ -382,8 +386,8 @@ fn an_unparseable_aggregate_line_reads_no_percentage_but_still_counts_cores() {
 }
 
 #[test]
-fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_per_admitted_pool()
-{
+fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_each_running_state_and_one_read_per_admitted_pool()
+ {
     let scratch = Scratch::new("gets");
     write_first_tree(scratch.path());
     let fake = FakeIncus::start(scratch.path(), fake_state()).expect("start the fake Incus");
@@ -399,8 +403,8 @@ fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_
     let requests = fake.requests();
     assert_eq!(
         requests.len(),
-        7,
-        "the pool list, the instance list, the GPU inventory, one resources read for the admitted pool and the three incus-osd documents"
+        9,
+        "the pool list, the instance list, the state of each of the two running instances, the GPU inventory, one resources read for the admitted pool and the three incus-osd documents"
     );
     assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
     let mut paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
@@ -408,6 +412,8 @@ fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_
     assert_eq!(
         paths,
         vec![
+            STATE_A1,
+            STATE_B1,
             INSTANCES,
             "/1.0/resources",
             "/1.0/storage-pools/default/resources",
@@ -449,6 +455,8 @@ fn a_pool_name_that_is_not_plain_is_never_sent_to_incus() {
     assert_eq!(
         paths,
         vec![
+            STATE_A1.to_string(),
+            STATE_B1.to_string(),
             INSTANCES.to_string(),
             "/1.0/resources".to_string(),
             POOLS.to_string(),
@@ -828,6 +836,8 @@ mod pools_from_incus {
         assert_eq!(
             sorted_paths(&fake),
             vec![
+                STATE_A1.to_string(),
+                STATE_B1.to_string(),
                 INSTANCES.to_string(),
                 "/1.0/resources".to_string(),
                 "/1.0/storage-pools/default/resources".to_string(),
@@ -862,6 +872,8 @@ mod pools_from_incus {
         assert_eq!(
             sorted_paths(&fake),
             vec![
+                STATE_A1.to_string(),
+                STATE_B1.to_string(),
                 INSTANCES.to_string(),
                 "/1.0/resources".to_string(),
                 "/1.0/storage-pools/pool1/resources".to_string(),
@@ -899,6 +911,8 @@ mod pools_from_incus {
         assert_eq!(
             sorted_paths(&fake),
             vec![
+                STATE_A1.to_string(),
+                STATE_B1.to_string(),
                 INSTANCES.to_string(),
                 "/1.0/resources".to_string(),
                 POOLS.to_string(),
@@ -1011,7 +1025,7 @@ mod instance_readings {
 
     use super::*;
 
-    const LISTED: &str = "/1.0/instances?all-projects=true&recursion=2";
+    const LISTED: &str = "/1.0/instances?all-projects=true&recursion=1";
 
     /// Incus holds one project with a running container `db1`, a running virtual machine `vm1` and a stopped container `web1`.
     /// `db1` was last used at 10:00:00 UTC.
@@ -1062,6 +1076,10 @@ mod instance_readings {
         }
 
         fn get(&self, path: &str) -> Result<Value, IncusError> {
+            // An instance's own state answers with no usage: these tests count starts.
+            if path.starts_with("/1.0/instances/") && path.contains("/state?") {
+                return Ok(json!({}));
+            }
             if path != LISTED {
                 return Err(IncusError::Decode(format!("no answer for {path}")));
             }
@@ -1101,7 +1119,8 @@ mod instance_readings {
     }
 
     #[test]
-    fn the_instance_list_is_one_get_per_tick_at_recursion_two() {
+    fn the_instance_list_is_one_get_per_tick_without_state_and_each_running_instance_has_one_state_read()
+     {
         let scratch = Scratch::new("one-get");
         write_first_tree(scratch.path());
         let fake = FakeIncus::start(scratch.path(), proj1_state()).expect("start the fake Incus");
@@ -1112,16 +1131,25 @@ mod instance_readings {
         }
 
         let paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
-        let listed = paths
-            .iter()
-            .filter(|path| path.starts_with("/1.0/instances"))
-            .count();
+        let listed = paths.iter().filter(|path| *path == LISTED).count();
         assert_eq!(listed, 3, "one instance list per tick: {paths:?}");
-        assert!(
-            paths
-                .iter()
-                .all(|path| path == LISTED || !path.starts_with("/1.0/instances"))
-        );
+        // The two running instances, each once a tick; the stopped one never.
+        let states: Vec<&String> = paths
+            .iter()
+            .filter(|path| path.starts_with("/1.0/instances/"))
+            .collect();
+        assert_eq!(states.len(), 6, "{paths:?}");
+        for name in ["db1", "vm1"] {
+            let state = format!("/1.0/instances/{name}/state?project=proj1");
+            assert_eq!(
+                states.iter().filter(|path| ***path == state).count(),
+                3,
+                "{name}"
+            );
+        }
+        assert!(paths.iter().all(|path| path == LISTED
+            || path.ends_with("/state?project=proj1")
+            || !path.starts_with("/1.0/instances")));
     }
 
     #[test]
@@ -1335,6 +1363,7 @@ mod instance_readings {
 }
 
 mod latency_probe {
+    use std::collections::BTreeSet;
     use std::net::{SocketAddr, TcpListener};
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
@@ -2963,5 +2992,198 @@ mod host_totals {
         clock.advance(PROVISIONAL_WINDOW_MS);
         sampler.sample(1_000 + 3 * 3_600_000 + 5_000);
         assert!(!sampler.mode_provisional(), "the monotonic window ended");
+    }
+}
+
+/// Each running instance's usage, read from its own state one after another under a deadline each and a budget a tick.
+mod state_reads {
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    use arca_metrics::{ANSWERED_AN_ERROR, BUDGET_SPENT, NOT_ANSWERED};
+
+    use super::*;
+
+    /// One project with the running virtual machines `names` and a stopped container `off`.
+    fn machines(names: &[&str]) -> FakeState {
+        let mut instances: Vec<Value> = names
+            .iter()
+            .map(|name| json!({ "name": name, "project": "p", "status": "Running", "type": "virtual-machine" }))
+            .collect();
+        instances.push(
+            json!({ "name": "off", "project": "p", "status": "Stopped", "type": "container" }),
+        );
+        FakeState {
+            server: json!({ "api_version": "1.0" }),
+            projects: vec![json!({ "name": "p" })],
+            instances,
+            networks: Vec::new(),
+            pools: Vec::new(),
+        }
+    }
+
+    fn state_of(name: &str) -> String {
+        format!("/1.0/instances/{name}/state?project=p")
+    }
+
+    /// A sampler over `fake` whose state reads have `deadline` each and `budget` a tick.
+    fn sampler(root: &Path, fake: &FakeIncus, deadline: u64, budget: u64) -> Sampler<UnixIncus> {
+        Sampler::new(
+            SamplerConfig {
+                proc_root: root.join("proc"),
+                sys_root: root.join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: true,
+                mode_retry: None,
+            },
+            UnixIncus::new(fake.socket().to_path_buf()),
+        )
+        .with_state_reads(
+            Duration::from_millis(deadline),
+            Duration::from_millis(budget),
+        )
+    }
+
+    fn usage(sampler: &Sampler<UnixIncus>, name: &str) -> (Option<f64>, Option<u64>) {
+        let reading = sampler
+            .readings()
+            .instances
+            .as_ref()
+            .expect("the list was read")
+            .iter()
+            .find(|instance| instance.name == name)
+            .cloned()
+            .expect("a reading");
+        (reading.cpu_seconds, reading.memory_bytes)
+    }
+
+    fn not_read(sampler: &Sampler<UnixIncus>) -> Vec<(String, String)> {
+        sampler
+            .instances_not_read()
+            .iter()
+            .map(|item| (item.name.clone(), item.why.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_machine_that_does_not_answer_in_time_or_answers_an_error_is_named_and_the_others_are_read()
+    {
+        let scratch = Scratch::new("state-slow");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), machines(&["fast", "slow", "broken"]))
+            .expect("start the fake Incus");
+        for name in ["fast", "slow", "broken"] {
+            fake.set_instance_usage("p", name, 3_000_000_000, 4_096);
+        }
+        fake.slow_reads(&state_of("slow"), 1, Duration::from_millis(600));
+        fake.fail_reads(&state_of("broken"), 1, 500);
+        let mut sampler = sampler(scratch.path(), &fake, 200, 2_000);
+
+        let began = Instant::now();
+        sampler.sample(1_000);
+        assert!(
+            began.elapsed() < Duration::from_millis(1_500),
+            "a slow machine held the tick past its deadline"
+        );
+        assert_eq!(usage(&sampler, "fast"), (Some(3.0), Some(4_096)));
+        assert_eq!(usage(&sampler, "slow"), (None, None));
+        assert_eq!(usage(&sampler, "broken"), (None, None));
+        assert_eq!(usage(&sampler, "off"), (None, None));
+        assert_eq!(
+            not_read(&sampler),
+            vec![
+                ("broken".to_string(), ANSWERED_AN_ERROR.to_string()),
+                ("slow".to_string(), NOT_ANSWERED.to_string())
+            ]
+        );
+        // Every row is still counted: three running, one stopped.
+        let instances = sampler.readings().instances.clone().expect("the list");
+        assert_eq!(instances.len(), 4);
+        assert_eq!(
+            instances.iter().filter(|instance| instance.running).count(),
+            3
+        );
+
+        // node_metrics names them, in its schema, with fixed words only.
+        let value = node_metrics(&sampler, Some(1), 1_000);
+        let schema = (verb("node_metrics")
+            .expect("node_metrics is in the verb table")
+            .result)();
+        conforms(&schema, &value).expect("the node_metrics result conforms to its schema");
+        let named = json!([
+            { "project": "p", "name": "broken", "why": "Incus answered with an error" },
+            { "project": "p", "name": "slow", "why": "Incus did not answer within 2 seconds" },
+        ]);
+        assert_eq!(value["latest"]["instancesNotRead"], named);
+        assert_eq!(
+            value["mean"]["instancesNotRead"], named,
+            "the mean names the newest sample's"
+        );
+
+        // The next tick, both answer: nothing is named.
+        sampler.sample(6_000);
+        assert!(not_read(&sampler).is_empty());
+        assert_eq!(usage(&sampler, "slow"), (Some(3.0), Some(4_096)));
+        assert_eq!(
+            node_metrics(&sampler, Some(1), 6_000)["latest"]["instancesNotRead"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn more_slow_machines_than_one_tick_reaches_are_each_read_within_a_few_ticks() {
+        // Five machines, each slower than its deadline. A deadline of 150 ms and a budget of 400 ms reach two whole
+        // reads and a third cut short; the other two are not reached. Ordered by name every tick, the last two would
+        // never be asked; asked by who was asked longest ago, every one is asked by the second tick.
+        let names = ["m1", "m2", "m3", "m4", "m5"];
+        let scratch = Scratch::new("state-rotate");
+        write_first_tree(scratch.path());
+        let fake =
+            FakeIncus::start(scratch.path(), machines(&names)).expect("start the fake Incus");
+        for name in names {
+            fake.slow_reads(&state_of(name), 100, Duration::from_millis(500));
+        }
+        let mut sampler = sampler(scratch.path(), &fake, 150, 400);
+        let asked = |fake: &FakeIncus| -> BTreeSet<String> {
+            fake.requests()
+                .into_iter()
+                .filter_map(|request| {
+                    names
+                        .iter()
+                        .find(|name| request.path == state_of(name))
+                        .map(|name| name.to_string())
+                })
+                .collect()
+        };
+
+        let began = Instant::now();
+        sampler.sample(1_000);
+        assert!(
+            began.elapsed() < Duration::from_millis(900),
+            "the tick outlasted its budget"
+        );
+        // The fake records a read when it answers it, after its hold.
+        std::thread::sleep(Duration::from_millis(700));
+        let first = asked(&fake);
+        assert_eq!(first.len(), 3, "{first:?}");
+        let whys: Vec<&str> = sampler
+            .instances_not_read()
+            .iter()
+            .map(|item| item.why.as_str())
+            .collect();
+        assert_eq!(whys.len(), 5);
+        assert_eq!(whys.iter().filter(|why| **why == NOT_ANSWERED).count(), 2);
+        assert_eq!(whys.iter().filter(|why| **why == BUDGET_SPENT).count(), 3);
+
+        sampler.sample(6_000);
+        std::thread::sleep(Duration::from_millis(700));
+        let second = asked(&fake);
+        assert_eq!(
+            second.len(),
+            5,
+            "every machine is asked by the second tick: {second:?}"
+        );
     }
 }

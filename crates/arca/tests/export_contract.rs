@@ -207,6 +207,7 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         }],
         network: None,
         projects: Vec::new(),
+        instances_not_read: Vec::new(),
     };
     let readings = Readings {
         pools: Some(sample.pools.clone()),

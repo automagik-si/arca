@@ -530,6 +530,36 @@
                     "null"
                   ]
                 },
+                "instancesNotRead": {
+                  "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read.",
+                  "items": {
+                    "properties": {
+                      "name": {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      "project": {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      "why": {
+                        "enum": [
+                          "Incus did not answer within 2 seconds",
+                          "Incus answered with an error",
+                          "the tick's time for state reads was spent"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "project",
+                      "name",
+                      "why"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
                 "load": {
                   "properties": {
                     "fifteen": {
@@ -729,7 +759,8 @@
                 "gpu",
                 "pools",
                 "network",
-                "projects"
+                "projects",
+                "instancesNotRead"
               ],
               "type": [
                 "object",
@@ -1000,6 +1031,36 @@
                     "null"
                   ]
                 },
+                "instancesNotRead": {
+                  "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read.",
+                  "items": {
+                    "properties": {
+                      "name": {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      "project": {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      "why": {
+                        "enum": [
+                          "Incus did not answer within 2 seconds",
+                          "Incus answered with an error",
+                          "the tick's time for state reads was spent"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "project",
+                      "name",
+                      "why"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
                 "load": {
                   "properties": {
                     "fifteen": {
@@ -1199,7 +1260,8 @@
                 "gpu",
                 "pools",
                 "network",
-                "projects"
+                "projects",
+                "instancesNotRead"
               ],
               "type": [
                 "object",
