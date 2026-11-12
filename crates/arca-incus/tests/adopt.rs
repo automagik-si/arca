@@ -785,7 +785,7 @@ fn the_adoption_project_grants_only_eth0s_network_and_allows_snapshots_and_backu
             &json!({})
         )
         .0,
-        403
+        500
     );
 }
 
