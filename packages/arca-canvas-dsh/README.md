@@ -558,6 +558,20 @@ npx -y node@24.11.0 build.mjs
 git diff --exit-code -- client.js page.js page.css
 ```
 
+One test runs against a real DSH and is skipped unless it is given one:
+
+```sh
+ARCA_REAL_DSH_PROOF=/path/to/dsh npx -y node@24.11.0 --test test/real-host.test.js
+```
+
+`pnpm` must be beside that `dsh` or on `PATH`. The test installs this package's
+shipped files into a profile in a temporary home, starts the harness on a free
+loopback port, and fetches the canvas page, its snapshot and its chat history.
+It fails when the harness leaves the plugin out, as it does for a version the
+`engines.dsh` range refuses. The harness gets none of the caller's environment,
+and no model is asked. Run it against each DSH release before the range is
+changed to let that release in: every other test stands in for the host.
+
 Tests use fixture data, temporary Unix sockets and an ephemeral loopback browser
 server. Playwright 1.64.0 is pinned to the Chromium used by the rendering checks.
 The tests assert light/dark colors, layout regions and literal rendering of
