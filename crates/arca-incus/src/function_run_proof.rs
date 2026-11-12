@@ -1762,3 +1762,214 @@ fn starts_around_rebuilds(
     }
     first
 }
+
+/// The sweep's three calls against a REAL Incus and a registry that asks for a credential: the list of images
+/// fetched with a credential, the turn-off of `auto_update`, and the delete of one nothing is made from. Ignored, and
+/// a no-op unless `ARCA_REAL_INCUS_PROOF=1`. Same scratch project and variables as the proofs above it.
+///
+/// A second container from the public image puts a cached image without a credential into the same store: it must
+/// not be listed, and what Incus keeps of it must be the same before and after.
+#[test]
+#[ignore = "touches a real Incus and a real registry; run by hand with ARCA_REAL_INCUS_PROOF=1"]
+fn a_real_incus_lets_the_sweep_turn_auto_update_off_and_delete_what_nothing_uses() {
+    use crate::write::RegistryCredential;
+
+    if env("ARCA_REAL_INCUS_PROOF").as_deref() != Some("1") {
+        eprintln!("ARCA_REAL_INCUS_PROOF is not 1; nothing was done");
+        return;
+    }
+    let socket = env("ARCA_PROOF_SOCKET").unwrap_or_else(|| "/var/lib/incus/unix.socket".into());
+    let socket = Path::new(&socket);
+    let project = env("ARCA_PROOF_PROJECT").expect("ARCA_PROOF_PROJECT");
+    let pool = env("ARCA_PROOF_POOL").expect("ARCA_PROOF_POOL");
+    let server = env("ARCA_PROOF_REGISTRY_SERVER").expect("ARCA_PROOF_REGISTRY_SERVER");
+    let alias = env("ARCA_PROOF_REGISTRY_ALIAS").expect("ARCA_PROOF_REGISTRY_ALIAS");
+    let credential = RegistryCredential {
+        username: env("ARCA_PROOF_REGISTRY_USER").expect("ARCA_PROOF_REGISTRY_USER"),
+        password: std::fs::read_to_string(
+            env("ARCA_PROOF_REGISTRY_WORD_FILE").expect("ARCA_PROOF_REGISTRY_WORD_FILE"),
+        )
+        .expect("the password file reads")
+        .trim()
+        .to_string(),
+    };
+    sweeps_calls(socket, project, pool, server, alias, credential);
+}
+
+/// The body of the proof above, for the Incus at `socket`.
+fn sweeps_calls(
+    socket: &Path,
+    project: String,
+    pool: String,
+    server: String,
+    alias: String,
+    credential: crate::write::RegistryCredential,
+) {
+    use crate::write::UnixIncusWriter;
+    use arca_kernel::desired::EntryId;
+    use arca_kernel::ownership::{IncusKind, KERNEL_ENTRY_KEY, ObjectRef};
+
+    assert!(
+        project.starts_with("arcak-scratch-"),
+        "the project must be a scratch project"
+    );
+    // Nothing is printed that has not passed through this.
+    let word = credential.password.clone();
+    let hide = |text: &str| -> String { text.replace(&word, "[word]") };
+    const OTHER: &str = "fnbench2";
+    let instance = format!("/1.0/instances/{NAME}?project={project}");
+    let other = format!("/1.0/instances/{OTHER}?project={project}");
+    let images = format!("/1.0/images?project={project}&recursion=1");
+    for left in [&instance, &other] {
+        if send(socket, "GET", left, None).is_ok() {
+            delete(socket, left).expect("the container of an earlier run is deleted");
+        }
+    }
+    let entry = "fnbench";
+    let family =
+        ProjectFamily::new([project.as_str()], std::iter::empty::<&str>()).expect("family");
+    let writer = UnixIncusWriter::new(
+        socket.to_path_buf(),
+        EntryId(entry.to_string()),
+        std::collections::BTreeMap::new(),
+        family.clone(),
+    )
+    .with_operation_deadline(CALL);
+    let run = FunctionRun::new(socket.to_path_buf(), family);
+    let target = ObjectRef {
+        kind: IncusKind::Instance,
+        project: project.clone(),
+        parent: None,
+        name: NAME.to_string(),
+        uuid: None,
+    };
+    let body = json!({
+        "type": "container",
+        "source": { "type": "image", "mode": "pull", "protocol": "oci", "server": server, "alias": alias },
+        "config": { KERNEL_ENTRY_KEY: entry, "limits.cpu": "1", "limits.memory": "128MiB" },
+        "devices": { "root": { "type": "disk", "path": "/", "pool": pool } },
+        "start": false,
+    });
+    // What Incus keeps of every image of the store, by fingerprint: whether its address holds a credential, and
+    // auto_update. Never the address.
+    let store = || -> Vec<(String, bool, Value)> {
+        send(socket, "GET", &images, None).expect("the images")["metadata"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|image| {
+                (
+                    image["fingerprint"].as_str().unwrap_or_default()[..12].to_string(),
+                    image["update_source"]["server"]
+                        .as_str()
+                        .is_some_and(crate::write::address_holds_credential),
+                    image["auto_update"].clone(),
+                )
+            })
+            .collect()
+    };
+    let listed = |when: &str| {
+        let found = run
+            .fetched_with_credential(&project)
+            .map(|images| {
+                images
+                    .iter()
+                    .map(|image| {
+                        format!(
+                            "{} auto_update {} used {}",
+                            &image.fingerprint[..12],
+                            image.auto_update,
+                            image.used
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| hide(&error.to_string()));
+        println!("PROOF {when}: fetched with a credential: {found:?}");
+    };
+
+    // 1. The writer creates it; a second container from the public image stands beside it.
+    let from = Instant::now();
+    let created = match writer.create_with_registry(&target, &body, Some(&credential)) {
+        Ok(owned) => owned,
+        Err(error) => {
+            println!(
+                "PROOF the writer's create with a credential: REFUSED after {} ms: {}",
+                from.elapsed().as_millis(),
+                hide(&error.to_string())
+            );
+            let _ = delete(socket, &instance);
+            return;
+        }
+    };
+    println!(
+        "PROOF the writer's create with a credential: DONE in {} ms",
+        from.elapsed().as_millis()
+    );
+    let fingerprint = created
+        .config()
+        .get("volatile.base_image")
+        .cloned()
+        .unwrap_or_default();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write(
+            socket,
+            "POST",
+            &format!("/1.0/instances?project={project}"),
+            Some(&json!({
+                "name": OTHER,
+                "type": "container",
+                "source": { "type": "image", "mode": "pull", "protocol": "oci",
+                            "server": "https://docker.io", "alias": IMAGE },
+                "devices": { "root": { "type": "disk", "path": "/", "pool": pool } },
+                "start": false,
+            })),
+        )
+        .expect("the container from the public image is created");
+        println!(
+            "PROOF the store (fingerprint, credential in its address, auto_update): {:?}",
+            store()
+        );
+        listed("after the create");
+
+        // 2. Someone turns auto_update back on: the list says so, and the turn-off turns it off.
+        write(
+            socket,
+            "PATCH",
+            &format!("/1.0/images/{fingerprint}?project={project}"),
+            Some(&json!({ "auto_update": true })),
+        )
+        .expect("auto_update is turned on by hand");
+        listed("with auto_update turned on by hand");
+        println!(
+            "PROOF the turn-off: {:?}",
+            run.auto_update_off(&project, &fingerprint)
+                .map_err(|error| hide(&error.to_string()))
+        );
+        listed("after the turn-off");
+
+        // 3. The container goes: the image is listed as not used, and is deleted. The public image stays.
+        println!(
+            "PROOF the image is dropped while the container is made from it: {:?}",
+            run.drop_unused_image(&project, &fingerprint)
+                .map_err(|error| hide(&error.to_string()))
+        );
+        delete(socket, &instance).expect("the container is deleted");
+        listed("with its container deleted");
+        println!(
+            "PROOF the image is dropped once nothing is made from it: {:?}",
+            run.drop_unused_image(&project, &fingerprint)
+                .map_err(|error| hide(&error.to_string()))
+        );
+        listed("after the delete");
+        println!("PROOF the store at the end: {:?}", store());
+    }));
+    for left in [&instance, &other] {
+        if send(socket, "GET", left, None).is_ok() {
+            println!("PROOF {left} is deleted: {:?}", delete(socket, left));
+        }
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
