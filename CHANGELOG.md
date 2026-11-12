@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.10.0 (2026-11-12)
+
 `service_status` now answers `update` for a service whose version is known: `pin`, the version it was created with,
 `templatePin`, the one the template installed on the node names now, and `state`, `same` or `differs` (`unknown`
 with a `problem` when the installed template cannot say). `service_list` carries `update` only on a service that
@@ -16,6 +18,8 @@ where its version is with a new key, `"update": { "pin": "<a key of settings>" }
 names `serverImage`. A container's version is its `digest`. It only tells you: the way to the template's version is
 still `service_remove` and `service_create`. See "Whether the installed template names another version" in
 `docs/OPERATING.md`.
+
+- a service's status says whether the installed template names the same version as the one running, another one, or cannot tell
 
 ## 0.9.0 (2026-11-12)
 
