@@ -11,7 +11,6 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 use std::time::Instant;
 
 use arca_alerts::Engine;
@@ -30,7 +29,7 @@ use arca_kernel::identity::NodeKey;
 use arca_kernel::plugin::Provider;
 use arca_mcp::{
     Server, TokenStore, TokenStoreError, serve_loopback, serve_proxy, serve_services,
-    serve_tailnet, serve_unix,
+    serve_tailnet, serve_unix_bound,
 };
 use arca_metrics::ProbeTarget;
 use arca_providers::ReadOnlyIncusProvider;
@@ -55,6 +54,8 @@ use crate::{Failure, Flags};
 const NODE_KEY_FILE: &str = "node.key";
 /// The file a running server leaves its pid in, so `arca token revoke` can send it SIGHUP.
 pub(crate) const SERVE_PID_FILE: &str = "serve.pid";
+/// The file in the state directory where `serve` records each reload of its tokens.
+pub(crate) const SERVE_RELOAD_FILE: &str = "serve.reload";
 #[cfg(target_os = "linux")]
 const PID_NOFOLLOW: i32 = 0o400000;
 #[cfg(not(target_os = "linux"))]
@@ -590,6 +591,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .build()
         .map_err(|e| Failure::Runtime(e.to_string()))?;
     let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
+    let reload_path = cfg.state_dir.join(SERVE_RELOAD_FILE);
     let unix_path = cfg.listen.unix.clone();
     let outcome: io::Result<()> = runtime.block_on(async {
         let mut terminate = signal(SignalKind::terminate())?;
@@ -597,24 +599,34 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         let mut hangup = signal(SignalKind::hangup())?;
         let reload_tokens = tokens.clone();
         let reload_dir = cfg.tokens.hash_dir.clone();
+        let reload_record = reload_path.clone();
         tokio::spawn(async move {
+            // Each reload is numbered and recorded, so `arca token reload` can say what its signal did, not only that it
+            // was sent.
+            let mut seq: u64 = 0;
             while hangup.recv().await.is_some() {
-                match reload_tokens.reload(&reload_dir) {
-                    Ok(count) => eprintln!("arca: {count} token(s) reloaded"),
-                    Err(error) => eprintln!("arca: the token store was not reloaded: {error}"),
+                seq += 1;
+                let tokens = match reload_tokens.reload(&reload_dir) {
+                    Ok(count) => {
+                        eprintln!("arca: {count} token(s) reloaded");
+                        Some(count)
+                    }
+                    Err(error) => {
+                        eprintln!("arca: the token store was not reloaded: {error}");
+                        None
+                    }
+                };
+                let record = ReloadRecord {
+                    pid: std::process::id(),
+                    seq,
+                    tokens,
+                };
+                if let Err(error) = write_private(&reload_record, &record.line()) {
+                    eprintln!(
+                        "arca: the reload was not recorded in {}: {error}",
+                        reload_record.display()
+                    );
                 }
-            }
-        });
-        let pid_write_path = pid_path.clone();
-        let pid_probe = unix_path.clone();
-        tokio::spawn(async move {
-            let until = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < until {
-                if let Ok(stream) = tokio::net::UnixStream::connect(&pid_probe).await {
-                    write_pid_for_peer(&stream, &pid_write_path);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
         let stop = async {
@@ -669,7 +681,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }
         };
         tokio::select! {
-            result = serve_unix(router.clone(), &unix_path) => result,
+            // The pid file is published the moment the socket is this process's own, and before any request is served: a
+            // start that is refused never reaches it, so the file never names a process that holds no listener.
+            result = serve_unix_bound(router.clone(), &unix_path, || {
+                publish_pid(&pid_path);
+                // This process holds the state directory alone, so a reload record in it is an older node's: it goes, and
+                // no reload of this node is ever taken for one of that node's.
+                clear_reload_record(&reload_path);
+            }) => result,
             result = loopback => result,
             result = loopback_twin => result,
             result = tailnet => result,
@@ -679,6 +698,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         }
     });
     remove_own_pid(&pid_path);
+    remove_own_pid(&reload_path);
     match outcome {
         Ok(()) => {
             remove_own_socket(&cfg.listen.unix);
@@ -691,29 +711,85 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
 }
 
-/// Publishes our pid only when the connected listener belongs to this process.
-fn write_pid_for_peer(stream: &tokio::net::UnixStream, path: &Path) {
-    if !stream.peer_cred().is_ok_and(|cred| {
-        cred.pid()
-            .is_some_and(|pid| pid as u32 == std::process::id())
-    }) {
-        return;
+/// One reload of the token store, as `serve` records it in [`SERVE_RELOAD_FILE`]: which process reloaded, its count of
+/// reloads so far, and how many tokens it holds now, or `None` when the token directory could not be read and the node
+/// keeps the tokens it had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReloadRecord {
+    pub pid: u32,
+    pub seq: u64,
+    pub tokens: Option<usize>,
+}
+
+impl ReloadRecord {
+    /// The record as its one line: `<pid> <seq> ok <tokens>` or `<pid> <seq> failed`.
+    fn line(&self) -> String {
+        match self.tokens {
+            Some(tokens) => format!("{} {} ok {tokens}\n", self.pid, self.seq),
+            None => format!("{} {} failed\n", self.pid, self.seq),
+        }
     }
-    if let Ok(mut file) = fs::OpenOptions::new()
+
+    /// The record in the file at `path`, when it holds one whole line of one. A file that is missing, half written or
+    /// anything else is no record.
+    pub(crate) fn read(path: &Path) -> Option<ReloadRecord> {
+        let text = fs::read_to_string(path).ok()?;
+        let line = text.strip_suffix('\n')?;
+        let fields: Vec<&str> = line.split(' ').collect();
+        let (pid, seq) = (fields.first()?.parse().ok()?, fields.get(1)?.parse().ok()?);
+        let tokens = match fields.get(2..)? {
+            ["ok", tokens] => Some(tokens.parse().ok()?),
+            ["failed"] => None,
+            _ => return None,
+        };
+        Some(ReloadRecord { pid, seq, tokens })
+    }
+}
+
+/// Writes `text` as the whole of the file at `path`: a regular file of mode 0600, never through a link.
+fn write_private(path: &Path, text: &str) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .custom_flags(PID_NOFOLLOW)
-        .open(path)
-        && file.metadata().is_ok_and(|meta| meta.is_file())
-    {
-        let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
-        let _ = file.sync_all();
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the path holds something other than a regular file",
+        ));
+    }
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+/// Publishes this process's pid in the file at `path`, once its listener is bound. A failure is said once, on stderr, and
+/// does not stop the node: `arca token reload` and `arca token revoke` still find it by its command line.
+fn publish_pid(path: &Path) {
+    if let Err(error) = write_private(path, &format!("{}\n", std::process::id())) {
+        eprintln!(
+            "arca: the pid file {} was not written ({error}); arca token reload and revoke still find this node by its command line",
+            path.display()
+        );
     }
 }
 
-/// Removes `path` only when it still holds this process's pid, so a second server cannot delete the first one's file.
+/// Removes the reload record a node that ran before left in `path`. A failure other than "no such file" is said once.
+fn clear_reload_record(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "arca: the older reload record {} was not removed ({error})",
+            path.display()
+        ),
+    }
+}
+
+/// Removes `path` only when it still names this process (its first field is this pid), so a second server cannot delete
+/// the first one's file. It serves the pid file and the reload record alike.
 fn remove_own_pid(path: &Path) {
     let own = std::process::id().to_string();
     let Ok(meta) = fs::symlink_metadata(path) else {
@@ -724,7 +800,7 @@ fn remove_own_pid(path: &Path) {
     }
     if fs::read_to_string(path)
         .ok()
-        .is_some_and(|text| text.trim() == own)
+        .is_some_and(|text| text.split_whitespace().next() == Some(own.as_str()))
     {
         let _ = fs::remove_file(path);
     }
@@ -745,21 +821,68 @@ mod pid_tests {
         dir
     }
 
-    #[tokio::test]
-    async fn our_listener_peer_writes_our_pid_with_private_permissions() {
-        let dir = scratch("own-peer");
-        let socket = dir.join("serve.sock");
-        let _listener = tokio::net::UnixListener::bind(&socket).expect("own listener");
-        let stream = tokio::net::UnixStream::connect(&socket)
-            .await
-            .expect("connect");
+    #[test]
+    fn the_pid_is_published_with_private_permissions_and_never_through_a_link() {
+        let dir = scratch("publish");
         let path = dir.join(SERVE_PID_FILE);
-        write_pid_for_peer(&stream, &path);
+        publish_pid(&path);
         assert_eq!(
             fs::read_to_string(&path).expect("pid"),
             format!("{}\n", std::process::id())
         );
         assert_eq!(fs::metadata(&path).expect("metadata").mode() & 0o777, 0o600);
+        // A link at the path is refused, and what it points at is left alone: the failure is an error, not a silence.
+        let target = dir.join("elsewhere");
+        fs::write(&target, "untouched\n").expect("target");
+        let link = dir.join("linked.pid");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        assert!(write_private(&link, "1\n").is_err());
+        assert_eq!(fs::read_to_string(&target).expect("target"), "untouched\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reload_record_reads_back_whole_and_a_half_written_one_is_no_record() {
+        let dir = scratch("reload-record");
+        let path = dir.join(SERVE_RELOAD_FILE);
+        assert_eq!(ReloadRecord::read(&path), None, "no file is no record");
+        for record in [
+            ReloadRecord {
+                pid: 4242,
+                seq: 3,
+                tokens: Some(2),
+            },
+            ReloadRecord {
+                pid: 4242,
+                seq: 4,
+                tokens: None,
+            },
+        ] {
+            write_private(&path, &record.line()).expect("write");
+            assert_eq!(ReloadRecord::read(&path), Some(record));
+        }
+        for partial in [
+            "",
+            "4242 5 ok 1",
+            "4242 5 ok\n",
+            "4242 five ok 1\n",
+            "4242 5 ok 1 extra\n",
+        ] {
+            fs::write(&path, partial).expect("partial");
+            assert_eq!(ReloadRecord::read(&path), None, "{partial:?}");
+        }
+        // Its own record goes with the process, and another process's stays.
+        write_private(&path, "999999 1 ok 1\n").expect("other");
+        remove_own_pid(&path);
+        assert!(path.exists(), "another server's record stays");
+        let own = ReloadRecord {
+            pid: std::process::id(),
+            seq: 1,
+            tokens: Some(1),
+        };
+        write_private(&path, &own.line()).expect("own");
+        remove_own_pid(&path);
+        assert!(!path.exists(), "this process removes its own record");
         let _ = fs::remove_dir_all(dir);
     }
 

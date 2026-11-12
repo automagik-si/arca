@@ -700,9 +700,8 @@ fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         format!(
-            "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> --config {}/.config/arca/node.json. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}\n",
-            home.display(),
-            reload_command(&node)
+            "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> --config {installed}. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: arca token reload --config {installed}\n",
+            installed = home.join(".config/arca/node.json").display()
         )
     );
 }
@@ -734,10 +733,7 @@ fn wait_for_pid_file(node: &Node) {
 
 /// The command a refusal gives to make `node` read its tokens again.
 fn reload_command(node: &Node) -> String {
-    format!(
-        "kill -HUP $(cat {}/serve.pid)",
-        node.scratch.path("state").display()
-    )
+    format!("arca token reload --config {}", node.config.display())
 }
 
 /// What a refusal says about minting a token of `scope` for `node`.
@@ -786,19 +782,15 @@ fn a_token_minted_while_the_node_runs_is_refused_until_the_reload_the_refusal_na
         "the refusal names the reload: {refusal}"
     );
 
-    // `serve` writes its pid file a moment after it starts to listen, so a node that already answers may not have one
-    // yet. The reload reads that file, so the test waits for it first.
-    wait_for_pid_file(&node);
-    // The reload, run as the refusal words it.
-    let ran = Command::new("sh")
-        .arg("-c")
-        .arg(&reload)
-        .output()
-        .expect("run the reload");
-    assert!(
-        ran.status.success(),
-        "{}",
-        String::from_utf8_lossy(&ran.stderr)
+    // The reload the refusal names, run at once: the node is found whether or not its pid file is there yet.
+    let ran = token_reload(&node);
+    assert_eq!(code(&ran), 0, "{}", String::from_utf8_lossy(&ran.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&ran.stdout),
+        format!(
+            "reloaded: the node on this config (pid {}) read its tokens again and holds 4 token(s)\n",
+            node.serve.id()
+        )
     );
     // A bound, not a speed judgement: the node reloads in its own time.
     let until = Instant::now() + PID_WAIT;
@@ -813,4 +805,80 @@ fn a_token_minted_while_the_node_runs_is_refused_until_the_reload_the_refusal_na
         "{}",
         String::from_utf8_lossy(&after.stderr)
     );
+}
+
+/// `arca token reload --config <the node's config>`.
+fn token_reload(node: &Node) -> Output {
+    arca()
+        .args(["token", "reload", "--config"])
+        .arg(&node.config)
+        .output()
+        .expect("run token reload")
+}
+
+#[test]
+fn token_reload_finds_a_running_node_whose_pid_file_is_not_there() {
+    let node = start_node("reload-no-pid-file");
+    // The file a node has not written yet, or could not write, is the same to the command: no file.
+    wait_for_pid_file(&node);
+    let pid_file = node.scratch.path("state").join("serve.pid");
+    fs::remove_file(&pid_file).expect("remove the pid file");
+    let out = token_reload(&node);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "reloaded: the node on this config (pid {}) read its tokens again and holds 3 token(s)\n",
+            node.serve.id()
+        )
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn token_reload_follows_no_stale_pid_file_and_still_finds_the_node_itself() {
+    let node = start_node("reload-stale-file");
+    wait_for_pid_file(&node);
+    // The file names a stranger: another program of this user. The node itself still runs on the config.
+    let mut stranger = Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("a stranger process");
+    let pid_file = node.scratch.path("state").join("serve.pid");
+    fs::write(&pid_file, format!("{}\n", stranger.id())).expect("the stale pid file");
+    let out = token_reload(&node);
+    let alive = stranger.try_wait().expect("poll the stranger").is_none();
+    let _ = stranger.kill();
+    let _ = stranger.wait();
+    assert!(alive, "the stranger was not signalled");
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with(&format!(
+            "reloaded: the node on this config (pid {}) ",
+            node.serve.id()
+        )),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn token_reload_says_so_when_the_node_could_not_read_its_tokens_and_exits_non_zero() {
+    let node = start_node("reload-refused");
+    // A token directory others may write is one the node refuses to read, so it keeps the tokens it had.
+    let hash_dir = node.scratch.path("tokens");
+    fs::set_permissions(&hash_dir, fs::Permissions::from_mode(0o777)).expect("mode 0777");
+    let out = token_reload(&node);
+    fs::set_permissions(&hash_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty(), "nothing is claimed on stdout");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "arca: not reloaded: the node on this config (pid {}) could not read its token directory and keeps the tokens it had. Its own log says why\n",
+            node.serve.id()
+        )
+    );
+    let still = call(&node, &node.viewer, "arca_status", &[]);
+    assert_eq!(code(&still), 0, "the node keeps the tokens it had");
 }

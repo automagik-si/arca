@@ -20,8 +20,6 @@ use arca_api::{verb, verbs};
 use arca_mcp::PROTOCOL_VERSION;
 use serde_json::{Value, json};
 
-use crate::cmd_serve::SERVE_PID_FILE;
-use crate::config::NodeConfig;
 use crate::{Chosen, Failure, Flags, INSTALL_UNIT, Origin, closest, parse_flags};
 
 /// The node a call addresses, for the next step a refusal names: every command in a hint names this node's own config, so
@@ -31,26 +29,23 @@ pub(crate) struct Addressed {
     config: String,
     /// Whether that config is the installer's own, whose node the installer runs as a service.
     installed: bool,
-    /// The node's state directory, where `serve` keeps its pid file.
-    state_dir: String,
     /// Whether the call goes to a paired peer through this node's link, and not to this node.
     peer: bool,
 }
 
 impl Addressed {
-    pub(crate) fn new(config: &Chosen, cfg: &NodeConfig, peer: bool) -> Addressed {
+    pub(crate) fn new(config: &Chosen, peer: bool) -> Addressed {
         Addressed {
             config: config.path.display().to_string(),
             installed: config.origin == Origin::Default,
-            state_dir: cfg.state_dir.display().to_string(),
             peer,
         }
     }
 
-    /// The command that makes a running node read its tokens again: `serve` reads them when it starts and on SIGHUP, and
-    /// keeps its pid in the state directory.
+    /// The command that makes a running node read its tokens again. `serve` reads them when it starts and on SIGHUP;
+    /// `token reload` finds this config's node, signals no other process, and says what happened.
     fn reload(&self) -> String {
-        format!("kill -HUP $(cat {}/{SERVE_PID_FILE})", self.state_dir)
+        format!("arca token reload --config {}", self.config)
     }
 
     /// How a token of `scope` is made for this node into `out`, and the step that makes a running node take it: `token
@@ -157,7 +152,7 @@ pub fn call(args: &[String]) -> Result<Option<Value>, Failure> {
         let (config, cfg) = crate::load_chosen_config(&flags)?;
         (config, cfg, crate::token_path(&flags)?)
     };
-    let node = Addressed::new(&config, &cfg, peer.is_some());
+    let node = Addressed::new(&config, peer.is_some());
     let token = read_token(&token_file, &node)?;
     let arguments = call_arguments(&flags)?;
     let socket = if peer.is_some() {

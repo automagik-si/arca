@@ -1,18 +1,23 @@
 //! `token mint --scope <s> --id <id> --out <f>` with `--config <c>` or `--hash-dir <d>`: one scoped bearer token. The hash file goes
 //! into the token directory and the secret into a file the caller names, both at mode 0400. Only the id and the scope are
 //! printed. Nothing is overwritten: an id or an output path that exists is refused.
+//!
+//! `token reload --config <c>` makes the node that runs on that config read its tokens again, and says what happened. A
+//! node reads its tokens when it starts and on SIGHUP, and `token mint` sends no signal, so this is the step after a mint
+//! on a running node. It signals only a process it has checked to be `arca serve` on that very config.
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use arca_api::{Scope, may_call, verb};
 use arca_mcp::mint_with_tools;
 use serde_json::{Value, json};
 
-use crate::cmd_serve::SERVE_PID_FILE;
+use crate::cmd_serve::{ReloadRecord, SERVE_PID_FILE, SERVE_RELOAD_FILE};
 use crate::config;
 use crate::{Failure, Flags};
 
@@ -78,19 +83,8 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     let mut reload_signalled = false;
     if let Some(path) = flags.value("config") {
         let cfg = config::load(Path::new(path))?;
-        let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
-        let config_path = Path::new(path);
-        let from_file = fs::read_to_string(&pid_path)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-            .filter(|pid| pid_serves_config(*pid, config_path));
-        let pid = from_file.or_else(|| serve_pid_for_config(config_path));
-        if let Some(pid) = pid {
-            let status = Command::new("kill")
-                .arg("-HUP")
-                .arg(pid.to_string())
-                .status();
-            reload_signalled = status.is_ok_and(|status| status.success());
+        if let Some(pid) = serving_pid(Path::new(path), &cfg.state_dir) {
+            reload_signalled = send_hangup(pid, Path::new(path));
         }
     }
     Ok(Some(json!({
@@ -98,6 +92,109 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
         "revoked": true,
         "reloadSignalled": reload_signalled
     })))
+}
+
+/// How long `token reload` waits for the node to record that it read its tokens: a bound for a busy machine, since the node
+/// answers in milliseconds.
+const RELOAD_WAIT: Duration = Duration::from_secs(30);
+
+/// `token reload --config <c>`: sends the `arca serve` that runs on this config SIGHUP, waits for the node's own record of
+/// the reload, and prints what happened. It exits 0 only when the node read its tokens again. A node that is not there, a
+/// node that could not read its token directory, and a signal whose effect cannot be told are each said in words, with a
+/// failure's exit code. It takes `--config` as a flag alone: it acts on a node, so it reads no default.
+pub fn reload_tokens(flags: &Flags) -> Result<Option<Value>, Failure> {
+    let cfg = crate::load_named_config(flags, "token reload signals a node")?;
+    let config_text = flags.value("config").unwrap_or_default();
+    let config_path = Path::new(config_text);
+    // The process is checked through /proc. Without it nothing can be checked, so nothing is signalled.
+    if fs::read_dir("/proc").is_err() {
+        return Err(Failure::Runtime(
+            "could not tell whether a node runs on this config: /proc cannot be read, and the node's process is checked there. Nothing was signalled".to_string(),
+        ));
+    }
+    let Some(pid) = serving_pid(config_path, &cfg.state_dir) else {
+        return Err(Failure::Runtime(format!(
+            "no node runs on this config, so nothing was reloaded. A node reads its tokens when it starts: arca serve --config {config_text}"
+        )));
+    };
+    let record_path = cfg.state_dir.join(SERVE_RELOAD_FILE);
+    let before = ReloadRecord::read(&record_path).filter(|record| record.pid == pid);
+    if !send_hangup(pid, config_path) {
+        return Err(Failure::Runtime(format!(
+            "could not tell whether the node on this config (pid {pid}) read its tokens: it could not be signalled. It may have just stopped, or it runs as another user"
+        )));
+    }
+    let deadline = Instant::now() + RELOAD_WAIT;
+    loop {
+        let record = ReloadRecord::read(&record_path)
+            .filter(|record| record.pid == pid && Some(*record) != before);
+        match record {
+            Some(ReloadRecord {
+                tokens: Some(tokens),
+                ..
+            }) => {
+                println!(
+                    "reloaded: the node on this config (pid {pid}) read its tokens again and holds {tokens} token(s)"
+                );
+                return Ok(None);
+            }
+            Some(ReloadRecord { tokens: None, .. }) => {
+                return Err(Failure::Runtime(format!(
+                    "not reloaded: the node on this config (pid {pid}) could not read its token directory and keeps the tokens it had. Its own log says why"
+                )));
+            }
+            None => {}
+        }
+        if !pid_serves_config(pid, config_path) {
+            return Err(Failure::Runtime(format!(
+                "could not tell whether the node on this config read its tokens: it (pid {pid}) stopped before it said so"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(Failure::Runtime(format!(
+                "could not tell whether the node on this config (pid {pid}) read its tokens: it was signalled and did not say so within {} seconds. A node older than this command reloads without saying so; a call with the new token shows whether it did",
+                RELOAD_WAIT.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The pid of the `arca serve` that runs on the config at `config`, when one does. The pid file in `state_dir` is believed
+/// only when its pid is, right now, an `arca serve` on this very config: a file left by a node that crashed names a pid
+/// that is gone or is another program's, and is not followed. With no such file (a node that has not written it, or
+/// could not), the node is found by its command line.
+fn serving_pid(config: &Path, state_dir: &Path) -> Option<u32> {
+    let from_file = fs::read_to_string(state_dir.join(SERVE_PID_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .filter(|pid| pid_serves_config(*pid, config));
+    from_file.or_else(|| serve_pid_for_config(config))
+}
+
+/// Sends SIGHUP to the `arca serve` on `config` that has the pid `pid`, and to nothing else. Whether the signal was
+/// delivered.
+///
+/// A pid is only a number: between the caller's check and a signal sent by number, the process could end and another
+/// could take the number. So the process is first held by a descriptor, which names that one process for as long as it is
+/// open; it is checked again while held, and the signal goes through the descriptor. A process that took over the number
+/// fails the second check, and a process that ended cannot be signalled through its descriptor.
+#[cfg(target_os = "linux")]
+fn send_hangup(pid: u32, config: &Path) -> bool {
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+    let Some(process) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+        return false;
+    };
+    let Ok(held) = pidfd_open(process, PidfdFlags::empty()) else {
+        return false;
+    };
+    pid_serves_config(pid, config) && pidfd_send_signal(&held, Signal::HUP).is_ok()
+}
+
+/// Off Linux there is no `/proc` to check a process in, so no process is ever found to signal, and none is signalled.
+#[cfg(not(target_os = "linux"))]
+fn send_hangup(_pid: u32, _config: &Path) -> bool {
+    false
 }
 
 /// Finds a live `arca serve --config <config>` process for this config, for the window before its post-bind pid file lands.

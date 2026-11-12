@@ -16,7 +16,7 @@ const VERB: &str = "arca_status";
 
 pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
     let (config, cfg) = crate::load_chosen_config(flags)?;
-    let node = Addressed::new(&config, &cfg, false);
+    let node = Addressed::new(&config, false);
     let token = read_token(&crate::token_path(flags)?, &node)?;
     let answer =
         run_call(&cfg.listen.unix, None, &token, VERB, json!({}), &node)?.unwrap_or(Value::Null);

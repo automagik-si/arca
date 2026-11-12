@@ -56,7 +56,7 @@ states what the kernel may touch.
 the default. Only a command that reads a node takes them, and the table shows those flags in brackets. A command that
 writes to a node, starts one or calls a peer takes `--config` as a flag alone. `token mint` writes the hash and sends no
 signal: a node reads its tokens when it starts and on SIGHUP, so a running node takes a new token after
-`kill -HUP $(cat <stateDir>/serve.pid)` or a restart.
+`arca token reload --config <file>` or a restart.
 
 | Command | Reads | Prints |
 |---------|-------|--------|
@@ -77,6 +77,7 @@ signal: a node reads its tokens when it starts and on SIGHUP, so a running node 
 | `arca call --peer <name> <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and both flags are required: this node's own token is never sent by default | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>]` with `--config <file>` or `--hash-dir <dir>` | nothing | the id, scope and tool list |
 | `arca token revoke <id>` with `--config <file>` or `--hash-dir <dir>` | the token's hash file | the id and `revoked: true` |
+| `arca token reload --config <file>` | the pid file and the reload record in the state directory, and `/proc` | one line: `reloaded: the node on this config (pid <n>) read its tokens again and holds <k> token(s)`. It exits non-zero, with the reason on stderr, when no node runs on the config, when the node could not read its token directory, or when it cannot tell |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
 | `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
 | `arca --version`, `arca version` or `arca -V` | nothing | one line: `Automagik Arca <version> (<short commit>, <target triple>)`; the commit reads `unknown` when the binary was built with no git checkout |
@@ -387,10 +388,19 @@ one is refused with exit 2 and nothing is written. Giving neither is refused wit
 **Run `arca token mint` as the user that runs `serve`.** A mint run as another user writes hash files owned by that user, and
 the server refuses every file it does not own, so the load fails until those files are minted again as the server's user.
 
+`arca token reload --config <file>` makes the node that runs on that config read its tokens again: the step after a
+`token mint` on a running node, which sends no signal itself. It finds the node as `token revoke` does, and signals only a
+process it has checked to be `arca serve` on that very config: a pid file left by a node that crashed, whose pid is gone or
+is another program's, is not followed. It then waits for the node's own record of the reload, `<stateDir>/serve.reload`,
+and answers in words: `reloaded`, with the pid and the count of tokens; `no node runs on this config`; `not reloaded`, when
+the node could not read its token directory and keeps the tokens it had; or `could not tell`, when the signal was sent and
+the node did not say so within 30 seconds (a node older than this command reloads without saying so). Only `reloaded`
+exits 0.
+
 `arca token revoke <id>` removes the token's hash file. With `--config`, it sends `SIGHUP` to a live `arca serve` for that
 config: it checks `<stateDir>/serve.pid` only when its pid is a live `arca serve`, and otherwise finds the same process in
-`/proc`. The server writes that pid file only after its own unix socket accepts connections and removes it only when it still
-holds its own pid. A second start that fails to bind leaves the running server's pid file unchanged. The answer carries
+`/proc`. The server writes that pid file as soon as its own unix socket is bound, before it serves a request, and removes
+it only when it still holds its own pid; a write that fails is said once on stderr and does not stop the node. A second start that fails to bind leaves the running server's pid file unchanged. The answer carries
 `reloadSignalled`; `token_list` drops the token and a call with it is 401 without a restart. With `--hash-dir` alone no state
 directory or serve is known, so no signal is sent (`reloadSignalled: false`) and a running server keeps the token until it is
 restarted or signalled. The hash files stay mode 0400. The signal uses the host's `kill` command.

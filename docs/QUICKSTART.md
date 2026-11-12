@@ -154,7 +154,8 @@ the `arca_status` tool's own answer, the same as `arca call arca_status`: one JS
 its owner, and `arca call` alone lists every verb.
 
 A token minted while the node runs is refused until the node reads it: `serve` reads its tokens when it starts and on
-SIGHUP, so run `kill -HUP $(cat <stateDir>/serve.pid)` after a later `arca token mint`, or restart the node.
+SIGHUP, so run `arca token reload --config ~/.config/arca/node.json` after a later `arca token mint`, or restart the
+node. `token reload` finds the node that runs on that config, signals nothing else, and says whether it read its tokens.
 
 **4. Connect an assistant over MCP.** The node is an MCP server over streamable HTTP: `POST /mcp`, JSON answers, and a
 bearer token on every request. It speaks protocol version `2026-07-28` (no handshake: each request names its version)
