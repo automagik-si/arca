@@ -31,6 +31,16 @@ result, one JSON object with `"ok"`. Six new verbs: `function_create`, `function
 `function_list`, `function_run`, `function_runs`. Known limit: a run can write its container's root file system, and
 the next run finds what it wrote (Incus refuses to start an OCI container with a read-only root). `docs/OPERATING.md`,
 "Functions", has the whole of it.
+`postgres_create` now works on a node set up from a clean install. On a node whose config sets no
+`kernel.postgresImage`, it makes a service from the node's `postgres-autopg` template, with the image fetched by
+digest and the password the template generates: give the name only. A database made this way is a service: connect to it with
+`service_connect`, remove it with `service_remove`; `postgres_list` shows it with `service: true`. A proposal's card
+shows the image and binds it, and a template changed before the approval refuses the create.
+
+No call chooses a database's image any more. A `doctor` or `operator` token's own `postgres_create` used to run any
+digest-pinned image it named; it now uses the node's template, or `kernel.postgresImage` where the config sets it, and
+a call that states another image is refused. A node whose config sets `kernel.postgresImage` keeps the old kind of
+database whole, and its records and lists are unchanged; `image` is now optional in the call.
 
 ## 0.12.0 (2026-11-12)
 

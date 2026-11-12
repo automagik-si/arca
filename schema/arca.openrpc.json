@@ -2627,18 +2627,27 @@
       "name": "postgres_create",
       "params": [
         {
-          "name": "image",
+          "name": "name",
           "required": true,
+          "schema": {
+            "maxLength": 31,
+            "type": "string"
+          }
+        },
+        {
+          "name": "image",
+          "required": false,
           "schema": {
             "maxLength": 512,
             "type": "string"
           }
         },
         {
-          "name": "name",
-          "required": true,
+          "name": "template",
+          "required": false,
           "schema": {
-            "maxLength": 31,
+            "description": "Filled in by the node: the template a database is made from when its config names no image (postgres-autopg). A caller leaves it out.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
             "type": "string"
           }
         },
@@ -2662,11 +2671,17 @@
             "name": {
               "type": "string"
             },
+            "service": {
+              "type": "boolean"
+            },
             "status": {
               "enum": [
                 "pending",
                 "running"
               ],
+              "type": "string"
+            },
+            "stoppedBecause": {
               "type": "string"
             }
           },
@@ -2678,7 +2693,7 @@
           "type": "object"
         }
       },
-      "summary": "Create a Postgres database on the node's service network, in the node's service project (arcak-svc): one instance from a digest-pinned image (name@sha256:<64 hex>), with a password Arca generates and keeps; no tool shows it. Returns its name, its entry and the status pending; postgres_list shows when it runs. Nothing reaches it until postgres_link links a consumer. Inside a tenant a database is a service from the postgres-autopg template instead (service_create, then service_connect).",
+      "summary": "Create a Postgres database in the node's service project (arcak-svc), with a password Arca generates and keeps; no tool shows it. Give the name only: the image is the node's, never the call's. With no kernel.postgresImage in the node's config, the database is a service from the node's postgres-autopg template (its digest-pinned image is fetched), and the answer says service: true: connect to it with service_connect, remove it with service_remove. With kernel.postgresImage, it is a database of the old kind from that image, linked with postgres_link. Returns its name, its entry and the status pending; postgres_list shows when it runs. In a tenant, use service_create with that template.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -2726,6 +2741,9 @@
                   "port": {
                     "type": "integer"
                   },
+                  "service": {
+                    "type": "boolean"
+                  },
                   "status": {
                     "type": "string"
                   }
@@ -2749,7 +2767,7 @@
           "type": "object"
         }
       },
-      "summary": "The Postgres databases in the node's service project (arcak-svc), each with its name, its entry, its status (pending until it has an address), its address, its port and the consumers linked to it. A node with no database answers an empty list. Never a password or a connection URL. A tenant's databases are services: service_list shows them.",
+      "summary": "The Postgres databases in the node's service project (arcak-svc), each with its name, its entry, its status (pending until it has an address), its address, its port and the consumers linked to it. A database made from the node's postgres-autopg template is a service: its row carries service: true, its links are the services connected to it, and the service verbs act on it (service_connect, service_remove). A node with no database answers an empty list. Never a password or a connection URL. A tenant's databases are services: service_list shows them.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,

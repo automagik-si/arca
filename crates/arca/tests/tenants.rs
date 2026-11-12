@@ -244,10 +244,14 @@ impl Rig {
                 Arc::new(move |project, instance| secrets.deliver(project, instance))
             }),
         );
+        let services = service_handlers(kernel.clone(), time.clone(), cfg.clone());
+        let service_create =
+            arca::handlers::service_create_handler(&services).expect("service_create");
         let handlers = plan_handlers_served(
             kernel.clone(),
             time.clone(),
-            Some(PG_IMAGE.into()),
+            // As serve does: the image the node's config names, or none.
+            cfg.kernel.postgres_image.clone(),
             None,
             None,
             Some(lifecycle),
@@ -255,8 +259,13 @@ impl Rig {
             Some(cfg.clone()),
         )
         .into_iter()
-        .chain(service_handlers(kernel.clone(), time.clone(), cfg.clone()))
-        .chain(postgres_handlers(kernel.clone(), time.clone(), cfg.clone()))
+        .chain(services)
+        .chain(postgres_handlers(
+            kernel.clone(),
+            time.clone(),
+            cfg.clone(),
+            service_create,
+        ))
         .chain(tenant_handlers(kernel.clone(), time, cfg.clone()))
         .collect();
         Self {
@@ -491,6 +500,8 @@ fn project(id: &str) -> String {
 mod admission;
 #[path = "tenants/create_stopped.rs"]
 mod create_stopped;
+#[path = "tenants/databases.rs"]
+mod databases;
 #[path = "tenants/deploys.rs"]
 mod deploys;
 #[path = "tenants/destinations.rs"]

@@ -158,7 +158,7 @@ refused without the value being echoed back.
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
 | `kernel.droiddProjects` | yes | droidd's projects. Required, and it must not be empty while `kernel.projects` is not. |
 | `kernel.serviceCidr` | no | Service bridge `<ipv4-network>/24`, outside every `kernel.reservedCidrs` range. Required for Postgres creation and probe consumer add; no default. |
-| `kernel.postgresImage` | no | A digest-pinned image (`name@sha256:<64 hex>`). A proposed `postgres_create` uses exactly this image and may not choose another; without it, a proposed database create is refused. `arca init` sets none, because the node creates that database from an image Incus already holds and fetches none. On such a node a database is the shipped `postgres-autopg` service: propose `service_create` with that template, which fetches its own pinned image; the refusal says the same |
+| `kernel.postgresImage` | no | The old way to name a database's image; leave it unset on a new node. A digest-pinned reference (`name@sha256:<64 hex>`) to an image Incus already holds under that fingerprint: Arca does not fetch it. With it, `postgres_create` makes a database of the old kind from exactly this image, proposed or not. Without it, `postgres_create` makes a service from the node's `postgres-autopg` template, whose image Incus fetches by digest. See "A database". |
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
 | `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
@@ -471,20 +471,16 @@ and holds no record answers an empty list.
   `arca setup-code`; see "The page on this machine alone".
 - The page it names is the page of one machine, for a machine where every account is trusted. Approving from a
   phone or from another machine needs an `https://` origin, set by hand.
-- It sets no `kernel.postgresImage`, so a proposed `postgres_create` stays refused. **A database after this step
-  is the shipped `postgres-autopg` service:** ask the assistant for it, or propose `service_create` with
-  `"template": "postgres-autopg"`. That template fetches its own pinned image and waits for the owner's card like
-  any change; the refusal of the proposed `postgres_create` names it, and so does the step's own report. The
-  template makes the database's password itself at create (32 letters and digits, stored as the service's
-  `POSTGRES_PASSWORD` secret and never shown), so the approved create starts by itself, and a proposed
-  `service_connect` gives the linked service its `DATABASE_URL`. No `service_secret_set` is needed, which matters
-  because that verb cannot be proposed and needs a `doctor` token. See "A node set up before the template made
-  its password" below for an older node. The step
-  does not write the key because the node creates a `postgres_create` database from an image Incus already holds,
-  by its fingerprint, and fetches none: the key alone would turn a refusal at the proposal into a failure after
-  the owner approved. That is about what is proposed: a `doctor` or `operator` token's own
-  `postgres_create` names its image itself and needs only the service network, and its `postgres_delete` removes a
-  database's record, password and links without a card. It sets no `kernel.vmLimits`, so no virtual machine is created.
+- It sets no `kernel.postgresImage`, and none is needed. **A database after this step is the shipped
+  `postgres-autopg` service:** ask the assistant for it, or propose `postgres_create` with a name, or
+  `service_create` with `"template": "postgres-autopg"`. Both make the same service and wait for the owner's card
+  like any change (see "A database"). The template fetches its own pinned image and makes the database's password
+  itself at create (32 letters and digits, stored as the service's `POSTGRES_PASSWORD` secret and never shown), so
+  the approved create starts by itself, and a proposed `service_connect` gives the linked service its
+  `DATABASE_URL`. No `service_secret_set` is needed, which matters because that verb cannot be proposed and needs a
+  `doctor` token. See "A node set up before the template made its password" below for an older node. No call
+  chooses the image: a `doctor` or `operator` token's own `postgres_create` runs without a card, as its
+  `service_create` of that template does. It sets no `kernel.vmLimits`, so no virtual machine is created.
   Tenants, adoption and import are not turned on. A node that may change things also runs its snapshot writer
   (snapshot pools and the project `arcak-snapshots`) and its GPU device writer: each acts only from a card the owner
   approves.
@@ -749,6 +745,44 @@ remains restricted; Arca sets and reconciles only `restricted.devices.proxy=allo
 restrictions retain Incus' managed default.
 The `automagik-server` template pins the OCI server image, mounts `/data` owned by uid/gid 1000, overrides the profile to
 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
+
+### A database
+
+`postgres_create` takes a name and nothing else. The image is the node's, never the call's, through both doors: a
+call of a `doctor` or `operator` token, and a proposal the owner approves on a card.
+
+On a node whose config sets no `kernel.postgresImage` (every node `arca init --enable-changes` sets up), the database
+is the service that `service_create` makes from the node's `postgres-autopg` template:
+
+- Incus fetches the template's image itself, by registry and digest, when it does not hold it. Nothing is put in
+  Incus by hand first.
+- The template generates the password, and Arca keeps it in a private file; no tool shows it. A template that
+  generates none (one installed before the shipped template did, or the owner's edit) makes the database stopped,
+  and the answer's `stoppedBecause` says so: `arca templates install --replace` puts the shipped template back.
+- The answer carries `service: true`, and `postgres_list` shows the database with `service: true` and, under
+  `links`, the services connected to it.
+- A database made this way is a service: connect to it with `service_connect`, remove it with `service_remove`.
+  The service that connects is given `DATABASE_URL` for the role `app` and the database `app`.
+  `postgres_link`, `postgres_unlink` and `postgres_delete` refuse its name and say which verb acts on it.
+- Its name must be one no database and no service holds.
+
+A proposal is given the template's name and the image it pins when it is made. The card shows the image by digest,
+the template and a `Made as` row, and the approval binds the image and the template: if the template on the node names another image when the owner
+approves, the create is refused and nothing is made; propose it again. The card binds the image, not the template's
+entrypoint script, which is the node's own file in its state directory.
+
+If the template is not installed, the create and the proposal are refused in words that name `arca templates
+install`. An image or a template stated in a call must be exactly the node's own, or the call is refused; the
+refusal never repeats what the caller stated.
+
+**The old way.** On a node whose config sets `kernel.postgresImage`, nothing changed: `postgres_create` makes a
+database of the old kind from that image, which Incus must hold already under that fingerprint (Arca does not fetch
+it, and the fingerprint Incus gives an image it fetched from a registry is not the image's digest). Such a database
+is linked to a consumer with `postgres_link` and removed with `postgres_delete`, and its row in `postgres_list` is
+the one it always was. A call that states another image than the configured one is refused. One thing stops on
+upgrade: on a node with no `kernel.postgresImage`, a token's own `postgres_create` could name any digest-pinned
+image; it no longer can. A node that relied on that sets `kernel.postgresImage` to that image. A database of the
+old kind is not turned into a service, and stays as it is.
 
 ### A service that may reach one private address
 
@@ -1678,8 +1712,9 @@ database, GPU, storage, snapshot or instance verbs: `service_create`, `service_r
 `snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`, `instance_stop` or
 `instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `function_create` and `function_remove` (see [Functions](#functions)) are proposed the same way. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
 the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid call and leaves no
-record. A proposal cannot choose a container image: `postgres_create` uses `kernel.postgresImage`, and an explicit image that
-differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains;
+record. A proposal cannot choose a container image: `postgres_create` uses the image the node's `postgres-autopg`
+template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is
+refused (see "A database"). `service_create` names a template from the kernel's catalog, whose name the schema constrains;
 its card has a `Start` row whenever the service will be created stopped, with the reason, so the owner approves a stopped service knowingly.
 A GPU proposal names an existing Incus instance and the card's PCI address. The kernel resolves the instance's project,
 type and `volatile.uuid` when the proposal is made and puts them in the arguments, so the owner's digest binds them. Only a
@@ -1721,7 +1756,8 @@ that window; the thirty-first new proposal gets `RateLimited`, with `retryAfterS
 for want of room and for asking too often"). A proposal lapses fifteen minutes after it was made. The
 journal writes `proposed` when the record is made, `approved` when its proof verifies, `declined` on a decline, and `result`
 after the one run. On start every `proposed` record is validated again: the verb's parameter schema without `approval`, its
-semantic checks, and the kernel's configured `kernel.postgresImage`, never the image the file itself carries. A record that
+semantic checks, and the kernel's configured `kernel.postgresImage` (a proposed database made under another setting
+of that key does not wait on). A record that
 fails is not accepted, and the file is quarantined. The journal is compacted to the waiting, unexpired proposals at start,
 and again during an append once it passes about 1 MiB; an unreadable, invalid or larger-than-16-MiB file is quarantined as
 `action-proposals.jsonl.bad-<ts>` and the kernel starts empty, so this file never stops a start. A temporary file that a

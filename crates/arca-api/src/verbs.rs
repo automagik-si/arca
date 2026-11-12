@@ -250,7 +250,7 @@ static VERBS: [Verb; 61] = [
     },
     Verb {
         name: "postgres_create",
-        summary: "Create a Postgres database on the node's service network, in the node's service project (arcak-svc): one instance from a digest-pinned image (name@sha256:<64 hex>), with a password Arca generates and keeps; no tool shows it. Returns its name, its entry and the status pending; postgres_list shows when it runs. Nothing reaches it until postgres_link links a consumer. Inside a tenant a database is a service from the postgres-autopg template instead (service_create, then service_connect).",
+        summary: "Create a Postgres database in the node's service project (arcak-svc), with a password Arca generates and keeps; no tool shows it. Give the name only: the image is the node's, never the call's. With no kernel.postgresImage in the node's config, the database is a service from the node's postgres-autopg template (its digest-pinned image is fetched), and the answer says service: true: connect to it with service_connect, remove it with service_remove. With kernel.postgresImage, it is a database of the old kind from that image, linked with postgres_link. Returns its name, its entry and the status pending; postgres_list shows when it runs. In a tenant, use service_create with that template.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -264,7 +264,7 @@ static VERBS: [Verb; 61] = [
     },
     Verb {
         name: "postgres_list",
-        summary: "The Postgres databases in the node's service project (arcak-svc), each with its name, its entry, its status (pending until it has an address), its address, its port and the consumers linked to it. A node with no database answers an empty list. Never a password or a connection URL. A tenant's databases are services: service_list shows them.",
+        summary: "The Postgres databases in the node's service project (arcak-svc), each with its name, its entry, its status (pending until it has an address), its address, its port and the consumers linked to it. A database made from the node's postgres-autopg template is a service: its row carries service: true, its links are the services connected to it, and the service verbs act on it (service_connect, service_remove). A node with no database answers an empty list. Never a password or a connection URL. A tenant's databases are services: service_list shows them.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -2439,7 +2439,14 @@ fn postgres_create_params() -> Value {
 fn postgres_create_params_base() -> Value {
     params(vec![
         ("name", true, string_max(31)),
-        ("image", true, string_max(512)),
+        ("image", false, string_max(512)),
+        (
+            "template",
+            false,
+            service_name_schema(
+                "Filled in by the node: the template a database is made from when its config names no image (postgres-autopg). A caller leaves it out.",
+            ),
+        ),
     ])
 }
 fn postgres_create_result() -> Value {
@@ -2447,6 +2454,8 @@ fn postgres_create_result() -> Value {
         ("name", true, string()),
         ("entry", true, string()),
         ("status", true, one_of(&["pending", "running"])),
+        ("service", false, boolean()),
+        ("stoppedBecause", false, string()),
     ])
 }
 fn postgres_list_params() -> Value {
@@ -2467,6 +2476,7 @@ fn postgres_list_result() -> Value {
             ("address", true, nullable(string())),
             ("port", true, int()),
             ("links", true, array(string())),
+            ("service", false, boolean()),
         ])),
     )])
 }

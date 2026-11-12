@@ -225,7 +225,9 @@ impl ActionKind {
     /// normalized arguments the owner will approve.
     ///
     /// `postgres_create` may not choose a container image. When the kernel has a configured pinned default, that image is
-    /// inserted; an explicitly different image is refused, and an absent default refuses the proposal with a clear error.
+    /// inserted and an explicitly different image is refused. Without one the proposal names the node's database
+    /// template and the image it pins, both filled in by the kernel when the proposal is made; one that names neither
+    /// is refused.
     /// `service_create`'s template is already constrained to the catalog's name grammar by its schema.
     pub fn prepare(self, args: &Value, postgres_image: Option<&str>) -> Result<Value, String> {
         let mut args = args.clone();
@@ -244,28 +246,52 @@ impl ActionKind {
             }
         }
         if self == Self::PostgresCreate {
-            let Some(default) = postgres_image else {
-                // The node `arca init` leaves sets no such image, so the refusal names the database that works on
-                // it today: the shipped service template, which fetches its own pinned image.
-                return Err(NO_POSTGRES_IMAGE.to_string());
-            };
-            if arca_postgres::fingerprint(default).is_err() {
-                return Err(
-                    "kernel.postgresImage is not a digest-pinned image reference".to_string(),
-                );
-            }
             let Some(object) = args.as_object_mut() else {
                 return Err("args: expected an object".to_string());
             };
-            if let Some(chosen) = object.get("image")
-                && chosen.as_str() != Some(default)
-            {
-                return Err(
-                    "args/image: a proposal uses the kernel's configured pinned image; it cannot choose another"
-                        .to_string(),
-                );
+            match postgres_image {
+                // The node's config names the image: the old way, a database of its own kind from that image.
+                Some(default) => {
+                    if arca_postgres::fingerprint(default).is_err() {
+                        return Err(
+                            "kernel.postgresImage is not a digest-pinned image reference"
+                                .to_string(),
+                        );
+                    }
+                    if object.contains_key("template") {
+                        return Err(
+                            "args/template: this node's config names kernel.postgresImage, so a database is made from that image and from no template"
+                                .to_string(),
+                        );
+                    }
+                    if let Some(chosen) = object.get("image")
+                        && chosen.as_str() != Some(default)
+                    {
+                        return Err(
+                            "args/image: a proposal uses the kernel's configured pinned image; it cannot choose another"
+                                .to_string(),
+                        );
+                    }
+                    object.insert("image".to_string(), Value::String(default.to_string()));
+                }
+                // No image in the config: the database is the service the node's template makes. The kernel names
+                // the template and the image it pins when the proposal is made, so the card shows the image and the
+                // approval binds it; the create refuses when the template names another by then.
+                None => {
+                    let filled = object.get("template").and_then(Value::as_str)
+                        == Some(crate::service::DATABASE_TEMPLATE)
+                        && object
+                            .get("image")
+                            .and_then(Value::as_str)
+                            .is_some_and(|image| arca_postgres::fingerprint(image).is_ok());
+                    if !filled {
+                        return Err(format!(
+                            "args/template: the kernel names the template ({}) and the image it pins when the proposal is made; a caller names neither",
+                            crate::service::DATABASE_TEMPLATE
+                        ));
+                    }
+                }
             }
-            object.insert("image".to_string(), Value::String(default.to_string()));
         }
         // The checker names a place inside the action's arguments; the caller passed them as `args`. A refusal about
         // the arguments themselves has no place, or calls them "the value"; one about a field starts with its pointer.
@@ -428,7 +454,14 @@ impl ActionKind {
                 vec![row("Service", text("from")), row("To", text("to"))]
             }
             Self::PostgresCreate => {
-                vec![row("Database", text("name")), row("Image", text("image"))]
+                let mut rows = vec![row("Database", text("name")), row("Image", text("image"))];
+                // A database made from the node's template is a service. The proposal names the template (the
+                // kernel fills it in when the proposal is made), so the card says what the owner gets.
+                if args.get("template").is_some() {
+                    rows.push(row("Template", text("template")));
+                    rows.push(row("Made as", &database_service_words(text("template"))));
+                }
+                rows
             }
             Self::GpuAttach | Self::GpuDetach => {
                 let instance = text("instance");
@@ -705,6 +738,14 @@ pub fn destinations_list(destinations: &Value) -> String {
         [one] => one.clone(),
         [first @ .., last] => format!("{} and {last}", first.join(", ")),
     }
+}
+
+/// The card's words for a database made from the node's template `template`: what the owner gets, and the verbs that
+/// reach it afterwards.
+pub fn database_service_words(template: &str) -> String {
+    format!(
+        "A service from this node's {template} template, with the password that template generates; Arca keeps it. A database made this way is a service: connect to it with service_connect, remove it with service_remove."
+    )
 }
 
 /// The `Private network` row of a `service_create` whose service this node's config gives a destination, in the
@@ -1426,6 +1467,65 @@ mod tests {
             crate::cmd_templates::SHIPPED
                 .iter()
                 .any(|(name, _)| *name == "postgres-autopg.json")
+        );
+    }
+
+    #[test]
+    fn a_proposed_database_names_the_configured_image_or_the_template_the_kernel_filled_in() {
+        let create = ActionKind::PostgresCreate;
+        // The config names the image: it is filled in, and neither another image nor a template is taken.
+        assert_eq!(
+            create.prepare(&json!({ "name": "orders" }), Some(PINNED_IMAGE)),
+            Ok(json!({ "name": "orders", "image": PINNED_IMAGE }))
+        );
+        assert_eq!(
+            create.prepare(
+                &json!({ "name": "orders", "image": OTHER_IMAGE }),
+                Some(PINNED_IMAGE)
+            ),
+            Err("args/image: a proposal uses the kernel's configured pinned image; it cannot choose another".to_string())
+        );
+        let filled = json!({
+            "name": "orders",
+            "template": crate::service::DATABASE_TEMPLATE,
+            "image": PINNED_IMAGE
+        });
+        assert_eq!(
+            create.prepare(&filled, Some(PINNED_IMAGE)),
+            Err("args/template: this node's config names kernel.postgresImage, so a database is made from that image and from no template".to_string())
+        );
+        // No image in the config: the proposal is the one the kernel filled in, whole, or it is refused. A replayed
+        // record is checked by the same rule, so one made under a config that has changed since does not wait on.
+        assert_eq!(create.prepare(&filled, None), Ok(filled.clone()));
+        let unfilled = "args/template: the kernel names the template (postgres-autopg) and the image it pins when the proposal is made; a caller names neither";
+        for args in [
+            json!({ "name": "orders" }),
+            json!({ "name": "orders", "image": PINNED_IMAGE }),
+            json!({ "name": "orders", "template": crate::service::DATABASE_TEMPLATE }),
+            json!({ "name": "orders", "template": "app", "image": PINNED_IMAGE }),
+            json!({ "name": "orders", "template": crate::service::DATABASE_TEMPLATE, "image": "postgres:18" }),
+        ] {
+            assert_eq!(
+                create.prepare(&args, None),
+                Err(unfilled.to_string()),
+                "{args}"
+            );
+        }
+        // The card of a template database says what the owner gets; the old kind's card is the one it was.
+        let labels = |args: &Value| -> Vec<String> {
+            create
+                .details(args)
+                .iter()
+                .map(|row| row.label.clone())
+                .collect()
+        };
+        assert_eq!(
+            labels(&filled),
+            ["Database", "Image", "Template", "Made as"]
+        );
+        assert_eq!(
+            labels(&json!({ "name": "orders", "image": PINNED_IMAGE })),
+            ["Database", "Image"]
         );
     }
 

@@ -537,6 +537,15 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         None
     };
     let action_slot = ActionSlot::default();
+    let service_handlers = crate::handlers::service_handlers_with(
+        kernel.clone(),
+        clock.clone(),
+        Arc::new(cfg.clone()),
+        functions,
+    );
+    // A database made from the node's template is created by the service handler itself.
+    let service_create = crate::handlers::service_create_handler(&service_handlers)
+        .ok_or_else(|| Failure::Runtime("the service handlers hold no service_create".into()))?;
     let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> =
         plan_handlers_served(
             Arc::clone(&kernel),
@@ -553,13 +562,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             kernel.clone(),
             clock.clone(),
             Arc::new(cfg.clone()),
+            service_create,
         ))
-        .chain(crate::handlers::service_handlers_with(
-            kernel.clone(),
-            clock.clone(),
-            Arc::new(cfg.clone()),
-            functions,
-        ))
+        .chain(service_handlers)
         .chain(crate::handlers::tenant_handlers(
             kernel.clone(),
             clock.clone(),

@@ -340,6 +340,18 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
         let prepared = action
             .prepare(&sample(action), Some(TEST_PG_IMAGE))
             .expect("the sample is valid");
+        // A database made from the node's template carries every field of its verb: the kernel fills the template
+        // and the image in when the proposal is made, on a node whose config names no image.
+        let prepared = if action == ActionKind::PostgresCreate {
+            action
+                .prepare(
+                    &json!({ "name": "orders", "template": "postgres-autopg", "image": TEST_PG_IMAGE }),
+                    None,
+                )
+                .expect("the filled sample is valid")
+        } else {
+            prepared
+        };
         let details = action.details(&prepared);
         if matches!(action, ActionKind::GpuAttach | ActionKind::GpuDetach) {
             let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
@@ -578,6 +590,16 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 value => value.as_str().expect("a string field"),
             };
             assert_eq!(row.value, expected, "{action:?} {label}");
+            seen += 1;
+        }
+        // The card of a template database also says, in words, what the owner gets and which verbs reach it.
+        if action == ActionKind::PostgresCreate {
+            let made = details.last().expect("its last row");
+            assert_eq!(made.label, "Made as");
+            assert_eq!(
+                made.value,
+                arca::action_proposal::database_service_words("postgres-autopg")
+            );
             seen += 1;
         }
         assert_eq!(seen, details.len(), "{action:?} has an extra detail row");

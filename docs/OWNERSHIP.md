@@ -1506,6 +1506,41 @@ service (the instance is deleted before its ACL), after the run that is going ha
 links to is not removed while the function exists: the removal is refused when it is proposed, when it runs, and by
 `Kernel::remove_service_spent` itself, under the kernel's lock, on the entries it is about to change.
 
+## The image of a database
+
+**Rule 74.** No call chooses the image a database runs. `postgres_create` takes its image from the node alone, through
+both doors, a token's own call and a proposal the owner approves. On a node whose config sets no
+`kernel.postgresImage` the database is the service that `service_create` makes from the node's `postgres-autopg`
+template: `postgres_create` calls that handler with the name and the template and nothing else, so the image is
+fetched by registry and digest as every template's is (Rule 11), and a token's own `postgres_create` makes no more
+than its own `service_create` of that template makes. A proposal is given the template's name and the image it pins
+when it is made, so the card shows the image and the approval binds it; the create compares the image the proposal
+carries with the one the template names then, and refuses when they differ. On a node whose config sets
+`kernel.postgresImage` the database is of the old kind (`arca.postgres`), from that image and no other. An image or a
+template a call states is only compared with the node's own, and a refusal never repeats what the caller stated. The
+password of a database made from the template is the template's to generate, as every generated secret is: Arca
+invents none of its own, and from a template that generates none the service is created stopped and the answer says
+why.
+
+A record of the old kind is not touched by any of this: the `arca.postgres` plugin and its record are as they were,
+so an existing database's entry, digest, instance and ACL are the same after an upgrade.
+
+Enforced in `database_source`, `enrich_postgres_create`, `PostgresHandler::create_from_template` and
+`PostgresHandler::call` in `crates/arca/src/handlers.rs`, and in `ActionKind::prepare` in
+`crates/arca/src/action_proposal.rs`. Tested in `crates/arca/tests/tenants/databases.rs`
+(`on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_fetched_by_digest`,
+`a_database_made_from_the_template_is_reached_and_removed_with_the_service_verbs`,
+`a_template_changed_between_the_card_and_the_approval_refuses_the_create`,
+`no_call_chooses_the_image_of_a_database_through_either_door`,
+`a_node_whose_config_names_the_image_keeps_its_databases_and_the_old_way_as_they_were`,
+`a_database_takes_a_name_nothing_holds_and_a_failed_create_leaves_no_password`,
+`a_template_that_generates_no_password_makes_a_stopped_database_and_says_why`,
+`a_create_the_service_handler_refuses_leaves_no_password_behind`,
+`a_node_whose_config_sets_up_no_services_refuses_a_database_in_those_words`) and in `crates/arca/src/action_proposal.rs`
+(`a_proposed_database_names_the_configured_image_or_the_template_the_kernel_filled_in`). The binding is of the image:
+the template's entrypoint script is the node's own file and is read when the service is created. That a clean node's
+Incus fetches the template's image by digest is under "Assumptions to confirm".
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -1519,6 +1554,9 @@ possible.
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
 
+- A clean node's Incus fetches the `postgres-autopg` template's image from its registry by digest when a database is
+  created, and the database then answers a connected service as the role `app` (Rule 74). The fake only records the
+  source; this has not been run on a live node.
 - Incus orders ACL rules by action and not by their place in the list (drop, then reject, then allow), takes a list of
   ports and port ranges (`1-442,444-65535`) in `destination_port`, and names the protocols `tcp`, `udp`, `icmp4` and
   `icmp6` (Rule 70). Read from
