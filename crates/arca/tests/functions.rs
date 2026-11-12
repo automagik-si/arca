@@ -32,6 +32,8 @@ use serde_json::{Value, json};
 const NOW: u64 = 1_793_361_600_000;
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OK: &str = "published 3\n{\"ok\":true,\"published\":3}\n";
+/// The fingerprint of the copy of a function's image in the node's store, as an instance made from it records it.
+const BASE_IMAGE: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 struct Rig {
@@ -242,6 +244,15 @@ impl Rig {
 
     /// Has the owner approve a proposal that waits, and runs it once through the executor.
     fn approve(&self, action: &str, proposal: &Value) -> Result<Value, CallError> {
+        let args = self.approval(action, proposal);
+        let result = arca::handlers::run_approved_action(&self.kernel, &self.executor, &args, NOW)
+            .map(|answer| answer["result"].clone());
+        self.after_create(action, &result);
+        result
+    }
+
+    /// The owner's signed approval of a proposal that waits, as the arguments that run it.
+    fn approval(&self, action: &str, proposal: &Value) -> Value {
         let id = proposal["id"].as_str().expect("an id").to_string();
         let nonce = self.nonce.fetch_add(1, Ordering::SeqCst);
         let statement = arca::handlers::action_statement(
@@ -254,13 +265,23 @@ impl Rig {
         )
         .expect("the statement");
         let approval = approve_statement(&self.key, &statement);
-        arca::handlers::run_approved_action(
-            &self.kernel,
-            &self.executor,
-            &json!({ "plan": id, "approval": approval }),
-            NOW,
-        )
-        .map(|answer| answer["result"].clone())
+        json!({ "plan": id, "approval": approval })
+    }
+
+    /// A real Incus records on a new instance the image it was made from. The fake does not, so it is written here.
+    fn after_create(&self, action: &str, result: &Result<Value, CallError>) {
+        if action == "function_create"
+            && let Ok(created) = result
+            && let Some(name) = created["name"].as_str()
+        {
+            let mut body = self.instance(name);
+            body["config"]["volatile.base_image"] = json!(BASE_IMAGE);
+            put(
+                self,
+                &format!("/1.0/instances/{name}?project={PROJECT}"),
+                &body,
+            );
+        }
     }
 
     fn get(&self, path: &str) -> Option<Value> {
@@ -800,7 +821,8 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
         "the effect journal has the length it had"
     );
     assert_eq!(after, journal);
-    // To Incus it sent a start for each run and no other write but the clearing of its console log.
+    // To Incus each run sent three writes, in this order: the rebuild of its root from its image, the clearing of its
+    // console log, and its start. Nothing else.
     let writes: Vec<String> = rig
         .fake
         .requests()
@@ -815,20 +837,16 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
             )
         })
         .collect();
-    assert_eq!(
-        writes
-            .iter()
-            .filter(|w| *w == "PUT /1.0/instances/relay/state")
-            .count(),
-        10
-    );
-    assert!(
-        writes
-            .iter()
-            .all(|w| w == "PUT /1.0/instances/relay/state"
-                || w == "DELETE /1.0/instances/relay/console"),
-        "{writes:?}"
-    );
+    let one_run = [
+        "POST /1.0/instances/relay/rebuild",
+        "DELETE /1.0/instances/relay/console",
+        "PUT /1.0/instances/relay/state",
+    ];
+    assert_eq!(writes.len(), 30, "{writes:?}");
+    for run in writes.chunks(3) {
+        assert_eq!(run, one_run, "{writes:?}");
+    }
+    assert_eq!(rig.fake.rebuilds(PROJECT, "relay"), ["store"; 10]);
 
     // One line a run, in the month's file, each a meter.
     // NOW is in October 2026: a month has its own file.
@@ -853,6 +871,8 @@ fn ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state() {
         line["startMs"].is_u64() && line["durationMs"].is_u64(),
         "{line}"
     );
+    assert_eq!(line["root"], "store");
+    assert!(line["rootMs"].is_u64(), "{line}");
     assert_eq!(line["cpuMs"], 42);
     assert_eq!(line["memoryPeakBytes"], 6_291_456);
     assert_eq!(line["memoryLimitBytes"], 128 * 1024 * 1024);
@@ -1193,6 +1213,72 @@ fn two_approved_actions_in_either_order_never_leave_a_function_linked_to_nothing
 }
 
 #[test]
+fn a_removal_that_passed_its_own_check_is_refused_by_the_kernel_and_the_handler_says_so() {
+    let rig = Rig::new();
+    // A function linked to nats is made and removed again: its record is kept for later.
+    rig.relay();
+    let record = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "service-relay")
+        .expect("relay's record");
+    rig.approved("function_remove", json!({ "name": "relay" }))
+        .expect("removed");
+    // The owner approves the removal of nats while no function links to it. The removal reads the node, passes its
+    // own check, and then waits for the write gate, which this test holds.
+    let removal = rig
+        .propose("service_remove", json!({ "name": "nats" }))
+        .expect("proposed");
+    let args = rig.approval("service_remove", &removal);
+    let gate = rig.kernel.lock().expect("kernel").write_gate();
+    let held = gate.lock().expect("the write gate");
+    let listings = |rig: &Rig| {
+        rig.fake
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.method == "GET" && request.path.starts_with("/1.0/instances?")
+            })
+            .count()
+    };
+    let before = listings(&rig);
+    let (kernel, executor) = (Arc::clone(&rig.kernel), rig.executor.clone());
+    let removing = std::thread::spawn(move || {
+        arca::handlers::run_approved_action(&kernel, &executor, &args, NOW)
+    });
+    // The removal has read the node's instances, which it does just before it reads the entries and checks them.
+    let until = Instant::now() + Duration::from_secs(10);
+    while listings(&rig) == before {
+        assert!(Instant::now() < until, "the removal never read the node");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !removing.is_finished(),
+        "the removal waits for the write gate"
+    );
+    // Meanwhile the function comes to be, linked to nats, as a create that held the gate would have left it.
+    let outcomes = rig
+        .kernel
+        .lock()
+        .expect("kernel")
+        .propose(vec![arca::desired_store::EntryChange::Put(record)], NOW)
+        .expect("the function's record is taken");
+    assert!(!format!("{outcomes:?}").contains("Failed"), "{outcomes:?}");
+    let entries = rig.entries();
+    drop(held);
+    // The kernel refuses under its own lock, and the handler says it in the owner's words, approval and all.
+    let (_, message) = refusal(removing.join().expect("the removal answers"));
+    assert_eq!(
+        message,
+        "The approval was accepted, but service_remove did not complete: remove service nats: the function relay links to it, and what a function reaches is part of what its owner approved. Remove the function relay first (function_remove); nothing was removed, and the owner's approval is spent, so another try needs a new one"
+    );
+    assert_eq!(rig.entries(), entries, "no record changed");
+    assert_eq!(rig.instance("nats")["status"], "Running");
+    assert_eq!(rig.instance("relay")["status"], "Stopped");
+}
+
+#[test]
 fn a_create_that_fails_is_said_as_a_functions_with_the_verbs_that_act_on_one() {
     let rig = Rig::new();
     rig.nats();
@@ -1367,6 +1453,72 @@ fn a_node_with_no_function_has_no_run_log_and_one_appears_with_the_first_run() {
         0o700
     );
     assert!(dir.join("runs-2026-10.jsonl").is_file());
+}
+
+#[test]
+fn every_run_starts_from_its_images_own_root_or_does_not_start() {
+    let rig = Rig::new();
+    rig.relay();
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    // The node holds a copy of the image: the root is rebuilt from it, and no registry is asked.
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("store"))
+    );
+    // The copy is gone from the store: the rebuild names the registry and the digest the owner approved, and Incus
+    // fetches the image again. The run goes on.
+    rig.fake.lose_image(PROJECT, "relay");
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("registry"))
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "relay"), ["store", "registry"]);
+    // Neither answers: the run does not start, and its line says why. Nothing was started and no log was cleared.
+    rig.fake.refuse_rebuild(PROJECT, "relay");
+    let writes = rig.state_writes();
+    let clears = |rig: &Rig| {
+        rig.fake
+            .requests()
+            .iter()
+            .filter(|request| request.method == "DELETE" && request.path.contains("/console"))
+            .count()
+    };
+    let cleared = clears(&rig);
+    let line = rig.run("relay");
+    assert_eq!(line["outcome"], "notStarted");
+    assert_eq!(line["root"], Value::Null);
+    let why = line["why"].as_str().expect("why");
+    assert!(
+        why.starts_with(
+            "its root could not be put back to its image's own, so nothing was started: "
+        ),
+        "{why}"
+    );
+    assert!(
+        why.contains("from the node's own copy of the image") && why.contains("from the registry"),
+        "{why}"
+    );
+    assert_eq!(rig.state_writes(), writes);
+    assert_eq!(clears(&rig), cleared);
+    assert_eq!(rig.fake.rebuilds(PROJECT, "relay").len(), 2);
+    // The next run, once the image can be had again, is an ordinary one.
+    rig.fake.allow_rebuild(PROJECT, "relay");
+    assert_eq!(rig.run("relay")["root"], "store");
+    // An instance that names no image it was made from is rebuilt from the registry too.
+    let mut body = rig.instance("relay");
+    body["config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("volatile.base_image");
+    put(
+        &rig,
+        &format!("/1.0/instances/relay?project={PROJECT}"),
+        &body,
+    );
+    assert_eq!(rig.run("relay")["root"], "registry");
+    assert_eq!(rig.runs("relay").len(), 5);
 }
 
 /// An edit made by an Incus operator, outside the kernel's writer.

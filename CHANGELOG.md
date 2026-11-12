@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Every run of a function now starts from its image's own root. Before a run starts, its container's root is rebuilt
+from the function's image: from the copy the node already holds, the one the function's record took when it was
+created, or from the registry by the approved digest when that copy is gone. So no run finds what an earlier one
+wrote, which replaces the limit 0.13.0 named. A root that cannot be rebuilt is a run that does not start, and its
+line says why. A run's line gains `root`, `rootImage` and `rootMs`.
+
 ## 0.13.0 (2026-11-12)
 
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU

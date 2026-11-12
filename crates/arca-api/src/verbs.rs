@@ -852,7 +852,7 @@ static VERBS: [Verb; 61] = [
     },
     Verb {
         name: "function_create",
-        summary: "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
+        summary: "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container, on its image's own root, with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -922,7 +922,7 @@ static VERBS: [Verb; 61] = [
     },
     Verb {
         name: "function_runs",
-        summary: "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. With run, that one run and the end of its output, when it is still kept.",
+        summary: "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. root says where the image its root was rebuilt from came from before the run: store, the node's own copy, or registry, fetched again. With run, that one run and the end of its output, when it is still kept.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -1212,6 +1212,8 @@ fn function_run_line() -> Value {
         ("kind", true, one_of(&["container"])),
         ("trigger", true, one_of(&["timer", "manual", "kernel"])),
         ("startedAt", true, at_least(0)),
+        ("root", false, nullable_enum(&["store", "registry"])),
+        ("rootMs", false, nullable(at_least(0))),
         ("startMs", false, nullable(at_least(0))),
         ("durationMs", false, nullable(at_least(0))),
         ("cpuMs", false, nullable(at_least(0))),

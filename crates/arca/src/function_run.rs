@@ -1,18 +1,20 @@
 //! Running a function: the timer, one run, its limits, the run log and the meter.
 //!
-//! One run is one start of the function's own container. The kernel clears the container's console log, starts it,
-//! and watches it until its program exits or the run passes its time limit, when the kernel stops it (a stop the
+//! One run is one start of the function's own container. The kernel gives the container its image's own root again
+//! (a rebuild from the copy of the image the node already holds, or from the registry when that copy is gone), so no
+//! run finds what an earlier one wrote and none can leave the next something to execute. A root that cannot be put
+//! back is a run that does not start. The kernel then clears the container's console log, starts it, and watches it until its program exits or the run passes its time limit, when the kernel stops it (a stop the
 //! program has a few seconds to obey, then a forced one). What the program wrote is read from the console log; its last
 //! line is its result.
 //!
-//! **What a run writes, and where.** To Incus: the instance's power state and its console log, through
-//! `arca_incus::function_run` and nothing else. To the state directory: one line in the run log
+//! **What a run writes, and where.** To Incus: the instance's root disk (rebuilt), its power state and its console
+//! log, through `arca_incus::function_run` and nothing else. To the state directory: one line in the run log
 //! (`function-runs/runs-<year>-<month>.jsonl`) and the end of the run's output
 //! (`function-runs/output/<function>/<run>.log`). A run writes nothing to the desired state and nothing to the effect
 //! journal: neither is touched, read apart, by anything in this module. Thousands of runs a day leave both as they were.
 //!
 //! **The run log is the meter.** One line for each run, never rewritten: the run's id, its function and digest, what
-//! triggered it, when it started, how long the start took, how long it ran, the CPU time and the memory peak when they
+//! triggered it, when it started, where its root came from and how long that, and the start, took, how long it ran, the CPU time and the memory peak when they
 //! could be read, the memory it was allowed, its outcome and its result line. A month has its own file, and no file
 //! is ever cut, because runs will be billed from them.
 //!
@@ -458,6 +460,8 @@ impl FunctionRunner {
             "kind": "container",
             "trigger": trigger,
             "startedAt": started_ms,
+            "root": measured.root,
+            "rootMs": measured.root_ms,
             "startMs": measured.start_ms,
             "durationMs": measured.duration_ms,
             "cpuMs": measured.cpu_ms,
@@ -549,6 +553,21 @@ impl FunctionRunner {
         if !wait.is_zero() {
             std::thread::sleep(wait);
         }
+        // Every run starts from its image's own root, or not at all.
+        let rooting = Instant::now();
+        let root = match self.writer.fresh_root(&seen, &config.source) {
+            Ok(root) => root,
+            Err(error) => {
+                return not_started(
+                    &config,
+                    format!(
+                        "its root could not be put back to its image's own, so nothing was started: {}",
+                        incus_words(&error)
+                    ),
+                );
+            }
+        };
+        let root_ms = millis(rooting.elapsed());
         // A run starts with an empty log, or not at all: what is read after it is then this run's output alone.
         let cleared = self
             .writer
@@ -596,6 +615,8 @@ impl FunctionRunner {
         }
         let mut measured = Measured {
             start_ms: Some(millis(begun.elapsed())),
+            root: Some(root.as_str()),
+            root_ms: Some(root_ms),
             ..Measured::default()
         };
         let running = Instant::now();
@@ -739,6 +760,9 @@ enum Ended {
 /// What the meter read of one run. Each is `None` when it was not read.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Measured {
+    /// Where the image the root was rebuilt from came from, and how long the rebuild took.
+    root: Option<&'static str>,
+    root_ms: Option<u64>,
     start_ms: Option<u64>,
     duration_ms: Option<u64>,
     cpu_ms: Option<u64>,

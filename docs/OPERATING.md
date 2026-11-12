@@ -4368,6 +4368,14 @@ one is still going as the next is due, the next is not started, and a `function_
 `FunctionBusy`. Nothing is queued and nothing is retried: the next tick is the next try. After a restart of the
 kernel every function is due at once, and no missed tick is made up.
 
+**Every run starts from the image's own root.** Before it starts a run the kernel has Incus rebuild the container's
+root disk from the function's image. The config, the secrets among it, and the network card stay as they are; the
+files are the image's again. So no run finds what an earlier run wrote, and none can leave the next something to
+execute. The rebuild uses the copy of the image the node already holds, and asks no registry. When that copy is gone
+(Incus drops a cached image nothing has used for a while; a function's runs keep using it) the rebuild names the
+registry and the digest the owner approved, and Incus fetches the image again. When neither can be done the run does
+not start: `notStarted`, and `why` says what each answered.
+
 **What the program must do.** Run one batch and exit. Print what it likes, up to 1 MiB in one run (past that the
 output cannot be read, and the run ends `died` whatever it printed); **its last output line is its result: one JSON
 object, at most 4096 bytes, with `"ok": true` or `"ok": false`**. Incus reports no exit status of a container's
@@ -4388,10 +4396,10 @@ killed.
 | `memory` | It ended without a result and the node counted a kill at its memory limit. Best effort: the count is gone with the container, so a run killed for memory is often `died`. |
 | `died` | It ended without a result line. |
 | `interrupted` | The kernel stopped it for another reason: the function's removal, or a kernel that started and found a run nobody watched. |
-| `notStarted` | Nothing was started, and `why` says so: a secret is not set, Incus refused the start, the instance is not the one Arca created. |
+| `notStarted` | Nothing was started, and `why` says so: a secret is not set, the root could not be rebuilt from the image, Incus refused the start, the instance is not the one Arca created. |
 
 Between the end of one run of a function and its next start the kernel keeps 2 seconds. Incus is still putting a
-container away for a moment after its program exits, and a start in that moment can be refused. The shortest timer is
+container away for a moment after its program exits, and a rebuild or a start in that moment can be refused. The shortest timer is
 10 seconds, so only a `function_run` that follows another run at once waits for it.
 
 ### The run log is the meter
@@ -4401,11 +4409,14 @@ One line for each run, appended and never rewritten, in `<stateDir>/function-run
 
 ```
 {"run":"fr-1793361600000-7","function":"relay","digest":"sha256:...","kind":"container","trigger":"timer",
- "startedAt":1793361600000,"startMs":265,"durationMs":41,"cpuMs":12,"memoryPeakBytes":3194880,
+ "startedAt":1793361600000,"root":"store","rootMs":55,"startMs":265,"durationMs":41,"cpuMs":12,
+ "memoryPeakBytes":3194880,
  "memoryLimitBytes":134217728,"outcome":"ok","result":{"ok":true,"published":3}}
 ```
 
-`startMs` is how long Incus took to start the container; `durationMs` runs from there to the exit the kernel saw.
+`root` says where the image the root was rebuilt from came from, `store` (the node's own copy) or `registry` (fetched
+again), and `rootMs` how long the rebuild took. `startMs` is how long Incus took to start the container; `durationMs`
+runs from there to the exit the kernel saw.
 `cpuMs` and `memoryPeakBytes` are read from the container's cgroup while it runs, and only when the node's Incus is on
 the machine `arca serve` runs on: the files are gone when the container stops, so the peak is the last reading before
 the exit, a lower bound, and both are `null` when nothing could be read. `memoryLimitBytes` is what the run was allowed.
@@ -4413,8 +4424,9 @@ the exit, a lower bound, and both are `null` when nothing could be read. `memory
 line and the end of the run's output (64 KiB, kept for the 20 newest runs of each function under
 `function-runs/output/`). A function's output is untrusted text.
 
-**What a run writes.** To Incus: the container's power state, and its console log, which is cleared before each start
-so that what is read afterwards is that run's output alone. To the state directory: the run's line and the end of its
+**What a run writes.** To Incus: the container's root disk, rebuilt from its image; its power state; and its console
+log, which is cleared before each start so that what is read afterwards is that run's output alone. A rebuild keeps
+the container's config, its devices and its uuid. To the state directory: the run's line and the end of its
 output. Nothing else: no desired-state entry, no line of the effect journal. The run log's directory is made by the
 first run of the node's first function: a node with no function has none. A function's container is never started
 by Incus itself (`boot.autostart` is `false`), so a host that comes back up starts none. `instance_start`, `instance_stop` and
@@ -4422,14 +4434,16 @@ by Incus itself (`boot.autostart` is `false`), so a host that comes back up star
 
 ### What to know
 
-- **A run's root file system is not read-only and is kept between runs.** Incus refuses to start an OCI container
-  whose root disk is read-only (seen on Incus 7.5.1), so a run can write its container's root, and the next run finds
-  what it wrote. A function's program must not execute what an earlier run could have left, and must keep no state
-  there. Giving every run the image's own root again is a change of its own.
+- **A run can write its container's root, and the next run does not find it.** Incus refuses to start an OCI
+  container whose root disk is read-only (seen on Incus 7.5.1), so the root is rebuilt from the image before each run
+  instead. A function keeps no state in its container: what must outlive a run goes to the services it reaches.
+- A function whose image is gone from the node's store needs its registry for its next run. With the registry out of
+  reach that run is `notStarted`, and so is each one after it until the image can be fetched.
 - The image is pulled without a credential, so it must be one the node can pull anonymously.
 - On Incus 7.5.1, on one machine and without a network card on the container, a run of a program that prints two lines
   and exits took a third of a second from the clearing of its log to its output being read (median of 20; start 0.27 s),
-  and a forced stop 0.63 s. A network card and its rules add to the start.
+  and a forced stop 0.63 s. The rebuild before it took 55 ms from the node's own copy of the image and 1.3 s when the
+  registry was named (medians of 10). A network card and its rules add to the start.
 - A function is created in the node's own project only: not in a tenant, and not on a bridged node without the managed
   service network.
 - A service a function links to is not removed while the function is there: `service_remove` is refused, when it is
@@ -4674,7 +4688,11 @@ What the fake cannot say was read from a real Incus by an ignored test,
 `ARCA_REAL_INCUS_PROOF=1` and runs only in a project whose name begins with `arcak-scratch-`: how long a start and a
 stop take, that Incus refuses to start an OCI container with a read-only root, that the console log is empty after a
 clear and holds a run's output after it, that Incus reports no exit status, and that two runs with no pause between
-them can find the older run's output in the log. Not proven anywhere yet: a function on a live node with its network
+them can find the older run's output in the log. A second one beside it,
+`function_run::proof::a_real_incus_gives_a_container_its_images_root_again`, read that a snapshot restore puts the
+instance's config back too (so it would undo a secret set since), and that a rebuild from the image removes what a run
+wrote, keeps the config and the uuid, takes 55 ms from the store's copy, and fetches the image again when the store no
+longer holds it. Not proven anywhere yet: a function on a live node with its network
 card and rules, a link that carries a real connection, and a run killed at its memory limit.
 
 ### Service wiring

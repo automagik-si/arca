@@ -223,6 +223,24 @@ impl StateChanger {
         self.wait_for(&envelope)
     }
 
+    /// Asks Incus to rebuild one instance's root disk from an image and waits for the operation. The instance keeps its
+    /// config, its devices and its uuid. It is the crate's own, for [`crate::function_run`] alone, which sends it to a
+    /// function's stopped instance and to nothing else.
+    pub(crate) fn rebuild(
+        &self,
+        project: &str,
+        name: &str,
+        body: &Value,
+    ) -> Result<(), IncusError> {
+        self.allow(project)?;
+        if !plain_name(project) || !plain_name(name) {
+            return Err(refused("the project or instance name is not plain"));
+        }
+        let url = format!("/1.0/instances/{name}/rebuild?project={project}");
+        let envelope = checked_envelope(self.send("POST", &url, Some(body))?)?;
+        self.wait_for(&envelope)
+    }
+
     /// Refuses a project outside the family before any request is sent, a read included.
     fn allow(&self, project: &str) -> Result<(), IncusError> {
         self.allows(project)
