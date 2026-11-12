@@ -1274,7 +1274,8 @@ same in both versions, and so are the tokens and their scopes.
   a legacy request. `initialize` answers `2025-11-25` whatever version it asks for, `ping` answers, and `tools/list`
   and `tools/call` return what they returned before `2026-07-28` existed: no result gains a field, and a JSON-RPC
   error travels inside a `200`. The header values `2025-06-18` and `2025-03-26` are served the same way.
-- **`server/discover`** answers `supportedVersions` (`2026-07-28`, `2025-11-25`), the capabilities and the server's name.
+- **`server/discover`** answers `supportedVersions` (`2026-07-28`, `2025-11-25`), the capabilities and `serverInfo`:
+  the server's name and the release it is, the version `arca --version` prints. `initialize` names the same release.
   It answers a request that names no version too, so one `curl` with a token shows what a node speaks.
 - **Any other version**, in the header or in `params._meta`, is `400` with the error `-32022`. Its `data` holds
   `supported` and `requested`, the latter cut at 64 characters.

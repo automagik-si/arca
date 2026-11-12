@@ -151,8 +151,13 @@ fn assert_discovery(reply: &Reply) {
     assert_eq!(result["supportedVersions"], json!([MODERN, LEGACY]));
     assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
     assert_eq!(result["resultType"], "complete");
-    assert_eq!(result["_meta"][SERVER_INFO_META]["name"], "arca");
-    assert_eq!(result["_meta"][SERVER_INFO_META]["version"], "0.1.0");
+    // The release the binary is: the workspace's version, which `arca --version` prints too. Named on its own, and
+    // beside every modern result's `_meta`.
+    assert_eq!(
+        result["serverInfo"],
+        json!({ "name": "arca", "version": env!("CARGO_PKG_VERSION") })
+    );
+    assert_eq!(result["_meta"][SERVER_INFO_META], result["serverInfo"]);
     assert_eq!(result["ttlMs"], 300_000);
     assert_eq!(result["cacheScope"], "public");
 }
@@ -535,6 +540,7 @@ fn a_2025_11_25_client_is_served_as_before_from_initialize_on() {
     assert_eq!(result["protocolVersion"], LEGACY);
     assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
     assert_eq!(result["serverInfo"]["name"], "arca");
+    assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
 
     let mut headers = vec![bearer(&fx.viewer)];
     headers.extend_from_slice(&version);

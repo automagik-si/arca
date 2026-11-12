@@ -21,6 +21,9 @@ On the approval page, while no passkey is trusted, a waiting card's button says 
 passkey there was none of and failed. Once a passkey is trusted the cards are drawn again with their Approve buttons.
 
 ## 0.16.0 (2026-11-12)
+The MCP server names the release it is. `serverInfo.version` said `0.1.0`, the version of the verbs' contract, on
+`initialize` and beside every `2026-07-28` result; it is now the release, the version `arca --version` prints. A
+`server/discover` answer now carries `serverInfo` too, where before the server was named only inside its `_meta`.
 
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
