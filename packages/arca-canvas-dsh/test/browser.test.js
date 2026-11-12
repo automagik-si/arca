@@ -1005,7 +1005,29 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     await page.waitForFunction(() => document.querySelector('.arca-node-instance') !== null);
     assert.equal(await page.locator('.arca-node-instance a.arca-card-link').count(), 0);
     assert.match(await page.locator('.arca-node-instance').innerText(), /web1/);
+
+    // A service whose installed template names another version says so on its card and in the machine's
+    // Details, in words that claim no order. A service without the mark carries no tag.
+    assert.equal(await page.locator('.arca-node-instance .arca-version').count(), 0);
+    data = {
+      ...fixture,
+      hosts: fixture.hosts.map((host) => host.name === 'alpha'
+        ? { ...host, services: [{ ...host.services[0], update: { state: 'differs' } }, ...host.services.slice(1)] }
+        : host),
+    };
+    await page.waitForFunction(() => document.querySelector('.arca-node-instance .arca-version') !== null);
+    const version = page.locator('.arca-node-instance .arca-version');
+    assert.equal(await version.innerText(), 'Other version');
+    assert.equal(await version.getAttribute('title'),
+      'The template installed on this machine names another version than the one this service runs.');
+    await page.locator('.arca-machine[data-host="alpha"] .arca-machine-more').click();
+    const versionDetail = page.locator('.arca-detail-panel');
+    await versionDetail.waitFor();
+    assert.equal(await versionDetail.locator('.arca-detail-service-version').count(), 1);
+    assert.equal(await versionDetail.locator('.arca-detail-service-version').innerText(), 'Other version');
+    await versionDetail.locator('.arca-detail-close').click();
     data = fixture;
+    await page.waitForFunction(() => document.querySelector('.arca-node-instance .arca-version') === null);
     await page.locator('.arca-project-select').selectOption('Studio');
     await page.waitForFunction(() => location.hash === '#project/Studio');
   });

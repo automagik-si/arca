@@ -459,6 +459,7 @@ function buildMachine(host) {
         name: text(service?.name).trim(),
         state: text(service?.state).trim(),
         lanPort: finite(service?.lanPort),
+        versionDiffers: versionDiffers(service),
       }))
       .filter((service) => service.name),
     // Older snapshots have no flag: treat their empty list as known-empty, as before.
@@ -470,6 +471,12 @@ function buildMachine(host) {
     error: host.error ?? null,
     metricsAt: host.metrics?.latest?.at ?? null,
   };
+}
+
+// service_list marks a service whose installed template names another version than the one it runs with
+// update.state "differs", and no other service. Two digests carry no order, so this never means "newer".
+function versionDiffers(service) {
+  return service?.update?.state === 'differs';
 }
 
 // A service Open link is composed only from a real configured LAN address and a real service port. The
@@ -496,6 +503,7 @@ function serviceTargets(hosts) {
         ports: list(service.ports).map(finite).filter((port) => port !== null),
         lanPort: finite(service.lanPort),
         published: service.published ?? null,
+        versionDiffers: versionDiffers(service),
         url: serviceUrl(host.address, service.lanPort, service.state),
       });
     }

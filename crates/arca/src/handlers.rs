@@ -3887,6 +3887,29 @@ fn service_not_found(message: impl Into<String>) -> CallError {
     }
 }
 
+/// What a service's view says under `update` ([`crate::service::update_view`]): its own version beside the one the
+/// template installed on this node names. `templates` keeps each template this call has read, so a listing reads a
+/// template's file once whatever the number of services made from it. No network is used and no registry is asked.
+fn service_update(
+    cfg: &NodeConfig,
+    templates: &mut BTreeMap<
+        String,
+        Result<crate::service::Template, crate::service::TemplateError>,
+    >,
+    service: &crate::service::ServiceConfig,
+) -> Option<Value> {
+    // An adopted instance has no version of Arca's making, so its template is not read at all.
+    if service.adopted {
+        return None;
+    }
+    let template = templates
+        .entry(service.template.clone())
+        .or_insert_with(|| {
+            crate::service::load_template(&cfg.state_dir.join("templates"), &service.template)
+        });
+    crate::service::update_view(service, template.as_ref())
+}
+
 fn service_template_error(error: crate::service::TemplateError) -> CallError {
     if error.not_found {
         service_not_found(error.message)
@@ -4891,9 +4914,18 @@ impl ToolHandler for ServiceHandler {
                     .iter()
                     .map(|(_, config)| config.instance.clone())
                     .collect();
+                let mut templates = BTreeMap::new();
                 for (_, config) in &records {
                     let live = service_live_in(&rows, &config.project, &config.instance);
-                    views.push(crate::service::view(config, live));
+                    let mut view = crate::service::view(config, live);
+                    // Only a service whose installed template names another version carries the key, so every
+                    // other row is the one it always was.
+                    if service_update(&self.cfg, &mut templates, config)
+                        .is_some_and(|update| update["state"] == "differs")
+                    {
+                        view["update"] = json!({ "state": "differs" });
+                    }
+                    views.push(view);
                 }
                 for row in &rows {
                     if let Some(name) = row["name"].as_str()
@@ -4932,6 +4964,10 @@ impl ToolHandler for ServiceHandler {
                     // a template's secrets are named apart and are never part of this object.
                     if let Some(settings) = config.vm.as_ref().and_then(|vm| vm.guest_settings()) {
                         view["settings"] = settings;
+                    }
+                    // The version it was created with beside the one its installed template names now.
+                    if let Some(update) = service_update(&self.cfg, &mut BTreeMap::new(), &config) {
+                        view["update"] = update;
                     }
                     // Whether the access its record names is the one that stands: the device on the instance, and
                     // the listener of this server.

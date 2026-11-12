@@ -7,6 +7,16 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`service_status` now answers `update` for a service whose version is known: `pin`, the version it was created with,
+`templatePin`, the one the template installed on the node names now, and `state`, `same` or `differs` (`unknown`
+with a `problem` when the installed template cannot say). `service_list` carries `update` only on a service that
+differs, and the canvas marks it "Other version". Both versions come from the node's own records and files: no
+registry is asked, nothing is written, and it never says which of the two is newer. A virtual-machine template says
+where its version is with a new key, `"update": { "pin": "<a key of settings>" }`; the shipped `automagik-workspace`
+names `serverImage`. A container's version is its `digest`. It only tells you: the way to the template's version is
+still `service_remove` and `service_create`. See "Whether the installed template names another version" in
+`docs/OPERATING.md`.
+
 ## 0.9.0 (2026-11-12)
 
 - The README and `docs/QUICKSTART.md` now fetch the installer from the newest release

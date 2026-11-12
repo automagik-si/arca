@@ -392,6 +392,23 @@ test('a service Open link needs a configured host address and a real service por
   assert.equal(project(noLanPort, 'Web1').cards[0].url, '', 'container ports are not host listeners');
   assert.equal(project(noLanPort, 'Web1').cards[0].service.ports[0], 8080);
 
+  // Only service_list's own mark says the installed template names another version; nothing else does.
+  assert.equal(web.service.versionDiffers, false);
+  const marked = (update) => buildDashboard({
+    ...fixture,
+    hosts: fixture.hosts.map((host) => host.name === 'alpha'
+      ? { ...host, services: [{ ...host.services[0], update }, ...host.services.slice(1)] } : host),
+  });
+  const differs = marked({ state: 'differs' });
+  assert.equal(project(differs, 'Web1').cards[0].service.versionDiffers, true);
+  assert.deepEqual(
+    differs.hosts.find((machine) => machine.name === 'alpha').services.map((service) => service.versionDiffers),
+    fixture.hosts.find((host) => host.name === 'alpha').services.map((_, index) => index === 0),
+  );
+  for (const update of [{ state: 'same' }, { state: 'unknown' }, {}, 'differs', true, null]) {
+    assert.equal(project(marked(update), 'Web1').cards[0].service.versionDiffers, false, JSON.stringify(update));
+  }
+
   // The container bridge address and the service's published dash never become a URL on their own.
   const noService = buildDashboard({
     ...fixture,

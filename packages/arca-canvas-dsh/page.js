@@ -390,7 +390,8 @@
       services: list(host.services).map((service) => ({
         name: text(service?.name).trim(),
         state: text(service?.state).trim(),
-        lanPort: finite(service?.lanPort)
+        lanPort: finite(service?.lanPort),
+        versionDiffers: versionDiffers(service)
       })).filter((service) => service.name),
       // Older snapshots have no flag: treat their empty list as known-empty, as before.
       servicesKnown: host.servicesKnown !== false,
@@ -401,6 +402,9 @@
       error: host.error ?? null,
       metricsAt: host.metrics?.latest?.at ?? null
     };
+  }
+  function versionDiffers(service) {
+    return service?.update?.state === "differs";
   }
   function serviceUrl(address, lanPort, state) {
     const host = text(address).trim();
@@ -422,6 +426,7 @@
           ports: list(service.ports).map(finite).filter((port) => port !== null),
           lanPort: finite(service.lanPort),
           published: service.published ?? null,
+          versionDiffers: versionDiffers(service),
           url: serviceUrl(host.address, service.lanPort, service.state)
         });
       }
@@ -1128,6 +1133,13 @@
     node.append(foot);
     return node;
   }
+  var VERSION_DIFFERS = "Other version";
+  var VERSION_DIFFERS_WHY = "The template installed on this machine names another version than the one this service runs.";
+  function versionTag(doc, className) {
+    const tag = el(doc, "span", className, VERSION_DIFFERS);
+    tag.title = VERSION_DIFFERS_WHY;
+    return tag;
+  }
   function instanceCard2(doc, card, x, y, width, height) {
     const node = cardShell(doc, "instance", x, y, width, height);
     node.dataset.host = card.host;
@@ -1137,6 +1149,7 @@
     node.append(head);
     const tags = el(doc, "div", "arca-card-tags");
     tags.append(hostTag(doc, card.host));
+    if (card.service?.versionDiffers) tags.append(versionTag(doc, "arca-prov arca-version"));
     if (card.url) {
       const link = el(doc, "a", "arca-card-link", "Open");
       link.href = card.url;
@@ -1661,6 +1674,7 @@
           const item = el(doc, "li", "arca-detail-service");
           item.append(el(doc, "span", "", service.name), el(doc, "span", "arca-detail-service-state", service.state || "Unknown"));
           if (service.lanPort !== null) item.append(el(doc, "span", "arca-detail-service-port mono", `port ${service.lanPort}`));
+          if (service.versionDiffers) item.append(versionTag(doc, "arca-detail-service-version"));
           rows.append(item);
         }
         services.append(rows);

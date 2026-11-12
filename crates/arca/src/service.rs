@@ -87,6 +87,15 @@ pub struct Lan {
     pub port: u16,
 }
 
+/// A virtual-machine template's `update`: the key of its `settings` that holds the version its service runs, an image
+/// by digest. It is how `service_status` knows the version a machine was created with from the one the installed
+/// template names now. A container template needs none: its version is its `digest`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Update {
+    pub pin: String,
+}
+
 /// A template's `kernelAccess`: the port, inside the instance, where the service finds this node's kernel on loopback.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1094,6 +1103,10 @@ pub struct Template {
     /// template, never one in a tenant.
     #[serde(default)]
     pub kernel_access: Option<KernelAccess>,
+    /// A virtual-machine template whose service runs a version the template names: `{ "pin": "<a key of settings>" }`.
+    /// No other kind sets it.
+    #[serde(default)]
+    pub update: Option<Update>,
 }
 
 impl Template {
@@ -1169,6 +1182,11 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     {
         return Err(TemplateError::refused(format!(
             "template {name}: only a virtual-machine template has a firstBoot, settings or createSettings"
+        )));
+    }
+    if template.update.is_some() {
+        return Err(TemplateError::refused(format!(
+            "template {name}: only a virtual-machine template has an update; a container's version is its digest"
         )));
     }
     if template.kind == "oci" && template.digest.is_none() {
@@ -1370,6 +1388,19 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     {
         return refused(
             "createSettings lists at most 32 distinct keys of settings, each with its default there",
+        );
+    }
+    if let Some(update) = &template.update
+        && (listed.contains(update.pin.as_str())
+            || !template
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.get(&update.pin))
+                .and_then(Value::as_str)
+                .is_some_and(image_by_digest))
+    {
+        return refused(
+            "update.pin names a key of settings that createSettings does not list, whose value is an image by digest: <registry>/<name>@sha256:<64 hex digits>",
         );
     }
     if let Some(description) = &template.description
@@ -1822,6 +1853,107 @@ fn env_name_ok(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Whether `text` is an image by digest, as a guest's keeper takes one: `<registry>/<name>@sha256:<64 hex digits>`, in
+/// lower case.
+fn image_by_digest(text: &str) -> bool {
+    let Some((name, digest)) = text.split_once("@sha256:") else {
+        return false;
+    };
+    name.len() <= 255
+        && name.contains('/')
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._/:-".contains(&byte)
+        })
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The version an OCI source names: `<registry>/<repository>@sha256:<digest>`. `None` for any other source.
+fn source_pin(source: &Value) -> Option<String> {
+    if source["protocol"].as_str() != Some("oci") {
+        return None;
+    }
+    let server = source["server"].as_str()?.strip_prefix("https://")?;
+    let alias = source["alias"].as_str()?;
+    Some(format!("{server}/{alias}"))
+}
+
+/// The version a template names for the services made from it: an OCI template's image and digest, or the image by
+/// digest under a virtual-machine template's `update.pin`. `None` for a template that names none: a system image, or
+/// a virtual machine without `update`.
+pub fn template_pin(template: &Template) -> Option<String> {
+    if template.is_vm() {
+        let key = &template.update.as_ref()?.pin;
+        return template
+            .settings
+            .as_ref()?
+            .get(key)?
+            .as_str()
+            .map(str::to_owned);
+    }
+    source_pin(&source(template).ok()?)
+}
+
+/// The version a service was created with, from its own record: a container's OCI source, or what its machine's
+/// settings hold under the key its template's `update.pin` names. The record keeps both from the create, so a template
+/// edited since changes nothing here. `None` for an adopted instance, a system image, and a machine whose installed
+/// template names no such key.
+pub fn created_pin(cfg: &ServiceConfig, template: Option<&Template>) -> Option<String> {
+    if cfg.adopted {
+        return None;
+    }
+    match &cfg.vm {
+        Some(vm) => {
+            let key = &template?.update.as_ref()?.pin;
+            vm.guest_settings()?.get(key)?.as_str().map(str::to_owned)
+        }
+        None => source_pin(&cfg.source),
+    }
+}
+
+/// What `service_status` answers under `update`: the version the service was created with (`pin`), the one its
+/// installed template names now (`templatePin`), and whether the two are the `same` or the template's `differs`. Two
+/// digests carry no order, so nothing here says which is newer. `unknown`, with the reason in `problem`, when the
+/// installed template cannot say: it is gone, cannot be read, or is of another kind now. `None` for a service whose
+/// own version is not known. Nothing is asked of any registry: both come from this node's own files and records.
+pub fn update_view(
+    cfg: &ServiceConfig,
+    template: Result<&Template, &TemplateError>,
+) -> Option<Value> {
+    let pin = created_pin(cfg, template.ok())?;
+    let unknown =
+        |problem: String| Some(json!({ "pin": pin, "state": "unknown", "problem": problem }));
+    let template = match template {
+        Ok(template) => template,
+        Err(error) if error.not_found => {
+            return unknown(format!(
+                "template {} is not installed on this node any more",
+                cfg.template
+            ));
+        }
+        Err(_) => {
+            return unknown(format!(
+                "template {} on this node cannot be used as it is",
+                cfg.template
+            ));
+        }
+    };
+    let Some(now) = template_pin(template).filter(|_| template.is_vm() == cfg.vm.is_some()) else {
+        return unknown(format!(
+            "template {} on this node is of another kind now, or names no version",
+            cfg.template
+        ));
+    };
+    let state = if now == pin { "same" } else { "differs" };
+    Some(json!({ "pin": pin, "templatePin": now, "state": state }))
 }
 
 /// The Incus source for a template: an OCI image by digest, a system image by alias or fingerprint.

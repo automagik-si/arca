@@ -184,6 +184,10 @@ list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable
   lanPort, links, published). `lanPort` is the template's host proxy port, or null when the
   service has no lan listener. A service whose instance is on the canvas contributes an Open
   link only from the configured host `address` and its real `lanPort`.
+  A row that `service_list` marks with `update.state` `differs` (the template installed on
+  the node names another version than the one the service runs) gets the tag "Other version"
+  on its card and beside its name in the machine's Details. The words claim no order: two
+  digests do not say which is newer. No other row carries the tag.
 - `journal` holds the newest `journal_list` records, at most 200 per host. Every
   poll re-reads a trailing window of the newest ids and merges by id with the
   latest record winning, so an effect that moved from `Intent` to `Failed` (or
