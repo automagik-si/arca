@@ -978,6 +978,33 @@ pub(super) fn deploy_parts(entries: &[Entry], payload: &Value) -> String {
     parts.join(", ")
 }
 
+/// What tenant `id` holds as its removal is proposed, for the owner's card: its block, when it was made, and each of
+/// its services, read from the desired state only. `None` when no record of the tenant is found, and the card then says
+/// that what it holds is read when the removal runs.
+pub(super) fn tenant_held(entries: &[Entry], payload: &Value) -> Option<String> {
+    let id = payload["id"].as_str()?;
+    let (_, config) = tenants(entries)
+        .into_iter()
+        .find(|(entry, config)| entry.id.0 == tenant_entry(id) && config.id == id)?;
+    let services = service_entries(entries)
+        .into_iter()
+        .filter(|(_, record)| record.tenant.as_ref().is_some_and(|found| found.id == id))
+        .map(|(_, record)| crate::action_proposal::HeldService {
+            database: record.template == crate::service::DATABASE_TEMPLATE,
+            vm: record.vm.is_some(),
+            name: record.name,
+        })
+        .collect();
+    Some(
+        crate::action_proposal::TenantHeld {
+            block: config.block,
+            made_ms: config.created,
+            services,
+        }
+        .fact(),
+    )
+}
+
 /// The check a proposed `tenant_remove` passes before the owner is asked: the tenant exists.
 pub(super) fn check_remove(
     cfg: &NodeConfig,
