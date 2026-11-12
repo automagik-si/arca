@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.16.0 (2026-11-12)
+
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
 what to propose it now reads the tenants (with what each instance uses and the deploy it came from) and the functions
@@ -20,6 +22,12 @@ build with a newer DSH or any other new pin was refused as an image that exists,
 hand. The template changed, so an installed copy nobody edited is brought up to date by the upgrade. A node's image of
 before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
 that image is built with `templates/automagik.build.sh`.
+
+- Merge PR 120: v0.15.0's automagik.json is on the list of earlier versions, so an upgrade replaces it
+- Merge PR 109: the Automagik image is named after every input of its build, so changing any pin builds a new image beside the old one
+- Merge dev at v0.15.0 into set G
+- Merge PR 107: the tenant removal card says the tenant's address block, when it was made, and the services it holds as of the proposal, and that services made later go too
+- Merge PR 103: the canvas Doctor proposes all 22 kernel actions and reads tenants and functions, with the kernel's untrusted note first in what it reads
 
 ## 0.15.0 (2026-11-12)
 
