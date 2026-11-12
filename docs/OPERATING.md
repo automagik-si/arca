@@ -3496,13 +3496,13 @@ Where a virtual machine's secret is, and is not:
   starts inside a key shows none of the key when the key's END line is inside the window. `function_runs` redacts a
   kept output and a run's line again when it reads them. Certificates, public keys and other public PEM blocks are
   hidden as `[secret]` too.
-- Known gaps. Still shown: the last line of a key printed without its END line, when it is shorter than 16
-  characters; for a key that is not a stored secret, after a BEGIN line with no END, its lines that each carry a
-  prefix (a journal's timestamp, a colour code, `key: `), and a key longer than a journal window when neither its
-  BEGIN nor its END line is inside the window; and a stored key's base64 printed at another width, where a run of it
-  touches other base64 characters (`key=...`). Hidden beyond a key: a stray END line with no BEGIN before it hides
-  the text from its start, so a function's result that names such a line is hidden too; and a stray BEGIN line hides
-  everything up to the next END line.
+- Known gaps. Still shown: the last line of a key printed without its END line, when it is shorter than 16 characters;
+  for a key that is not a stored secret, after a BEGIN line with no END, its lines that each carry a prefix (a journal's
+  timestamp, a colour code, `key: `), and a key longer than a journal window when neither its BEGIN nor its END line is
+  inside the window; a stored key's base64 printed at another width, where a run of it touches other base64 characters
+  (`key=...`); and a stored key whose letters were changed in case. Hidden beyond a key: a stray END line with no BEGIN
+  before it hides the text from its start, so a function's result that names such a line is hidden too; and a stray
+  BEGIN line hides everything up to the next END line.
 
 **Settings for one service.** A template may let a create replace some of its settings, so that two services of one
 template differ without a second template file. It lists their names in `createSettings`, each a key of its

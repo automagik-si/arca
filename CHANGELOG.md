@@ -24,11 +24,11 @@ body is hidden, printed at another width or with each `/` written `\/`. A label 
 hyphens (`OpenVPN Static key V1`). A function's kept outputs and its runs' lines are redacted again when
 `function_runs` reads them, with the secrets stored then.
 
-Known gaps: for a key that is not a stored secret, its lines after a BEGIN line with no END are still shown when each
-carries a prefix (a journal's timestamp, a colour code), and so is a key longer than a journal window when neither its
-BEGIN nor its END line is inside the window; a stray END line hides the text from its start, so a function's result
-that names such a line is hidden too; a stray BEGIN line hides everything up to the next END line. `docs/OPERATING.md`
-lists them all.
+Known gaps: a stored key whose letters were changed in case is still shown; for a key that is not a stored secret, its
+lines after a BEGIN line with no END are still shown when each carries a prefix (a journal's timestamp, a colour code),
+and so is a key longer than a journal window when neither its BEGIN nor its END line is inside the window; a stray END
+line hides the text from its start, so a function's result that names such a line is hidden too; a stray BEGIN line
+hides everything up to the next END line. `docs/OPERATING.md` lists them all.
 
 ## 0.14.0 (2026-11-12)
 
@@ -53,7 +53,6 @@ the upgrade is refused when approved, and must be proposed again.
 A create is refused when the instance it would get has the name of another service's instance on the node: the
 node's own service `x-<tenant id>` and that tenant's service `x`. Before, the second one was recorded and Incus
 refused it.
-
 A secret of several lines, such as a key file a virtual machine reads, is now hidden in `service_logs`, in a failed
 command's words and in a function's output. Before, a log was cleaned line by line before the stored values were looked
 for, so a value of several lines was never found and a key the guest printed on its console was shown to any token
