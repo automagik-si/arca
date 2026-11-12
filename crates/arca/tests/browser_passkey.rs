@@ -1127,7 +1127,7 @@ fn g9_a_real_browser_at_http_localhost_saves_the_first_passkey_with_the_terminal
         "the browser treats http://localhost as a secure context"
     );
     assert_eq!(
-        chrome.eval("!document.getElementById('local-help').hidden && document.getElementById('local-help').textContent.includes('ssh -L ' + location.port + ':127.0.0.1:' + location.port)"),
+        chrome.eval("!document.getElementById('local-help').hidden && document.getElementById('local-help').textContent.includes('ssh -o ExitOnForwardFailure=yes -L ' + location.port + ':127.0.0.1:' + location.port)"),
         json!(true),
         "the page says what this browser needs, and the other way in"
     );

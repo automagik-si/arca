@@ -1430,6 +1430,14 @@ fn arca_status_result() -> Value {
                 ("addr", true, string()),
                 ("open", true, boolean()),
                 ("reason", true, nullable(string())),
+                (
+                    "page",
+                    false,
+                    result(vec![
+                        ("open", true, boolean()),
+                        ("reason", true, nullable(string())),
+                    ]),
+                ),
             ]),
         ),
     ])

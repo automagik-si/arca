@@ -162,3 +162,85 @@ fn the_status_exposes_the_chosen_mode_and_reason() {
         json!("the Incus server name does not match the local host name")
     );
 }
+
+#[test]
+fn a_localhost_pages_door_is_open_only_while_both_loopback_addresses_are_this_nodes() {
+    use arca::handlers::LoopbackDoor;
+    use std::io::{Error, ErrorKind};
+
+    // A door with no page on it has no twin, and says nothing of a page.
+    let plain = LoopbackDoor::new("127.0.0.1:7471".parse().expect("an address"));
+    plain.report(None);
+    assert!(plain.twin().is_none());
+    assert_eq!(plain.page_refusal(), None);
+    assert_eq!(
+        plain.json(),
+        serde_json::json!({ "addr": "127.0.0.1:7471", "open": true, "reason": null })
+    );
+
+    // The door of a localhost page: its twin is the same port on the other loopback address, whichever one the
+    // config names.
+    let door = LoopbackDoor::new("127.0.0.1:7471".parse().expect("an address")).with_twin();
+    let twin = door.twin().expect("a twin");
+    assert_eq!(twin.addr().to_string(), "[::1]:7471");
+    assert_eq!(
+        LoopbackDoor::new("[::1]:7471".parse().expect("an address"))
+            .with_twin()
+            .twin()
+            .expect("a twin")
+            .addr()
+            .to_string(),
+        "127.0.0.1:7471"
+    );
+
+    // Before either bind has succeeded the page is closed.
+    assert!(door.page_refusal().is_some());
+    // The door alone is not the page: another program on the twin would be the page, at the page's own origin.
+    door.report(None);
+    twin.report(Some(&Error::from(ErrorKind::AddrInUse)));
+    let why = door.page_refusal().expect("the page is closed");
+    assert!(why.contains("does not hold [::1]:7471"), "{why}");
+    assert!(why.contains("address in use"), "{why}");
+    assert!(why.contains("http://localhost:7471"), "{why}");
+    let status = door.json();
+    assert_eq!(
+        status["open"],
+        serde_json::json!(true),
+        "the door itself is open"
+    );
+    assert_eq!(status["page"]["open"], serde_json::json!(false));
+    assert_eq!(status["page"]["reason"], serde_json::json!(why));
+    // Both held: the page is open.
+    twin.report(None);
+    assert_eq!(door.page_refusal(), None);
+    assert_eq!(
+        door.json()["page"],
+        serde_json::json!({ "open": true, "reason": null })
+    );
+    // The twin held and the door not: closed again, naming the door.
+    door.report(Some(&Error::from(ErrorKind::AddrInUse)));
+    assert!(
+        door.page_refusal()
+            .expect("closed")
+            .contains("does not hold 127.0.0.1:7471")
+    );
+    door.report(None);
+
+    // A machine with no IPv6 loopback: the twin's address is not on the machine (EADDRNOTAVAIL, 99), or the kernel
+    // has no such family (EAFNOSUPPORT, 97). No program can bind it and no browser can reach it, so it is nobody's
+    // to hold and the page is open on the one address there is.
+    for missing in [99, 97] {
+        twin.report(Some(&Error::from_raw_os_error(missing)));
+        assert_eq!(door.page_refusal(), None, "os error {missing}");
+    }
+    // Any other failure of the twin's bind is a door this node does not hold.
+    for held_elsewhere in [98, 13] {
+        twin.report(Some(&Error::from_raw_os_error(held_elsewhere)));
+        assert!(door.page_refusal().is_some(), "os error {held_elsewhere}");
+    }
+    // The door's own address missing is never "nobody's": the door is closed, and so is the page.
+    twin.report(None);
+    door.report(Some(&Error::from_raw_os_error(99)));
+    assert!(door.page_refusal().is_some());
+    assert_eq!(door.json()["open"], serde_json::json!(false));
+}

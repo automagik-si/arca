@@ -226,7 +226,8 @@ usual, `serve` says once on stderr `arca: the loopback door <addr> is closed: ad
 this port. The node runs without it and tries the address again`, and it tries the bind again after 1 second, then
 after twice as long each time, up to 30 seconds, for as long as it runs. When a try succeeds it says `arca: the
 loopback door <addr> is open`. `arca_status` reports the door of a node whose config names one, as
-`"loopback": { "addr": "<addr>", "open": true | false, "reason": "<why it is closed>" | null }`. While it reads
+`"loopback": { "addr": "<addr>", "open": true | false, "reason": "<why it is closed>" | null }`, with a `"page"`
+object beside them when the node's approval page is on this listener (see "The page on this machine alone"). While it reads
 `"open": false`, whatever answers on that port is not this node: do not send the token there.
 
 ### Tailnet listener
@@ -1548,6 +1549,28 @@ passkeys at `http://localhost` because it treats that name as a secure context w
 an IP address as a passkey's relying party, so the same page at `http://127.0.0.1:7471/approve` loads and cannot save
 or use a passkey.
 
+**This is for a machine where every account, and every agent or sandbox that shares its network, is trusted.** A
+loopback port has no owner: any program of the machine can bind one that is free, and a browser cannot tell which
+program answers at `http://localhost:7471`. A program that answered there in the node's place would be the approval
+page at the page's exact origin. It could collect the setup code you type and enrol its own passkey, or show a
+harmless card while your passkey signs a dangerous one. The node closes what it can (next paragraph); it cannot close
+the port to a program that takes it while the node is not running. On a machine shared with accounts or agents you
+do not trust with that, use an `https://` origin, where a name and a certificate say who answers.
+
+**Both loopback addresses, or no page.** `localhost` names two addresses, `127.0.0.1` and `::1`, and a browser tries
+`::1` first. So a node with this origin binds the port on both, whichever one `listen.loopback` names, and serves
+the page only while it holds both. While it does not hold one of them (another program has it), every page route
+answers 503 with the reason, `arca setup-code` and the page's own button give no code, and nothing is approved:
+whatever was typed or signed at the other program's copy of the page is worth nothing here. `arca_status` says it
+under `"loopback"`, as `"page": { "open": true | false, "reason": "<why it is closed>" | null }`. The node keeps
+trying the address and opens the page when it has both. A machine with no IPv6 loopback at all (IPv6 turned off, or
+a kernel built without it) has no second address for anyone to hold: the bind fails with "address not available" or
+"address family not supported", the node says so once on stderr, and the page is open on the one address there is.
+Any other failure of that bind, a port in use first of all, keeps the page closed.
+
+Before you type a setup code or approve for the first time, ask `arca_status` (`arca call arca_status ...`) and read
+`"page": { "open": true }`.
+
 What the config must say, and what it refuses with exit 2:
 
 - `approvalOrigin` may be `http://localhost:<port>` and no other `http://` origin: not an IP address, not another
@@ -1590,8 +1613,11 @@ The first passkey:
    a computer that has one, through an SSH forward. On that computer:
 
    ```sh
-   ssh -L 7471:127.0.0.1:7471 <the machine that runs Arca>
+   ssh -o ExitOnForwardFailure=yes -L 7471:127.0.0.1:7471 <the machine that runs Arca>
    ```
+
+   `ExitOnForwardFailure=yes` makes `ssh` stop when port 7471 is already taken on that computer. Without it `ssh`
+   only warns, and the browser would open whatever program holds the port there.
 
    and open `http://localhost:7471/approve` in its browser. Its origin is the same `http://localhost:7471`, so the
    passkey it saves is the node's. The setup code still comes from the node's own screen or terminal.
@@ -1601,15 +1627,22 @@ What this does not do:
 - **A phone cannot open this page**, and neither can another machine without the SSH forward. Approving from a
   phone needs a name and a certificate: an `https://` origin.
 - **The passkey belongs to `http://localhost:<port>`.** Change the port, or move to an `https://` origin later, and
-  the passkey no longer answers: enrol again.
-- **Other accounts of the machine can reach the page.** They can read the waiting cards, decline a proposal or deny a
-  request (neither needs a passkey), and use up the hour's setup codes. They cannot approve anything, and they do not
-  get a setup code. As for any loopback port, another account can also take the port while the node is down (see
-  "Loopback listener").
+  the passkey no longer answers at the new origin. There is no way to enrol a second time from the page: a setup code
+  is given only while no passkey is trusted, and adding a passkey needs one that answers at the page's origin. To
+  start again, stop the node, remove `<stateDir>/owner-passkeys`, start it, and enrol with a new setup code. Until
+  that file is removed, the old passkey is still trusted for the old origin.
+- **Other accounts of the machine can reach the page.** They can read the waiting cards and the list of passkeys
+  (names, fingerprints and dates), decline a proposal or deny a request (neither needs a passkey), and use up the
+  hour's setup codes or lock setup for an hour with wrong ones. Through the node's own page they cannot approve and
+  they get no setup code. What the paragraph at the top says still holds: a program that holds the port while the
+  node does not is the page, and what you type or sign there is that program's.
+- **Cookies are the whole name's.** A browser keeps cookies for `localhost` without regard to the port. The canvas
+  session cookie this page sets is therefore sent to every other web server you open at `http://localhost:<any
+  port>`, and a program that received it could use it on the canvas routes here. The canvas is not tested on this
+  origin; do not sign in to it here on a machine where you open other local web servers you do not trust.
 - **Not tested with a real passkey manager.** A browser test drives Chromium's virtual authenticator at
   `http://localhost`. Google Password Manager, a password manager extension and a phone over Bluetooth were not
   tried against a `localhost` page.
-- **The remote canvas** (`/approve/canvas`) keeps a `Secure` session cookie; it is not tested on this origin.
 
 #### Approving on another kernel of this machine
 

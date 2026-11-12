@@ -373,6 +373,8 @@ struct Rig {
     upstream: Arc<TestUpstream>,
     action_runs: Arc<AtomicU64>,
     requests: Arc<ApprovalRequests>,
+    /// Why the page is closed, while a test says it is: what `serve` reads from the loopback door of a localhost page.
+    closed: Arc<Mutex<Option<String>>>,
     _runtime: Runtime,
 }
 
@@ -565,6 +567,9 @@ impl Rig {
                 .expect("log lock")
                 .push(line.to_string())
         }));
+        let closed: Arc<Mutex<Option<String>>> = Arc::default();
+        let gate = Arc::clone(&closed);
+        let page = page.with_gate(Arc::new(move || gate.lock().expect("gate lock").clone()));
         let canvas = page.canvas().clone();
         let proxy_router = if with_page {
             base.clone().merge(page.router(true))
@@ -607,6 +612,7 @@ impl Rig {
             upstream,
             action_runs,
             requests,
+            closed,
             _runtime: runtime,
         };
         (rig, key)
@@ -1869,6 +1875,97 @@ fn the_terminal_setup_code_answers_only_a_caller_that_wrote_the_state_directory(
         !rig.proof_file(PROOF_C).exists(),
         "a refused request leaves no file either"
     );
+}
+
+#[test]
+fn a_closed_page_serves_nothing_takes_nothing_and_gives_no_setup_code() {
+    // The page of this machine alone is closed while the node does not hold both loopback addresses of its port:
+    // some other program may then be answering at the page's own origin. Whatever a person typed or signed there
+    // must be worth nothing here.
+    let (rig, key) = Rig::new_local("page-closed");
+    let why = "The approval page is closed: this node does not hold [::1]:7471 (address in use: another program holds this port).";
+    *rig.closed.lock().expect("gate lock") = Some(why.to_string());
+    let closed = |status: u16, body: &[u8]| {
+        assert_eq!(status, 503);
+        let body: Value = serde_json::from_slice(body).expect("a refusal in JSON");
+        assert_eq!(body["refusal"], json!("page_closed"));
+        assert_eq!(body["message"], json!(why));
+    };
+    // Every route of the page, the page itself and its open list of cards among them.
+    for path in [
+        "/approve",
+        "/approve/plans",
+        "/approve/passkeys",
+        "/approve/canvas",
+    ] {
+        let (status, body) = rig.get(path, None);
+        closed(status, &body);
+    }
+    for path in [
+        "/approve/setup-code",
+        "/approve/setup-code/verify",
+        "/approve/register",
+        "/approve/approve",
+        "/approve/decline",
+        "/approve/requests/begin",
+        "/approve/passkeys/change",
+    ] {
+        let (status, body) = rig.post(path, Some(LOCAL_ORIGIN), json!({}));
+        closed(status, &body);
+    }
+    assert!(
+        rig.display.codes.lock().expect("display lock").is_empty(),
+        "no setup code was sent to a screen"
+    );
+    // The terminal gets no code either, though it shows that it is the node's user: the code would be typed into
+    // whatever answers at the page's address.
+    let (status, body) = rig.terminal_code(false, PROOF_A, true);
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["message"], json!(why));
+    assert!(body.get("code").is_none());
+    // The Origin rule still comes first: a foreign origin learns nothing, not even that the page is closed.
+    assert_eq!(
+        rig.post_empty("/approve/setup-code", Some("http://127.0.0.1:7471"))
+            .0,
+        403
+    );
+
+    // The node holds both addresses again: the page is the page.
+    *rig.closed.lock().expect("gate lock") = None;
+    assert_eq!(rig.get("/approve", None).0, 200);
+    let (status, body) = rig.terminal_code(false, PROOF_B, true);
+    assert_eq!(status, 200, "{body}");
+    let code = body["code"].as_str().expect("a code").to_string();
+    let (status, answer) = rig.post(
+        "/approve/register",
+        Some(LOCAL_ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+}
+
+#[test]
+fn the_terminals_proof_must_be_fresh_and_the_state_directory_still_private() {
+    let (rig, _key) = Rig::new_empty("page-proof-fresh");
+    // A file that was made two minutes ago is not a request that was made just now.
+    let stale = rig.proof_file(PROOF_A);
+    fs::write(&stale, b"").expect("the proof file");
+    fs::File::options()
+        .write(true)
+        .open(&stale)
+        .expect("open the proof file")
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+        .expect("set its time");
+    assert_eq!(rig.terminal_code(false, PROOF_A, false).0, 403);
+    assert!(stale.exists(), "a stale file is not taken");
+    fs::remove_file(&stale).expect("remove it");
+
+    // The state directory was opened to others after the node started: a file in it no longer shows who made it.
+    fs::set_permissions(&rig.state_dir, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    assert_eq!(rig.terminal_code(false, PROOF_B, true).0, 403);
+    assert!(rig.proof_file(PROOF_B).exists(), "nothing is taken from it");
+    fs::set_permissions(&rig.state_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    assert_eq!(rig.terminal_code(false, PROOF_B, false).0, 200);
 }
 
 #[test]

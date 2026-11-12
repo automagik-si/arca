@@ -135,7 +135,15 @@ struct PageState {
     linked: Arc<Vec<LinkedHost>>,
     peer_sync: Option<PeerSyncer>,
     requests: Option<Arc<ApprovalRequests>>,
+    gate: Option<PageGate>,
 }
+
+/// Why the page is closed right now, in words for the owner, or `None` while it is open. `serve` gives the page of this
+/// machine alone a gate that is closed while the node does not hold both loopback addresses of the page's port.
+pub type PageGate = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// The refusal code of a page that is closed by its gate.
+pub const PAGE_CLOSED: &str = "page_closed";
 
 /// The path the unix socket alone carries for a setup code on the terminal.
 pub const LOCAL_SETUP_CODE_PATH: &str = "/local/setup-code";
@@ -225,7 +233,7 @@ impl SetupState {
 ///
 /// # Panics
 ///
-/// Panics when `origin` is not the validated `https://` origin. `cmd_serve` only calls this after the config check.
+/// Panics when `origin` is not a validated approval origin. `cmd_serve` only calls this after the config check.
 pub fn router(
     origin: String,
     kernel: Arc<Mutex<Kernel>>,
@@ -239,7 +247,7 @@ pub fn router(
 ///
 /// # Panics
 ///
-/// Panics when `origin` is not the validated `https://` origin.
+/// Panics when `origin` is not a validated approval origin.
 pub fn router_with(
     origin: String,
     kernel: Arc<Mutex<Kernel>>,
@@ -260,7 +268,7 @@ impl Page {
     ///
     /// # Panics
     ///
-    /// Panics when `origin` is not the validated `https://` origin.
+    /// Panics when `origin` is not a validated approval origin.
     pub fn new(
         origin: String,
         kernel: Arc<Mutex<Kernel>>,
@@ -307,12 +315,20 @@ impl Page {
                 linked: Arc::new(Vec::new()),
                 peer_sync: None,
                 requests: None,
+                gate: None,
             },
         }
     }
 
     /// Supplies the handlers an approved action runs through. `cmd_serve` passes the same handler set the MCP door holds;
     /// tests may pass a fake. Without them an action proposal can still be listed and declined, but not approved.
+    /// Closes the page while `gate` says why: every page route, and the terminal's setup code, answer 503 with the
+    /// gate's words and do nothing else. Without a gate the page is always open.
+    pub fn with_gate(mut self, gate: PageGate) -> Self {
+        self.state.gate = Some(gate);
+        self
+    }
+
     pub fn with_actions(mut self, actions: ActionExecutor) -> Self {
         self.state.actions = actions;
         self
@@ -426,6 +442,10 @@ impl Page {
             .layer(DefaultBodyLimit::max(PAGE_BODY_BYTES))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
+                gate_rule,
+            ))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
                 origin_rule,
             ))
             .layer(middleware::from_fn(security_headers))
@@ -450,6 +470,24 @@ impl PageState {
             .unwrap_or("proxy-unknown")
             .to_string()
     }
+}
+
+/// The page's gate, after the Origin rule and before any handler or body: while the gate gives a reason, every page route
+/// answers 503 with it, the page itself included. A closed page serves no card, takes no approval and gives no setup
+/// code, so nothing a person typed or signed at another program's copy of the page can be spent here.
+async fn gate_rule(State(state): State<Arc<PageState>>, request: Request, next: Next) -> Response {
+    if let Some(why) = state.gate.as_ref().and_then(|gate| gate()) {
+        return page_closed(why);
+    }
+    next.run(request).await
+}
+
+fn page_closed(why: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "refusal": PAGE_CLOSED, "message": why })),
+    )
+        .into_response()
 }
 
 /// The page's Origin rule, before any body is read: a POST needs the exact configured Origin; a GET needs none or the exact
@@ -1486,6 +1524,10 @@ async fn local_setup_code(
         )
             .into_response();
     }
+    // A code for a page that is closed would be typed into whatever answers at the page's address.
+    if let Some(why) = state.gate.as_ref().and_then(|gate| gate()) {
+        return page_closed(why);
+    }
     let now = (state.clock)();
     let mut setup = match state.setup.lock() {
         Ok(setup) => setup,
@@ -1526,17 +1568,35 @@ async fn local_setup_code(
     reply
 }
 
-/// Takes the proof file of one terminal request: `true` when the state directory held a regular file of this process's own
-/// user under the request's name, and it was removed. A link, a directory, another user's file, a file that is not
-/// there, and a file that cannot be removed are all no proof.
+/// How old a terminal request's proof file may be. The command makes it and asks at once.
+const LOCAL_PROOF_FRESH: Duration = Duration::from_secs(60);
+
+/// Takes the proof file of one terminal request: `true` when the state directory, which is still a directory of this
+/// process's own user at mode 0700, held a regular file of that user under the request's name, made within the last
+/// [`LOCAL_PROOF_FRESH`], and the file was removed. A link, a directory, another user's file, a file that is not there,
+/// an old file, a file that cannot be removed, and a state directory that was opened up since `serve` checked it at
+/// start are all no proof.
 fn take_local_proof(state_dir: &Path, proof: &str) -> bool {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(uid) = arca_approval::effective_uid() else {
+        return false;
+    };
+    let private = fs::symlink_metadata(state_dir).is_ok_and(|dir| {
+        dir.is_dir() && dir.uid() == uid && dir.permissions().mode() & 0o777 == 0o700
+    });
+    if !private {
+        return false;
+    }
     let path = state_dir.join(format!("{LOCAL_PROOF_PREFIX}{proof}"));
     let Ok(meta) = fs::symlink_metadata(&path) else {
         return false;
     };
-    let own = arca_approval::effective_uid().is_ok_and(|uid| meta.uid() == uid);
-    meta.is_file() && own && fs::remove_file(&path).is_ok()
+    let fresh = meta
+        .modified()
+        .ok()
+        .and_then(|made| made.elapsed().ok())
+        .is_some_and(|age| age <= LOCAL_PROOF_FRESH);
+    meta.is_file() && meta.uid() == uid && fresh && fs::remove_file(&path).is_ok()
 }
 
 /// Checks a setup code before the page creates a credential, using the same wrong-try budgets as registration. A correct

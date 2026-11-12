@@ -490,6 +490,14 @@ fn arca_status_schemas_equal_its_table_row() {
                         "addr": { "type": "string" },
                         "open": { "type": "boolean" },
                         "reason": { "type": ["string", "null"] },
+                        "page": {
+                            "type": "object",
+                            "properties": {
+                                "open": { "type": "boolean" },
+                                "reason": { "type": ["string", "null"] },
+                            },
+                            "required": ["open", "reason"],
+                        },
                     },
                     "required": ["addr", "open", "reason"],
                 }

@@ -268,7 +268,16 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // not_found, exactly as before the verb existed.
     let relayed = accepts_relayed_approvals(&cfg);
     // The loopback door's state: the listener reports each bind it tries, and arca_status says what the last one found.
-    let door = cfg.listen.loopback.map(crate::handlers::LoopbackDoor::new);
+    // A node whose approval page is http://localhost:<port> holds that port on both loopback addresses: `localhost`
+    // names both, and a program on the one this node left free would be the page.
+    let door = cfg.listen.loopback.map(|addr| {
+        let door = crate::handlers::LoopbackDoor::new(addr);
+        if config::page_is_local(&cfg) {
+            door.with_twin()
+        } else {
+            door
+        }
+    });
     // peer_keys_sync is served only to a kernel whose config keeps another machine's page host's passkeys.
     let keeps_peer_keys = !peers.is_empty();
     let mut server = Server::new(served_verbs(relayed, keeps_peer_keys), tokens.clone())
@@ -537,8 +546,13 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .with_actions(actions)
         .with_approval_requests(Arc::clone(&approval_requests))
         .with_linked_hosts(linked_hosts.clone());
-        match &peer_sync {
+        let page = match &peer_sync {
             Some(syncer) => page.with_peer_sync(syncer.clone()),
+            None => page,
+        };
+        // The page of this machine alone is open only while this node holds both loopback addresses of its port.
+        match door.clone().filter(|door| door.twin().is_some()) {
+            Some(door) => page.with_gate(Arc::new(move || door.page_refusal())),
             None => page,
         }
     });
@@ -606,6 +620,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         // A listener the config does not name is a future that never ends, so the first listener to fail, or the first
         // signal, stops them all. The loopback listener is the exception: its port is one any program of the machine
         // can hold first, so a bind that fails is reported and tried again, and never stops the others.
+        let twin = door.as_ref().and_then(crate::handlers::LoopbackDoor::twin);
         let loopback = async {
             match (cfg.listen.loopback, door) {
                 (Some(addr), Some(door)) => {
@@ -615,6 +630,18 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                     .await
                 }
                 _ => std::future::pending().await,
+            }
+        };
+        // The same routes under the same rules on the port's other loopback address, for a localhost page.
+        let loopback_twin = async {
+            match twin {
+                Some(twin) => {
+                    serve_loopback(loopback_router.clone(), twin.addr(), move |error| {
+                        twin.report(error)
+                    })
+                    .await
+                }
+                None => std::future::pending().await,
             }
         };
         let tailnet = async {
@@ -638,6 +665,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         tokio::select! {
             result = serve_unix(router.clone(), &unix_path) => result,
             result = loopback => result,
+            result = loopback_twin => result,
             result = tailnet => result,
             result = proxy => result,
             result = services => result,

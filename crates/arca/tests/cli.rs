@@ -1980,6 +1980,25 @@ fn the_page_of_this_machine_is_on_the_loopback_listener_and_its_setup_code_comes
     let get =
         |path: &str, host: &str| status_of(at, &format!("GET {path} HTTP/1.1\r\nHost: {host}"), "");
 
+    // The node takes the port's other loopback address too, a moment after the first; the page opens once it holds
+    // both (or once it has found that this machine has no IPv6 loopback).
+    let deadline = Instant::now() + WAIT;
+    while !get("/approve", &format!("localhost:{port}")).starts_with("HTTP/1.1 200") {
+        assert!(Instant::now() < deadline, "the page opens");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Where the machine has an IPv6 loopback, the page is there as well, under the same rules: a browser that
+    // tries ::1 first for the name localhost finds this node, not an empty port another program could take.
+    let six: std::net::SocketAddr = format!("[::1]:{port}").parse().expect("an address");
+    if std::net::TcpStream::connect(six).is_ok() {
+        let on_six = |path: &str, host: &str| {
+            status_of(six, &format!("GET {path} HTTP/1.1\r\nHost: {host}"), "")
+        };
+        assert!(on_six("/approve", &format!("localhost:{port}")).starts_with("HTTP/1.1 200"));
+        assert!(on_six("/approve", &format!("[::1]:{port}")).starts_with("HTTP/1.1 200"));
+        assert!(on_six("/approve", &format!("rebound.example:{port}")).starts_with("HTTP/1.1 403"));
+    }
+
     // The page and its cards answer the listener's own two names, with no token, and no other name.
     for own in [format!("localhost:{port}"), format!("127.0.0.1:{port}")] {
         assert!(get("/approve", &own).starts_with("HTTP/1.1 200"), "{own}");
@@ -2087,6 +2106,151 @@ fn the_page_of_this_machine_is_on_the_loopback_listener_and_its_setup_code_comes
             .filter(|name| name.starts_with("setup-code-request-"))
             .count(),
         0
+    );
+    let summary = rig.shim.stop().expect("stop the shim");
+    assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn while_another_program_holds_the_ports_other_loopback_address_the_page_is_closed_and_no_code_is_given()
+ {
+    let scratch = Scratch::new("serve-twin-held");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+
+    // Another program, of any user, takes [::1]:<port> and keeps it: the address a browser tries first for the name
+    // localhost. The node's config names 127.0.0.1:<port>, which stays free for it.
+    let Ok(held) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!(
+            "this machine has no IPv6 loopback, so no program can hold one: the case cannot be made here \
+             (the door's own test covers what the node does then)"
+        );
+        return;
+    };
+    let port = held.local_addr().expect("its address").port();
+    let at: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("an address");
+    let origin = format!("http://localhost:{port}");
+    let mut value = config(&scratch, rig.shim.socket());
+    value["listen"]["loopback"] = json!(at.to_string());
+    value["approvalOrigin"] = json!(origin);
+    let node = write_config(&scratch, "node.json", &value);
+    let log = scratch.at("serve.log");
+    let mut child = arca()
+        .args(["serve", "--config"])
+        .arg(&node)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&log).expect("the server's log"))
+        .spawn()
+        .expect("start arca serve");
+    let said = || fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + WAIT;
+    while std::net::TcpStream::connect(at).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the node takes its own address: {}",
+            said()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let get = |path: &str| {
+        reply_of(
+            at,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost:{port}"),
+            "",
+        )
+    };
+    let code = || {
+        arca()
+            .args(["setup-code", "--config"])
+            .arg(&node)
+            .output()
+            .expect("run arca setup-code")
+    };
+
+    // The node holds its own address, and its door for MCP clients is open as ever.
+    assert!(
+        status_of(
+            at,
+            &format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}"),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        )
+        .starts_with("HTTP/1.1 401")
+    );
+    // The page is closed on it, and says why: nothing is served, no code is checked, none is given.
+    let closed = format!(
+        "this node does not hold [::1]:{port} (address in use: another program holds this port)"
+    );
+    for path in ["/approve", "/approve/plans"] {
+        let reply = get(path);
+        assert!(reply.starts_with("HTTP/1.1 503"), "{path}: {reply}");
+        assert!(reply.contains("\"refusal\":\"page_closed\""), "{reply}");
+        assert!(reply.contains(&closed), "{reply}");
+    }
+    let verify = reply_of(
+        at,
+        &format!(
+            "POST /approve/setup-code/verify HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: {origin}"
+        ),
+        r#"{"setupCode":"00000000"}"#,
+    );
+    assert!(verify.starts_with("HTTP/1.1 503"), "{verify}");
+    let out = code();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "no setup code while the page is closed"
+    );
+    assert!(out.stdout.is_empty(), "nothing on stdout");
+    let refused = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(refused.contains(&closed), "{refused}");
+    assert!(
+        refused.contains("type no setup code and approve nothing there"),
+        "{refused}"
+    );
+    assert!(
+        said().contains(&format!(
+            "the approval page's other address [::1]:{port} is not this node's: address in use"
+        )),
+        "{}",
+        said()
+    );
+
+    // The other program lets go. The node takes the address without being started again, the page opens, and the
+    // terminal gets its code.
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !get("/approve").starts_with("HTTP/1.1 200") {
+        assert!(
+            Instant::now() < deadline,
+            "the page opens once both addresses are the node's: {}",
+            said()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    let out = code();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed: Value = serde_json::from_slice(&out.stdout).expect("JSON on stdout");
+    assert_eq!(printed["code"].as_str().map(str::len), Some(8));
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(
+        wait_exit(&mut child).code(),
+        Some(0),
+        "serve exits 0 on SIGTERM"
     );
     let summary = rig.shim.stop().expect("stop the shim");
     assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
