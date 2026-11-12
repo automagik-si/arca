@@ -644,10 +644,12 @@ test('host snapshot route answers from its cache while Arca is held and device H
   assert.equal(arcaGivenUp, 0, `${arcaGivenUp} held Arca request(s) were given up before the route answered`);
   assert.equal(snapshot.machine, null, 'Arca was held, so the route had nothing of it yet');
   letArcaAnswer();
+  // Each look is a route answer like the others, within a second; the looks go on for at most five seconds.
   const start = performance.now();
-  for (let attempt = 0; attempt < 20 && !snapshot.machine; attempt++) {
-    snapshot = (await (await fetch(url)).json()).hosts[0];
-    if (!snapshot.machine) await new Promise((resolve) => setTimeout(resolve, 10));
+  while (!snapshot.machine) {
+    assert.ok(performance.now() - start < 5000, 'the route still showed no Arca answer five seconds after Arca was let answer');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    ({ host: snapshot } = await hostWithin(url, 'while the cache took in Arca\'s answer'));
   }
   const readyElapsed = performance.now() - start;
   assert.deepEqual(snapshot.machine, fixtures.arca_status);
@@ -659,11 +661,13 @@ test('host snapshot route answers from its cache while Arca is held and device H
   // The device request is still open, and the route answers from its cache all the same.
   let { host: next } = await hostWithin(url, 'while the device request was open');
   assert.equal(closed, 0, 'the device request was still open when the route answered');
-  for (let attempt = 0; attempt < 20 && next.at === snapshot.at; attempt++) {
+  const polling = performance.now();
+  while (next.at === snapshot.at) {
+    assert.ok(performance.now() - polling < 5000,
+      `the route showed the snapshot of ${snapshot.at} for five seconds: Arca, polled every ${config.pollMs} ms, was not read again while the device request was pending`);
     await new Promise((resolve) => setTimeout(resolve, 10));
-    next = (await (await fetch(url)).json()).hosts[0];
+    ({ host: next } = await hostWithin(url, 'while Arca was polled again'));
   }
-  assert.notEqual(next.at, snapshot.at, 'Arca keeps polling during the pending device phase');
   assert.equal(next.error, null);
   await fiber.dispose();
   await until(() => closed === deviceRequests);

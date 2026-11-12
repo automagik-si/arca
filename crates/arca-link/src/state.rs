@@ -435,15 +435,24 @@ mod tests {
                 }
             })
         };
+        // Stops the asker and waits for it, so that nothing touches the state directory once the test ends, and a
+        // panic of the asker is shown as its own.
+        let finish = |asker: std::thread::JoinHandle<()>| {
+            stop.store(true, Ordering::SeqCst);
+            if let Err(panic) = asker.join() {
+                std::panic::resume_unwind(panic);
+            }
+        };
         together.wait();
         let waited = Duration::from_secs(30);
         let deadline = Instant::now() + waited;
         let (mut starts, mut refused) = (0u64, 0u64);
         while starts < 2000 || asked.load(Ordering::SeqCst) < 2000 {
-            if Instant::now() >= deadline {
-                stop.store(true, Ordering::SeqCst);
+            if asker.is_finished() || Instant::now() >= deadline {
+                finish(asker);
                 panic!(
-                    "after {waited:?}, {starts} starts and {} status checks beside them; the test needs 2000 of each",
+                    "after {waited:?}, {starts} starts ({refused} of them refused as 'already running') and {} status \
+                     checks beside them; the test needs 2000 of each",
                     asked.load(Ordering::SeqCst)
                 );
             }
@@ -453,8 +462,7 @@ mod tests {
             }
             starts += 1;
         }
-        stop.store(true, Ordering::SeqCst);
-        asker.join().unwrap();
+        finish(asker);
         assert_eq!(
             refused,
             0,
