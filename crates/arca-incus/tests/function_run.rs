@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arca_incus::function_run::{FUNCTION_KEY, FreshRoot, FunctionRun};
+use arca_incus::function_run::{FUNCTION_KEY, FreshRoot, FunctionRun, STARTED_KEY};
 use arca_incus::{FakeIncus, FakeState, IncusError, ProjectFamily, StateAction, StateChanger};
 use serde_json::{Value, json};
 
@@ -49,7 +49,19 @@ impl Rig {
                     "relay",
                     "Stopped",
                     "container",
-                    json!({ FUNCTION_KEY: "true", "volatile.base_image": "c".repeat(64) }),
+                    // It has run before: Incus wrote the key that says so at its first start.
+                    json!({ FUNCTION_KEY: "true", "volatile.base_image": "c".repeat(64),
+                            "volatile.last_state.power": "STOPPED" }),
+                ),
+                // A function's container as its create leaves it: never started, with the id map it would start
+                // with next.
+                instance(
+                    "fresh",
+                    "Stopped",
+                    "container",
+                    json!({ FUNCTION_KEY: "true", "volatile.base_image": "e".repeat(64),
+                            "volatile.idmap.base": "0", "volatile.idmap.next": "[{\"Hostid\":1000000}]",
+                            "volatile.last_state.idmap": "[]" }),
                 ),
                 instance(
                     "busy",
@@ -325,6 +337,61 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
         Err(IncusError::Refused(_))
     ));
     assert_eq!(rig.rebuild_requests(), sent, "nothing was sent for either");
+}
+
+/// A container that has never been started is not rebuilt before its first run: its root is the one its create made
+/// from the image, and Incus cannot start a container that was rebuilt before it ever ran. Once it has run, every
+/// run's root is rebuilt, and it still starts.
+#[test]
+fn a_container_that_never_started_is_not_rebuilt_and_one_that_has_run_is() {
+    let rig = Rig::new();
+    let source = json!({
+        "type": "image", "mode": "pull", "protocol": "oci",
+        "server": "https://registry.example",
+        "alias": format!("acme/relay@sha256:{}", "a".repeat(64)),
+    });
+    let never = || false;
+    let made_from = "e".repeat(64);
+    let seen = rig.run.read(PROJECT, "fresh").expect("a function");
+    assert!(!seen.own_config.contains_key(STARTED_KEY));
+    // What can be checked of a root nothing was rebuilt into is checked: the instance says it was made from the
+    // image the function's record took. Another image, and it is refused.
+    let refused = rig
+        .run
+        .fresh_root(&seen, Some(&"f".repeat(64)), &source, &never)
+        .expect_err("another image than the record's");
+    assert!(
+        matches!(&refused, IncusError::Refused(why) if why.contains("never been started")),
+        "{refused:?}"
+    );
+    // The record's own image, or a record that names none: nothing is rebuilt, and Incus is asked for no rebuild.
+    for recorded in [Some(made_from.as_str()), None] {
+        assert_eq!(
+            rig.run
+                .fresh_root(&seen, recorded, &source, &never)
+                .expect("a new root"),
+            FreshRoot::New
+        );
+    }
+    assert_eq!(rig.rebuild_requests(), 0);
+    // So its first start is taken. Had it been rebuilt, Incus would have refused it: a rebuild takes away the id
+    // map a container starts with next, and one that never ran has no other.
+    rig.fake.run_until_stopped(PROJECT, "fresh");
+    rig.run.start(&seen).expect("the first start");
+    rig.run
+        .stop(&seen, Duration::from_secs(1))
+        .expect("it stops");
+    let seen = rig.run.read(PROJECT, "fresh").expect("a function");
+    assert!(seen.own_config.contains_key(STARTED_KEY));
+    // It has run: now its root is rebuilt before a run, and the start after the rebuild is taken too.
+    assert_eq!(
+        rig.run
+            .fresh_root(&seen, None, &source, &never)
+            .expect("rebuilt"),
+        FreshRoot::Registry
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "fresh"), ["registry"]);
+    rig.run.start(&seen).expect("a start after a rebuild");
 }
 
 #[test]

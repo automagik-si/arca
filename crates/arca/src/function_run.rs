@@ -632,7 +632,8 @@ impl FunctionRunner {
         let mut measured = Measured {
             start_ms: Some(millis(begun.elapsed())),
             root: Some(root.as_str()),
-            root_image: (root == arca_incus::function_run::FreshRoot::Store)
+            // A new root and one rebuilt from the store's copy are both of the image the function's record took.
+            root_image: (root != arca_incus::function_run::FreshRoot::Registry)
                 .then(|| function.fingerprint.clone())
                 .flatten(),
             root_ms: Some(root_ms),

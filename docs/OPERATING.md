@@ -4445,7 +4445,18 @@ kernel every function is due at once, and no missed tick is made up.
 **Every run starts from the image's own root.** Before it starts a run the kernel has Incus rebuild the container's
 root disk from the function's image. The config, the secrets among it, and the network card stay as they are; the
 files are the image's again. So no run finds what an earlier run wrote, and none can leave the next something to
-execute. The rebuild uses the copy of the image the node already holds, and asks no registry: the copy whose
+execute.
+
+The first run of a function is the one run with nothing rebuilt before it: its container has never been started, so
+its root is still the one its create made from the image, and no program has run in it. It must not be rebuilt
+either: Incus cannot start a container that was rebuilt before it ever ran (it answers `No ID map found for
+unprivileged container`; seen on Incus 7.5.1, and the source of Incus 7.6.0 gives such a container a map again,
+which was read and not run). Whether a container has started is read on the container itself, from
+the key Incus writes at its first start. Before that first run the kernel checks what it can of the root: the
+container must still say it was made from the image the function's record took, or the run does not start. That
+run's line says `root` is `new`.
+
+For every run after the first, the rebuild uses the copy of the image the node already holds, and asks no registry: the copy whose
 fingerprint the function's record took when it was created, read from the image Incus fetched for the approved
 registry and digest. It is never the image the container itself says it was made from, which whoever may write the
 container could change. When that copy is gone (Incus drops a cached image nothing has used for a while; a function's
@@ -4500,8 +4511,10 @@ One line for each run, appended and never rewritten, in `<stateDir>/function-run
  "memoryLimitBytes":134217728,"outcome":"ok","result":{"ok":true,"published":3}}
 ```
 
-`root` says where the image the root was rebuilt from came from, `store` (the node's own copy, whose fingerprint is
-`rootImage`) or `registry` (fetched again), and `rootMs` how long the rebuild took. `startMs` is how long Incus took to start the container; `durationMs`
+`root` says what the root was before the run: `new` (the root the create made, for a function that had never
+started: nothing was rebuilt), `store` (rebuilt from the node's own copy of the image) or `registry` (rebuilt from
+the image fetched again). `rootImage` is the image's fingerprint for `new` and `store`, and `rootMs` is how long it
+took. `startMs` is how long Incus took to start the container; `durationMs`
 runs from there to the exit the kernel saw.
 `cpuMs` and `memoryPeakBytes` are read from the container's cgroup while it runs, and only when the node's Incus is on
 the machine `arca serve` runs on: the files are gone when the container stops, so the peak is the last reading before

@@ -16,7 +16,9 @@ Every run of a function now starts from its image's own root. Before a run start
 from the function's image: from the copy the node already holds, the one the function's record took when it was
 created, or from the registry by the approved digest when that copy is gone. So no run finds what an earlier one
 wrote, which replaces the limit 0.13.0 named. A root that cannot be rebuilt is a run that does not start, and its
-line says why. A run's line gains `root`, `rootImage` and `rootMs`.
+line says why. A run's line gains `root`, `rootImage` and `rootMs`. A function's first run rebuilds nothing, and its
+line says `root` is `new`: a container that has never started still has the root its create made from the image, and
+Incus cannot start one that was rebuilt before its first start.
 
 What the owner approves on a card is now what is created. A proposed `service_create` or `postgres_create` is given,
 by the node, the image its template names and a fingerprint of the template's content (its file and the scripts it
