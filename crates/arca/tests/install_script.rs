@@ -909,6 +909,8 @@ fn an_upgrade_brings_the_templates_of_an_earlier_release_up_to_date_and_names_wh
         .ok()
         .says("  templates brought up to this release: postgres-autopg.json, postgres-autopg.sh")
         .says("(each was an earlier release's own file, not edited; a service that already runs is not changed)")
+        .says("A create that was proposed from one of them and still waits is refused when it is approved:")
+        .says("propose it again.")
         .says("  templates kept as you edited them: nats.json")
         .says("To replace them with this release's, losing those edits:")
         .says(&format!("{bin} templates install --config {config_path} --replace"));

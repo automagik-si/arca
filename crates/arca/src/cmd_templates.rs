@@ -63,6 +63,11 @@ pub const EARLIER: &[(&str, &str)] = &[
         "github-runner-pool.sh",
         "b092ba0ec712f9a90cd3ed2c8fa6cac24e70de27c519e0c7ec09a952a4b502e2",
     ),
+    // 0.13.0: before each pass looked at every slot once.
+    (
+        "github-runner-pool.sh",
+        "0c41006927d037d304ba27c26aad983616f1178bf8d42b246f8d7b0817015bb4",
+    ),
     // 0.9.0 to 0.12.0: the same.
     (
         "gitlab-runner-pool.sh",

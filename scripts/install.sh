@@ -971,6 +971,8 @@ report() {
     if [ -n "${templates_replaced-}" ]; then
         say "  templates brought up to this release: $templates_replaced"
         say "            (each was an earlier release's own file, not edited; a service that already runs is not changed)"
+        say "            A create that was proposed from one of them and still waits is refused when it is approved:"
+        say "            propose it again."
     fi
     if [ -n "${templates_kept-}" ] && [ -n "${templates_older-}" ]; then
         say "  templates kept as they are: $templates_kept"

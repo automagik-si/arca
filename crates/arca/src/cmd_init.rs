@@ -325,7 +325,7 @@ impl Node<'_> {
         {
             let names: Vec<&str> = replaced.iter().filter_map(Value::as_str).collect();
             say(&format!(
-                "Templates brought up to this release (each was an earlier release's own file, not edited): {}.",
+                "Templates brought up to this release (each was an earlier release's own file, not edited): {}. A create that was proposed from one of them and still waits is refused when it is approved: propose it again.",
                 names.join(", ")
             ));
         }

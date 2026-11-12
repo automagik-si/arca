@@ -1376,7 +1376,7 @@ fn init_brings_templates_an_earlier_release_installed_up_to_date_and_says_which(
 
     let said = node.init(&["--enable-changes", "--yes"], "");
     said.ok().says(
-        "Templates brought up to this release (each was an earlier release's own file, not edited): postgres-autopg.json, postgres-autopg.sh.",
+        "Templates brought up to this release (each was an earlier release's own file, not edited): postgres-autopg.json, postgres-autopg.sh. A create that was proposed from one of them and still waits is refused when it is approved: propose it again.",
     );
     assert!(
         said.report(5)[0].starts_with("The config now lets Arca make changes on this machine."),

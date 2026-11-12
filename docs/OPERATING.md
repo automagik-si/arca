@@ -669,7 +669,10 @@ name what it had already put in place, and running it again finishes. For a node
 templates install --config <file>` once after the upgrade, or `arca init --enable-changes` again; neither needs
 `--replace` for a template nobody edited.
 
-What a replaced template changes is the next create. Nothing changes for a service that already exists: a
+What a replaced template changes is the next create. A create that was proposed before the replacement and still
+waits is not made from the new file: its card bound the content of the template it showed, so approving it is
+refused and nothing is created; propose it again (see "What the owner saw is what is created"). `arca init` and the
+installer say so beside the names they replaced. Nothing changes for a service that already exists: a
 `postgres-autopg` service keeps the password that is stored, and none is made over it. One that was created
 stopped with no password gains none by itself either: set it with `service_secret_set`, or remove the service and
 create it again from the new template. A runner pool reads its script when its virtual machine is created, so a
