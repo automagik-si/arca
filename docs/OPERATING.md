@@ -1560,13 +1560,22 @@ do not trust with that, use an `https://` origin, where a name and a certificate
 **Both loopback addresses, or no page.** `localhost` names two addresses, `127.0.0.1` and `::1`, and a browser tries
 `::1` first. So a node with this origin binds the port on both, whichever one `listen.loopback` names, and serves
 the page only while it holds both. While it does not hold one of them (another program has it), every page route
-answers 503 with the reason, `arca setup-code` and the page's own button give no code, and nothing is approved:
-whatever was typed or signed at the other program's copy of the page is worth nothing here. `arca_status` says it
+answers 503 with the reason, `arca setup-code` and the page's own button give no code, and the page approves
+nothing. So the node takes nothing from you while the page is closed, and there is no setup code to type anywhere.
+**A signature is different.** If you approve with your passkey at another program's copy of the page, that
+signature is a valid approval of the card that program chose. It stays valid until its statement expires, and the
+program can spend it once the page opens again, or through the node's approval verbs with a token that may call
+them. If you approved at a page while `arca_status` said the page was closed, decline that card. `arca_status` says it
 under `"loopback"`, as `"page": { "open": true | false, "reason": "<why it is closed>" | null }`. The node keeps
 trying the address and opens the page when it has both. A machine with no IPv6 loopback at all (IPv6 turned off, or
 a kernel built without it) has no second address for anyone to hold: the bind fails with "address not available" or
 "address family not supported", the node says so once on stderr, and the page is open on the one address there is.
-Any other failure of that bind, a port in use first of all, keeps the page closed.
+The node does not take that failure at its word, because it can be true for the node alone: a service unit that
+restricts address families, or a network namespace of the node's own, makes the bind fail while the machine still
+has `::1` for any other program to take. So the node reads `/proc/net/if_inet6`. Only when that file is missing, or
+lists no `::1`, does the address count as nobody's. When it lists `::1`, or cannot be read, the page stays closed
+and the reason says so. Do not run a node with this origin under restricted address families or in a network
+namespace of its own. Any other failure of that bind, a port in use first of all, keeps the page closed.
 
 Before you type a setup code or approve for the first time, ask `arca_status` (`arca call arca_status ...`) and read
 `"page": { "open": true }`.

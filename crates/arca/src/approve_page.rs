@@ -474,7 +474,10 @@ impl PageState {
 
 /// The page's gate, after the Origin rule and before any handler or body: while the gate gives a reason, every page route
 /// answers 503 with it, the page itself included. A closed page serves no card, takes no approval and gives no setup
-/// code, so nothing a person typed or signed at another program's copy of the page can be spent here.
+/// code: the node takes nothing from the owner while it is closed, and no setup code exists to be typed elsewhere.
+/// It does not undo a signature: a passkey approval the owner gave at another program's copy of the page is still a
+/// valid approval of the card that program chose, until its statement expires. That program can spend it once the
+/// page is open again, or through the MCP approval verbs, which this gate does not cover.
 async fn gate_rule(State(state): State<Arc<PageState>>, request: Request, next: Next) -> Response {
     if let Some(why) = state.gate.as_ref().and_then(|gate| gate()) {
         return page_closed(why);

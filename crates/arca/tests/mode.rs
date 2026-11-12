@@ -179,8 +179,12 @@ fn a_localhost_pages_door_is_open_only_while_both_loopback_addresses_are_this_no
     );
 
     // The door of a localhost page: its twin is the same port on the other loopback address, whichever one the
-    // config names.
-    let door = LoopbackDoor::new("127.0.0.1:7471".parse().expect("an address")).with_twin();
+    // config names. The machine's IPv6 addresses are read from a file of this test's own.
+    let scratch = Scratch::new("door-inet6");
+    let table = scratch.path("if_inet6");
+    let door = LoopbackDoor::new("127.0.0.1:7471".parse().expect("an address"))
+        .with_inet6_table(table.clone())
+        .with_twin();
     let twin = door.twin().expect("a twin");
     assert_eq!(twin.addr().to_string(), "[::1]:7471");
     assert_eq!(
@@ -228,10 +232,44 @@ fn a_localhost_pages_door_is_open_only_while_both_loopback_addresses_are_this_no
 
     // A machine with no IPv6 loopback: the twin's address is not on the machine (EADDRNOTAVAIL, 99), or the kernel
     // has no such family (EAFNOSUPPORT, 97). No program can bind it and no browser can reach it, so it is nobody's
-    // to hold and the page is open on the one address there is.
+    // to hold and the page is open on the one address there is. The error alone is not believed: the kernel's list
+    // of addresses must agree. It agrees when it is not there at all (a kernel with no IPv6), and when it lists
+    // other addresses and no ::1.
+    let link_local = "fe800000000000000000000000000001 02 40 20 80     eth0\n";
+    let with_loopback =
+        format!("00000000000000000000000000000001 01 80 10 80       lo\n{link_local}");
     for missing in [99, 97] {
+        let _ = std::fs::remove_file(&table);
+        twin.report(None);
         twin.report(Some(&Error::from_raw_os_error(missing)));
-        assert_eq!(door.page_refusal(), None, "os error {missing}");
+        assert_eq!(door.page_refusal(), None, "os error {missing}, no list");
+        std::fs::write(&table, link_local).expect("the list");
+        twin.report(None);
+        twin.report(Some(&Error::from_raw_os_error(missing)));
+        assert_eq!(
+            door.page_refusal(),
+            None,
+            "os error {missing}, no ::1 listed"
+        );
+
+        // The same error on a machine that has ::1 is the node's own doing (restricted address families, a
+        // network namespace of its own): the address is there for another program to take, so the page is closed.
+        std::fs::write(&table, &with_loopback).expect("the list");
+        twin.report(Some(&Error::from_raw_os_error(missing)));
+        let why = door.page_refusal().expect("closed");
+        assert!(why.contains("does not hold [::1]:7471"), "{why}");
+        assert!(why.contains("the machine has the address"), "{why}");
+        assert_eq!(door.json()["page"]["open"], serde_json::json!(false));
+
+        // A list that is there and cannot be read says nothing either way: closed, and the reason names the file.
+        std::fs::remove_file(&table).expect("remove the list");
+        std::fs::create_dir(&table).expect("something that is not a readable file");
+        twin.report(None);
+        twin.report(Some(&Error::from_raw_os_error(missing)));
+        let why = door.page_refusal().expect("closed");
+        assert!(why.contains("cannot be read"), "{why}");
+        assert!(why.contains("if_inet6"), "{why}");
+        std::fs::remove_dir(&table).expect("remove it");
     }
     // Any other failure of the twin's bind is a door this node does not hold.
     for held_elsewhere in [98, 13] {
