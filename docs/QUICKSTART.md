@@ -18,21 +18,21 @@ the quickstart needs (x86_64 Linux with glibc 2.34 or newer, a running Incus tha
 **Download it, read it, run it.**
 
 ```sh
-curl -fsSLO https://github.com/automagik-si/arca/releases/latest/download/install.sh
+curl -fsSL -o install.sh https://get.automagik.si/arca
 less install.sh
 sh install.sh
 ```
 
-**Or in one line.** The script runs as soon as it has arrived. This address is the newest release's own
-`install.sh`, the file that release's `SHA256SUMS` lists; in one line nothing checks it before it runs. Use this only
-when you trust the address:
+**Or in one line.** The script runs as soon as it has arrived. The address gives the newest release's own
+`install.sh` ([what the address is](#what-the-short-address-is)); in one line nothing checks it before it runs. Use
+this only when you trust the address:
 
 ```sh
-curl -fsSL https://github.com/automagik-si/arca/releases/latest/download/install.sh | sh
+curl -fsSL https://get.automagik.si/arca | sh
 ```
 
-To hand it to a coding agent, paste this: *Download
-`https://github.com/automagik-si/arca/releases/latest/download/install.sh`, read it, run it with `sh`, and tell me
+To hand it to a coding agent, paste this: *Download `https://get.automagik.si/arca` with
+`curl -fsSL -o install.sh`, read it, run it with `sh install.sh`, and tell me
 what it printed. Then tell me plainly that this node only looks: it can read my machines and it cannot change
 anything yet, and there is no approval page. Tell me the next step is "Next: a node that changes things" in
 docs/QUICKSTART.md, which is done by hand today, and do not start it unless I ask.*
@@ -61,9 +61,21 @@ to run their services.
   service and the program, while the program is still the file it installed, and keeps the config, the tokens and the
   state.
 
-The addresses above give the `install.sh` of the newest release, which installs that release. To check the script
-itself, download `SHA256SUMS` from the same address beside it and run `sha256sum --check --ignore-missing SHA256SUMS`;
-it must print `install.sh: OK`. Like the program's checksum, that catches a damaged download and not a release that
+### What the short address is
+
+`https://get.automagik.si/arca` holds no script of its own. It answers with a redirect to the newest release's
+`install.sh` on GitHub, so the script, and the `SHA256SUMS` that lists it, still come from the release, and that
+script installs that release. `curl` follows the redirect because of `-L`. With the short address you trust two
+names, `get.automagik.si` and GitHub. To skip the redirect, or to check the script itself, use the long address and
+the `SHA256SUMS` beside it:
+
+```sh
+base=https://github.com/automagik-si/arca/releases/latest/download
+curl -fsSL -O "$base/install.sh" -O "$base/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+It must print `install.sh: OK`. Like the program's checksum, that catches a damaged download and not a release that
 was tampered with.
 
 **Not yet:** the script is tested

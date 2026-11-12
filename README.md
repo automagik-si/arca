@@ -42,7 +42,7 @@ Arca is an alpha. Read this before you install.
 On a Linux machine with Incus ([what this does and does not do](docs/QUICKSTART.md#install-with-one-command)):
 
 ```sh
-curl -fsSL https://github.com/automagik-si/arca/releases/latest/download/install.sh | sh
+curl -fsSL https://get.automagik.si/arca | sh
 ```
 
 This gives you a node that only looks: it reads your machines and changes nothing, and it has no approval page yet. Letting it change things is [set up by hand today](docs/QUICKSTART.md#next-a-node-that-changes-things); a one-step way is being built.
