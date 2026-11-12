@@ -312,9 +312,25 @@ pub(crate) fn run_call(
         .cloned()
         .unwrap_or(Value::Null);
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return Err(Failure::Tool(content));
+        return Err(Failure::Tool(failure_words(result, content)));
     }
     Ok(Some(content))
+}
+
+/// What a call prints for a tool result with `isError`: its structured content, or, for a failure that has none (an
+/// argument the verb does not take, an internal failure), the code and the words of its text, as
+/// `{"code": "invalid_arguments", "message": "/action: not one of the allowed values; ..."}`.
+fn failure_words(result: &Value, content: Value) -> Value {
+    if !content.is_null() {
+        return content;
+    }
+    let code = result["_meta"]["droidd/error"].as_str().unwrap_or_default();
+    let text = result["content"][0]["text"].as_str().unwrap_or_default();
+    let message = text
+        .strip_prefix(code)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .unwrap_or(text);
+    json!({ "code": code, "message": message })
 }
 
 /// A reply's status as a call's outcome: 200 goes on, 401 and 403 are the node refusing the token, and anything else is the

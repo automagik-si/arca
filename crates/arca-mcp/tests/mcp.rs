@@ -713,10 +713,13 @@ fn arguments_are_checked_against_the_closed_params_schema() {
     for (name, args) in cases {
         let reply = fx.tool_call(&fx.operator, name, args.clone());
         assert_eq!(reply.status, 200, "{name} {args}");
+        // An argument the verb does not take is a tool result with isError, so the model reads why.
+        let reply = reply.json();
+        assert!(reply.get("error").is_none(), "{name} {args}: {reply}");
+        assert_eq!(reply["result"]["isError"], true, "{name} {args}");
         assert_eq!(
-            reply.json()["error"]["code"],
-            -32602,
-            "{name} {args} is invalid params"
+            reply["result"]["_meta"]["droidd/error"], "invalid_arguments",
+            "{name} {args}"
         );
     }
 }

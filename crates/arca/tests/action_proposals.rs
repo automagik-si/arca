@@ -7,6 +7,7 @@ mod common;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -726,10 +727,9 @@ fn a_proposed_postgres_create_uses_only_the_configured_pinned_image() {
     assert!(matches!(error, CallError::Invalid(_)));
 }
 
-#[test]
-fn action_propose_succeeds_through_the_mcp_door() {
-    let key = SkKey::from_seed(1);
-    let rig = Rig::new("proposal-mcp", &key);
+/// An MCP door over `rig`'s `action_propose`, for one viewer token: the runtime that serves it, its socket and the
+/// token's secret.
+fn propose_door(rig: &Rig) -> (Runtime, PathBuf, String) {
     let tokens_dir = rig._scratch.path("mcp-tokens");
     std::fs::create_dir(&tokens_dir).expect("the token directory");
     std::fs::set_permissions(&tokens_dir, std::fs::Permissions::from_mode(0o700))
@@ -755,24 +755,23 @@ fn action_propose_succeeds_through_the_mcp_door() {
         assert!(Instant::now() < until, "the MCP socket started");
         std::thread::sleep(Duration::from_millis(10));
     }
+    (runtime, socket, secret)
+}
+
+/// One `action_propose` call through the door with `arguments`, and the JSON-RPC reply. The door answers 200.
+fn propose_through(socket: &Path, secret: &str, arguments: Value) -> Value {
     let call = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {
-            "name": "action_propose",
-            "arguments": {
-                "action": "service_create",
-                "args": { "name": "nats", "template": "nats" }
-            }
-        }
+        "params": { "name": "action_propose", "arguments": arguments }
     });
     let body = serde_json::to_vec(&call).expect("the call");
     let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let mut stream = UnixStream::connect(&socket).expect("connect to MCP");
+    let mut stream = UnixStream::connect(socket).expect("connect to MCP");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
@@ -788,7 +787,22 @@ fn action_propose_succeeds_through_the_mcp_door() {
         String::from_utf8_lossy(&raw[..split]).starts_with("HTTP/1.1 200"),
         "the MCP door answers 200"
     );
-    let reply: Value = serde_json::from_slice(&raw[split + 4..]).expect("JSON-RPC");
+    serde_json::from_slice(&raw[split + 4..]).expect("JSON-RPC")
+}
+
+#[test]
+fn action_propose_succeeds_through_the_mcp_door() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-mcp", &key);
+    let (_runtime, socket, secret) = propose_door(&rig);
+    let reply = propose_through(
+        &socket,
+        &secret,
+        json!({
+            "action": "service_create",
+            "args": { "name": "nats", "template": "nats" }
+        }),
+    );
     assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
     let proposal = &reply["result"]["structuredContent"];
     assert_eq!(proposal["kind"], json!("action"));
@@ -1778,4 +1792,45 @@ fn a_tenants_removal_card_names_at_most_sixteen_services_and_counts_the_rest() {
             "x".repeat(61)
         )
     );
+}
+
+/// Arguments the action does not take are answered as a tool result with `isError`, in the words of the check that
+/// refused them, so the model reads them and corrects the call; an action that is not one gets the list and the
+/// nearest name. Nothing is recorded. These are the two calls of issue 111.
+#[test]
+fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_nearest_action() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-mcp-invalid", &key);
+    let (_runtime, socket, secret) = propose_door(&rig);
+    let failure = |arguments: Value| {
+        let reply = propose_through(&socket, &secret, arguments);
+        assert!(reply.get("error").is_none(), "no protocol error: {reply}");
+        let result = &reply["result"];
+        assert_eq!(result["isError"], json!(true), "{reply}");
+        assert_eq!(result["_meta"]["droidd/error"], json!("invalid_arguments"));
+        result["content"][0]["text"]
+            .as_str()
+            .expect("the words")
+            .to_string()
+    };
+    assert_eq!(
+        failure(json!({ "action": "function_create", "args": {} })),
+        "invalid_arguments: args: missing required field name"
+    );
+    let params = (verb("action_propose").expect("the verb").params)();
+    let all: Vec<&str> = params["properties"]["action"]["enum"]
+        .as_array()
+        .expect("the actions")
+        .iter()
+        .map(|action| action.as_str().expect("a name"))
+        .collect();
+    assert_eq!(all.len(), 22);
+    assert_eq!(
+        failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
+        format!(
+            "invalid_arguments: /action: not one of the allowed values; it is one of: {}; did you mean postgres_create?",
+            all.join(", ")
+        )
+    );
+    assert_eq!(rig.list()["plans"].as_array().map(Vec::len), Some(0));
 }

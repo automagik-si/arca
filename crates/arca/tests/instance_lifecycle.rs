@@ -938,7 +938,11 @@ fn through_the_mcp_door_a_doctor_starts_and_a_stop_needs_the_owners_approval() {
         );
     }
     let (_, reply) = door.call(&door.doctor, "instance_restart", at(PROJECT, "web"));
-    assert_eq!(reply["error"]["code"], json!(-32602), "{reply}");
+    assert_eq!(
+        reply["result"]["_meta"]["droidd/error"],
+        json!("invalid_arguments"),
+        "{reply}"
+    );
     assert_eq!(rig.status(PROJECT, "web"), "Running");
 
     // The viewer proposes the stop through the door; the owner approves it; it runs once.

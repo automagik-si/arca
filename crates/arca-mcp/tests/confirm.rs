@@ -270,8 +270,8 @@ fn a_confirm_that_is_not_a_boolean_is_refused_by_the_schema() {
         for confirm in [json!("yes"), json!(1), json!(null), json!({})] {
             let reply = fx.tool_call(name, with(&args, confirm.clone()));
             assert_eq!(
-                reply["error"]["code"],
-                json!(-32602),
+                reply["result"]["_meta"]["droidd/error"],
+                json!("invalid_arguments"),
                 "{name} confirm {confirm}: {reply}"
             );
             assert!(
@@ -297,7 +297,11 @@ fn a_verb_that_is_not_destructive_still_refuses_confirm() {
         "service_create",
         json!({ "name": "pg", "template": "pg", "confirm": true }),
     );
-    assert_eq!(reply["error"]["code"], json!(-32602), "{reply}");
+    assert_eq!(
+        reply["result"]["_meta"]["droidd/error"],
+        json!("invalid_arguments"),
+        "{reply}"
+    );
 }
 
 #[test]
