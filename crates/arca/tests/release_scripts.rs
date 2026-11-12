@@ -449,6 +449,69 @@ fn set_writes_the_version_into_every_field_and_touches_no_other_line() {
 }
 
 #[test]
+fn check_refuses_a_changelog_that_heads_one_release_twice() {
+    let scratch = Scratch::new("heading-twice");
+    copy_version_files(&scratch);
+    assert_eq!(scratch.answer(&["set", "0.8.0"]), "version: 0.8.0");
+    // One section for each release, as the release writes them: the check has nothing to say.
+    let written = "# Changelog\n\n## Unreleased\n\nA note.\n\n## 0.8.0 (2026-11-12)\n\n- one\n\n## 0.7.0 (2026-11-11)\n\n- two\n";
+    scratch.write("CHANGELOG.md", written);
+    assert_eq!(scratch.answer(&["check"]), "version: 0.8.0 everywhere");
+
+    // What a merge of two branches that both wrote under a release leaves: its heading twice. The check names it and
+    // fails, with the same date or with another, and it names every release that is headed twice.
+    for (twice, named) in [
+        (
+            written.replace(
+                "## 0.8.0 (2026-11-12)\n",
+                "## 0.8.0 (2026-11-12)\n\n## 0.8.0 (2026-11-12)\n",
+            ),
+            vec!["0.8.0"],
+        ),
+        (
+            written
+                .replace(
+                    "## 0.8.0 (2026-11-12)\n",
+                    "## 0.8.0 (2026-11-12)\n\n- three\n\n## 0.8.0 (2026-11-13)\n",
+                )
+                .replace(
+                    "## 0.7.0 (2026-11-11)\n",
+                    "## 0.7.0\n\n## 0.7.0 (2026-11-11)\n",
+                ),
+            vec!["0.7.0", "0.8.0"],
+        ),
+    ] {
+        scratch.write("CHANGELOG.md", &twice);
+        let refused = scratch.version(&["check"]);
+        assert_eq!(refused.status.code(), Some(1), "{twice}");
+        let said = String::from_utf8_lossy(&refused.stderr);
+        for version in &named {
+            assert!(
+                said.contains(&format!(
+                    "version: CHANGELOG.md has the heading \"## {version}\" more than once: make it one"
+                )),
+                "{said}"
+            );
+        }
+        assert_eq!(said.lines().count(), named.len(), "{said}");
+    }
+
+    // A heading that only begins like a release's is not one: 0.8.0 and 0.8.01, and a line of the text.
+    scratch.write(
+        "CHANGELOG.md",
+        &written.replace(
+            "- one\n",
+            "- one\n\n## 0.8.01 (2026-11-12)\n\nSee ## 0.8.0 above.\n",
+        ),
+    );
+    assert_eq!(scratch.answer(&["check"]), "version: 0.8.0 everywhere");
+
+    // A checkout with no changelog is checked for its versions alone.
+    fs::remove_file(scratch.0.join("CHANGELOG.md")).expect("remove the changelog");
+    assert_eq!(scratch.answer(&["check"]), "version: 0.8.0 everywhere");
+}
+
+#[test]
 fn set_writes_nothing_when_a_field_is_missing() {
     let scratch = Scratch::new("missing");
     copy_version_files(&scratch);
