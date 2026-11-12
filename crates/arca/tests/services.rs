@@ -505,6 +505,7 @@ fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
         })),
         approval: None,
         loopback: None,
+        page: None,
     });
     let caller = Caller {
         token_id: "doctor".into(),

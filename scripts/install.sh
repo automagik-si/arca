@@ -1062,23 +1062,19 @@ report() {
     say "Connect an assistant. Two ways work today:"
     say
     if [ -n "$door_url" ]; then
-        say "  1. An assistant that takes an MCP server URL reaches the node over HTTP on this machine, with the token"
-        say "     as its bearer. For Claude Code, run this one line; the shell reads the token from its file, so it is"
-        say "     not shown here:"
+        # The report shows what connects an assistant and one line that says where the cautions are. They are the
+        # program's to say, for this node, when a person asks: a program from before that names the guide instead.
+        case $("$bin" --help 2>/dev/null </dev/null) in
+            *'--security'*) door_cautions="$bin status --security --config $config" ;;
+            *) door_cautions="$GUIDE#loopback-listener" ;;
+        esac
+        say "  1. An assistant that takes an MCP server URL. On a machine other people log in to, paste the entry below"
+        say "     instead of running the line, and read this first: $door_cautions"
+        say "     For Claude Code, run this one line; the shell reads the token from its file, so it is not shown here:"
         say "       claude mcp add --transport http arca $door_url --header \"Authorization: Bearer \$(cat '$token_file')\""
         say "     Any other client takes this entry, with the content of $token_file"
         say "     in place of <token>:"
         say "       { \"mcpServers\": { \"arca\": { \"type\": \"http\", \"url\": \"$door_url\", \"headers\": { \"Authorization\": \"Bearer <token>\" } } } }"
-        say "     The client then keeps the token in its own config, in clear text: whoever can read that file can ask"
-        say "     this node whatever the token may ask. Running the line above also puts the token in that command's"
-        say "     arguments for a moment, where other users of this machine can read it; pasting the entry into the"
-        say "     client's config avoids that."
-        say "     The address is 127.0.0.1 and not the name localhost: the name can also mean ::1, where this node"
-        say "     does not listen and another program could."
-        say "     On a machine shared with other accounts: while the node is not running, another account can take"
-        say "     port $door_port, and would then receive what a client sends there, the token included. Way 2 below"
-        say "     uses a socket only $user can open and is not exposed to that. To have no door at all:"
-        say "       sh install.sh --no-door"
         if [ "$service" != unit ]; then
             say "     This script started no node: the door is open once a node has started with this config."
         fi

@@ -154,7 +154,9 @@ pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> 
 }
 
 pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let cfg = crate::load_config_to(flags, crate::Does::Acts)?.1;
+    let (config, cfg) = crate::load_config_to(flags, crate::Does::Acts)?;
+    // The config's own path, as the one rule for finding it chose it: the page of this machine names it.
+    let config_path = config.path.clone();
     if !cfg.kernel.adopt.is_empty() {
         // An adoption is never a desired-state entry, so no reconciler may run over a config that names one.
         return Err(Failure::Config(
@@ -321,6 +323,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                     peer_sources: peer_sources.clone(),
                 }),
                 loopback: door.clone(),
+                page: cfg
+                    .approval_origin
+                    .as_ref()
+                    .map(|origin| crate::handlers::PageStatus {
+                        url: format!("{origin}/approve"),
+                        door: door.clone().filter(|door| door.twin().is_some()),
+                        kernel: Arc::clone(&kernel),
+                    }),
             }),
         )
         .handle(
@@ -554,6 +564,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             .spawn()
             .map_err(|e| Failure::Runtime(e.to_string()))?;
     }
+    // The one line that prints the first passkey's setup code on a terminal of this machine, with this node's own
+    // config by its whole path: the page shows it where it says the machine has no screen.
+    let setup_command = format!(
+        "arca setup-code --config {}",
+        fs::canonicalize(&config_path)
+            .unwrap_or_else(|_| config_path.clone())
+            .display()
+    );
     let page = cfg.approval_origin.clone().map(|origin| {
         let page = crate::approve_page::Page::new(
             origin,
@@ -569,6 +587,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         let page = match &peer_sync {
             Some(syncer) => page.with_peer_sync(syncer.clone()),
             None => page,
+        };
+        // The exact line, with the config's whole path, is for the page of this machine alone, which only this
+        // machine's accounts can load. A page under any other origin may be public: it keeps the line with a
+        // placeholder, and shows nobody the node user's name or where its files are.
+        let page = if config::page_is_local(&cfg) {
+            page.with_setup_command(setup_command.clone())
+        } else {
+            page
         };
         // The page of this machine alone is open only while this node holds both loopback addresses of its port.
         match door.clone().filter(|door| door.twin().is_some()) {

@@ -81,6 +81,26 @@ fn mint(scratch: &Scratch, hash_dir: &Path, scope: &str) -> String {
         .to_string()
 }
 
+/// What a test's node is started through: a shell that closes every file it was handed but its three standard ones,
+/// then becomes the program. A test process may hold files that are not its own to pass on, such as the descriptor of a
+/// lock its runner took; a node that inherited one would keep it for as long as it lived.
+const CLOSE_THEN_EXEC: &str = r#"for fd in /proc/$$/fd/*; do fd=${fd##*/}; case $fd in 0|1|2) ;; *) eval "exec $fd>&-" 2>/dev/null ;; esac; done; exec "$0" "$@""#;
+
+/// `arca serve --config <config>` as a command to spawn, with no file of the test's process but its standard three.
+fn serve_command(config: &Path) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(CLOSE_THEN_EXEC)
+        .arg(env!("CARGO_BIN_EXE_arca"))
+        .env("HOME", "/nonexistent/arca-test-home")
+        .env_remove("ARCA_CONFIG")
+        .env_remove("ARCA_TOKEN_FILE")
+        .args(["serve", "--config"])
+        .arg(config);
+    command
+}
+
 /// A server process with its stderr in a file, killed if the test ends first.
 struct Serve {
     child: Option<Child>,
@@ -89,9 +109,7 @@ struct Serve {
 
 impl Serve {
     fn start(config: &Path, log: PathBuf) -> Serve {
-        let child = arca()
-            .args(["serve", "--config"])
-            .arg(config)
+        let child = serve_command(config)
             .stdout(Stdio::null())
             .stderr(File::create(&log).expect("the server log"))
             .spawn()
@@ -589,6 +607,18 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         .says("No passkey is trusted yet, so nothing can be approved until you enrol the first one.")
         .says(&format!("arca setup-code --config {config}"))
         .says("That page is for a machine where every account is trusted.")
+        .says(&format!("    arca status --config {config}"))
+        // A machine with no screen: the one line that brings the page to the person's own computer, and no phone.
+        .says("No browser on this machine? On your own computer run:")
+        .says(&format!(
+            "    ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>",
+            node.port
+        ))
+        .says(&format!(
+            "Then open http://localhost:{}/approve in its browser: the page is this node's.",
+            node.port
+        ))
+        .says("A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet")
         .says("this is not the installer's service, so init did not")
         .says(&format!("arca serve --config {config}"))
         .says(&format!("arca init --watch-only --config {config}"))
@@ -1051,6 +1081,8 @@ fn an_approval_page_the_config_already_names_is_kept_whichever_kind_it_is() {
         .says("https://arca.example.com/approve, the page this config already names: it is kept as it is")
         .says("passkey on the page: https://arca.example.com/approve")
         .never_says("localhost")
+        .never_says("ssh ")
+        .never_says("A phone cannot open this page")
         .never_says("That page is for a machine where every account is trusted");
     let after = node.read();
     assert_eq!(after["approvalOrigin"], json!("https://arca.example.com"));
@@ -1149,4 +1181,62 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
         "--user restart arca.service\n",
         "no second restart"
     );
+}
+
+/// `arca status` on a node that may change things: a doctor token does not wait for the approval page, so status names
+/// it, and does not print "Each one waits", which would be false.
+#[test]
+fn status_names_a_token_that_changes_things_without_the_page_and_does_not_say_each_one_waits() {
+    let node = Installed::new("status-tokens");
+    mint(&node.scratch, &node.hash_dir, "viewer");
+    let mut config = node.installers();
+    config["kernel"] = json!({
+        "projects": ["arcak-svc"], "droiddProjects": ["default"], "serviceCidr": "192.0.2.0/24"
+    });
+    node.write(&config);
+    let status = || {
+        let out = arca()
+            .args(["status", "--config"])
+            .arg(&node.config)
+            .arg("--token-file")
+            .arg(node.scratch.at("viewer.secret"))
+            .output()
+            .expect("run arca status");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Only a viewer token: every change waits, and status says so with its reason.
+    let mut serve = Serve::start(&node.config, node.scratch.at("serve-1.log"));
+    serve.wait_for(&node.socket);
+    let text = status();
+    assert!(
+        text.contains("Changes: on. Each one waits for the owner's approval with a passkey: no token of this node may do more than look and propose"),
+        "{text}"
+    );
+    assert_eq!(serve.terminate(), Some(0));
+
+    // A doctor token is minted: it is named, with the way to take it away, and the plain sentence is gone.
+    mint(&node.scratch, &node.hash_dir, "doctor");
+    let mut serve = Serve::start(&node.config, node.scratch.at("serve-2.log"));
+    serve.wait_for(&node.socket);
+    let text = status();
+    assert!(
+        text.contains("NOT every change does: these tokens change things directly, with no card and no passkey: doctor-1 (doctor)."),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "To take one away: arca token revoke <id> --config {}",
+            node.config.display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Each one waits"), "{text}");
+    assert!(!text.contains("viewer-1"), "{text}");
+    assert_eq!(serve.terminate(), Some(0));
 }

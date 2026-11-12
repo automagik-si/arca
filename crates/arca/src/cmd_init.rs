@@ -356,17 +356,24 @@ impl Node<'_> {
                 self.path.display()
             ));
         }
-        if arca_approval::localhost_origin_port(&origin).is_some() {
+        if let Some(port) = arca_approval::localhost_origin_port(&origin) {
             say(
                 "  That page is for a machine where every account is trusted. Before you type a setup code or approve for",
             );
-            say(
-                "  the first time, check that the node says its page is open (\"page\": { \"open\": true } under \"loopback\"):",
-            );
+            say("  the first time, check that the node says the page is open:");
+            say(&format!("    arca status --config {}", self.path.display()));
+            // A machine with no screen and no browser: the page comes to the person's own computer.
+            say("  No browser on this machine? On your own computer run:");
             say(&format!(
-                "    arca status --json --config {}",
-                self.path.display()
+                "    ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>"
             ));
+            say(&format!(
+                "  Then open {origin}/approve in its browser: the page is this node's. If ssh warns that it could not bind\n  the port, close it: another port will not work, since the page's address names this one."
+            ));
+            say(
+                "  A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet",
+            );
+            say("  or a domain; the guide's section \"The approval page\" says how.");
         }
         if installed > 0 {
             say(&format!(
@@ -537,24 +544,7 @@ impl Node<'_> {
 
     /// The tokens of this node that may change things without the approval page once it may change things at all.
     fn direct_tokens(&self) -> DirectTokens {
-        match arca_mcp::TokenStore::load(&self.cfg.tokens.hash_dir) {
-            Ok(store) => DirectTokens::Read(
-                store
-                    .ids()
-                    .into_iter()
-                    .filter(|(_, scope, _)| *scope >= arca_api::Scope::Doctor)
-                    .map(|(id, scope, tools)| match tools {
-                        Some(tools) => format!(
-                            "{id} ({}, limited to: {})",
-                            scope.as_str(),
-                            tools.join(", ")
-                        ),
-                        None => format!("{id} ({})", scope.as_str()),
-                    })
-                    .collect(),
-            ),
-            Err(_) => DirectTokens::Unread(self.cfg.tokens.hash_dir.clone()),
-        }
+        direct_tokens(&self.cfg)
     }
 
     /// The /24 for the service network: the one `--service-cidr` names, checked against the machine, or the first of
@@ -760,8 +750,31 @@ impl Node<'_> {
     }
 }
 
+/// The doctor and operator tokens of the node `cfg` describes, read from its token directory as `serve` reads it.
+/// `init` names them before it asks, and `status` says them beside "Changes: on".
+pub(crate) fn direct_tokens(cfg: &NodeConfig) -> DirectTokens {
+    match arca_mcp::TokenStore::load(&cfg.tokens.hash_dir) {
+        Ok(store) => DirectTokens::Read(
+            store
+                .ids()
+                .into_iter()
+                .filter(|(_, scope, _)| *scope >= arca_api::Scope::Doctor)
+                .map(|(id, scope, tools)| match tools {
+                    Some(tools) => format!(
+                        "{id} ({}, limited to: {})",
+                        scope.as_str(),
+                        tools.join(", ")
+                    ),
+                    None => format!("{id} ({})", scope.as_str()),
+                })
+                .collect(),
+        ),
+        Err(_) => DirectTokens::Unread(cfg.tokens.hash_dir.clone()),
+    }
+}
+
 /// The doctor and operator tokens of a node, which do not wait for the approval page.
-enum DirectTokens {
+pub(crate) enum DirectTokens {
     /// The token directory was read: each such token, by its id and scope. Empty when every token only looks and
     /// proposes.
     Read(Vec<String>),
@@ -814,6 +827,26 @@ impl DirectTokens {
                 ),
                 "directly, with no card and no passkey: a doctor or an operator token may.".to_string(),
             ],
+        }
+    }
+
+    /// The line `arca status` prints for a node that may change things: what waits for the owner's passkey, and which
+    /// tokens do not. "Each one waits" is said only where every token was read and none of them does more than look
+    /// and propose.
+    pub(crate) fn status_line(&self, config: &Path) -> String {
+        match self {
+            Self::Read(tokens) if tokens.is_empty() => {
+                "Changes: on. Each one waits for the owner's approval with a passkey: no token of this node may do more than look and propose".to_string()
+            }
+            Self::Read(tokens) => format!(
+                "Changes: on. What an assistant proposes waits for the owner's approval with a passkey. NOT every change does: these tokens change things directly, with no card and no passkey: {}. To take one away: arca token revoke <id> --config {}",
+                tokens.join(", "),
+                config.display()
+            ),
+            Self::Unread(dir) => format!(
+                "Changes: on. What an assistant proposes waits for the owner's approval with a passkey. The token directory {} could not be read, so a doctor or operator token, which does not wait, may exist",
+                dir.display()
+            ),
         }
     }
 

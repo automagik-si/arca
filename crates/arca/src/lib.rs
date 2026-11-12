@@ -56,7 +56,7 @@ use crate::config::{ConfigError, NodeConfig};
 
 const USAGE: &str = "usage: arca <command>
   version (or --version, -V)
-  status [--json] [--config <file>] [--token-file <file>]
+  status [--json | --security] [--config <file>] [--token-file <file>]
   watch --once --json [--config <file>]
   metrics --json [--sample-for <seconds, 0 to 60>] [--config <file>]
   link serve [--config <file>] (forwards arca/mcp/1 to listen.unix by default)
@@ -566,7 +566,11 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
 
 fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure> {
     match command {
-        "status" => cmd_status::status(&parse_flags(rest, &["config", "token-file"], &["json"])?),
+        "status" => cmd_status::status(&parse_flags(
+            rest,
+            &["config", "token-file"],
+            &["json", "security"],
+        )?),
         "watch" => cmd_watch::watch(&parse_flags(rest, &["config"], &["once", "json"])?),
         "metrics" => cmd_watch::metrics(&parse_flags(rest, &["config", "sample-for"], &["json"])?),
         "serve" => cmd_serve::serve(&parse_flags(rest, &["config"], &[])?),

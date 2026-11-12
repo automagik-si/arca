@@ -149,6 +149,7 @@ fn the_status_exposes_the_chosen_mode_and_reason() {
         metrics_source: choice,
         approval: None,
         loopback: None,
+        page: None,
     };
     let caller = Caller {
         token_id: "viewer".to_string(),

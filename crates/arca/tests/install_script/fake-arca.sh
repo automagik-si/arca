@@ -12,7 +12,8 @@
 #                  `"incusReachable":false` while $FAKE_DIR/node-cannot-reach-incus is there, and the loopback door
 #                  closed, as a node whose port another program holds reports it, while $FAKE_DIR/node-door-closed is; it
 #                  fails when no node runs, when the config is missing and when the token file is not private.
-#   --help         the usage, with the line for `init` unless $FAKE_DIR/program-without-init is there
+#   --help         the usage, with the line for `init` unless $FAKE_DIR/program-without-init is there,
+#                  and naming `status --security` unless $FAKE_DIR/program-without-security is there
 #   init           `init --enable-changes --yes --config <file>`: it refuses in words while $FAKE_DIR/init-refuses is
 #                  there; otherwise the node's mode becomes kernel, the config gains a key (so it is no longer the
 #                  installer's text) and it prints the first line of the real report. It restarts nothing here.
@@ -54,6 +55,8 @@ case "${1-} ${2-}" in
     echo "  serve --config <file>"
     [ -e "$root/program-without-init" ] ||
       echo "  init --enable-changes --config <file> [--yes] [--service-cidr <a.b.c.0/24>]"
+    [ -e "$root/program-without-security" ] ||
+      echo "  status [--json | --security] [--config <file>] [--token-file <file>]"
     ;;
   "init --enable-changes")
     [ "${3-}" = --yes ] || fail "the installer must answer init's question itself: --yes"

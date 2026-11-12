@@ -136,7 +136,12 @@ struct PageState {
     peer_sync: Option<PeerSyncer>,
     requests: Option<Arc<ApprovalRequests>>,
     gate: Option<PageGate>,
+    /// The line that prints the setup code on a terminal of this machine, for a machine with no screen.
+    setup_command: String,
 }
+
+/// What the page shows for the terminal's command when `serve` gave it none: the command, with the config to fill in.
+const SETUP_COMMAND: &str = "arca setup-code --config <this node's config>";
 
 /// Why the page is closed right now, in words for the owner, or `None` while it is open. `serve` gives the page of this
 /// machine alone a gate that is closed while the node does not hold both loopback addresses of the page's port.
@@ -316,6 +321,7 @@ impl Page {
                 peer_sync: None,
                 requests: None,
                 gate: None,
+                setup_command: SETUP_COMMAND.to_string(),
             },
         }
     }
@@ -326,6 +332,13 @@ impl Page {
     /// gate's words and do nothing else. Without a gate the page is always open.
     pub fn with_gate(mut self, gate: PageGate) -> Self {
         self.state.gate = Some(gate);
+        self
+    }
+
+    /// Names the exact line that prints the setup code on a terminal of this machine. The page shows it where it says
+    /// the machine has no screen, and the answer of a setup-code request that found no screen carries it.
+    pub fn with_setup_command(mut self, command: String) -> Self {
+        self.state.setup_command = command;
         self
     }
 
@@ -552,7 +565,10 @@ async fn security_headers(request: Request, next: Next) -> Response {
 
 async fn page(State(state): State<Arc<PageState>>) -> Response {
     let ids = trusted_credential_ids(&state);
-    let body = render_credentials(include_str!("approve_page.html"), &ids);
+    let body = render_credentials(include_str!("approve_page.html"), &ids).replace(
+        "__ARCA_SETUP_COMMAND__",
+        &escape_attribute(&state.setup_command),
+    );
     let mut response = body.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -811,6 +827,14 @@ fn trusted_credential_ids(state: &PageState) -> Vec<String> {
         .iter()
         .map(|line| URL_SAFE_NO_PAD.encode(&line.credential_id))
         .collect()
+}
+
+/// `text` as the value of a double-quoted HTML attribute.
+fn escape_attribute(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn render_credentials(html: &str, ids: &[String]) -> String {
@@ -1471,7 +1495,8 @@ async fn setup_code(State(state): State<Arc<PageState>>, headers: HeaderMap) -> 
     if state.display.show(&code).is_err() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "message": "No screen to show the code on" })),
+            // The answer names the way that needs no screen, so the page can show the exact line.
+            Json(json!({ "message": "No screen to show the code on", "command": state.setup_command })),
         )
             .into_response();
     }

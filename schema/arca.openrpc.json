@@ -123,6 +123,36 @@
               ],
               "type": "object"
             },
+            "approvalPage": {
+              "properties": {
+                "open": {
+                  "type": "boolean"
+                },
+                "passkeys": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url",
+                "open",
+                "reason",
+                "passkeys"
+              ],
+              "type": "object"
+            },
             "incusReachable": {
               "type": "boolean"
             },

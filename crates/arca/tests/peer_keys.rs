@@ -203,6 +203,7 @@ fn status_of(peer: Option<PeerPasskeys>) -> Value {
             peer_sources: None,
         }),
         loopback: None,
+        page: None,
     }
     .call(json!({}), &caller(Scope::Viewer))
     .expect("arca_status answers")
@@ -792,6 +793,7 @@ impl Sources {
                 peer_sources: self.list.then(|| self.peers.clone()),
             }),
             loopback: None,
+            page: None,
         }
         .call(json!({}), &caller(Scope::Viewer))
         .expect("arca_status answers");
@@ -1334,6 +1336,7 @@ impl Remote {
                     peer_sources: None,
                 }),
                 loopback: None,
+                page: None,
             }),
         );
         let _ = slot.set(executor(&gamma_runs));

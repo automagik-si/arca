@@ -71,6 +71,51 @@ fn installed_home(scratch: &Scratch, config: Option<&Value>) -> PathBuf {
     home
 }
 
+/// What a test's node is started through: a shell that closes every file it was handed but its three standard ones,
+/// then becomes the program. A test process may hold files that are not its own to pass on, such as the descriptor of a
+/// lock its runner took; a node that inherited one would keep it for as long as it lived.
+const CLOSE_THEN_EXEC: &str = r#"for fd in /proc/$$/fd/*; do fd=${fd##*/}; case $fd in 0|1|2) ;; *) eval "exec $fd>&-" 2>/dev/null ;; esac; done; exec "$0" "$@""#;
+
+/// `arca serve --config <config>` as a command to spawn, with no file of the test's process but its standard three.
+fn serve_command(config: &Path) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(CLOSE_THEN_EXEC)
+        .arg(env!("CARGO_BIN_EXE_arca"))
+        .env("HOME", "/nonexistent/arca-test-home")
+        .env_remove("ARCA_CONFIG")
+        .env_remove("ARCA_TOKEN_FILE")
+        .args(["serve", "--config"])
+        .arg(config);
+    command
+}
+
+/// A node a test started. It is ended when this value goes away, on every path out of the test, a panic among them:
+/// killed, and waited for, so no node outlives its test.
+struct Node(std::process::Child);
+
+impl std::ops::Deref for Node {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Node {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn stdout_text(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -1110,7 +1155,7 @@ fn serve_on_a_free_port(
     scratch: &Scratch,
     incus: &Path,
     listen: &dyn Fn(&mut Value, std::net::SocketAddr),
-) -> (std::process::Child, std::net::SocketAddr) {
+) -> (Node, std::net::SocketAddr) {
     // A port is free when it is probed, but another process can take it before `serve` binds it. Then `serve` exits with
     // "Address already in use", and a connect to that port reaches the other process's listener, so a connect proves nothing
     // about the owner. The loop waits for the child's own listening socket on the port (`child_listens_on`). A `serve` that
@@ -1123,15 +1168,15 @@ fn serve_on_a_free_port(
         let mut value = config(scratch, incus);
         listen(&mut value, at);
         let path = write_config(scratch, "node.json", &value);
-        let mut child = arca()
-            .args(["serve", "--config"])
-            .arg(&path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start arca serve");
+        let mut child = Node(
+            serve_command(&path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start arca serve"),
+        );
 
-        let deadline = Instant::now() + WAIT;
+        let deadline = Instant::now() + LISTEN_WAIT;
         let owned = loop {
             if child_listens_on(child.id(), at.port()) {
                 break true;
@@ -1174,7 +1219,7 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
     let (mut child, at) = serve_on_a_free_port(&scratch, rig.shim.socket(), &|value, at| {
         value["listen"]["proxy"] = json!({ "addr": at.to_string(), "peer": "127.0.0.1" });
     });
-    let mut stream = std::net::TcpStream::connect(at).expect("connect to the proxy listener");
+    let mut stream = connect_when_bound(at);
     stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let request = format!(
@@ -1703,7 +1748,7 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
     assert_eq!(out.status.code(), Some(0));
     let help = stdout_text(&out);
     for line in [
-        "  status [--json] [--config <file>] [--token-file <file>]",
+        "  status [--json | --security] [--config <file>] [--token-file <file>]",
         "  --config      ~/.config/arca/node.json",
         "  --token-file  ~/.config/arca/assistant-1.secret",
         "  The order is: the flag, then the variable (ARCA_CONFIG, ARCA_TOKEN_FILE), then the default.",
@@ -1924,10 +1969,34 @@ fn a_config_with_a_mistyped_field_names_the_field_and_the_file() {
     );
 }
 
+/// How long a test waits for a listener of the server under test to be bound. `serve` binds its loopback addresses
+/// after it has started, each on its own task, and a node with a page binds two; on a loaded machine that takes time.
+#[cfg(target_os = "linux")]
+const LISTEN_WAIT: Duration = Duration::from_secs(120);
+
+/// A connection to `at`, made as soon as something listens there: a connect that is refused is tried again until
+/// [`LISTEN_WAIT`] has passed. A test never fails because it asked before the server had bound its address.
+#[cfg(target_os = "linux")]
+fn connect_when_bound(at: std::net::SocketAddr) -> std::net::TcpStream {
+    let deadline = Instant::now() + LISTEN_WAIT;
+    loop {
+        match std::net::TcpStream::connect(at) {
+            Ok(stream) => return stream,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "nothing listens on {at} after {LISTEN_WAIT:?}: {error}"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 /// One HTTP/1.1 request to `at`, with `Connection: close`, and the whole reply.
 #[cfg(target_os = "linux")]
 fn reply_of(at: std::net::SocketAddr, head: &str, body: &str) -> String {
-    let mut stream = std::net::TcpStream::connect(at).expect("connect to the listener");
+    let mut stream = connect_when_bound(at);
     stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
     let request = format!(
         "{head}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2063,13 +2132,13 @@ fn a_loopback_port_another_program_holds_does_not_stop_the_node_and_the_status_s
     value["listen"]["loopback"] = json!(at.to_string());
     let path = write_config(&scratch, "node.json", &value);
     let log = scratch.at("serve.log");
-    let mut child = arca()
-        .args(["serve", "--config"])
-        .arg(&path)
-        .stdout(Stdio::null())
-        .stderr(fs::File::create(&log).expect("the server's log"))
-        .spawn()
-        .expect("start arca serve");
+    let mut child = Node(
+        serve_command(&path)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log).expect("the server's log"))
+            .spawn()
+            .expect("start arca serve"),
+    );
     let status = || -> Option<Value> {
         let out = arca()
             .args(["call", "arca_status", "--config"])
@@ -2101,7 +2170,9 @@ fn a_loopback_port_another_program_holds_does_not_stop_the_node_and_the_status_s
     };
 
     // The node starts and answers on its unix socket, and says that its door is closed and why.
-    let answer = until("the node answers on its unix socket", WAIT, &|_| true);
+    let answer = until("the node answers on its unix socket", LISTEN_WAIT, &|_| {
+        true
+    });
     assert_eq!(answer["loopback"]["addr"], json!(at.to_string()));
     assert_eq!(answer["loopback"]["open"], json!(false), "{answer}");
     assert!(
@@ -2125,7 +2196,7 @@ fn a_loopback_port_another_program_holds_does_not_stop_the_node_and_the_status_s
     drop(held);
     let answer = until(
         "the door opens once the port is free",
-        Duration::from_secs(40),
+        LISTEN_WAIT,
         &|answer| answer["loopback"]["open"] == json!(true),
     );
     assert_eq!(answer["loopback"]["reason"], Value::Null);
@@ -2195,7 +2266,7 @@ fn the_page_of_this_machine_is_on_the_loopback_listener_and_its_setup_code_comes
 
     // The node takes the port's other loopback address too, a moment after the first; the page opens once it holds
     // both (or once it has found that this machine has no IPv6 loopback).
-    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now() + LISTEN_WAIT;
     while !get("/approve", &format!("localhost:{port}")).starts_with("HTTP/1.1 200") {
         assert!(Instant::now() < deadline, "the page opens");
         thread::sleep(Duration::from_millis(50));
@@ -2326,6 +2397,153 @@ fn the_page_of_this_machine_is_on_the_loopback_listener_and_its_setup_code_comes
 
 #[test]
 #[cfg(target_os = "linux")]
+fn status_says_whether_changes_are_on_which_page_approves_and_what_to_do_next_from_the_nodes_own_answer()
+ {
+    let scratch = Scratch::new("status-approvals");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let secret_file = scratch.at("viewer-1.secret");
+    let minted = arca()
+        .args(["token", "mint", "--scope", "viewer", "--id", "viewer-1"])
+        .arg("--hash-dir")
+        .arg(&tokens)
+        .arg("--out")
+        .arg(&secret_file)
+        .output()
+        .expect("mint a token");
+    assert!(minted.status.success(), "the token is minted");
+
+    let (mut child, at) = serve_on_a_free_port(&scratch, rig.shim.socket(), &|value, at| {
+        value["listen"]["loopback"] = json!(at.to_string());
+        value["approvalOrigin"] = json!(format!("http://localhost:{}", at.port()));
+    });
+    let port = at.port();
+    let page = format!("http://localhost:{port}/approve");
+    let node = scratch.at("node.json");
+    let command = format!(
+        "arca setup-code --config {}",
+        fs::canonicalize(&node)
+            .expect("the config's path")
+            .display()
+    );
+    let status = |arguments: &[&str]| {
+        let out = arca()
+            .arg("status")
+            .args(arguments)
+            .arg("--config")
+            .arg(&node)
+            .arg("--token-file")
+            .arg(&secret_file)
+            .output()
+            .expect("run arca status");
+        assert!(out.status.success(), "{}", stderr_text(&out));
+        stdout_text(&out)
+    };
+    // The page opens once the node holds both loopback addresses of its port.
+    let deadline = Instant::now() + LISTEN_WAIT;
+    let answer = loop {
+        let answer: Value = serde_json::from_str(&status(&["--json"])).expect("the status is JSON");
+        if answer["approvalPage"]["open"] == json!(true) {
+            break answer;
+        }
+        assert!(Instant::now() < deadline, "the page opens: {answer}");
+        thread::sleep(Duration::from_millis(100));
+    };
+    // The node's own answer: the page's address, that it is open, and that no passkey is trusted.
+    assert_eq!(
+        answer["approvalPage"],
+        json!({ "url": page, "open": true, "reason": null, "passkeys": 0 })
+    );
+    // In words: this node only looks, so changes are off; the page and the passkeys are still the node's word.
+    let words = status(&[]);
+    for said in [
+        "Changes: off. This node only looks".to_string(),
+        format!("Approval page: {page} (open)"),
+        "Passkeys: none trusted yet, so nothing can be approved".to_string(),
+        "Next: this node only looks. To let it make changes".to_string(),
+        format!("arca init --enable-changes --config {}", node.display()),
+    ] {
+        assert!(words.contains(&said), "{said:?} is missing:\n{words}");
+    }
+    // The page itself names the exact line for a machine with no screen, with this node's config by its whole path.
+    let html = reply_of(
+        at,
+        &format!("GET /approve HTTP/1.1\r\nHost: localhost:{port}"),
+        "",
+    );
+    assert!(
+        html.contains(&format!("data-setup-command=\"{command}\"")),
+        "the page carries the line for this node"
+    );
+    // And that line's own words give the way to the person's own computer, and promise no phone.
+    let out = arca()
+        .args(["setup-code", "--config"])
+        .arg(&node)
+        .output()
+        .expect("run arca setup-code");
+    assert!(out.status.success(), "{}", stderr_text(&out));
+    let said = stderr_text(&out);
+    assert!(
+        said.contains(&format!(
+            "ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>"
+        )),
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!("then open {page} in its browser")),
+        "{said}"
+    );
+    assert!(
+        said.contains("a phone cannot open this page. Approving from a phone needs the node reachable under a name"),
+        "{said}"
+    );
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(
+        wait_exit(&mut child).code(),
+        Some(0),
+        "serve exits 0 on SIGTERM"
+    );
+
+    // The cautions are the config's to tell: no node is asked, so they are there with the node stopped.
+    let out = arca()
+        .args(["status", "--security", "--config"])
+        .arg(&node)
+        .output()
+        .expect("run arca status --security");
+    assert!(out.status.success(), "{}", stderr_text(&out));
+    let cautions = stdout_text(&out);
+    for said in [
+        format!(
+            "The HTTP door, http://127.0.0.1:{port}/mcp, answers this machine only, and only with a token."
+        ),
+        "keeps the token in its own config, in clear text".to_string(),
+        format!("The approval page, {page}, is the page of this machine alone."),
+        "A phone cannot open this page.".to_string(),
+    ] {
+        assert!(cautions.contains(&said), "{said:?} is missing:\n{cautions}");
+    }
+    let both = arca()
+        .args(["status", "--security", "--json", "--config"])
+        .arg(&node)
+        .output()
+        .expect("run arca status");
+    assert_eq!(both.status.code(), Some(2), "one of the two");
+    let summary = rig.shim.stop().expect("stop the shim");
+    assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn while_another_program_holds_the_ports_other_loopback_address_the_page_is_closed_and_no_code_is_given()
  {
     let scratch = Scratch::new("serve-twin-held");
@@ -2354,23 +2572,15 @@ fn while_another_program_holds_the_ports_other_loopback_address_the_page_is_clos
     value["approvalOrigin"] = json!(origin);
     let node = write_config(&scratch, "node.json", &value);
     let log = scratch.at("serve.log");
-    let mut child = arca()
-        .args(["serve", "--config"])
-        .arg(&node)
-        .stdout(Stdio::null())
-        .stderr(fs::File::create(&log).expect("the server's log"))
-        .spawn()
-        .expect("start arca serve");
+    let mut child = Node(
+        serve_command(&node)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log).expect("the server's log"))
+            .spawn()
+            .expect("start arca serve"),
+    );
     let said = || fs::read_to_string(&log).unwrap_or_default();
-    let deadline = Instant::now() + WAIT;
-    while std::net::TcpStream::connect(at).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "the node takes its own address: {}",
-            said()
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    drop(connect_when_bound(at));
     let get = |path: &str| {
         reply_of(
             at,
@@ -2437,7 +2647,7 @@ fn while_another_program_holds_the_ports_other_loopback_address_the_page_is_clos
     // The other program lets go. The node takes the address without being started again, the page opens, and the
     // terminal gets its code.
     drop(held);
-    let deadline = Instant::now() + Duration::from_secs(40);
+    let deadline = Instant::now() + LISTEN_WAIT;
     while !get("/approve").starts_with("HTTP/1.1 200") {
         assert!(
             Instant::now() < deadline,

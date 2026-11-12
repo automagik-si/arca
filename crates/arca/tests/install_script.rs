@@ -543,14 +543,17 @@ fn says_the_door(machine: &Machine, run: &Run, port: u16) {
             "claude mcp add --transport http arca {url} --header \"Authorization: Bearer $(cat '{}')\"",
             secret.display()
         ))
-        .says("keeps the token in its own config, in clear text")
-        // What running the line shows other users, why the address is the IP, and who else can take the port.
-        .says("puts the token in that command's")
-        .says("pasting the entry into the")
-        .says("The address is 127.0.0.1 and not the name localhost")
-        .says("On a machine shared with other accounts: while the node is not running, another account can take")
-        .says(&format!("port {port}, and would then receive what a client sends there, the token included."))
-        .says("sh install.sh --no-door")
+        // One line says where the cautions are; the report itself carries none of them. They are the program's to
+        // say when asked (`arca status --security`), and the guide's.
+        .says(&format!(
+            "instead of running the line, and read this first: {} status --security --config {}",
+            machine.home(".local/bin/arca").display(),
+            machine.home(".config/arca/node.json").display()
+        ))
+        .never_says("in clear text")
+        .never_says("arguments for a moment")
+        .never_says("not the name localhost")
+        .never_says("another account can take")
         .never_says("listen.tailnet");
     let entry = run
         .out
@@ -1445,6 +1448,61 @@ fn enable_changes_runs_the_programs_own_step_for_the_service_it_started_and_says
     run.says("--enable-changes was NOT done, and the node still only looks.")
         .says("This script runs `arca init` only for the node it runs as a service, and it started none here.");
     assert_eq!(init_calls(&machine), Vec::<String>::new());
+}
+
+#[test]
+fn the_connect_block_is_the_line_the_entry_and_one_pointer_and_a_closed_door_still_prints_neither()
+{
+    let version = door_since();
+    let machine = Machine::new();
+    machine.release(&version);
+    let run = machine.run(&["--version", &version]);
+    run.ok();
+    says_the_door(&machine, &run, 7471);
+    // The caution is said before the line it is about, not after it.
+    let caution = run
+        .out
+        .find("On a machine other people log in to, paste the entry below")
+        .expect("the caution");
+    assert!(
+        caution < run.out.find("claude mcp add").expect("the line"),
+        "{}",
+        run.out
+    );
+    // The block a person reads to connect: its heading, the two lines to copy, their two lead-ins and the pointer.
+    let block: Vec<&str> = run
+        .out
+        .lines()
+        .skip_while(|line| !line.starts_with("  1. An assistant that takes an MCP server URL"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect();
+    assert!(
+        (5..=8).contains(&block.len()),
+        "the connect block is short: {} lines\n{}",
+        block.len(),
+        block.join("\n")
+    );
+
+    // A program from before `status --security`: the pointer names the guide, not a command that does not exist.
+    let machine = Machine::new();
+    machine.release(&version);
+    machine.switch("program-without-security", true);
+    let run = machine.run(&["--version", &version]);
+    run.ok()
+        .says("instead of running the line, and read this first: https://github.com/automagik-si/arca/blob/dev/docs/OPERATING.md#loopback-listener")
+        .never_says("status --security");
+
+    // What did not move: with the door closed there is no line and no entry, and the report says why.
+    let machine = Machine::new();
+    machine.release(&version);
+    machine.run(&["--version", &version]).ok();
+    machine.switch("node-door-closed", true);
+    let run = machine.run(&["--version", &version]);
+    run.ok()
+        .says("The HTTP door is CLOSED: the node could not take port 7471 (address in use: another program holds this port).")
+        .never_says("claude mcp add")
+        .never_says("mcpServers")
+        .never_says("status --security");
 }
 
 #[test]

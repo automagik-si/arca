@@ -62,7 +62,7 @@ to run their services.
   the node, and ends with exit code 3: the program is installed and no node was started.
 - **It ends with the node's own answer** to `arca_status`: the mode (`watch-only`), where the token's file is (never the
   token), and the two ways to connect an assistant from step 4 below, with the one line that adds the node to Claude
-  Code. Exit code 0 means the node runs, answered, and reaches Incus.
+  Code and one line that says where the cautions are (`arca status --security`). Exit code 0 means the node runs, answered, and reaches Incus.
 - **A second run** replaces the program in place and restarts the service. `sh install.sh --uninstall` removes the
   service and the program, while the program is still the file it installed, and keeps the config, the tokens and the
   state.
