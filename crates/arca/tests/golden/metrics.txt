@@ -104,6 +104,9 @@ arca_alert_firing{node="00000000000000000000000000000000000000000000000000000000
 # HELP arca_store_write_failures_total The node store's failed writes since the server started.
 # TYPE arca_store_write_failures_total counter
 arca_store_write_failures_total{node="0000000000000000000000000000000000000000000000000000000000000000"} 0
+# HELP arca_store_slow_commits_total The node store's commits since the server started that worked and took over one second.
+# TYPE arca_store_slow_commits_total counter
+arca_store_slow_commits_total{node="0000000000000000000000000000000000000000000000000000000000000000"} 0
 # HELP arca_sample_timestamp_seconds When the newest host sample was taken, in epoch seconds.
 # TYPE arca_sample_timestamp_seconds gauge
 arca_sample_timestamp_seconds{node="0000000000000000000000000000000000000000000000000000000000000000"} 1793361785

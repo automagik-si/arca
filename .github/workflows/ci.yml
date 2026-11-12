@@ -129,8 +129,9 @@ jobs:
         run: scripts/ci-setup.sh test
       # The tests are built first, and what the build left to write is written out before any of them runs.
       # A test that keeps a store commits to it with fsync, and the node counts a commit that takes over a second as a
-      # failed write (`store-write-failed`). Straight after a build the disk still owes the build's gigabytes, and an
-      # fsync waits behind them: a golden text once came out "wrong" that way, with nothing wrong.
+      # slow commit and says so in what it publishes (`arca_store_slow_commits_total`, the warning
+      # `store-commit-slow`), which a golden text reads. Straight after a build the disk still owes the build's
+      # gigabytes, and an fsync waits behind them: a golden text once came out "wrong" that way, with nothing wrong.
       - name: Build the tests
         run: cargo test --workspace --no-run
       - name: Write out what the build left, and time a small write before and after
