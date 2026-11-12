@@ -1454,6 +1454,52 @@ the rules before and after, `a_destination_at_the_end_of_a_range_or_beside_anoth
 `a_machine_on_a_host_bridge_is_not_created_with_a_destination`). What Incus and the host do with these rules on a live
 node is under "Assumptions to confirm".
 
+## A function
+
+**Rule 71.** A function is a service record with one more key, `function`, and nothing of it is owned another way: its
+ACL, its instance and its secrets are the entry's own, created, patched and retired by the rules above. Its instance
+carries `user.arca.function = true` beside the kernel's entry mark. Keys under `user.arca.` are the other system's
+(Rule 3), and `classify_object` classes a fixed list of them as the entry's own on a service's instance; this key is
+one more on that list, and no other key is. The plugin refuses a function's record that is anything but a
+container of the node's own project on the managed service network, created stopped, with no port, no host listener,
+no kernel access, and exactly one opened address for each of its links.
+
+Source: `Function`, `record_ok` and `template` in `crates/arca/src/function.rs`; `Service::apply` and `instance_body`
+in `crates/arca/src/service.rs`; `classify_object` in `crates/arca-kernel/src/ownership.rs`. Tests in
+`crates/arca/tests/functions.rs`
+(`a_function_is_created_only_from_an_approved_proposal_whose_card_names_what_it_reaches`,
+`functions_and_services_share_one_name_space_and_each_verb_keeps_to_its_kind`).
+
+**Rule 72.** A function reaches only what its definition names. `function_egress_rules` builds its NIC's egress array:
+a service's array (Rule 70) without its last rule, the allow that lets everything else out, and with one allow for
+each link: tcp to the linked service's address on the linked port. A service's packets reach their neighbours on the
+service /24 through that last allow, so a function has none of that reach either. A link whose address is outside the
+service /24, is one of the node's own, or names port 0 opens nothing, whatever a record says. The linked service's
+side is the ordinary grant of a link, bound to the function's uuid and address.
+
+Source: `function_egress_rules` in `crates/arca-netproject/src/tenant.rs`, with its test
+`a_functions_rules_are_a_services_without_the_way_out_and_with_one_allow_for_each_link`; `egress` in
+`crates/arca/src/service.rs`; `create_function` in `crates/arca/src/function_handlers.rs`. Tests in
+`crates/arca/tests/functions.rs` (`a_private_destination_comes_from_the_nodes_config_and_is_on_the_card`).
+
+**Rule 73.** A run is not an effect. `arca_incus::function_run` is a path beside the effect journal, as the state
+writer of the instance verbs is: it reads one instance, refuses it unless it is a container that carries the function
+mark and has the uuid it was read with, and then writes only its `state` (a start, a stop) and clears its console log.
+It is the only path that forces a stop, and nothing reaches it with a service's instance: the instance verbs still
+force nothing, and refuse a function's instance. The kernel starts a run only for the instance whose uuid the effect
+journal holds for the function's entry. A run writes one line to the run log and the end of its output, both in the
+state directory, and nothing to the desired state or the effect journal.
+
+Source: `FunctionRun` and `is_function` in `crates/arca-incus/src/function_run.rs`, with the tests in
+`crates/arca-incus/tests/function_run.rs` (`a_service_is_never_read_started_or_force_stopped_from_here`,
+`a_function_outside_the_family_or_recreated_is_refused`); `FunctionRunner` in `crates/arca/src/function_run.rs`;
+`InstanceLifecycle::target` in `crates/arca/src/lifecycle.rs`. Tests in `crates/arca/tests/functions.rs`
+(`ten_runs_write_ten_lines_and_nothing_to_the_journal_or_the_desired_state`,
+`a_run_starts_only_the_instance_arca_created_for_its_function`).
+
+`function_create` and `function_remove` run only from a proposal the owner approved; a removal is the removal of a
+service (the instance is deleted before its ACL), after the run that is going has been stopped.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
