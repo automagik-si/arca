@@ -322,3 +322,156 @@ fn the_shipped_runner_pool_over_a_bridged_nodes_cpu_cap_is_refused_when_it_is_pr
     assert_eq!(proposal["args"]["bridge"], "br0", "{proposal}");
     assert_eq!(waiting(&roomy).len(), 1);
 }
+
+/// A tenant far under its own caps asks for a machine the node has no room for. The node's caps are asked first, so
+/// the proposal is refused with the node's amounts and `scope` `node`, as the create refuses it: the tenant's plan
+/// was not the reason.
+#[test]
+fn a_tenants_machine_the_node_has_no_room_for_is_refused_with_the_nodes_amounts_when_proposed() {
+    let mut kernel = json!({
+        "projects": [PROJECT],
+        "droiddProjects": ["other"],
+        "serviceCidr": CIDR,
+        "vmLimits": { "virtualMachines": 4, "cpu": 16, "memory": "16GiB", "disk": "1TiB" }
+    });
+    kernel["tenants"] = policy();
+    let rig = Rig::with_kernel(kernel, empty_state());
+    rig.template("vm", vm_template());
+    rig.template(
+        "big",
+        json!({
+            "name": "big", "kind": "virtual-machine", "image": "images:debian/13",
+            "limits": { "cpu": "2", "memory": "8GiB" }, "rootSize": "20GiB", "ports": [22]
+        }),
+    );
+    rig.create_tenant(json!({ "id": A })).expect("the tenant");
+    for name in ["own1", "own2", "own3"] {
+        rig.call("service_create", json!({ "name": name, "template": "vm" }))
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    }
+    let args = json!({ "name": "big", "template": "big", "tenant": A });
+    let told = listed(propose(&rig, args.clone()));
+    assert_eq!(
+        told,
+        (
+            "capacity".to_string(),
+            "creating big would exceed this node's cap on memory (kernel.vmLimits.memory): 12.0 GiB in use, 8.0 GiB asked, 16.0 GiB allowed".to_string(),
+            room("memory", 12 * GIB, 8 * GIB, 16 * GIB),
+        )
+    );
+    assert_eq!(listed(rig.call("service_create", args)), told);
+    assert_eq!(waiting(&rig), Vec::<String>::new(), "no card waits");
+}
+
+/// A tenant's container whose template gives its data volume no size cannot be counted against the tenant's cap on
+/// disk. That is a plain refusal, not one for want of room, and the proposal gets it as the create does.
+#[test]
+fn a_tenants_data_volume_with_no_stated_size_is_refused_when_it_is_proposed() {
+    let rig = two_tenants(policy());
+    let mut unsized_data = app_template("unsized");
+    unsized_data["data"] = json!({ "path": "/data" });
+    rig.template("unsized", unsized_data);
+    let args = json!({ "name": "store", "template": "unsized", "tenant": A });
+    let create = refusal(rig.call("service_create", args.clone()));
+    assert_eq!(create.0, "refused");
+    assert_eq!(
+        create.1,
+        "template unsized: its data volume states no size, so it cannot be counted against tenant aaaaaaaa's cap on disk (limits.disk)"
+    );
+    assert_eq!(refusal(propose(&rig, args)), create);
+    assert_eq!(waiting(&rig), Vec::<String>::new(), "no card waits");
+    // The node's own service from the same template is held to no cap, and is proposed.
+    propose(&rig, json!({ "name": "store", "template": "unsized" }))
+        .expect("the node's own service is proposed");
+}
+
+/// Every file under the node's state directory, with its bytes.
+fn state(rig: &Rig) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &std::path::Path, found: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(dir).expect("the directory").flatten() {
+            let path = entry.path();
+            let kind = entry.file_type().expect("its kind");
+            if kind.is_dir() {
+                walk(&path, found);
+            } else if kind.is_file() {
+                found.insert(path.clone(), fs::read(&path).expect("the file"));
+            }
+        }
+    }
+    let mut found = std::collections::BTreeMap::new();
+    walk(&rig.dir, &mut found);
+    found
+}
+
+/// A proposal refused for want of room writes nothing and counts for nothing: no file under the node's state
+/// directory changes (the proposals' journal and the kernel's own among them), and the token's window of proposals
+/// is as full as before, so as many proposals as the window holds still pass after as many refusals.
+#[test]
+fn a_proposal_refused_for_room_leaves_the_journals_and_the_tokens_window_as_they_were() {
+    let rig = node(
+        "vmLimits",
+        json!({ "virtualMachines": 1, "cpu": 8, "memory": "16GiB", "disk": "80GiB" }),
+    );
+    rig.template("app", app_template("app"));
+    rig.call("service_create", json!({ "name": "ws1", "template": "vm" }))
+        .expect("the one machine the node allows");
+    let before = state(&rig);
+    let window = arca::action_proposal::PROPOSAL_RATE_MAX;
+    for n in 0..window {
+        let (code, _, _) = listed(propose(
+            &rig,
+            json!({ "name": format!("over{n}"), "template": "vm" }),
+        ));
+        assert_eq!(code, "capacity", "proposal {n}");
+    }
+    assert!(state(&rig) == before, "a refused proposal changed a file");
+    for n in 0..window {
+        let card = propose(
+            &rig,
+            json!({ "name": format!("fits{n}"), "template": "app" }),
+        )
+        .unwrap_or_else(|error| panic!("proposal {n} of a full window: {error:?}"));
+        // Only eight cards wait at once: each is declined, which gives nothing back to the window.
+        let id = card["id"].as_str().expect("its id");
+        assert!(
+            rig.kernel
+                .lock()
+                .expect("kernel")
+                .decline_action(id)
+                .expect("declined")
+        );
+    }
+    let (code, _, _) = listed(propose(
+        &rig,
+        json!({ "name": "onemore", "template": "app" }),
+    ));
+    assert_eq!(
+        code, "RateLimited",
+        "the window is full of recorded proposals only"
+    );
+}
+
+/// A proposal whose name is not a service name is told about the name, as the create tells a token, even when the
+/// node has no room for the machine it asks for.
+#[test]
+fn a_proposal_with_a_bad_name_is_told_about_the_name_and_not_about_room() {
+    let rig = node(
+        "vmLimits",
+        json!({ "virtualMachines": 1, "cpu": 8, "memory": "16GiB", "disk": "80GiB" }),
+    );
+    rig.call("service_create", json!({ "name": "ws1", "template": "vm" }))
+        .expect("the one machine the node allows");
+    for args in [
+        json!({ "name": "Not A Name", "template": "vm" }),
+        json!({ "template": "vm" }),
+    ] {
+        match propose(&rig, args.clone()) {
+            Err(CallError::Invalid(why)) => {
+                assert!(why.contains("name"), "{args}: {why}");
+                assert!(!why.contains("would exceed"), "{args}: {why}");
+            }
+            other => panic!("{args}: expected the schema's refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(waiting(&rig), Vec::<String>::new());
+}

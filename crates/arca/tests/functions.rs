@@ -589,6 +589,13 @@ fn functions_and_services_share_one_name_space_and_each_verb_keeps_to_its_kind()
             .contains("a function named relay exists: functions and services share one name space"),
         "{message}"
     );
+    // The proposal of that create is refused when it is made, in the create's words, and no card waits for it.
+    let (_, proposed) = refusal(rig.propose(
+        "service_create",
+        json!({ "name": "relay", "template": "nats" }),
+    ));
+    assert_eq!(proposed, message);
+    assert!(rig.kernel.lock().unwrap().action_proposals().is_empty());
     // No service verb acts on a function.
     for (name, args) in [
         ("service_status", json!({ "name": "relay" })),

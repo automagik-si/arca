@@ -323,6 +323,29 @@ pub(super) fn open_deploy(
     entry: &str,
     now: u64,
 ) -> Result<Option<String>, CallError> {
+    let Some(id) = joinable_deploy(cfg, scope, args, &caller.token_id, now)? else {
+        return Ok(None);
+    };
+    let scope = scope.ok_or_else(internal)?;
+    journal_deploy(
+        cfg,
+        json!({ "kind": "create", "tenant": scope.id, "deploy": id, "token_id": caller.token_id,
+            "entry": entry, "at_ms": now }),
+    )?;
+    Ok(Some(id))
+}
+
+/// The deploy a create names, when the token `token` may add to it now: a deploy nobody opened yet, or one this
+/// token opened that is still provisional. `None` for a create that names none. Nothing is written. The create asks
+/// here before it journals its part ([`open_deploy`]), and a proposal asks here when it is made, with the token its
+/// approved create will run as.
+pub(super) fn joinable_deploy(
+    cfg: &NodeConfig,
+    scope: Option<&TenantScope>,
+    args: &Value,
+    token: &str,
+    now: u64,
+) -> Result<Option<String>, CallError> {
     let Some(value) = args.get("deploy") else {
         return Ok(None);
     };
@@ -338,7 +361,7 @@ pub(super) fn open_deploy(
             CallError::Invalid("deploy: expected 1 to 64 of a-z, 0-9 and \"-\"".into())
         })?;
     if let Some(open) = deploys(cfg)?.get(&(scope.id.clone(), id.to_string())) {
-        if open.token != caller.token_id {
+        if open.token != token {
             return Err(service_refused(format!(
                 "deploy {id} was opened by another token: only the token that opened a deploy adds to it"
             )));
@@ -349,11 +372,6 @@ pub(super) fn open_deploy(
             )));
         }
     }
-    journal_deploy(
-        cfg,
-        json!({ "kind": "create", "tenant": scope.id, "deploy": id, "token_id": caller.token_id,
-            "entry": entry, "at_ms": now }),
-    )?;
     Ok(Some(id.to_string()))
 }
 
