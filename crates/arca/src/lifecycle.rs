@@ -491,7 +491,7 @@ fn not_arca(project: &str, instance: &str, why: &str) -> CallError {
 pub fn disabled() -> CallError {
     refused(
         "InstanceLifecycleDisabled",
-        "starting, stopping and restarting instances is disabled: this node is watch-only",
+        arca_mcp::jsonrpc::ONLY_LOOKS_NOTE,
     )
 }
 

@@ -712,7 +712,8 @@ fn a_watch_only_node_refuses_all_three_and_their_proposals() {
     ] {
         let (code, message) = refusal(rig.call(Scope::Operator, name, args));
         assert_eq!(code, "InstanceLifecycleDisabled");
-        assert!(message.contains("watch-only"), "{message}");
+        // The refusal keeps its own code and says the node's one sentence.
+        assert_eq!(message, arca_mcp::jsonrpc::ONLY_LOOKS_NOTE);
         let (code, _) = refusal(rig.call(
             Scope::Viewer,
             "action_propose",

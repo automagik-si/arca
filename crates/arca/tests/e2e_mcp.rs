@@ -339,6 +339,15 @@ fn a_viewer_reads_the_watch_and_the_metrics_and_the_shim_saw_only_gets() {
     let status_row = tool_result(&text);
     conforming("arca_status", &status_row);
     assert_eq!(status_row["mode"], json!("watch-only"));
+    // A node that only looks says so in every answer, in the structured content and in the text.
+    let only_looks = "this node only looks: nothing here can be changed until the node is running with changes turned on (arca init --enable-changes, then restart the node if init did not)";
+    assert_eq!(status_row["watchOnly"], json!(only_looks));
+    assert!(text.contains(only_looks), "{text}");
+    assert_eq!(
+        metrics["watchOnly"],
+        json!(only_looks),
+        "every answer, not one verb's"
+    );
     assert_eq!(status_row["incusReachable"], json!(true));
     assert_eq!(status_row["appliedSeq"], Value::Null);
 
@@ -438,6 +447,10 @@ fn a_node_with_kernel_projects_reports_kernel_mode_before_any_document_applies()
     let row = tool_result(&text);
     conforming("arca_status", &row);
     assert_eq!(row["mode"], json!("kernel"));
+    assert!(
+        row.get("watchOnly").is_none() && !text.contains("only looks"),
+        "a node that makes changes says nothing of the kind: {text}"
+    );
     assert_eq!(row["incusReachable"], json!(true));
     assert_eq!(row["appliedSeq"], Value::Null);
     assert_eq!(serve.terminate().code(), Some(0));

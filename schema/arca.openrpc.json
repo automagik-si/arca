@@ -3375,6 +3375,11 @@
               "maxLength": 40,
               "type": "string"
             },
+            "note": {
+              "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
+              "maxLength": 200,
+              "type": "string"
+            },
             "ports": {
               "description": "The ports it listens on; a link opens the first.",
               "items": {
@@ -3624,6 +3629,11 @@
                   },
                   "name": {
                     "maxLength": 40,
+                    "type": "string"
+                  },
+                  "note": {
+                    "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
+                    "maxLength": 200,
                     "type": "string"
                   },
                   "ports": {
@@ -3891,6 +3901,11 @@
               "maxLength": 40,
               "type": "string"
             },
+            "note": {
+              "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
+              "maxLength": 200,
+              "type": "string"
+            },
             "ports": {
               "description": "The ports it listens on; a link opens the first.",
               "items": {
@@ -4052,6 +4067,11 @@
               },
               "maxItems": 200,
               "type": "array"
+            },
+            "note": {
+              "description": "Present when the lines are not the service's journal: on a node that only looks they are the instance's console log, since the journal is read by running a command inside the instance.",
+              "maxLength": 300,
+              "type": "string"
             }
           },
           "required": [
@@ -4293,6 +4313,11 @@
                 },
                 "name": {
                   "maxLength": 40,
+                  "type": "string"
+                },
+                "note": {
+                  "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
+                  "maxLength": 200,
                   "type": "string"
                 },
                 "ports": {

@@ -9,17 +9,28 @@ fn a_node_never_set_up_for_services_lists_no_tenants_and_every_other_tenant_verb
         rig.call("tenant_list", json!({})).expect("the empty list"),
         json!({ "tenants": [] })
     );
+    // A read of one tenant answers that the node has none.
     for (verb, args) in [
-        ("tenant_create", json!({})),
         ("tenant_status", json!({ "id": A })),
         ("tenant_usage", json!({ "id": A })),
-        ("tenant_remove", json!({ "id": A, "approval": "x" })),
         ("service_list", json!({ "tenant": A })),
     ] {
         let (code, message) = refusal(rig.call_as(verb, args, Some(&["tenant_create"])));
         assert_eq!(
             (code.as_str(), message.as_str()),
             ("no_tenants", "this node has no tenants"),
+            "{verb}"
+        );
+    }
+    // A call that would make or remove one is refused as every write is on a node that only looks.
+    for (verb, args) in [
+        ("tenant_create", json!({})),
+        ("tenant_remove", json!({ "id": A, "approval": "x" })),
+    ] {
+        let (code, message) = refusal(rig.call_as(verb, args, Some(&["tenant_create"])));
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("refused", arca_mcp::jsonrpc::ONLY_LOOKS_NOTE),
             "{verb}"
         );
     }
@@ -51,6 +62,135 @@ fn a_node_that_still_holds_a_tenant_never_answers_an_empty_list_when_its_config_
         (code.as_str(), message.as_str()),
         ("no_tenants", "this node has no tenants")
     );
+}
+
+#[test]
+fn a_node_set_back_to_watch_only_still_shows_its_tenants_and_databases() {
+    let rig = Rig::new(Some(policy()));
+    rig.create_tenant(json!({ "id": A })).expect("the tenant");
+    let reads = [
+        ("tenant_list", json!({})),
+        ("tenant_status", json!({ "id": A })),
+        ("tenant_usage", json!({ "id": A })),
+        ("postgres_list", json!({})),
+        ("service_list", json!({ "tenant": A })),
+        ("service_list", json!({})),
+    ];
+    let before: Vec<Value> = reads
+        .iter()
+        .map(|(verb, args)| {
+            rig.call(verb, args.clone())
+                .unwrap_or_else(|e| panic!("{verb}: {e:?}"))
+        })
+        .collect();
+    // The node as `arca init --watch-only` leaves it: the same records, and no kernel project.
+    let mut cfg = (*rig.cfg).clone();
+    cfg.kernel.projects.clear();
+    let cfg = Arc::new(cfg);
+    let time: arca::handlers::Clock = Arc::new(|| NOW);
+    let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> =
+        tenant_handlers(rig.kernel.clone(), time.clone(), cfg.clone())
+            .into_iter()
+            .chain(service_handlers(
+                rig.kernel.clone(),
+                time.clone(),
+                cfg.clone(),
+            ))
+            .chain(postgres_handlers(rig.kernel.clone(), time, cfg))
+            .collect();
+    let doctor = Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    let entries = rig.entries();
+    for ((verb, args), before) in reads.iter().zip(&before) {
+        let now = handlers[verb]
+            .call(args.clone(), &doctor)
+            .unwrap_or_else(|e| panic!("{verb} on a node that only looks: {e:?}"));
+        assert_eq!(&now, before, "{verb}: what is there is shown as it was");
+    }
+    assert_eq!(rig.entries(), entries, "reading wrote no record");
+
+    // Every call that would change something is refused in the node's one sentence, a tenant's own calls included,
+    // and nothing is changed: no record, no secret file, nothing in the state directory, nothing in Incus.
+    let state = state_files(&rig.dir);
+    let writes = rig.fake().writes().len();
+    for (verb, args) in [
+        ("tenant_create", json!({})),
+        ("tenant_remove", json!({ "id": A, "approval": "x" })),
+        ("deploy_confirm", json!({ "tenant": A, "deploy": "d1" })),
+        ("deploy_rollback", json!({ "tenant": A, "deploy": "d1" })),
+        (
+            "deploy_remove",
+            json!({ "tenant": A, "deploy": "d1", "approval": "x" }),
+        ),
+        (
+            "service_create",
+            json!({ "name": "web", "template": "app", "tenant": A }),
+        ),
+        (
+            "service_secret_set",
+            json!({ "name": "web", "key": "k", "value": "v", "tenant": A }),
+        ),
+        (
+            "service_connect",
+            json!({ "from": "web", "to": "db", "tenant": A }),
+        ),
+        (
+            "service_remove",
+            json!({ "name": "web", "approval": "x", "tenant": A }),
+        ),
+        (
+            "postgres_create",
+            json!({ "name": "db", "image": PG_IMAGE }),
+        ),
+    ] {
+        let tools = [verb];
+        let caller = Caller {
+            token_id: "doctor".into(),
+            scope: Scope::Doctor,
+            tools: Some(tools.iter().map(|tool| tool.to_string()).collect()),
+        };
+        let (code, message) = refusal(handlers[verb].call(args, &caller));
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("refused", arca_mcp::jsonrpc::ONLY_LOOKS_NOTE),
+            "{verb}"
+        );
+    }
+    assert_eq!(rig.entries(), entries, "no record was saved");
+    assert_eq!(
+        state_files(&rig.dir),
+        state,
+        "nothing in the state directory changed"
+    );
+    assert_eq!(
+        rig.fake().writes().len(),
+        writes,
+        "Incus was not written to"
+    );
+}
+
+/// Every regular file under `dir`, with its content: the node's records, its journal, its secret files.
+fn state_files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut left = vec![dir.to_path_buf()];
+    while let Some(at) = left.pop() {
+        for entry in fs::read_dir(&at)
+            .expect("read the state directory")
+            .flatten()
+        {
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).expect("stat");
+            if meta.is_dir() {
+                left.push(path);
+            } else if meta.is_file() {
+                files.insert(path.clone(), fs::read(&path).unwrap_or_default());
+            }
+        }
+    }
+    files
 }
 
 #[test]
