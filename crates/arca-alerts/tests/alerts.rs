@@ -1547,6 +1547,47 @@ mod store_failure {
     }
 
     #[test]
+    fn a_failed_commit_while_store_commit_slow_fires_starts_its_120_s_again() {
+        let scratch = Scratch::new("slow-then-failed");
+        let switches = Switches::default();
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        let slow_fires = |snapshot: &arca_alerts::AlertSnapshot| {
+            snapshot
+                .firing
+                .iter()
+                .any(|alert| alert.event.rule == STORE_COMMIT_SLOW)
+        };
+        // Slow at 0 s, in time from 5 s: left alone, the warning would clear at 125 s.
+        set(&switches.slow, true);
+        engine.tick(&Inputs::default(), Vec::new(), T0);
+        set(&switches.slow, false);
+        for t in (5_000..=60_000).step_by(5_000) {
+            engine.tick(&Inputs::default(), Vec::new(), T0 + t);
+        }
+        // A commit fails at 65 s. It was not a commit in time, so the 120 s start again with the next one that is,
+        // at 70 s. It is a failed write and no slow commit.
+        set(&switches.fail, true);
+        let failed = engine.tick(&Inputs::default(), Vec::new(), T0 + 65_000);
+        set(&switches.fail, false);
+        assert_eq!(
+            (failed.store_write_failures, failed.store_slow_commits),
+            (1, 1)
+        );
+        assert!(slow_fires(&failed));
+        for t in (70_000..=185_000).step_by(5_000) {
+            assert!(
+                slow_fires(&engine.tick(&Inputs::default(), Vec::new(), T0 + t)),
+                "still firing at {t}: the failed commit started the wait again"
+            );
+        }
+        let cleared = engine.tick(&Inputs::default(), Vec::new(), T0 + 190_000);
+        assert!(
+            !slow_fires(&cleared),
+            "cleared 120 s after the first commit in time that followed the failure"
+        );
+    }
+
+    #[test]
     fn a_failed_write_and_a_slow_commit_are_two_alerts_and_each_clears_by_its_own_clock() {
         let scratch = Scratch::new("failed-and-slow");
         let switches = Switches::default();

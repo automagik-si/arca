@@ -168,8 +168,9 @@ jobs:
           cargo fmt --all --check
           cargo clippy --workspace -- -D warnings
           # Built first, and what the build left to write is written out before a test runs: a test's store commits
-          # with fsync, the node counts a commit of over a second as a failed write, and straight after a build an
-          # fsync waits behind the build's gigabytes (see the cargo test job of ci.yml).
+          # with fsync, the node counts a commit of over a second as a slow commit and shows it in the text a golden
+          # file is compared with, and straight after a build an fsync waits behind the build's gigabytes (see the
+          # cargo test job of ci.yml).
           cargo test --workspace --no-run
           sync
           cargo test --workspace

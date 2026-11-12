@@ -44,7 +44,6 @@ disk: watch the new counter or the new alert for that. Both counters start at 0 
 
 ## 0.13.0 (2026-11-12)
 
-## 0.13.0 (2026-11-12)
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU
 assignment no longer hold the word `watch-only`, which they did in 0.12.0: they carry the same sentence as every other
 refusal and every answer of such a node, `this node only looks: nothing here can be changed until the node is running
