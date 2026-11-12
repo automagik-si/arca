@@ -210,6 +210,11 @@ struct Shared {
     /// The operations whose wait answers 404 while the listing still shows them running.
     waits_ended: Mutex<Vec<String>>,
     console: Mutex<BTreeMap<(String, String), String>>,
+    /// What an instance's program does after each start, by project and name: how many reads of the instance it stays
+    /// running for, and what it has written to its console when it exits by itself.
+    exit_plans: Mutex<BTreeMap<(String, String), (u32, String)>>,
+    /// The exits armed by a start that has not ended yet.
+    exits: Mutex<BTreeMap<(String, String), (u32, String)>>,
     counter: AtomicU64,
     /// The `/1.0/resources` document the fake serves, when a test sets one.
     resources: Mutex<Option<Value>>,
@@ -395,6 +400,8 @@ impl Shared {
             operations_unreadable: AtomicBool::new(false),
             waits_ended: Mutex::new(Vec::new()),
             console: Mutex::new(BTreeMap::new()),
+            exit_plans: Mutex::new(BTreeMap::new()),
+            exits: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
         }
@@ -436,6 +443,21 @@ impl FakeIncus {
     /// Every request received so far, in arrival order.
     pub fn requests(&self) -> Vec<RecordedRequest> {
         lock(&self.shared.requests).clone()
+    }
+
+    /// Makes the program of the instance `name` in `project` exit by itself after every start: the instance stays
+    /// running for `reads` reads of it, then it is stopped and its console log is `output`. It records no write. A
+    /// stop sent before the exit ends the run, and the console keeps what a test set.
+    pub fn exit_after_start(&self, project: &str, name: &str, reads: u32, output: &str) {
+        lock(&self.shared.exit_plans).insert(
+            (project.to_string(), name.to_string()),
+            (reads, output.to_string()),
+        );
+    }
+
+    /// Takes back [`FakeIncus::exit_after_start`]: the instance runs until it is stopped.
+    pub fn run_until_stopped(&self, project: &str, name: &str) {
+        lock(&self.shared.exit_plans).remove(&(project.to_string(), name.to_string()));
     }
 
     /// Sets the raw console log a project's instance serves from `/console`.
@@ -966,6 +988,20 @@ fn console_body(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)> {
     let Some(Route::Console(address)) = parse(&request.target) else {
         return None;
     };
+    // A DELETE clears the log, as Incus does: the next read finds none.
+    if request.method == "DELETE" {
+        let had = lock(&shared.console)
+            .remove(&(address.project, address.name))
+            .is_some();
+        return Some(if had {
+            (200, sync_envelope(json!({})).to_string().into_bytes())
+        } else {
+            (
+                404,
+                error_envelope(404, "not found").to_string().into_bytes(),
+            )
+        });
+    }
     if request.method != "GET" {
         return Some((405, Vec::new()));
     }
@@ -1248,6 +1284,22 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         },
         ("GET", Route::Object(address)) => match store.find(&address) {
             Some(index) => {
+                // A program armed to exit by itself does so at the read its plan names.
+                if address.kind == "instance" {
+                    let key = (address.project.clone(), address.name.clone());
+                    let mut exits = lock(&shared.exits);
+                    let left = exits.get(&key).map(|(reads, _)| *reads);
+                    if left == Some(0) {
+                        if let Some((_, output)) = exits.remove(&key) {
+                            lock(&shared.console).insert(key, output);
+                        }
+                        if let Some(body) = store.objects[index].body.as_object_mut() {
+                            body.insert("status".to_string(), json!("Stopped"));
+                        }
+                    } else if let Some((reads, _)) = exits.get_mut(&key) {
+                        *reads -= 1;
+                    }
+                }
                 let body = store.objects[index].body.clone();
                 let extra = format!("ETag: {}\r\n", etag_of(&body));
                 (200, extra, sync_envelope(body))
@@ -2690,6 +2742,10 @@ fn change_state(
         "start" if running => bad("The instance is already running"),
         "start" => {
             store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
+            let key = (address.project.clone(), address.name.clone());
+            if let Some(plan) = lock(&shared.exit_plans).get(&key).cloned() {
+                lock(&shared.exits).insert(key, plan);
+            }
             answered(shared, store, "instance", "PUT", Ok(()))
         }
         "stop" if !running => bad("The instance is already stopped"),
@@ -2702,6 +2758,7 @@ fn change_state(
             if let Some(body) = store.objects[index].body.as_object_mut() {
                 body.insert("status".to_string(), json!("Stopped"));
             }
+            lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));
             answered(shared, store, "instance", "PUT", Ok(()))
         }
         "restart" if !running => bad("The instance is already stopped"),

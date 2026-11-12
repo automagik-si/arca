@@ -208,6 +208,21 @@ impl StateChanger {
         Ok(after)
     }
 
+    /// Sends one state body for one instance and waits for its operation. It is the crate's own: the one caller outside
+    /// this module is [`crate::function_run`], which sends a forced stop to a function's instance and to nothing else.
+    /// [`StateChanger::change`] is the only public state write, and it never forces.
+    pub(crate) fn put_state(
+        &self,
+        project: &str,
+        name: &str,
+        body: &Value,
+    ) -> Result<(), IncusError> {
+        self.allow(project)?;
+        let url = state_url(project, name)?;
+        let envelope = checked_envelope(self.send("PUT", &url, Some(body))?)?;
+        self.wait_for(&envelope)
+    }
+
     /// Refuses a project outside the family before any request is sent, a read included.
     fn allow(&self, project: &str) -> Result<(), IncusError> {
         self.allows(project)
@@ -327,7 +342,7 @@ fn state_url(project: &str, name: &str) -> Result<String, IncusError> {
     Ok(format!("/1.0/instances/{name}/state?project={project}"))
 }
 
-fn plain_name(text: &str) -> bool {
+pub(crate) fn plain_name(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= 128
         && text
@@ -350,7 +365,7 @@ fn checked_metadata(framed: Framed) -> Result<Value, IncusError> {
         .ok_or_else(|| decode("the answer has no metadata"))
 }
 
-fn checked_envelope(framed: Framed) -> Result<Value, IncusError> {
+pub(crate) fn checked_envelope(framed: Framed) -> Result<Value, IncusError> {
     let status = framed.status;
     if !(200..300).contains(&status) {
         // An error answer still names its reason in the envelope, which says more than the reason phrase.
@@ -390,7 +405,7 @@ fn checked_envelope(framed: Framed) -> Result<Value, IncusError> {
     Ok(value)
 }
 
-fn refused(reason: &str) -> IncusError {
+pub(crate) fn refused(reason: &str) -> IncusError {
     IncusError::Refused(reason.to_string())
 }
 

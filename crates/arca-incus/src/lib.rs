@@ -20,6 +20,9 @@ pub mod fake;
 pub mod fake_storage;
 #[cfg(feature = "write")]
 pub mod folder;
+/// One run of a function: the start, the stop and the console log of a function's own instance.
+#[cfg(feature = "write")]
+pub mod function_run;
 #[cfg(feature = "write")]
 pub mod import;
 #[cfg(feature = "write")]
