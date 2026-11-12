@@ -27,6 +27,33 @@ fn a_node_never_set_up_for_services_lists_no_tenants_and_every_other_tenant_verb
 }
 
 #[test]
+fn a_node_that_still_holds_a_tenant_never_answers_an_empty_list_when_its_config_loses_the_keys() {
+    let rig = Rig::new(Some(policy()));
+    rig.create_tenant(json!({ "id": A })).expect("the tenant");
+    // The same node, started again from a config that lost the tenants policy, the service subnet and the projects.
+    let mut cfg = (*rig.cfg).clone();
+    cfg.kernel.tenants = None;
+    cfg.kernel.service_cidr = None;
+    cfg.kernel.projects.clear();
+    let handlers = tenant_handlers(rig.kernel.clone(), Arc::new(|| NOW), Arc::new(cfg));
+    let list = handlers
+        .iter()
+        .find(|(verb, _)| *verb == "tenant_list")
+        .map(|(_, handler)| handler.clone())
+        .expect("the tenant_list handler");
+    let doctor = Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    let (code, message) = refusal(list.call(json!({}), &doctor));
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("no_tenants", "this node has no tenants")
+    );
+}
+
+#[test]
 fn a_node_without_the_key_has_no_tenants_whatever_the_verb() {
     let rig = Rig::new(None);
     rig.template("app", app_template("app"));
