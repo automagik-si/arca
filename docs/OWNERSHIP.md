@@ -1626,7 +1626,8 @@ Source: `RegistryCredential` and `create_with_registry` in `crates/arca-incus/sr
 and `registry_owner` in `crates/arca-providers/src/incus.rs`; `crates/arca/src/registry.rs`; `with_registry` and
 `drop_fetched_images` in `crates/arca/src/function_handlers.rs`; `FunctionRun::fresh_root` and `drop_unused_image`
 in `crates/arca-incus/src/function_run.rs`. Tests in `crates/arca/tests/functions.rs`
-(`an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_rests_in_incus_alone`) and
+(`an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_rests_in_incus_alone`),
+`crates/arca/tests/tenants/isolation.rs` (`a_tenants_image_is_fetched_without_the_nodes_registry_credential`) and
 `crates/arca-incus/tests/function_run.rs`
 (`a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_deleted`).
 

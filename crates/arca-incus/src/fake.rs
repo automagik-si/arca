@@ -1670,16 +1670,23 @@ fn create(
         let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
         let (server, alias) = (server.to_string(), alias.to_string());
         store.put_image_from(&project, fingerprint.clone(), &alias, true, Some(&server));
-        // A new function's instance says which image it was made from, as Incus writes it for every instance. The
-        // fake writes it for a function's alone: a service's view shows the key, and the suites that compare whole
-        // views were written without it. The same holds for the id map Incus gives a new container to start with.
-        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut)
-            && config.contains_key("user.arca.function")
-        {
-            config.insert("volatile.base_image".to_string(), json!(fingerprint));
-            config.insert("volatile.idmap.base".to_string(), json!("0"));
-            config.insert("volatile.idmap.next".to_string(), json!(ID_MAP));
-            config.insert("volatile.last_state.idmap".to_string(), json!("[]"));
+        // A new instance says which image it was made from, as Incus writes it for every instance. The fake writes
+        // it for a function's, and for an instance whose image was fetched with a registry's credential: a service's
+        // view shows the key, and the suites that compare whole views were written without it. The id map Incus
+        // gives a new container to start with is written for a function's alone, for the same reason.
+        let credentialed = server
+            .strip_prefix("https://")
+            .is_some_and(|rest| rest.contains('@'));
+        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut) {
+            let function = config.contains_key("user.arca.function");
+            if credentialed || function {
+                config.insert("volatile.base_image".to_string(), json!(fingerprint));
+            }
+            if function {
+                config.insert("volatile.idmap.base".to_string(), json!("0"));
+                config.insert("volatile.idmap.next".to_string(), json!(ID_MAP));
+                config.insert("volatile.last_state.idmap".to_string(), json!("[]"));
+            }
         }
     }
     let parent = address.parent.clone();
