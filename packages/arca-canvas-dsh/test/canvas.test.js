@@ -668,6 +668,8 @@ test('host snapshot route answers from its cache while Arca is held and device H
     await new Promise((resolve) => setTimeout(resolve, 10));
     ({ host: next } = await hostWithin(url, 'while Arca was polled again'));
   }
+  // The device read gives up after 5 s as well: a new poll that came only once it had ended would pass the loop above.
+  assert.equal(closed, 0, 'Arca was read again only once the device request had ended: the cache waited for it');
   assert.equal(next.error, null);
   await fiber.dispose();
   await until(() => closed === deviceRequests);
