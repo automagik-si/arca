@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.14.0 (2026-11-12)
+
 The metrics sampler no longer reads the listing of every instance with its live state each tick. On a node where one
 running virtual machine's guest agent is slow, that listing took up to its 10 second deadline, so a tick often had no
 instance readings at all, and it slowed every service create made at the same time. Each tick now lists the instances
@@ -156,6 +158,37 @@ of classes is refused when it is proposed, before any card, and no machine is ma
 one: a pool of one class created with `maxSlots` 0, which ran with one place, is refused at create too; set 1. The
 template's file changed, so an installed copy that was not edited is brought up to date by the upgrade, and a card
 for it that waits across the upgrade is refused and proposed again.
+
+- Merge: the fake Incus answers slowly again for the sampler tests, and reads that must miss their deadline are never answered (fixes the set E build: PR 92 removed slow_reads, PR 95 used it)
+- Merge PR 96: clippy runs on every target in CI and in the release, and the test code's lints are fixed
+- Merge PR 97: the link race test stops and joins its status thread before it fails, and the canvas snapshot test's waits are bounded and still catch a cache that waits on the device
+- Merge PR 98: a GitHub runner pool keeps GitHub's own refusal even when its answer is cut off, says when a runner is updating, and a slot started at a stop registers nothing
+- Merge PR 95: the metrics sampler lists instances without live state and reads each running one's state within a budget, naming the ones it did not read
+- Merge PR 94: asking whether link serve runs no longer makes a starting serve stop as already running
+- Merge PR 92: four load-flaky tests wait on the thing itself, and the canvas snapshot test counts held Arca requests
+- Merge PR 91: a GitHub runner pool asks a runner again after its update, and a lost answer to a sent request is not a pool failure
+- Merge PR 90: a multi-line secret is hidden line by line and a PEM block is hidden whole before a log is cleaned
+- Merge PR 89: a settings rule names its setting in 1 to 64 plain characters, functions and template databases are name-checked, GitLab pools state their ceilings
+- Merge PR 88: the GitHub runner pool takes a stop in one process, so bash 5.2 cannot lose it
+- Merge PR 87: a service call no longer waits on a guest's agent; instances are listed without live state
+- Merge PR 86: settings rules are refused when proposed
+- Merge PR 80: a GitHub runner pool keeps one runner per class
+- Merge PR 82: a refused secret value is refused in words
+- Merge PR 85: an upgraded node replaces the keeper and GitLab pool scripts earlier releases shipped; CI fetches tags
+- fix(service): more of what a create refuses is refused when it is proposed, and no token takes the name approved actions run under
+- fix(templates): the workspace keeper and the GitLab runner pool take a stop signal in a process that runs no command substitution
+- feat(registry): an image on a registry that asks for a credential is fetched with the one set for that registry, and the node sweeps what it fetched
+- fix(service): a create the node has no room for is refused when it is proposed
+- fix(alerts): a slow commit to the store is called slow, and only a write that failed is a failure
+- fix(service): a card's rows come from one read of its template
+- fix(function): a function's first run rebuilds nothing, because Incus cannot start a container rebuilt before its first start
+- an upgrade through the installer brings the shipped templates up to the release and keeps what the owner edited, and no printed command holds a placeholder a shell would misread
+- an approval card for a service or a database shows its image and binds the template's exact content, and the create refuses a template changed since
+- every run of a function starts from its approved image's own root, rebuilt from the copy the node recorded at create
+- fix: a GitHub runner pool looks at every slot once per pass, so a place that frees goes on in turn and no free slot starts a tick late
+- a template's local image may be pinned by its fingerprint, and a create refuses when the name holds another image
+- fix: a database card that waits across a node restart keeps what it said, and says 'generates' only when a password will be generated
+- fix: the canvas plugin loads on a DSH 0.2.2-rc.2 host as well as rc.1, with its range pinned by a test (diff read by the Orchestrator)
 
 ## 0.13.0 (2026-11-12)
 
