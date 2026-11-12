@@ -7,6 +7,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+When the node refuses the viewer token `arca status` found beside a missing `assistant-1.secret`, the refusal now names
+the file it used, by its name alone; before, it spoke of a token file the owner never named. `arca --help` and
+`docs/OPERATING.md` now say this step of `arca status` beside the other defaults.
+
 ## 0.17.0 (2026-11-12)
 
 Arguments a tool does not take are now answered as a tool result with `isError: true` and `droidd/error` `invalid_arguments`, in the same words, instead of a JSON-RPC error `-32602`, so an assistant reads why and corrects the call (MCP 2025-11-25). A value outside a closed list, such as an `action_propose` action that is not one, now lists the allowed values and names the nearest one. `arca call` prints such a failure as `{"code": "invalid_arguments", "message": ...}`. A call that names no tool, or a tool the server does not have, is still a JSON-RPC error.

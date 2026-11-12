@@ -1756,6 +1756,8 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
         "  --config      ~/.config/arca/node.json",
         "  --token-file  ~/.config/arca/assistant-1.secret",
         "  The order is: the flag, then the variable (ARCA_CONFIG, ARCA_TOKEN_FILE), then the default.",
+        "  status alone takes one step more: with no token file named and none at the default, it uses a viewer token of this",
+        "  node from the default's directory (the viewer.secret of a node installed before that default existed).",
         "  Every command finds its config this way. One that writes to a node or acts on it, without --config, first says on",
         "  stderr which config it uses; one that removes or cuts something off also names the node's state directory.",
         "  A call with --peer sends its token to another node, so its --token-file is always named: it has no default.",

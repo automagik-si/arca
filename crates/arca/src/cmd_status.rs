@@ -36,12 +36,25 @@ pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
     let node = Addressed::new(&config, false);
     let chosen = crate::token_path(flags)?;
-    let token = match read_token(&chosen, &node) {
-        Ok(token) => token,
-        Err(refusal) => viewer_token_beside(&chosen, &cfg, &node).ok_or(refusal)?,
+    let (token, found) = match read_token(&chosen, &node) {
+        Ok(token) => (token, None),
+        Err(refusal) => {
+            let (token, file) = viewer_token_beside(&chosen, &cfg, &node).ok_or(refusal)?;
+            (token, Some(file))
+        }
     };
-    let answer =
-        run_call(&cfg.listen.unix, None, &token, VERB, json!({}), &node)?.unwrap_or(Value::Null);
+    let answer = match run_call(&cfg.listen.unix, None, &token, VERB, json!({}), &node) {
+        Ok(answer) => answer.unwrap_or(Value::Null),
+        // The owner named no token file, so a refusal of the one found says which file it was: by its name alone.
+        Err(Failure::Unauthorized(text)) if found.is_some() => {
+            return Err(Failure::Unauthorized(format!(
+                "the installer's token file {} is not there, so arca status used the viewer token in {} beside it, and {text}",
+                file_name(&chosen.path),
+                found.as_deref().map(file_name).unwrap_or_default()
+            )));
+        }
+        Err(failure) => return Err(failure),
+    };
     if flags.switch("json") {
         return Ok(Some(answer));
     }
@@ -60,7 +73,12 @@ pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
 /// telling the owner to mint a token. It is the first `.secret` file there, by name, that is a private token file and
 /// that the node's own token directory holds as a viewer that may call `arca_status`; a token of a wider scope is never
 /// taken in its place. A file that is not such a token is passed over without a word, and none found keeps the refusal.
-fn viewer_token_beside(chosen: &Chosen, cfg: &NodeConfig, node: &Addressed) -> Option<String> {
+/// The token is returned with the file it was read from.
+fn viewer_token_beside(
+    chosen: &Chosen,
+    cfg: &NodeConfig,
+    node: &Addressed,
+) -> Option<(String, PathBuf)> {
     let missing = std::fs::symlink_metadata(&chosen.path)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     if chosen.origin != Origin::Default || !missing {
@@ -83,12 +101,16 @@ fn viewer_token_beside(chosen: &Chosen, cfg: &NodeConfig, node: &Addressed) -> O
         };
         let token = read_token(&file, node).ok()?;
         let caller = store.lookup(&token)?;
-        let may_ask = caller
-            .tools
-            .as_ref()
-            .is_none_or(|tools| tools.iter().any(|tool| tool == VERB));
-        (caller.scope == arca_api::Scope::Viewer && may_ask).then_some(token)
+        (caller.scope == arca_api::Scope::Viewer && caller.allows_tool(VERB))
+            .then_some((token, file.path))
     })
+}
+
+/// The last part of `path`, the file's name: what a refusal says of a file the owner did not name.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// `status --security`: what a person should know before sharing this machine, or a token of this node, with anyone
