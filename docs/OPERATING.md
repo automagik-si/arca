@@ -662,7 +662,10 @@ program holds their SHA-256 hashes):
 The installer runs this step on an upgrade (`sh install.sh` on a machine that has Arca), for the node it runs as
 a service and only where templates are already installed: a node that only looks has none and gets none. Its
 report names what it brought up to this release, and what it kept because it was edited, with the one command that
-replaces those (`arca templates install --replace --config <file>`). For a node started any other way, run `arca
+replaces those (`arca templates install --replace --config <file>`). Where the run puts an older program over a
+newer one (`--version`), the files it keeps may be the newer release's own: the report says so and gives no command
+to replace them. The step writes every file before it puts any in place; if it stops between two files, its words
+name what it had already put in place, and running it again finishes. For a node started any other way, run `arca
 templates install --config <file>` once after the upgrade, or `arca init --enable-changes` again; neither needs
 `--replace` for a template nobody edited.
 

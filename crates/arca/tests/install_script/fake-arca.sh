@@ -122,7 +122,8 @@ case "${1-} ${2-}" in
       "$reach" "$door" "$mode" "$version"
     ;;
   "templates install")
-    [ ! -e "$root/templates-install-fails" ] || fail "the templates directory cannot be read"
+    [ ! -e "$root/templates-install-fails" ] ||
+      fail "a template cannot be put in place (no space left). Already put in place by this run: postgres-autopg.json. The rest are as they were"
     if [ -n "${FAKE_REAL_ARCA-}" ] && [ ! -e "$root/program-without-replaced" ]; then
       exec "$FAKE_REAL_ARCA" "$@"
     fi

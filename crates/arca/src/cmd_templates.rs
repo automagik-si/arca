@@ -139,6 +139,16 @@ pub fn install(flags: &Flags) -> Result<Option<Value>, Failure> {
 /// name under `installed` (it was missing, or `replace` overwrote an edit), `unchanged`, `kept` (it differs and stays)
 /// or `replaced` (it was an earlier release's own file, unedited, and is now this release's).
 pub fn install_into(dir: &Path, replace: bool) -> Result<Value, Failure> {
+    install_with(dir, replace, &mut |from, to| fs::rename(from, to))
+}
+
+/// [`install_into`], with the step that puts one written file in its place given by the caller: the tests make it
+/// fail part-way.
+fn install_with(
+    dir: &Path,
+    replace: bool,
+    put: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Value, Failure> {
     let failed =
         |what: &str, error: std::io::Error| Failure::Runtime(format!("{what} ({})", error.kind()));
     match fs::symlink_metadata(dir) {
@@ -202,6 +212,7 @@ pub fn install_into(dir: &Path, replace: bool) -> Result<Value, Failure> {
 
     let (mut installed, mut unchanged, mut kept, mut replaced) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut to_write = Vec::new();
     for ((name, text), held) in SHIPPED.iter().zip(&held) {
         let path = dir.join(name);
         match held {
@@ -219,8 +230,15 @@ pub fn install_into(dir: &Path, replace: bool) -> Result<Value, Failure> {
             }
             Held::Missing | Held::Edited | Held::Earlier => {}
         }
-        // Written beside its place and renamed in, so a reader never sees half a file.
-        let scratch = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+        to_write.push((*name, *text, path, *held == Held::Earlier));
+    }
+
+    // Every file is written beside its place first, and only then is each put in its place, so a reader never sees
+    // half a file, and a write that fails (a full disk) fails before anything has changed. What is left is the
+    // moment between two renames: a failure there has already put some files in place, and it names them.
+    let scratch_of = |name: &str| dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    for (at, (name, text, _, _)) in to_write.iter().enumerate() {
+        let scratch = scratch_of(name);
         let written = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -229,13 +247,41 @@ pub fn install_into(dir: &Path, replace: bool) -> Result<Value, Failure> {
             .and_then(|mut file| {
                 file.write_all(text.as_bytes())?;
                 file.sync_all()
-            })
-            .and_then(|()| fs::rename(&scratch, &path));
+            });
         if let Err(error) = written {
-            let _ = fs::remove_file(&scratch);
-            return Err(failed("a template cannot be written", error));
+            // Only what this run made is taken away: a file that was already there under that name is not ours.
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = fs::remove_file(&scratch);
+            }
+            for (earlier, _, _, _) in &to_write[..at] {
+                let _ = fs::remove_file(scratch_of(earlier));
+            }
+            return Err(Failure::Runtime(format!(
+                "a template cannot be written ({}). Nothing was put in place: every installed template is as it was",
+                error.kind()
+            )));
         }
-        if *held == Held::Earlier {
+    }
+    for (at, (name, _, path, earlier)) in to_write.iter().enumerate() {
+        if let Err(error) = put(&scratch_of(name), path) {
+            for (later, _, _, _) in &to_write[at..] {
+                let _ = fs::remove_file(scratch_of(later));
+            }
+            let done: Vec<&str> = to_write[..at].iter().map(|(name, _, _, _)| *name).collect();
+            return Err(Failure::Runtime(if done.is_empty() {
+                format!(
+                    "a template cannot be put in place ({}). Nothing was put in place: every installed template is as it was",
+                    error.kind()
+                )
+            } else {
+                format!(
+                    "a template cannot be put in place ({}). Already put in place by this run: {}. The rest are as they were, so a template and the script it reads may be of two releases until this is run again, which finishes it",
+                    error.kind(),
+                    done.join(", ")
+                )
+            }));
+        }
+        if *earlier {
             replaced.push(*name);
         } else {
             installed.push(*name);
@@ -248,4 +294,103 @@ pub fn install_into(dir: &Path, replace: bool) -> Result<Value, Failure> {
         "kept": kept,
         "replaced": replaced,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arca-templates-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("the directory")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A step that fails between two files has already put some in place. It says which, and that a template and its
+    /// script may be of two releases until the next run; it leaves no half-written file behind; and the next run
+    /// finishes the work.
+    #[test]
+    fn a_failure_part_way_names_what_is_already_in_place_and_the_next_run_finishes() {
+        let dir = scratch("part-way").join("templates");
+        let mut calls = 0;
+        let refused = install_with(&dir, false, &mut |from, to| {
+            calls += 1;
+            if calls == 3 {
+                return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+            }
+            fs::rename(from, to)
+        });
+        let Err(Failure::Runtime(why)) = refused else {
+            panic!("the step fails");
+        };
+        let (first, second) = (SHIPPED[0].0, SHIPPED[1].0);
+        assert_eq!(
+            why,
+            format!(
+                "a template cannot be put in place ({}). Already put in place by this run: {first}, {second}. The rest are as they were, so a template and the script it reads may be of two releases until this is run again, which finishes it",
+                std::io::ErrorKind::StorageFull
+            )
+        );
+        // The two it names are there, whole; nothing else is, and no file written beside its place is left.
+        assert_eq!(names(&dir), [first, second]);
+        assert_eq!(
+            fs::read_to_string(dir.join(first)).expect("the file"),
+            SHIPPED[0].1
+        );
+
+        let finished = install_into(&dir, false).ok().expect("the next run");
+        assert_eq!(finished["unchanged"], json!([first, second]));
+        assert_eq!(
+            finished["installed"].as_array().map(Vec::len),
+            Some(SHIPPED.len() - 2)
+        );
+    }
+
+    /// A step that cannot write one of its files has changed nothing yet, and says so.
+    #[test]
+    fn a_file_that_cannot_be_written_stops_the_step_before_anything_is_put_in_place() {
+        let dir = scratch("unwritten").join("templates");
+        fs::create_dir_all(&dir).expect("the templates directory");
+        // The place a later file would be written to is taken by something that is not this run's.
+        let taken = dir.join(format!(".{}.{}.tmp", SHIPPED[4].0, std::process::id()));
+        fs::write(&taken, "not this run's").expect("a file in the way");
+        let Err(Failure::Runtime(why)) = install_into(&dir, false) else {
+            panic!("the step fails");
+        };
+        assert!(
+            why.starts_with("a template cannot be written (")
+                && why.ends_with("Nothing was put in place: every installed template is as it was"),
+            "{why}"
+        );
+        assert_eq!(
+            names(&dir),
+            [taken.file_name().expect("a name").to_string_lossy()],
+            "no template was put in place, the four files written before it were taken away, and the file in the way is left"
+        );
+        assert_eq!(
+            fs::read_to_string(&taken).expect("the file in the way"),
+            "not this run's"
+        );
+    }
 }

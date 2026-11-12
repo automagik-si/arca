@@ -913,8 +913,16 @@ upgrade_templates() {
         *) return 0 ;;
     esac
     templates_command="$bin templates install --config $config"
-    if ! templates_said=$("$bin" templates install --config "$config" 2>/dev/null </dev/null); then
-        templates_failed=1
+    # A run that puts an older program in place (--version asked for it): what that program keeps may be a newer
+    # release's file, not an edit, and replacing it would bring back a template that release fixed.
+    templates_older=
+    if [ -n "${was_version-}" ] && newer "$was_version" "$version"; then
+        templates_older=1
+    fi
+    # The program's own words when it stops: it names what it had already put in place.
+    if ! templates_said=$("$bin" templates install --config "$config" 2>&1 </dev/null); then
+        templates_failed=$templates_said
+        [ -n "$templates_failed" ] || templates_failed="it said nothing"
         return 0
     fi
     # A program from before it named what it replaced answers without that list: there is then nothing to say.
@@ -964,13 +972,21 @@ report() {
         say "  templates brought up to this release: $templates_replaced"
         say "            (each was an earlier release's own file, not edited; a service that already runs is not changed)"
     fi
-    if [ -n "${templates_kept-}" ]; then
+    if [ -n "${templates_kept-}" ] && [ -n "${templates_older-}" ]; then
+        say "  templates kept as they are: $templates_kept"
+        say "            This run put an older program ($version) in place of a newer one ($was_version). These files"
+        say "            are that newer release's, or your own edits; either way this program does not replace them."
+    elif [ -n "${templates_kept-}" ]; then
         say "  templates kept as you edited them: $templates_kept"
         say "            To replace them with this release's, losing those edits:"
         say "              $templates_command --replace"
     fi
     if [ -n "${templates_failed-}" ]; then
-        say "  templates NOT checked: \`arca templates install\` failed. Run it to see why:"
+        say "  templates NOT finished: \`arca templates install\` stopped. Its words:"
+        printf '%s\n' "$templates_failed" | while IFS= read -r templates_line; do
+            say "              $templates_line"
+        done
+        say "            Run it again to finish; a template and its script may be of two releases until then:"
         say "              $templates_command"
     fi
     say "  service   $service_note"

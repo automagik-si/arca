@@ -948,13 +948,44 @@ fn an_upgrade_brings_the_templates_of_an_earlier_release_up_to_date_and_names_wh
     machine.run(&[]).ok().never_says("templates");
     machine.switch("program-without-replaced", false);
 
-    // A program whose step fails: said, with the command to run, and the install itself is not a failure.
+    // A program whose step stops: its own words are relayed, since they name what it had already put in place,
+    // with the command that finishes; and the install itself is not a failure.
     machine.switch("templates-install-fails", true);
     machine
         .run(&[])
         .ok()
-        .says("  templates NOT checked: `arca templates install` failed. Run it to see why:")
+        .says("  templates NOT finished: `arca templates install` stopped. Its words:")
+        .says("              arca: a template cannot be put in place (no space left). Already put in place by this run: postgres-autopg.json.")
+        .says("Run it again to finish; a template and its script may be of two releases until then:")
         .says(&format!("{bin} templates install --config {config_path}"));
+    machine.switch("templates-install-fails", false);
+
+    // A downgrade. The owner's edit is back, and `--version` puts an older program over this one (the release
+    // these tests call NEXT is an alpha, older than the one the script installs). What the older program keeps may
+    // be the newer release's own files, so the report does not call them edits, and gives no command that would
+    // replace them with the older release's.
+    fs::write(templates.join("nats.json"), "{}").expect("the owner's edit");
+    machine.release(NEXT);
+    let down = machine.run(&["--version", NEXT]);
+    down.ok()
+        .says("  templates kept as they are: nats.json")
+        .says(&format!(
+            "This run put an older program ({NEXT}) in place of a newer one ({}). These files",
+            current()
+        ))
+        .says("are that newer release's, or your own edits; either way this program does not replace them.")
+        .never_says("kept as you edited them")
+        .never_says("--replace");
+    assert_eq!(installed("nats.json"), "{}");
+    // And up again: a kept file is an edit once more, and the command that replaces it is given.
+    machine
+        .run(&["--version", &current()])
+        .ok()
+        .says("  templates kept as you edited them: nats.json")
+        .says(&format!(
+            "{bin} templates install --config {config_path} --replace"
+        ));
+    assert_eq!(installed("nats.json"), "{}");
 }
 
 #[test]
