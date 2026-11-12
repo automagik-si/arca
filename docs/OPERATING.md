@@ -398,6 +398,14 @@ the node could not read its token directory and keeps the tokens it had; or `cou
 the node did not say so within 30 seconds (a node older than this command reloads without saying so). Only `reloaded`
 exits 0.
 
+A node that is still starting is left alone: `serve` takes `SIGHUP` as the first thing it does, and until it has, the signal
+would end the process. `token reload` then answers `the node on this config (pid <n>) is still starting; nothing was
+signalled. Run this again in a moment`, and `token revoke` says the same on stderr and reports `reloadSignalled: false`.
+Run both as the node's own user: a node that another user runs is never signalled, and the answer says so (`no node of
+yours runs on this config`). The node is found by the config path its `serve` was started with, so a config file that
+was moved or renamed after the node started is not found, and the answer is that no node runs on it; give the path the
+node was started with, or restart the node on the new path.
+
 `arca token revoke <id>` removes the token's hash file. With `--config`, it sends `SIGHUP` to a live `arca serve` for that
 config: it checks `<stateDir>/serve.pid` only when its pid is a live `arca serve`, and otherwise finds the same process in
 `/proc`. The server writes that pid file as soon as its own unix socket is bound, before it serves a request, and removes

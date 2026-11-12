@@ -83,14 +83,29 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     let mut reload_signalled = false;
     if let Some(path) = flags.value("config") {
         let cfg = config::load(Path::new(path))?;
-        if let Some(pid) = serving_pid(Path::new(path), &cfg.state_dir) {
-            let sent = send_hangup(pid, Path::new(path));
-            if sent == Hangup::NoDescriptor {
-                eprintln!(
-                    "arca: the node was not signalled: {NO_DESCRIPTOR}. Restart the node for the revoke to take effect"
-                );
+        match serving_pid(Path::new(path), &cfg.state_dir) {
+            Some(pid) => {
+                let sent = send_hangup(pid, Path::new(path));
+                match sent {
+                    Hangup::Sent | Hangup::NotSent => {}
+                    Hangup::NoDescriptor => eprintln!(
+                        "arca: the node was not signalled: {NO_DESCRIPTOR}. Restart the node for the revoke to take effect"
+                    ),
+                    // A node that is starting may have read the token before its file went, and a signal now would end
+                    // it. So it is left alone, and the caller is told how to make sure.
+                    Hangup::Starting => eprintln!(
+                        "arca: the node on this config (pid {pid}) is still starting, so it was not signalled, and it may have read the token before this revoke. Run this in a moment to be sure: arca token reload --config {path}"
+                    ),
+                }
+                reload_signalled = sent == Hangup::Sent;
             }
-            reload_signalled = sent == Hangup::Sent;
+            None => {
+                if let Some(pid) = other_users_node(Path::new(path)) {
+                    eprintln!(
+                        "arca: no node of yours runs on this config, so none was signalled: one runs as another user (pid {pid}) and keeps the token until that user reloads or restarts it"
+                    );
+                }
+            }
         }
     }
     Ok(Some(json!({
@@ -119,9 +134,15 @@ pub fn reload_tokens(flags: &Flags) -> Result<Option<Value>, Failure> {
         ));
     }
     let Some(pid) = serving_pid(config_path, &cfg.state_dir) else {
-        return Err(Failure::Runtime(format!(
-            "no node runs on this config, so nothing was reloaded. A node reads its tokens when it starts: arca serve --config {config_text}"
-        )));
+        // A node another user runs is not this caller's to signal, root's included: say whose it is.
+        return Err(Failure::Runtime(match other_users_node(config_path) {
+            Some(other) => format!(
+                "no node of yours runs on this config, so nothing was reloaded: one runs as another user (pid {other}). Run this as that user"
+            ),
+            None => format!(
+                "no node runs on this config, so nothing was reloaded. A node reads its tokens when it starts: arca serve --config {config_text}"
+            ),
+        }));
     };
     let record_path = cfg.state_dir.join(SERVE_RELOAD_FILE);
     let before = ReloadRecord::read(&record_path).filter(|record| record.pid == pid);
@@ -130,6 +151,11 @@ pub fn reload_tokens(flags: &Flags) -> Result<Option<Value>, Failure> {
         Hangup::NoDescriptor => {
             return Err(Failure::Runtime(format!(
                 "could not tell whether the node on this config (pid {pid}) read its tokens: nothing was signalled, because {NO_DESCRIPTOR}. Restart the node to have it read its tokens"
+            )));
+        }
+        Hangup::Starting => {
+            return Err(Failure::Runtime(format!(
+                "the node on this config (pid {pid}) is still starting; nothing was signalled. Run this again in a moment"
             )));
         }
         Hangup::NotSent => {
@@ -166,7 +192,7 @@ pub fn reload_tokens(flags: &Flags) -> Result<Option<Value>, Failure> {
         }
         if Instant::now() >= deadline {
             return Err(Failure::Runtime(format!(
-                "could not tell whether the node on this config (pid {pid}) read its tokens: it was signalled and did not say so within {} seconds. A node older than this command reloads without saying so; a call with the new token shows whether it did",
+                "could not tell whether the node on this config (pid {pid}) read its tokens: it was signalled and did not say so within {} seconds. A node that is still starting says so once it is up, and a node older than this command reloads without saying so; a call with the new token shows whether it did",
                 RELOAD_WAIT.as_secs()
             )));
         }
@@ -193,6 +219,9 @@ enum Hangup {
     Sent,
     /// The process could not be held by a descriptor at all, so nothing was signalled.
     NoDescriptor,
+    /// The process is the node, but it does not catch SIGHUP yet: it is still starting, and the signal would end it.
+    /// Nothing was signalled.
+    Starting,
     /// The process was gone, was no longer the node, or refused the signal.
     NotSent,
 }
@@ -207,8 +236,9 @@ const NO_DESCRIPTOR: &str = "this kernel cannot signal through a pid descriptor 
 /// open; it is checked again while held, and the signal goes through the descriptor. A process that took over the number
 /// fails the second check, and a process that ended cannot be signalled through its descriptor.
 ///
-/// The order is the whole of the protection, so keep it: open the descriptor, THEN check, THEN signal through the
-/// descriptor. A check moved before the open, or a signal sent by pid number, brings the race back.
+/// The order is the whole of the protection, so keep it: open the descriptor, THEN check (who the process is, and that
+/// it catches the signal), THEN signal through the descriptor. A check moved before the open, or a signal sent by pid
+/// number, brings the race back.
 #[cfg(target_os = "linux")]
 fn send_hangup(pid: u32, config: &Path) -> Hangup {
     use rustix::io::Errno;
@@ -222,7 +252,16 @@ fn send_hangup(pid: u32, config: &Path) -> Hangup {
         Err(Errno::NOSYS | Errno::PERM) => return Hangup::NoDescriptor,
         Err(_) => return Hangup::NotSent,
     };
-    if pid_serves_config(pid, config) && pidfd_send_signal(&held, Signal::HUP).is_ok() {
+    if !pid_serves_config(pid, config) {
+        return Hangup::NotSent;
+    }
+    // Who the process is does not say that it is ready. Until `serve` has taken SIGHUP for itself, the signal's default
+    // action ends the process, and systemd counts that as a clean stop and leaves the node down. So the signal goes only
+    // to a process that catches it. A handler, once set, is never taken away, so this check cannot go stale.
+    if !catches_hangup(pid) {
+        return Hangup::Starting;
+    }
+    if pidfd_send_signal(&held, Signal::HUP).is_ok() {
         Hangup::Sent
     } else {
         Hangup::NotSent
@@ -256,12 +295,13 @@ fn serve_pid_for_config(config: &Path) -> Option<u32> {
 /// comes first, so another user's process is never a candidate, whatever its command line says.
 fn pid_serves_config(pid: u32, config: &Path) -> bool {
     let own = rustix::process::geteuid().as_raw();
-    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
-        return false;
-    };
-    if !status_names_owner(&status, own) {
-        return false;
-    }
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .is_ok_and(|status| status_names_owner(&status, own))
+        && pid_runs_serve_on(pid, config)
+}
+
+/// Whether the command line of the process `pid` is `arca serve` on `config`, whoever owns the process.
+fn pid_runs_serve_on(pid: u32, config: &Path) -> bool {
     let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
@@ -272,6 +312,32 @@ fn pid_serves_config(pid: u32, config: &Path) -> bool {
         .collect();
     let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok();
     serve_args_match_config(&args, cwd.as_deref(), config)
+}
+
+/// The pid of an `arca serve` on `config` that is NOT this user's, when there is one: for the words of a refusal only.
+/// Such a process is never signalled.
+fn other_users_node(config: &Path) -> Option<u32> {
+    fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|pid| pid_runs_serve_on(*pid, config) && !pid_serves_config(*pid, config))
+}
+
+/// Whether the process `pid` catches SIGHUP, read from `/proc/<pid>/status`.
+fn catches_hangup(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .is_ok_and(|status| status_catches_hangup(&status))
+}
+
+/// Whether the text of a `/proc/<pid>/status` says the process has a handler for SIGHUP: bit 0 of `SigCgt`, the mask of
+/// the signals it catches, since SIGHUP is signal 1.
+fn status_catches_hangup(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigCgt:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & 1 == 1)
 }
 
 /// Whether the text of a `/proc/<pid>/status` says the process's real uid and its effective uid are both `uid`.
@@ -521,6 +587,26 @@ mod pid_match_tests {
         assert!(!matches(&["arca", "serve"]));
         assert!(!matches(&["arca"]));
         assert!(!matches(&[]));
+    }
+
+    #[test]
+    fn a_process_is_ready_for_sighup_only_when_its_status_says_it_catches_it() {
+        let status = |caught: &str| {
+            format!("Name:\tarca\nSigIgn:\t0000000000001000\nSigCgt:\t{caught}\nCapInh:\t0\n")
+        };
+        // Bit 0 is SIGHUP. A node that has taken it, alone or among others.
+        assert!(status_catches_hangup(&status("0000000000000001")));
+        assert!(status_catches_hangup(&status("0000000000004003")));
+        // A node that has not yet: SIGTERM and SIGINT only, or nothing.
+        assert!(!status_catches_hangup(&status("0000000000004002")));
+        assert!(!status_catches_hangup(&status("0000000000000000")));
+        // Ignoring the signal is not catching it, and a status with no such line, or no mask, is not ready.
+        assert!(!status_catches_hangup(
+            "Name:\tarca\nSigIgn:\t0000000000000001\n"
+        ));
+        assert!(!status_catches_hangup(&status("not-hex")));
+        // This test process has no handler for SIGHUP.
+        assert!(!catches_hangup(std::process::id()));
     }
 
     #[test]

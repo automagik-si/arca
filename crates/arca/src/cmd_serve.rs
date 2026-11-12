@@ -162,6 +162,19 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         ));
     }
     let started = Instant::now();
+    // SIGHUP is taken before anything else is done. Left at its default it ends the process, and a start takes as long
+    // as the kernel's first reconcile: a `token reload`, or anything else that hangs up on the node in that time, would
+    // end it, and systemd counts that as a clean stop. A hangup that arrives during the start waits, and is answered
+    // with one reload as soon as the node is up. `arca token reload` and `revoke` read this handler as the sign that a
+    // node can be signalled at all.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::Runtime(e.to_string()))?;
+    let mut hangup = {
+        let _within = runtime.enter();
+        signal(SignalKind::hangup()).map_err(|e| Failure::Runtime(e.to_string()))?
+    };
     check_state_dir(&cfg.state_dir)?;
 
     // The alert rules are read before anything listens. A malformed alerts.json stops the start with exit 2.
@@ -586,17 +599,12 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         None => router,
     };
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Failure::Runtime(e.to_string()))?;
     let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
     let reload_path = cfg.state_dir.join(SERVE_RELOAD_FILE);
     let unix_path = cfg.listen.unix.clone();
     let outcome: io::Result<()> = runtime.block_on(async {
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
-        let mut hangup = signal(SignalKind::hangup())?;
         let reload_tokens = tokens.clone();
         let reload_dir = cfg.tokens.hash_dir.clone();
         let reload_record = reload_path.clone();

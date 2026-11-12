@@ -2377,3 +2377,77 @@ fn a_program_that_only_names_arcas_words_is_never_taken_for_the_node() {
     let answer: Value = serde_json::from_slice(&revoke.stdout).expect("the revoke's answer");
     assert_eq!(answer["reloadSignalled"], json!(false));
 }
+
+#[test]
+fn a_node_that_does_not_catch_sighup_yet_is_never_signalled_and_is_called_starting() {
+    use std::os::unix::process::CommandExt;
+    let scratch = Scratch::new("reload-starting");
+    let (config_path, _state) = config_with_state(&scratch);
+    // The config's token directory, for the token the revoke below removes.
+    token_dir(&scratch, "tokens");
+    let minted = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "start-1", "--out",
+        ])
+        .arg(scratch.at("start-1.secret"))
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    assert_eq!(minted.status.code(), Some(0), "{}", stderr_text(&minted));
+
+    // A process that is everything the check asks of a node: this user's, called arca, with the command line
+    // `arca serve --config <this config>`. But SIGHUP is at its default, as it is in a node that has only just started,
+    // so the signal would end it. `xargs` waits on its input, which the test holds open, and runs nothing.
+    let mut starting = Command::new("xargs")
+        .arg0("arca")
+        .args(["serve", "--config"])
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the starting node's stand-in");
+    let pid = starting.id();
+    let reload = arca()
+        .args(["token", "reload", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let after_reload = starting.try_wait().expect("poll").is_none();
+    let revoke = arca()
+        .args(["token", "revoke", "start-1", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let after_revoke = starting.try_wait().expect("poll").is_none();
+    let _ = starting.kill();
+    let _ = starting.wait();
+
+    assert!(
+        after_reload,
+        "token reload did not signal the starting node"
+    );
+    assert_eq!(reload.status.code(), Some(1), "{}", stderr_text(&reload));
+    assert!(reload.stdout.is_empty(), "nothing is claimed on stdout");
+    assert_eq!(
+        stderr_text(&reload),
+        format!(
+            "arca: the node on this config (pid {pid}) is still starting; nothing was signalled. Run this again in a moment\n"
+        )
+    );
+    assert!(
+        after_revoke,
+        "token revoke did not signal the starting node"
+    );
+    assert_eq!(revoke.status.code(), Some(0), "{}", stderr_text(&revoke));
+    let answer: Value = serde_json::from_slice(&revoke.stdout).expect("the revoke's answer");
+    assert_eq!(answer["reloadSignalled"], json!(false));
+    assert_eq!(
+        stderr_text(&revoke),
+        format!(
+            "arca: the node on this config (pid {pid}) is still starting, so it was not signalled, and it may have read the token before this revoke. Run this in a moment to be sure: arca token reload --config {}\n",
+            config_path.display()
+        )
+    );
+}
