@@ -121,6 +121,7 @@ refused without the value being echoed back.
 | `incus.local` | no | Whether `incus.socket` reaches the local Incus daemon. When absent, the node asks Incus `GET /1.0` for `environment.server_name` and compares it with the local host name: a match is local, a mismatch is remote. The socket path rule (the standard local daemon sockets) is the fallback only when `/1.0` or the host name cannot be read. An explicit value wins. See "Host metrics". |
 | `identityPhones` | no | Instance names the watch flags with `identity: true`. |
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
+| `listen.loopback` | no | One loopback address and port, such as `"127.0.0.1:7471"`, or `null`: the HTTP MCP door for a client on the same machine. It serves the MCP routes alone, never the approval page, to loopback peers that name it by its own address or as `localhost`. See below. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
 | `listen.proxy` | no | `{ "addr": "<ip>:<port>", "peer": "<ip>" }`, or `null`: one address for a reverse proxy on the same host, served to the single peer address `peer`. See below. |
 | `listen.services` | no | The path of a second unix socket, or `null`: the services socket. It serves the MCP routes alone, never the approval page, to the server's own user and to root. A service with kernel access connects to it. See below, and "A service that may talk to the kernel". |
@@ -151,6 +152,8 @@ The config is refused, with exit 2, when:
 - `approvalHost` is not a host name: one letter or digit, then up to 252 letters, digits, dots or hyphens;
 - `approvalOrigin` is not `https://`, a lowercase host name, and at most a non-443 port, with no path;
 - `canvasOrigin` is not `http://`, a literal loopback IP, and a nonzero port, with no path;
+- `listen.loopback` is not a loopback address (`127.0.0.0/8` or `::1`; a wildcard, a tailnet address, any other address
+  of the machine and an IPv4-mapped address are refused), or its port is 0, 80, 443, 7443 or 9443;
 - `listen.tailnet` is not a tailnet address: it must be a fixed port, not a wildcard, inside `100.64.0.0/10` or
   `fd7a:115c:a1e0::/48`, and not on port 80, 443, 7443 or 9443;
 - `listen.proxy.addr` is a wildcard, a tailnet address (IPv4-mapped included), port 0, or port 80, 443, 7443 or 9443;
@@ -172,6 +175,33 @@ The config is refused, with exit 2, when:
   which sets `kernel.bridged` beside `kernel.serviceCidr`, may list imports.
 
 No command reads Incus before the config passes these checks.
+
+### Loopback listener
+
+`listen.loopback` is the HTTP MCP door for a client on the same machine: an assistant that takes an MCP server URL and
+cannot open a unix socket. `"listen": { "unix": "...", "loopback": "127.0.0.1:7471" }` gives the URL
+`http://127.0.0.1:7471/mcp`. `scripts/install.sh` writes this key, on port 7471 or the next free port up to 7480. The
+key takes a loopback address and nothing else. No value of it reaches another machine: for that there is
+`listen.tailnet` or `listen.proxy`, each under its own rule.
+
+What the listener serves and refuses:
+
+- **The MCP routes alone.** `POST /mcp` and the read-only GET routes, each behind a bearer token: 401 without one. The
+  approval page is not on it: `/approve` and everything under it is 404, whatever `approvalOrigin` is.
+- **Loopback peers only.** A peer that is not a loopback address is closed at accept with no bytes sent.
+- **Only a request that names it.** The `Host` must be the listener's own address and port (`127.0.0.1:7471`) or
+  `localhost` and that port (`localhost:7471`), compared without regard to case. Every `Host` header a request carries
+  must be one of the two, and so must the authority of an absolute request target. Any other name, the same name with
+  another port or with none, and a request with no `Host` are 403 on every route, before the token is looked at and
+  before the body is read. This is what stops DNS rebinding: a web page loaded from a foreign name that is then pointed
+  at `127.0.0.1` sends that foreign name as its `Host`.
+- **No `Origin`.** As on every listener, a request that carries an `Origin` is 403, so a web page cannot call the node
+  from a browser.
+
+What it does not do. The connection is plain HTTP, which on loopback never leaves the machine. Every user and every
+process of the machine can connect to the port; without a token each gets 401, and the token's file is readable by the
+node's user alone. A client that is given the token keeps it in its own config. A port that is in use when `serve`
+starts stops the server with exit 1, naming the address; it is not tried again.
 
 ### Tailnet listener
 
@@ -481,7 +511,8 @@ A create of such a template is refused, before anything is written, unless all o
 - **The node has the socket.** `listen.services` must be set. When it is not, the refusal says what to set:
   `"listen": { "services": "/run/arca/services.sock" }` (a path beside `listen.unix`) in the node's config, then restart
   `serve`. No other listener stands in for it: the unix socket, the tailnet listener and `listen.proxy` may carry the
-  approval page, whose routes need no token, so no device is ever pointed at one of them. A node that serves its
+  approval page, whose routes need no token, so no device is ever pointed at one of them, and `listen.loopback` is a
+  TCP port, which another program could take while the server is down. A node that serves its
   approval page and has `listen.services` gives kernel access like any other.
 - **The owner approved it.** Such a service is created only from a proposal: `action_propose` with `service_create`,
   then the owner's approval. A direct `service_create` of such a template is refused with `NotApproved`, whatever the
@@ -749,8 +780,8 @@ them would change nothing a user sees. They move to `2026-07-28` before `2025-11
   sign; nothing written) or `changed`. No line is echoed. It is a doctor verb that writes, served only by a kernel whose
   `approval.peerKeys` is set; see "Approving on another machine".
 
-`serve` listens on the unix socket, and on the tailnet and proxy addresses and the services socket when the config names
-them. If any listener
+`serve` listens on the unix socket, and on the loopback, tailnet and proxy addresses and the services socket when the
+config names them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
 SIGHUP reloads the bearer token store only; it does not reread the node config or the owner passkeys.
 A socket that another server answers on is left alone.

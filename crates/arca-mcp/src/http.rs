@@ -12,6 +12,9 @@
 //! peer outside them is dropped before any byte is read or written. The proxy listener binds one fixed address outside the
 //! tailnet ranges for a reverse proxy on the same host, and serves exactly one peer address; any other peer is dropped the
 //! same way. The proxy address may not be assigned yet when the server starts, so its bind is tried again for a while. The
+//! loopback listener binds one loopback address for clients on the same machine, serves loopback peers only, and answers
+//! only a request whose `Host` is the listener's own address or `localhost` with its port: a name that merely resolves to
+//! loopback (DNS rebinding) is refused `403` on every route. The
 //! services socket is a second unix socket, bound the same way as the first, that also serves root: Incus connects to it
 //! for a service with kernel access. Each listener serves at most [`MAX_CONNECTIONS`] connections at once, counted for
 //! that listener alone.
@@ -383,6 +386,73 @@ pub async fn serve_proxy(router: Router, addr: SocketAddr, peer: IpAddr) -> io::
     .await
 }
 
+/// Serves `router` on one loopback address, for clients on the same machine. The address must pass
+/// [`loopback_addr_ok`]. Three rules hold on this listener, whatever routes `router` carries:
+///
+/// - only a loopback peer is served, and any other is closed at accept with no bytes sent;
+/// - a request must name the listener by its own address and port or by `localhost` and that port (see [`host_named`]);
+///   any other `Host` is `403` before a route, the bearer check or the body is reached. A page a browser loaded from a
+///   foreign name that was then pointed at loopback (DNS rebinding) sends that foreign name as its `Host`, so it reaches
+///   nothing here, with or without an `Origin`;
+/// - the bearer and `Origin` rules of `router` are unchanged.
+///
+/// A bind error, a port in use among them, fails at once and names the address.
+pub async fn serve_loopback(router: Router, addr: SocketAddr) -> io::Result<()> {
+    loopback_addr_ok(&addr).map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
+    let listener = TcpListener::bind(addr).await.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("the loopback address {addr}: {error}"),
+        )
+    })?;
+    let hosts = Arc::new(loopback_hosts(&listener.local_addr()?));
+    let router = router.layer(middleware::from_fn_with_state(hosts, require_host));
+    serve_filtered(router, listener, |ip: &IpAddr| {
+        ip.to_canonical().is_loopback()
+    })
+    .await
+}
+
+/// The two names a request may give the loopback listener at `addr`: the address and port as a `Host` header writes them
+/// (`127.0.0.1:7471`, `[::1]:7471`), and `localhost` with the same port.
+fn loopback_hosts(addr: &SocketAddr) -> [String; 2] {
+    [addr.to_string(), format!("localhost:{}", addr.port())]
+}
+
+/// Refuses, before anything else runs, a request that does not name one of `hosts`.
+async fn require_host(
+    State(hosts): State<Arc<[String; 2]>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !host_named(&hosts[..], request.headers(), request.uri()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
+/// Whether a request names one of `hosts` and nothing else. Every `Host` header it carries must be one of them, and so
+/// must the authority of its target when the target has one (an absolute target, or HTTP/2's `:authority`); a request
+/// with neither names nobody. Names are compared without regard to ASCII case, and the port is part of the name: `Host:
+/// localhost` alone, or another port, is not this listener.
+fn host_named(hosts: &[String], headers: &HeaderMap, uri: &Uri) -> bool {
+    let listed = |name: &str| hosts.iter().any(|host| host.eq_ignore_ascii_case(name));
+    let mut named = false;
+    for value in headers.get_all(header::HOST) {
+        if !value.to_str().is_ok_and(listed) {
+            return false;
+        }
+        named = true;
+    }
+    if let Some(authority) = uri.authority() {
+        if !listed(authority.as_str()) {
+            return false;
+        }
+        named = true;
+    }
+    named
+}
+
 /// How a bind is tried again: for `wait` from the first try, pausing `first`, then twice as long each time, up to `max`.
 #[derive(Debug, Clone, Copy)]
 struct Backoff {
@@ -639,6 +709,28 @@ pub fn proxy_addr_ok(addr: &SocketAddr) -> Result<(), String> {
     }
     if in_tailnet(&ip) {
         return Err("a tailnet address is never a proxy listener".into());
+    }
+    Ok(())
+}
+
+/// Whether `addr` may be the loopback listener: a fixed, unreserved port on a loopback address (`127.0.0.0/8` or `::1`).
+/// A wildcard, a tailnet address, any other address of the machine and an IPv4-mapped IPv6 address are all refused: an
+/// address another machine can reach is the tailnet listener's or the proxy listener's, each under its own rule.
+pub fn loopback_addr_ok(addr: &SocketAddr) -> Result<(), String> {
+    let port = addr.port();
+    if port == 0 {
+        return Err("the loopback port must be a fixed number".into());
+    }
+    if RESERVED_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is reserved and never a loopback listener"
+        ));
+    }
+    if !addr.ip().is_loopback() {
+        return Err(
+            "the address is not a loopback address: only 127.0.0.0/8 and ::1 are, and no other address is served here"
+                .into(),
+        );
     }
     Ok(())
 }
