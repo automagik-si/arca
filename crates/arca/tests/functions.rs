@@ -1753,6 +1753,10 @@ fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_r
         "registry+credential"
     );
     assert!(!line.to_string().contains(&word));
+    // Incus made the image's record anew, with the address and auto_update on: it is turned off again.
+    let again = credentialed(&rig);
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert_eq!(again[0]["auto_update"], false);
 
     // A card approved after the credential was removed no longer says what would happen: it does not run.
     let mut tock = relay_args();

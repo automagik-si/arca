@@ -181,19 +181,49 @@ impl FunctionRun {
         }
         // A registry that asks for a credential is named with it, in the address that is sent and nowhere else.
         let mut sent = source.clone();
-        if let Some(address) = registry
-            .and_then(|registry| registry.address(source["server"].as_str().unwrap_or_default()))
-        {
+        let address = registry
+            .and_then(|registry| registry.address(source["server"].as_str().unwrap_or_default()));
+        let with_credential = address.is_some();
+        if let Some(address) = address {
             sent["server"] = json!(address);
         }
         match self
             .changer
             .rebuild(&fresh.project, &fresh.name, &json!({ "source": sent }))
         {
-            Ok(()) => Ok(FreshRoot::Registry),
+            Ok(()) => {
+                if with_credential {
+                    self.keep_from_the_registry(&fresh, fingerprint);
+                }
+                Ok(FreshRoot::Registry)
+            }
             Err(remote) => Err(refused(&format!(
                 "the node's own copy of the image is gone, and the registry did not give it again: {remote}"
             ))),
+        }
+    }
+
+    /// After a rebuild that fetched the image again with a registry's credential: Incus made a new record for it, with
+    /// the address it was fetched from and `auto_update` on, as it does for every image it fetches. It is turned off,
+    /// as the writer turns it off at a create, so Incus does not go back to the registry with that address by
+    /// itself. The image is the one the instance names now, or the one its function's record took.
+    fn keep_from_the_registry(&self, rebuilt: &InstanceState, recorded: Option<&str>) {
+        let named = self
+            .changer
+            .read(&rebuilt.project, &rebuilt.name)
+            .ok()
+            .and_then(|now| now.own_config.get("volatile.base_image").cloned())
+            .filter(|image| self::fingerprint(image));
+        let done = named.as_deref().or(recorded).is_some_and(|image| {
+            self.changer
+                .image_auto_update_off(&rebuilt.project, image)
+                .is_ok()
+        });
+        if !done {
+            eprintln!(
+                "arca: auto_update could not be turned off on the image {} was rebuilt from: Incus may ask its registry again by itself",
+                rebuilt.name
+            );
         }
     }
 

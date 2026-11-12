@@ -2809,7 +2809,8 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
 
 /// Rebuilds a stopped instance's root from an image, as an operation, and records which image the request named: the
 /// store's copy by fingerprint (`store`) or a registry's by alias (`registry`). A running instance is refused, and
-/// so is what a test set with [`FakeIncus::lose_image`] or [`FakeIncus::refuse_rebuild`]. The fake keeps no root.
+/// so is what a test set with [`FakeIncus::lose_image`] or [`FakeIncus::refuse_rebuild`]. The fake keeps no root; a
+/// rebuild from a registry leaves the image's record in the store, as a fetch does.
 fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Address) -> Answer {
     let bad = |message: &str| (400, String::new(), error_envelope(400, message));
     let Some(index) = store.find(address) else {
@@ -2878,6 +2879,29 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
     {
         config.remove("volatile.idmap.next");
         config.remove("volatile.last_state.idmap");
+    }
+    // A rebuild that names a registry fetches the image again: Incus makes its record anew, with the address it was
+    // asked at and `auto_update` on, and the instance names it.
+    if let Some(source) = sent.get("source").filter(|_| !local)
+        && let Some(server) = source.get("server").and_then(Value::as_str)
+    {
+        let alias = source.get("alias").and_then(Value::as_str).unwrap_or("");
+        let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
+        store.put_image_from(
+            &address.project,
+            fingerprint.clone(),
+            alias,
+            true,
+            Some(server),
+        );
+        if let Some(config) = store.objects[index]
+            .body
+            .get_mut("config")
+            .and_then(Value::as_object_mut)
+            && config.contains_key("volatile.base_image")
+        {
+            config.insert("volatile.base_image".to_string(), json!(fingerprint));
+        }
     }
     answered(shared, store, "instance", "PUT", Ok(()))
 }

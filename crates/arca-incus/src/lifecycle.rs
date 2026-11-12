@@ -259,6 +259,24 @@ impl StateChanger {
         }
     }
 
+    /// Tells Incus not to go back by itself to where a cached image came from. For [`crate::function_run`] alone: an
+    /// image fetched again with a registry's credential keeps the address it was fetched from, and an image by
+    /// digest never changes.
+    pub(crate) fn image_auto_update_off(
+        &self,
+        project: &str,
+        fingerprint: &str,
+    ) -> Result<(), IncusError> {
+        self.allow(project)?;
+        if !plain_name(project) || !plain_name(fingerprint) {
+            return Err(refused("the project or the fingerprint is not plain"));
+        }
+        let url = format!("/1.0/images/{fingerprint}?project={project}");
+        let envelope =
+            checked_envelope(self.send("PATCH", &url, Some(&json!({ "auto_update": false })))?)?;
+        self.wait_for(&envelope)
+    }
+
     /// Deletes one cached image from the store the project reads, when no instance of the project says it was made
     /// from it. Returns whether it was deleted. For [`crate::function_run`] alone.
     pub(crate) fn delete_unused_image(
