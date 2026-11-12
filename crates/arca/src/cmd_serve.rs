@@ -545,17 +545,22 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The services socket serves the MCP routes alone: a service with kernel access connects to it, and it never
     // carries the approval page, whose routes need no token. It is taken here, before the page is merged anywhere.
     let services_router = router.clone();
-    // The loopback listener is a TCP port every process of the machine can reach, so it carries the MCP routes alone
-    // too: every one of them needs a bearer token, and the page's routes need none.
-    let loopback_router = router.clone();
-    let proxy_router = match &page {
-        Some(page) => router.clone().merge(page.router(true)),
+    let with_page = |trust_forwarded_for: bool| match &page {
+        Some(page) => router.clone().merge(page.router(trust_forwarded_for)),
         None => router.clone(),
     };
-    let router = match &page {
-        Some(page) => router.merge(page.router(false)),
-        None => router,
+    // Where the page is served depends on its origin. An https page is reached through the tailnet listener or a
+    // reverse proxy, and never on the loopback listener, where a browser could not use it and every process of the
+    // machine could read its cards. The page of this machine alone (`http://localhost:<port>`) is the opposite: it
+    // is on the loopback listener, behind that listener's Host rule, and on no address another machine reaches.
+    let local_page = config::page_is_local(&cfg);
+    let (loopback_router, tailnet_router, proxy_router) = if local_page {
+        (with_page(false), router.clone(), router.clone())
+    } else {
+        (router.clone(), with_page(false), with_page(true))
     };
+    // The unix socket carries the page as before.
+    let router = with_page(false);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -611,7 +616,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         };
         let tailnet = async {
             match cfg.listen.tailnet {
-                Some(addr) => serve_tailnet(router.clone(), addr).await,
+                Some(addr) => serve_tailnet(tailnet_router.clone(), addr).await,
                 None => std::future::pending().await,
             }
         };

@@ -708,6 +708,80 @@ fn a_passkey_line_is_kept_with_its_number_rp_origin_and_fingerprint_when_it_list
 }
 
 #[test]
+fn http_localhost_with_a_port_is_the_one_origin_without_tls_a_passkey_answers_from() {
+    // The page of a node on its own machine: rp localhost, origin http://localhost:<port>.
+    let mut key = SoftPasskey::from_seed(1);
+    key.rp_id = "localhost".to_string();
+    key.origin = "http://localhost:7471".to_string();
+    let lines = parse_passkeys(key.line(ARCA_NAMESPACE).as_bytes()).expect("the line parses");
+    assert_eq!(lines[0].rp_id, "localhost");
+    assert_eq!(lines[0].origin, "http://localhost:7471");
+    assert_eq!(
+        arca_approval::format_passkey_line(
+            "localhost",
+            "http://localhost:7471",
+            &key.cred_text(),
+            &key.key_text()
+        )
+        .as_deref(),
+        // The fixture's line ends with a comment; a written line has none.
+        Ok(key.line(ARCA_NAMESPACE).trim_end_matches(" test-passkey"))
+    );
+
+    // It approves as any passkey does, and only from its own origin: the same page under the IP address, on another
+    // port or over https is another origin, and its assertion is refused.
+    let (_scratch, mut v) = verifier_of("localhost-line", &key);
+    assert!(check(&mut v, &genuine(&key, &statement(NONCE))).is_ok());
+    for (nonce, other) in [
+        (NONCE_B, "http://127.0.0.1:7471"),
+        (NONCE_C, "http://localhost:7472"),
+        (NONCE_D, "https://localhost:7471"),
+    ] {
+        let bent = approve(&key, &statement(nonce), |a| {
+            a.origin = Some(other.to_string());
+        });
+        assert_eq!(check(&mut v, &bent), Err(WrongOrigin), "{other}");
+    }
+
+    // No other http origin is a line: no port, the port a browser leaves out, a path, a name under localhost, another
+    // name, an IP address, and localhost's origin under another rp.
+    for (rp, origin) in [
+        ("localhost", "http://localhost"),
+        ("localhost", "http://localhost:80"),
+        ("localhost", "http://localhost:0"),
+        ("localhost", "http://localhost:07471"),
+        ("localhost", "http://localhost:7471/"),
+        ("localhost", "http://localhost:7471x"),
+        ("localhost", "http://a.localhost:7471"),
+        ("a.localhost", "http://a.localhost:7471"),
+        ("localhost", "http://127.0.0.1:7471"),
+        ("box1.example.com", "http://box1.example.com:7471"),
+        ("box1.example.com", "http://localhost:7471"),
+        ("a.localhost", "http://localhost:7471"),
+    ] {
+        key.rp_id = rp.to_string();
+        key.origin = origin.to_string();
+        assert!(
+            parse_passkeys(key.line(ARCA_NAMESPACE).as_bytes()).is_err(),
+            "rp {rp} with origin {origin} must not be a line"
+        );
+        assert!(
+            arca_approval::format_passkey_line(rp, origin, &key.cred_text(), &key.key_text())
+                .is_err(),
+            "rp {rp} with origin {origin} must not be written"
+        );
+    }
+    assert_eq!(
+        arca_approval::localhost_origin_port("http://localhost:7471"),
+        Some(7471)
+    );
+    assert_eq!(
+        arca_approval::localhost_origin_port("https://localhost:7471"),
+        None
+    );
+}
+
+#[test]
 fn a_malformed_or_repeated_line_refuses_the_whole_file_by_its_number_alone() {
     let key = SoftPasskey::from_seed(1);
     let line = key.line(ARCA_NAMESPACE);

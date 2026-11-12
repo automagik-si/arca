@@ -456,7 +456,35 @@ impl Rig {
         Self::build_full(tag, true, true, false, idle, total)
     }
 
+    /// The page of a node on its own machine, with no passkey yet: the origin is [`LOCAL_ORIGIN`] and the key that comes
+    /// back is a browser's at that origin, for the rp `localhost`.
+    fn new_local(tag: &str) -> (Rig, SoftPasskey) {
+        Self::build_at(
+            LOCAL_ORIGIN,
+            tag,
+            true,
+            false,
+            false,
+            TEST_CHAT_IDLE,
+            TEST_CHAT_TOTAL,
+        )
+    }
+
     fn build_full(
+        tag: &str,
+        with_page: bool,
+        enrolled: bool,
+        refusing: bool,
+        chat_idle: Duration,
+        chat_total: Duration,
+    ) -> (Rig, SoftPasskey) {
+        Self::build_at(
+            ORIGIN, tag, with_page, enrolled, refusing, chat_idle, chat_total,
+        )
+    }
+
+    fn build_at(
+        origin: &str,
         tag: &str,
         with_page: bool,
         enrolled: bool,
@@ -467,7 +495,11 @@ impl Rig {
         let scratch = Scratch::new(tag);
         let upstream = TestUpstream::start();
         let fake = start_fake(&scratch);
-        let key = SoftPasskey::from_seed(1);
+        let mut key = SoftPasskey::from_seed(1);
+        if origin == LOCAL_ORIGIN {
+            key.rp_id = "localhost".to_string();
+            key.origin = origin.to_string();
+        }
         let lines = if enrolled {
             format!("{}\n", key.line(NAMESPACE))
         } else {
@@ -501,7 +533,7 @@ impl Rig {
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
         let clock = Arc::new(AtomicU64::new(NOW));
         let requests = Arc::new(
-            ApprovalRequests::open(&state_dir, Some(format!("{ORIGIN}/approve")), NOW)
+            ApprovalRequests::open(&state_dir, Some(format!("{origin}/approve")), NOW)
                 .expect("the approval requests open"),
         );
         let display = Arc::new(FakeDisplay::default());
@@ -517,7 +549,7 @@ impl Rig {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let captured_logs = Arc::clone(&logs);
         let page = approve_page::Page::new(
-            ORIGIN.to_string(),
+            origin.to_string(),
             Arc::clone(&kernel),
             clock_fn,
             state_dir.clone(),
@@ -902,6 +934,9 @@ impl Rig {
         self.state_dir.join(STATE_PASSKEYS_FILE)
     }
 }
+
+/// The page origin of a node on its own machine's loopback listener.
+const LOCAL_ORIGIN: &str = "http://localhost:7471";
 
 fn sign_in_statement(origin: &str, challenge: &str, now: u64) -> String {
     canonical_json(&json!({
@@ -1656,6 +1691,60 @@ fn setup_code_enrols_the_first_passkey_and_approval_works_without_restart() {
     let (status, answer) = rig.post(
         "/approve/approve",
         Some(ORIGIN),
+        json!({ "plan": plan, "approval": approval(&key, &statement) }),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 1);
+}
+
+#[test]
+fn the_page_at_http_localhost_enrols_a_passkey_for_the_rp_localhost_and_approves_from_that_origin_alone()
+ {
+    let (rig, key) = Rig::new_local("page-local-origin");
+    // The page's POSTs take its exact origin: the IP address is another origin, and so is https.
+    for other in [
+        "http://127.0.0.1:7471",
+        "http://localhost:7472",
+        "https://localhost:7471",
+        ORIGIN,
+    ] {
+        assert_eq!(
+            rig.post_empty("/approve/setup-code", Some(other)).0,
+            403,
+            "{other}"
+        );
+    }
+    assert_eq!(
+        rig.post_empty("/approve/setup-code", Some(LOCAL_ORIGIN)).0,
+        200
+    );
+    let code = rig.last_code();
+    let (status, answer) = rig.post(
+        "/approve/register",
+        Some(LOCAL_ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let lines = load_state_passkeys(&rig.state_path()).expect("the state line loads");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].rp_id, "localhost");
+    assert_eq!(lines[0].origin, LOCAL_ORIGIN);
+
+    // An assertion a browser made at the IP address names that origin, and is no approval here.
+    let (plan, statement) = rig.waiting_plan();
+    let mut elsewhere = Assert::over(NAMESPACE, statement.as_bytes());
+    elsewhere.origin = Some("http://127.0.0.1:7471".to_string());
+    let (status, _) = rig.post(
+        "/approve/approve",
+        Some(LOCAL_ORIGIN),
+        json!({ "plan": plan, "approval": passkey_approval(&statement, &key.assert(&elsewhere)) }),
+    );
+    assert!(refusal(status), "{status}");
+    assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
+    // The same passkey at the page's own origin approves.
+    let (status, answer) = rig.post(
+        "/approve/approve",
+        Some(LOCAL_ORIGIN),
         json!({ "plan": plan, "approval": approval(&key, &statement) }),
     );
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));

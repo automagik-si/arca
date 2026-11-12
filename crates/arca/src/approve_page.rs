@@ -8,16 +8,8 @@
 //! is unchanged, and this router is merged into its result in `cmd_serve`.
 //!
 //! `approvalOrigin` is the page origin and the WebAuthn rp id. It is not the host an approval statement names: the statement
-//! host stays `approval_host(&cfg)`.
-//!
-//! With an owner approval request store (`Page::with_approval_requests`), the page lists the requests agents made with
-//! `owner_approval_request` in their own section, as data, and approves one with one tap: `POST /approve/requests/begin`
-//! mints the statement, the passkey signs it, and `POST /approve/requests/approve` takes the request id, that statement and
-//! the proof (see `crate::approval_requests`). `POST /approve/requests/deny` declines one without a passkey.
-//!
-//! With `approval.linkedHosts`, the page also lists the waiting action proposals of other kernels on this machine and relays
-//! the owner's signed approval or decline for one of them to that kernel over its own socket (see `crate::linked`). The page
-//! never checks or spends another kernel's approval, and never asks its own kernel about another kernel's id.
+//! host stays `approval_host(&cfg)`. The origin is `https://` and a host name, or `http://localhost:<port>`, the page of a
+//! node on its own machine's loopback listener, whose rp id is `localhost`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -253,12 +245,16 @@ impl Page {
         state_dir: PathBuf,
         display: Arc<dyn SetupCodeDisplay>,
     ) -> Self {
-        let rp_id = origin
-            .strip_prefix("https://")
-            .and_then(|authority| authority.split(':').next())
-            .filter(|host| !host.is_empty())
-            .expect("approvalOrigin is validated before the page router is built")
-            .to_string();
+        let rp_id = if arca_approval::localhost_origin_port(&origin).is_some() {
+            arca_approval::LOCALHOST_RP.to_string()
+        } else {
+            origin
+                .strip_prefix("https://")
+                .and_then(|authority| authority.split(':').next())
+                .filter(|host| !host.is_empty())
+                .expect("approvalOrigin is validated before the page router is built")
+                .to_string()
+        };
         let base_passkeys = kernel
             .lock()
             .map(|kernel| kernel.owner_passkey_lines())

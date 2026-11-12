@@ -45,8 +45,9 @@ pub struct NodeConfig {
     /// The host name every owner approval statement names. When it is not set, the system's host name is used.
     #[serde(default)]
     pub approval_host: Option<String>,
-    /// The page origin the owner approval page is served at: `https://` plus a host name and at most a non-443 port.
-    /// It is the WebAuthn rp id and origin; it is not the host an approval statement names.
+    /// The page origin the owner approval page is served at: `https://` plus a host name and at most a non-443 port, or
+    /// `http://localhost:<port>` where `<port>` is `listen.loopback`'s, the page of a node on its own machine with no
+    /// domain and no certificate. It is the WebAuthn rp id and origin; it is not the host an approval statement names.
     #[serde(default)]
     pub approval_origin: Option<String>,
     /// The loopback DSH origin the remote canvas proxies: `http://127.0.0.1:3081` by default. A literal loopback IP and port
@@ -388,8 +389,12 @@ pub enum ConfigError {
     ScratchPrefix(String),
     /// The approval host is not a host name. The value is left out of the message.
     ApprovalHost,
-    /// The approval origin is not an https origin with a host name and at most a non-443 port. The value is left out.
+    /// The approval origin is not an https origin with a host name and at most a non-443 port, nor the localhost origin.
+    /// The value is left out.
     ApprovalOrigin,
+    /// The approval origin is `http://localhost:<port>`, and `listen.loopback` is not set, is not on that port, or is not
+    /// an address `localhost` names. The value is left out.
+    ApprovalOriginLoopback,
     /// The canvas origin is not an http literal loopback IP and port. The value is left out.
     CanvasOrigin,
     /// Kernel projects are named, and no droidd project is listed to exclude.
@@ -462,7 +467,11 @@ impl fmt::Display for ConfigError {
             ),
             Self::ApprovalOrigin => write!(
                 f,
-                "approvalOrigin is refused: it must be https://, a lowercase host name, and at most a non-443 port, with no path"
+                "approvalOrigin is refused: it must be https://, a lowercase host name, and at most a non-443 port, with no path; or http://localhost:<port> with the port of listen.loopback, never an IP address"
+            ),
+            Self::ApprovalOriginLoopback => write!(
+                f,
+                "approvalOrigin is refused: http://localhost:<port> is the page on this machine's loopback listener, so listen.loopback must be set to 127.0.0.1 or [::1] on that same port"
             ),
             Self::CanvasOrigin => write!(
                 f,
@@ -573,10 +582,22 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::ApprovalHost);
     }
-    if let Some(origin) = &config.approval_origin
-        && !approval_origin_ok(origin)
-    {
-        return Err(ConfigError::ApprovalOrigin);
+    if let Some(origin) = &config.approval_origin {
+        match arca_approval::localhost_origin_port(origin) {
+            // The page of this machine alone: it is served on the loopback listener, on the address `localhost`
+            // names and on the port the origin names, or nowhere.
+            Some(port) => {
+                if !config
+                    .listen
+                    .loopback
+                    .is_some_and(|addr| addr.port() == port && localhost_names(&addr.ip()))
+                {
+                    return Err(ConfigError::ApprovalOriginLoopback);
+                }
+            }
+            None if !approval_origin_ok(origin) => return Err(ConfigError::ApprovalOrigin),
+            None => {}
+        }
     }
     if canvas_origin_addr(&config.canvas_origin).is_none() {
         return Err(ConfigError::CanvasOrigin);
@@ -685,8 +706,25 @@ pub fn canvas_origin_addr(origin: &str) -> Option<SocketAddr> {
     (addr.ip().is_loopback() && addr.port() != 0).then_some(addr)
 }
 
+/// Whether `ip` is an address the name `localhost` stands for: `127.0.0.1` or `::1`. Another loopback address
+/// (`127.0.0.2`) is a loopback listener's to take, and no browser reaches it as `localhost`.
+fn localhost_names(ip: &IpAddr) -> bool {
+    *ip == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        || *ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+}
+
+/// Whether the config's page is the page of this machine alone: `approvalOrigin` is `http://localhost:<port>`. Such a page
+/// is served on the loopback listener and the unix socket, and on no listener another machine reaches.
+pub fn page_is_local(config: &NodeConfig) -> bool {
+    config
+        .approval_origin
+        .as_deref()
+        .is_some_and(|origin| arca_approval::localhost_origin_port(origin).is_some())
+}
+
 /// Whether `origin` is `https://`, a lowercase DNS host name, and at most a port that is not 443, with no path. The host is
-/// the WebAuthn rp id, so the passkeys file's stricter DNS rule applies here too.
+/// the WebAuthn rp id, so the passkeys file's stricter DNS rule applies here too. `approval.origins` and
+/// `approval.peerKeys.origins` take this form alone: the localhost origin is `approvalOrigin`'s only.
 fn approval_origin_ok(origin: &str) -> bool {
     let Some(authority) = origin.strip_prefix("https://") else {
         return false;
@@ -1203,6 +1241,73 @@ mod tests {
                 "{said}"
             );
         }
+    }
+
+    #[test]
+    fn the_localhost_approval_origin_needs_the_loopback_listener_on_its_port_and_no_other_http_origin_passes()
+     {
+        let with = |origin: &str, loopback: Option<&str>| {
+            let mut config = config_with(None);
+            config.approval_origin = Some(origin.to_string());
+            config.listen.loopback = loopback.map(|addr| addr.parse().expect("a socket address"));
+            check(&config)
+        };
+        // The page of this machine: the loopback listener, on an address localhost names, on the origin's port.
+        assert_eq!(
+            with("http://localhost:7471", Some("127.0.0.1:7471")),
+            Ok(())
+        );
+        assert_eq!(with("http://localhost:7471", Some("[::1]:7471")), Ok(()));
+        for (origin, loopback) in [
+            ("http://localhost:7471", None),
+            ("http://localhost:7471", Some("127.0.0.1:7472")),
+            ("http://localhost:7471", Some("127.0.0.2:7471")),
+        ] {
+            assert_eq!(
+                with(origin, loopback),
+                Err(ConfigError::ApprovalOriginLoopback),
+                "{origin} beside {loopback:?}"
+            );
+        }
+        // Every other http origin stays refused, with the loopback listener there or not: an IP address, another
+        // name, a name under localhost, no port, the port a browser leaves out, a path, and the wrong case.
+        for origin in [
+            "http://127.0.0.1:7471",
+            "http://[::1]:7471",
+            "http://example.com:7471",
+            "http://arca.localhost:7471",
+            "http://localhost",
+            "http://localhost:80",
+            "http://localhost:07471",
+            "http://localhost:7471/",
+            "http://localhost:7471/approve",
+            "http://LOCALHOST:7471",
+            "http://user@localhost:7471",
+        ] {
+            for loopback in [None, Some("127.0.0.1:7471")] {
+                assert_eq!(
+                    with(origin, loopback),
+                    Err(ConfigError::ApprovalOrigin),
+                    "{origin} beside {loopback:?}"
+                );
+            }
+        }
+        // An https origin does not need the loopback listener, and is not changed by it.
+        assert_eq!(with("https://arca.example.com", None), Ok(()));
+        assert_eq!(
+            with("https://arca.example.com", Some("127.0.0.1:7471")),
+            Ok(())
+        );
+        // The origins a kernel trusts another kernel's passkeys from stay https only.
+        let mut config = config_with(None);
+        config.approval = Some(ApprovalConfig {
+            trust_owner_keys_from: vec![PathBuf::from("/nonexistent/owner-passkeys")],
+            origins: vec!["http://localhost:7471".to_string()],
+            ..Default::default()
+        });
+        assert!(matches!(check(&config), Err(ConfigError::Approval(_))));
+        let said = ConfigError::ApprovalOriginLoopback.to_string();
+        assert!(said.contains("listen.loopback"), "{said}");
     }
 
     #[test]
