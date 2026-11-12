@@ -1872,8 +1872,10 @@ profile names no storage pool; no address is free; and whatever Incus itself ref
 the instance. An instance that carries Arca's marks and that the node holds no record of is adopted first, and the
 create then answers `service <name> exists`. The node's own disk can refuse too: the deploy journal or the
 service's secrets cannot be written. So can anything that changed while the card waited: the template (see above), the room, the name, a
-deploy that closed, or a restart of the node with another config. A node that only looks records a proposal as
-before, and its create is refused.
+deploy that closed, or a restart of the node with another config. On a node that only looks, two of the checks
+above are not made when a create is proposed: the config's service project, and the virtual-machine count against
+what the node holds. Its create answers that the node only looks, so a proposal those two alone would refuse is
+recorded there as before. Everything else in the list, and the room, is refused there as on any other node.
 
 A token's own `service_create` shows no card and binds nothing, as before. It may state `templateDigest` or `image`
 itself, and is then refused when the node's template differs. Not part of the fingerprint: why a service is created
@@ -3462,6 +3464,32 @@ value in words, so an address is seen before it is approved. A list has one row 
 1`, `Setting classes 2`), each with its fields, so a long list is shown whole. The card cuts nothing: a proposal whose
 setting would need a row of more than 160 characters is refused when it is made, naming the row, and nothing is asked
 of the owner. The service's record keeps the replaced values as `vm.settings`.
+
+**What must hold between settings.** A template may also say what must hold between its settings, in
+`settingRules`, so that a create the machine itself would refuse at its first boot is refused before anything is
+made, and its proposal before any card is shown:
+
+```json
+"settingRules": [
+  { "need": "maxSlots", "atLeast": { "count": "classes" }, "why": "every class is kept one place under the cap" },
+  { "need": 200, "atLeast": "percent", "why": "200 is the most" }
+]
+```
+
+Each rule says one amount is at least another. An amount is a whole number, the name of a top-level setting whose
+value is a whole number, or `{ "count": "<name>" }`, the number of entries of a top-level setting that is a list.
+There is nothing else: a rule whose `need` is a number is a ceiling on the other amount. Arca compares the two
+amounts and knows nothing of what they mean. The rules are asked of the settings one service would have (the
+template's, with the create's values in place of the defaults), when the create is proposed and again when it
+runs. The refusal has Arca's words about the two amounts and then the template's `why`: `settings:
+settings.maxSlots is 2, below the number of entries in settings.classes (3): every class is kept one place under
+the cap`. A template lists at most 16 rules, each with a `why` of 1 to 200 plain characters. A template is refused
+when it is read, naming the rule (`settingRules[1]: ...`), when a rule names a setting it does not have or one of
+the wrong type, when an amount has another form, or when the template's own defaults do not pass the rule. Only a
+virtual-machine template has rules. They are asked of a create only: a service that exists is not checked again.
+The machine's own script keeps its checks; the rules repeat only what it refuses. The two GitLab runner pool
+templates state six: `concurrent` and `jobCpu` of 1 or more, `memoryOvercommitPercent` from 100 to 200, and 1 to
+12 entries in `runners`.
 
 **Which image a machine was made from.** A template may name its image by an alias (`images:debian/13/cloud`), which
 does not say which build that was. `service_status` adds `baseImage`, the fingerprint (SHA-256) Incus recorded on the

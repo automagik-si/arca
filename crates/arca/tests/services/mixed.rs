@@ -1095,6 +1095,9 @@ mod vm_secrets;
 #[path = "create_settings.rs"]
 mod create_settings;
 
+#[path = "setting_rules.rs"]
+mod setting_rules;
+
 #[path = "update_available.rs"]
 mod update_available;
 

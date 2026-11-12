@@ -585,6 +585,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         first_boot: None,
         settings: None,
         create_settings: Vec::new(),
+        setting_rules: Vec::new(),
         kernel_access: None,
         update: None,
     }

@@ -84,6 +84,15 @@ pub const EARLIER: &[(&str, &str)] = &[
         "gitlab-runner-pool.sh",
         "e92d6a12e269866a0e9f89e1523bb428ead6d75d2cab6fb267d71f88f2c401f7",
     ),
+    // 0.9.0 to 0.14.0: before the two GitLab pool templates stated what must hold between their settings.
+    (
+        "gitlab-runner-pool.json",
+        "1651abb14c9ad97201f14e726613ace48bb7c69a64d53f7963f700277ff6e8ad",
+    ),
+    (
+        "gitlab-runner-pool-large.json",
+        "599fe3c71523641778520f7a0ee21fc59e4c17ac1d82216a5c1922d7139bf789",
+    ),
     // 0.1.0-alpha.7 to 0.12.0: it declared POSTGRES_PASSWORD and did not make it, so a create came up stopped.
     (
         "postgres-autopg.json",

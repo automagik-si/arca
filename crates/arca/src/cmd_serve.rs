@@ -1238,8 +1238,6 @@ fn approval_failure(error: ApprovalRefusal) -> Failure {
     }
 }
 
-/// The token store's refusals as exits. A directory that cannot be read is an I/O failure (exit 1). A directory or file that
-/// is unsafe, missing or malformed is a config failure (exit 2), and the message says what to change.
 /// One line for each token file the store left out when it was last read: a file under the name approved actions
 /// run under. The node runs without it, and the line says how the file is removed.
 fn say_ignored_tokens(tokens: &TokenStore) {
@@ -1251,6 +1249,8 @@ fn say_ignored_tokens(tokens: &TokenStore) {
     }
 }
 
+/// The token store's refusals as exits. A directory that cannot be read is an I/O failure (exit 1). A directory or file that
+/// is unsafe, missing or malformed is a config failure (exit 2), and the message says what to change.
 fn token_failure(error: TokenStoreError) -> Failure {
     match &error {
         TokenStoreError::Io { .. } => Failure::Runtime(error.to_string()),

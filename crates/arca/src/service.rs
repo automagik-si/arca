@@ -1173,6 +1173,11 @@ pub struct Template {
     /// `settings`, whose value there is the default and gives the type. No other kind sets it.
     #[serde(default)]
     pub create_settings: Vec<String>,
+    /// What must hold between a virtual-machine template's settings, for the defaults and for every create: each
+    /// rule says one amount is at least another ([`SettingRule`]). The machine's own first-boot script may refuse
+    /// the same; stated here, a create that would not start is refused before anything is made. No other kind sets it.
+    #[serde(default)]
+    pub setting_rules: Vec<SettingRule>,
     /// A container template whose service may talk to this node's kernel: `{ "port": <n> }`, the port inside the
     /// instance where the kernel answers on loopback. Only a service of the node's own project is created from such a
     /// template, never one in a tenant.
@@ -1182,6 +1187,139 @@ pub struct Template {
     /// No other kind sets it.
     #[serde(default)]
     pub update: Option<Update>,
+}
+
+/// One rule of a template's `settingRules`: `{ "need": <amount>, "atLeast": <amount>, "why": "<words>" }`. An amount
+/// is a whole number, the name of a top-level setting whose value is a whole number, or `{ "count": "<name>" }`, the
+/// number of entries of a top-level setting that is a list. The kernel compares the two amounts and knows nothing
+/// of what they mean; `why` is the template's own reason, told after the kernel's words when a create is refused.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SettingRule {
+    pub need: Value,
+    pub at_least: Value,
+    pub why: String,
+}
+
+/// One side of a [`SettingRule`].
+enum Amount<'a> {
+    Number(u64),
+    Setting(&'a str),
+    Count(&'a str),
+}
+
+impl<'a> Amount<'a> {
+    /// The amount a rule's side states, or `None` for anything but the three forms.
+    fn of(side: &'a Value) -> Option<Self> {
+        match side {
+            Value::Number(number) => number.as_u64().map(Amount::Number),
+            Value::String(name) => Some(Amount::Setting(name)),
+            Value::Object(object) if object.len() == 1 => {
+                object.get("count")?.as_str().map(Amount::Count)
+            }
+            _ => None,
+        }
+    }
+
+    /// Its value in `settings`: `Err` says what is wrong with the setting it names.
+    fn value(&self, settings: Option<&Value>) -> Result<i128, String> {
+        let setting = |name: &str| {
+            settings
+                .and_then(|settings| settings.get(name))
+                .ok_or_else(|| format!("names {name}, which is not a setting of the template"))
+        };
+        match self {
+            Amount::Number(number) => Ok(i128::from(*number)),
+            Amount::Setting(name) => match setting(name)? {
+                Value::Number(number) if number.is_u64() || number.is_i64() => Ok(number
+                    .as_i64()
+                    .map(i128::from)
+                    .or(number.as_u64().map(i128::from))
+                    .unwrap_or_default()),
+                _ => Err(format!("names {name}, whose value is not a whole number")),
+            },
+            Amount::Count(name) => match setting(name)? {
+                Value::Array(entries) => Ok(entries.len() as i128),
+                _ => Err(format!("counts {name}, whose value is not a list")),
+            },
+        }
+    }
+
+    /// The amount in the words of a refusal.
+    fn words(&self) -> String {
+        match self {
+            Amount::Number(number) => number.to_string(),
+            Amount::Setting(name) => format!("settings.{name}"),
+            Amount::Count(name) => format!("the number of entries in settings.{name}"),
+        }
+    }
+}
+
+/// How a [`SettingRule`] stands against one settings object.
+enum RuleCheck {
+    Holds,
+    /// The rule cannot be read against these settings: what is wrong with it.
+    Unreadable(String),
+    /// The settings do not pass it: the kernel's words, without the template's reason.
+    Fails(String),
+}
+
+fn check_rule(rule: &SettingRule, settings: Option<&Value>) -> RuleCheck {
+    let (Some(need), Some(least)) = (Amount::of(&rule.need), Amount::of(&rule.at_least)) else {
+        return RuleCheck::Unreadable(
+            "need and atLeast are each a whole number, the name of a setting, or { \"count\": \"<the name of a setting that is a list>\" }".into(),
+        );
+    };
+    if matches!((&need, &least), (Amount::Number(_), Amount::Number(_))) {
+        return RuleCheck::Unreadable(
+            "need and atLeast are both numbers, so it says nothing about a setting".into(),
+        );
+    }
+    let (have, floor) = match (need.value(settings), least.value(settings)) {
+        (Ok(have), Ok(floor)) => (have, floor),
+        (Err(why), _) => return RuleCheck::Unreadable(format!("need {why}")),
+        (_, Err(why)) => return RuleCheck::Unreadable(format!("atLeast {why}")),
+    };
+    if have >= floor {
+        return RuleCheck::Holds;
+    }
+    // Said about the setting, not about the number: a rule whose `need` is a number is a ceiling on the other side.
+    RuleCheck::Fails(match (&need, &least) {
+        (Amount::Number(_), _) => format!("{} is {floor}, above {have}", least.words()),
+        (_, Amount::Number(_)) => format!("{} is {have}, below {floor}", need.words()),
+        _ => format!(
+            "{} is {have}, below {} ({floor})",
+            need.words(),
+            least.words()
+        ),
+    })
+}
+
+/// Why a template's `settingRules` are not ones it may state, or `None`: each is readable against the template's own
+/// settings, gives a plain reason, and holds for the template's own defaults.
+fn setting_rules_refusal(template: &Template) -> Option<String> {
+    if template.setting_rules.len() > 16 {
+        return Some("settingRules lists at most 16 rules".into());
+    }
+    template
+        .setting_rules
+        .iter()
+        .enumerate()
+        .find_map(|(n, rule)| {
+            let why = rule.why.trim();
+            if why.is_empty() || rule.why.chars().count() > 200 || !plain_text(&rule.why) {
+                return Some(format!(
+                    "settingRules[{n}]: why is its reason in plain words, 1 to 200 characters"
+                ));
+            }
+            match check_rule(rule, template.settings.as_ref()) {
+                RuleCheck::Holds => None,
+                RuleCheck::Unreadable(what) => Some(format!("settingRules[{n}]: {what}")),
+                RuleCheck::Fails(what) => Some(format!(
+                    "settingRules[{n}]: the template's own settings do not pass it: {what}"
+                )),
+            }
+        })
 }
 
 impl Template {
@@ -1400,6 +1538,11 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     {
         return Err(TemplateError::refused(format!(
             "template {name}: only a virtual-machine template has a firstBoot, settings or createSettings"
+        )));
+    }
+    if !template.setting_rules.is_empty() {
+        return Err(TemplateError::refused(format!(
+            "template {name}: only a virtual-machine template has settingRules"
         )));
     }
     if template.update.is_some() {
@@ -1625,6 +1768,9 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
             "createSettings lists at most 32 distinct keys of settings, each with its default there",
         );
     }
+    if let Some(why) = setting_rules_refusal(template) {
+        return refused(&why);
+    }
     if let Some(update) = &template.update
         && (listed.contains(update.pin.as_str())
             || !template
@@ -1810,6 +1956,21 @@ pub fn create_settings(
         return refused(format!(
             "settings: with these values the settings of template {name} pass 16KiB"
         ));
+    }
+    // What the template says must hold between its settings, asked of the values this service would have. The
+    // kernel's words say which amounts, the template's own say why.
+    for rule in &template.setting_rules {
+        match check_rule(rule, Some(&merged)) {
+            RuleCheck::Holds => {}
+            RuleCheck::Fails(what) => {
+                return refused(format!("settings: {what}: {}", rule.why.trim()));
+            }
+            // A value of another type than its default was refused above, so a rule the template passed when it
+            // was read is readable here too.
+            RuleCheck::Unreadable(what) => {
+                return refused(format!("settings: a rule of template {name} {what}"));
+            }
+        }
     }
     Ok(ServiceSettings {
         merged: Some(merged),

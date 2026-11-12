@@ -7,6 +7,17 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A virtual-machine template can say what must hold between its settings (`settingRules`: one amount at least
+another), and a create whose settings would not pass is refused when it is proposed, before any card. The two GitLab
+runner pool templates now state what their script already refused on the machine's console: `concurrent` and
+`jobCpu` of 1 or more, `memoryOvercommitPercent` from 100 to 200, and 1 to 12 `runners`. Both files changed, so an
+installed copy that was not edited is brought up to date by the upgrade, and a card for one of them that waits across
+the upgrade is refused and proposed again.
+
+A create is refused when the instance it would get has the name of another service's instance on the node: the
+node's own service `x-<tenant id>` and that tenant's service `x`. Before, the second one was recorded and Incus
+refused it.
+
 More of what a `service_create` would refuse is now refused when it is proposed, in the create's words, so no card is
 shown for it: a name that is taken, a deploy the approved create could not add to, a tenant's machine on a host
 bridge, a tenant's service from a template that opens a host port, a MAC another record holds, and a config with no
