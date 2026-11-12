@@ -200,6 +200,220 @@ fn waits(rig: &Rig) -> usize {
         .count()
 }
 
+/// A database through the card alone. On a node with the keys `arca init --enable-changes` writes, with the shipped
+/// templates as init installs them, a token that only looks and proposes asks for the shipped `postgres-autopg`
+/// service, the owner approves, and it STARTS: the template makes its own password, so no `service_secret_set`,
+/// which cannot be proposed, is needed, and so no doctor token. A second approved card links a service to it, and
+/// that service gets a `DATABASE_URL` with the same password.
+#[test]
+fn the_shipped_postgres_template_approved_from_a_card_starts_and_gives_a_linked_service_its_database_url()
+ {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    let templates = rig.dir.join("templates");
+    assert!(
+        arca::cmd_templates::install_into(&templates, false).is_ok(),
+        "the shipped templates install"
+    );
+    rig.template("consumer",json!({"name":"consumer","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[],"env":{}}));
+
+    // The shipped template is not one that is created stopped: nothing it needs is missing before the create.
+    let shipped =
+        service::load_template(&templates, "postgres-autopg").expect("the shipped template");
+    assert_eq!(
+        service::template_stopped_reason(&shipped, "service-db1", &rig.dir.join("secrets")),
+        None
+    );
+
+    let plans: HashMap<&'static str, Arc<dyn ToolHandler>> = arca::handlers::plan_handlers_served(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        None,
+        None,
+        None,
+        None,
+        arca::handlers::ActionSlot::default(),
+        Some(rig.cfg.clone()),
+    )
+    .into_iter()
+    .collect();
+    let viewer = Caller {
+        token_id: "viewer".into(),
+        scope: Scope::Viewer,
+        tools: None,
+    };
+    let executor = arca::handlers::ActionExecutor::new(
+        rig.handlers
+            .iter()
+            .map(|(verb, handler)| (*verb, Arc::clone(handler))),
+    );
+    // One card: proposed with a token that only looks and proposes, signed by the owner's key, and run.
+    let card = |action: &str, args: Value, nonce: &str| -> (Value, Value) {
+        let proposed = plans["action_propose"]
+            .call(json!({ "action": action, "args": args }), &viewer)
+            .expect("the proposal is recorded");
+        let statement = arca::handlers::action_statement(
+            "node1",
+            proposed["id"].as_str().expect("its id"),
+            action,
+            proposed["argsDigest"].as_str().expect("its digest"),
+            NOW,
+            &nonce.repeat(32),
+        )
+        .expect("the statement");
+        let approval = common::approve_statement(&key, &statement);
+        let approved = {
+            let mut kernel = rig.kernel.lock().expect("kernel");
+            arca::handlers::approve_action(
+                &mut kernel,
+                &json!({ "plan": proposed["id"], "approval": approval }),
+                NOW,
+            )
+            .expect("the owner's approval verifies")
+        };
+        let result = executor
+            .run(&approved.action, &approved.args, &approved.grant)
+            .expect("the approved action runs");
+        (proposed, result)
+    };
+
+    let (proposed, created) = card(
+        "service_create",
+        json!({ "name": "db1", "template": "postgres-autopg" }),
+        "1",
+    );
+    // The card told the owner the truth before the signature. A template that is created stopped whatever the
+    // call says gets a Start row that begins "No: it is created stopped because"; this one has no such row.
+    assert!(
+        proposed["details"]
+            .as_array()
+            .expect("the card's rows")
+            .iter()
+            .all(|row| row["label"] != "Start"),
+        "{proposed}"
+    );
+    assert_eq!(created["state"], "running", "{created}");
+    // Its password was made at create: letters and digits, which the template's own start script accepts and which
+    // goes into a URL as it is. It is in the instance and in no answer.
+    let password = instance(&rig, "db1")["config"]["environment.POSTGRES_PASSWORD"]
+        .as_str()
+        .expect("the database has its password")
+        .to_string();
+    assert_eq!(password.len(), 32);
+    assert!(password.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    assert!(!created.to_string().contains(&password) && !proposed.to_string().contains(&password));
+
+    // A service linked to it by a second card gets the URL, with that password and the database's own address.
+    card(
+        "service_create",
+        json!({ "name": "app", "template": "consumer" }),
+        "2",
+    );
+    let (_, linked) = card(
+        "service_connect",
+        json!({ "from": "app", "to": "db1" }),
+        "3",
+    );
+    assert_eq!(linked, json!({ "env": ["DATABASE_URL"] }));
+    let address = instance(&rig, "db1")["config"][service::ADDRESS_KEY]
+        .as_str()
+        .expect("the database's address")
+        .to_string();
+    assert_eq!(
+        instance(&rig, "app")["config"]["environment.DATABASE_URL"],
+        json!(["postgresql://app:", &password, "@", &address, ":5432/app"].concat())
+    );
+    // Nothing in this test set a secret, and no handler was called with more than the owner's approval.
+    assert!(
+        rig.entries()
+            .iter()
+            .any(|entry| entry.id.0 == "service-db1"),
+        "the database is the kernel's own"
+    );
+}
+
+/// What stays as it was. A password the owner stored is the one used: the template makes one only where none is
+/// stored. And a template installed before this one, which makes none, still creates a database stopped: such a
+/// node keeps its template until `arca templates install --replace`.
+#[test]
+fn a_stored_postgres_password_is_kept_and_a_template_from_before_still_creates_stopped() {
+    let rig = Rig::new();
+    let templates = rig.dir.join("templates");
+    assert!(arca::cmd_templates::install_into(&templates, false).is_ok());
+    let shipped =
+        fs::read_to_string(templates.join("postgres-autopg.json")).expect("the shipped template");
+    let mut before: Value = serde_json::from_str(&shipped).expect("JSON");
+    before
+        .as_object_mut()
+        .expect("an object")
+        .remove("generate")
+        .expect("the shipped template makes its password");
+
+    // The template as it was before: created stopped, and it says why.
+    fs::write(templates.join("postgres-autopg.json"), before.to_string())
+        .expect("the old template");
+    let old = rig
+        .call(
+            "service_create",
+            json!({ "name": "old1", "template": "postgres-autopg" }),
+        )
+        .expect("create");
+    assert_eq!(old["state"], "stopped", "{old}");
+    // A run without --replace keeps a template that differs, so that node still has the old one.
+    let kept = arca::cmd_templates::install_into(&templates, false)
+        .ok()
+        .expect("install");
+    assert!(
+        kept["kept"]
+            .as_array()
+            .is_some_and(|names| names.contains(&json!("postgres-autopg.json"))),
+        "{kept}"
+    );
+    assert_eq!(
+        fs::read_to_string(templates.join("postgres-autopg.json")).expect("the template"),
+        before.to_string()
+    );
+    // With --replace it is the shipped one again, and the service made before is not touched by that.
+    let replaced = arca::cmd_templates::install_into(&templates, true)
+        .ok()
+        .expect("install");
+    assert!(
+        replaced["installed"]
+            .as_array()
+            .is_some_and(|names| names.contains(&json!("postgres-autopg.json"))),
+        "{replaced}"
+    );
+    assert!(
+        instance(&rig, "old1")["config"]
+            .get("environment.POSTGRES_PASSWORD")
+            .is_none(),
+        "a service from before gains no password by itself"
+    );
+
+    // The owner's own password, stored before the create, is the one the database gets: none is made over it.
+    op(
+        &rig,
+        "service_secret_set",
+        json!({ "name": "old1", "key": "POSTGRES_PASSWORD", "value": "synthetic-password" }),
+    )
+    .expect("the owner's password");
+    assert_eq!(
+        instance(&rig, "old1")["config"]["environment.POSTGRES_PASSWORD"],
+        "synthetic-password"
+    );
+}
+
 #[test]
 fn g5_connect_and_disconnect_open_only_the_provider_port_and_render_env() {
     let rig = Rig::new();

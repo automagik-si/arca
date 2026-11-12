@@ -250,7 +250,9 @@ What comes after is yours:
 3. **Approve it on the page** with your passkey. Arca runs it and writes it in its journal.
 
 **A database:** ask your assistant for the `postgres-autopg` service. It is one of the shipped templates, it fetches
-its own pinned image, and it waits for your approval like any change. (`postgres_create`, proposed, is refused on
+its own pinned image, it makes its own password, and it waits for your approval like any change: once you approve,
+it starts. A node whose templates were installed by 0.12.0 or older has a template that does not make the password;
+`arca templates install --replace --config ~/.config/arca/node.json` installs the new one. (`postgres_create`, proposed, is refused on
 this node: the step sets no image for it, and the refusal names `postgres-autopg`.)
 
 That page is for a machine where every account is trusted, and it cannot be opened from a phone; read

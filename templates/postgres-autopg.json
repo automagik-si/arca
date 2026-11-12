@@ -1,6 +1,6 @@
 {
   "name": "postgres-autopg",
-  "description": "PostgreSQL 18 by autopg (its public image by digest; Postgres only): one database and role, app, per service, its password the POSTGRES_PASSWORD secret. A link gives DATABASE_URL.",
+  "description": "PostgreSQL 18 by autopg (its public image by digest; Postgres only): one database and role, app, per service, its password the POSTGRES_PASSWORD secret, which Arca makes at create and never shows. A link gives DATABASE_URL.",
   "kind": "oci",
   "image": "ghcr.io/automagik-si/autopg",
   "digest": "sha256:62ea0404001b8b04b61173031e86a4577b3d589419ed853895775a7a7a45f377",
@@ -8,6 +8,7 @@
   "ports": [5432],
   "env": { "POSTGRES_PASSWORD": "{{secret:POSTGRES_PASSWORD}}" },
   "secrets": ["POSTGRES_PASSWORD"],
+  "generate": { "POSTGRES_PASSWORD": "" },
   "provides": { "env": { "DATABASE_URL": "postgresql://app:{{secret:POSTGRES_PASSWORD}}@{{host}}:{{port}}/app" } },
   "publishable": false
 }

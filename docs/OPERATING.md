@@ -469,7 +469,12 @@ and holds no record answers an empty list.
 - It sets no `kernel.postgresImage`, so a proposed `postgres_create` stays refused. **A database after this step
   is the shipped `postgres-autopg` service:** ask the assistant for it, or propose `service_create` with
   `"template": "postgres-autopg"`. That template fetches its own pinned image and waits for the owner's card like
-  any change; the refusal of the proposed `postgres_create` names it, and so does the step's own report. The step
+  any change; the refusal of the proposed `postgres_create` names it, and so does the step's own report. The
+  template makes the database's password itself at create (32 letters and digits, stored as the service's
+  `POSTGRES_PASSWORD` secret and never shown), so the approved create starts by itself, and a proposed
+  `service_connect` gives the linked service its `DATABASE_URL`. No `service_secret_set` is needed, which matters
+  because that verb cannot be proposed and needs a `doctor` token. See "A node set up before the template made
+  its password" below for an older node. The step
   does not write the key because the node creates a `postgres_create` database from an image Incus already holds,
   by its fingerprint, and fetches none: the key alone would turn a refusal at the proposal into a failure after
   the owner approved. That is about what is proposed: a `doctor` or `operator` token's own
@@ -631,6 +636,15 @@ images and vendored npm lockfile. Five of them, `workspace-vm`, `github-runner-p
 `gitlab-runner-pool-large` and `automagik-workspace`, are
 virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners", "A pool
 of GitLab runners" and "An Automagik workspace in its own virtual machine").
+
+**A node set up before the template made its password.** Up to 0.12.0 the shipped `postgres-autopg` template
+declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped until a `doctor` token set the secret.
+`arca init` and `arca templates install` keep a template that is already installed and differs, so such a node
+still has the old one. `arca templates install --replace --config <file>` installs the shipped one; it overwrites
+every shipped template you edited, and names the node first. Nothing changes for a `postgres-autopg` service that
+already exists: a password that is stored stays the one used, and none is made over it. A service that was created
+stopped with no password gains none by itself either: set it with `service_secret_set`, or remove the service and
+create it again from the new template.
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
 script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `github-runner-pool.sh` for

@@ -705,7 +705,7 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
             && why.contains("propose service_create with the template postgres-autopg"),
         "the refusal names what works: {why}"
     );
-    result(
+    let card = result(
         &mcp(
             &node.socket,
             &viewer,
@@ -713,6 +713,12 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
             json!({ "action": "service_create", "args": { "name": "db1", "template": "postgres-autopg" } }),
         ),
         "action_propose",
+    );
+    // The card does not say "created stopped": the template init installed makes the database's password itself, so
+    // the approved create starts, and nobody needs a token that sets secrets without a card.
+    assert!(
+        !card.to_string().contains("created stopped"),
+        "the database's card: {card}"
     );
     assert!(
         !instance_exists(&node.fake, "db1"),

@@ -18,7 +18,7 @@ SOCK=/var/run/autopg
 PORT=5432
 RULE='host app app samenet scram-sha-256'
 
-: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set (service_secret_set)}"
+: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set: this service was created from a template that did not make it (arca templates install --replace, then create it again; or service_secret_set)}"
 case "$POSTGRES_PASSWORD" in
   *[!A-Za-z0-9._~-]*)
     echo 'postgres-autopg: POSTGRES_PASSWORD must be letters, digits and . _ ~ - only: it goes into DATABASE_URL as it is' >&2
