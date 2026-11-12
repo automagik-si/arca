@@ -756,20 +756,33 @@ A new Automagik starts from Automagik's published image, and nothing is built on
 pinned to Automagik's release 3.136.4 by its digest (`ghcr.io/automagik-si/automagik-server@sha256:49e997e3…`, one
 linux/amd64 image, about 190 MiB to pull): `automagik-server`, a container on the node reachable on its LAN address at
 port 3081, and `automagik-workspace`, a virtual machine of its own reached through a Cloudflare Tunnel or the tailnet
-(see "An Automagik workspace in its own virtual machine"). Incus pulls the image from the registry by that digest at
-the create. Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
+(see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
+registry by that digest at the create. A workspace is created stopped, and Docker inside its machine pulls the image
+by the same digest when the keeper first starts the server, after `instance_start`; the machine needs a route to
+`ghcr.io` then. Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
 that loses the plugin. They come through the welcome once Automagik's fixed release is pinned here. The hand-built
 `automagik` template below stays as it is for what the published image does not give today: the Omni channels plugin
 until then, and being published on the tailnet with `service_publish`, which an OCI service cannot be. Build
 `automagik` when you need either.
 
-A node that installed `automagik-server` or `automagik-workspace` up to Arca 0.14.0 (the server template pinned
+A node that installed `automagik-server` or `automagik-workspace` up to Arca 0.15.0 (the server template pinned
 Automagik 3.95.0, the workspace a build of Automagik's commit `5fe0be6`) gets both brought up to 3.136.4 by the
 upgrade, as any shipped template nobody edited. A service made before keeps running the image it was created with: it
 is its own instance, and the upgrade does not touch it. Its `service_status` shows the newer release under `update`
-(`"state": "differs"`, the new digest as `templatePin`). A new service pulls 3.136.4. Moving a service made before to
-3.136.4 is today a `service_remove` and a `service_create`, and a remove deletes the service's data with it (the
-server's `/data` volume, the workspace's whole machine): take a snapshot first, or keep it on the release it has.
+(`"state": "differs"`, the new digest as `templatePin`). A new service pulls 3.136.4.
+
+Keep a running service on the release it has: Arca has no way yet to move one to its template's version in place.
+The only way today is a `service_remove` and a `service_create`, and the remove deletes the service's data, which
+Arca cannot put back into the new service:
+
+- The server's `/data` is its own volume, `<name>-data`, which `service_remove` deletes with the instance. A snapshot
+  of the instance leaves that volume out; it needs its own: `snapshot_create` with `{project: "arcak-svc", volume:
+  "<name>-data", pool}`.
+- A workspace's data is on its machine's own disk, which the remove deletes. Incus does not copy a running virtual
+  machine, so stop the workspace first, then `snapshot_create` with `{project: "arcak-svc", instance: "<name>",
+  pool}`.
+- Either snapshot is put back by hand with Incus (see "Restoring from the disk alone"); Arca has no step that restores
+  it into a service.
 
 The `automagik` image is built from a checkout with `bash templates/automagik.build.sh PROJECT PROFILE
 local:BASE_FINGERPRINT`, which publishes it in `PROJECT` under the alias the template names. `PROFILE` must carry a
@@ -3945,13 +3958,13 @@ What to know:
   repository's commit `7aaa512`), the same image the `automagik-server` template pins. It has the gate, its
   Cloudflare Access sign-in, and the gate's own sign-in with passkeys, which the tailnet reach uses; both reaches run
   it. The gate's files (`compose.gate.yml`, `gate-entrypoint.mjs`, `gate-access.mjs`, `gate-claim.mjs`) are the same
-  as at commit `5fe0be6`, the build pinned up to Arca 0.14.0. The image's health check was rewritten since; it still
+  as at commit `5fe0be6`, the build pinned up to Arca 0.15.0. The image's health check was rewritten since; it still
   prints the code of the port it asks (the gate's in the gate's container, the server's in the server's), which is
   all the keeper reads. Nothing of the Access sign-in changed between the build pinned before that (`8fb2e6f`) and
   `5fe0be6`. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
   tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
   (three paths, the two ports, the claim code's place and the seven variable names) is in one block at the top of
-  `automagik-workspace.sh`, as that commit has them; check the block when you move the pin to a later build.
+  `automagik-workspace.sh`, as commit `7aaa512` has them; check the block when you move the pin to a later build.
 - **The first sign-in.** The server signs a browser in with a link that it writes once into its own data. Arca
   never reads that link, the keeper never reads the server's or the gate's data, and the keeper never copies their
   output to the console, so the link is in no `service_logs` answer and reaches no assistant. The way in is
