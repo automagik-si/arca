@@ -60,7 +60,7 @@ signal: a node reads its tokens when it starts and on SIGHUP, so a running node 
 
 | Command | Reads | Prints |
 |---------|-------|--------|
-| `arca status [--json] [--config <file>] [--token-file <file>]` | the running node, with the same call as `arca call arca_status` | the node in words: version, mode, uptime, whether Incus answers, the unix socket it answered on, the other listeners the config file names (not checked) and a next step; with `--json`, the `arca_status` result as it came |
+| `arca status [--json] [--config <file>] [--token-file <file>]` | the running node, with the same call as `arca call arca_status` | the node in words: version, mode, uptime, whether Incus answers, the unix socket it answered on, the loopback door as the node itself reports it (open with its URL, or CLOSED with the reason), the other listeners the config file names (not checked) and a next step; with `--json`, the `arca_status` result as it came |
 | `arca watch --once --json [--config <file>]` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
