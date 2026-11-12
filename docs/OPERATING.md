@@ -1427,7 +1427,14 @@ them would change nothing a user sees. They move to `2026-07-28` before `2025-11
   See the next section.
 - `action_propose` takes `{action, args}` and records an inert action proposal, returning `kind`, `summary`, `details` and
   the record. It is a viewer verb: it changes no desired state and applies nothing, so MCP does not advertise it as
-  read-only. The owner approves it on the approval page with a passkey.
+  read-only. The owner approves it on the approval page with a passkey. The answer also says what happens next:
+  `approvalUrl` is this node's approval page (`approvalOrigin` plus `/approve`, absent when the node serves none),
+  `passkeysTrusted` is how many owner passkeys the node itself trusts (a node set to trust another page host's passkeys
+  through `approval.trustOwnerKeysFrom` or `approval.peerKeys` also approves with those: its card is approved on that host's
+  page and no passkey is needed on the node), and `nextStep` says it in words, which is also the text
+  an MCP client reads: where the owner approves it, the time the card expires (fifteen minutes after it was proposed),
+  and, while no passkey is trusted, how to enrol one first ("Get a setup code" on the page, or `arca setup-code` on a
+  machine with no screen), with the `ssh -o ExitOnForwardFailure=yes -L` line when the page is on `http://localhost` only.
 - `plan_decline` retains a waiting delete plan's objects, or declines a waiting action proposal. A decline is final and
   survives a restart.
 - `approval_submit` checks an owner's approval for a waiting delete plan and, when it holds, deletes the plan's objects once.

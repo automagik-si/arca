@@ -1791,6 +1791,11 @@ impl ToolHandler for ActionPropose {
         // What the owner does next is said with the answer, so an assistant can guide them: where the card is, until
         // when, and that a passkey must be enrolled first while none is trusted.
         let passkeys = kernel.owner_passkey_count();
+        // A kernel set to trust another page host's passkeys has its cards approved on that host, with those keys.
+        let relayed = self
+            .node
+            .as_ref()
+            .is_some_and(|node| crate::cmd_serve::accepts_relayed_approvals(node));
         let page = self
             .node
             .as_ref()
@@ -1807,7 +1812,7 @@ impl ToolHandler for ActionPropose {
             "createdAt": proposal.created_ms,
             "expiresAt": proposal.expires_at,
             "passkeysTrusted": passkeys,
-            "nextStep": propose_next_step(page.as_deref(), passkeys, proposal.created_ms, proposal.expires_at),
+            "nextStep": propose_next_step(page.as_deref(), passkeys, relayed, proposal.created_ms, proposal.expires_at),
         });
         card_words(&mut answer, &proposal);
         if let Some(url) = page {
@@ -1822,6 +1827,7 @@ impl ToolHandler for ActionPropose {
 pub(crate) fn propose_next_step(
     page: Option<&str>,
     passkeys: usize,
+    relayed: bool,
     created_ms: u64,
     expires_ms: u64,
 ) -> String {
@@ -1832,6 +1838,11 @@ pub(crate) fn propose_next_step(
         &iso[11..16],
         &iso[..10]
     );
+    if relayed && (page.is_none() || passkeys == 0) {
+        return format!(
+            "This node trusts the passkeys of another page host, so the owner approves it on that host's approval page, where this card is approved and relayed here; no passkey is needed on this node. {until}"
+        );
+    }
     let Some(url) = page else {
         return format!(
             "This node has no approval page, so nothing can be approved here: the guide's section \"The approval page\" says how to give it one. {until}"
@@ -1848,7 +1859,7 @@ pub(crate) fn propose_next_step(
         .and_then(arca_approval::localhost_origin_port)
     {
         enrol.push_str(&format!(
-            " The page is on this machine only: from another computer, open it through ssh -L localhost:{port}:127.0.0.1:{port} and this machine's name or address."
+            " The page is on this machine only: from another computer, open it through ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} and this machine's name or address."
         ));
     }
     enrol
