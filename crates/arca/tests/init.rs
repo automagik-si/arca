@@ -574,12 +574,17 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         .says("address(es) of this machine in /proc/net/fib_trie")
         .says("address(es) on the interfaces it lists")
         .says("nothing inside the tailnet range 100.64.0.0/10")
-        .says("Arca may now make changes on this machine.")
+        // Nobody restarted the node, so the words do not claim it has taken the change up.
+        .says("The config now lets Arca make changes on this machine. The node takes that up when it next starts.")
+        .never_says("Arca may now make changes on this machine.")
         .says(&format!(
-            "It may touch: the Incus project arcak-svc, and the bridge arcak-svcbr on {cidr}. Nothing else."
+            "It may touch: the Incus project arcak-svc, and the bridge arcak-svcbr on {cidr}."
         ))
+        .says("And, each only from a card you approve: snapshots")
+        .says("and the GPU devices of its own instances. Nothing else.")
+        .says("No token of this node may do more than look and propose, so every change waits for your passkey.")
         .says("Arca never writes in \"default\"; the entry in kernel.droiddProjects only names it as not Arca's.")
-        .says("Each change still waits for you: an assistant proposes, and nothing runs until you approve it with your")
+        .says("What an assistant proposes waits for you: nothing of it runs until you approve it with your")
         .says(&format!("passkey on the page: http://localhost:{}/approve", node.port))
         .says("No passkey is trusted yet, so nothing can be approved until you enrol the first one.")
         .says(&format!("arca setup-code --config {config}"))
@@ -637,7 +642,9 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
     // Back: the one key, and nothing else.
     let back = node.init(&["--watch-only"], "");
     back.ok()
-        .says("Arca now only looks on this machine: it changes nothing.")
+        // Nobody restarted the node: the words must not say it only looks while it may still be changing things.
+        .says("The config now says watch-only. The node that is running STILL MAKES CHANGES until it is restarted:")
+        .never_says("Arca now only looks on this machine")
         .says("Nothing was removed.")
         .says("service_list answers \"no service project\"")
         .says(&format!("arca init --enable-changes --config {config}"));
@@ -667,6 +674,101 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
     // And forward again: the network and the page it wrote before are kept, so only the project is added.
     node.init(&["--enable-changes", "--yes"], "").ok();
     assert_eq!(node.text(), enabled);
+}
+
+#[test]
+fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks() {
+    let node = Installed::new("direct-tokens");
+    mint(&node.scratch, &node.hash_dir, "viewer");
+    mint(&node.scratch, &node.hash_dir, "doctor");
+    let before = node.text();
+
+    // Asked, and not answered: the tokens that do not wait for the page are named, and what they may do, before the
+    // question; and the question no longer says "each only after you approve it", which would be false.
+    let said = node.init(&["--enable-changes"], "");
+    assert_eq!(said.code, Some(2), "{}", said.all());
+    said.says("NOT every change waits for you. This node has 1 token(s) that may then change things directly,")
+        .says("with no card and no passkey:")
+        .says("    doctor-1 (doctor)")
+        .says("Whoever holds one may create a service from a template, connect and disconnect services, set a")
+        .says("service's secret, unpublish one, start an instance, link and unlink a database, and use the Omni verbs.")
+        .says(&format!(
+            "To take one away first: arca token revoke <id> --config {}",
+            node.config.display()
+        ))
+        .says("Let Arca make changes on this machine: what is proposed after your approval, and directly for the tokens named above? [y/N]")
+        .never_says("each only after you approve it")
+        .never_says("every change waits for your passkey")
+        .never_says("viewer-1");
+    let all = said.all();
+    assert!(
+        said.out.contains("doctor-1 (doctor)") && said.err.contains("[y/N]"),
+        "the tokens are in what it printed before it asked:\n{all}"
+    );
+    assert_eq!(node.text(), before);
+
+    // After a yes the closing words say it again: the passkey gates what is proposed, not what such a token does.
+    let said = node.init(&["--enable-changes"], "y\n\n");
+    said.ok()
+        .says("What an assistant proposes waits for you: nothing of it runs until you approve it with your")
+        .says("  NOT every change waits for you. This node has 1 token(s) that may then change things directly,")
+        .says("      doctor-1 (doctor)")
+        .never_says("every change waits for your passkey");
+
+    // With only tokens that look and propose, the plain sentence is true, and it is the one printed.
+    let node = Installed::new("no-direct-tokens");
+    mint(&node.scratch, &node.hash_dir, "viewer");
+    node.init(&["--enable-changes"], "")
+        .says("No token of this node may do more than look and propose, so every change waits for your passkey.")
+        .says("Let Arca make changes on this machine, each only after you approve it? [y/N]")
+        .never_says("NOT every change");
+}
+
+#[test]
+fn init_follows_no_link_and_overwrites_no_file_that_is_not_its_own() {
+    // The config named through a link: init would replace the link and leave the file the node reads as it was.
+    let node = Installed::new("links");
+    let link = node.scratch.at("link.json");
+    std::os::unix::fs::symlink(&node.config, &link).expect("a link");
+    let before = node.text();
+    let out = arca()
+        .args(["init", "--enable-changes", "--yes", "--config"])
+        .arg(&link)
+        .output()
+        .expect("run arca init");
+    assert_eq!(out.status.code(), Some(2));
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains("is a link. Name the file it points to with --config"),
+        "{said}"
+    );
+    assert_eq!(node.text(), before);
+    assert!(
+        fs::symlink_metadata(&link)
+            .expect("the link")
+            .file_type()
+            .is_symlink()
+    );
+
+    // A link planted under the name of init's copy, pointing at a file of the owner's: init writes nothing through
+    // it and changes nothing.
+    let precious = node.scratch.at("precious");
+    fs::write(&precious, "the owner's own file\n").expect("a file");
+    std::os::unix::fs::symlink(&precious, node.backup()).expect("a planted link");
+    let said = node.init(&["--enable-changes", "--yes"], "");
+    assert_eq!(said.code, Some(2), "{}", said.all());
+    said.says("is there and is not a file of init's (a link or a directory)");
+    assert_eq!(
+        fs::read_to_string(&precious).expect("the file"),
+        "the owner's own file\n"
+    );
+    assert_eq!(node.text(), before);
+    fs::remove_file(node.backup()).expect("remove the planted link");
+
+    // A copy from an earlier run is a regular file of init's own: it is replaced, not appended to or followed.
+    fs::write(node.backup(), "an older copy\n").expect("an earlier copy");
+    node.init(&["--enable-changes", "--yes"], "").ok();
+    assert_eq!(fs::read_to_string(node.backup()).expect("the copy"), before);
 }
 
 #[test]
@@ -743,6 +845,22 @@ fn init_changes_nothing_where_it_would_have_to_guess_open_a_door_or_overrule_the
         2,
         "10.47.0.0/24 is not free on this machine: 10.47.0.1 is an address of this machine",
     );
+    // A network that is not a private one would pass every other check and then hide real addresses from the machine:
+    // multicast, link-local, a public range, the unspecified one.
+    for not_private in [
+        "224.0.0.0/24",
+        "169.254.7.0/24",
+        "203.0.113.0/24",
+        "0.0.0.0/24",
+    ] {
+        refused(
+            "not a private network",
+            node.installers(),
+            &["--service-cidr", not_private],
+            2,
+            "is not a private network",
+        );
+    }
     for not_a_network in ["10.47.3.1/24", "10.47.0.0/16", "ten"] {
         refused(
             "not a /24 network",

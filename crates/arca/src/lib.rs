@@ -66,7 +66,7 @@ const USAGE: &str = "usage: arca <command>
   probe consumer add --name <n> --image <fingerprint> --config <file>
   probe consumer remove --name <n> --config <file>
   serve --config <file>
-  init --enable-changes --config <file> [--yes] [--service-cidr <a.b.c.0/24>] (let this node make changes, each after the owner approves it)
+  init --enable-changes --config <file> [--yes] [--service-cidr <a.b.c.0/24>] (let this node make changes; what is proposed waits for the owner's approval)
   init --watch-only --config <file> (back to a node that only looks)
   setup-code --config <file> (the code for the first passkey, on this terminal, for a machine with no screen)
   call <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]

@@ -217,14 +217,16 @@ serves; the node is not started as a client's local command.
 ## Next: a node that changes things
 
 The node this page leaves only looks: `arca_status` answers `"mode":"watch-only"`, and a watch-only node writes
-nothing. One step lets it change things, with every change still waiting for you:
+nothing. One step lets it change things, with what your assistant proposes still waiting for you:
 
 ```sh
 arca init --enable-changes --config ~/.config/arca/node.json
 ```
 
-It asks before it writes: whether Arca may make changes on this machine, each only after you approve it, and whether
-the service network it found free may be used. Then it names the Incus project Arca's services live in, that
+It asks before it writes: whether Arca may make changes on this machine, and whether the service network it found
+free may be used. What an assistant proposes then runs only after you approve it with your passkey. A `doctor` or
+`operator` token, if you have minted one, does not wait for that: the step names every such token before it asks,
+and the installer mints none. Then it names the Incus project Arca's services live in, that
 network, and the approval page on this machine's own door, `http://localhost:7471/approve`, installs the shipped
 templates and restarts the installer's service. `sh install.sh --enable-changes` does the same at install time,
 with the flag as your yes.

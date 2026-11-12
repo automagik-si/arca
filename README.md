@@ -45,7 +45,7 @@ On a Linux machine with Incus ([what this does and does not do](docs/QUICKSTART.
 curl -fsSL https://get.automagik.si/arca | sh
 ```
 
-This gives you a node that only looks: it reads your machines and changes nothing. One step lets it change things, each change only after you approve it with your passkey: [`arca init --enable-changes`](docs/QUICKSTART.md#next-a-node-that-changes-things), or `--enable-changes` on the install line (`curl -fsSL https://get.automagik.si/arca | sh -s -- --enable-changes`).
+This gives you a node that only looks: it reads your machines and changes nothing. One step lets it change things, with what your assistant proposes running only after you approve it with your passkey: [`arca init --enable-changes`](docs/QUICKSTART.md#next-a-node-that-changes-things), or `--enable-changes` on the install line (`curl -fsSL https://get.automagik.si/arca | sh -s -- --enable-changes`).
 
 ## How it works
 

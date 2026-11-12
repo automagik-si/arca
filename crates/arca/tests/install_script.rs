@@ -1381,7 +1381,7 @@ fn enable_changes_runs_the_programs_own_step_for_the_service_it_started_and_says
         .says(&format!("      arca setup-code --config {}", config.display()))
         .says(&format!("      arca init --watch-only --config {}", config.display()))
         .says("node      mode kernel")
-        .says("This node may now make changes, each only after you approve it: --enable-changes asked for it.")
+        .says("This node may now make changes: --enable-changes asked for it. Its words above say what waits for you.")
         .never_says("its config, which this script did not write, says so")
         .never_says(TOKEN);
     assert_eq!(

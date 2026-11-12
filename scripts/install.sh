@@ -118,9 +118,10 @@ ${DOOR_PORTS%% *}, or the next free one), with a token. It opens no address anot
 
   sh install.sh --no-door            open no TCP port at all; a later run without a flag keeps it that way
   sh install.sh --door               open the door again
-  sh install.sh --enable-changes     after installing, let the node make changes, each only after you approve it with
-                                     your passkey (it runs: arca init --enable-changes --yes). Without it the node
-                                     only looks
+  sh install.sh --enable-changes     after installing, let the node make changes: what an assistant proposes runs
+                                     only after you approve it with your passkey (it runs: arca init
+                                     --enable-changes --yes, which names any token that does not wait for that).
+                                     Without it the node only looks
 
 It ends with 0 when the node runs and answered, with 1 when it refused or failed, and with $NOT_STARTED when the program
 is installed and it started no node.
@@ -932,7 +933,7 @@ report() {
         fi
         if [ "$mode" != watch-only ]; then
             if [ "$init_done" = yes ]; then
-                say "            This node may now make changes, each only after you approve it: --enable-changes asked for it."
+                say "            This node may now make changes: --enable-changes asked for it. Its words above say what waits for you."
             else
                 say "            This node is not read-only: its config, which this script did not write, says so."
             fi

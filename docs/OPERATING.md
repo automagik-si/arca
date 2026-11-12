@@ -293,14 +293,23 @@ arca init --enable-changes --config ~/.config/arca/node.json
 
 or, at install time, `sh install.sh --enable-changes`, which installs and then runs the same step with `--yes`.
 
-**What does not change.** Every change still waits for the owner. An assistant proposes; nothing runs until the
-owner approves it with a passkey on the approval page. The step gives no token more reach: the installer's token can
-look and propose, as before. Until the first passkey is enrolled, nothing can be approved at all.
+**What waits for the owner, and what does not.** What an assistant proposes waits: nothing of it runs until the
+owner approves it with a passkey on the approval page, and until the first passkey is enrolled nothing can be
+approved at all. The installer's token is a `viewer` token, which can look and propose and nothing more, so on a
+node as the installer leaves it every change waits for the passkey.
+
+A `doctor` or `operator` token does not wait. On a node that may change things, whoever holds one may, with no card
+and no passkey, create a service from a template (the shipped ones among them), connect and disconnect services, set
+a service's secret, unpublish one, start an instance, link and unlink a database, and use the Omni verbs. Such a
+token gains that reach the moment the node may change things, so the step reads the token directory first and
+**names every `doctor` and `operator` token before it asks**. With none it says so, and then "every change waits
+for your passkey" is true as written. `arca token revoke <id> --config <file>` takes one away.
 
 **What it asks**, each with a default:
 
-1. `Let Arca make changes on this machine, each only after you approve it? [y/N]`. The default is no. `--yes`
-   answers it on the command line.
+1. `Let Arca make changes on this machine, each only after you approve it? [y/N]`, or, where a `doctor` or
+   `operator` token exists, `... what is proposed after your approval, and directly for the tokens named above?`.
+   The default is no. `--yes` answers it on the command line.
 2. `Service network <a.b.c.0/24> is free. Use it? [Y/n]`. The default is yes. `--service-cidr <a.b.c.0/24>` names
    another, which is checked the same way.
 
@@ -345,7 +354,12 @@ under `--yes` it stops. A network named with `--service-cidr` must be an IPv4 /2
   in `kernel.droiddProjects` by hand, and the step fills that key only on a machine that has none;
 - a config set up by hand for something else: `kernel.scratch`, `kernel.bridged`, `kernel.adopt`, or
   `kernel.projects` that names projects without `arcak-svc`;
-- a service network that is not free, or no free one among its own;
+- a service network that is not free, or no free one among its own; and a network named with `--service-cidr`
+  that is not inside the private ranges of RFC 1918, since a public, multicast or link-local one would pass every
+  other check and then hide those addresses from the machine;
+- a config that is a link (name the file it points to), and a `<config>.before-init` that is a link or a directory.
+  The copy and the new config are written as new files of the user's own, no link is followed, and the directory is
+  synced after the rename;
 - an Incus that does not answer on `incus.socket`;
 - root. It runs as the node's user and never runs `sudo`. The one program it starts is `systemctl --user`, to
   restart the installer's unit.
@@ -358,8 +372,9 @@ It takes `--config` as a flag and reads no default, like every command that writ
 arca init --watch-only --config ~/.config/arca/node.json
 ```
 
-empties `kernel.projects` and changes nothing else, then restarts the installer's service as above. The node then
-only looks: it starts, stops, creates and removes nothing, and a proposal that waits can no longer run. Nothing is
+empties `kernel.projects` and changes nothing else, then restarts the installer's service as above. It says "Arca
+now only looks" only when the restarted node answered so itself; otherwise it says that the node that is running
+still makes changes until it is restarted. Once restarted, the node only looks: it starts, stops, creates and removes nothing, and a proposal that waits can no longer run. Nothing is
 removed: the Incus project `arcak-svc`, its bridge, the services in it and the owner's passkeys stay as they are.
 Running `--enable-changes` again adds the project back and keeps the network and the page.
 
@@ -371,7 +386,9 @@ Running `--enable-changes` again adds the project back and keeps the network and
   phone or from another machine needs an `https://` origin, set by hand.
 - It sets no `kernel.postgresImage`, so a proposed `postgres_create` stays refused; a database is created from the
   `postgres-autopg` service template instead. It sets no `kernel.vmLimits`, so no virtual machine is created.
-  GPUs, tenants, adoption and import are not turned on.
+  Tenants, adoption and import are not turned on. A node that may change things also runs its snapshot writer
+  (snapshot pools and the project `arcak-snapshots`) and its GPU device writer: each acts only from a card the owner
+  approves.
 - It does not check that Incus can fetch a template's image; a create that cannot answers in Incus's own words.
 - It grants no access to Incus. The node's user must already be able to open the Incus socket, which is the
   machine's administrator's to grant, as is keeping the service running without a login session.

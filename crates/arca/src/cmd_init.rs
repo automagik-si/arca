@@ -24,7 +24,7 @@
 use std::fs;
 use std::io::{BufRead, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -47,6 +47,11 @@ const UNIT: &str = "arca.service";
 /// The kernel's IPv4 routing table and its table of the machine's own addresses.
 const ROUTES: &str = "/proc/net/route";
 const FIB_TRIE: &str = "/proc/net/fib_trie";
+/// `O_NOFOLLOW` on Linux: an open of a name that is a link fails.
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(not(target_os = "linux"))]
+const O_NOFOLLOW: i32 = 0;
 /// How long a restarted node has to answer with its new mode.
 const RESTART_WAIT: Duration = Duration::from_secs(30);
 
@@ -74,6 +79,14 @@ pub fn init(flags: &Flags) -> Result<Option<Value>, Failure> {
             "this is root, and Arca's node belongs to an ordinary user: run init as the user who runs the node, without sudo"
                 .to_string(),
         ));
+    }
+    // Init replaces the config by rename. A config that is a link would be replaced by a file while the link's target,
+    // which the node may be reading, stayed as it was.
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(Failure::Refused(format!(
+            "init changed nothing: {} is a link. Name the file it points to with --config, so init writes the file the node reads",
+            path.display()
+        )));
     }
     let cfg = config::load(&path)?;
     let text = fs::read_to_string(&path).map_err(|error| {
@@ -245,20 +258,20 @@ impl Node<'_> {
             ));
         }
         say("");
+        let direct = self.direct_tokens();
+        say("Arca will then be able to create and change what is in its own project.");
         say(
-            "Arca will then be able to create and change what is in its own project. Every change still waits for you:",
+            "What an assistant proposes waits for you: nothing of it runs until you approve it with your passkey on the",
         );
-        say(
-            "an assistant proposes it, and nothing runs until you approve it with your passkey on the approval page.",
-        );
+        say("approval page.");
+        for line in direct.words(&self.path) {
+            say(&line);
+        }
         say("");
 
         if !nothing_to_write {
             if !self.flags.switch("yes") {
-                if !ask(
-                    "Let Arca make changes on this machine, each only after you approve it? [y/N] ",
-                    false,
-                ) {
+                if !ask(direct.question(), false) {
                     return Err(Failure::Refused(
                         "init changed nothing: the answer was not yes. To answer on the command line, pass --yes"
                             .to_string(),
@@ -297,19 +310,32 @@ impl Node<'_> {
         let installed = templates["installed"].as_array().map_or(0, Vec::len);
         let restarted = self.restart("kernel");
 
-        say("Arca may now make changes on this machine.");
+        if matches!(restarted, Restart::Answered(_)) {
+            say("Arca may now make changes on this machine.");
+        } else {
+            say(
+                "The config now lets Arca make changes on this machine. The node takes that up when it next starts.",
+            );
+        }
         say("");
         say(&format!(
-            "  It may touch: the Incus project {PROJECT}, and the bridge {} on {cidr}. Nothing else.",
+            "  It may touch: the Incus project {PROJECT}, and the bridge {} on {cidr}.",
             arca_netproject::BRIDGE
         ));
+        say(
+            "  And, each only from a card you approve: snapshots (the pools they are kept in and the project",
+        );
+        say("  arcak-snapshots) and the GPU devices of its own instances. Nothing else.");
         say(&format!(
             "  Arca never writes in \"{DEFAULT_PROJECT}\"; the entry in kernel.droiddProjects only names it as not Arca's."
         ));
         say(
-            "  Each change still waits for you: an assistant proposes, and nothing runs until you approve it with your",
+            "  What an assistant proposes waits for you: nothing of it runs until you approve it with your",
         );
         say(&format!("  passkey on the page: {origin}/approve"));
+        for line in direct.words(&self.path) {
+            say(&format!("  {line}"));
+        }
         if self.passkey_is_trusted() {
             say("  A passkey is already trusted on this node: it approves.");
         } else {
@@ -374,7 +400,16 @@ impl Node<'_> {
         self.write(&document)?;
         let restarted = self.restart("watch-only");
 
-        say("Arca now only looks on this machine: it changes nothing.");
+        // The node's own word, or none: a node that was not restarted, or did not answer, still runs on the config as it
+        // was, and may still be changing things.
+        if matches!(restarted, Restart::Answered(_)) {
+            say("Arca now only looks on this machine: it changes nothing.");
+        } else {
+            say(
+                "The config now says watch-only. The node that is running STILL MAKES CHANGES until it is restarted:",
+            );
+            say("it reads its config only when it starts.");
+        }
         say("");
         say(&format!(
             "  Nothing was removed. The Incus project {PROJECT}, its bridge, the services in it and your passkeys are"
@@ -432,28 +467,71 @@ impl Node<'_> {
         let failed = |what: &str, error: std::io::Error| {
             Failure::Runtime(format!("{what} ({}); nothing was changed", error.kind()))
         };
+        // A new file of the user's own at `path`, which must not exist: no link is followed and no file is truncated,
+        // so a name another user planted in the config's directory is refused, never written through.
         let private = |path: &Path, text: &str| -> std::io::Result<()> {
             let mut file = fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
+                .custom_flags(O_NOFOLLOW)
                 .mode(0o600)
                 .open(path)?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
             file.write_all(text.as_bytes())?;
             file.sync_all()
         };
-        private(&self.backup(), &self.text)
+        // The copy from an earlier run is replaced: a regular file is removed first, and anything else under that
+        // name (a link, a directory) is not init's to touch.
+        let backup = self.backup();
+        match fs::symlink_metadata(&backup) {
+            Ok(meta) if meta.is_file() => fs::remove_file(&backup).map_err(|error| {
+                failed("the earlier copy of the config cannot be replaced", error)
+            })?,
+            Ok(_) => {
+                return Err(Failure::Refused(format!(
+                    "init changed nothing: {} is there and is not a file of init's (a link or a directory). Move it away and run init again",
+                    backup.display()
+                )));
+            }
+            Err(_) => {}
+        }
+        private(&backup, &self.text)
             .map_err(|error| failed("the copy of the config as it was cannot be written", error))?;
         let mut staged = self.path.as_os_str().to_owned();
         staged.push(format!(".init-{}", std::process::id()));
         let staged = PathBuf::from(staged);
         private(&staged, &text)
             .and_then(|()| fs::rename(&staged, &self.path))
+            .and_then(|()| {
+                // The rename is in the directory: without this a power cut could bring the old config back.
+                let parent = self.path.parent().filter(|dir| !dir.as_os_str().is_empty());
+                fs::File::open(parent.unwrap_or(Path::new(".")))?.sync_all()
+            })
             .map_err(|error| {
                 let _ = fs::remove_file(&staged);
                 failed("the config cannot be written", error)
             })
+    }
+
+    /// The tokens of this node that may change things without the approval page once it may change things at all.
+    fn direct_tokens(&self) -> DirectTokens {
+        match arca_mcp::TokenStore::load(&self.cfg.tokens.hash_dir) {
+            Ok(store) => DirectTokens::Read(
+                store
+                    .ids()
+                    .into_iter()
+                    .filter(|(_, scope, _)| *scope >= arca_api::Scope::Doctor)
+                    .map(|(id, scope, tools)| match tools {
+                        Some(tools) => format!(
+                            "{id} ({}, limited to: {})",
+                            scope.as_str(),
+                            tools.join(", ")
+                        ),
+                        None => format!("{id} ({})", scope.as_str()),
+                    })
+                    .collect(),
+            ),
+            Err(_) => DirectTokens::Unread(self.cfg.tokens.hash_dir.clone()),
+        }
     }
 
     /// The /24 for the service network: the one `--service-cidr` names, checked against the machine, or the first of
@@ -496,9 +574,12 @@ impl Node<'_> {
             ),
             "nothing inside the tailnet range 100.64.0.0/10".to_string(),
         ];
-        unread_sources(&unread, self.flags.switch("yes"), &|question| {
-            ask(question, false)
-        })?;
+        unread_sources(
+            &unread,
+            self.flags.switch("yes"),
+            self.flags.value("service-cidr").is_some(),
+            &|question| ask(question, false),
+        )?;
         match self.flags.value("service-cidr") {
             Some(named) => {
                 let Some(network) = Cidr::parse(named).filter(|cidr| cidr.prefix == 24 && cidr.is_network()) else {
@@ -506,6 +587,14 @@ impl Node<'_> {
                         "--service-cidr takes an IPv4 /24 network, such as 10.47.0.0/24".to_string(),
                     ));
                 };
+                // The tailnet's range has its own words, which say more than "not private".
+                if !network.overlaps(&TAILNET)
+                    && !PRIVATE.iter().any(|range| range.contains(network.address))
+                {
+                    return Err(Failure::Refused(format!(
+                        "init changed nothing: {network} is not a private network. A service network is taken from the private ranges of RFC 1918 (10/8, 172.16/12 and the /16 of home routers): any other would hide real addresses from this machine"
+                    )));
+                }
                 if let Some(why) = used.conflict(&network) {
                     return Err(Failure::Refused(format!(
                         "init changed nothing: {network} is not free on this machine: {why}"
@@ -646,6 +735,67 @@ impl Node<'_> {
     }
 }
 
+/// The doctor and operator tokens of a node, which do not wait for the approval page.
+enum DirectTokens {
+    /// The token directory was read: each such token, by its id and scope. Empty when every token only looks and
+    /// proposes.
+    Read(Vec<String>),
+    /// The token directory could not be read, so init cannot say.
+    Unread(PathBuf),
+}
+
+impl DirectTokens {
+    /// What init says of them before it asks and after it wrote: who may change things with no card and no passkey.
+    fn words(&self, config: &Path) -> Vec<String> {
+        match self {
+            Self::Read(tokens) if tokens.is_empty() => vec![
+                "No token of this node may do more than look and propose, so every change waits for your passkey."
+                    .to_string(),
+            ],
+            Self::Read(tokens) => {
+                let mut lines = vec![format!(
+                    "NOT every change waits for you. This node has {} token(s) that may then change things directly,",
+                    tokens.len()
+                )];
+                lines.push("with no card and no passkey:".to_string());
+                lines.extend(tokens.iter().map(|token| format!("    {token}")));
+                lines.push(
+                    "Whoever holds one may create a service from a template, connect and disconnect services, set a"
+                        .to_string(),
+                );
+                lines.push(
+                    "service's secret, unpublish one, start an instance, link and unlink a database, and use the Omni verbs."
+                        .to_string(),
+                );
+                lines.push(format!(
+                    "To take one away first: arca token revoke <id> --config {}",
+                    config.display()
+                ));
+                lines
+            }
+            Self::Unread(dir) => vec![
+                format!(
+                    "The tokens in {} could not be read, so init cannot say whether one of them may change things",
+                    dir.display()
+                ),
+                "directly, with no card and no passkey: a doctor or an operator token may.".to_string(),
+            ],
+        }
+    }
+
+    /// The question, which says the same.
+    fn question(&self) -> &'static str {
+        match self {
+            Self::Read(tokens) if tokens.is_empty() => {
+                "Let Arca make changes on this machine, each only after you approve it? [y/N] "
+            }
+            _ => {
+                "Let Arca make changes on this machine: what is proposed after your approval, and directly for the tokens named above? [y/N] "
+            }
+        }
+    }
+}
+
 /// How the restart went.
 enum Restart {
     /// The installer's service was restarted and the node answered with the mode init wrote.
@@ -678,17 +828,29 @@ impl Network {
     }
 }
 
-/// What init does when it could not read every source that says which networks are in use. It never guesses: with
-/// `yes` (no person to ask) it stops, and otherwise it asks, with no as the default, and stops on anything but a yes.
-/// With every source read it goes on.
-fn unread_sources(unread: &[String], yes: bool, ask: &dyn Fn(&str) -> bool) -> Result<(), Failure> {
+/// What init does when it could not read every source that says which networks are in use. It never guesses. A network
+/// the owner named is the owner's word: it is still checked against what could be read, and init goes on. With none
+/// named and `yes` (no person to ask) it stops; otherwise it asks, with no as the default, and stops on anything but a
+/// yes. With every source read it goes on.
+fn unread_sources(
+    unread: &[String],
+    yes: bool,
+    named: bool,
+    ask: &dyn Fn(&str) -> bool,
+) -> Result<(), Failure> {
     if unread.is_empty() {
         return Ok(());
     }
     let what = unread.join(" and ");
+    if named {
+        eprintln!(
+            "arca: could not read {what}. The network --service-cidr names is taken on your word, checked against what could be read."
+        );
+        return Ok(());
+    }
     if yes {
         return Err(Failure::Runtime(format!(
-            "init changed nothing: it could not read {what}, so it cannot tell which network is free, and it does not guess. Name one you know to be free with --service-cidr <a.b.c.0/24>"
+            "init changed nothing: it could not read {what}, so it cannot tell which network is free, and it does not guess. Name one you know to be free: --service-cidr <a.b.c.0/24> goes on with what could be read"
         )));
     }
     if ask(&format!(
@@ -800,6 +962,23 @@ impl std::fmt::Display for Cidr {
         )
     }
 }
+
+/// The private ranges of RFC 1918. A service network named on the command line must lie in one: a public, multicast
+/// or link-local /24 would pass every other check and then hide those addresses from the machine.
+const PRIVATE: [Cidr; 3] = [
+    Cidr {
+        address: 10 << 24,
+        prefix: 8,
+    },
+    Cidr {
+        address: (172 << 24) | (16 << 16),
+        prefix: 12,
+    },
+    Cidr {
+        address: (192 << 24) | (168 << 16),
+        prefix: 16,
+    },
+];
 
 /// The tailnet's IPv4 range: no service network is ever taken from it, whatever the machine's tables say.
 const TAILNET: Cidr = Cidr {
@@ -1017,10 +1196,14 @@ mod tests {
         ];
         let never = |_: &str| -> bool { panic!("nothing is asked") };
         // Everything was read: nothing to ask, whoever runs it.
-        assert!(unread_sources(&[], true, &never).is_ok());
-        assert!(unread_sources(&[], false, &never).is_ok());
+        assert!(unread_sources(&[], true, false, &never).is_ok());
+        assert!(unread_sources(&[], false, false, &never).is_ok());
+        // A network the owner named: taken on the owner's word with or without --yes, and nothing is asked. This is
+        // the way on that the stop below names, so it must not stop the same way.
+        assert!(unread_sources(&unread, true, true, &never).is_ok());
+        assert!(unread_sources(&unread, false, true, &never).is_ok());
         // Nobody to ask: it stops, names what it could not read, and says how to go on.
-        let stopped = unread_sources(&unread, true, &never).expect_err("it stops");
+        let stopped = unread_sources(&unread, true, false, &never).expect_err("it stops");
         assert_eq!(stopped.code(), 1);
         assert!(
             stopped.message().contains(
@@ -1040,8 +1223,9 @@ mod tests {
                 yes
             }
         };
-        assert!(unread_sources(&unread, false, &answer(true)).is_ok());
-        let refused = unread_sources(&unread, false, &answer(false)).expect_err("a no stops it");
+        assert!(unread_sources(&unread, false, false, &answer(true)).is_ok());
+        let refused =
+            unread_sources(&unread, false, false, &answer(false)).expect_err("a no stops it");
         assert_eq!(refused.code(), 2);
         let asked = asked.borrow();
         assert_eq!(asked.len(), 2);
