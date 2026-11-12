@@ -244,7 +244,7 @@ async fn call_tool(
         .cloned()
         .unwrap_or_else(|| json!({}));
     if let Err(why) = conforms(&(verb.params)(), &arguments) {
-        return Ok(Some(error_reply(id, INVALID_PARAMS, &why, None)));
+        return Ok(Some(result_reply(id, invalid_arguments(&why))));
     }
     // A destructive verb's `confirm` is the door's: it is taken out here, so the handler, and every approval it checks or
     // binds, sees the call without it. `false` refuses before the handler runs, so nothing changes and nothing is spent.
@@ -304,7 +304,7 @@ async fn call_tool(
             )))
         }
         Err(CallError::NotFound) => Ok(Some(error_reply(id, unknown_tool, "not_found", None))),
-        Err(CallError::Invalid(why)) => Ok(Some(error_reply(id, INVALID_PARAMS, &why, None))),
+        Err(CallError::Invalid(why)) => Ok(Some(result_reply(id, invalid_arguments(&why)))),
         Err(
             refused @ (CallError::Refused { .. }
             | CallError::UntrustedRefused { .. }
@@ -487,6 +487,16 @@ fn tool_result(v: &Verb, value: Value, cut: Option<&str>, only_looks: bool) -> V
         "isError": false,
         "_meta": Value::Object(meta)
     })
+}
+
+/// The `droidd/error` of a call whose arguments the verb does not take.
+pub const INVALID_ARGUMENTS: &str = "invalid_arguments";
+
+/// A call whose arguments the schema or the handler refuses is answered as a tool result with `isError`, its words
+/// whole, so the model reads them and can correct the call (MCP 2025-11-25, SEP-1303). A JSON-RPC error is kept for
+/// what is wrong with the request itself: no tool named, or a tool the server does not have.
+fn invalid_arguments(why: &str) -> Value {
+    tool_failure(INVALID_ARGUMENTS, why)
 }
 
 /// A tool-level failure that is not a refusal: `isError` with `<code>: <message>` and the door's error meta.

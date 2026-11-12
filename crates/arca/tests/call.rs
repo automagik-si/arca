@@ -378,6 +378,27 @@ fn an_unknown_plan_is_a_tool_error_exit_3_with_the_error_object_on_stdout() {
     assert_eq!(reply["data"]["refusal"], json!("NoSuchPlan"));
 }
 
+/// An argument the verb does not take is a tool failure, not a refusal of the call: exit 3, and its code and words on
+/// stdout, read from the result's text since it has no structured content.
+#[test]
+fn an_argument_the_verb_does_not_take_is_a_tool_error_exit_3_with_its_code_and_words_on_stdout() {
+    let node = start_node("invalid-arguments");
+    let out = call(
+        &node,
+        &node.viewer,
+        "plan_list",
+        &["--args", r#"{"plna":1}"#],
+    );
+    assert_eq!(code(&out), 3, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout_json(&out),
+        json!({
+            "code": "invalid_arguments",
+            "message": "unknown field 'plna'; this verb takes no field"
+        })
+    );
+}
+
 #[test]
 fn a_viewer_calling_a_write_verb_is_refused_403_and_the_call_exits_4() {
     let node = start_node("viewer-write");

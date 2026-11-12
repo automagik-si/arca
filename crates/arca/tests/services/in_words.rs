@@ -231,12 +231,13 @@ fn every_value_a_caller_may_choose_is_stored_or_refused_in_words_that_name_the_r
     let rig = machine_and_container();
     let door = Door::over(&rig);
     let line = "v".repeat(20);
-    let too_short = "error -32602: /value: shorter than the minimum length of 8 characters";
-    let too_long = "error -32602: /value: longer than the maximum length of 4097 characters";
-    let not_text = "error -32602: /value: expected string";
+    let too_short =
+        "tool failure: invalid_arguments: /value: shorter than the minimum length of 8 characters";
+    let too_long = "tool failure: invalid_arguments: /value: longer than the maximum length of 4097 characters";
+    let not_text = "tool failure: invalid_arguments: /value: expected string";
     let big = "HTTP/1.1 413 Payload Too Large";
-    let machine = |why: &str| format!("error -32602: {MACHINE}: {why}");
-    let container = |why: &str| format!("error -32602: {CONTAINER}: {why}");
+    let machine = |why: &str| format!("tool failure: invalid_arguments: {MACHINE}: {why}");
+    let container = |why: &str| format!("tool failure: invalid_arguments: {CONTAINER}: {why}");
     let few = "this one has fewer than 8 characters that are not line breaks";
     let breaks = "this one has a line break";
     let nul = "this one has a NUL character";

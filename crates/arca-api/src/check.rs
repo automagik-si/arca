@@ -188,7 +188,7 @@ fn validate(schema: &Value, value: &Value, at: &str) -> Result<(), String> {
     if let Some(Value::Array(options)) = map.get("enum")
         && !options.contains(value)
     {
-        return Err(format!("{}: not one of the allowed values", here(at)));
+        return Err(not_allowed(at, options, value));
     }
     if let Some(Value::Array(options)) = map.get("anyOf")
         && !options
@@ -406,6 +406,29 @@ pub fn unknown_field(at: &str, key: &str, known: &[&str]) -> String {
     format!("{place}{named}; {takes}{hint}")
 }
 
+/// The most allowed values a refusal lists by name.
+const ALLOWED_LISTED: usize = 64;
+
+/// The refusal of a value an `enum` does not hold. When every allowed value is a string it lists them, and offers the
+/// closest one when one is close: `/action: not one of the allowed values; it is one of: postgres_create, ...; did you
+/// mean postgres_create?`. The value sent is never repeated.
+fn not_allowed(at: &str, options: &[Value], value: &Value) -> String {
+    let refusal = format!("{}: not one of the allowed values", here(at));
+    let names: Option<Vec<&str>> = options.iter().map(Value::as_str).collect();
+    let Some(names) = names.filter(|names| !names.is_empty() && names.len() <= ALLOWED_LISTED)
+    else {
+        return refusal;
+    };
+    let hint = match value
+        .as_str()
+        .and_then(|sent| closest(sent, names.iter().copied()))
+    {
+        Some(near) => format!("; did you mean {near}?"),
+        None => String::new(),
+    };
+    format!("{refusal}; it is one of: {}{hint}", names.join(", "))
+}
+
 /// The number of single-character edits (insert, remove, replace) that turn `a` into `b`.
 fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
@@ -556,6 +579,35 @@ mod tests {
         assert_eq!(
             conforms(&empty, &json!({ "not a name": 2 })).expect_err("extra refused"),
             "a field the schema does not name; this verb takes no field"
+        );
+    }
+
+    #[test]
+    fn a_value_outside_a_list_of_names_is_refused_with_the_list_and_the_nearest_name() {
+        let schema = json!({ "enum": ["postgres_create", "postgres_delete", "service_create"] });
+        assert_eq!(
+            conforms(&schema, &json!("postgres_creat")).expect_err("refused"),
+            "the value: not one of the allowed values; it is one of: postgres_create, postgres_delete, service_create; did you mean postgres_create?"
+        );
+        // Nothing close: the list, and no guess.
+        assert_eq!(
+            conforms(&schema, &json!("zzz")).expect_err("refused"),
+            "the value: not one of the allowed values; it is one of: postgres_create, postgres_delete, service_create"
+        );
+        // A value that is not text is refused with the list, and what was sent is never repeated.
+        assert_eq!(
+            conforms(&schema, &json!(7)).expect_err("refused"),
+            "the value: not one of the allowed values; it is one of: postgres_create, postgres_delete, service_create"
+        );
+        // A list that is not all names, or too long to say, is refused in the words it always had.
+        assert_eq!(
+            conforms(&json!({ "enum": [1, 2] }), &json!(3)).expect_err("refused"),
+            "the value: not one of the allowed values"
+        );
+        let many: Vec<String> = (0..65).map(|n| format!("v{n}")).collect();
+        assert_eq!(
+            conforms(&json!({ "enum": many }), &json!("v")).expect_err("refused"),
+            "the value: not one of the allowed values"
         );
     }
 

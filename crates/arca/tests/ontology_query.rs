@@ -214,8 +214,12 @@ fn invalid_arguments_are_refused_by_mcp() {
     ] {
         let (status, body) = node.post(args, true);
         assert_eq!(status, 200);
-        let reply: Value = serde_json::from_str(&body).expect("JSON-RPC error");
-        assert_eq!(reply["error"]["code"], -32602);
+        let reply: Value = serde_json::from_str(&body).expect("JSON-RPC");
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["_meta"]["droidd/error"],
+            "invalid_arguments"
+        );
     }
     node.query(&"é".repeat(128));
 }

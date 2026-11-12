@@ -1230,6 +1230,19 @@ fn at_every_bound() -> Value {
     json!({ "kind": "arca", "action": "delete", "target": target, "args": args })
 }
 
+/// The words of an argument the door refused: a tool result with `isError` and `droidd/error` `invalid_arguments`.
+fn invalid_words(reply: &Value) -> &str {
+    assert_eq!(
+        reply["result"]["_meta"]["droidd/error"],
+        json!("invalid_arguments"),
+        "{reply}"
+    );
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .and_then(|text| text.strip_prefix("invalid_arguments: "))
+        .unwrap_or_default()
+}
+
 #[test]
 fn m1_through_the_door_a_65_character_args_key_is_refused_and_a_request_at_every_bound_lists_and_answers()
  {
@@ -1237,7 +1250,7 @@ fn m1_through_the_door_a_65_character_args_key_is_refused_and_a_request_at_every
     let door = Door::over(&g);
     let long = json!({ "kind": "arca", "action": "delete", "target": "pg", "args": { "k".repeat(65): 1 } });
     let refused = door.call(&door.doctor, "owner_approval_request", long);
-    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    let message = invalid_words(&refused);
     assert!(message.contains("longer than 64 characters"), "{refused}");
     assert!(!message.contains(&"k".repeat(65)), "the key is not quoted");
     let listed = door.ok(&door.viewer, "owner_approval_list", json!({}));
@@ -1396,7 +1409,11 @@ fn confirm_never_enters_what_an_approval_binds_and_a_false_one_spends_nothing() 
         "service_remove",
         json!({ "name": "pg", "approval": approval, "confirm": "yes" }),
     );
-    assert_eq!(yes["error"]["code"], json!(-32602), "{yes}");
+    assert_eq!(
+        yes["result"]["_meta"]["droidd/error"],
+        json!("invalid_arguments"),
+        "{yes}"
+    );
     assert!(instance_exists(&g, "pg"));
 
     // The same approval is refused for another name, with or without confirm.
@@ -1476,8 +1493,8 @@ fn a_request_drops_confirm_true_from_the_args_it_binds_and_refuses_confirm_false
     declined["args"]["confirm"] = json!(false);
     let refused = door.call(&door.doctor, "owner_approval_request", declined);
     assert_eq!(
-        refused["error"]["message"],
-        json!("confirm is false: no approval was asked for"),
+        invalid_words(&refused),
+        "confirm is false: no approval was asked for",
         "{refused}"
     );
     let listed = door.ok(&door.viewer, "owner_approval_list", json!({}));
