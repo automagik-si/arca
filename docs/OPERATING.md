@@ -390,8 +390,9 @@ the server refuses every file it does not own, so the load fails until those fil
 
 `arca token reload --config <file>` makes the node that runs on that config read its tokens again: the step after a
 `token mint` on a running node, which sends no signal itself. It finds the node as `token revoke` does, and signals only a
-process it has checked to be `arca serve` on that very config: a pid file left by a node that crashed, whose pid is gone or
-is another program's, is not followed. It then waits for the node's own record of the reload, `<stateDir>/serve.reload`,
+process it has checked to be the node: one that belongs to this user and whose command line is `arca serve` on that very
+config, with `serve` as the command itself. The node's own link (`arca link serve` on the same config) is never taken
+for it, and neither is a pid file left by a node that crashed, whose pid is gone or is another program's. It then waits for the node's own record of the reload, `<stateDir>/serve.reload`,
 and answers in words: `reloaded`, with the pid and the count of tokens; `no node runs on this config`; `not reloaded`, when
 the node could not read its token directory and keeps the tokens it had; or `could not tell`, when the signal was sent and
 the node did not say so within 30 seconds (a node older than this command reloads without saying so). Only `reloaded`
@@ -403,7 +404,7 @@ config: it checks `<stateDir>/serve.pid` only when its pid is a live `arca serve
 it only when it still holds its own pid; a write that fails is said once on stderr and does not stop the node. A second start that fails to bind leaves the running server's pid file unchanged. The answer carries
 `reloadSignalled`; `token_list` drops the token and a call with it is 401 without a restart. With `--hash-dir` alone no state
 directory or serve is known, so no signal is sent (`reloadSignalled: false`) and a running server keeps the token until it is
-restarted or signalled. The hash files stay mode 0400. The signal uses the host's `kill` command.
+restarted or signalled. The hash files stay mode 0400. The signal goes through a pid descriptor (Linux 5.3 or later), never the host's `kill` command: the process is held, checked again and signalled through the descriptor, so no other process can receive it.
 
 The secret file holds the secret and one newline. A client reads that file, strips the newline, and sends the secret as
 `Authorization: Bearer <secret>`. Keep the secret out of command lines, logs and shell history.

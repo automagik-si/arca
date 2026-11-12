@@ -2321,3 +2321,59 @@ fn token_reload_never_signals_the_stranger_a_stale_pid_file_names() {
         stderr_text(&out)
     );
 }
+
+#[test]
+fn a_program_that_only_names_arcas_words_is_never_taken_for_the_node() {
+    use std::os::unix::process::CommandExt;
+    let scratch = Scratch::new("reload-lookalike");
+    let (config_path, _state) = config_with_state(&scratch);
+    // The config's token directory, for the token the revoke below removes.
+    token_dir(&scratch, "tokens");
+    let minted = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "look-1", "--out",
+        ])
+        .arg(scratch.at("look-1.secret"))
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    assert_eq!(minted.status.code(), Some(0), "{}", stderr_text(&minted));
+
+    // A program of this user that is called arca and has `serve` and `--config <this config>` among its arguments, but
+    // whose command is not `serve`: a shell that reads its input until the test lets go of it.
+    let mut lookalike = Command::new("sh")
+        .arg0("arca")
+        .args(["-c", "while read -r line; do :; done", "serve", "--config"])
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("the look-alike");
+    let reload = arca()
+        .args(["token", "reload", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let after_reload = lookalike.try_wait().expect("poll").is_none();
+    let revoke = arca()
+        .args(["token", "revoke", "look-1", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let after_revoke = lookalike.try_wait().expect("poll").is_none();
+    let _ = lookalike.kill();
+    let _ = lookalike.wait();
+
+    assert!(after_reload, "token reload did not signal the look-alike");
+    assert_eq!(reload.status.code(), Some(1), "{}", stderr_text(&reload));
+    assert!(
+        stderr_text(&reload)
+            .starts_with("arca: no node runs on this config, so nothing was reloaded."),
+        "{}",
+        stderr_text(&reload)
+    );
+    assert!(after_revoke, "token revoke did not signal the look-alike");
+    assert_eq!(revoke.status.code(), Some(0), "{}", stderr_text(&revoke));
+    let answer: Value = serde_json::from_slice(&revoke.stdout).expect("the revoke's answer");
+    assert_eq!(answer["reloadSignalled"], json!(false));
+}

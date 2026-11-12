@@ -84,7 +84,13 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     if let Some(path) = flags.value("config") {
         let cfg = config::load(Path::new(path))?;
         if let Some(pid) = serving_pid(Path::new(path), &cfg.state_dir) {
-            reload_signalled = send_hangup(pid, Path::new(path));
+            let sent = send_hangup(pid, Path::new(path));
+            if sent == Hangup::NoDescriptor {
+                eprintln!(
+                    "arca: the node was not signalled: {NO_DESCRIPTOR}. Restart the node for the revoke to take effect"
+                );
+            }
+            reload_signalled = sent == Hangup::Sent;
         }
     }
     Ok(Some(json!({
@@ -119,10 +125,18 @@ pub fn reload_tokens(flags: &Flags) -> Result<Option<Value>, Failure> {
     };
     let record_path = cfg.state_dir.join(SERVE_RELOAD_FILE);
     let before = ReloadRecord::read(&record_path).filter(|record| record.pid == pid);
-    if !send_hangup(pid, config_path) {
-        return Err(Failure::Runtime(format!(
-            "could not tell whether the node on this config (pid {pid}) read its tokens: it could not be signalled. It may have just stopped, or it runs as another user"
-        )));
+    match send_hangup(pid, config_path) {
+        Hangup::Sent => {}
+        Hangup::NoDescriptor => {
+            return Err(Failure::Runtime(format!(
+                "could not tell whether the node on this config (pid {pid}) read its tokens: nothing was signalled, because {NO_DESCRIPTOR}. Restart the node to have it read its tokens"
+            )));
+        }
+        Hangup::NotSent => {
+            return Err(Failure::Runtime(format!(
+                "could not tell whether the node on this config (pid {pid}) read its tokens: it could not be signalled. It may have just stopped"
+            )));
+        }
     }
     let deadline = Instant::now() + RELOAD_WAIT;
     loop {
@@ -172,29 +186,53 @@ fn serving_pid(config: &Path, state_dir: &Path) -> Option<u32> {
     from_file.or_else(|| serve_pid_for_config(config))
 }
 
-/// Sends SIGHUP to the `arca serve` on `config` that has the pid `pid`, and to nothing else. Whether the signal was
-/// delivered.
+/// What became of a SIGHUP for a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hangup {
+    /// The signal was delivered to the node.
+    Sent,
+    /// The process could not be held by a descriptor at all, so nothing was signalled.
+    NoDescriptor,
+    /// The process was gone, was no longer the node, or refused the signal.
+    NotSent,
+}
+
+/// Why a kernel, or a sandbox around this command, gives no pid descriptor.
+const NO_DESCRIPTOR: &str = "this kernel cannot signal through a pid descriptor (that needs Linux 5.3 or later, and a sandbox may forbid it)";
+
+/// Sends SIGHUP to the `arca serve` on `config` that has the pid `pid`, and to nothing else.
 ///
 /// A pid is only a number: between the caller's check and a signal sent by number, the process could end and another
 /// could take the number. So the process is first held by a descriptor, which names that one process for as long as it is
 /// open; it is checked again while held, and the signal goes through the descriptor. A process that took over the number
 /// fails the second check, and a process that ended cannot be signalled through its descriptor.
+///
+/// The order is the whole of the protection, so keep it: open the descriptor, THEN check, THEN signal through the
+/// descriptor. A check moved before the open, or a signal sent by pid number, brings the race back.
 #[cfg(target_os = "linux")]
-fn send_hangup(pid: u32, config: &Path) -> bool {
+fn send_hangup(pid: u32, config: &Path) -> Hangup {
+    use rustix::io::Errno;
     use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
     let Some(process) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
-        return false;
+        return Hangup::NotSent;
     };
-    let Ok(held) = pidfd_open(process, PidfdFlags::empty()) else {
-        return false;
+    let held = match pidfd_open(process, PidfdFlags::empty()) {
+        Ok(held) => held,
+        // No such call on this kernel, or a sandbox that forbids it: neither says anything about the process.
+        Err(Errno::NOSYS | Errno::PERM) => return Hangup::NoDescriptor,
+        Err(_) => return Hangup::NotSent,
     };
-    pid_serves_config(pid, config) && pidfd_send_signal(&held, Signal::HUP).is_ok()
+    if pid_serves_config(pid, config) && pidfd_send_signal(&held, Signal::HUP).is_ok() {
+        Hangup::Sent
+    } else {
+        Hangup::NotSent
+    }
 }
 
 /// Off Linux there is no `/proc` to check a process in, so no process is ever found to signal, and none is signalled.
 #[cfg(not(target_os = "linux"))]
-fn send_hangup(_pid: u32, _config: &Path) -> bool {
-    false
+fn send_hangup(_pid: u32, _config: &Path) -> Hangup {
+    Hangup::NotSent
 }
 
 /// Finds a live `arca serve --config <config>` process for this config, for the window before its post-bind pid file lands.
@@ -214,8 +252,16 @@ fn serve_pid_for_config(config: &Path) -> Option<u32> {
     None
 }
 
-/// Reads `/proc/<pid>/cmdline` and `/proc/<pid>/cwd` and compares the named config with `config`.
+/// Whether the process `pid` is, right now, this user's `arca serve` on `config`: read from `/proc/<pid>`. Its owner
+/// comes first, so another user's process is never a candidate, whatever its command line says.
 fn pid_serves_config(pid: u32, config: &Path) -> bool {
+    let own = rustix::process::geteuid().as_raw();
+    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    if !status_names_owner(&status, own) {
+        return false;
+    }
     let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
@@ -228,7 +274,21 @@ fn pid_serves_config(pid: u32, config: &Path) -> bool {
     serve_args_match_config(&args, cwd.as_deref(), config)
 }
 
-/// Whether `args` name `arca serve --config <config>`, resolving a relative config against the process's cwd.
+/// Whether the text of a `/proc/<pid>/status` says the process's real uid and its effective uid are both `uid`.
+fn status_names_owner(status: &str, uid: u32) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .is_some_and(|ids| {
+            let mut ids = ids.split_whitespace().map(|id| id.parse::<u32>().ok());
+            ids.next().flatten() == Some(uid) && ids.next().flatten() == Some(uid)
+        })
+}
+
+/// Whether `args` are the command line `arca serve --config <config>`, resolving a relative config against the process's
+/// cwd. `serve` must be the command itself, the first word after the program: the word anywhere else is another command's
+/// (`arca link serve`, the node's own link, which a SIGHUP would end) or one of its values (a token or a peer named
+/// `serve`). The config is looked for among the command's own flags, after it.
 fn serve_args_match_config(args: &[Vec<u8>], cwd: Option<&Path>, config: &Path) -> bool {
     let Some(program) = args.first() else {
         return false;
@@ -241,11 +301,11 @@ fn serve_args_match_config(args: &[Vec<u8>], cwd: Option<&Path>, config: &Path) 
     {
         return false;
     }
-    if !args.iter().any(|arg| arg.as_slice() == b"serve") {
+    if args.get(1).map(Vec::as_slice) != Some(b"serve".as_slice()) {
         return false;
     }
     let wanted = fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
-    for pair in args.windows(2) {
+    for pair in args[2..].windows(2) {
         if pair[0].as_slice() != b"--config" {
             continue;
         }
@@ -428,5 +488,57 @@ mod pid_match_tests {
         assert!(!serve_args_match_config(&process, Some(&dir), &other));
         assert!(!pid_serves_config(std::process::id(), &config));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_serve_as_the_command_itself_is_the_node() {
+        let config = Path::new("/nonexistent/arca-node.json");
+        let matches = |items: &[&str]| serve_args_match_config(&args(items), None, config);
+        let path = "/nonexistent/arca-node.json";
+        assert!(matches(&["arca", "serve", "--config", path]));
+        assert!(matches(&["/usr/local/bin/arca", "serve", "--config", path]));
+        // The node's own link: `serve` is its action, not its command, and a SIGHUP would end it.
+        assert!(!matches(&["arca", "link", "serve", "--config", path]));
+        // `serve` as a value: a token id, a peer name.
+        assert!(!matches(&[
+            "arca", "token", "revoke", "serve", "--config", path
+        ]));
+        assert!(!matches(&[
+            "arca", "link", "remove", "serve", "--config", path
+        ]));
+        // Another program that names arca's words among its arguments.
+        assert!(!matches(&[
+            "arca", "-c", "script", "serve", "--config", path
+        ]));
+        assert!(!matches(&["sh", "serve", "--config", path]));
+        // The node of another config, and a command line that stops short.
+        assert!(!matches(&[
+            "arca",
+            "serve",
+            "--config",
+            "/nonexistent/other.json"
+        ]));
+        assert!(!matches(&["arca", "serve"]));
+        assert!(!matches(&["arca"]));
+        assert!(!matches(&[]));
+    }
+
+    #[test]
+    fn a_process_is_this_users_only_when_its_real_and_effective_uid_both_are() {
+        let status =
+            |uids: &str| format!("Name:\tarca\nPid:\t42\nUid:\t{uids}\nGid:\t7\t7\t7\t7\n");
+        assert!(status_names_owner(&status("1000\t1000\t1000\t1000"), 1000));
+        assert!(!status_names_owner(&status("1001\t1001\t1001\t1001"), 1000));
+        // A program that changed its effective uid, either way, is not plainly this user's.
+        assert!(!status_names_owner(&status("1000\t0\t0\t0"), 1000));
+        assert!(!status_names_owner(&status("0\t1000\t1000\t1000"), 1000));
+        assert!(!status_names_owner("Name:\tarca\n", 1000));
+        assert!(!status_names_owner(&status("x\ty\tz\tw"), 1000));
+        // This process is its own user's.
+        let own = fs::read_to_string("/proc/self/status").expect("this process's status");
+        assert!(status_names_owner(
+            &own,
+            rustix::process::geteuid().as_raw()
+        ));
     }
 }
