@@ -10,6 +10,7 @@ use arca_kernel::{
     ownership::IncusKind,
     plugin::{Ctx, EffectOp, Manifest, Observe, Plugin, PluginError},
 };
+use arca_netproject::destination::Destination;
 use arca_netproject::{BRIDGE, PROFILE, PROJECT, create, manifest, name_ok, observed};
 use arca_providers::incus::SECRET_PREFIX;
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,32 @@ pub struct KernelAccess {
 pub struct KernelLink {
     pub port: u16,
     pub connect: String,
+}
+
+/// Whether the destinations a record carries are ones a service may have: the service is the node's own, on the
+/// managed network, and each is an address and port [`arca_netproject::destination::refusal`] takes, named once.
+pub fn destinations_ok(cfg: &ServiceConfig) -> bool {
+    let Ok(gateway) = cfg.gateway.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    cfg.tenant.is_none()
+        && !cfg.adopted
+        && cfg.project == PROJECT
+        && cfg.bridge == BRIDGE
+        && cfg.destinations.len() <= arca_netproject::destination::MAX_PER_SERVICE
+        && cfg
+            .destinations
+            .iter()
+            .enumerate()
+            .all(|(index, destination)| {
+                arca_netproject::destination::refusal(
+                    destination.address,
+                    destination.port,
+                    gateway,
+                )
+                .is_none()
+                    && !cfg.destinations[..index].contains(destination)
+            })
 }
 
 /// The name of the device that gives a service kernel access.
@@ -269,6 +296,11 @@ pub struct ServiceConfig {
     /// a tenant ever does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_access: Option<KernelLink>,
+    /// The private addresses this service may reach through the node, each on one tcp port: what the node's config
+    /// (`kernel.serviceDestinations`) named for it when the owner approved its create. No other record carries the
+    /// key, and no service in a tenant ever does. Its NIC rules are built from this list and from nothing else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destinations: Vec<Destination>,
 }
 
 /// What only a service in a tenant records: the tenant, its address block, and the address of the node's front service
@@ -634,7 +666,7 @@ pub fn egress(cfg: &ServiceConfig, hosts: &Value) -> Vec<Value> {
         Some(Ok(block)) => Some(block),
         _ => None,
     };
-    arca_netproject::tenant::egress_rules(gateway, hosts, block)
+    arca_netproject::tenant::egress_rules(gateway, hosts, block, &cfg.destinations)
 }
 
 /// A tenant's NIC also filters IPv6. The managed bridge has no IPv6 address, so the NIC is given none, and Incus then
@@ -792,6 +824,13 @@ impl Plugin for Service {
         {
             return Err(PluginError::Config(
                 "kernel access is for a container of the node's own service project, on a port of 1024 or above that is not one of its own, to the kernel's services socket".into(),
+            ));
+        }
+        // A destination is for a service of the node's own project on the managed network, whose NIC rules Arca
+        // writes: a record that says otherwise is never applied, whatever else it holds.
+        if !cfg.destinations.is_empty() && !destinations_ok(cfg) {
+            return Err(PluginError::Config(
+                "a private destination is for a service of the node's own project on the managed service network: one private or tailnet address outside the service subnet and one tcp port each, at most 4".into(),
             ));
         }
         if let Some(vm) = &cfg.vm
@@ -2404,6 +2443,10 @@ pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
     // Only a service with kernel access carries the key, so every other view is the one it always was.
     if let Some(link) = &cfg.kernel_access {
         view["kernelAccess"] = json!({ "port": link.port, "connect": link.connect });
+    }
+    // Only a service that may reach a private address carries the key.
+    if !cfg.destinations.is_empty() {
+        view["destinations"] = json!(cfg.destinations);
     }
     view
 }

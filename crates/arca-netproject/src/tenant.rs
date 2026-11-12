@@ -2,6 +2,7 @@
 //! (plugin `arca.tenant`). It owns its project and that project's service profile, and nothing else: it makes no bridge and
 //! no network, and its instances sit on the bridge the node's services already use. Each tenant holds a /28 of the service
 //! /24, and its instances take their addresses from it (Rules 61 to 65 of the ownership document).
+use crate::destination::{self, Destination};
 use crate::{BRIDGE, PROFILE, check_cidr, create, observed, project_ref};
 use arca_kernel::{
     desired::PluginId,
@@ -183,34 +184,25 @@ pub fn rule(fields: Value) -> Value {
 
 /// The egress rules of a NIC on the managed service bridge, whose gateway is `gateway`: reject private ranges outside
 /// the service /24 before allowing internet traffic. With `tenant`, the NIC is a tenant's: it also rejects the service
-/// /24 outside the tenant's block.
-pub fn egress_rules(gateway: Ipv4Addr, hosts: &Value, tenant_block: Option<Block>) -> Vec<Value> {
+/// /24 outside the tenant's block, and it never has a destination.
+///
+/// `destinations` are the private addresses this one service may reach through the node, each on one tcp port. Incus
+/// weighs a reject above an allow whatever the order of the rules, so an allow alone opens nothing: each address is
+/// cut out of the reject of the private ranges, one allow opens tcp to it on the named port, and the last allow, which
+/// lets everything else out to the internet, names every address but the opened ones. A packet to an opened address
+/// that is not tcp on its port then matches no rule at all and meets the NIC's default action, which every service NIC
+/// sets to reject: that closes every IP protocol, the ones a rule cannot name (GRE, IPIP, ESP, SCTP) among them. Three
+/// rejects of the address's own (every other tcp port, udp, icmp) say the same again, should a NIC's default ever be
+/// another. The reject of the host's own addresses is never cut, and neither is anything for a network or broadcast
+/// address of the host's networks: none of them is a destination, whatever a record says. With no destination the
+/// rules are the ones every service had before there were any.
+pub fn egress_rules(
+    gateway: Ipv4Addr,
+    hosts: &Value,
+    tenant_block: Option<Block>,
+    destinations: &[Destination],
+) -> Vec<Value> {
     let own = u32::from(gateway) & 0xffffff00;
-    let mut rejected = Vec::new();
-    for (base, prefix) in [
-        (0x0a000000u32, 8u32),
-        (0xac100000, 12),
-        (0xc0a80000, 16),
-        (0x64400000, 10),
-        (0xa9fe0000, 16),
-        (0x7f000000, 8),
-    ] {
-        if own & (u32::MAX << (32 - prefix)) == base {
-            let mut blocks = Vec::new();
-            for length in prefix + 1..=24 {
-                let size = 1u32 << (32 - length);
-                blocks.push(((own & (u32::MAX << (32 - length))) ^ size, length));
-            }
-            blocks.sort_unstable();
-            rejected.extend(
-                blocks
-                    .into_iter()
-                    .map(|(ip, length)| format!("{}/{length}", Ipv4Addr::from(ip))),
-            );
-        } else {
-            rejected.push(format!("{}/{prefix}", Ipv4Addr::from(base)));
-        }
-    }
     let mut host4 = std::collections::BTreeSet::from([gateway]);
     host4.extend(
         hosts
@@ -219,7 +211,33 @@ pub fn egress_rules(gateway: Ipv4Addr, hosts: &Value, tenant_block: Option<Block
             .flatten()
             .filter_map(|host| host.as_str()?.split('/').next()?.parse::<Ipv4Addr>().ok()),
     );
-    let destinations = host4
+    let open = if tenant_block.is_some() {
+        BTreeMap::new()
+    } else {
+        let mut closed = destination::node_own(hosts);
+        closed.insert(gateway);
+        destination::by_address(destinations, gateway, &closed)
+    };
+    let mut ranges = Vec::new();
+    for (base, prefix) in [
+        (0x0a000000u32, 8u32),
+        (0xac100000, 12),
+        (0xc0a80000, 16),
+        (0x64400000, 10),
+        (0xa9fe0000, 16),
+        (0x7f000000, 8),
+    ] {
+        if destination::holds(base, prefix, own) {
+            ranges.extend(destination::without(prefix, own, 24));
+        } else {
+            ranges.push((base, prefix));
+        }
+    }
+    let rejected = destination::cut(ranges, open.keys().copied())
+        .into_iter()
+        .map(|(ip, length)| format!("{}/{length}", Ipv4Addr::from(ip)))
+        .collect::<Vec<_>>();
+    let host_list = host4
         .iter()
         .map(|ip| format!("{ip}/32"))
         .collect::<Vec<_>>()
@@ -256,10 +274,49 @@ pub fn egress_rules(gateway: Ipv4Addr, hosts: &Value, tenant_block: Option<Block
             json!({"action":"reject", "destination":"224.0.0.0/4,255.255.255.255/32,0.0.0.0/8,240.0.0.0/4", "description":"multicast, broadcast, this-network, reserved (as desktops)"}),
         ),
         rule(
-            json!({"action":"reject", "destination":destinations, "description":"host addresses, the bridge gateway among them"}),
+            json!({"action":"reject", "destination":host_list, "description":"host addresses, the bridge gateway among them"}),
         ),
-        rule(json!({"action":"allow", "description":"internet"})),
     ]);
+    for (address, ports) in &open {
+        let to = format!("{address}/32");
+        let named = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let others = destination::other_ports(ports);
+        // An empty port list means every port: no rule is written for an address whose ports leave none over.
+        if !others.is_empty() {
+            rules.push(rule(json!({"action":"reject", "destination":to,
+                "protocol":"tcp", "destination_port":others,
+                "description":format!("the private address {address}: every tcp port but {named}")})));
+        }
+        rules.push(rule(
+            json!({"action":"reject", "destination":to, "protocol":"udp",
+            "description":format!("the private address {address}: udp")}),
+        ));
+        rules.push(rule(
+            json!({"action":"reject", "destination":to, "protocol":"icmp4",
+            "description":format!("the private address {address}: icmp")}),
+        ));
+        rules.push(rule(json!({"action":"allow", "destination":to,
+            "protocol":"tcp", "destination_port":named,
+            "description":format!("the private address {address}, tcp port {named}, named in the node's config")})));
+    }
+    if open.is_empty() {
+        rules.push(rule(json!({"action":"allow", "description":"internet"})));
+    } else {
+        // Every address but the opened ones. An empty destination would match them too, and with them every IP
+        // protocol no reject can name.
+        let internet = destination::cut(vec![(0, 0)], open.keys().copied())
+            .into_iter()
+            .map(|(ip, length)| format!("{}/{length}", Ipv4Addr::from(ip)))
+            .collect::<Vec<_>>()
+            .join(",");
+        rules.push(rule(
+            json!({"action":"allow", "destination":internet, "description":"internet"}),
+        ));
+    }
     rules
 }
 
@@ -404,6 +461,444 @@ impl Plugin for Tenant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rules as they were built before a service could have a destination, kept word for word: what the rules of a
+    /// service with none must still be, and what a destination's rules are measured against.
+    fn egress_rules_before(
+        gateway: Ipv4Addr,
+        hosts: &Value,
+        tenant_block: Option<Block>,
+    ) -> Vec<Value> {
+        let own = u32::from(gateway) & 0xffffff00;
+        let mut rejected = Vec::new();
+        for (base, prefix) in [
+            (0x0a000000u32, 8u32),
+            (0xac100000, 12),
+            (0xc0a80000, 16),
+            (0x64400000, 10),
+            (0xa9fe0000, 16),
+            (0x7f000000, 8),
+        ] {
+            if own & (u32::MAX << (32 - prefix)) == base {
+                let mut blocks = Vec::new();
+                for length in prefix + 1..=24 {
+                    let size = 1u32 << (32 - length);
+                    blocks.push(((own & (u32::MAX << (32 - length))) ^ size, length));
+                }
+                blocks.sort_unstable();
+                rejected.extend(
+                    blocks
+                        .into_iter()
+                        .map(|(ip, length)| format!("{}/{length}", Ipv4Addr::from(ip))),
+                );
+            } else {
+                rejected.push(format!("{}/{prefix}", Ipv4Addr::from(base)));
+            }
+        }
+        let mut host4 = std::collections::BTreeSet::from([gateway]);
+        host4.extend(
+            hosts
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|host| host.as_str()?.split('/').next()?.parse::<Ipv4Addr>().ok()),
+        );
+        let destinations = host4
+            .iter()
+            .map(|ip| format!("{ip}/32"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut tenant = Vec::new();
+        if let Some(block) = tenant_block {
+            // Inside the service subnet a tenant's service reaches its own block only. Incus weighs a reject above an
+            // allow, so the gateway stays rejected as it is for every service, and its DHCP and DNS answer through the
+            // rules Incus keeps for a bridge's own address; the allows state that those two are meant to pass.
+            tenant.push(rule(json!({"action":"reject",
+                "destination":block.outside().join(","),
+                "description":"the service subnet outside this tenant's block"})));
+            for (protocol, port, what) in [
+                ("udp", "67", "DHCP"),
+                ("udp", "53", "DNS"),
+                ("tcp", "53", "DNS"),
+            ] {
+                tenant.push(rule(
+                    json!({"action":"allow", "destination":format!("{gateway}/32"),
+                    "protocol":protocol, "destination_port":port,
+                    "description":format!("{what} on the bridge gateway")}),
+                ));
+            }
+        }
+        let mut rules = tenant;
+        rules.extend(vec![
+            rule(
+                json!({"action":"reject", "destination":rejected.join(","), "description":"RFC1918 outside the service subnet, CGNAT (tailnet), link-local, loopback"}),
+            ),
+            rule(
+                json!({"action":"reject", "destination":"::/0", "description":"all IPv6 (IPv4-only bridge), host addresses included"}),
+            ),
+            rule(
+                json!({"action":"reject", "destination":"224.0.0.0/4,255.255.255.255/32,0.0.0.0/8,240.0.0.0/4", "description":"multicast, broadcast, this-network, reserved (as desktops)"}),
+            ),
+            rule(
+                json!({"action":"reject", "destination":destinations, "description":"host addresses, the bridge gateway among them"}),
+            ),
+            rule(json!({"action":"allow", "description":"internet"})),
+        ]);
+        rules
+    }
+
+    /// What Incus does with a packet under `rules`, as its documentation states it: the order of the rules does not
+    /// count, a reject is weighed before an allow, and a packet no rule matches is rejected. `protocol` is `tcp`, `udp`,
+    /// `icmp4` or any other name for an IP protocol no rule can name.
+    fn allowed(rules: &[Value], to: Ipv4Addr, protocol: &str, port: u16) -> bool {
+        let matches = |rule: &Value| {
+            let destination = rule["destination"].as_str().unwrap();
+            let inside = destination.is_empty()
+                || destination.split(',').any(|range| {
+                    let (base, prefix) = range.split_once('/').expect("a CIDR");
+                    let Ok(base) = base.parse::<Ipv4Addr>() else {
+                        return false;
+                    };
+                    destination::holds(u32::from(base), prefix.parse().unwrap(), u32::from(to))
+                });
+            let wanted = rule["protocol"].as_str().unwrap();
+            let ports = rule["destination_port"].as_str().unwrap();
+            assert!(ports.is_empty() || matches!(wanted, "tcp" | "udp"));
+            assert!(matches!(wanted, "" | "tcp" | "udp" | "icmp4"));
+            inside
+                && (wanted.is_empty() || wanted == protocol)
+                && (ports.is_empty()
+                    || ports.split(',').any(|range| {
+                        let (first, last) = range.split_once('-').unwrap_or((range, range));
+                        (first.parse::<u16>().unwrap()..=last.parse::<u16>().unwrap())
+                            .contains(&port)
+                    }))
+        };
+        let of = |action: &str| {
+            rules
+                .iter()
+                .filter(|rule| rule["action"] == action)
+                .any(matches)
+        };
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule["action"] == "reject" || rule["action"] == "allow")
+        );
+        !of("reject") && of("allow")
+    }
+
+    /// Every address where a decision could change: both ends of every range any rule of either set names, the address
+    /// before and after each, and a spread of others.
+    fn edges(sets: &[&[Value]], more: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+        let mut out = std::collections::BTreeSet::new();
+        for range in sets
+            .iter()
+            .flat_map(|rules| rules.iter())
+            .flat_map(|rule| rule["destination"].as_str().unwrap().split(','))
+        {
+            let Some((base, prefix)) = range.split_once('/') else {
+                continue;
+            };
+            let Ok(base) = base.parse::<Ipv4Addr>() else {
+                continue;
+            };
+            let first = u32::from(base);
+            let last = first
+                | !u32::MAX
+                    .checked_shl(32 - prefix.parse::<u32>().unwrap())
+                    .unwrap_or(0);
+            for ip in [first, last] {
+                out.extend([ip.wrapping_sub(1), ip, ip.wrapping_add(1)]);
+            }
+        }
+        out.extend(more.iter().map(|ip| u32::from(*ip)));
+        // And one address in every /8 there is, whatever the rules name.
+        out.extend((0..256u32).map(|n| (n << 24) | 0x0005_0607));
+        out.into_iter().map(Ipv4Addr::from).collect()
+    }
+
+    fn to(address: [u8; 4], port: u16) -> Destination {
+        Destination {
+            address: Ipv4Addr::from(address),
+            port,
+        }
+    }
+
+    #[test]
+    fn a_service_with_no_destination_has_the_rules_it_always_had() {
+        let hosts = json!([
+            "10.20.30.1/24",
+            "100.99.1.2/32",
+            "172.20.7.5/24",
+            "fd00::1/64"
+        ]);
+        for gateway in [
+            [10, 90, 0, 1],
+            [172, 20, 5, 1],
+            [192, 168, 44, 1],
+            [100, 70, 3, 1],
+            [198, 51, 100, 1],
+        ] {
+            let gateway = Ipv4Addr::from(gateway);
+            let block = blocks(
+                &format!("{}/24", Ipv4Addr::from(u32::from(gateway) & 0xffff_ff00)),
+                29,
+            )
+            .unwrap()[3];
+            for tenant in [None, Some(block)] {
+                assert_eq!(
+                    egress_rules(gateway, &hosts, tenant, &[]),
+                    egress_rules_before(gateway, &hosts, tenant),
+                    "{gateway} {tenant:?}"
+                );
+            }
+            // A tenant's rules take no destination at all.
+            assert_eq!(
+                egress_rules(
+                    gateway,
+                    &hosts,
+                    Some(block),
+                    &[to([10, 4, 0, 9], 443), to([100, 100, 1, 1], 443)]
+                ),
+                egress_rules_before(gateway, &hosts, Some(block)),
+            );
+        }
+    }
+
+    #[test]
+    fn a_destination_opens_one_address_on_one_tcp_port_and_nothing_else() {
+        let hosts = json!(["10.20.30.1/24", "100.99.1.2/32", "172.20.7.5/24"]);
+        // The two a first user needs: an address on another bridge of the node, and one on the tailnet. The gateway is
+        // tried in the same private range as the first, in another, and outside every one.
+        let bridge = to([10, 20, 30, 40], 443);
+        let tailnet = to([100, 101, 102, 103], 443);
+        for gateway in [
+            [10, 90, 0, 1],
+            [192, 168, 44, 1],
+            [100, 70, 3, 1],
+            [198, 51, 100, 1],
+        ] {
+            let gateway = Ipv4Addr::from(gateway);
+            for wanted in [
+                vec![bridge],
+                vec![tailnet],
+                vec![bridge, tailnet],
+                vec![bridge, to([10, 20, 30, 40], 8443), to([172, 16, 0, 1], 22)],
+            ] {
+                let before = egress_rules_before(gateway, &hosts, None);
+                let after = egress_rules(gateway, &hosts, None, &wanted);
+                let named =
+                    |ip: Ipv4Addr, port: u16| wanted.contains(&Destination { address: ip, port });
+                let more: Vec<Ipv4Addr> = wanted.iter().map(|d| d.address).collect();
+                for ip in edges(&[&before, &after], &more) {
+                    let is_destination = wanted.iter().any(|d| d.address == ip);
+                    // tcp: every port of a destination's address, and the ports around the named ones everywhere.
+                    let ports: Vec<u16> = if is_destination {
+                        (1..=65535).collect()
+                    } else {
+                        vec![1, 22, 80, 442, 443, 444, 8443, 65535]
+                    };
+                    for port in ports {
+                        let was = allowed(&before, ip, "tcp", port);
+                        let now = allowed(&after, ip, "tcp", port);
+                        if named(ip, port) {
+                            assert!(!was && now, "{gateway}: tcp {ip}:{port} is the destination");
+                        } else {
+                            assert_eq!(was, now, "{gateway}: tcp {ip}:{port}");
+                            assert!(
+                                !(is_destination && now),
+                                "{gateway}: tcp {ip}:{port} is open"
+                            );
+                        }
+                    }
+                    for port in [1, 53, 123, 443, 65535] {
+                        assert_eq!(
+                            allowed(&before, ip, "udp", port),
+                            allowed(&after, ip, "udp", port),
+                            "{gateway}: udp {ip}:{port}"
+                        );
+                    }
+                    assert_eq!(
+                        allowed(&before, ip, "icmp4", 0),
+                        allowed(&after, ip, "icmp4", 0),
+                        "{gateway}: icmp {ip}"
+                    );
+                    // Every other IP protocol, which no rule can name: decided as before everywhere, so closed
+                    // for a destination's address too. Nothing but tcp on the named port is newly open.
+                    for protocol in ["gre", "ipip", "esp", "sctp"] {
+                        assert_eq!(
+                            allowed(&before, ip, protocol, 0),
+                            allowed(&after, ip, protocol, 0),
+                            "{gateway}: {protocol} {ip}"
+                        );
+                        assert!(
+                            !(is_destination && allowed(&after, ip, protocol, 0)),
+                            "{gateway}: {protocol} {ip} is open"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_address_of_the_host_or_one_that_is_no_destination_is_never_opened() {
+        let hosts = json!(["10.20.30.1/24", "100.99.1.2/32"]);
+        let gateway = Ipv4Addr::new(10, 90, 0, 1);
+        let before = egress_rules_before(gateway, &hosts, None);
+        // The node's own address on the other bridge, its tailnet address, the bridge gateway, an address of the
+        // service subnet, loopback, the metadata address, a public address and a port of 0: a record that named any of
+        // them changes no rule.
+        for closed in [
+            to([10, 20, 30, 1], 443),
+            to([100, 99, 1, 2], 443),
+            to([10, 90, 0, 1], 443),
+            to([10, 90, 0, 7], 443),
+            to([127, 0, 0, 1], 443),
+            to([169, 254, 169, 254], 80),
+            to([8, 8, 8, 8], 443),
+            to([10, 20, 30, 40], 0),
+        ] {
+            assert_eq!(
+                egress_rules(gateway, &hosts, None, &[closed]),
+                before,
+                "{closed:?}"
+            );
+        }
+        // The network and broadcast addresses of the node's networks are the node's own too, when Incus tells the
+        // netmask: a packet to one is answered by the host itself.
+        let with_masks = json!(["10.20.30.1/24", "100.99.1.2/32"]);
+        assert_eq!(
+            egress_rules(gateway, &with_masks, None, &[]),
+            egress_rules_before(gateway, &with_masks, None)
+        );
+        for closed in [to([10, 20, 30, 0], 443), to([10, 20, 30, 255], 443)] {
+            assert_eq!(
+                egress_rules(gateway, &with_masks, None, &[closed]),
+                before,
+                "{closed:?}"
+            );
+        }
+        // Beside a real one it is still left out.
+        let rules = egress_rules(
+            gateway,
+            &hosts,
+            None,
+            &[to([10, 20, 30, 1], 443), to([10, 20, 30, 40], 443)],
+        );
+        assert!(!allowed(&rules, Ipv4Addr::new(10, 20, 30, 1), "tcp", 443));
+        assert!(allowed(&rules, Ipv4Addr::new(10, 20, 30, 40), "tcp", 443));
+    }
+
+    #[test]
+    fn a_destination_at_the_end_of_a_range_or_beside_another_opens_only_itself() {
+        let hosts = json!(["10.20.30.1/24", "100.99.1.2/32"]);
+        let gateway = Ipv4Addr::new(10, 90, 0, 1);
+        let before = egress_rules_before(gateway, &hosts, None);
+        let cases: Vec<Vec<Destination>> = vec![
+            // Both ends of each range, and the addresses beside the service /24.
+            vec![to([10, 0, 0, 0], 443)],
+            vec![to([10, 255, 255, 255], 443)],
+            vec![to([172, 16, 0, 0], 443)],
+            vec![to([172, 31, 255, 255], 443)],
+            vec![to([192, 168, 0, 0], 443)],
+            vec![to([192, 168, 255, 255], 443)],
+            vec![to([100, 64, 0, 0], 443)],
+            vec![to([100, 127, 255, 255], 443)],
+            vec![to([10, 89, 255, 255], 443)],
+            vec![to([10, 90, 1, 0], 443)],
+            // Two neighbours, with the same port and with another; four in four ranges.
+            vec![to([10, 20, 30, 40], 443), to([10, 20, 30, 41], 443)],
+            vec![to([10, 20, 30, 41], 22), to([10, 20, 30, 40], 443)],
+            vec![
+                to([10, 0, 0, 0], 443),
+                to([172, 31, 255, 255], 443),
+                to([192, 168, 0, 0], 8443),
+                to([100, 127, 255, 255], 22),
+            ],
+        ];
+        for wanted in cases {
+            let after = egress_rules(gateway, &hosts, None, &wanted);
+            let more: Vec<Ipv4Addr> = wanted.iter().map(|d| d.address).collect();
+            for ip in edges(&[&before, &after], &more) {
+                for port in [1, 21, 22, 23, 442, 443, 444, 8442, 8443, 8444, 65535] {
+                    let named = wanted.contains(&Destination { address: ip, port });
+                    assert_eq!(
+                        allowed(&after, ip, "tcp", port),
+                        named || allowed(&before, ip, "tcp", port),
+                        "{wanted:?}: tcp {ip}:{port}"
+                    );
+                    assert!(!(named && allowed(&before, ip, "tcp", port)));
+                }
+                for protocol in ["udp", "icmp4", "gre", "sctp"] {
+                    assert_eq!(
+                        allowed(&after, ip, protocol, 443),
+                        allowed(&before, ip, protocol, 443),
+                        "{wanted:?}: {protocol} {ip}"
+                    );
+                }
+            }
+            // Every named one is open, so none was dropped on the way.
+            for one in &wanted {
+                assert!(allowed(&after, one.address, "tcp", one.port), "{one:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_rules_of_a_destination_are_written_as_incus_reads_them() {
+        let rules = egress_rules(
+            Ipv4Addr::new(10, 90, 0, 1),
+            &json!([]),
+            None,
+            &[to([10, 20, 30, 40], 443)],
+        );
+        let of = |index: usize| {
+            let rule = &rules[index];
+            [
+                rule["action"].as_str().unwrap(),
+                rule["destination"].as_str().unwrap(),
+                rule["protocol"].as_str().unwrap(),
+                rule["destination_port"].as_str().unwrap(),
+            ]
+            .map(str::to_owned)
+        };
+        assert_eq!(rules.len(), 9);
+        assert_eq!(
+            of(4),
+            ["reject", "10.20.30.40/32", "tcp", "1-442,444-65535"]
+        );
+        assert_eq!(of(5), ["reject", "10.20.30.40/32", "udp", ""]);
+        assert_eq!(of(6), ["reject", "10.20.30.40/32", "icmp4", ""]);
+        assert_eq!(of(7), ["allow", "10.20.30.40/32", "tcp", "443"]);
+        // The last allow names every address but the opened one: 32 ranges, one of each length, none of which holds
+        // it. So what is not tcp on port 443 to that address matches no rule, and meets the NIC's default reject.
+        let internet = of(8);
+        assert_eq!(internet[0], "allow");
+        assert_eq!(internet[2..], ["".to_owned(), "".to_owned()]);
+        let ranges: Vec<&str> = internet[1].split(',').collect();
+        assert_eq!(ranges.len(), 32);
+        assert!(ranges.contains(&"128.0.0.0/1") && ranges.contains(&"10.20.30.41/32"));
+        let opened = u32::from(Ipv4Addr::new(10, 20, 30, 40));
+        assert!(!ranges.iter().any(|range| {
+            let (base, prefix) = range.split_once('/').unwrap();
+            destination::holds(
+                u32::from(base.parse::<Ipv4Addr>().unwrap()),
+                prefix.parse().unwrap(),
+                opened,
+            )
+        }));
+        // 10.0.0.0/8 without the service /24 and without the one address: no range of the reject holds it.
+        let reject = rules[0]["destination"].as_str().unwrap();
+        assert!(
+            !reject
+                .split(',')
+                .any(|range| range == "10.0.0.0/8" || range == "10.20.30.40/32")
+        );
+        assert!(reject.split(',').any(|range| range == "10.20.30.41/32"));
+        assert!(reject.split(',').any(|range| range == "100.64.0.0/10"));
+    }
 
     fn ip(last: u8) -> Ipv4Addr {
         Ipv4Addr::new(192, 0, 2, last)

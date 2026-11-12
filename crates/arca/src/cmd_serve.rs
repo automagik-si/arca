@@ -112,7 +112,8 @@ pub fn watch_kernel_handler(cfg: &NodeConfig, kernel: Arc<Mutex<Kernel>>) -> Wat
 }
 
 /// Refuses a start whose config would leave a half-state under the desired state (a network dropped from under what
-/// lives on it, or the services socket moved or taken from under a service with kernel access), and a start that names
+/// lives on it, the services socket moved or taken from under a service with kernel access, or a private destination
+/// taken from under a service whose owner approved it), and a start that names
 /// a host bridge this host does not have. A node that holds containers and virtual
 /// machines together starts. The desired document is read under the state directory's lock, which is released before the kernel takes it.
 pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> {
@@ -138,6 +139,11 @@ pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> 
     // A service whose device connects to a socket this config does not serve as the services socket: see
     // `kernel_access_refusal`.
     if let Some(why) = crate::handlers::kernel_access_refusal(cfg, &entries) {
+        return Err(Failure::Config(why));
+    }
+    // A service whose record names a private destination this config no longer names for it: see
+    // `destinations_refusal`.
+    if let Some(why) = crate::handlers::destinations_refusal(cfg, &entries) {
         return Err(Failure::Config(why));
     }
     match crate::handlers::mode_refusal(cfg, &entries) {

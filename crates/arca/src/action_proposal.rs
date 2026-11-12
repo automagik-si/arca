@@ -360,6 +360,14 @@ impl ActionKind {
                 if let Some(port) = args["kernelAccess"]["port"].as_u64() {
                     rows.push(row("Kernel access", &kernel_access_words(port)));
                 }
+                // This node's config lets the service reach a private address. The proposal names it (it is filled
+                // in from the config when the proposal is made), so the approval binds it and the card says it.
+                if args.get("destinations").is_some() {
+                    rows.push(row(
+                        "Private network",
+                        &destinations_words(&args["destinations"]),
+                    ));
+                }
                 // The row says what will happen, so the owner approves a stopped service knowingly: a create that
                 // said `start: false`, and one whose template is created stopped whatever the call says (the reason
                 // is read from the template when the proposal is made, and is not in its arguments).
@@ -619,6 +627,12 @@ impl ActionKind {
         } else {
             sentence
         };
+        // A service that may reach a private address through the node is named as one.
+        let sentence = if self == Self::ServiceCreate && args.get("destinations").is_some() {
+            format!("{sentence}, with a way through this node to a private address")
+        } else {
+            sentence
+        };
         // A service created stopped is named as one: nothing of it runs until it is started.
         let sentence =
             if self == Self::ServiceCreate && args.get("start") == Some(&Value::Bool(false)) {
@@ -639,6 +653,37 @@ impl ActionKind {
 pub fn kernel_access_words(port: u64) -> String {
     format!(
         "Yes: this service can call this node's kernel from inside, at http://127.0.0.1:{port}/mcp, with whatever token it is given. The token's scope and tool list decide what it may do, and a call without a token is refused."
+    )
+}
+
+/// The destinations of a `service_create`, as a list in words: `10.1.2.3 on tcp port 443 and 10.1.2.4 on tcp port 22`.
+/// A value that is not a list of addresses and ports is said to be one, so a card never shows nothing for it.
+pub fn destinations_list(destinations: &Value) -> String {
+    let parts: Vec<String> = destinations
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(
+            |one| match (one["address"].as_str(), one["port"].as_u64()) {
+                (Some(address), Some(port)) => format!("{address} on tcp port {port}"),
+                _ => "a destination that cannot be read".to_string(),
+            },
+        )
+        .collect();
+    match parts.as_slice() {
+        [] => "no address".to_string(),
+        [one] => one.clone(),
+        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    }
+}
+
+/// The `Private network` row of a `service_create` whose service this node's config gives a destination, in the
+/// owner's words. It names the address and the port, and that the node's NAT makes the service's packets the node's
+/// own: an allowlist at the destination that admits the node admits every process of the service.
+pub fn destinations_words(destinations: &Value) -> String {
+    format!(
+        "Yes: this service, and everything that runs in it, can reach {} through this node, and is seen there as this node itself: whatever trusts this node's address there trusts everything in this service. Every other private address stays closed.",
+        destinations_list(destinations)
     )
 }
 

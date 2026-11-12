@@ -281,6 +281,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "tenant": "abcdefgh", "deploy": "d1", "start": false,
                 "settings": { "url": "https://git.example/example-org" },
                 "kernelAccess": { "port": 7461 },
+                "destinations": [{ "address": "10.20.30.40", "port": 443 }],
             }),
             ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
             ActionKind::ServiceUnpublish
@@ -493,16 +494,25 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (_, "mac") => "MAC address",
                 (ActionKind::ServiceCreate, "start") => "Start",
                 (ActionKind::ServiceCreate, "kernelAccess") => "Kernel access",
+                (ActionKind::ServiceCreate, "destinations") => "Private network",
                 _ => panic!("{action:?} field {field} has no owner label"),
             };
             let row = details
                 .iter()
                 .find(|row| row.label == label)
                 .unwrap_or_else(|| panic!("{action:?} details lack {label}"));
-            // The two fields that are not strings are shown in words.
+            // The fields that are not strings are shown in words.
             let access: String;
             let expected = match &prepared[field.as_str()] {
                 Value::Bool(start) => arca::action_proposal::start_words(*start),
+                stated @ Value::Array(_) => {
+                    access = arca::action_proposal::destinations_words(stated);
+                    assert_eq!(
+                        access,
+                        "Yes: this service, and everything that runs in it, can reach 10.20.30.40 on tcp port 443 through this node, and is seen there as this node itself: whatever trusts this node's address there trusts everything in this service. Every other private address stays closed."
+                    );
+                    access.as_str()
+                }
                 Value::Object(stated) => {
                     access = arca::action_proposal::kernel_access_words(
                         stated["port"].as_u64().expect("a port"),

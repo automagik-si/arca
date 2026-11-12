@@ -2,6 +2,7 @@
 //! the node's first service used the managed network, [`BridgedProject`] when it was a virtual machine on a host bridge.
 //! A node that later gains the other network keeps the one project, and its owner widens it (Rules 54 and 55 of the
 //! ownership document).
+pub mod destination;
 pub mod tenant;
 
 use arca_kernel::{

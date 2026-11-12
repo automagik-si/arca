@@ -493,6 +493,8 @@ mod admission;
 mod create_stopped;
 #[path = "tenants/deploys.rs"]
 mod deploys;
+#[path = "tenants/destinations.rs"]
+mod destinations;
 #[path = "tenants/gate.rs"]
 mod gate;
 #[path = "tenants/isolation.rs"]
