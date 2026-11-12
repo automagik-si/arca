@@ -2021,6 +2021,28 @@ fn node_metrics_result() -> Value {
     ])
 }
 
+/// The running instances whose CPU and memory a sample's tick did not read, each with why in fixed words.
+fn instances_not_read() -> Value {
+    let mut schema = array(result(vec![
+        ("project", true, string_max(64)),
+        ("name", true, string_max(64)),
+        (
+            "why",
+            true,
+            one_of(&[
+                "Incus did not answer within 2 seconds",
+                "Incus answered with an error",
+                "Incus answered without the CPU or the memory figure",
+                "the tick's time for state reads was spent",
+            ]),
+        ),
+    ]));
+    schema["description"] = json!(
+        "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read."
+    );
+    schema
+}
+
 /// One host sample. Every key is required; a measurement the host cannot give is `null`, not absent.
 fn host_sample() -> Value {
     result(vec![
@@ -2096,6 +2118,7 @@ fn host_sample() -> Value {
                 ("running", true, int()),
             ])),
         ),
+        ("instancesNotRead", true, instances_not_read()),
     ])
 }
 
@@ -2746,7 +2769,7 @@ pub fn service_view_schema() -> Value {
                 "type": "string"
             },
             "ipv4": {
-                "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: it has none now.",
+                "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
                 "maxLength": 15,
                 "type": "string"
             },

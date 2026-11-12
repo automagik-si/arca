@@ -2480,8 +2480,6 @@ mod tests {
     }
 
     const PROJECTS_PATH: &str = "/1.0/projects?recursion=1";
-    /// The instance list the sampler reads each tick, with each row's state.
-    const SAMPLED_INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=2";
 
     /// An Incus that answers the project index and the instance listing from two scripts, one answer per read, the last
     /// answer repeating.
@@ -2519,8 +2517,8 @@ mod tests {
                         .collect(),
                 ));
             }
-            // The watch reads the recursion-one listing, and the sampler reads the recursion-two listing in the same tick.
-            if path == INSTANCES_ALL_PROJECTS || path == SAMPLED_INSTANCES {
+            // The watch and the sampler both read the recursion-one listing.
+            if path == INSTANCES_ALL_PROJECTS {
                 return Ok(Value::Array(next_answer(&self.instances)));
             }
             Err(IncusError::Decode(format!("no script answer for {path}")))
@@ -5427,8 +5425,9 @@ fn read_again_once(read: &UnixIncus, path: &str) -> Result<Value, arca_incus::In
         incus_read_cause(error).1
     );
     thread::sleep(READ_AGAIN_AFTER);
-    let left = arca_incus::read::TIMEOUT.saturating_sub(began.elapsed());
-    read.clone().with_timeout(left).get(path)
+    // The second try has what is left of this client's own deadline, so both together take no longer than one read.
+    let left = read.timeout().saturating_sub(began.elapsed());
+    read.get_within(path, left)
 }
 
 /// The instances of `project`, or of every project. `with_state` asks Incus for each one's live state too, which for a

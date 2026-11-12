@@ -1169,7 +1169,7 @@ Every service verb, a read too, first asks Incus for the node's instances. That 
 config and devices and is answered at once. It does not ask for an instance's **live state**, which for a running
 virtual machine Incus takes from the machine's guest agent: a machine that runs many containers of its own can take
 most of the 10 seconds a read is given, and a listing with every instance's state is as slow as the slowest of them.
-Only three things read live state:
+Among the service verbs, only these read live state:
 
 - `service_status` of a virtual machine **on a host bridge**, which runs: its address is given by that network and
   is in no record, so this one call reads the state of that one instance. When Incus does not answer in time the
@@ -1177,6 +1177,10 @@ Only three things read live state:
   row has `ipv4` empty and `ipv4In: "state"`, which says the address is there to be read and is not "none".
 - `service_create` and `function_create`, and `tenant_create`: a new instance's address, MAC or block must not be one
   that an instance holds live without a record of it.
+
+Outside the service verbs, the metrics sampler reads each running instance's own state for its CPU and memory, one
+instance at a time with a short deadline, and never the listing with every instance's state (see "Instances" under
+"Host metrics").
 
 A read that failed fast (the socket was not reached, or Incus answered with a server error) is made once more after a
 fifth of a second, inside the same 10 seconds. One that got no answer by its deadline is not made again. When the
@@ -1347,6 +1351,25 @@ sample ring and its rate counters, so the window mean and the next rate cover on
   integer in the schema, so its `0` is a placeholder a consumer must not show as a count. `cpu.reason` and `memory.reason`
   say `the Incus resources read failed`. The node never falls back to its own `/proc`: a failed read is unknown, not the wrong
   machine. `load.reason` still says `not available for a remote host`.
+
+### Instances
+
+Each sample lists the node's instances once, without their live state: the listing holds each one's status and
+`last_used_at` (the project counts and the starts that `crash_loop` reads) and is answered at once. An instance's CPU time
+and memory are in its **live state**, which Incus takes from a running virtual machine's guest agent and which can take
+seconds for one busy machine. So the sampler reads each running instance's own state, one after another, never two at
+once: 2 seconds each and 4 seconds for all of them in one sample. The ones asked longest ago go first, so on a node with
+more slow machines than one sample reaches, each is still read within a few samples: a read the 4 seconds cut short
+does not count as asked, so that machine goes first in the next sample. Only a running instance is asked. A stopped
+one has no usage; a frozen one, or one in any other status, is not asked and not named either, and its CPU and memory
+are left out of the export.
+
+An instance whose state was not read keeps its row (it counts in `projects` and in `arca_instance_running`), its CPU and
+memory are left out of that sample's export, and the sample's `instancesNotRead` names it with one of four fixed reasons:
+`Incus did not answer within 2 seconds`, `Incus answered with an error`, `Incus answered without the CPU or the memory
+figure` (the figure it did answer is kept), or `the tick's time for state reads was spent`.
+Incus's own text is never shown. In `mean`, `instancesNotRead` is the newest sample's. No alert reads an instance's CPU or
+memory, so a machine that was not read changes no alert.
 
 ### GPUs
 
@@ -3122,8 +3145,8 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_drift_entries` | gauge | `kind` (`marked_without_entry`, `entry_without_object`) | the drift entries of the newest watch sweep |
 | `arca_instance_running` | gauge | `project`, `incus_instance`, `type` (`container`, `vm`) | 1 when an instance runs |
 | `arca_instance_starts_total` | counter | `project`, `incus_instance` | the starts of an instance since the server started |
-| `arca_instance_cpu_seconds_total` | counter | `project`, `incus_instance` | the CPU time an instance has used |
-| `arca_instance_memory_used_bytes` | gauge | `project`, `incus_instance` | the memory an instance uses |
+| `arca_instance_cpu_seconds_total` | counter | `project`, `incus_instance` | the CPU time an instance has used, from its own live state; absent for a sample that did not read it (see "Instances" under "Host metrics") |
+| `arca_instance_memory_used_bytes` | gauge | `project`, `incus_instance` | the memory an instance uses, read as the CPU time is |
 | `arca_latency_seconds` | gauge | `target` (`gateway`, `internet`, `relay`) | the TCP connect time to a probe target |
 | `arca_secureboot_enabled` | gauge | | 1 when Secure Boot is enabled |
 | `arca_tpm_present` | gauge | | 1 only when incus-osd reports the TPM status `ok`; see "incus-osd readings" |
@@ -3343,8 +3366,9 @@ kernel's mark and `user.arca.template`. It gets its address from the bridge's ow
 neither assigns nor filters it. A bridge whose network hands out no addresses by DHCP (one where another hypervisor
 assigns them itself) gives the guest none: put such a virtual machine on the managed service network of a mixed node,
 or configure its address inside the guest. `service_status` of the running machine reads its live state and shows the
-address its own network card holds, or an empty `ipv4` when it holds none; an address of a bridge the guest made for
-its own containers is never shown. `service_list` reads no live state: the machine's row has an empty `ipv4` and
+address the guest reports for the card that has the machine's MAC, or an empty `ipv4` when the guest reports none
+there: the card is down, or the guest's agent does not answer (the guest can set what it reports). An address of a
+bridge the guest made for its own containers is never shown. `service_list` reads no live state: the machine's row has an empty `ipv4` and
 `ipv4In: "state"` (see "When Incus does not answer").
 
 Ownership, the journal and approvals are the same as for a container. `service_create` needs a doctor token, can be

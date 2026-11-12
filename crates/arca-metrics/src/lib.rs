@@ -20,7 +20,10 @@ pub use gpu::{
     NVIDIA_TIMEOUT_REASON, Nvidia, NvidiaError, NvidiaProcess, NvidiaReading, NvidiaSmi, attribute,
     cards_of, mean_gpu, normalize_pci, parse_processes, parse_readings, read_inventory,
 };
-pub use incus::{InstanceKind, InstanceReading};
+pub use incus::{
+    ANSWERED_AN_ERROR, BUDGET_SPENT, InstanceKind, InstanceReading, NO_FIGURES, NOT_ANSWERED,
+    STATE_BUDGET, STATE_DEADLINE, state_path,
+};
 pub use mode::{
     HostMode, HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode,
     choose_host_mode_within,
@@ -29,7 +32,7 @@ pub use osd::OsdReading;
 pub use probe::ProbeTarget;
 pub use sample::{
     Cpu, DEFAULT_MINUTES, HostSample, LatencyReading, Load, MODE_PROBE_EVERY_MS, Memory,
-    MonotonicClock, Network, NicCounters, PROVISIONAL_WINDOW_MS, Pool, ProjectCount, Psi,
+    MonotonicClock, Network, NicCounters, NotRead, PROVISIONAL_WINDOW_MS, Pool, ProjectCount, Psi,
     REMOTE_HOST_REASON, RESOURCES_REASON, Readings, Sampler, SamplerConfig, mean, node_metrics,
 };
 pub use smart::{DriveReading, DrivesReading};

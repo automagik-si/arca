@@ -7,6 +7,17 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The metrics sampler no longer reads the listing of every instance with its live state each tick. On a node where one
+running virtual machine's guest agent is slow, that listing took up to its 10 second deadline, so a tick often had no
+instance readings at all, and it slowed every service create made at the same time. Each tick now lists the instances
+without state and reads each running instance's own state one after another, 2 seconds each and 4 seconds for all, the
+ones asked longest ago first. `node_metrics` names, in each sample's new `instancesNotRead`, a running instance whose
+CPU and memory a tick did not read, and why, in fixed words; its CPU and memory are left out of that tick's export.
+
+On such a node the `crash_loop` alert was unknown whenever that listing failed, since it reads the instances' starts.
+It is now evaluated there again: it can fire for a crash loop that was hidden before, and an alert held firing as
+unknown can now clear.
+
 A virtual-machine template can say what must hold between its settings (`settingRules`: one amount at least
 another), and a create whose settings would not pass is refused when it is proposed, before any card. The two GitLab
 runner pool templates now state what their script already refused on the machine's console: `concurrent` and

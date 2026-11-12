@@ -9,7 +9,7 @@
 //!
 //! The `recursion=2` instance listing is the `recursion=1` rows, each with a `state` object. A running instance's `state` holds
 //! `cpu.usage` (nanoseconds) and `memory.usage` (bytes), set by [`FakeIncus::set_instance_usage`] and zero until a test sets them.
-//! A stopped instance's `state` is `null`. [`FakeIncus::set_last_used`] sets an instance's `last_used_at`, as a start does.
+//! A running instance's cards are in its `state` only when [`FakeIncus::set_live_network`] set them. A stopped instance's `state` is `null`. [`FakeIncus::set_last_used`] sets an instance's `last_used_at`, as a start does.
 //!
 //! Operations: the listing groups every operation the fake holds by its status in lower case, as Incus does. A held operation
 //! ([`FakeIncus::hold_operation`], [`FakeIncus::hold_create`]) stays running (status code 103) and names its object in
@@ -245,6 +245,9 @@ struct Store {
     hung: BTreeMap<String, bool>,
     /// The CPU time (nanoseconds) and memory (bytes) a running instance reports, by project and name.
     usage: BTreeMap<(String, String), (u64, u64)>,
+    /// The network cards a running instance reports in its live state, by project and name, set by
+    /// [`FakeIncus::set_live_network`]: in place of the cards the fake makes from its devices and leases.
+    live: BTreeMap<(String, String), Value>,
 }
 
 /// One DHCP lease: the network, the MAC that holds it and its address, and whether a device's `ipv4.address` pinned it.
@@ -395,6 +398,7 @@ impl Shared {
             leases: Vec::new(),
             hung: BTreeMap::new(),
             usage: BTreeMap::new(),
+            live: BTreeMap::new(),
         };
         for index in 0..store.objects.len() {
             store.expand(index, false);
@@ -707,8 +711,8 @@ impl FakeIncus {
             .insert(name.to_string(), forced_too);
     }
 
-    /// Sets the CPU time, in nanoseconds, and the memory, in bytes, that the instance `name` in `project` reports in its `state`
-    /// on the `recursion=2` listing. Panics when no such instance is held. It records no write.
+    /// Sets the CPU time, in nanoseconds, and the memory, in bytes, that the running instance `name` in `project` reports in
+    /// its `state`, on its own `/state` and on the `recursion=2` listing. Panics when no such instance is held. It records no write.
     pub fn set_instance_usage(&self, project: &str, name: &str, cpu_ns: u64, memory_bytes: u64) {
         let mut store = lock(&self.shared.store);
         assert!(
@@ -718,6 +722,42 @@ impl FakeIncus {
         store.usage.insert(
             (project.to_string(), name.to_string()),
             (cpu_ns, memory_bytes),
+        );
+    }
+
+    /// Sets the network cards the running instance `name` in `project` reports in its live state, as a guest's agent does:
+    /// each card's name, its MAC, whether it is up, and its IPv4 addresses. They replace the cards the fake makes from the
+    /// instance's devices and leases, on its `/state` and on the `recursion=2` listing, which otherwise has none. What a
+    /// guest sets inside itself (an address no lease gave, a MAC no device carries) is only seen here. Panics when no such
+    /// instance is held. It records no write.
+    pub fn set_live_network(
+        &self,
+        project: &str,
+        name: &str,
+        cards: &[(&str, &str, bool, &[&str])],
+    ) {
+        let mut store = lock(&self.shared.store);
+        assert!(
+            store.instance_held(project, name),
+            "no instance {project}/{name} to set the live network of"
+        );
+        let network: Map<String, Value> = cards
+            .iter()
+            .map(|(card, mac, up, addresses)| {
+                let addresses: Vec<Value> = addresses
+                    .iter()
+                    .map(|address| json!({ "family": "inet", "address": address, "netmask": "24", "scope": "global" }))
+                    .collect();
+                let state = if *up { "up" } else { "down" };
+                (
+                    (*card).to_string(),
+                    json!({ "hwaddr": mac, "addresses": addresses, "state": state, "type": "broadcast" }),
+                )
+            })
+            .collect();
+        store.live.insert(
+            (project.to_string(), name.to_string()),
+            Value::Object(network),
         );
     }
 
@@ -1699,7 +1739,15 @@ impl Store {
                 } else {
                     (0, 0)
                 };
-                let state = json!({ "cpu": { "usage": cpu_ns }, "memory": { "usage": memory } });
+                let mut state =
+                    json!({ "cpu": { "usage": cpu_ns }, "memory": { "usage": memory } });
+                if text_of(&body, "status") == "Running"
+                    && let Some(network) = self
+                        .live
+                        .get(&(object.project.clone(), object.name.clone()))
+                {
+                    state["network"] = network.clone();
+                }
                 if let Some(map) = body.as_object_mut() {
                     map.insert("state".to_string(), state);
                 }
@@ -2916,9 +2964,25 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
             json!({ "hwaddr": mac, "addresses": addresses, "state": "up", "type": "broadcast" }),
         );
     }
-    sync(
-        json!({ "status": status, "status_code": if running { 103 } else { 102 }, "network": network }),
-    )
+    let object = &store.objects[index];
+    let live = store
+        .live
+        .get(&(object.project.clone(), object.name.clone()))
+        .filter(|_| running);
+    let network = live.cloned().unwrap_or(Value::Object(network));
+    let (cpu_ns, memory) = store
+        .usage
+        .get(&(object.project.clone(), object.name.clone()))
+        .copied()
+        .filter(|_| running)
+        .unwrap_or((0, 0));
+    sync(json!({
+        "status": status,
+        "status_code": if running { 103 } else { 102 },
+        "network": network,
+        "cpu": { "usage": cpu_ns },
+        "memory": { "usage": memory },
+    }))
 }
 
 /// Rebuilds a stopped instance's root from an image, as an operation, and records which image the request named: the

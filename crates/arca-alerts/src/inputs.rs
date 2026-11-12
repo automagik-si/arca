@@ -339,7 +339,7 @@ mod tests {
         );
     }
 
-    /// An Incus that lists the instance rows the test sets, at recursion two.
+    /// An Incus that lists the instance rows the test sets, without their state. An instance's own state is not answered.
     #[derive(Clone, Default)]
     struct Rows(Arc<Mutex<Vec<Value>>>);
 
@@ -353,7 +353,7 @@ mod tests {
         }
 
         fn get(&self, path: &str) -> Result<Value, IncusError> {
-            if path == "/1.0/instances?all-projects=true&recursion=2" {
+            if path == "/1.0/instances?all-projects=true&recursion=1" {
                 let rows = self.0.lock().expect("the rows are not poisoned").clone();
                 return Ok(Value::Array(rows));
             }
