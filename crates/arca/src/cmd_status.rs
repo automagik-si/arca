@@ -9,10 +9,10 @@ use serde_json::{Value, json};
 
 use crate::cmd_call::{Addressed, read_token, run_call};
 use crate::cmd_init::DirectTokens;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::NodeConfig;
-use crate::{Failure, Flags};
+use crate::{Chosen, Failure, Flags, Origin};
 
 /// The verb whose answer this command prints.
 const VERB: &str = "arca_status";
@@ -35,7 +35,11 @@ pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
         return Ok(None);
     }
     let node = Addressed::new(&config, false);
-    let token = read_token(&crate::token_path(flags)?, &node)?;
+    let chosen = crate::token_path(flags)?;
+    let token = match read_token(&chosen, &node) {
+        Ok(token) => token,
+        Err(refusal) => viewer_token_beside(&chosen, &cfg, &node).ok_or(refusal)?,
+    };
     let answer =
         run_call(&cfg.listen.unix, None, &token, VERB, json!({}), &node)?.unwrap_or(Value::Null);
     if flags.switch("json") {
@@ -48,6 +52,43 @@ pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
         words(&answer, &cfg, &config.path, &tokens, has_screen())
     );
     Ok(None)
+}
+
+/// A viewer token of this node beside the installer's token file, when nothing named a token file and the installer's
+/// is not there. A node installed before the installer named its token `assistant-1.secret` keeps its viewer token in
+/// that directory under another name (`viewer.secret`), so the first command after an upgrade finds that one instead of
+/// telling the owner to mint a token. It is the first `.secret` file there, by name, that is a private token file and
+/// that the node's own token directory holds as a viewer that may call `arca_status`; a token of a wider scope is never
+/// taken in its place. A file that is not such a token is passed over without a word, and none found keeps the refusal.
+fn viewer_token_beside(chosen: &Chosen, cfg: &NodeConfig, node: &Addressed) -> Option<String> {
+    let missing = std::fs::symlink_metadata(&chosen.path)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    if chosen.origin != Origin::Default || !missing {
+        return None;
+    }
+    let store = arca_mcp::TokenStore::load(&cfg.tokens.hash_dir).ok()?;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(chosen.path.parent()?)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "secret")
+        })
+        .collect();
+    files.sort();
+    files.into_iter().find_map(|path| {
+        let file = Chosen {
+            path,
+            origin: Origin::Flag,
+        };
+        let token = read_token(&file, node).ok()?;
+        let caller = store.lookup(&token)?;
+        let may_ask = caller
+            .tools
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|tool| tool == VERB));
+        (caller.scope == arca_api::Scope::Viewer && may_ask).then_some(token)
+    })
 }
 
 /// `status --security`: what a person should know before sharing this machine, or a token of this node, with anyone

@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`arca status` works on a node that was upgraded rather than installed fresh. Such a node keeps its viewer token beside
+its config under another name (`viewer.secret`), and `arca status` with no `--token-file` asked only for the
+installer's `assistant-1.secret`, so the first command after an upgrade told the owner to mint a token. When that file
+is not there, `arca status` now uses a viewer token of this node from the same directory; a token of a wider scope is
+never taken in its place. A `--token-file` or `ARCA_TOKEN_FILE` that names a file is still read alone.
+
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
 what to propose it now reads the tenants (with what each instance uses and the deploy it came from) and the functions
