@@ -1680,7 +1680,7 @@ fn first_boot_with(
             TemplateError::refused(format!(
                 "template {name}: its first-boot script is not installed (templates/{file} does not exist). \
                  The script belongs beside templates/{name}.json in the state directory; for a template Arca ships, \
-                 `arca templates install --config <file>` puts the template and its script there"
+                 `arca templates install --config CONFIG_FILE` (this node's config in place of CONFIG_FILE) puts the template and its script there"
             ))
         } else {
             TemplateError::refused(format!(
@@ -2671,7 +2671,7 @@ fn script_unreadable(template: &str, file: &str, error: &std::io::Error) -> Temp
         return TemplateError::refused(format!(
             "template {template}: its entrypoint script is not installed (templates/{file} does not exist). \
              The script belongs beside templates/{template}.json in the state directory; for a template Arca ships, \
-             `arca templates install --config <file>` puts the template and its script there"
+             `arca templates install --config CONFIG_FILE` (this node's config in place of CONFIG_FILE) puts the template and its script there"
         ));
     }
     TemplateError::refused(format!(

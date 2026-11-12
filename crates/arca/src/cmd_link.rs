@@ -34,10 +34,10 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
             .filter(|(v, _)| end_of_options || !v.starts_with("--"))
         else {
             return Err(Failure::Usage(if command == "join" {
-                "link join needs the link the other node's `arca link pair` printed: arca link join <link>"
+                "link join needs the link the other node's `arca link pair` printed: arca link join LINK, with that link in place of LINK"
                     .to_string()
             } else {
-                "link remove needs the name of the peer to remove; arca link peers lists them: arca link remove <name>"
+                "link remove needs the name of the peer to remove; arca link peers lists them: arca link remove PEER_NAME, with the peer's name in place of PEER_NAME"
                     .to_string()
             }));
         };

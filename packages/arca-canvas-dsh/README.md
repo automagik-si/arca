@@ -327,7 +327,7 @@ the plain reason "this machine is not linked for approvals yet"; a page host
 whose status cannot be read links nothing. The proposal is recorded by the
 target host's own kernel, which later verifies the owner's passkey itself. The tools are
 registered globally with a per-session `when` condition, the Doctor's scope is
-restricted with `restrict({ allow: DOCTOR_TOOLS })` (the eight reads plus
+restricted with `restrict({ allow: DOCTOR_TOOLS })` (the ten reads plus
 `arca_propose`), and scoped `tools/pre-execute` and `tools.guard` checks deny every
 other name (including the reserved `run_code`) at dispatch. A setup that cannot
 install the restriction and guard, or enumerate its tools, fails after the
@@ -496,7 +496,7 @@ SSE events, in order. Every `data` is one JSON object.
 | --- | --- | --- |
 | `start` | `{ "session": "Doctor", "sessionId"?: "<dsh-session-id>" }` | Always first, sent before agent or model work so the kernel's idle timer never starts on a silent socket. `sessionId` is present when a persisted session is already known. |
 | `text` | `{ "text": "<delta>" }` | One assistant text delta; concatenate in arrival order. |
-| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"?, "proposal"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the eight reads or `arca_propose`. `proposal` is `{ "id": "act-<12 hex>" }` when the kernel accepted an action proposal. |
+| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"?, "proposal"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the ten reads or `arca_propose`. `proposal` is `{ "id": "act-<12 hex>" }` when the kernel accepted an action proposal. |
 | `usage` | `{ "turnToolCalls", "turnOutputTokens", "dailyTokens", "dailyBudget", "day" }` | Token accounting from the model's own usage; `dailyTokens` counts input plus output for the UTC day. |
 | `budget` | `{ "scope": "daily", "used", "budget", "message" }` | Daily budget reached; the message is `Daily budget reached, try tomorrow.`. The turn then ends. |
 | `cap` | `{ "reason", "limit", "message" }` | Per-turn cap reached: `reason` is `tool-calls` (40) or `output-tokens` (64000). |

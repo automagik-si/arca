@@ -38,6 +38,12 @@
 # It starts a node only for a config it wrote, or through a service it wrote earlier, and only where it can ask the
 # node afterwards what it is. For any other config it installs the program, starts nothing and says so.
 #
+# Templates. A node gets its service templates from `arca init`, not from this script. Where the node this script
+# runs as a service already has them, an upgrade runs `arca templates install` for it: a template that is an
+# earlier release's own file, byte for byte, becomes this release's, and the report names it. A template the owner
+# edited is kept, and the report names it too, with the one command that replaces it. A node with no templates gets
+# none here.
+#
 # How it ends:
 #   0   the node runs and answered `arca_status`, and Incus answers the node
 #   1   refused or failed; the words say what, and a refusal has changed nothing
@@ -107,13 +113,13 @@ usage() {
 Install Automagik Arca as a read-only node for this user.
 
   sh install.sh                      install, or upgrade in place, release $ARCA_VERSION
-  sh install.sh --version <version>  the same, for another release (see $RELEASES)
+  sh install.sh --version VERSION    the same, for the release VERSION names (see $RELEASES)
   sh install.sh --uninstall          remove the program and the service; keep the config, the tokens and the state
   sh install.sh --help
 
 It needs Linux on x86_64 with glibc $GLIBC_MAJOR.$GLIBC_MINOR or newer, curl, sha256sum, and an Incus this user can reach.
 It never runs sudo, and it changes nothing outside this user's home and runtime directory.
-A program from release $DOOR_SINCE on answers MCP clients of this machine at http://127.0.0.1:<port>/mcp (port
+A program from release $DOOR_SINCE on answers MCP clients of this machine at http://127.0.0.1:PORT/mcp (PORT is
 ${DOOR_PORTS%% *}, or the next free one), with a token. It opens no address another machine can reach.
 
   sh install.sh --no-door            open no TCP port at all; a later run without a flag keeps it that way
@@ -186,6 +192,29 @@ json_text() {
     esac
     json_rest=${1#*"\"$2\":\""}
     printf '%s\n' "${json_rest%%\"*}"
+}
+
+# The names in the list `"$2":[...]` of the one-line JSON $1, as words with commas: `a, b`. Fails when $1 has no such
+# list; prints nothing for an empty one. The names are file names, which hold no comma and no quote.
+json_list() {
+    case $1 in
+        *"\"$2\":["*) ;;
+        *) return 1 ;;
+    esac
+    json_rest=${1#*"\"$2\":["}
+    json_rest=${json_rest%%]*}
+    json_names=
+    while [ -n "$json_rest" ]; do
+        json_item=${json_rest%%,*}
+        json_item=${json_item#\"}
+        json_item=${json_item%\"}
+        json_names=${json_names:+$json_names, }$json_item
+        case $json_rest in
+            *,*) json_rest=${json_rest#*,} ;;
+            *) json_rest= ;;
+        esac
+    done
+    printf '%s\n' "$json_names"
 }
 
 # The version in the line `arca --version` prints: "Automagik Arca <version> (<commit>, <target>)".
@@ -439,7 +468,7 @@ check_runtime_dir() {
             problem "XDG_RUNTIME_DIR is $XDG_RUNTIME_DIR, which is not a directory." \
                 "The node's socket lives there. Unset it, or set it to this user's runtime directory, then run this again."
         else
-            problem "XDG_RUNTIME_DIR is not set and ${ARCA_INSTALL_RUN_ROOT:-/run/user}/${uid:-<uid>} does not exist." \
+            problem "XDG_RUNTIME_DIR is not set and ${ARCA_INSTALL_RUN_ROOT:-/run/user}/${uid:-YOUR_USER_NUMBER} does not exist." \
                 "The node's socket lives in this user's runtime directory, which the system makes when the user logs in." \
                 "Log in as this user (a console or ssh session), or have the machine's administrator keep the" \
                 "directory without a session (\`loginctl enable-linger $user\`), then run this again."
@@ -454,7 +483,7 @@ check_runtime_dir() {
         problem "the runtime directory $XDG_RUNTIME_DIR is not this user's alone:" \
             "$(ls -ldn "$XDG_RUNTIME_DIR/." 2>/dev/null || echo "(it cannot be listed)")" \
             "The node's socket lives there, and whoever else may write the directory could put their own in its place." \
-            "Set XDG_RUNTIME_DIR to this user's own runtime directory (mode 0700; /run/user/${uid:-<uid>} on most systems)."
+            "Set XDG_RUNTIME_DIR to this user's own runtime directory (mode 0700; /run/user/${uid:-YOUR_USER_NUMBER} on most systems)."
     elif [ ! -w "$XDG_RUNTIME_DIR" ]; then
         problem "this user cannot write the runtime directory $XDG_RUNTIME_DIR." \
             "The node's socket lives there. Set XDG_RUNTIME_DIR to this user's own runtime directory."
@@ -472,7 +501,7 @@ check_incus() {
         problem "there is no Incus socket at $incus_socket." \
             "Arca reads the machine through Incus. Install Incus and start it" \
             "(https://linuxcontainers.org/incus/docs/main/installing/), then run this again." \
-            "If Incus listens on another socket, name it: INCUS_SOCKET=<path> sh install.sh"
+            "If Incus listens on another socket, name it, with its path in place of SOCKET_PATH: INCUS_SOCKET=SOCKET_PATH sh install.sh"
     elif [ ! -r "$incus_socket" ] || [ ! -w "$incus_socket" ]; then
         problem "the user $user may not open the Incus socket $incus_socket:" \
             "$(ls -l "$incus_socket" 2>/dev/null || echo "(it cannot be listed)")" \
@@ -866,6 +895,41 @@ enable_changes() {
     fi
 }
 
+# The templates of the node this script runs as a service, on an upgrade. `arca init` installs a node's templates; a
+# later release may change one, and a node must not keep a template that release fixed. The program does the work
+# and decides: a file that is an earlier release's own, byte for byte, becomes this release's, and a file the owner
+# edited is kept. This script only runs it and says what it answered.
+#
+# It runs only where templates are already installed, in the state directory this script names in the config it
+# writes, and only while the config still names that directory: a node that only looks has none, and gets none here.
+upgrade_templates() {
+    templates_replaced=
+    templates_kept=
+    templates_failed=
+    [ "$service" = unit ] || return 0
+    exists "$state_dir/templates" || return 0
+    case ${config_has-} in
+        *"\"$state_dir\""*) ;;
+        *) return 0 ;;
+    esac
+    templates_command="$bin templates install --config $config"
+    # A run that puts an older program in place (--version asked for it): what that program keeps may be a newer
+    # release's file, not an edit, and replacing it would bring back a template that release fixed.
+    templates_older=
+    if [ -n "${was_version-}" ] && newer "$was_version" "$version"; then
+        templates_older=1
+    fi
+    # The program's own words when it stops: it names what it had already put in place.
+    if ! templates_said=$("$bin" templates install --config "$config" 2>&1 </dev/null); then
+        templates_failed=$templates_said
+        [ -n "$templates_failed" ] || templates_failed="it said nothing"
+        return 0
+    fi
+    # A program from before it named what it replaced answers without that list: there is then nothing to say.
+    templates_replaced=$(json_list "$templates_said" replaced) || templates_replaced=
+    templates_kept=$(json_list "$templates_said" kept) || templates_kept=
+}
+
 report() {
     status_command="$bin call arca_status --config $config --token-file $token_file"
     start_command="$bin serve --config $config"
@@ -903,6 +967,29 @@ report() {
     fi
     if [ "$config_ours" = 1 ]; then
         say "  state     $state_dir"
+    fi
+    if [ -n "${templates_replaced-}" ]; then
+        say "  templates brought up to this release: $templates_replaced"
+        say "            (each was an earlier release's own file, not edited; a service that already runs is not changed)"
+        say "            A create that was proposed from one of them and still waits is refused when it is approved:"
+        say "            propose it again."
+    fi
+    if [ -n "${templates_kept-}" ] && [ -n "${templates_older-}" ]; then
+        say "  templates kept as they are: $templates_kept"
+        say "            This run put an older program ($version) in place of a newer one ($was_version). These files"
+        say "            are that newer release's, or your own edits; either way this program does not replace them."
+    elif [ -n "${templates_kept-}" ]; then
+        say "  templates kept as you edited them: $templates_kept"
+        say "            To replace them with this release's, losing those edits:"
+        say "              $templates_command --replace"
+    fi
+    if [ -n "${templates_failed-}" ]; then
+        say "  templates NOT finished: \`arca templates install\` stopped. Its words:"
+        printf '%s\n' "$templates_failed" | while IFS= read -r templates_line; do
+            say "              $templates_line"
+        done
+        say "            Run it again to finish; a template and its script may be of two releases until then:"
+        say "              $templates_command"
     fi
     say "  service   $service_note"
     # The node says whether it holds the door's port. A port another program took first does not stop the node: it
@@ -1030,8 +1117,9 @@ report() {
             say "If the node is yours to start, this one command starts it; it runs until it is stopped:"
             say "  $start_command"
             say "To ask it, mint a token first (the node reads its tokens when it starts):"
-            say "  $bin token mint --scope viewer --id <id> --config $config --out <file>"
-            say "  $bin call arca_status --config $config --token-file <file>"
+            say "  $bin token mint --scope viewer --id TOKEN_ID --config $config --out TOKEN_FILE"
+            say "  $bin call arca_status --config $config --token-file TOKEN_FILE"
+            say "with a name for the token in place of TOKEN_ID, and the path to write it to in place of TOKEN_FILE."
             return "$NOT_STARTED"
             ;;
     esac
@@ -1048,7 +1136,7 @@ report() {
         # would send the token to it: no line to run, and no entry to paste.
         say "Connect an assistant. One way works right now:"
         say
-        say "  1. An assistant with a shell on this machine, as the user $user, runs \`arca call <verb>\`:"
+        say "  1. An assistant with a shell on this machine, as the user $user, runs \`arca call\` with a verb, such as:"
         say "       $status_command"
         say "     \`watch_report\` in place of \`arca_status\` lists every project and instance with its owner."
         say
@@ -1073,26 +1161,26 @@ report() {
         say "     For Claude Code, run this one line; the shell reads the token from its file, so it is not shown here:"
         say "       claude mcp add --transport http arca $door_url --header \"Authorization: Bearer \$(cat '$token_file')\""
         say "     Any other client takes this entry, with the content of $token_file"
-        say "     in place of <token>:"
-        say "       { \"mcpServers\": { \"arca\": { \"type\": \"http\", \"url\": \"$door_url\", \"headers\": { \"Authorization\": \"Bearer <token>\" } } } }"
+        say "     in place of TOKEN:"
+        say "       { \"mcpServers\": { \"arca\": { \"type\": \"http\", \"url\": \"$door_url\", \"headers\": { \"Authorization\": \"Bearer TOKEN\" } } } }"
         if [ "$service" != unit ]; then
             say "     This script started no node: the door is open once a node has started with this config."
         fi
         say
-        say "  2. An assistant with a shell on this machine, as the user $user, runs \`arca call <verb>\`:"
+        say "  2. An assistant with a shell on this machine, as the user $user, runs \`arca call\` with a verb, such as:"
         say "       $status_command"
         say "     \`watch_report\` in place of \`arca_status\` lists every project and instance with its owner."
         return "$result"
     fi
-    say "  1. An assistant with a shell on this machine, as the user $user, runs \`arca call <verb>\`:"
+    say "  1. An assistant with a shell on this machine, as the user $user, runs \`arca call\` with a verb, such as:"
     say "       $status_command"
     say "     \`watch_report\` in place of \`arca_status\` lists every project and instance with its owner."
     say
     say "  2. An assistant that takes an MCP server URL needs a TCP address. The node opens one only when its"
     say "     config names \`listen.loopback\`, \`listen.tailnet\` or \`listen.proxy\`, and this script wrote none of"
     say "     them here. The operating guide says how to turn one on: $GUIDE#the-config-file"
-    say "     The client's entry is then the URL http://<address>:<port>/mcp and the header"
-    say "     \"Authorization: Bearer <the content of $token_file>\"."
+    say "     The client's entry is then the URL http://ADDRESS:PORT/mcp, with that address and port, and the header"
+    say "     \"Authorization: Bearer TOKEN\", with the content of $token_file in place of TOKEN."
     return "$result"
 }
 
@@ -1264,6 +1352,7 @@ main() {
     install_program
     write_config
     start_service
+    upgrade_templates
     enable_changes
     report
 }

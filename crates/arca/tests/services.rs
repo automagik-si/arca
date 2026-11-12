@@ -1,5 +1,7 @@
 //! Service verbs against a fake Incus: create, list and status are hermetic; no live host is touched.
 mod common;
+mod templates_before;
+use templates_before::postgres_file_of_0_12_0;
 #[path = "../../arca-approval/tests/common/webauthn.rs"]
 mod webauthn;
 
@@ -3254,7 +3256,7 @@ fn service_create_names_the_missing_entrypoint_script_and_how_it_gets_there() {
         "the refusal names the file it looked for and where it belongs: {message}"
     );
     assert!(
-        message.contains("for a template Arca ships, `arca templates install --config <file>`"),
+        message.contains("for a template Arca ships, `arca templates install --config CONFIG_FILE` (this node's config in place of CONFIG_FILE)"),
         "the one-step install is offered for shipped templates only: {message}"
     );
     assert!(
@@ -3302,6 +3304,159 @@ fn an_entrypoint_script_is_a_plain_file_name_in_the_template_directory() {
             ),
             "{file:?} is refused"
         );
+    }
+}
+
+/// A node that installed its templates with an earlier release is not left on a template a later release fixed. A
+/// file that is an earlier release's own, byte for byte, is replaced without `--replace` and named. A file the owner
+/// edited matches no release and is kept, as before, and so is the earlier file that belongs with it.
+#[test]
+fn templates_install_brings_an_earlier_shipped_file_up_to_date_and_keeps_an_edited_one() {
+    let rig = Rig::new();
+    let dir = rig.dir.join("templates");
+    let shipped = |name: &str| {
+        arca::cmd_templates::SHIPPED
+            .iter()
+            .find(|(shipped, _)| *shipped == name)
+            .map(|(_, text)| text.to_string())
+            .expect("a shipped file")
+    };
+    let read = |name: &str| fs::read_to_string(dir.join(name)).expect("an installed file");
+    let (json_file, script) = ("postgres-autopg.json", "postgres-autopg.sh");
+    let old_json = postgres_file_of_0_12_0(json_file);
+    let old_script = postgres_file_of_0_12_0(script);
+    assert_ne!(old_json, shipped(json_file));
+    assert_ne!(old_script, shipped(script));
+
+    // The node as 0.12.0 left it: both files are that release's own. One plain run brings both to this release.
+    arca::cmd_templates::install_into(&dir, false).expect("install");
+    fs::write(dir.join(json_file), &old_json).expect("the template of 0.12.0");
+    fs::write(dir.join(script), &old_script).expect("the script of 0.12.0");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("upgrade");
+    assert_eq!(report["replaced"], json!([json_file, script]), "{report}");
+    assert_eq!(report["installed"], json!([]));
+    assert_eq!(report["kept"], json!([]));
+    assert_eq!(read(json_file), shipped(json_file));
+    assert_eq!(read(script), shipped(script));
+    assert!(
+        service::load_template(&dir, "postgres-autopg")
+            .expect("it loads")
+            .generate
+            .contains_key("POSTGRES_PASSWORD"),
+        "the template now makes its password"
+    );
+    // And once more: nothing is left to replace.
+    let again = arca::cmd_templates::install_into(&dir, false).expect("again");
+    assert_eq!(again["replaced"], json!([]));
+
+    // The owner edited the template: it matches no release, so it is kept, and the earlier script that belongs
+    // with it is kept too, so the pair stays the one the owner has.
+    let edited = old_json.replace("PostgreSQL 18", "My PostgreSQL 18");
+    fs::write(dir.join(json_file), &edited).expect("the owner's edit");
+    fs::write(dir.join(script), &old_script).expect("the script of 0.12.0");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("kept");
+    assert_eq!(report["kept"], json!([json_file, script]), "{report}");
+    assert_eq!(report["replaced"], json!([]));
+    assert_eq!(read(json_file), edited);
+    assert_eq!(read(script), old_script);
+
+    // The other way round: an edited script holds the earlier template as it is.
+    fs::write(dir.join(json_file), &old_json).expect("the template of 0.12.0");
+    fs::write(dir.join(script), format!("{old_script}# mine\n")).expect("the owner's edit");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("kept");
+    assert_eq!(report["kept"], json!([json_file, script]), "{report}");
+    assert_eq!(read(json_file), old_json);
+
+    // An edit elsewhere holds nothing of this pair back.
+    fs::write(dir.join(script), &old_script).expect("the script of 0.12.0");
+    fs::write(dir.join("nats.json"), "{}").expect("an edit to another template");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("upgrade");
+    assert_eq!(report["replaced"], json!([json_file, script]), "{report}");
+    assert_eq!(report["kept"], json!(["nats.json"]));
+
+    // --replace still overwrites an edit, and says an earlier file was replaced.
+    fs::write(dir.join(json_file), &edited).expect("the owner's edit");
+    fs::write(dir.join(script), &old_script).expect("the script of 0.12.0");
+    let report = arca::cmd_templates::install_into(&dir, true).expect("replace");
+    assert_eq!(
+        report["installed"],
+        json!(["nats.json", json_file]),
+        "{report}"
+    );
+    assert_eq!(report["replaced"], json!([script]));
+    assert_eq!(report["kept"], json!([]));
+}
+
+/// The list of earlier shipped files is sound: every entry names a shipped file by a SHA-256, and none is the file
+/// this build ships (that one is "unchanged", not "earlier"). Where the checkout has the release tags, every file a
+/// release shipped is this build's or is on the list, so a release that changes a template cannot forget its entry.
+#[test]
+fn every_file_an_earlier_release_shipped_is_this_builds_or_is_on_the_list() {
+    use arca::cmd_templates::{EARLIER, SHIPPED};
+    let digest = |bytes: &[u8]| arca_kernel::canon::Digest::of(bytes).to_hex();
+    for (name, hash) in EARLIER {
+        let (_, text) = SHIPPED
+            .iter()
+            .find(|(shipped, _)| shipped == name)
+            .unwrap_or_else(|| panic!("{name} is not a shipped file"));
+        assert!(
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "{name}: {hash} is not a SHA-256 in lower-case hex"
+        );
+        assert_ne!(
+            *hash,
+            digest(text.as_bytes()),
+            "{name}: that is the file this build ships"
+        );
+    }
+
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let git = |arguments: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(arguments)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| out.stdout)
+    };
+    let tags = git(&["tag", "--list", "v*"])
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .unwrap_or_default();
+    let mut checked = 0;
+    for tag in tags.lines() {
+        // A release from before `templates install` put no file on any node.
+        if git(&[
+            "cat-file",
+            "-e",
+            &format!("{tag}:crates/arca/src/cmd_templates.rs"),
+        ])
+        .is_none()
+        {
+            continue;
+        }
+        for (name, text) in SHIPPED {
+            let Some(then) = git(&["show", &format!("{tag}:templates/{name}")]) else {
+                continue;
+            };
+            checked += 1;
+            let hash = digest(&then);
+            assert!(
+                then == text.as_bytes()
+                    || EARLIER
+                        .iter()
+                        .any(|(earlier, listed)| earlier == name && *listed == hash),
+                "{name} as {tag} shipped it ({hash}) is neither this build's file nor on cmd_templates::EARLIER: add it"
+            );
+        }
+    }
+    if checked == 0 {
+        eprintln!("no release tag in this checkout: the list was checked for form only");
     }
 }
 

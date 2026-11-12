@@ -708,7 +708,7 @@ fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         format!(
-            "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> --config {installed}. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: arca token reload --config {installed}\n",
+            "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id TOKEN_ID --out TOKEN_FILE --config {installed} (a name for the token in place of TOKEN_ID, and the path to write it to in place of TOKEN_FILE). A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: arca token reload --config {installed}\n",
             installed = home.join(".config/arca/node.json").display()
         )
     );
@@ -747,7 +747,7 @@ fn reload_command(node: &Node) -> String {
 /// What a refusal says about minting a token of `scope` for `node`.
 fn mint_advice(node: &Node, scope: &str) -> String {
     format!(
-        "arca token mint --scope {scope} --id <id> --out <file> --config {}. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}",
+        "arca token mint --scope {scope} --id TOKEN_ID --out TOKEN_FILE --config {} (a name for the token in place of TOKEN_ID, and the path to write it to in place of TOKEN_FILE). A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}",
         node.config.display(),
         reload_command(node)
     )

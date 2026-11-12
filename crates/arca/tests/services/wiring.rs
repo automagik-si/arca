@@ -343,26 +343,137 @@ fn the_shipped_postgres_template_approved_from_a_card_starts_and_gives_a_linked_
     );
 }
 
-/// What stays as it was. A password the owner stored is the one used: the template makes one only where none is
-/// stored. And a template installed before this one, which makes none, still creates a database stopped: such a
-/// node keeps its template until `arca templates install --replace`.
+/// A card that waits across an upgrade. A database is proposed while the node still has the template of 0.12.0, the
+/// card says it will be created stopped, and then `templates install` replaces that template with this release's.
+/// The approval of the old card creates nothing: the card bound the content of the template it showed, and the
+/// refusal says to propose it again. Proposed again, on the new template, it is created and runs. This is what
+/// `arca init` and the installer tell the owner beside the names they replaced.
 #[test]
-fn a_stored_postgres_password_is_kept_and_a_template_from_before_still_creates_stopped() {
+fn a_card_that_waited_across_the_replacement_of_its_template_is_refused_and_proposed_again_it_runs()
+{
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    let templates = rig.dir.join("templates");
+    assert!(arca::cmd_templates::install_into(&templates, false).is_ok());
+    for name in ["postgres-autopg.json", "postgres-autopg.sh"] {
+        fs::write(templates.join(name), postgres_file_of_0_12_0(name)).expect("the file of 0.12.0");
+    }
+    let plans: HashMap<&'static str, Arc<dyn ToolHandler>> = arca::handlers::plan_handlers_served(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        None,
+        None,
+        None,
+        None,
+        arca::handlers::ActionSlot::default(),
+        Some(rig.cfg.clone()),
+    )
+    .into_iter()
+    .collect();
+    let viewer = Caller {
+        token_id: "viewer".into(),
+        scope: Scope::Viewer,
+        tools: None,
+    };
+    let executor = arca::handlers::ActionExecutor::new(
+        rig.handlers
+            .iter()
+            .map(|(verb, handler)| (*verb, Arc::clone(handler))),
+    );
+    let propose = || {
+        plans["action_propose"]
+            .call(
+                json!({ "action": "service_create", "args": { "name": "db1", "template": "postgres-autopg" } }),
+                &viewer,
+            )
+            .expect("the proposal is recorded")
+    };
+    let approve_and_run = |proposed: &Value, nonce: &str| {
+        let statement = arca::handlers::action_statement(
+            "node1",
+            proposed["id"].as_str().expect("its id"),
+            "service_create",
+            proposed["argsDigest"].as_str().expect("its digest"),
+            NOW,
+            &nonce.repeat(32),
+        )
+        .expect("the statement");
+        let approval = common::approve_statement(&key, &statement);
+        let approved = {
+            let mut kernel = rig.kernel.lock().expect("kernel");
+            arca::handlers::approve_action(
+                &mut kernel,
+                &json!({ "plan": proposed["id"], "approval": approval }),
+                NOW,
+            )
+            .expect("the owner's approval verifies")
+        };
+        executor.run(&approved.action, &approved.args, &approved.grant)
+    };
+
+    // Proposed on the template of 0.12.0: the card says the truth of that template.
+    let before = propose();
+    assert!(
+        before.to_string().contains("created stopped"),
+        "the old template's card: {before}"
+    );
+    // The upgrade replaces the template while the card waits.
+    let report = arca::cmd_templates::install_into(&templates, false).expect("install");
+    assert_eq!(
+        report["replaced"],
+        json!(["postgres-autopg.json", "postgres-autopg.sh"])
+    );
+    // The old card's approval makes nothing, and says what to do.
+    let refused = format!(
+        "{:?}",
+        approve_and_run(&before, "1").expect_err("the old card creates nothing")
+    );
+    assert!(
+        refused.contains("was changed or installed again since the card was shown")
+            && refused.contains("Nothing was created; propose it again"),
+        "{refused}"
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/db1?project={PROJECT}"))
+            .is_none(),
+        "nothing was created"
+    );
+    // Proposed again, the card is the new template's, and the database runs.
+    let after = propose();
+    assert_ne!(
+        after["id"], before["id"],
+        "another card: it binds another template"
+    );
+    assert!(!after.to_string().contains("created stopped"), "{after}");
+    let created = approve_and_run(&after, "2").expect("the new card's create runs");
+    assert_eq!(created["state"], "running", "{created}");
+}
+
+/// A node that installed its templates with 0.12.0. Its template makes no password, so a database created from it
+/// is stopped. A plain `templates install` of this release (which `arca init` also runs) replaces that template,
+/// since nobody edited it, and the next database starts. The database made before is not touched: it gains no
+/// password by itself, and a password the owner stores for it is the one it gets.
+#[test]
+fn a_node_from_0_12_0_gets_the_new_postgres_template_and_its_old_database_is_left_as_it_is() {
     let rig = Rig::new();
     let templates = rig.dir.join("templates");
     assert!(arca::cmd_templates::install_into(&templates, false).is_ok());
-    let shipped =
-        fs::read_to_string(templates.join("postgres-autopg.json")).expect("the shipped template");
-    let mut before: Value = serde_json::from_str(&shipped).expect("JSON");
-    before
-        .as_object_mut()
-        .expect("an object")
-        .remove("generate")
-        .expect("the shipped template makes its password");
+    for name in ["postgres-autopg.json", "postgres-autopg.sh"] {
+        fs::write(templates.join(name), postgres_file_of_0_12_0(name)).expect("the file of 0.12.0");
+    }
 
-    // The template as it was before: created stopped, and it says why.
-    fs::write(templates.join("postgres-autopg.json"), before.to_string())
-        .expect("the old template");
+    // The template as 0.12.0 shipped it: created stopped.
     let old = rig
         .call(
             "service_create",
@@ -370,38 +481,30 @@ fn a_stored_postgres_password_is_kept_and_a_template_from_before_still_creates_s
         )
         .expect("create");
     assert_eq!(old["state"], "stopped", "{old}");
-    // A run without --replace keeps a template that differs, so that node still has the old one.
-    let kept = arca::cmd_templates::install_into(&templates, false)
-        .ok()
-        .expect("install");
-    assert!(
-        kept["kept"]
-            .as_array()
-            .is_some_and(|names| names.contains(&json!("postgres-autopg.json"))),
-        "{kept}"
-    );
+
+    // The upgrade: no flag, and the report names what it replaced.
+    let report = arca::cmd_templates::install_into(&templates, false).expect("install");
     assert_eq!(
-        fs::read_to_string(templates.join("postgres-autopg.json")).expect("the template"),
-        before.to_string()
+        report["replaced"],
+        json!(["postgres-autopg.json", "postgres-autopg.sh"]),
+        "{report}"
     );
-    // With --replace it is the shipped one again, and the service made before is not touched by that.
-    let replaced = arca::cmd_templates::install_into(&templates, true)
-        .ok()
-        .expect("install");
-    assert!(
-        replaced["installed"]
-            .as_array()
-            .is_some_and(|names| names.contains(&json!("postgres-autopg.json"))),
-        "{replaced}"
-    );
+    let new = rig
+        .call(
+            "service_create",
+            json!({ "name": "new1", "template": "postgres-autopg" }),
+        )
+        .expect("create");
+    assert_eq!(new["state"], "running", "{new}");
+
+    // The database from before gains no password by itself.
     assert!(
         instance(&rig, "old1")["config"]
             .get("environment.POSTGRES_PASSWORD")
             .is_none(),
         "a service from before gains no password by itself"
     );
-
-    // The owner's own password, stored before the create, is the one the database gets: none is made over it.
+    // The owner's own password, once stored, is the one it gets: the template makes none over it.
     op(
         &rig,
         "service_secret_set",
