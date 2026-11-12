@@ -315,7 +315,20 @@ impl Node<'_> {
             self.write(&document)?;
         }
 
-        crate::cmd_templates::install_into(&self.cfg.state_dir.join("templates"), false)?;
+        let templates =
+            crate::cmd_templates::install_into(&self.cfg.state_dir.join("templates"), false)?;
+        // A template an earlier release installed, and nobody edited, is now this release's: say which, before the
+        // report. An edited one is kept, and `arca templates install` lists those.
+        if let Some(replaced) = templates["replaced"]
+            .as_array()
+            .filter(|names| !names.is_empty())
+        {
+            let names: Vec<&str> = replaced.iter().filter_map(Value::as_str).collect();
+            say(&format!(
+                "Templates brought up to this release (each was an earlier release's own file, not edited): {}.",
+                names.join(", ")
+            ));
+        }
         let restarted = self.restart("kernel");
 
         // The first screen: what changed, who does not wait, the one next thing, and one pointer. Everything else

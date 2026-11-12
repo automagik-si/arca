@@ -343,26 +343,20 @@ fn the_shipped_postgres_template_approved_from_a_card_starts_and_gives_a_linked_
     );
 }
 
-/// What stays as it was. A password the owner stored is the one used: the template makes one only where none is
-/// stored. And a template installed before this one, which makes none, still creates a database stopped: such a
-/// node keeps its template until `arca templates install --replace`.
+/// A node that installed its templates with 0.12.0. Its template makes no password, so a database created from it
+/// is stopped. A plain `templates install` of this release (which `arca init` also runs) replaces that template,
+/// since nobody edited it, and the next database starts. The database made before is not touched: it gains no
+/// password by itself, and a password the owner stores for it is the one it gets.
 #[test]
-fn a_stored_postgres_password_is_kept_and_a_template_from_before_still_creates_stopped() {
+fn a_node_from_0_12_0_gets_the_new_postgres_template_and_its_old_database_is_left_as_it_is() {
     let rig = Rig::new();
     let templates = rig.dir.join("templates");
     assert!(arca::cmd_templates::install_into(&templates, false).is_ok());
-    let shipped =
-        fs::read_to_string(templates.join("postgres-autopg.json")).expect("the shipped template");
-    let mut before: Value = serde_json::from_str(&shipped).expect("JSON");
-    before
-        .as_object_mut()
-        .expect("an object")
-        .remove("generate")
-        .expect("the shipped template makes its password");
+    for name in ["postgres-autopg.json", "postgres-autopg.sh"] {
+        fs::write(templates.join(name), postgres_file_of_0_12_0(name)).expect("the file of 0.12.0");
+    }
 
-    // The template as it was before: created stopped, and it says why.
-    fs::write(templates.join("postgres-autopg.json"), before.to_string())
-        .expect("the old template");
+    // The template as 0.12.0 shipped it: created stopped.
     let old = rig
         .call(
             "service_create",
@@ -370,38 +364,30 @@ fn a_stored_postgres_password_is_kept_and_a_template_from_before_still_creates_s
         )
         .expect("create");
     assert_eq!(old["state"], "stopped", "{old}");
-    // A run without --replace keeps a template that differs, so that node still has the old one.
-    let kept = arca::cmd_templates::install_into(&templates, false)
-        .ok()
-        .expect("install");
-    assert!(
-        kept["kept"]
-            .as_array()
-            .is_some_and(|names| names.contains(&json!("postgres-autopg.json"))),
-        "{kept}"
-    );
+
+    // The upgrade: no flag, and the report names what it replaced.
+    let report = arca::cmd_templates::install_into(&templates, false).expect("install");
     assert_eq!(
-        fs::read_to_string(templates.join("postgres-autopg.json")).expect("the template"),
-        before.to_string()
+        report["replaced"],
+        json!(["postgres-autopg.json", "postgres-autopg.sh"]),
+        "{report}"
     );
-    // With --replace it is the shipped one again, and the service made before is not touched by that.
-    let replaced = arca::cmd_templates::install_into(&templates, true)
-        .ok()
-        .expect("install");
-    assert!(
-        replaced["installed"]
-            .as_array()
-            .is_some_and(|names| names.contains(&json!("postgres-autopg.json"))),
-        "{replaced}"
-    );
+    let new = rig
+        .call(
+            "service_create",
+            json!({ "name": "new1", "template": "postgres-autopg" }),
+        )
+        .expect("create");
+    assert_eq!(new["state"], "running", "{new}");
+
+    // The database from before gains no password by itself.
     assert!(
         instance(&rig, "old1")["config"]
             .get("environment.POSTGRES_PASSWORD")
             .is_none(),
         "a service from before gains no password by itself"
     );
-
-    // The owner's own password, stored before the create, is the one the database gets: none is made over it.
+    // The owner's own password, once stored, is the one it gets: the template makes none over it.
     op(
         &rig,
         "service_secret_set",

@@ -1343,6 +1343,76 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
     assert_eq!(calls().lines().count(), 3, "one restart per run");
 }
 
+/// A shipped Postgres file exactly as release 0.12.0 shipped it, made from this release's file by undoing what
+/// changed since. The caller checks its hash against `cmd_templates::EARLIER`, which proves it is that file byte for
+/// byte.
+fn postgres_file_of_0_12_0(name: &str) -> String {
+    let now = arca::cmd_templates::SHIPPED
+        .iter()
+        .find(|(shipped, _)| *shipped == name)
+        .map(|(_, text)| *text)
+        .expect("a shipped file");
+    let before = match name {
+        "postgres-autopg.json" => now
+            .replace(", which Arca makes at create and never shows", "")
+            .replace("  \"generate\": { \"POSTGRES_PASSWORD\": \"\" },\n", ""),
+        "postgres-autopg.sh" => now.replace(
+            "is not set: this service was created from a template that did not make it (arca templates install, then create it again; or service_secret_set)",
+            "is not set (service_secret_set)",
+        ),
+        other => panic!("{other} did not change since 0.12.0"),
+    };
+    let digest = arca_kernel::canon::Digest::of(before.as_bytes()).to_hex();
+    assert!(
+        arca::cmd_templates::EARLIER
+            .iter()
+            .any(|(earlier, hash)| *earlier == name && *hash == digest),
+        "{name} as rebuilt here is not the file 0.12.0 shipped ({digest})"
+    );
+    before
+}
+
+/// A node whose templates were installed by 0.12.0: `arca init` brings the unedited ones up to this release and says
+/// which, before its report, and the report is still its last five lines. A template the owner edited is kept and
+/// not named.
+#[test]
+fn init_brings_templates_an_earlier_release_installed_up_to_date_and_says_which() {
+    let node = Installed::new("old-templates");
+    mint(&node.scratch, &node.hash_dir, "viewer");
+    let templates = node.state.join("templates");
+    fs::create_dir_all(&templates).expect("the templates directory");
+    for name in ["postgres-autopg.json", "postgres-autopg.sh"] {
+        fs::write(templates.join(name), postgres_file_of_0_12_0(name)).expect("the file of 0.12.0");
+    }
+    fs::write(templates.join("nats.json"), "{}").expect("the owner's edit");
+
+    let said = node.init(&["--enable-changes", "--yes"], "");
+    said.ok().says(
+        "Templates brought up to this release (each was an earlier release's own file, not edited): postgres-autopg.json, postgres-autopg.sh.",
+    );
+    assert!(
+        said.report(5)[0].starts_with("The config now lets Arca make changes on this machine."),
+        "{}",
+        said.all()
+    );
+    let installed =
+        fs::read_to_string(templates.join("postgres-autopg.json")).expect("the template");
+    assert!(
+        installed.contains("\"generate\": { \"POSTGRES_PASSWORD\": \"\" }"),
+        "{installed}"
+    );
+    assert_eq!(
+        fs::read_to_string(templates.join("nats.json")).expect("the edit"),
+        "{}",
+        "an edited template is kept"
+    );
+
+    // A second run has nothing to bring up, and says nothing of templates.
+    node.init(&["--enable-changes", "--yes"], "")
+        .ok()
+        .never_says("Templates brought up");
+}
+
 /// The one next step, from the real program on a node that `arca init` made and that says its page is open: with a
 /// screen it is ONE line, the page and its button; with none, the code from this terminal, where to type it, the way
 /// to the page from the person's own computer and what a phone needs.

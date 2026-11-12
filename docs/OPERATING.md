@@ -88,7 +88,7 @@ node takes a new token after `arca token reload` or a restart.
 | `arca watch --once --json [--config <file>]` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
 | `arca store check [--config <file>]` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
-| `arca templates install [--config <file>] [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
+| `arca templates install [--config <file>] [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept", "replaced" }` as JSON. A file that is an earlier release's own, byte for byte, is brought up to this release's and named under `replaced`; any other file that differs is the owner's edit and is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> [--config <file>]` / `remove --name <n> [--config <file>]` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve [--config <file>]` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan and two questions; it writes the config's missing keys after a yes, and ends in five lines: what changed, who does not wait for the page, the one next step, where a database comes from, and one pointer to the rest. See "Turning on changes" |
@@ -478,7 +478,7 @@ and holds no record answers an empty list.
   itself at create (32 letters and digits, stored as the service's `POSTGRES_PASSWORD` secret and never shown), so
   the approved create starts by itself, and a proposed `service_connect` gives the linked service its
   `DATABASE_URL`. No `service_secret_set` is needed, which matters because that verb cannot be proposed and needs a
-  `doctor` token. See "A node set up before the template made its password" below for an older node. No call
+  `doctor` token. See "Templates an earlier release installed" below for an older node. No call
   chooses the image: a `doctor` or `operator` token's own `postgres_create` runs without a card, as its
   `service_create` of that template does. It sets no `kernel.vmLimits`, so no virtual machine is created.
   Tenants, adoption and import are not turned on. A node that may change things also runs its snapshot writer
@@ -638,14 +638,27 @@ images and vendored npm lockfile. Five of them, `workspace-vm`, `github-runner-p
 virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners", "A pool
 of GitLab runners" and "An Automagik workspace in its own virtual machine").
 
-**A node set up before the template made its password.** Up to 0.12.0 the shipped `postgres-autopg` template
-declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped until a `doctor` token set the secret.
-`arca init` and `arca templates install` keep a template that is already installed and differs, so such a node
-still has the old one. `arca templates install --replace --config <file>` installs the shipped one; it overwrites
-every shipped template you edited, and names the node first. Nothing changes for a `postgres-autopg` service that
-already exists: a password that is stored stays the one used, and none is made over it. A service that was created
+**Templates an earlier release installed.** A release may change a shipped template: up to 0.12.0, for one, the
+shipped `postgres-autopg` template declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped
+until a `doctor` token set the secret. A node keeps no such template by accident. `arca templates install`, which
+`arca init --enable-changes` also runs, compares each installed file with the files earlier releases shipped (the
+program holds their SHA-256 hashes):
+
+- a file that is an earlier release's own, byte for byte, is replaced with this release's and named under
+  `replaced`; `arca init` names those in one line before its report. Nobody edited it, so nothing is lost;
+- a file that matches no release is the owner's edit. It is kept, under `kept`, as before, and only `--replace`
+  overwrites it (that flag names the node first);
+- a template and the script it reads move together: where one of the two is edited, the other is kept as it is too,
+  though it is an earlier release's, so a new template is never paired with a script it was not shipped with.
+
+The installer does not run this step. After an upgrade, run `arca templates install --config <file>` once, or
+`arca init --enable-changes` again; neither needs `--replace` for a template nobody edited.
+
+What a replaced template changes is the next create. Nothing changes for a service that already exists: a
+`postgres-autopg` service keeps the password that is stored, and none is made over it. One that was created
 stopped with no password gains none by itself either: set it with `service_secret_set`, or remove the service and
-create it again from the new template.
+create it again from the new template. A runner pool reads its script when its virtual machine is created, so a
+pool that runs keeps the script it has.
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
 script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `github-runner-pool.sh` for

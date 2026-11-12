@@ -252,8 +252,8 @@ What comes after is yours:
 **A database:** ask your assistant for the `postgres-autopg` service. It is one of the shipped templates, it fetches
 its own pinned image, it makes its own password, and it waits for your approval like any change: once you approve,
 it starts. A node whose templates were installed by 0.12.0 or older has a template that does not make the password;
-`arca templates install --replace --config ~/.config/arca/node.json` installs the new one. (`postgres_create`, proposed with a name, makes
-that same service.)
+`arca templates install --config ~/.config/arca/node.json` replaces it, and every other shipped template nobody
+edited, with this release's. (`postgres_create`, proposed with a name, makes that same service.)
 
 That page is for a machine where every account is trusted, and it cannot be opened from a phone; read
 ["The page on this machine alone"](OPERATING.md#the-page-on-this-machine-alone-with-no-domain-and-no-certificate)
