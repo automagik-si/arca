@@ -197,8 +197,8 @@ fn parse_tools(text: &str, scope: Scope) -> Result<Vec<String>, Failure> {
 }
 
 /// The directory the hash file goes into: `--hash-dir`, or `tokens.hashDir` of `--config`. A config is loaded and checked as
-/// every other command checks it. When both are given they must name the same directory, and when neither is given the mint is
-/// refused.
+/// every other command checks it. When both are given they must name the same directory, and when neither is given the
+/// command is refused: a credential is never written to, or removed from, a node nobody named.
 fn hash_dir_of(flags: &Flags) -> Result<PathBuf, Failure> {
     let given = flags.value("hash-dir").map(PathBuf::from);
     let configured = flags
@@ -212,7 +212,7 @@ fn hash_dir_of(flags: &Flags) -> Result<PathBuf, Failure> {
         )),
         (Some(dir), None) | (None, Some(dir)) => Ok(dir),
         (None, None) => Err(Failure::Usage(
-            "token mint needs --hash-dir or --config".to_string(),
+            "--config or --hash-dir is required: a token is a credential of one node, so the command reads no default config".to_string(),
         )),
     }
 }

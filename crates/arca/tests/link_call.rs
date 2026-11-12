@@ -305,7 +305,13 @@ fn peer_call_without_a_running_link_is_a_runtime_failure_and_creates_no_key() {
         let error = arca::run(&args).unwrap_err();
         assert!(matches!(error, arca::Failure::Runtime(_)));
         assert_eq!(error.code(), 1);
-        assert_eq!(error.message(), "the link is not running");
+        assert_eq!(
+            error.message(),
+            format!(
+                "the link is not running: start it with: arca link serve --config {}, and keep it running",
+                temp.0.join("node.json").display()
+            )
+        );
         assert!(!temp.0.join("secret.key").exists());
         assert!(!temp.0.join(".link-control.sock").exists());
     }

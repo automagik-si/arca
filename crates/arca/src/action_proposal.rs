@@ -257,7 +257,13 @@ impl ActionKind {
             }
             object.insert("image".to_string(), Value::String(default.to_string()));
         }
-        conforms(&self.params_schema(), &args)?;
+        // The checker names a place inside the action's arguments; the caller passed them as `args`.
+        conforms(&self.params_schema(), &args).map_err(|why| {
+            match why.strip_prefix("the value") {
+                Some(rest) => format!("args{rest}"),
+                None => format!("args{why}"),
+            }
+        })?;
         match self {
             Self::ServiceCreate => {
                 // The digest the owner approves covers the MAC in the one form the record keeps.
@@ -1324,6 +1330,25 @@ mod tests {
     const PINNED_IMAGE: &str = "docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     /// Another pinned image, as a kernel configured differently would name.
     const OTHER_IMAGE: &str = "docker.io/library/postgres@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn a_field_the_action_does_not_take_is_refused_by_its_place_and_the_fields_it_takes() {
+        let why = ActionKind::InstanceRestart
+            .prepare(&json!({ "project": "default", "nmae-7": "x" }), None)
+            .expect_err("an unknown field is refused");
+        assert!(
+            why.starts_with("args: a field the schema does not name; the fields it takes are "),
+            "the refusal names the place: {why}"
+        );
+        assert!(
+            why.contains("instance"),
+            "it names the field the action takes: {why}"
+        );
+        assert!(
+            !why.contains("nmae-7"),
+            "the unknown key is never echoed: {why}"
+        );
+    }
 
     #[test]
     fn a_twenty_mib_journal_is_quarantined_and_the_store_starts_empty() {

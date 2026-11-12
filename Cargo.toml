@@ -49,6 +49,8 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 rustix = { version = "=1.1.4", features = ["fs"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
+# Names the field a refused config value is in. In the lock already through axum.
+serde_path_to_error = "=0.1.20"
 sha2 = "=0.11.1"
 # Constant-time comparison of pairing code digests.
 subtle = "=2.6.1"

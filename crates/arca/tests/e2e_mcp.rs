@@ -104,8 +104,15 @@ impl Drop for Serve {
     }
 }
 
+/// The binary, with no home directory and no variable to take a config or a token from: a call that names neither must
+/// never read the files of the user who runs the tests.
 fn arca() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_arca"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arca"));
+    command
+        .env("HOME", "/nonexistent/arca-test-home")
+        .env_remove("ARCA_CONFIG")
+        .env_remove("ARCA_TOKEN_FILE");
+    command
 }
 
 /// A node config that reads through `socket`, names one identity phone and keeps the kernel out of every project.

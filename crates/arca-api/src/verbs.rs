@@ -250,7 +250,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "postgres_create",
-        summary: "Create a service database.",
+        summary: "Create a Postgres database on the node's service network, in the node's service project (arcak-svc): one instance from a digest-pinned image (name@sha256:<64 hex>), with a password Arca generates and keeps; no tool shows it. Returns its name, its entry and the status pending; postgres_list shows when it runs. Nothing reaches it until postgres_link links a consumer. Inside a tenant a database is a service from the postgres-autopg template instead (service_create, then service_connect).",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -264,7 +264,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "postgres_list",
-        summary: "List a service database.",
+        summary: "The Postgres databases in the node's service project (arcak-svc), each with its name, its entry, its status (pending until it has an address), its address, its port and the consumers linked to it. A node with no database answers an empty list. Never a password or a connection URL. A tenant's databases are services: service_list shows them.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -278,7 +278,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "postgres_link",
-        summary: "Link a service database.",
+        summary: "Link a consumer to a Postgres database: the database's network ACL lets the consumer reach it, and the consumer is given the connection URL under DATABASE_URL for its first database, or DATABASE_URL_<NAME> for each other. Returns the variable names only, never the URL. The consumer is one the node already records (arca probe consumer add); a service is linked with service_connect instead.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -292,7 +292,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "postgres_unlink",
-        summary: "Unlink a service database.",
+        summary: "Remove the link between a consumer and a Postgres database: the database's network ACL stops letting the consumer in, and the consumer loses the connection URL it was given. Returns the names of the variables removed. The database and its data stay.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -306,7 +306,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "postgres_delete",
-        summary: "Delete a service database.",
+        summary: "Delete a Postgres database and its data. The call itself, at once, removes every consumer's link to the database, its password and the connection URLs Arca kept, even when the delete of the database then waits for the owner. Returns removed: true and no plan when the database is gone, or removed: false and the delete plan that waits for the owner's approval (plan_list shows it, approval_submit carries the approval).",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -362,7 +362,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "service_status",
-        summary: "One service's address, ports, links and state.",
+        summary: "One service, named by its name: its address, its ports, its links and its state, and for a virtual machine the settings it was created with. Never a secret. Use service_list first when the name is not known.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,

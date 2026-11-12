@@ -25,8 +25,15 @@ const WAIT: Duration = Duration::from_secs(15);
 /// kernel project starts with `arcak-scratch-`.
 const CALL_PROJECT: &str = "arcak-scratch-call";
 
+/// The binary, with no home directory and no variable to take a config or a token from: a call that names neither must
+/// never read the files of the user who runs the tests.
 fn arca() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_arca"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arca"));
+    command
+        .env("HOME", "/nonexistent/arca-test-home")
+        .env_remove("ARCA_CONFIG")
+        .env_remove("ARCA_TOKEN_FILE");
+    command
 }
 
 /// A served node, killed when the test ends.
@@ -373,6 +380,14 @@ fn a_doctor_calling_token_list_is_refused_403_and_the_call_exits_4() {
     let node = start_node("doctor-operator");
     let out = call(&node, &node.doctor, "token_list", &["--args", "{}"]);
     assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+    // The refusal names the scope the verb needs, how a token of it is made for this node, and how the node takes it.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "arca: the token's scope may not make this call: token_list needs a token of the operator scope, and a token minted with --tools must list it. An owner mints one with: {}\n",
+            mint_advice(&node, "operator")
+        )
+    );
 }
 
 #[test]
@@ -413,6 +428,14 @@ fn a_token_the_server_does_not_hold_is_refused_401_and_the_call_exits_4() {
     write_mode(&stranger, &format!("arca_{}\n", "A".repeat(43)), 0o400);
     let out = call(&node, &stranger, "arca_status", &[]);
     assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "arca: the node does not accept this token: it was minted after the node last read its tokens, it was revoked, or it is another node's. If it was just minted, have the node read it: {}. For a new one: {}\n",
+            reload_command(&node),
+            mint_advice(&node, "viewer")
+        )
+    );
 }
 
 #[test]
@@ -594,5 +617,171 @@ fn an_args_file_refused_for_its_mode_names_no_path_in_its_message() {
     assert!(
         !stderr.contains(&args.display().to_string()),
         "the message does not name the file: {stderr}"
+    );
+}
+
+/// A home directory as the installer leaves it for `node`: its config as `node.json` and its viewer token as
+/// `assistant-1.secret`, in `.config/arca`.
+fn installed_home(node: &Node) -> PathBuf {
+    let home = node.scratch.path("home");
+    let dir = home.join(".config/arca");
+    fs::create_dir_all(&dir).expect("the installer's directory");
+    fs::copy(&node.config, dir.join("node.json")).expect("the installer's config");
+    let secret = fs::read_to_string(&node.viewer).expect("the minted secret");
+    write_mode(&dir.join("assistant-1.secret"), &secret, 0o600);
+    home
+}
+
+#[test]
+fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
+    let node = start_node("status-words");
+    let home = installed_home(&node);
+    let run = |args: &[&str]| {
+        arca()
+            .args(args)
+            .env("HOME", &home)
+            .env_remove("ARCA_CONFIG")
+            .env_remove("ARCA_TOKEN_FILE")
+            .output()
+            .expect("run arca")
+    };
+    let out = run(&["status"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let words = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = words.lines().collect();
+    assert!(lines[0].starts_with("Automagik Arca "), "{words}");
+    assert!(lines[1].starts_with("Mode: "), "{words}");
+    assert!(lines[2].starts_with("Up for: "), "{words}");
+    assert!(lines[3].starts_with("Incus: "), "{words}");
+    assert!(
+        words.contains(&format!(
+            "MCP door: open, on the unix socket {}",
+            node.socket.display()
+        )),
+        "{words}"
+    );
+    assert!(
+        lines.last().is_some_and(|line| line.starts_with("Next: ")),
+        "{words}"
+    );
+
+    // --json is the tool's own answer: the same document `arca call arca_status` prints, with no flag either.
+    let raw = stdout_json(&run(&["status", "--json"]));
+    let called = stdout_json(&run(&["call", "arca_status"]));
+    let keys = |value: &Value| -> Vec<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(keys(&raw), keys(&called));
+    for key in ["version", "node", "mode", "incusReachable", "appliedSeq"] {
+        assert_eq!(raw[key], called[key], "{key}");
+    }
+    assert_eq!(
+        words.lines().nth(1),
+        Some(
+            format!(
+                "Mode: {}",
+                match raw["mode"].as_str() {
+                    Some("watch-only") => "watch-only (it looks, and changes nothing)".to_string(),
+                    other => format!("{} (it may make changes)", other.unwrap_or("unknown")),
+                }
+            )
+            .as_str()
+        )
+    );
+
+    // An explicit flag still wins over the installer's file: a token file that is not there is refused, not replaced.
+    let out = run(&["status", "--token-file", "/nonexistent/arca-test.secret"]);
+    assert_eq!(code(&out), 2);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> --config {}/.config/arca/node.json. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}\n",
+            home.display(),
+            reload_command(&node)
+        )
+    );
+}
+
+/// The command a refusal gives to make `node` read its tokens again.
+fn reload_command(node: &Node) -> String {
+    format!(
+        "kill -HUP $(cat {}/serve.pid)",
+        node.scratch.path("state").display()
+    )
+}
+
+/// What a refusal says about minting a token of `scope` for `node`.
+fn mint_advice(node: &Node, scope: &str) -> String {
+    format!(
+        "arca token mint --scope {scope} --id <id> --out <file> --config {}. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}",
+        node.config.display(),
+        reload_command(node)
+    )
+}
+
+#[test]
+fn a_token_minted_while_the_node_runs_is_refused_until_the_reload_the_refusal_names() {
+    let node = start_node("mint-reload");
+    // The mint the 403 and 401 texts give, with this node's config: it writes the hash and sends no signal.
+    let fresh = node.scratch.path("fresh.secret");
+    let minted = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "fresh-1", "--out",
+        ])
+        .arg(&fresh)
+        .arg("--config")
+        .arg(&node.config)
+        .output()
+        .expect("run token mint");
+    assert_eq!(
+        code(&minted),
+        0,
+        "{}",
+        String::from_utf8_lossy(&minted.stderr)
+    );
+    let before = call(&node, &fresh, "arca_status", &[]);
+    assert_eq!(
+        code(&before),
+        4,
+        "the running node has not read the new token"
+    );
+    let refusal = String::from_utf8_lossy(&before.stderr).into_owned();
+    assert!(
+        refusal.contains("it was minted after the node last read its tokens"),
+        "the refusal lists the true cause: {refusal}"
+    );
+    let reload = reload_command(&node);
+    assert!(
+        refusal.contains(&reload),
+        "the refusal names the reload: {refusal}"
+    );
+
+    // The reload, run as the refusal words it.
+    let ran = Command::new("sh")
+        .arg("-c")
+        .arg(&reload)
+        .output()
+        .expect("run the reload");
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut after = call(&node, &fresh, "arca_status", &[]);
+    while code(&after) != 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(100));
+        after = call(&node, &fresh, "arca_status", &[]);
+    }
+    assert_eq!(
+        code(&after),
+        0,
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
     );
 }

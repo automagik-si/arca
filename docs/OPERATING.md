@@ -51,10 +51,18 @@ states what the kernel may touch.
 
 ## Commands
 
+`--config` and `--token-file` have defaults, the files the installer writes: `~/.config/arca/node.json` and
+`~/.config/arca/assistant-1.secret`. The order is the flag, then the variable (`ARCA_CONFIG`, `ARCA_TOKEN_FILE`), then
+the default. Only a command that reads a node takes them, and the table shows those flags in brackets. A command that
+writes to a node, starts one or calls a peer takes `--config` as a flag alone. `token mint` writes the hash and sends no
+signal: a node reads its tokens when it starts and on SIGHUP, so a running node takes a new token after
+`kill -HUP $(cat <stateDir>/serve.pid)` or a restart.
+
 | Command | Reads | Prints |
 |---------|-------|--------|
-| `arca watch --once --json --config <file>` | every instance in every project, through Incus GET | the `watch_report` result |
-| `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
+| `arca status [--json] [--config <file>] [--token-file <file>]` | the running node, with the same call as `arca call arca_status` | the node in words: version, mode, uptime, whether Incus answers, the unix socket it answered on, the other listeners the config file names (not checked) and a next step; with `--json`, the `arca_status` result as it came |
+| `arca watch --once --json [--config <file>]` | every instance in every project, through Incus GET | the `watch_report` result |
+| `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
 | `arca templates install --config <file> [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
@@ -62,15 +70,16 @@ states what the kernel may touch.
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
 | `arca link join [--] <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
-| `arca link peers --config <file>` | the paired peers file | the peers array, as JSON |
+| `arca link peers [--config <file>]` | the paired peers file | the peers array, as JSON |
 | `arca link remove [--] <name> --config <file>` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
-| `arca call [--peer <name>] <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the local node, or through a paired peer with `--peer` | the verb's result, as JSON |
+| `arca call <verb> [--config <file>] [--token-file <file>]`, with `--args <json>` or `--args-file <file>`; `arca call` alone lists the verbs | one tool call against the local node | the verb's result, as JSON |
+| `arca call --peer <name> <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and both flags are required: this node's own token is never sent by default | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>]` with `--config <file>` or `--hash-dir <dir>` | nothing | the id, scope and tool list |
 | `arca token revoke <id>` with `--config <file>` or `--hash-dir <dir>` | the token's hash file | the id and `revoked: true` |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
 | `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
 | `arca --version`, `arca version` or `arca -V` | nothing | one line: `Automagik Arca <version> (<short commit>, <target triple>)`; the commit reads `unknown` when the binary was built with no git checkout |
-| `arca service import plan --name <service> --config <file>` | one instance `kernel.importServices` lists, and the instance listing, through Incus GET | the import's dry run as JSON: every check, the one write and the pre-image digest; see "Importing a service another manager created" |
+| `arca service import plan --name <service> [--config <file>]` | one instance `kernel.importServices` lists, and the instance listing, through Incus GET | the import's dry run as JSON: every check, the one write and the pre-image digest; see "Importing a service another manager created" |
 
 `watch` and `metrics` print the same JSON as the MCP verb of the same name, so a command's output can be compared with the
 server's answer.

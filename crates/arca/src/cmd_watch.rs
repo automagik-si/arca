@@ -2,7 +2,6 @@
 //! for a while and prints the `node_metrics` result. Both print the same JSON as the MCP verb they answer.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,7 +9,6 @@ use arca_incus::UnixIncus;
 use serde_json::Value;
 
 use crate::adoptions::AdoptionRecord;
-use crate::config;
 use crate::handlers::{self, SAMPLE_INTERVAL};
 use crate::{Failure, Flags, call_failure};
 
@@ -21,7 +19,7 @@ const MAX_SAMPLE_SECONDS: u64 = 60;
 /// How long `metrics` samples when no `--sample-for` is given: long enough that the mean has two samples to average.
 const DEFAULT_SAMPLE_SECONDS: u64 = 5;
 
-/// `watch --once --json --config <file>`. The adoption record in the state directory names the adopted instances, which the
+/// `watch --once --json [--config <file>]`. The adoption record in the state directory names the adopted instances, which the
 /// watch counts as live entries, as the server's `watch_report` does.
 pub fn watch(flags: &Flags) -> Result<Option<Value>, Failure> {
     if !flags.switch("once") {
@@ -32,7 +30,7 @@ pub fn watch(flags: &Flags) -> Result<Option<Value>, Failure> {
     if !flags.switch("json") {
         return Err(Failure::Usage("watch prints JSON: pass --json".to_string()));
     }
-    let cfg = config::load(Path::new(flags.required("config")?))?;
+    let cfg = crate::load_config(flags)?;
     let phones: BTreeSet<String> = cfg.identity_phones.iter().cloned().collect();
     // The adopted instances are live entries, so each shows kernel-owned. A record that cannot be read fails the command.
     let adopted = AdoptionRecord::open(&cfg.state_dir)?.adopted();
@@ -47,7 +45,7 @@ pub fn watch(flags: &Flags) -> Result<Option<Value>, Failure> {
     Ok(Some(value))
 }
 
-/// `metrics --json [--sample-for <seconds>] --config <file>`. It samples at once and then every [`SAMPLE_INTERVAL`] until the
+/// `metrics --json [--sample-for <seconds>] [--config <file>]`. It samples at once and then every [`SAMPLE_INTERVAL`] until the
 /// time runs out, and prints the result. The mean covers every sample of the run.
 pub fn metrics(flags: &Flags) -> Result<Option<Value>, Failure> {
     if !flags.switch("json") {
@@ -67,7 +65,7 @@ pub fn metrics(flags: &Flags) -> Result<Option<Value>, Failure> {
                 ))
             })?,
     };
-    let cfg = config::load(Path::new(flags.required("config")?))?;
+    let cfg = crate::load_config(flags)?;
     let (mut sampler, _) = handlers::new_sampler(&cfg);
     sampler.sample(handlers::now_ms());
     let span = Duration::from_secs(seconds);

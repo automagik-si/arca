@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::{Failure, Flags, config};
+use crate::{Failure, Flags};
 
 macro_rules! shipped {
     ($($name:literal),* $(,)?) => {
@@ -41,7 +41,10 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 ];
 
 pub fn install(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let cfg = config::load(Path::new(flags.required("config")?))?;
+    let cfg = crate::load_named_config(
+        flags,
+        "templates install writes into a node's state directory",
+    )?;
     install_into(&cfg.state_dir.join("templates"), flags.switch("replace")).map(Some)
 }
 

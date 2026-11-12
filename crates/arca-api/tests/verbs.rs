@@ -1372,3 +1372,50 @@ fn service_remove_params_equal_droidds_golden_row() {
     assert_eq!(parity_shape(&(v.params)()), golden);
     assert!(v.destructive);
 }
+
+/// An assistant chooses a tool by its description, so none is a bare label and none is a page: at least
+/// [`SHORTEST_SUMMARY`] characters, at most [`LONGEST_SUMMARY`].
+const SHORTEST_SUMMARY: usize = 60;
+const LONGEST_SUMMARY: usize = 700;
+
+#[test]
+fn every_verb_description_says_what_the_verb_does_in_60_to_700_characters() {
+    for verb in arca_api::verbs() {
+        let length = verb.summary.chars().count();
+        assert!(
+            (SHORTEST_SUMMARY..=LONGEST_SUMMARY).contains(&length),
+            "{}: its description is {length} characters, outside {SHORTEST_SUMMARY} to {LONGEST_SUMMARY}: {}",
+            verb.name,
+            verb.summary
+        );
+    }
+}
+
+#[test]
+fn the_postgres_descriptions_say_what_each_verb_returns() {
+    let summary = |name: &str| verb(name).expect("present").summary;
+    for (name, words) in [
+        (
+            "postgres_create",
+            vec!["digest-pinned", "postgres_list", "postgres_link"],
+        ),
+        (
+            "postgres_list",
+            vec!["name", "status", "address", "port", "empty list"],
+        ),
+        ("postgres_link", vec!["DATABASE_URL", "never the URL"]),
+        ("postgres_unlink", vec!["variables removed", "data stay"]),
+        (
+            "postgres_delete",
+            vec!["at once", "removed: false", "delete plan"],
+        ),
+    ] {
+        for word in words {
+            assert!(
+                summary(name).contains(word),
+                "{name}: its description names {word}: {}",
+                summary(name)
+            );
+        }
+    }
+}
