@@ -47,6 +47,7 @@ pub const UPDATE_FAILED: &str = "arca_update_failed";
 pub const SMART_PASSED: &str = "arca_smart_passed";
 pub const ALERT_FIRING: &str = "arca_alert_firing";
 pub const STORE_WRITE_FAILURES: &str = "arca_store_write_failures_total";
+pub const STORE_SLOW_COMMITS: &str = "arca_store_slow_commits_total";
 pub const SAMPLE_TIMESTAMP: &str = "arca_sample_timestamp_seconds";
 
 /// The drift kinds `arca_drift_entries` exports. The watch report's kind that the closed set does not name is `other`, and it is
@@ -62,7 +63,7 @@ struct Family {
 }
 
 /// The families `/metrics` renders, in the export contract's order. A new family goes in its place in this order.
-const FAMILIES: [Family; 31] = [
+const FAMILIES: [Family; 32] = [
     Family {
         name: CPU_USED,
         kind: "gauge",
@@ -241,6 +242,12 @@ const FAMILIES: [Family; 31] = [
         name: STORE_WRITE_FAILURES,
         kind: "counter",
         help: "The node store's failed writes since the server started.",
+        labels: &[],
+    },
+    Family {
+        name: STORE_SLOW_COMMITS,
+        kind: "counter",
+        help: "The node store's commits since the server started that worked and took over one second.",
         labels: &[],
     },
     Family {
@@ -596,6 +603,10 @@ fn series_of<'a>(family: &Family, snapshot: &'a AlertSnapshot) -> Vec<Series<'a>
         STORE_WRITE_FAILURES => vec![Series {
             labels: Vec::new(),
             value: snapshot.store_write_failures as f64,
+        }],
+        STORE_SLOW_COMMITS => vec![Series {
+            labels: Vec::new(),
+            value: snapshot.store_slow_commits as f64,
         }],
         _ => snapshot
             .points

@@ -36,6 +36,12 @@ templates install --config <file>` once after the upgrade (or `arca init --enabl
 use `--replace` for this, which also overwrites your edits: it is no longer needed. A service that already exists is
 not changed.
 
+A commit to the node's store that works but takes over one second is no longer called a failed write. It has its own
+counter, `arca_store_slow_commits_total`, and its own alert, the warning `store-commit-slow`.
+`arca_store_write_failures_total` and the critical alert `store-write-failed` now mean only a write the store refused. A
+dashboard or an outside alert built on `arca_store_write_failures_total`, or on `store-write-failed`, stops firing for a slow
+disk: watch the new counter or the new alert for that. Both counters start at 0 when the server starts, as before.
+
 ## 0.13.0 (2026-11-12)
 
 ## 0.13.0 (2026-11-12)

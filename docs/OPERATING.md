@@ -2827,8 +2827,13 @@ The pools that `disk-pool-full` reads come from Incus's own pool list on every t
 file filters that list (see the config table), so a pool that is left out is never evaluated.
 
 `store-write-failed` is built in. It is not in `alerts.json`, it is critical, and it lives only in memory. It fires at the
-first failed commit, or at the first commit that takes over one second, and it clears after 120 seconds of commits that work.
-It shows in `alerts_list`, in the HEALTH line and as `arca_alert_firing`.
+first failed commit, and it clears after 120 seconds of commits that work. It shows in `alerts_list`, in the HEALTH line and
+as `arca_alert_firing`.
+
+`store-commit-slow` is built in the same way, and it is a warning. It fires at the first commit that works and takes over one
+second, and it clears after 120 seconds of commits that take less. Such a commit is on disk and nothing waits: the alert
+says the disk under the store is slow, not that a write failed. (Up to 0.13 a slow commit fired `store-write-failed`,
+critical, and counted as a failed write.)
 
 ### Unknown data
 
@@ -3012,7 +3017,8 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_update_failed` | gauge | | 1 for a failed update, no completed check in 14 days, or a node up 24 hours with no completed check and no usable check time; 0 for a known recent success; absent when unknown |
 | `arca_smart_passed` | gauge | `device` | 1 when the drive's SMART check passed, 0 when it failed; see "SMART drive labels" |
 | `arca_alert_firing` | gauge | `rule`, `severity`, and the alert's own labels | 1 for each firing alert |
-| `arca_store_write_failures_total` | counter | | the failed writes since the server started |
+| `arca_store_write_failures_total` | counter | | the failed writes since the server started: a commit or a rollup the store refused |
+| `arca_store_slow_commits_total` | counter | | the commits since the server started that worked and took over one second |
 | `arca_sample_timestamp_seconds` | gauge | | when the newest host sample was taken, in epoch seconds |
 
 Notes on the names above:
@@ -3022,7 +3028,8 @@ Notes on the names above:
 - **Drift.** See "Drift" above. `arca_drift_entries` has two kinds only.
 - **TPM and update.** See "incus-osd readings" above.
 - **Alerts.** A firing alert has one series, with its rule, its severity and its own labels. A pending, resolved or disabled
-  alert has no series, so an absent series means the alert is not firing. The `store-write-failed` alert appears here too.
+  alert has no series, so an absent series means the alert is not firing. The `store-write-failed` and `store-commit-slow`
+  alerts appear here too.
 - **Instances.** A stopped instance has `arca_instance_running` 0 and no CPU or memory series.
 - **Ordering.** Series are written in order of their label values as text, so the `load` windows read `15m`, `1m`, `5m`.
 
@@ -3105,8 +3112,9 @@ When a commit fails, for example on a full disk:
   every alert event dropped since the server started, and that count does not reset until a restart.
 - The next commit that works writes the waiting events with their original times. Until then they appear in `alerts_list`
   without a `seq`, and they are not in `/alerts`.
-- `store-write-failed` fires at once, and `arca_store_write_failures_total` counts the failure. A commit that takes over one
-  second also counts as a failure, although its events are kept.
+- `store-write-failed` fires at once, and `arca_store_write_failures_total` counts the failure.
+- A commit that works and takes over one second is no failure: its events are kept and nothing waits. `store-commit-slow`, a
+  warning, fires at once, and `arca_store_slow_commits_total` counts it.
 - A rollup that fails, which runs at the first tick of a minute, takes the same path: that tick's `storeError` is set and
   `store-write-failed` fires.
 

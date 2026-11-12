@@ -6,6 +6,10 @@
 //! A failed commit keeps its events in a queue, at most [`QUEUE_LIMIT`] long. The next commit that works writes the queue and
 //! the tick's events together, oldest first, so a resolve is always committed with the firing it closes. The in-memory
 //! `store-write-failed` alert reports the failures, because the store cannot hold it.
+//!
+//! A commit that works but takes over [`SLOW_COMMIT`] is no failure: it is on disk and nothing is queued. It is counted on its
+//! own and reported by the in-memory warning `store-commit-slow`, so a slow disk is called slow and a write that failed is
+//! called failed.
 
 pub mod checks;
 pub mod eval;
@@ -25,12 +29,16 @@ use crate::eval::{Evaluator, Inputs, Labels, Rules};
 
 /// The most events a failed commit keeps waiting. Past it the oldest are dropped.
 pub const QUEUE_LIMIT: usize = 1_000;
-/// A commit that succeeds but takes longer than this is committed, and it counts as a failure.
+/// A commit that succeeds but takes longer than this is committed, and it counts as a slow commit: not as a failure.
 pub const SLOW_COMMIT: Duration = Duration::from_secs(1);
 /// How long commits must keep succeeding, in milliseconds, before `store-write-failed` clears.
 pub const WRITE_FAILED_CLEAR_MS: u64 = 120_000;
-/// The rule of the in-memory alert that reports the store's failed writes.
+/// How long commits must keep succeeding in time, in milliseconds, before `store-commit-slow` clears.
+pub const COMMIT_SLOW_CLEAR_MS: u64 = 120_000;
+/// The rule of the in-memory alert that reports the store's failed writes. It is critical.
 pub const STORE_WRITE_FAILED: &str = "store-write-failed";
+/// The rule of the in-memory alert that reports commits that worked and took over [`SLOW_COMMIT`]. It is a warning.
+pub const STORE_COMMIT_SLOW: &str = "store-commit-slow";
 
 /// The store calls a tick makes. `arca_store::Store` is the store; a test may give its own.
 pub trait TickStore {
@@ -137,13 +145,17 @@ pub struct AlertSnapshot {
     pub disabled: Vec<String>,
     pub store_error: Option<StoreErrorMark>,
     pub store_reset: bool,
+    /// The writes that failed since the engine started: a commit or a rollup the store refused.
     pub store_write_failures: u64,
+    /// The commits since the engine started that worked and took over [`SLOW_COMMIT`].
+    pub store_slow_commits: u64,
     /// How long the tick's commit took, in milliseconds.
     pub commit_ms: Option<u64>,
 }
 
-/// The in-memory `store-write-failed` alert: when it started firing, and since when commits have worked, while it fires.
-struct WriteFailed {
+/// An in-memory alert about the store, `store-write-failed` or `store-commit-slow`: when it started firing, and since when
+/// the commits have been as they should, while it fires.
+struct StoreAlert {
     started_at: u64,
     ok_since: Option<u64>,
 }
@@ -155,13 +167,15 @@ pub struct Engine<S: TickStore> {
     eval: Evaluator,
     store_reset: bool,
     store_write_failures: u64,
+    store_slow_commits: u64,
     /// The epoch minute the rollup last ran in.
     rolled_minute: u64,
     /// Events whose commit failed, oldest first. They are committed with the next batch that works.
     queue: VecDeque<AlertEvent>,
     /// Events dropped since start: the oldest past [`QUEUE_LIMIT`], and any resolve whose firing was dropped.
     dropped: u64,
-    write_failed: Option<WriteFailed>,
+    write_failed: Option<StoreAlert>,
+    commit_slow: Option<StoreAlert>,
 }
 
 impl<S: TickStore> Engine<S> {
@@ -183,10 +197,12 @@ impl<S: TickStore> Engine<S> {
             eval,
             store_reset,
             store_write_failures: 0,
+            store_slow_commits: 0,
             rolled_minute: now_ms / 60_000,
             queue: VecDeque::new(),
             dropped: 0,
             write_failed: None,
+            commit_slow: None,
         };
         if !disabled.is_empty() {
             engine.commit(now_ms, &[], disabled);
@@ -218,13 +234,14 @@ impl<S: TickStore> Engine<S> {
             store_error,
             store_reset: self.store_reset,
             store_write_failures: self.store_write_failures,
+            store_slow_commits: self.store_slow_commits,
             commit_ms: Some(commit_ms),
         }
     }
 
     /// Commits `points` and `events` with the queued events, oldest first, in one transaction. A failed commit queues the whole
     /// batch. A commit that succeeds but takes over [`SLOW_COMMIT`] keeps its events, which are never queued again, and counts
-    /// as a failure. Returns the error of a failed commit, and the commit's time in milliseconds.
+    /// as a slow commit: it is a write that worked. Returns the error of a failed commit, and the commit's time in milliseconds.
     fn commit(
         &mut self,
         now_ms: u64,
@@ -241,10 +258,11 @@ impl<S: TickStore> Engine<S> {
         match result {
             Ok(seqs) => {
                 self.eval.committed(&batch, &seqs);
+                self.record_success(now_ms);
                 if elapsed > SLOW_COMMIT {
-                    self.record_failure(now_ms);
+                    self.record_slow(now_ms);
                 } else {
-                    self.record_success(now_ms);
+                    self.record_in_time(now_ms);
                 }
                 (None, commit_ms)
             }
@@ -255,12 +273,16 @@ impl<S: TickStore> Engine<S> {
                 self.dropped += prune_orphans(&mut batch);
                 self.queue = batch.into();
                 self.record_failure(now_ms);
+                // A commit that failed was not in time either: `store-commit-slow`, where it fires, starts its wait again.
+                if let Some(slow) = self.commit_slow.as_mut() {
+                    slow.ok_since = None;
+                }
                 (Some(error), commit_ms)
             }
         }
     }
 
-    /// A commit worked. After [`WRITE_FAILED_CLEAR_MS`] of such commits, `store-write-failed` clears.
+    /// A commit worked, slow or not. After [`WRITE_FAILED_CLEAR_MS`] of such commits, `store-write-failed` clears.
     fn record_success(&mut self, now_ms: u64) {
         let Some(failed) = self.write_failed.as_mut() else {
             return;
@@ -271,14 +293,35 @@ impl<S: TickStore> Engine<S> {
         }
     }
 
-    /// A write failed, or was too slow. `store-write-failed` fires at once, and its clock starts again.
+    /// A write failed: the store refused a commit or a rollup. `store-write-failed` fires at once, and its clock starts again.
     fn record_failure(&mut self, now_ms: u64) {
         self.store_write_failures += 1;
-        let failed = self.write_failed.get_or_insert(WriteFailed {
+        let failed = self.write_failed.get_or_insert(StoreAlert {
             started_at: now_ms,
             ok_since: None,
         });
         failed.ok_since = None;
+    }
+
+    /// A commit worked and took over [`SLOW_COMMIT`]. `store-commit-slow` fires at once, and its clock starts again.
+    fn record_slow(&mut self, now_ms: u64) {
+        self.store_slow_commits += 1;
+        let slow = self.commit_slow.get_or_insert(StoreAlert {
+            started_at: now_ms,
+            ok_since: None,
+        });
+        slow.ok_since = None;
+    }
+
+    /// A commit worked in time. After [`COMMIT_SLOW_CLEAR_MS`] of such commits, `store-commit-slow` clears.
+    fn record_in_time(&mut self, now_ms: u64) {
+        let Some(slow) = self.commit_slow.as_mut() else {
+            return;
+        };
+        let since = *slow.ok_since.get_or_insert(now_ms);
+        if now_ms.saturating_sub(since) >= COMMIT_SLOW_CLEAR_MS {
+            self.commit_slow = None;
+        }
     }
 
     fn store_error_mark(&self, error: &StoreError, now_ms: u64) -> StoreErrorMark {
@@ -293,27 +336,39 @@ impl<S: TickStore> Engine<S> {
         }
     }
 
-    /// The firing alerts of the evaluator, and the in-memory `store-write-failed` alert while it fires.
+    /// The firing alerts of the evaluator, and the two in-memory alerts about the store while they fire: `store-write-failed`,
+    /// critical, and `store-commit-slow`, a warning.
     fn firing(&self) -> Vec<FiringAlert> {
         let mut firing = self.eval.firing();
-        if let Some(failed) = &self.write_failed {
+        let store_alerts = [
+            (&self.write_failed, STORE_WRITE_FAILED, "critical"),
+            (&self.commit_slow, STORE_COMMIT_SLOW, "warning"),
+        ];
+        let mut added = false;
+        for (alert, rule, severity) in store_alerts {
+            let Some(alert) = alert else {
+                continue;
+            };
+            added = true;
             firing.push(FiringAlert {
                 event: AlertEvent {
                     seq: None,
                     alert_id: None,
-                    rule: STORE_WRITE_FAILED.to_string(),
-                    severity: "critical".to_string(),
+                    rule: rule.to_string(),
+                    severity: severity.to_string(),
                     state: EventState::Firing,
                     labels: BTreeMap::new(),
                     value: None,
                     threshold: None,
-                    started_at: failed.started_at,
+                    started_at: alert.started_at,
                     resolved_at: None,
                     reason: None,
-                    at: failed.started_at,
+                    at: alert.started_at,
                 },
                 unknown: false,
             });
+        }
+        if added {
             firing.sort_by_key(|alert| alert.event.started_at);
         }
         firing

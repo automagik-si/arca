@@ -20,7 +20,8 @@ use arca_alerts::eval::{
 };
 use arca_alerts::rules::{AlertsFile, Probes, RulesError};
 use arca_alerts::{
-    Engine, QUEUE_LIMIT, STORE_WRITE_FAILED, TickStore, UnknownReason, export, inputs,
+    Engine, QUEUE_LIMIT, STORE_COMMIT_SLOW, STORE_WRITE_FAILED, TickStore, UnknownReason, export,
+    inputs,
 };
 use arca_incus::{FakeIncus, FakeState, UnixIncus};
 use arca_metrics::{Sampler, SamplerConfig};
@@ -1487,6 +1488,104 @@ mod store_failure {
             snapshot.store_write_failures, 3,
             "three failures, and the success does not count"
         );
+        assert_eq!(
+            snapshot.store_slow_commits, 0,
+            "a commit that failed is not a slow one"
+        );
+        assert!(
+            snapshot
+                .firing
+                .iter()
+                .all(|alert| alert.event.rule != STORE_COMMIT_SLOW),
+            "store-commit-slow does not fire for failures"
+        );
+    }
+
+    #[test]
+    fn store_commit_slow_clears_after_120_s_of_commits_in_time_and_a_slow_one_starts_the_wait_again()
+     {
+        let scratch = Scratch::new("slow-clears");
+        let switches = Switches::default();
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        let slow_fires = |snapshot: &arca_alerts::AlertSnapshot| {
+            snapshot
+                .firing
+                .iter()
+                .any(|alert| alert.event.rule == STORE_COMMIT_SLOW)
+        };
+        set(&switches.slow, true);
+        let first = engine.tick(&Inputs::default(), Vec::new(), T0);
+        set(&switches.slow, false);
+        assert!(slow_fires(&first));
+        // In time from 5 s on. A second slow commit at 60 s starts the 120 s again.
+        for t in (5_000..=55_000).step_by(5_000) {
+            assert!(slow_fires(&engine.tick(
+                &Inputs::default(),
+                Vec::new(),
+                T0 + t
+            )));
+        }
+        set(&switches.slow, true);
+        let second = engine.tick(&Inputs::default(), Vec::new(), T0 + 60_000);
+        set(&switches.slow, false);
+        assert_eq!(second.store_slow_commits, 2);
+        assert!(slow_fires(&second));
+        // The first commit in time after it is at 65 s: the alert holds until 120 s of them have passed, at 185 s.
+        for t in (65_000..=180_000).step_by(5_000) {
+            assert!(
+                slow_fires(&engine.tick(&Inputs::default(), Vec::new(), T0 + t)),
+                "still firing at {t}"
+            );
+        }
+        let cleared = engine.tick(&Inputs::default(), Vec::new(), T0 + 185_000);
+        assert!(
+            !slow_fires(&cleared),
+            "cleared after 120 s of commits in time"
+        );
+        assert_eq!(cleared.store_slow_commits, 2, "the count stays");
+        assert_eq!(cleared.store_write_failures, 0);
+    }
+
+    #[test]
+    fn a_failed_write_and_a_slow_commit_are_two_alerts_and_each_clears_by_its_own_clock() {
+        let scratch = Scratch::new("failed-and-slow");
+        let switches = Switches::default();
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        let rules = |snapshot: &arca_alerts::AlertSnapshot| -> Vec<(String, String)> {
+            snapshot
+                .firing
+                .iter()
+                .map(|alert| (alert.event.rule.clone(), alert.event.severity.clone()))
+                .collect()
+        };
+        // A commit fails at 0 s, and one that works is slow at 5 s.
+        set(&switches.fail, true);
+        engine.tick(&Inputs::default(), Vec::new(), T0);
+        set(&switches.fail, false);
+        set(&switches.slow, true);
+        let both = engine.tick(&Inputs::default(), Vec::new(), T0 + 5_000);
+        set(&switches.slow, false);
+        assert_eq!((both.store_write_failures, both.store_slow_commits), (1, 1));
+        // Both fire, the older first, each with its own severity.
+        assert_eq!(
+            rules(&both),
+            [
+                (STORE_WRITE_FAILED.to_string(), "critical".to_string()),
+                (STORE_COMMIT_SLOW.to_string(), "warning".to_string())
+            ]
+        );
+        // The slow commit worked, so the failed write's 120 s began with it, at 5 s: it clears at 125 s. The slow one's
+        // began with the first commit in time, at 10 s: it clears at 130 s.
+        for t in (10_000..=120_000).step_by(5_000) {
+            engine.tick(&Inputs::default(), Vec::new(), T0 + t);
+        }
+        let at_125 = engine.tick(&Inputs::default(), Vec::new(), T0 + 125_000);
+        assert_eq!(
+            rules(&at_125),
+            [(STORE_COMMIT_SLOW.to_string(), "warning".to_string())]
+        );
+        let at_130 = engine.tick(&Inputs::default(), Vec::new(), T0 + 130_000);
+        assert!(rules(&at_130).is_empty(), "both cleared");
     }
 
     #[test]
@@ -1497,20 +1596,33 @@ mod store_failure {
         for t in (0..=55_000).step_by(5_000) {
             engine.tick(&many_pools(1, |_| 95, T0 + t), Vec::new(), T0 + t);
         }
-        // The commit at 60 s takes 1.1 s. It is committed, and it counts as a failure.
+        // The commit at 60 s takes 1.1 s. It is committed: a slow commit, and no failed write.
         set(&switches.slow, true);
         let slow = engine.tick(&many_pools(1, |_| 95, T0 + 60_000), Vec::new(), T0 + 60_000);
         set(&switches.slow, false);
-        assert_eq!(slow.store_write_failures, 1, "the slow commit counts");
+        assert_eq!(slow.store_slow_commits, 1, "the slow commit counts as slow");
+        assert_eq!(slow.store_write_failures, 0, "and not as a failed write");
         assert!(
             slow.store_error.is_none(),
             "its events are committed, so no error is marked"
         );
+        let warned: Vec<_> = slow
+            .firing
+            .iter()
+            .filter(|alert| alert.event.rule == STORE_COMMIT_SLOW)
+            .collect();
+        assert_eq!(warned.len(), 1, "store-commit-slow fires at once");
+        assert_eq!(warned[0].event.severity, "warning");
+        assert_eq!(warned[0].event.started_at, T0 + 60_000);
+        assert!(
+            warned[0].event.seq.is_none(),
+            "the in-memory alert has no seq"
+        );
         assert!(
             slow.firing
                 .iter()
-                .any(|alert| alert.event.rule == STORE_WRITE_FAILED),
-            "store-write-failed fires"
+                .all(|alert| alert.event.rule != STORE_WRITE_FAILED),
+            "store-write-failed does not fire: nothing failed"
         );
         for t in (65_000..=120_000).step_by(5_000) {
             engine.tick(&many_pools(1, |_| 95, T0 + t), Vec::new(), T0 + t);

@@ -181,6 +181,7 @@ fn a_full_pool_fires_at_60_s_and_reaches_the_store_alerts_list_and_metrics() {
         format!("arca_pool_used_bytes{{node=\"{NODE}\",pool=\"default\"}} 95"),
         format!("arca_pool_size_bytes{{node=\"{NODE}\",pool=\"default\"}} 100"),
         format!("arca_store_write_failures_total{{node=\"{NODE}\"}} 0"),
+        format!("arca_store_slow_commits_total{{node=\"{NODE}\"}} 0"),
     ] {
         assert!(lines.contains(&wanted.as_str()), "{wanted} is in:\n{body}");
     }
