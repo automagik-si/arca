@@ -2544,6 +2544,23 @@ pub const SECRET_MAX: usize = 4096;
 /// The shortest secret, in characters. In a virtual machine's, line breaks do not count toward it.
 pub const SECRET_MIN: usize = 8;
 
+/// A secret without the one line break at its end that its length does not count.
+fn secret_body(value: &str) -> &str {
+    value.strip_suffix('\n').unwrap_or(value)
+}
+
+/// What a log line or an output must never show for a stored secret: the stored text without the line breaks at its
+/// end, since a line never holds them. `None` for a stored text that no secret can be: one longer than the rule
+/// allows, counted as [`secret_value`] counts it (in characters, not counting one line break at its end), or shorter
+/// than a secret once its line breaks are gone. The two share that count, so no value the node accepts is left out.
+pub fn secret_to_hide(stored: &str) -> Option<&str> {
+    if secret_body(stored).chars().count() > SECRET_MAX {
+        return None;
+    }
+    let shown = stored.trim_end_matches('\n');
+    (shown.chars().count() >= SECRET_MIN).then_some(shown)
+}
+
 /// The control character that stands in the way, by what it is. The words never hold the character or where it is.
 fn control_named(text: &str) -> &'static str {
     match text.chars().find(|c| c.is_control() && *c != '\n') {
@@ -2573,7 +2590,7 @@ pub fn secret_value(given: &str, of: SecretOf) -> Result<String, String> {
         if value.chars().any(|c| c.is_control() && c != '\n') {
             return Err(format!("{limits}: this one has {}", control_named(&value)));
         }
-        let counted = value.strip_suffix('\n').unwrap_or(&value).chars().count();
+        let counted = secret_body(&value).chars().count();
         if counted > SECRET_MAX {
             return Err(format!("{limits}: this one is longer"));
         }

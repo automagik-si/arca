@@ -473,6 +473,58 @@ fn a_read_of_incus_slower_than_its_deadline_is_refused_in_words_and_the_next_cal
 }
 
 #[test]
+fn the_longest_secret_and_one_of_many_bytes_are_taken_out_of_a_services_log() {
+    let rig = machine_and_container();
+    let door = Door::over(&rig);
+    // The longest value a machine takes: 4096 characters and its line break, 4097 bytes in its file. And the longest
+    // a container takes, of three bytes a character: 12288 bytes. Both are made here, from a counter.
+    let mut state: u32 = 0x1234_5678;
+    let mut letters = |alphabet: &[char], count: usize| -> String {
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                alphabet[(state >> 24) as usize % alphabet.len()]
+            })
+            .collect()
+    };
+    let longest = letters(&['q', 'r', 's', 't', 'u', 'w', 'x', 'z'], 4096);
+    let wide = letters(&['\u{20ac}', '\u{00e9}', '\u{4e2d}', '\u{00f1}'], 4096);
+    assert_eq!(longest.len(), 4096);
+    assert!(wide.len() > 2 * 4096);
+    for (service, key, value) in [
+        ("p1", "SIGNING_KEY", format!("{longest}\n")),
+        ("tok", "T", wide.clone()),
+    ] {
+        let reply = door.call(
+            "service_secret_set",
+            json!({"name":service,"key":key,"value":value}),
+        );
+        assert_eq!(answer(&reply), "ok", "{service}");
+    }
+    // Each guest prints its secret on its console, between two words.
+    for (service, value) in [("p1", &longest), ("tok", &wide)] {
+        rig.fake.set_console_log(
+            PROJECT,
+            service,
+            &format!("booting\nloaded {value} done\nready\n"),
+        );
+        let reply = door.call("service_logs", json!({"name":service}));
+        assert_eq!(answer(&reply), "ok", "{service}");
+        let lines = reply["result"]["structuredContent"]["lines"].clone();
+        // Compared here and not by assert_eq, whose message would print the line with the value in it.
+        let hidden = lines == json!(["booting", "loaded [secret] done", "ready"]);
+        assert!(hidden, "{service}: the value is not taken out of its line");
+        // No piece of it is anywhere in the answer.
+        let whole = reply.to_string();
+        let piece: String = value.chars().take(24).collect();
+        assert!(
+            !whole.contains(&piece),
+            "{service}: the answer shows the secret"
+        );
+    }
+}
+
+#[test]
 fn a_change_the_kernel_cannot_save_is_refused_in_words_with_its_own_code() {
     let rig = machine_and_container();
     let door = Door::over(&rig);

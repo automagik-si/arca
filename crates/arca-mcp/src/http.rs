@@ -130,7 +130,7 @@ impl Server {
 
     /// Sends the line the door writes when it answers "internal" to `sink` instead of standard error. The caller of a
     /// tool is told only "internal: the tool failed"; the line is where the node's own log says which verb failed and
-    /// why. It names the verb and a fixed reason, and never an argument of the call.
+    /// why. It names the verb and a reason the server wrote, and never an argument of the call.
     pub fn log_to(mut self, sink: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         self.log = sink;
         self

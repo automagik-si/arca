@@ -37,7 +37,10 @@ node's log had no line for it. Such a call is now refused in words that say Incu
 and that the same request may be made again, under the code `incus_unavailable` (`incus_answer` when Incus answered
 something this node cannot use, `state_not_saved` when the kernel could not save the change). When an answer is still
 `internal`, the node's log gets one line with the verb and the reason. A virtual machine's secret may be 4096
-characters and one line break at its end (a key file read whole), a value of only line breaks is refused, and a
+characters and one line break at its end (a key file read whole). Such a value needs 8 characters that are not line
+breaks: one of only line breaks is refused, and so is one that was accepted before, of fewer than 8 characters and
+line breaks to make up the count (seven characters and a line break). A stored secret that long, or one of many
+bytes a character, is taken out of logs and outputs like any other. A
 container's or a function's secret that ends with a line break is refused in words that name the line break. A text
 that is too short or too long for its field is refused in words that name the limit. See "When Incus does not answer,
 and when the answer is internal" in docs/OPERATING.md.

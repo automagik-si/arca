@@ -1167,8 +1167,9 @@ its request is read.
 
 Every service verb, a read too, first asks Incus for the node's instances with their state, and gives that read 10
 seconds. For a running virtual machine Incus gets the state from the machine's guest agent, so a busy guest, or
-several such reads at once, can make it late. A read of Incus that fails inside a service, function or tenant call is
-refused in words, with a code of its own in `data.refusal`:
+several such reads at once, can make it late. When that read fails, and when one of the reads a create makes for an
+address, for its project or for its new instance fails, the call is refused in words, with a code of its own in
+`data.refusal`:
 
 | Code | What happened | What to do |
 |---|---|---|
@@ -1180,8 +1181,10 @@ The sentence says what was being read and for which service, and what the call h
 changed.", or that a create did go through). It never holds Incus's own text.
 
 `internal: the tool failed` is left for a fault of Arca's own: a handler that panicked, an answer that does not fit
-the verb's schema, or a failure a handler keeps to itself. The caller is told no more than that. The node's log gets
-one line for each, with the verb and the reason and never an argument of the call:
+the verb's schema, or a failure a handler keeps to itself. A few failures that could be said in words are still among
+them: the kernel refusing to save a create's own state, and the read of the host's addresses a function with
+destinations makes. The caller is told no more than "internal". The node's log gets one line for each, with the verb
+and a reason the server wrote (it can name a file of the node or a service, and never an argument of the call):
 
 ```
 arca: service_status was answered "internal: the tool failed": the kernel could not complete the call
@@ -3386,6 +3389,8 @@ machine's is never there. The steps:
    counting one line break at its end, and at least 8 of them are not line breaks; it may have line breaks (a private
    key in PEM form is several lines) and no other control character. One thing is not byte for byte: a file with
    Windows line endings is stored with plain line breaks (each carriage return and line feed pair as one line feed).
+   The call itself carries at most 4097 characters, and there every carriage return counts: a file with Windows line
+   endings that is near the limit is refused as too long, and goes through once its line endings are plain.
    A container's value, and a function's, is an environment value: one line of 8 to 4096 characters, and a line break
    at its end is refused in words that say it is the one thing to change. Nothing is sent to the machine yet.
 3. `instance_start` with `{"project": "arcak-svc", "instance": "<name>"}` starts the machine, waits for its guest agent

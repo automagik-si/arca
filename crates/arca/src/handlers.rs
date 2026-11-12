@@ -4980,18 +4980,11 @@ const ASK_AGAIN: &str =
 const ASKED_THE_SAME: &str =
     "The same request is likely to be answered the same until Incus answers that read.";
 
-/// The refusal for a read of Incus, inside a service call, that failed: in words, never "internal". `what` is what was
-/// read and `subject` what it was read for (the service the call names, or the list); `changed` says what the call had
-/// done by then, such as "Nothing was changed.". The words hold the kind of failure and Incus's status, and never
-/// Incus's own text, which may quote a value.
-fn incus_read_refused(
-    error: &arca_incus::IncusError,
-    what: &str,
-    subject: &str,
-    changed: &str,
-) -> CallError {
+/// What went wrong with a read of Incus, in words, and the code of its refusal. The words hold the kind of failure
+/// and Incus's status, and never Incus's own text, which may quote a value.
+fn incus_read_cause(error: &arca_incus::IncusError) -> (&'static str, String) {
     use arca_incus::IncusError;
-    let (code, cause) = match error {
+    match error {
         IncusError::Timeout => (
             INCUS_UNAVAILABLE,
             format!(
@@ -5021,22 +5014,45 @@ fn incus_read_refused(
             INCUS_ANSWER,
             "Incus's answer was not the JSON this node expects".to_string(),
         ),
-    };
+    }
+}
+
+/// The refusal for a read of Incus, inside a service call, that failed: in words, never "internal". `what` is what was
+/// read and `subject` what it was read for (the service the call names, or the list); `changed` says what the call had
+/// done by then, such as "Nothing was changed.". The words hold the kind of failure and Incus's status, and never
+/// Incus's own text, which may quote a value.
+fn incus_read_refused(
+    error: &arca_incus::IncusError,
+    what: &str,
+    subject: &str,
+    changed: &str,
+) -> CallError {
+    let (code, _) = incus_read_cause(error);
     let after = if code == INCUS_UNAVAILABLE {
         ASK_AGAIN
     } else {
         ASKED_THE_SAME
     };
-    let mut message = format!("{cause} when this node read {what} for {subject}.");
-    for sentence in [changed, after] {
-        if !sentence.is_empty() {
-            message.push(' ');
-            message.push_str(sentence);
-        }
+    let mut tail = String::from(changed);
+    if !tail.is_empty() {
+        tail.push(' ');
     }
+    tail.push_str(after);
+    incus_read_told(error, what, subject, &tail)
+}
+
+/// The same refusal with its last sentences given whole, for a read made after the call changed something: there the
+/// caller is told what is there and what to look at, and never to make the same request again.
+fn incus_read_told(
+    error: &arca_incus::IncusError,
+    what: &str,
+    subject: &str,
+    tail: &str,
+) -> CallError {
+    let (code, cause) = incus_read_cause(error);
     CallError::Refused {
         code: code.into(),
-        message,
+        message: format!("{cause} when this node read {what} for {subject}. {tail}"),
     }
 }
 
@@ -5056,13 +5072,15 @@ fn read_subject(verb: &str, args: &Value) -> String {
 }
 
 /// What a service call had changed when its first reads of Incus are made: nothing, which a call that only reads does
-/// not need said.
-fn nothing_changed(verb: &str) -> &'static str {
+/// not need said. A call that runs from an owner's approval has used that approval by then, and says so.
+fn nothing_changed(verb: &str, approved: bool) -> &'static str {
     if matches!(
         verb,
         "service_list" | "service_status" | "service_logs" | "function_list" | "function_runs"
     ) {
         ""
+    } else if approved {
+        "Nothing was changed, and the approval was used."
     } else {
         "Nothing was changed."
     }
@@ -5740,11 +5758,12 @@ pub(crate) fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
                 if registry && file.file_name() == "server" {
                     continue;
                 }
+                // Which stored values are hidden is decided by the rule that says which values are stored
+                // ([`crate::service::secret_to_hide`]), so no secret the node accepts is left out of this list.
                 if let Ok(text) = std::fs::read_to_string(file.path())
-                    && text.len() >= 8
-                    && text.len() <= 4096
+                    && let Some(hidden) = crate::service::secret_to_hide(&text)
                 {
-                    values.push(text.trim_end_matches('\n').to_string());
+                    values.push(hidden.to_string());
                 }
             }
         }
@@ -6047,11 +6066,25 @@ impl ServiceHandler {
                 }
                 Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
                 Err(error) => {
-                    return Err(incus_read_refused(
+                    // Said as what it is, with the verbs that act on one: a function is not a service.
+                    let (subject, look) = if config.function.is_some() {
+                        (
+                            format!("function {name}"),
+                            "function_list shows what is there, and function_remove removes it",
+                        )
+                    } else {
+                        (
+                            format!("service {name}"),
+                            "service_status shows what is there, and service_remove removes it",
+                        )
+                    };
+                    return Err(incus_read_told(
                         &error,
                         "the instance of a create that did not complete",
-                        &format!("service {name}"),
-                        "Whether its instance exists is not known: service_status shows what is there, and service_remove removes it.",
+                        &subject,
+                        &format!(
+                            "Whether its instance exists is not known: {look}. Look before the create is made again."
+                        ),
                     ));
                 }
             }
@@ -6091,11 +6124,23 @@ impl ServiceHandler {
             Ok(state) => Some(state),
             Err(arca_incus::IncusError::Status { code: 404, .. }) => None,
             Err(error) => {
-                return Err(incus_read_refused(
+                // The create went through: the caller is told to look, never to make it again.
+                let (subject, look) = if config.function.is_some() {
+                    (
+                        format!("function {name}"),
+                        "The function was created: function_list shows it",
+                    )
+                } else {
+                    (
+                        format!("service {name}"),
+                        "The service was created: service_status shows it",
+                    )
+                };
+                return Err(incus_read_told(
                     &error,
                     "the state of the new instance",
-                    &format!("service {name}"),
-                    "The service was created: service_status shows it.",
+                    &subject,
+                    &format!("{look}. Do not make the create again."),
                 ));
             }
         };
@@ -6322,7 +6367,12 @@ impl ToolHandler for ServiceHandler {
         };
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
         let subject = read_subject(self.verb, &args);
-        let rows = service_listing(&read, None, &subject, nothing_changed(self.verb))?;
+        let rows = service_listing(
+            &read,
+            None,
+            &subject,
+            nothing_changed(self.verb, preapproved),
+        )?;
         let mut entries = {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
