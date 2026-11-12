@@ -953,12 +953,18 @@ run_workspace() {
       wait "$KEEPER"
       again=$?
       [ "$again" = 127 ] || ended=$again
-      exit "$ended"
+      # The child has no process number any more: nothing is to be sent to that number from here on.
+      KEEPER=''
+      # A child that a SIGTERM ended (128 + 15) was stopped with the keeper. systemd signals every process of the
+      # service, and it may reach the child before the keeper: that is a stop that was asked for, and the keeper ends
+      # as it does for its own signal.
+      [ "$ended" = 143 ] || exit "$ended"
+      STOP=1
     fi
   done
   # A stop that came before the child had a name, or before the child had put down the traps it was born with, has
   # not ended it yet.
-  while kill "$KEEPER" 2>/dev/null; do
+  while [ -n "$KEEPER" ] && kill "$KEEPER" 2>/dev/null; do
     sleep 0.05
   done
   # A keeper that was still saying why the workspace does not start stops without a word, as it always has.

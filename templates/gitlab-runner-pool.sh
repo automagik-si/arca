@@ -1080,7 +1080,9 @@ hold() {
 }
 
 # The controller: everything the pool does, as a child of run_pool. It takes no signal. It learns of a stop from the
-# line, and then stops in its own order.
+# line, and then stops in its own order. A SIGTERM sent to this process itself, which systemd never does under the
+# unit's KillMode=mixed, ends it at once with no stop. It does not ignore the signal instead, because whatever it
+# starts would ignore it too, and `timeout` could then no longer end the lookup it is set over.
 pool() {
   trap - TERM INT
   load_settings || {
