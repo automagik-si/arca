@@ -7,13 +7,13 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-The `automagik` image is now named after the harness too: `arca-automagik-<commit>-dsh-<harness>`, 12 hex digits of the
-Automagik commit and of the SHA-256 of the DSH lockfile. Before, it was named after the commit alone, so a build with a
-newer DSH was refused as an image that exists, and the old one had to be deleted by hand. The template changed, so an
-installed copy nobody edited is brought up to date by the upgrade. A node's image of before stays, and a service made
-from it keeps running; a new `automagik` service is refused with the new name until that image is built with
-`templates/automagik.build.sh`.
-## 0.14.0 (2026-11-12)
+The `automagik` image is now named after everything it is built from: `arca-automagik-<commit>-dsh-<harness>`, 12 hex
+digits of the Automagik commit and of a SHA-256 over the build's other inputs (the build script with its Node, Tailscale
+and plugin pins, the DSH package files, and the dashboard's port). Before, it was named after the commit alone, so a
+build with a newer DSH or any other new pin was refused as an image that exists, and the old one had to be deleted by
+hand. The template changed, so an installed copy nobody edited is brought up to date by the upgrade. A node's image of
+before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
+that image is built with `templates/automagik.build.sh`.
 
 The metrics sampler no longer reads the listing of every instance with its live state each tick. On a node where one
 running virtual machine's guest agent is slow, that listing took up to its 10 second deadline, so a tick often had no

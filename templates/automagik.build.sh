@@ -25,22 +25,34 @@ base=${3:?expected local base image fingerprint}
 [[ $project =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ && $profile =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || exit 2
 [[ $base =~ ^local:[0-9a-f]{64}$ ]] || { echo 'base must be local:<64 hex fingerprint>' >&2; exit 2; }
 # Read public template values without interpreting them as shell code.
-# The image is named after both things it is built from: the Automagik commit and the harness, the first 12 hex
-# digits of each (the commit's, and the SHA-256 of automagik-dsh/package-lock.json, which pins DSH and everything it
-# installs). A changed harness is a new name, so it is built beside the old image and never mistaken for it. Incus
-# allows an alias of 64 characters at most, so the full commit is a property of the image, not part of its name.
-mapfile -t pins < <(python3 - "$root/automagik.json" "$root/automagik-dsh/package-lock.json" <<'PY'
-import hashlib, json, re, sys
-with open(sys.argv[1]) as source:
+# The image is named after what it is built from: the Automagik commit and the harness, the first 12 hex digits of
+# each. The harness is every other input the build pins, hashed together: this script's own bytes (Node, Tailscale,
+# the Omni plugin's commit and every other pin below are in it), automagik-dsh/package.json and package-lock.json
+# (DSH and everything npm installs), and the template's dashPort (written into the dashboard's unit). It is the
+# SHA-256 of what this prints, run from the templates directory:
+#   sha256sum automagik.build.sh automagik-dsh/package.json automagik-dsh/package-lock.json; echo "dashPort 3080"
+# So a change to any of them is a new name, built beside the old image and never mistaken for it. Incus allows an
+# alias of 64 characters at most, so the full commit and the full harness are properties of the image.
+mapfile -t pins < <(python3 - "$root" "${BASH_SOURCE[0]}" <<'PY'
+import hashlib, json, os, re, sys
+root, script = sys.argv[1], sys.argv[2]
+with open(os.path.join(root, 'automagik.json')) as source:
     t = json.load(source)
-with open(sys.argv[2], 'rb') as lock:
-    harness = hashlib.sha256(lock.read()).hexdigest()
 assert re.fullmatch('[0-9a-f]{40}', t['commit'])
+assert isinstance(t['dashPort'], int) and 1 <= t['dashPort'] <= 65535
+inputs = [('automagik.build.sh', script)] + [(name, os.path.join(root, name))
+                                            for name in ('automagik-dsh/package.json', 'automagik-dsh/package-lock.json')]
+listing = ''
+for name, path in inputs:
+    with open(path, 'rb') as source:
+        listing += hashlib.sha256(source.read()).hexdigest() + '  ' + name + '\n'
+listing += 'dashPort ' + str(t['dashPort']) + '\n'
+harness = hashlib.sha256(listing.encode()).hexdigest()
 image = 'local:arca-automagik-' + t['commit'][:12] + '-dsh-' + harness[:12]
 if t['image'] != image:
-    sys.exit('automagik.json names the image ' + str(t['image']) + ', and its commit with this harness '
-             '(automagik-dsh/package-lock.json) is ' + image + ': set "image" to that')
-assert isinstance(t['dashPort'], int) and 1 <= t['dashPort'] <= 65535
+    sys.exit('automagik.json names the image ' + str(t['image']) + ', and its commit with these build inputs '
+             '(automagik.build.sh, automagik-dsh/package.json and package-lock.json, dashPort) is ' + image +
+             ': set "image" to that')
 print(t['commit'])
 print(image[6:])
 print(t['dashPort'])
@@ -58,7 +70,7 @@ if incus info "$builder" --project "$project" >/dev/null 2>&1; then
   echo 'builder already exists' >&2; exit 1
 fi
 if incus image info "$alias" --project "$project" >/dev/null 2>&1; then
-  echo "image $alias already exists: this commit with this harness is built already" >&2; exit 1
+  echo "image $alias already exists: this commit with these build inputs is built already" >&2; exit 1
 fi
 made=false
 cleanup() {
