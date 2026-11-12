@@ -860,7 +860,7 @@ fn the_card_says_what_will_happen_and_an_approved_start_false_create_runs_to_its
     // Issue 117: the card says what the service takes of the node, read from its template, and how to undo it.
     assert_eq!(
         plain["uses"],
-        "No set share: it uses what it needs of this node's CPUs and memory, and the disk its files take."
+        "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), and the disk its files take."
     );
     assert_eq!(
         plain["undo"],

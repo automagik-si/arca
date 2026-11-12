@@ -3626,7 +3626,7 @@ fn enrich_service_create(
         payload
     };
     let template = content.template;
-    *card_uses = Some(crate::action_proposal::uses_words(&template));
+    *card_uses = Some(crate::action_proposal::uses_words(&template, false));
     // A create that could never give the kernel access its template declares is refused now, so the owner is never asked
     // to approve it. The proposal then names the access, so the owner's card says it and the approval binds it.
     let stated = kernel_access_for(cfg, &template, payload.get("tenant").is_some(), None)?
@@ -4422,7 +4422,7 @@ fn enrich_postgres_create(
         // What the card says of the password, from the template this fingerprint is of.
         *card_fact = database_card_fact(cfg, &template, name);
     }
-    *card_uses = Some(crate::action_proposal::uses_words(&template));
+    *card_uses = Some(crate::action_proposal::uses_words(&template, false));
     let mut payload = payload.clone();
     payload["template"] = json!(crate::service::DATABASE_TEMPLATE);
     payload["image"] = json!(image);

@@ -1284,7 +1284,7 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only:
     }
     assert!(
         shown.contains("Uses")
-            && shown.contains("No set share: it uses what it needs of this node's CPUs and memory")
+            && shown.contains("Up to 2 CPUs and 2GiB of memory (Arca's default for a service)")
             && shown.contains("To undo")
             && shown.contains("Ask your assistant to remove it."),
         "{shown}"

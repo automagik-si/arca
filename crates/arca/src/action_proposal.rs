@@ -971,7 +971,7 @@ const USES_MAX: usize = 512;
 /// The card's `Uses` line for a create from `template`: what the new service takes of this node, read from the template
 /// the proposal's fingerprint binds. A share the template does not set is said to be unset: the service then uses what
 /// it needs of the node's.
-pub fn uses_words(template: &crate::service::Template) -> String {
+pub fn uses_words(template: &crate::service::Template, _in_tenant: bool) -> String {
     let limits = template.limits.as_ref();
     let cpu = limits.and_then(|limits| limits.cpu.as_deref());
     let memory = limits.and_then(|limits| limits.memory.as_deref());
@@ -2515,7 +2515,9 @@ mod tests {
         );
     }
 
-    /// Issue 117: what a create from a template takes of the node, read from the template its fingerprint is of.
+    /// Issue 117: what a create from a template takes of the node, read from the template its fingerprint is of. A
+    /// container whose template sets no limit runs at the share of Arca's service profile, so the card names that share;
+    /// a container in a tenant also has a root disk of a fixed size.
     #[test]
     fn a_create_says_what_it_uses_of_the_node() {
         let template = |extra: Value| -> crate::service::Template {
@@ -2525,28 +2527,83 @@ mod tests {
             }
             serde_json::from_value(base).expect("a template")
         };
+        let node = false;
+        let tenant = true;
         assert_eq!(
-            uses_words(&template(json!({}))),
-            "No set share: it uses what it needs of this node's CPUs and memory, and the disk its files take."
+            uses_words(&template(json!({})), node),
+            "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), and the disk its files take."
         );
         assert_eq!(
-            uses_words(&template(
-                json!({ "limits": { "cpu": "2", "memory": "4GiB" } })
-            )),
+            uses_words(&template(json!({ "limits": { "cpu": "2", "memory": "4GiB" } })), node),
             "Up to 2 CPUs and 4GiB of memory, and the disk its files take."
         );
         assert_eq!(
-            uses_words(&template(
-                json!({ "limits": { "cpu": "1" }, "data": { "path": "/data", "size": "10GiB" } })
-            )),
-            "Up to 1 CPU and what it needs of this node's memory, and a 10GiB disk for its data."
+            uses_words(
+                &template(json!({ "limits": { "cpu": "1" }, "data": { "path": "/data", "size": "10GiB" } })),
+                node
+            ),
+            "Up to 1 CPU and 2GiB of memory (the memory is Arca's default for a service), the disk its files take, and a 10GiB disk for its data."
         );
         assert_eq!(
-            uses_words(&template(json!({
-                "kind": "virtual-machine", "limits": { "cpu": "4", "memory": "8GiB" }, "rootSize": "40GiB"
-            }))),
+            uses_words(&template(json!({ "limits": { "memory": "1GiB" } })), node),
+            "Up to 2 CPUs and 1GiB of memory (the CPUs are Arca's default for a service), and the disk its files take."
+        );
+        assert_eq!(
+            uses_words(&template(json!({})), tenant),
+            "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), and a 16GiB disk."
+        );
+        assert_eq!(
+            uses_words(&template(json!({ "data": { "path": "/data", "size": "10GiB" } })), tenant),
+            "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), a 16GiB disk, and a 10GiB disk for its data."
+        );
+        assert_eq!(
+            uses_words(
+                &template(json!({
+                    "kind": "virtual-machine", "limits": { "cpu": "4", "memory": "8GiB" }, "rootSize": "40GiB"
+                })),
+                node
+            ),
             "4 CPUs, 8GiB of memory and a 40GiB disk."
         );
+        // The default named is the service profile's own, the one a tenant's project is given.
+        assert_eq!(arca_netproject::tenant::PROFILE_CPU, 2);
+        assert_eq!(arca_netproject::tenant::PROFILE_MEMORY, "2GiB");
+        assert_eq!(arca_netproject::tenant::CONTAINER_ROOT_SIZE, "16GiB");
+    }
+
+    /// Only a create says what it uses: a proposal of another action is given no `uses`, and a journal line that
+    /// carries one for such an action loads without it.
+    #[test]
+    fn only_a_create_carries_what_it_uses() {
+        let dir = Temp::new("uses-only-create");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let restart = json!({ "project": "default", "instance": "web" });
+        let proposed = store
+            .propose_using(
+                ActionKind::InstanceRestart,
+                restart.clone(),
+                1_000,
+                None,
+                Some("Up to 2 CPUs".to_string()),
+            )
+            .expect("proposed");
+        assert_eq!(proposed.uses, None);
+        let other = Temp::new("uses-planted");
+        let mut line: Value =
+            serde_json::from_str(&proposed_line("instance_restart", &restart, 1_000)).expect("JSON");
+        line["proposal"]["uses"] = json!("Planted words");
+        write_journal(&other.0, &format!("{line}\n"));
+        let reopened = ActionProposalStore::open(&other.0, 1_001, None);
+        assert_eq!(reopened.waiting().len(), 1);
+        assert_eq!(reopened.waiting()[0].uses, None);
+    }
+
+    /// Storage is added from a folder as well as from a disk: the undo line claims no erased disk for a folder.
+    #[test]
+    fn storage_add_undo_claims_no_erase_for_a_folder() {
+        let undo = ActionKind::StorageAdd.undo_words();
+        assert!(!undo.contains("A disk that was erased"), "{undo}");
+        assert!(undo.starts_with("If a disk was erased for it"), "{undo}");
     }
 
     /// A proposal keeps what its create uses through the journal, so the card says it after the kernel opens again.

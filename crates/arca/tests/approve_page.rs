@@ -3988,7 +3988,7 @@ fn action_cards_render_every_kernel_detail_row_as_text() {
     assert!(
         html.contains("const details = Array.isArray(plan.details) ? plan.details : [];")
             && html.contains(
-                "for (const detail of details) (AUDIT_ROWS.has(detail.label) ? audit : fact)(detail.label, detail.value);"
+                "for (const detail of details) (folded(detail) ? audit : fact)(detail.label, detail.value);"
             ),
         "the action card renders every details row, up front or in its Details"
     );
@@ -4007,6 +4007,22 @@ fn the_cards_lead_with_plain_words_and_fold_the_audit_rows_into_details() {
     assert!(!html.contains("asks before it deletes anything"));
     assert!(!html.contains("Nothing is deleted without your passkey"));
     assert!(html.contains(r#"const AUDIT_ROWS = new Set(["Image", "Template content"]);"#));
+    // An image with no digest is not held to the approval: its row says so, and stays up front.
+    let folded = html
+        .split("function folded(detail) {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("the folding rule");
+    assert!(folded.contains(r#"!detail.value.includes("(no digest:")"#), "{folded}");
+    // Each card's Details names its card, so a screen reader's list of disclosures tells them apart.
+    assert!(html.contains(r#"summary.setAttribute("aria-label", "Details: " + name);"#));
+    for call in [
+        "moreDetails(title)",
+        "moreDetails(plan.summary)",
+        "moreDetails(title)",
+    ] {
+        assert!(html.contains(call), "{call}");
+    }
     let action = html
         .split("function actionCard(")
         .nth(1)
