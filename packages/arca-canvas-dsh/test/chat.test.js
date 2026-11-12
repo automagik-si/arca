@@ -7,7 +7,7 @@ import test from 'node:test';
 import { ArcaError } from '../src/arca-client.js';
 import {
   ChatStore, DEFAULTS, DOCTOR_TOOLS, NOT_LINKED, PROPOSE_ACTIONS, PROPOSE_TOOL, READ_TOOLS, createDoctorChat, createProposeTool,
-  dayOf, doctorPrompt, formatToolResult, sseFrame, stateFilePath,
+  createReadTools, dayOf, doctorPrompt, formatToolResult, sseFrame, stateFilePath,
 } from '../src/chat.js';
 
 const GiB = 1024 ** 3;
@@ -571,13 +571,14 @@ test('SSE framing keeps one JSON object per data line and cannot forge an event'
   assert.equal(frame.includes('\ndata: {"text":"hello'), true);
 });
 
-test('the proposal tool offers exactly the seventeen allowed actions, never a database delete', () => {
+test('the proposal tool offers exactly the twenty-two allowed actions, never a database delete', () => {
   assert.deepEqual([...PROPOSE_ACTIONS], [
     'service_create', 'service_remove', 'service_import', 'service_release',
     'service_publish', 'service_unpublish',
     'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
     'storage_add', 'snapshot_create', 'snapshot_delete',
     'instance_start', 'instance_stop', 'instance_restart',
+    'tenant_create', 'tenant_remove', 'deploy_remove', 'function_create', 'function_remove',
   ]);
   assert.equal(PROPOSE_ACTIONS.includes('postgres_delete'), false);
   assert.equal(PROPOSE_ACTIONS.includes('gpu_delete'), false);
@@ -590,7 +591,10 @@ test('the proposal tool offers exactly the seventeen allowed actions, never a da
   assert.equal(tool.parameters.required.includes('action'), true);
   assert.equal(tool.parameters.required.includes('args'), true);
   assert.match(tool.description, /postgres_create \{name\}/);
-  assert.doesNotMatch(tool.description, /postgres_delete|image/);
+  // A database proposal never chooses its image; a function is an image, so only function_create names one.
+  assert.doesNotMatch(tool.description, /postgres_delete|postgres_create \{[^}]*image/);
+  assert.equal(tool.description.match(/\bimage\b/g).length, 1);
+  assert.match(tool.description, /function_create \{name, image, digest, /);
 });
 
 // A fake reader per host. The page host's arca_status names the hosts its kernel relays approvals to.
@@ -779,6 +783,20 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '  plan). Never guess a reason.',
     '- Arca lists and reads an imported service but never changes, removes, publishes or rewires it.',
     '  service_release hands it back to the manager that created it, and Arca stops listing it.',
+    '- A tenant is a walled-off space on this machine for someone else\'s services, with its own limits. It has',
+    '  no name: call it by its id. Read tenant_list, then tenant_status or tenant_usage with the id. To make one,',
+    '  propose tenant_create; give caps only when the owner asks for more than this machine\'s defaults. To remove',
+    '  one, propose tenant_remove with its id: every service of the tenant is deleted with its data; say so',
+    '  plainly.',
+    '- tenant_usage names the deploy each of a tenant\'s instances came from. To remove what one deploy created,',
+    '  propose deploy_remove with the tenant\'s id and the deploy: its services are deleted with their data, and',
+    '  nothing else of the tenant is touched. A deploy that is still provisional is refused; say so plainly.',
+    '- A function is a small program, an image by its digest, that runs on a timer. Read function_list, and',
+    '  function_runs with its name for its newest runs. To make one, propose function_create with its name,',
+    '  image, digest and timer, never an image tag, and never a secret in env: name each secret in secrets. The',
+    '  canvas cannot set a secret\'s value; say so. To remove one, propose function_remove with its name: a run',
+    '  that is going is stopped and the function is deleted with its secrets; its past runs stay in the log.',
+    '- A tenant, deploy or function change runs only after the owner approves its card, like every other change.',
     '- You can propose changes on alpha and on any machine linked to it for approvals. Another machine is',
     '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -1957,7 +1975,7 @@ test('the Doctor may propose a start, a stop and a restart of an instance, and e
     },
     onProposal(proposal) { proposals.push(proposal); },
   });
-  assert.match(tool.description, /instance_start \{project, instance\}; instance_stop \{project, instance\}; instance_restart \{project, instance\}\./);
+  assert.match(tool.description, /instance_start \{project, instance\}; instance_stop \{project, instance\}; instance_restart \{project, instance\}; /);
   for (const action of actions) {
     assert.equal(PROPOSE_ACTIONS.includes(action), true, action);
     assert.equal(tool.parameters.properties.action.enum.includes(action), true, action);
@@ -2049,4 +2067,108 @@ test('the Doctor may propose an import and a release of a service, and each reac
   assert.match(prompt, /Arca lists and reads an imported service but never changes, removes, publishes or rewires it\./);
   assert.match(prompt, /service_release hands it back to the manager that created it, and Arca stops listing it\./);
   assert.doesNotMatch(prompt, /fully moved|until it is released/);
+});
+
+test('the Doctor reads tenants and functions, and each read sends the kernel only the arguments it takes', async () => {
+  const reads = ['tenant_list', 'tenant_status', 'tenant_usage', 'function_list', 'function_runs'];
+  for (const name of reads) assert.equal(READ_TOOLS.includes(name), true, name);
+  const calls = [];
+  const tools = Object.fromEntries(createReadTools({
+    hosts: [{ name: 'alpha' }],
+    clientFor(host) {
+      return {
+        async call(verb, args) {
+          calls.push({ host, verb, args });
+          return { answered: verb };
+        },
+      };
+    },
+  }).map((tool) => [tool.name, tool]));
+  for (const name of reads) {
+    assert.equal(typeof tools[name]?.execute, 'function', name);
+    assert.match(tools[name].description, /\w/, name);
+  }
+  // One tenant is read by its id, in the kernel's shape; a function's runs by its name.
+  for (const name of ['tenant_status', 'tenant_usage']) {
+    const { properties, required } = tools[name].parameters;
+    assert.deepEqual(required, ['id'], name);
+    assert.equal(properties.id.pattern, '^[a-z2-7]{8}$', name);
+    assert.deepEqual(Object.keys(properties).sort(), ['host', 'id'], name);
+  }
+  assert.deepEqual(tools.function_runs.parameters.required, ['name']);
+  assert.deepEqual(Object.keys(tools.function_runs.parameters.properties).sort(), ['host', 'limit', 'name', 'run']);
+  assert.equal(tools.function_runs.parameters.properties.limit.maximum, 100);
+  for (const name of ['tenant_list', 'function_list']) {
+    assert.deepEqual(Object.keys(tools[name].parameters.properties), ['host'], name);
+    assert.equal(tools[name].parameters.required, undefined, name);
+  }
+
+  assert.deepEqual(await tools.tenant_list.execute({ host: 'alpha' }), { answered: 'tenant_list', host: 'alpha' });
+  await tools.tenant_status.execute({ id: 'abcd2345', extra: 'dropped' });
+  await tools.tenant_usage.execute({ id: ' abcd2345 ' });
+  await tools.function_list.execute({ name: 'dropped' });
+  await tools.function_runs.execute({ name: 'relay', limit: 500, run: 'fr-1700000000000-1', extra: 'dropped' });
+  await tools.function_runs.execute({ name: 'relay', limit: 0 });
+  assert.deepEqual(calls, [
+    { host: 'alpha', verb: 'tenant_list', args: {} },
+    { host: 'alpha', verb: 'tenant_status', args: { id: 'abcd2345' } },
+    { host: 'alpha', verb: 'tenant_usage', args: { id: 'abcd2345' } },
+    { host: 'alpha', verb: 'function_list', args: {} },
+    { host: 'alpha', verb: 'function_runs', args: { name: 'relay', limit: 100, run: 'fr-1700000000000-1' } },
+    { host: 'alpha', verb: 'function_runs', args: { name: 'relay' } },
+  ]);
+});
+
+test('the Doctor may propose a tenant, a deploy and a function change, and each reaches action_propose', async () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  // Each action with its arguments and the kernel's own summary (crates/arca/src/action_proposal.rs and function.rs).
+  const cases = [
+    ['tenant_create', {}, 'Create a tenant'],
+    ['tenant_create', { caps: { instances: 4, containers: 4, virtualMachines: 1, cpu: 4, memory: '8GiB', disk: '40GiB' } },
+      'Create a tenant with caps above this node\'s defaults'],
+    ['tenant_remove', { id: 'abcd2345' }, 'Remove the tenant abcd2345 and everything in it'],
+    ['deploy_remove', { tenant: 'abcd2345', deploy: 'shop-1' }, 'Remove everything the deploy shop-1 created, in tenant abcd2345'],
+    ['function_create', {
+      name: 'relay', image: 'registry.example/acme/relay', digest, triggers: [{ timer: { everySeconds: 300 } }], secrets: ['RELAY_KEY'],
+    }, 'Create the function relay from registry.example/acme/relay and run it every 5 minutes'],
+    ['function_remove', { name: 'relay' }, 'Remove the function relay'],
+  ];
+  const calls = [];
+  const tool = createProposeTool({
+    hosts: [{ name: 'alpha' }],
+    proposalHost: 'alpha',
+    clientFor(name) {
+      return {
+        async call(verb, args) {
+          calls.push({ host: name, verb, args });
+          const index = cases.findIndex(([action, given]) => action === args.action && given === args.args);
+          return { id: `act-${String(index + 1).repeat(12)}`, action: args.action, summary: cases[index][2] };
+        },
+      };
+    },
+  });
+  assert.match(tool.description, /tenant_remove \{id\}; deploy_remove \{tenant, deploy\}; /);
+  assert.match(tool.description, /function_create \{name, image, digest, triggers: \[\{timer: \{everySeconds\}\}\]\}/);
+  assert.match(tool.description, /function_remove \{name\}\./);
+  for (const [action, args, summary] of cases) {
+    assert.equal(PROPOSE_ACTIONS.includes(action), true, action);
+    assert.equal(tool.parameters.properties.action.enum.includes(action), true, action);
+    const accepted = await tool.execute({ action, args }, { callId: `call-${action}` });
+    assert.equal(tool.output.render({}, accepted)[0].text, `${accepted.id}: ${summary}. It waits for the owner's approval.`);
+  }
+  // The arguments reach the kernel as given: it checks them against the verb's own schema.
+  assert.deepEqual(calls, cases.map(([action, args]) => ({ host: 'alpha', verb: 'action_propose', args: { action, args } })));
+  // Setting a function's secret, rolling a deploy back or confirming one is not something the canvas can ask for.
+  for (const action of ['function_secret_set', 'deploy_rollback', 'deploy_confirm', 'function_run']) {
+    await assert.rejects(tool.execute({ action, args: { name: 'relay' } }, { callId: 'c' }), /That action cannot be proposed\./);
+  }
+
+  const prompt = doctorPrompt({ hosts: [{ name: 'alpha' }], approvalUrl: 'https://example.com/approve' });
+  assert.match(prompt, /Read tenant_list, then tenant_status or tenant_usage with the id\./);
+  assert.match(prompt, /every service of the tenant is deleted with its data; say so\s+plainly\./);
+  assert.match(prompt, /tenant_usage names the deploy each of a tenant's instances came from\./);
+  assert.match(prompt, /A deploy that is still provisional is refused; say so plainly\./);
+  assert.match(prompt, /never an image tag, and never a secret in env/);
+  assert.match(prompt, /canvas cannot set a secret's value; say so\./);
+  assert.match(prompt, /A tenant, deploy or function change runs only after the owner approves its card/);
 });

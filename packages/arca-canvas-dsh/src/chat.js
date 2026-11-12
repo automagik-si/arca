@@ -12,6 +12,7 @@ import { snapshotError } from './arca-client.js';
 export const READ_TOOLS = Object.freeze([
   'arca_status', 'watch_report', 'postgres_list', 'node_metrics',
   'alerts_list', 'plan_list', 'journal_list', 'service_list', 'storage_list', 'snapshot_list',
+  'tenant_list', 'tenant_status', 'tenant_usage', 'function_list', 'function_runs',
 ]);
 export const PROPOSE_TOOL = 'arca_propose';
 export const DOCTOR_TOOLS = Object.freeze([...READ_TOOLS, PROPOSE_TOOL]);
@@ -21,6 +22,7 @@ export const PROPOSE_ACTIONS = Object.freeze([
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
   'storage_add', 'snapshot_create', 'snapshot_delete',
   'instance_start', 'instance_stop', 'instance_restart',
+  'tenant_create', 'tenant_remove', 'deploy_remove', 'function_create', 'function_remove',
 ]);
 
 export const DEFAULTS = Object.freeze({
@@ -368,6 +370,20 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', 
     '  plan). Never guess a reason.',
     '- Arca lists and reads an imported service but never changes, removes, publishes or rewires it.',
     '  service_release hands it back to the manager that created it, and Arca stops listing it.',
+    '- A tenant is a walled-off space on this machine for someone else\'s services, with its own limits. It has',
+    '  no name: call it by its id. Read tenant_list, then tenant_status or tenant_usage with the id. To make one,',
+    '  propose tenant_create; give caps only when the owner asks for more than this machine\'s defaults. To remove',
+    '  one, propose tenant_remove with its id: every service of the tenant is deleted with its data; say so',
+    '  plainly.',
+    '- tenant_usage names the deploy each of a tenant\'s instances came from. To remove what one deploy created,',
+    '  propose deploy_remove with the tenant\'s id and the deploy: its services are deleted with their data, and',
+    '  nothing else of the tenant is touched. A deploy that is still provisional is refused; say so plainly.',
+    '- A function is a small program, an image by its digest, that runs on a timer. Read function_list, and',
+    '  function_runs with its name for its newest runs. To make one, propose function_create with its name,',
+    '  image, digest and timer, never an image tag, and never a secret in env: name each secret in secrets. The',
+    '  canvas cannot set a secret\'s value; say so. To remove one, propose function_remove with its name: a run',
+    '  that is going is stopped and the function is deleted with its secrets; its past runs stay in the log.',
+    '- A tenant, deploy or function change runs only after the owner approves its card, like every other change.',
     `- You can propose changes on ${proposeHost} and on any machine linked to it for approvals. Another machine is`,
     '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -718,6 +734,11 @@ function toolClient(clientFor, hosts, name, onCall) {
       service_list: 'List the managed services with name, state, address, ports and links.',
       storage_list: 'List the disks with their role (system, snapshots, in use or free), what each can be offered as for snapshots, and the storage pools with used and total space.',
       snapshot_list: 'List the snapshot copies of apps, data volumes and folders, with their source, storage, size and when they were made.',
+      tenant_list: 'List the tenants on this host, each with its id, its address block, its limits and what it uses of them.',
+      tenant_status: 'Read one tenant by its id: its address block, its limits, what it uses of them and how many instances it holds.',
+      tenant_usage: 'List what each instance of one tenant is allowed, by the tenant\'s id: name, kind, state, CPU, memory and disk limits, its service and the deploy it came from.',
+      function_list: 'List the functions on this host, each with its image and digest, its timer, its limits, its secrets\' names and whether each is set, and its newest run.',
+      function_runs: 'Read the newest runs of one function by its name, newest first: when, how long, the outcome and the last line it printed. Optional limit (1 to 100) or one run id.',
     }[name],
     parameters: {
       type: 'object',
@@ -731,7 +752,15 @@ function toolClient(clientFor, hosts, name, onCall) {
           after: { type: 'integer', minimum: 0, description: 'Only records with an id greater than this cursor.' },
           limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Page size, at most 500.' },
         } : {}),
+        ...(TENANT_READS.has(name) ? { id: TENANT_ID } : {}),
+        ...(name === 'function_runs' ? {
+          name: { type: 'string', description: 'The function\'s name.' },
+          limit: { type: 'integer', minimum: 1, maximum: 100, description: 'How many of the newest runs, 1 to 100.' },
+          run: { type: 'string', pattern: '^fr-[0-9]{1,16}-[0-9]{1,12}$', description: 'One run\'s id, for that run and the end of its output.' },
+        } : {}),
       },
+      ...(TENANT_READS.has(name) ? { required: ['id'] } : {}),
+      ...(name === 'function_runs' ? { required: ['name'] } : {}),
       additionalProperties: false,
     },
     output: {
@@ -766,7 +795,21 @@ function withHost(value, host) {
   return { host, data: value };
 }
 
+// The reads that take one tenant's id, and that id's shape (the kernel's tenant_id_schema).
+const TENANT_READS = new Set(['tenant_status', 'tenant_usage']);
+const TENANT_ID = { type: 'string', pattern: '^[a-z2-7]{8}$', description: 'The tenant\'s id: 8 characters, a to z and 2 to 7.' };
+
+// Only the arguments a read takes reach the kernel; the kernel checks their shape again.
 function toolInput(name, args) {
+  if (TENANT_READS.has(name)) return { id: text(args?.id).trim() };
+  if (name === 'function_runs') {
+    const input = { name: text(args?.name).trim() };
+    const limit = Number(args?.limit);
+    if (Number.isInteger(limit) && limit > 0) input.limit = Math.min(100, limit);
+    const run = text(args?.run).trim();
+    if (run) input.run = run;
+    return input;
+  }
   if (name !== 'journal_list') return {};
   const input = {};
   const after = Number(args?.after);
@@ -790,7 +833,11 @@ const PROPOSE_ARGUMENTS = 'service_create {name, template}; service_remove {name
   + 'gpu_attach {instance, pci}; gpu_detach {instance, pci}; '
   + 'storage_add {name, device} or {name, path}; snapshot_create {project, instance or volume, pool} or {folder, pool}; '
   + 'snapshot_delete {name}; instance_start {project, instance}; instance_stop {project, instance}; '
-  + 'instance_restart {project, instance}.';
+  + 'instance_restart {project, instance}; '
+  + 'tenant_create {} or {id}, with caps {instances, containers, virtualMachines, cpu, memory, disk} only above this machine\'s defaults; '
+  + 'tenant_remove {id}; deploy_remove {tenant, deploy}; '
+  + 'function_create {name, image, digest, triggers: [{timer: {everySeconds}}]} and optional command, env, secrets, limits, links, destinations; '
+  + 'function_remove {name}.';
 
 export const NOT_LINKED = 'this machine is not linked for approvals yet';
 

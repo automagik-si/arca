@@ -676,10 +676,16 @@
     "snapshot_delete",
     "instance_start",
     "instance_stop",
-    "instance_restart"
+    "instance_restart",
+    "tenant_create",
+    "tenant_remove",
+    "deploy_remove",
+    "function_create",
+    "function_remove"
   ]);
   var GPU_ACTIONS = /* @__PURE__ */ new Set(["gpu_attach", "gpu_detach"]);
   var INSTANCE_ACTIONS = /* @__PURE__ */ new Set(["instance_start", "instance_stop", "instance_restart"]);
+  var DESTRUCTIVE_ACTIONS = /* @__PURE__ */ new Set(["tenant_remove", "deploy_remove", "function_remove"]);
   function normalizePci(value) {
     const match = String(value ?? "").trim().toLowerCase().match(/^(?:([0-9a-f]{4}):)?([0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$/);
     return match ? `${match[1] ?? "0000"}:${match[2]}` : "";
@@ -811,6 +817,21 @@
       const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
       return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
     }
+    if (action === "tenant_create") {
+      return typeof value.id === "string" && value.id ? `The tenant ${value.id} was created.` : "The tenant was created.";
+    }
+    if (action === "tenant_remove" && value.removed === true) return "The tenant and everything in it were removed.";
+    if (action === "deploy_remove" && value.removed === true) {
+      const deploy = typeof value.deploy === "string" && value.deploy ? ` ${value.deploy}` : "";
+      const parts = Array.isArray(value.parts) ? ` (${count2(value.parts.length, "part")})` : "";
+      return `Everything the deploy${deploy} created was removed${parts}.`;
+    }
+    if (action === "function_create") {
+      const name = typeof value.name === "string" && value.name ? ` ${value.name}` : "";
+      const unset = Array.isArray(value.secrets) ? value.secrets.filter((secret) => secret?.set === false).length : 0;
+      return `The function${name} was created.${unset ? ` ${count2(unset, "secret")} still to be set.` : ""}`;
+    }
+    if (action === "function_remove" && value.removed === true) return "The function was removed.";
     if (value.removed === true) return "The service was removed.";
     if (value.imported === true) return "The service was imported. Arca lists it now and changes nothing on it.";
     if (value.released === true) return "The service was released back to the manager that created it.";
@@ -2019,6 +2040,7 @@
       const article = el(doc2, "article", "arca-card arca-card-warn arca-approval arca-proposal");
       article.dataset.proposal = key;
       article.dataset.state = card.state;
+      if (DESTRUCTIVE_ACTIONS.has(plan.action)) article.dataset.destructive = "true";
       article.setAttribute("aria-label", `Approval: ${plan.summary}`);
       const head = el(doc2, "div", "arca-card-head");
       const [tone, label] = cardBadge(card);

@@ -14,9 +14,13 @@ const PROPOSE_ACTIONS = new Set([
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
   'storage_add', 'snapshot_create', 'snapshot_delete',
   'instance_start', 'instance_stop', 'instance_restart',
+  'tenant_create', 'tenant_remove', 'deploy_remove', 'function_create', 'function_remove',
 ]);
 const GPU_ACTIONS = new Set(['gpu_attach', 'gpu_detach']);
 const INSTANCE_ACTIONS = new Set(['instance_start', 'instance_stop', 'instance_restart']);
+// Each of these deletes services or a function with their data or secrets, and none can be undone: its card is
+// drawn in the alert colour, so it is never approved as routine.
+const DESTRUCTIVE_ACTIONS = new Set(['tenant_remove', 'deploy_remove', 'function_remove']);
 
 function normalizePci(value) {
   const match = String(value ?? '').trim().toLowerCase()
@@ -161,6 +165,23 @@ function plainResult(action, result) {
     const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
     return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
   }
+  // A tenant, deploy or function result has fields a service result also has (removed, name), so each is read here
+  // first, in its own words.
+  if (action === 'tenant_create') {
+    return typeof value.id === 'string' && value.id ? `The tenant ${value.id} was created.` : 'The tenant was created.';
+  }
+  if (action === 'tenant_remove' && value.removed === true) return 'The tenant and everything in it were removed.';
+  if (action === 'deploy_remove' && value.removed === true) {
+    const deploy = typeof value.deploy === 'string' && value.deploy ? ` ${value.deploy}` : '';
+    const parts = Array.isArray(value.parts) ? ` (${count(value.parts.length, 'part')})` : '';
+    return `Everything the deploy${deploy} created was removed${parts}.`;
+  }
+  if (action === 'function_create') {
+    const name = typeof value.name === 'string' && value.name ? ` ${value.name}` : '';
+    const unset = Array.isArray(value.secrets) ? value.secrets.filter((secret) => secret?.set === false).length : 0;
+    return `The function${name} was created.${unset ? ` ${count(unset, 'secret')} still to be set.` : ''}`;
+  }
+  if (action === 'function_remove' && value.removed === true) return 'The function was removed.';
   if (value.removed === true) return 'The service was removed.';
   if (value.imported === true) return 'The service was imported. Arca lists it now and changes nothing on it.';
   if (value.released === true) return 'The service was released back to the manager that created it.';
@@ -1444,6 +1465,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     const article = el(doc, 'article', 'arca-card arca-card-warn arca-approval arca-proposal');
     article.dataset.proposal = key;
     article.dataset.state = card.state;
+    if (DESTRUCTIVE_ACTIONS.has(plan.action)) article.dataset.destructive = 'true';
     article.setAttribute('aria-label', `Approval: ${plan.summary}`);
 
     const head = el(doc, 'div', 'arca-card-head');

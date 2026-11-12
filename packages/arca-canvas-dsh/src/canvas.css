@@ -1303,6 +1303,21 @@ body,
   gap: 9px;
 }
 
+/* A removal that deletes data or secrets for good: the card and its Approve button take the alert colour. */
+.arca-proposal[data-destructive="true"] {
+  border-color: color-mix(in srgb, var(--arca-bad) 55%, var(--arca-line-2));
+}
+
+.arca-proposal[data-destructive="true"] .arca-approval-summary {
+  color: var(--arca-bad);
+}
+
+.arca-proposal[data-destructive="true"] .arca-approve {
+  background: var(--arca-bad);
+  /* White on the light red and the page's near-black on the dark one: both at least 4.5:1. */
+  color: light-dark(#fff, #0b0b0f);
+}
+
 .arca-badge.ok {
   background: color-mix(in srgb, var(--arca-ok) 14%, transparent);
   color: var(--arca-ok-ink);
