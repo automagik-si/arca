@@ -467,6 +467,14 @@ and holds no record answers an empty list.
 
 **What this step does not do:**
 
+- It does not make every shipped template start from the page alone. A template that makes every secret it needs
+  starts once its card is approved: `postgres-autopg`, `nats`, `omni-api` and `automagik-server`. A template that
+  needs a secret of the owner's is created stopped until it is set: `cloudflare-tunnel` (`TUNNEL_TOKEN`), the
+  runner pools and `automagik-workspace` (their tokens and keys). Omni starts, and its Telegram and WhatsApp tools
+  need `telegram_bot_token` and `whatsapp_phone_number`. `automagik` needs an image built from a checkout before it
+  can be created, and its `tailscale_authkey` before it can be published. `service_secret_set` cannot be proposed, so it needs a `doctor` token, which changes
+  things with no card and no passkey: mint one for that step and revoke it after, or leave those templates until
+  setting a secret can go through the page.
 - It does not enrol a passkey. The owner does, on the page, with a setup code from the node's own screen or from
   `arca setup-code`; see "The page on this machine alone".
 - The page it names is the page of one machine, for a machine where every account is trusted. Approving from a
