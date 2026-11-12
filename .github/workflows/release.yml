@@ -174,7 +174,11 @@ jobs:
         with:
           node-version: 24.11.0
 
-      # The limit is the rule: these tests stay in the gate only while they finish well inside it.
+      # The limit is the rule: these tests stay in the gate only while they finish well inside it. A test that hangs
+      # is stopped after 90 seconds and named, and the run then ends although the test left a server or a browser
+      # open: without --test-force-exit Node names the test and still waits for what it left, until the step's limit.
+      # The cost of that flag: a file whose tests all pass but which leaves something open no longer holds the run
+      # up, so that kind of leak is not seen here.
       - name: The canvas package's tests
         if: steps.plan.outputs.mode == 'cut'
         timeout-minutes: 5
@@ -183,7 +187,7 @@ jobs:
           set -euo pipefail
           npm ci --no-audit --no-fund
           npx playwright install --with-deps chromium
-          node --test
+          node --test --test-timeout=90000 --test-force-exit
 
       - name: Version, commit and tag
         id: cut

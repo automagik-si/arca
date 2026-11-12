@@ -51,7 +51,8 @@ async function fakeArca(t, config, respond = (body) => toolResult(body, fixtures
     }
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.socketPath, resolve); });
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+  // The plugin may still be asking when this runs, and close() alone waits for a connection that is in use.
+  t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }));
   return calls;
 }
 

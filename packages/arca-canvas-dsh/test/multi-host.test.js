@@ -27,7 +27,14 @@ async function listen(t, server, address, host) {
     server.once('error', reject);
     server.listen(address, host, resolve);
   });
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+  t.after(() => closed(server));
+}
+
+// close() alone only drops the connections that are idle. The plugin asks each host again every 100 ms over a connection
+// it keeps, so one caught with a request on its way stays, is used again, and close() never calls back: the test
+// then waits for ever. So every connection is cut first.
+function closed(server) {
+  return new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); });
 }
 
 async function until(read, predicate) {
@@ -214,7 +221,7 @@ test('two Unix hosts keep projects, machines, journal and failures isolated', as
   await chmod(hosts[1].viewerTokenPath, 0o400);
   await until(read, (snapshot) => snapshot.hosts[1].error === null);
 
-  await new Promise((resolve) => servers[1].close(resolve));
+  await closed(servers[1]);
   const socketFailure = await until(read, (snapshot) => snapshot.hosts[1].error?.includes('socket is unavailable'));
   assert.equal(socketFailure.hosts[0].error, null);
   assert.equal(socketFailure.hosts[0].instancesKnown, true);

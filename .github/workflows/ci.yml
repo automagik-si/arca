@@ -161,6 +161,9 @@ jobs:
         run: npx playwright install --with-deps chromium
       # Node starts one test file for each CPU it sees, and most of these files start a Chromium. On the pool that
       # would be one for each CPU of the whole virtual machine inside a 4GiB slot, so there the script gives the
-      # slot's own number. On a hosted runner the variable is not set and Node decides.
+      # slot's own number. On a hosted runner the variable is not set and Node decides. A test that hangs is stopped
+      # after 90 seconds and named, and the run then ends although the test left a server or a browser open: without
+      # --test-force-exit Node names the test and still waits for what it left. The cost of that flag: a file whose
+      # tests all pass but which leaves something open no longer holds the run up, so that kind of leak is not seen.
       - name: node --test
-        run: node --test ${CANVAS_TEST_CONCURRENCY:+--test-concurrency="$CANVAS_TEST_CONCURRENCY"}
+        run: node --test --test-timeout=90000 --test-force-exit ${CANVAS_TEST_CONCURRENCY:+--test-concurrency="$CANVAS_TEST_CONCURRENCY"}
