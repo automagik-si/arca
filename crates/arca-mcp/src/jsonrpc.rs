@@ -28,7 +28,7 @@ const REFUSED: i64 = -32000;
 /// The key, in every answer of a node that only looks, of the sentence that says so.
 pub const ONLY_LOOKS_KEY: &str = "watchOnly";
 /// What every answer of a node that only looks says: what is shown is there, and none of it can be changed here.
-pub const ONLY_LOOKS_NOTE: &str = "this node only looks: nothing here can be changed until changes are turned on again (arca init --enable-changes)";
+pub const ONLY_LOOKS_NOTE: &str = "this node only looks: nothing here can be changed until the node is running with changes turned on (arca init --enable-changes, then restart the node if init did not)";
 
 /// How long a client may keep a tool list or a discovery answer, in milliseconds. Neither changes while the server runs.
 const CACHE_TTL_MS: u64 = 300_000;

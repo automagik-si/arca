@@ -4027,6 +4027,10 @@ impl ToolHandler for PostgresHandler {
                 verb: self.verb.into(),
             });
         }
+        // A node that only looks makes no database, link or removal: refused before the write lock, in its one sentence.
+        if self.verb != "postgres_list" && node_only_looks(&self.cfg) {
+            return Err(only_looks());
+        }
         let now = (self.clock)();
         let _write = if self.verb == "postgres_list" {
             None
@@ -4455,21 +4459,27 @@ fn not_recorded(mut view: Value) -> Value {
     view
 }
 
-/// The refusal of a writing call on a node that only looks, when the call got as far as asking for the service project.
-fn only_looks() -> CallError {
-    service_refused(format!(
-        "this node only looks: nothing here can be changed until changes are turned on again ({ENABLE_CHANGES})"
-    ))
+/// The refusal of every call that would change something on a node that only looks: the one sentence every answer of
+/// such a node carries, so a write is refused in the words the reads are marked with. It is made before a grant is
+/// spent and before anything is written.
+pub(crate) fn only_looks() -> CallError {
+    service_refused(arca_mcp::jsonrpc::ONLY_LOOKS_NOTE)
+}
+
+/// Whether the node only looks: it has no kernel project, so it makes no change.
+pub(crate) fn node_only_looks(cfg: &NodeConfig) -> bool {
+    cfg.kernel.projects.is_empty()
 }
 
 /// The command that turns changes on.
 const ENABLE_CHANGES: &str = "arca init --enable-changes";
 
-/// The refusal of a call that would change something, or run a command inside a service, on a node that only looks.
-/// `does` says what the verb would have done.
+/// The refusal, on a node that only looks, of a verb that answers by running a command inside a service. `does` says
+/// what the verb would have done.
 pub(crate) fn only_looks_refusal(verb: &str, does: &str) -> CallError {
     service_refused(format!(
-        "this node only looks: {verb} {does}, and nothing here can be changed until changes are turned on again ({ENABLE_CHANGES})"
+        "{}. {verb} {does}",
+        arca_mcp::jsonrpc::ONLY_LOOKS_NOTE
     ))
 }
 
@@ -5378,6 +5388,17 @@ impl ToolHandler for ServiceHandler {
                 verb: self.verb.into(),
             });
         }
+        // A node that only looks refuses every service call that is not one of the three reads, a tenant's included,
+        // before a grant is spent and before anything is written: a grant spent here could not be used once changes
+        // are turned on, and a tenant's write would be saved now and applied then.
+        if node_only_looks(&self.cfg)
+            && !matches!(
+                self.verb,
+                "service_list" | "service_status" | "service_logs"
+            )
+        {
+            return Err(only_looks());
+        }
         let preapproved = matches!(
             self.verb,
             "service_create"
@@ -5434,7 +5455,7 @@ impl ToolHandler for ServiceHandler {
         // answers the three reads whenever there is something to read: a service config, or records of services it ran.
         // They read the node's own records and Incus, as they do on a node that makes changes, and nothing else: no
         // instance is adopted and no command is run inside one. So a person can always see what is there.
-        let only_looks = self.cfg.kernel.projects.is_empty();
+        let only_looks = node_only_looks(&self.cfg);
         let reading = matches!(
             self.verb,
             "service_list" | "service_status" | "service_logs"
@@ -6265,10 +6286,7 @@ mod service_project_tests {
         // What `arca init --watch-only` leaves: the subnet, and no kernel project.
         let cfg = config(json!({ "serviceCidr": "192.0.2.0/24", "droiddProjects": [] }));
         assert!(!no_service_project_asked(&cfg));
-        assert_eq!(
-            refused(&cfg),
-            "this node only looks: nothing here can be changed until changes are turned on again (arca init --enable-changes)"
-        );
+        assert_eq!(refused(&cfg), arca_mcp::jsonrpc::ONLY_LOOKS_NOTE);
         // A node that makes changes elsewhere and left the service project out is told that, as before.
         assert_eq!(
             refused(&config(json!({

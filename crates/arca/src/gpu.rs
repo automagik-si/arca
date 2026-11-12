@@ -106,7 +106,7 @@ pub enum GpuRefusal {
 impl std::fmt::Display for GpuRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Disabled => f.write_str("GPU assignment is disabled: this node is watch-only"),
+            Self::Disabled => f.write_str(arca_mcp::jsonrpc::ONLY_LOOKS_NOTE),
             Self::Inventory(why) => write!(f, "the GPU inventory could not be read: {why}"),
             Self::NotInInventory(pci) => write!(f, "the PCI address {pci} is not in the inventory"),
             Self::Bound(pci) => write!(

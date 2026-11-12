@@ -416,15 +416,23 @@ Running `--enable-changes` again adds the project back and keeps the network and
 the node's own records and Incus, exactly as on a node that makes changes. What differs:
 
 - Every answer says what the node is. Its text, and its structured content under `watchOnly`, carry `this node only
-  looks: nothing here can be changed until changes are turned on again (arca init --enable-changes)`.
+  looks: nothing here can be changed until the node is running with changes turned on (arca init --enable-changes, then
+  restart the node if init did not)`. The sentence is about the node that is running: one whose config already turns
+  changes on, but that was not restarted, still only looks, and the restart is the step that is left.
 - Nothing is adopted. An instance in `arcak-svc` that the node holds no record of is shown as it is, with the state
   `unknown` and the note `not recorded by this node`; a node that makes changes would have written a record for a
   marked one.
 - `service_logs` reads the instance's console log, and its `note` says so: the journal is read by running a command
-  inside the instance, and a node that only looks runs none.
+  inside the instance, and a node that only looks runs none. A container's console log holds only what its init system
+  wrote to the console, which is often much less than its journal, and may be nearly empty.
 - `omni_status` is refused, with that reason: it answers by running a command inside the service.
-- Every tool that would change something is refused in the same words, `this node only looks: nothing here can be
-  changed until changes are turned on again (arca init --enable-changes)`.
+- Every tool that would change an instance, a service, a database, a tenant, storage or a GPU assignment is refused
+  with that same sentence, before an approval is spent and before anything is saved: a tenant's own calls, the
+  `deploy_*` tools, `tenant_create` and `tenant_remove` included. A refusal of an instance start or stop, of a
+  storage change or of a GPU assignment keeps its own code (`InstanceLifecycleDisabled`, `StorageDisabled`) and
+  carries the same sentence. The tools that only keep a note for the owner (`action_propose`,
+  `owner_approval_request`, `plan_decline`, `peer_keys_sync`) still record it: what they record cannot run until
+  changes are turned on.
 
 A node that only looks and holds records of services it ran, but whose config lost `kernel.serviceCidr` too, shows them
 the same way: the records are enough to tell which instances are its services. A node that never had a service config

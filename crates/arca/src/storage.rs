@@ -1283,10 +1283,7 @@ impl Storage {
 
     fn writer(&self) -> Result<&SnapshotWriter, StorageRefusal> {
         self.writer.as_ref().ok_or_else(|| {
-            StorageRefusal::new(
-                "StorageDisabled",
-                "snapshot storage changes are disabled: this node is watch-only",
-            )
+            StorageRefusal::new("StorageDisabled", arca_mcp::jsonrpc::ONLY_LOOKS_NOTE)
         })
     }
 
@@ -3708,11 +3705,9 @@ impl StorageActionHandler {
 impl ToolHandler for StorageActionHandler {
     fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
         let Some(storage) = &self.storage else {
-            return Err(StorageRefusal::new(
-                "StorageDisabled",
-                "snapshot storage changes are disabled: this node is watch-only",
-            )
-            .into());
+            return Err(
+                StorageRefusal::new("StorageDisabled", arca_mcp::jsonrpc::ONLY_LOOKS_NOTE).into(),
+            );
         };
         let mut bare = args;
         let grant = bare

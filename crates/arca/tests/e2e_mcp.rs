@@ -340,7 +340,7 @@ fn a_viewer_reads_the_watch_and_the_metrics_and_the_shim_saw_only_gets() {
     conforming("arca_status", &status_row);
     assert_eq!(status_row["mode"], json!("watch-only"));
     // A node that only looks says so in every answer, in the structured content and in the text.
-    let only_looks = "this node only looks: nothing here can be changed until changes are turned on again (arca init --enable-changes)";
+    let only_looks = "this node only looks: nothing here can be changed until the node is running with changes turned on (arca init --enable-changes, then restart the node if init did not)";
     assert_eq!(status_row["watchOnly"], json!(only_looks));
     assert!(text.contains(only_looks), "{text}");
     assert_eq!(

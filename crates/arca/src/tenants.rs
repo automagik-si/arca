@@ -1135,6 +1135,13 @@ impl ToolHandler for TenantHandler {
                 "", key, allowed,
             )));
         }
+        // A node that only looks refuses every tenant verb that is not a read, before a grant is spent and before a
+        // record is saved: a create, a removal or a deploy step saved now would be applied once changes are turned on.
+        if super::node_only_looks(&self.cfg)
+            && !matches!(self.verb, "tenant_list" | "tenant_status" | "tenant_usage")
+        {
+            return Err(super::only_looks());
+        }
         // A node that was never set up for services or tenants, and whose desired state holds no tenant, has none: the
         // list is empty. A node that still holds tenant records, every other tenant verb, and a node set up for services
         // with no tenants policy still answer that the node has no tenants, which claims no list.

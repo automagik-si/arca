@@ -1071,7 +1071,7 @@ fn lists_the_service_project_with_each_instances_own_config_and_devices_none_whe
 }
 
 /// What a writing service call is refused with on a node that only looks.
-const ONLY_LOOKS: &str = "this node only looks: nothing here can be changed until changes are turned on again (arca init --enable-changes)";
+const ONLY_LOOKS: &str = arca_mcp::jsonrpc::ONLY_LOOKS_NOTE;
 
 /// The handlers of `rig`'s node as `arca init --watch-only` leaves it: the same kernel, the same records, the same
 /// service subnet, and a config whose `kernel.projects` is empty.
@@ -1196,7 +1196,9 @@ fn a_node_set_back_to_watch_only_still_shows_its_services_and_changes_nothing() 
     match looks["omni_status"].call(json!({"name":"nats"}), &doctor()) {
         Err(CallError::Refused { message, .. }) => assert_eq!(
             message,
-            "this node only looks: omni_status answers by running a command inside the service, which a node that only looks does not do, and nothing here can be changed until changes are turned on again (arca init --enable-changes)"
+            format!(
+                "{ONLY_LOOKS}. omni_status answers by running a command inside the service, which a node that only looks does not do"
+            )
         ),
         other => panic!("omni_status: expected a refusal, got {other:?}"),
     }
@@ -1222,20 +1224,18 @@ fn a_node_never_set_up_for_services_lists_none_and_every_other_service_call_says
         rig.call("service_list", json!({})).expect("the empty list"),
         json!({ "services": [] })
     );
-    for (verb, args) in [
-        ("service_create", json!({"name":"nats","template":"nats"})),
-        ("service_status", json!({"name":"nats"})),
-    ] {
-        match rig.call(verb, args) {
-            Err(CallError::Refused { message, .. }) => assert_eq!(
-                message,
-                format!(
-                    "no service project: this node only looks, and its config sets up no services. To let it run them: arca init --enable-changes"
-                ),
-                "{verb}"
-            ),
-            other => panic!("{verb}: expected a refusal, got {other:?}"),
-        }
+    // A read of one service has nothing to read, and says what the config needs; a write is refused as every write is
+    // on a node that only looks.
+    match rig.call("service_status", json!({"name":"nats"})) {
+        Err(CallError::Refused { message, .. }) => assert_eq!(
+            message,
+            "no service project: this node only looks, and its config sets up no services. To let it run them: arca init --enable-changes"
+        ),
+        other => panic!("service_status: expected a refusal, got {other:?}"),
+    }
+    match rig.call("service_create", json!({"name":"nats","template":"nats"})) {
+        Err(CallError::Refused { message, .. }) => assert_eq!(message, ONLY_LOOKS),
+        other => panic!("service_create: expected a refusal, got {other:?}"),
     }
     assert!(rig.fake.requests().is_empty(), "Incus was not contacted");
 
@@ -1297,14 +1297,9 @@ fn a_node_that_holds_service_records_and_lost_its_service_config_shows_them_and_
             .expect("status")["name"],
         "nats"
     );
-    // A call that would change something is refused, and says the records are there and what the config needs.
+    // A call that would change something is refused as every write is on a node that only looks.
     match handlers["service_create"].call(json!({"name":"web","template":"nats"}), &doctor()) {
-        Err(CallError::Refused { message, .. }) => assert_eq!(
-            message,
-            format!(
-                "no service project: this node's config sets up no services, but the node still holds records of services it ran. To reach them again, {SERVICE_KEYS}"
-            )
-        ),
+        Err(CallError::Refused { message, .. }) => assert_eq!(message, ONLY_LOOKS),
         other => panic!("expected a refusal, got {other:?}"),
     }
 }
