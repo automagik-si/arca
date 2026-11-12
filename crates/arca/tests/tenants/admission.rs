@@ -88,15 +88,18 @@ fn a_node_set_back_to_watch_only_still_shows_its_tenants_and_databases() {
     cfg.kernel.projects.clear();
     let cfg = Arc::new(cfg);
     let time: arca::handlers::Clock = Arc::new(|| NOW);
+    let services = service_handlers(rig.kernel.clone(), time.clone(), cfg.clone());
+    let service_create = arca::handlers::service_create_handler(&services).expect("service_create");
     let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> =
         tenant_handlers(rig.kernel.clone(), time.clone(), cfg.clone())
             .into_iter()
-            .chain(service_handlers(
+            .chain(services)
+            .chain(postgres_handlers(
                 rig.kernel.clone(),
-                time.clone(),
-                cfg.clone(),
+                time,
+                cfg,
+                service_create,
             ))
-            .chain(postgres_handlers(rig.kernel.clone(), time, cfg))
             .collect();
     let doctor = Caller {
         token_id: "doctor".into(),
