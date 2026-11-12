@@ -1427,11 +1427,16 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
   plus `"setupCode"` while no passkey is trusted, and returns `{ "trusted": true, "line": "<line>" }`; without `setupCode`
   it returns `{ "line": "<line>" }` as the developer answer.
 
+Every route of the page, the canvas routes below among them, answers the same with one trailing slash as without it
+(`/approve/` is `/approve`, `/approve/plans/` is `/approve/plans`): the same handler under the same rules, not a
+redirect, so a POST stays a POST and a query string stays with it. Two slashes, or an encoded one, are no route.
+
 The GETs need no token and admit no `Origin` or the configured one. Apart from the canvas chat POST described below, the
 POSTs admit only the exact configured `Origin` and refuse any other before reading the body. `/mcp` and every other MCP route
 keep refusing every `Origin`.
 
-With `approvalOrigin` set, the same page origin also serves the remote canvas at exactly these URLs: `GET /approve/canvas`
+With `approvalOrigin` set, the same page origin also serves the remote canvas at exactly these URLs, each with or
+without one trailing slash: `GET /approve/canvas`
 (the canvas, or a passkey sign-in page), `GET /approve/canvas/page.css`, `GET /approve/canvas/page.js`,
 `GET /approve/canvas/snapshot`, `POST /approve/canvas/chat` and `GET /approve/canvas/chat/history`. The CSS, script,
 snapshot and history are fetched from `canvasOrigin` over literal loopback; no cookie or authorization header is forwarded,

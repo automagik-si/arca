@@ -1033,6 +1033,124 @@ fn without_an_origin_the_page_routes_are_absent_and_mcp_refuses_an_origin() {
     );
 }
 
+/// Every route of the approval page, as its router names them.
+const PAGE_ROUTES: [(&str, &str); 21] = [
+    ("GET", "/approve"),
+    ("GET", "/approve/plans"),
+    ("POST", "/approve/approve"),
+    ("POST", "/approve/decline"),
+    ("POST", "/approve/requests/begin"),
+    ("POST", "/approve/requests/approve"),
+    ("POST", "/approve/requests/deny"),
+    ("POST", "/approve/peer-keys"),
+    ("POST", "/approve/peer-keys/sync"),
+    ("POST", "/approve/setup-code"),
+    ("POST", "/approve/setup-code/verify"),
+    ("POST", "/approve/register"),
+    ("GET", "/approve/passkeys"),
+    ("POST", "/approve/passkeys/change"),
+    ("GET", "/approve/canvas"),
+    ("POST", "/approve/canvas"),
+    ("GET", "/approve/canvas/page.css"),
+    ("GET", "/approve/canvas/page.js"),
+    ("GET", "/approve/canvas/snapshot"),
+    ("POST", "/approve/canvas/chat"),
+    ("GET", "/approve/canvas/chat/history"),
+];
+
+#[test]
+fn every_page_route_answers_the_same_with_and_without_a_trailing_slash_on_every_listener() {
+    // A fresh node for each spelling and each listener, asked the same things in the same order, so a route that
+    // changes state (a setup code, a sign-in challenge) is in the same state for both spellings.
+    let ask = |proxy: bool, slash: bool| -> (Vec<u16>, Rig) {
+        let tag = format!("slash-{}{}", u8::from(proxy), u8::from(slash));
+        let (rig, _key) = Rig::new_empty(&tag);
+        let answers = PAGE_ROUTES
+            .iter()
+            .map(|(method, path)| {
+                let path = if slash {
+                    format!("{path}/")
+                } else {
+                    path.to_string()
+                };
+                let body: &[u8] = if *method == "POST" { b"{}" } else { b"" };
+                rig.request_on(proxy, None, method, &path, Some(ORIGIN), body)
+                    .0
+            })
+            .collect();
+        (answers, rig)
+    };
+    for proxy in [false, true] {
+        let (plain, _rig) = ask(proxy, false);
+        let (slashed, rig) = ask(proxy, true);
+        for (((method, path), plain), slashed) in PAGE_ROUTES.iter().zip(&plain).zip(&slashed) {
+            assert_eq!(
+                slashed, plain,
+                "{method} {path}/ answers as {method} {path} does (proxy listener: {proxy})"
+            );
+            // Not the catch-all's 404 and not a wrong method: the request reached the route's own handler. The two
+            // peer-key routes answer 404 themselves on a node that keeps no peer in sync, as this one.
+            if !path.starts_with("/approve/peer-keys") {
+                assert!(
+                    *slashed != 404 && *slashed != 405,
+                    "{method} {path}/ did not reach its handler: {slashed}"
+                );
+            }
+        }
+        // The pages themselves are served, not redirected.
+        for page in [
+            "/approve/",
+            "/approve/plans/",
+            "/approve/passkeys/",
+            "/approve/canvas/",
+        ] {
+            assert_eq!(rig.get(page, None).0, 200, "{page}");
+        }
+        // A POST with the slash is still a POST that did its work: the setup code it asked for was issued.
+        assert_eq!(rig.last_code().len(), 8);
+        // A query string stays with the request.
+        assert_eq!(rig.get("/approve/plans/?after=1", None).0, 200);
+        assert_eq!(rig.get("/approve/plans?after=1", None).0, 200);
+        // The Origin rule is the route's, whichever way it is spelled: a POST with no Origin, or a foreign one, is
+        // refused before its body is read.
+        for path in [
+            "/approve/register/",
+            "/approve/canvas/chat/",
+            "/approve/decline/",
+        ] {
+            assert_eq!(
+                rig.request_on(proxy, None, "POST", path, None, b"{}").0,
+                403,
+                "{path}"
+            );
+            assert_eq!(
+                rig.request_on(
+                    proxy,
+                    None,
+                    "POST",
+                    path,
+                    Some("https://elsewhere.example"),
+                    b"{}"
+                )
+                .0,
+                403,
+                "{path}"
+            );
+        }
+        // What is not a route is not one with a slash either, and a route does not take another method.
+        for path in [
+            "/approve/nothing",
+            "/approve/nothing/",
+            "/approve//",
+            "/approve/plans//",
+        ] {
+            assert_eq!(rig.get(path, None).0, 404, "{path}");
+        }
+        assert_eq!(rig.get("/approve/register/", None).0, 405);
+        assert_eq!(rig.get("/approve/register", None).0, 405);
+    }
+}
+
 #[test]
 fn the_page_and_plan_list_are_open_and_mcp_still_refuses_every_origin() {
     let (rig, _) = Rig::new("page-open", true);
@@ -3132,7 +3250,7 @@ fn canvas_url_vectors_never_return_bytes_and_head_matches_get() {
         .expect("a session cookie");
     let pair = cookie.split(';').next().expect("cookie pair").to_string();
     for path in [
-        "/approve/canvas/",
+        "/approve/canvas//",
         "/approve/canvas%2F",
         "/approve%2Fcanvas",
         "/approve/canvas/%2E%2E/plans",
@@ -3146,11 +3264,16 @@ fn canvas_url_vectors_never_return_bytes_and_head_matches_get() {
             "{path} answered 200 with bytes"
         );
     }
+    // One trailing slash is the same route, and nothing more is: the page with the slash is the page, and a second
+    // slash, or an encoded one, is no route.
     assert_eq!(
         rig.get_with_cookie("/approve/canvas/", &pair).0,
-        404,
-        "a trailing slash is not the exact page URL"
+        rig.get_with_cookie("/approve/canvas", &pair).0,
+        "a trailing slash is the same page"
     );
+    for path in ["/approve/canvas//", "/approve/canvas%2F"] {
+        assert_eq!(rig.get_with_cookie(path, &pair).0, 404, "{path}");
+    }
 
     for signed in [false, true] {
         for path in [
