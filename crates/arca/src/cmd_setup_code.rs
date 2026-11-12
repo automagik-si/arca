@@ -87,9 +87,11 @@ pub fn setup_code(flags: &Flags) -> Result<Option<Value>, Failure> {
     // two sentences, and what it cannot do.
     if let Some(port) = arca_approval::localhost_origin_port(&origin) {
         eprintln!(
-            "arca: no browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L {port}:127.0.0.1:{port} <this machine>"
+            "arca: no browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>"
         );
-        eprintln!("arca: then open {page} in its browser: the page is this node's.");
+        eprintln!(
+            "arca: then open {page} in its browser: the page is this node's. If ssh warns that it could not bind the port, close it: another port will not work, since the page's address names this one."
+        );
         eprintln!(
             "arca: a phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain; the guide's section \"The approval page\" says how."
         );

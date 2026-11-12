@@ -262,7 +262,9 @@ object beside them when the node's approval page is on this listener (see "The p
 that serves an approval page also reports `"approvalPage": { "url", "open", "reason", "passkeys" }`: the page's
 address, whether it is open (for the page of this machine alone, whether the node holds both loopback addresses),
 the reason while it is not, and how many owner passkeys the node trusts (`null` while the kernel is busy with a
-change). `arca status` says these in words. While it reads
+change). `arca status` says these in words. Any token may call `arca_status`, a `viewer` token among them, so an
+assistant given one sees the page's address and the count. `arca status` also reads the node's token directory, to
+say beside "Changes: on" whether any `doctor` or `operator` token changes things without the page. While it reads
 `"open": false`, whatever answers on that port is not this node: do not send the token there.
 
 ### Tailnet listener
@@ -1898,7 +1900,7 @@ The first passkey:
    a computer that has one, through an SSH forward. On that computer:
 
    ```sh
-   ssh -o ExitOnForwardFailure=yes -L 7471:127.0.0.1:7471 <the machine that runs Arca>
+   ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <the machine that runs Arca>
    ```
 
    `ExitOnForwardFailure=yes` makes `ssh` stop when port 7471 is already taken on that computer. Without it `ssh`

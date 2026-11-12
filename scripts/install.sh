@@ -1068,13 +1068,13 @@ report() {
             *'--security'*) door_cautions="$bin status --security --config $config" ;;
             *) door_cautions="$GUIDE#loopback-listener" ;;
         esac
-        say "  1. An assistant that takes an MCP server URL. For Claude Code, run this one line; the shell reads the"
-        say "     token from its file, so it is not shown here:"
+        say "  1. An assistant that takes an MCP server URL. On a machine other people log in to, paste the entry below"
+        say "     instead of running the line, and read this first: $door_cautions"
+        say "     For Claude Code, run this one line; the shell reads the token from its file, so it is not shown here:"
         say "       claude mcp add --transport http arca $door_url --header \"Authorization: Bearer \$(cat '$token_file')\""
         say "     Any other client takes this entry, with the content of $token_file"
         say "     in place of <token>:"
         say "       { \"mcpServers\": { \"arca\": { \"type\": \"http\", \"url\": \"$door_url\", \"headers\": { \"Authorization\": \"Bearer <token>\" } } } }"
-        say "     Before you share this machine or that token with anyone, read: $door_cautions"
         if [ "$service" != unit ]; then
             say "     This script started no node: the door is open once a node has started with this config."
         fi

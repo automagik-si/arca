@@ -2490,7 +2490,7 @@ fn status_says_whether_changes_are_on_which_page_approves_and_what_to_do_next_fr
     let said = stderr_text(&out);
     assert!(
         said.contains(&format!(
-            "ssh -o ExitOnForwardFailure=yes -L {port}:127.0.0.1:{port} <this machine>"
+            "ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>"
         )),
         "{said}"
     );

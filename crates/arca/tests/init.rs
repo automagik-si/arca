@@ -611,7 +611,7 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         // A machine with no screen: the one line that brings the page to the person's own computer, and no phone.
         .says("No browser on this machine? On your own computer run:")
         .says(&format!(
-            "    ssh -o ExitOnForwardFailure=yes -L {0}:127.0.0.1:{0} <this machine>",
+            "    ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>",
             node.port
         ))
         .says(&format!(
@@ -1181,4 +1181,62 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
         "--user restart arca.service\n",
         "no second restart"
     );
+}
+
+/// `arca status` on a node that may change things: a doctor token does not wait for the approval page, so status names
+/// it, and does not print "Each one waits", which would be false.
+#[test]
+fn status_names_a_token_that_changes_things_without_the_page_and_does_not_say_each_one_waits() {
+    let node = Installed::new("status-tokens");
+    mint(&node.scratch, &node.hash_dir, "viewer");
+    let mut config = node.installers();
+    config["kernel"] = json!({
+        "projects": ["arcak-svc"], "droiddProjects": ["default"], "serviceCidr": "192.0.2.0/24"
+    });
+    node.write(&config);
+    let status = || {
+        let out = arca()
+            .args(["status", "--config"])
+            .arg(&node.config)
+            .arg("--token-file")
+            .arg(node.scratch.at("viewer.secret"))
+            .output()
+            .expect("run arca status");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Only a viewer token: every change waits, and status says so with its reason.
+    let mut serve = Serve::start(&node.config, node.scratch.at("serve-1.log"));
+    serve.wait_for(&node.socket);
+    let text = status();
+    assert!(
+        text.contains("Changes: on. Each one waits for the owner's approval with a passkey: no token of this node may do more than look and propose"),
+        "{text}"
+    );
+    assert_eq!(serve.terminate(), Some(0));
+
+    // A doctor token is minted: it is named, with the way to take it away, and the plain sentence is gone.
+    mint(&node.scratch, &node.hash_dir, "doctor");
+    let mut serve = Serve::start(&node.config, node.scratch.at("serve-2.log"));
+    serve.wait_for(&node.socket);
+    let text = status();
+    assert!(
+        text.contains("NOT every change does: these tokens change things directly, with no card and no passkey: doctor-1 (doctor)."),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "To take one away: arca token revoke <id> --config {}",
+            node.config.display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Each one waits"), "{text}");
+    assert!(!text.contains("viewer-1"), "{text}");
+    assert_eq!(serve.terminate(), Some(0));
 }

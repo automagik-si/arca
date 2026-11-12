@@ -1198,7 +1198,7 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool) {
         "the browser treats http://localhost as a secure context"
     );
     assert_eq!(
-        chrome.eval("!document.getElementById('local-help').hidden && document.getElementById('local-help').textContent.includes('ssh -o ExitOnForwardFailure=yes -L ' + location.port + ':127.0.0.1:' + location.port)"),
+        chrome.eval("!document.getElementById('local-help').hidden && document.getElementById('local-help').textContent.includes('ssh -o ExitOnForwardFailure=yes -L localhost:' + location.port + ':127.0.0.1:' + location.port)"),
         json!(true),
         "the page says what this browser needs, and the other way in"
     );

@@ -8,6 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::cmd_call::{Addressed, read_token, run_call};
+use crate::cmd_init::DirectTokens;
 use std::path::Path;
 
 use crate::config::NodeConfig;
@@ -36,7 +37,9 @@ pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
     if flags.switch("json") {
         return Ok(Some(answer));
     }
-    println!("{}", words(&answer, &cfg, &config.path));
+    // Which tokens change things without the page is in the node's token directory, read as `serve` reads it.
+    let tokens = crate::cmd_init::direct_tokens(&cfg);
+    println!("{}", words(&answer, &cfg, &config.path, &tokens));
     Ok(None)
 }
 
@@ -115,7 +118,12 @@ pub fn security(cfg: &NodeConfig, config: &Path) -> String {
 }
 
 /// The status in words: one line per fact, and a last line that says what to do next.
-pub fn words(status: &Value, cfg: &NodeConfig, config: &Path) -> String {
+pub(crate) fn words(
+    status: &Value,
+    cfg: &NodeConfig,
+    config: &Path,
+    tokens: &DirectTokens,
+) -> String {
     let text = |key: &str| status[key].as_str().unwrap_or("unknown");
     let watch_only = text("mode") == "watch-only";
     let incus = status["incusReachable"].as_bool();
@@ -196,14 +204,13 @@ pub fn words(status: &Value, cfg: &NodeConfig, config: &Path) -> String {
     }
     // Approvals, from the node's own answer: whether it may change things, the page that approves, whether that page
     // is open, and whether a passkey is trusted yet.
-    lines.push(
-        if watch_only {
-            "Changes: off. This node only looks"
-        } else {
-            "Changes: on. Each one waits for the owner's approval with a passkey"
-        }
-        .to_string(),
-    );
+    // A node that may change things: what waits for the passkey and what does not. "Each one waits" would be false
+    // where a doctor or operator token exists, so the line is the token directory's, not a fixed sentence.
+    lines.push(if watch_only {
+        "Changes: off. This node only looks".to_string()
+    } else {
+        tokens.status_line(config)
+    });
     let page = status.get("approvalPage").filter(|page| page.is_object());
     match page {
         Some(page) => {
@@ -265,7 +272,7 @@ fn next_step(watch_only: bool, incus: Option<bool>, page: Option<&Value>, config
             .and_then(arca_approval::localhost_origin_port)
         {
             step.push_str(&format!(
-                "\n      No browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L {port}:127.0.0.1:{port} <this machine>\n      Then open {url} in its browser: the page is this node's.\n      A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain; the guide's section \"The approval page\" says how."
+                "\n      No browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>\n      Then open {url} in its browser: the page is this node's. If ssh warns that it could not bind the port, close it: another port will not work, since the page's address names this one.\n      A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain; the guide's section \"The approval page\" says how."
             ));
         }
         return step;
@@ -300,6 +307,11 @@ fn uptime(seconds: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node none of whose tokens does more than look and propose.
+    fn quiet() -> DirectTokens {
+        DirectTokens::Read(Vec::new())
+    }
 
     /// The config's path, as `status` was given it.
     const CONFIG: &str = "/home/u/.config/arca/node.json";
@@ -338,6 +350,7 @@ mod tests {
             &answer("watch-only", true),
             &config(json!({})),
             Path::new(CONFIG),
+            &quiet(),
         );
         assert_eq!(
             text,
@@ -360,6 +373,7 @@ mod tests {
             &answer("kernel", false),
             &config(json!({})),
             Path::new(CONFIG),
+            &quiet(),
         );
         assert!(
             text.contains("Mode: kernel (it may make changes)"),
@@ -377,7 +391,7 @@ mod tests {
         let cfg = config(json!({ "loopback": "127.0.0.1:7471" }));
         let mut open = answer("watch-only", true);
         open["loopback"] = json!({ "addr": "127.0.0.1:7471", "open": true, "reason": null });
-        let text = words(&open, &cfg, Path::new(CONFIG));
+        let text = words(&open, &cfg, Path::new(CONFIG), &quiet());
         assert!(
             text.contains(
                 "MCP door for a client on this machine: open, at http://127.0.0.1:7471/mcp"
@@ -391,14 +405,19 @@ mod tests {
             "addr": "127.0.0.1:7471", "open": false,
             "reason": "address in use: another program holds this port"
         });
-        let text = words(&closed, &cfg, Path::new(CONFIG));
+        let text = words(&closed, &cfg, Path::new(CONFIG), &quiet());
         assert!(
             text.contains("MCP door for a client on this machine: CLOSED. The node does not hold 127.0.0.1:7471 (address in use: another program holds this port). Send no token there; the node keeps trying the address"),
             "{text}"
         );
         assert!(!text.contains("http://127.0.0.1:7471/mcp"), "{text}");
         // A node that says nothing of its door (an older one): only what the config names, marked as not checked.
-        let text = words(&answer("watch-only", true), &cfg, Path::new(CONFIG));
+        let text = words(
+            &answer("watch-only", true),
+            &cfg,
+            Path::new(CONFIG),
+            &quiet(),
+        );
         assert!(
             text.contains("Config also names: the loopback address 127.0.0.1:7471 (from the config file, not checked)"),
             "{text}"
@@ -408,6 +427,7 @@ mod tests {
             &answer("watch-only", true),
             &config(json!({ "loopback": null })),
             Path::new(CONFIG),
+            &quiet(),
         );
         assert!(
             !text.contains("loopback") && !text.contains("client on this machine"),
@@ -421,7 +441,7 @@ mod tests {
             "tailnet": "100.64.0.1:8443",
             "proxy": { "addr": "127.0.0.1:8080", "peer": "127.0.0.1" }
         }));
-        let text = words(&answer("kernel", true), &cfg, Path::new(CONFIG));
+        let text = words(&answer("kernel", true), &cfg, Path::new(CONFIG), &quiet());
         assert!(
             text.contains("Config also names: the tailnet address 100.64.0.1:8443 (from the config file, not checked)"),
             "{text}"
@@ -432,7 +452,7 @@ mod tests {
         );
         // Changes are on and the node names no page: nothing could be approved, and the next step says so.
         assert!(
-            text.contains("Changes: on. Each one waits for the owner's approval with a passkey\nApproval page: none\n"),
+            text.contains("Changes: on. Each one waits for the owner's approval with a passkey: no token of this node may do more than look and propose\nApproval page: none\n"),
             "{text}"
         );
         assert!(
@@ -461,10 +481,11 @@ mod tests {
             &with_page(page, true, None, Some(0)),
             &cfg,
             Path::new(CONFIG),
+            &quiet(),
         );
         assert!(
             text.contains(
-                "Changes: on. Each one waits for the owner's approval with a passkey\n\
+                "Changes: on. Each one waits for the owner's approval with a passkey: no token of this node may do more than look and propose\n\
                  Approval page: http://localhost:7471/approve (open)\n\
                  Passkeys: none trusted yet, so nothing can be approved\n\
                  Next: enrol your passkey: until one is trusted, nothing can be approved. Open http://localhost:7471/approve and press \"Get a setup code\". On a machine with no screen, this prints the code: arca setup-code --config /home/u/.config/arca/node.json\n"
@@ -472,7 +493,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("No browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L 7471:127.0.0.1:7471 <this machine>"),
+            text.contains("No browser on this machine? On your own computer run: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>"),
             "{text}"
         );
         assert!(
@@ -485,6 +506,7 @@ mod tests {
             &with_page(page, true, None, Some(2)),
             &cfg,
             Path::new(CONFIG),
+            &quiet(),
         );
         assert!(text.contains("Passkeys: 2 trusted\n"), "{text}");
         assert!(
@@ -499,6 +521,7 @@ mod tests {
             &with_page(page, false, Some(why), Some(0)),
             &cfg,
             Path::new(CONFIG),
+            &quiet(),
         );
         assert!(
             text.contains(&format!(
@@ -517,6 +540,7 @@ mod tests {
             &with_page("https://arca.example.com/approve", true, None, Some(0)),
             &cfg,
             Path::new(CONFIG),
+            &quiet(),
         );
         assert!(
             text.contains("Open https://arca.example.com/approve and press"),
@@ -525,7 +549,12 @@ mod tests {
         assert!(!text.contains("ssh ") && !text.contains("phone"), "{text}");
 
         // The kernel was busy and did not count: the words do not invent a number.
-        let text = words(&with_page(page, true, None, None), &cfg, Path::new(CONFIG));
+        let text = words(
+            &with_page(page, true, None, None),
+            &cfg,
+            Path::new(CONFIG),
+            &quiet(),
+        );
         assert!(
             text.contains("Passkeys: the node is busy with a change and did not say\n"),
             "{text}"
@@ -534,12 +563,55 @@ mod tests {
         // A node that says nothing of a page while its config names one: said as exactly that, never as open.
         let mut named: NodeConfig = config(json!({ "loopback": "127.0.0.1:7471" }));
         named.approval_origin = Some("http://localhost:7471".to_string());
-        let text = words(&answer("kernel", true), &named, Path::new(CONFIG));
+        let text = words(&answer("kernel", true), &named, Path::new(CONFIG), &quiet());
         assert!(
             text.contains("Approval page: the config names http://localhost:7471/approve, and the node did not say whether it serves it"),
             "{text}"
         );
         assert!(!text.contains("(open)"), "{text}");
+    }
+
+    #[test]
+    fn changes_on_says_each_one_waits_only_where_no_token_changes_things_without_the_page() {
+        let cfg = config(json!({}));
+        let on =
+            |tokens: &DirectTokens| words(&answer("kernel", true), &cfg, Path::new(CONFIG), tokens);
+        // A doctor or operator token does not wait for the page: it is named, with the way to take it away, and the
+        // plain sentence, which would be false, is not printed. This holds on a node with no page too.
+        let text = on(&DirectTokens::Read(vec![
+            "doctor-1 (doctor)".to_string(),
+            "ops (operator)".to_string(),
+        ]));
+        assert!(
+            text.contains("Changes: on. What an assistant proposes waits for the owner's approval with a passkey. NOT every change does: these tokens change things directly, with no card and no passkey: doctor-1 (doctor), ops (operator). To take one away: arca token revoke <id> --config /home/u/.config/arca/node.json\nApproval page: none\n"),
+            "{text}"
+        );
+        assert!(!text.contains("Each one waits"), "{text}");
+        // The token directory could not be read: that is said, and "each one waits" is not.
+        let text = on(&DirectTokens::Unread("/home/u/.config/arca/tokens".into()));
+        assert!(
+            text.contains("The token directory /home/u/.config/arca/tokens could not be read, so a doctor or operator token, which does not wait, may exist"),
+            "{text}"
+        );
+        assert!(!text.contains("Each one waits"), "{text}");
+        // Every token read, and none does more than look and propose: the plain sentence, with its reason.
+        let text = on(&quiet());
+        assert!(
+            text.contains("Changes: on. Each one waits for the owner's approval with a passkey: no token of this node may do more than look and propose\n"),
+            "{text}"
+        );
+        // A node that only looks changes nothing, whatever its tokens.
+        let text = words(
+            &answer("watch-only", true),
+            &cfg,
+            Path::new(CONFIG),
+            &DirectTokens::Read(vec!["doctor-1 (doctor)".to_string()]),
+        );
+        assert!(
+            text.contains("Changes: off. This node only looks\n"),
+            "{text}"
+        );
+        assert!(!text.contains("doctor-1"), "{text}");
     }
 
     #[test]

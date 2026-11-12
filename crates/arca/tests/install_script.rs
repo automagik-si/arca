@@ -546,7 +546,7 @@ fn says_the_door(machine: &Machine, run: &Run, port: u16) {
         // One line says where the cautions are; the report itself carries none of them. They are the program's to
         // say when asked (`arca status --security`), and the guide's.
         .says(&format!(
-            "Before you share this machine or that token with anyone, read: {} status --security --config {}",
+            "instead of running the line, and read this first: {} status --security --config {}",
             machine.home(".local/bin/arca").display(),
             machine.home(".config/arca/node.json").display()
         ))
@@ -1459,6 +1459,16 @@ fn the_connect_block_is_the_line_the_entry_and_one_pointer_and_a_closed_door_sti
     let run = machine.run(&["--version", &version]);
     run.ok();
     says_the_door(&machine, &run, 7471);
+    // The caution is said before the line it is about, not after it.
+    let caution = run
+        .out
+        .find("On a machine other people log in to, paste the entry below")
+        .expect("the caution");
+    assert!(
+        caution < run.out.find("claude mcp add").expect("the line"),
+        "{}",
+        run.out
+    );
     // The block a person reads to connect: its heading, the two lines to copy, their two lead-ins and the pointer.
     let block: Vec<&str> = run
         .out
@@ -1479,7 +1489,7 @@ fn the_connect_block_is_the_line_the_entry_and_one_pointer_and_a_closed_door_sti
     machine.switch("program-without-security", true);
     let run = machine.run(&["--version", &version]);
     run.ok()
-        .says("Before you share this machine or that token with anyone, read: https://github.com/automagik-si/arca/blob/dev/docs/OPERATING.md#loopback-listener")
+        .says("instead of running the line, and read this first: https://github.com/automagik-si/arca/blob/dev/docs/OPERATING.md#loopback-listener")
         .never_says("status --security");
 
     // What did not move: with the door closed there is no line and no entry, and the report says why.

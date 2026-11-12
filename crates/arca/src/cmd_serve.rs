@@ -581,13 +581,20 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(crate::approve_page::DesktopDisplay),
         )
         .with_canvas_origin(&cfg.canvas_origin)
-        .with_setup_command(setup_command.clone())
         .with_actions(actions)
         .with_approval_requests(Arc::clone(&approval_requests))
         .with_linked_hosts(linked_hosts.clone());
         let page = match &peer_sync {
             Some(syncer) => page.with_peer_sync(syncer.clone()),
             None => page,
+        };
+        // The exact line, with the config's whole path, is for the page of this machine alone, which only this
+        // machine's accounts can load. A page under any other origin may be public: it keeps the line with a
+        // placeholder, and shows nobody the node user's name or where its files are.
+        let page = if config::page_is_local(&cfg) {
+            page.with_setup_command(setup_command.clone())
+        } else {
+            page
         };
         // The page of this machine alone is open only while this node holds both loopback addresses of its port.
         match door.clone().filter(|door| door.twin().is_some()) {
