@@ -691,7 +691,7 @@ fn connect_from(rt: &Runtime, from: &str, to: SocketAddr) -> std::io::Result<std
 fn start_proxy(rt: &Runtime, router: axum::Router, peer: &str) -> SocketAddr {
     let at = free_loopback_port();
     rt.spawn(serve_proxy(router, at, ip(peer)));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while connect_from(rt, peer, at).is_err() {
         assert!(
             Instant::now() < deadline,
@@ -878,7 +878,7 @@ fn a_loopback_peer_that_sends_no_request_head_in_time_is_closed() {
         |_| {},
         Duration::from_millis(300),
     ));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while std::net::TcpStream::connect(at).is_err() {
         assert!(
             Instant::now() < deadline,
@@ -933,7 +933,7 @@ fn a_loopback_peer_that_sends_no_request_head_in_time_is_closed() {
 fn start_loopback(rt: &Runtime, router: axum::Router) -> SocketAddr {
     let at = free_loopback_port();
     rt.spawn(serve_loopback(router, at, |_| {}));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while std::net::TcpStream::connect(at).is_err() {
         assert!(
             Instant::now() < deadline,

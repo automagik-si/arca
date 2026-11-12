@@ -213,6 +213,26 @@ fn tls_front(listener: std::net::TcpListener, cert: Vec<u8>, key: Vec<u8>, upstr
     });
 }
 
+/// What a test's node is started through: a shell that closes every file it was handed but its three standard ones,
+/// then becomes the program. A test process may hold files that are not its own to pass on, such as the descriptor of a
+/// lock its runner took; a node that inherited one would keep it for as long as it lived.
+const CLOSE_THEN_EXEC: &str = r#"for fd in /proc/$$/fd/*; do fd=${fd##*/}; case $fd in 0|1|2) ;; *) eval "exec $fd>&-" 2>/dev/null ;; esac; done; exec "$0" "$@""#;
+
+/// `arca serve --config <config>` as a command to spawn, with no file of the test's process but its standard three.
+fn serve_command(config: &Path) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(CLOSE_THEN_EXEC)
+        .arg(env!("CARGO_BIN_EXE_arca"))
+        .env("HOME", "/nonexistent/arca-test-home")
+        .env_remove("ARCA_CONFIG")
+        .env_remove("ARCA_TOKEN_FILE")
+        .args(["serve", "--config"])
+        .arg(config);
+    command
+}
+
 /// A server process with its stderr in a file, killed if the test ends first.
 struct Serve {
     child: Option<Child>,
@@ -226,9 +246,7 @@ impl Serve {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let child = arca()
-            .args(["serve", "--config"])
-            .arg(config)
+        let child = serve_command(config)
             .env("PATH", path)
             .stdout(Stdio::null())
             .stderr(File::create(&log).expect("the server log"))
