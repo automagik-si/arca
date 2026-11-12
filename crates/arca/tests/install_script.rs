@@ -1587,6 +1587,27 @@ fn the_script_is_what_the_quickstart_and_the_hard_rules_say() {
         "docs/QUICKSTART.md shows the installer"
     );
 
+    // The install line a person sees is the short address, in the README and in the quickstart alike. That address
+    // is a redirect to the release's own `install.sh`, and the long address is written once: where the quickstart
+    // says what the short one is.
+    let one_line = "curl -fsSL https://get.automagik.si/arca | sh";
+    let readme = fs::read_to_string(repo().join("README.md")).expect("README.md");
+    for (name, page) in [("README.md", &readme), ("docs/QUICKSTART.md", &quickstart)] {
+        assert!(
+            page.lines().any(|line| line == one_line),
+            "{name} shows the one-line install: {one_line}"
+        );
+    }
+    assert!(
+        !readme.contains("releases/latest/download"),
+        "README.md shows the short install address only"
+    );
+    assert_eq!(
+        quickstart.matches("releases/latest/download").count(),
+        1,
+        "docs/QUICKSTART.md writes the long install address in one place"
+    );
+
     // It never becomes another user, and never uses the address that skips pre-releases.
     // (The tests' PATH holds no such program either, so a script that tried would fail every one of them.)
     assert!(!text.contains("releases/latest"));

@@ -38,8 +38,8 @@
 # answer (30); and ARCA_INSTALL_RUN_ROOT, where per-user runtime directories live (/run/user), for the tests.
 set -eu
 
-# The release this script installs. `--version` names another. This is not "the latest release": GitHub's address for
-# that skips pre-releases and answers 404 while every release of Arca is one.
+# The release this script installs. `--version` names another. The script never asks GitHub which release is the
+# newest: each release carries its own copy of this script, with this line set to that release.
 ARCA_VERSION=0.10.0
 
 RELEASES=https://github.com/automagik-si/arca/releases
