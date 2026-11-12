@@ -15,6 +15,8 @@ hand. The template changed, so an installed copy nobody edited is brought up to 
 before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
 that image is built with `templates/automagik.build.sh`.
 
+## 0.14.0 (2026-11-12)
+
 The metrics sampler no longer reads the listing of every instance with its live state each tick. On a node where one
 running virtual machine's guest agent is slow, that listing took up to its 10 second deadline, so a tick often had no
 instance readings at all, and it slowed every service create made at the same time. Each tick now lists the instances
