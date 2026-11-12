@@ -4874,8 +4874,11 @@ impl ToolHandler for PostgresHandler {
 mod function_handlers;
 #[path = "service_omni.rs"]
 mod service_omni;
+#[path = "service_update.rs"]
+mod service_update;
 #[path = "service_wiring.rs"]
 mod service_wiring;
+pub use service_update::{Probe as UpdateProbe, UpdateOptions};
 #[path = "tenants.rs"]
 mod tenants;
 pub use tenants::{SnapshotListInTenant, spawn_front_sync, sync_front, tenant_handlers};
@@ -4908,6 +4911,24 @@ pub fn service_handlers_with(
     cfg: Arc<NodeConfig>,
     functions: Option<Arc<crate::function_run::FunctionRunner>>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    service_handlers_updating(
+        kernel,
+        clock,
+        cfg,
+        functions,
+        service_update::UpdateOptions::default(),
+    )
+}
+
+/// [`service_handlers_with`] with the edges of `service_update` given: how its health check tries a port, and how
+/// long it waits between two tries. A served node uses the defaults; a test gives a fake port.
+pub fn service_handlers_updating(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    cfg: Arc<NodeConfig>,
+    functions: Option<Arc<crate::function_run::FunctionRunner>>,
+    update: service_update::UpdateOptions,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     // One gate for every handler that picks an address or a block: the kernel's own.
     let writes = write_gate(&kernel);
     let exec = Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()));
@@ -4927,6 +4948,7 @@ pub fn service_handlers_with(
         "service_status",
         "service_logs",
         "service_remove",
+        "service_update",
         "service_import",
         "service_release",
     ]
@@ -4943,6 +4965,7 @@ pub fn service_handlers_with(
                 writes: writes.clone(),
                 exec: exec.clone(),
                 functions: functions.clone(),
+                update: update.clone(),
             }) as Arc<dyn ToolHandler>,
         )
     })
@@ -4991,6 +5014,8 @@ struct ServiceHandler {
     exec: Arc<crate::service_exec::ServiceExec>,
     /// The runner of this node's functions, on a node that runs any. The function verbs need it.
     functions: Option<Arc<crate::function_run::FunctionRunner>>,
+    /// What `service_update` does at its edges.
+    update: service_update::UpdateOptions,
 }
 
 /// A refusal in plain words, under the plain code `refused`. A refusal for want of room is never this one, and neither
@@ -6272,6 +6297,7 @@ impl ToolHandler for ServiceHandler {
             ],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
+            "service_update" => &["name", "digest", "timeoutSeconds"],
             "service_remove" | "service_import" | "service_release" => &["name", "approval"],
             "service_connect" | "service_disconnect" => &["from", "to"],
             "service_secret_set" => &["name", "key", "value"],
@@ -6320,7 +6346,7 @@ impl ToolHandler for ServiceHandler {
         }
         if matches!(
             self.verb,
-            "service_create" | "service_import" | "service_release"
+            "service_create" | "service_update" | "service_import" | "service_release"
         ) && caller.scope < Scope::Doctor
         {
             return Err(CallError::Forbidden {
@@ -6772,6 +6798,7 @@ impl ToolHandler for ServiceHandler {
                 }
                 Ok(answer)
             }
+            "service_update" => self.call_update(&args, &entries),
             "service_remove" => {
                 let name = service_name(&args)?;
                 let approval = args["approval"]

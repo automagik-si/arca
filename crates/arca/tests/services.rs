@@ -3134,6 +3134,8 @@ mod kernel_access;
 mod omni;
 #[path = "services/tunnel.rs"]
 mod tunnel;
+#[path = "services/update.rs"]
+mod update;
 #[path = "services/wiring.rs"]
 mod wiring;
 

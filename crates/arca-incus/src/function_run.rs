@@ -355,7 +355,7 @@ fn fingerprint(text: &str) -> bool {
 
 /// Whether `source` is an OCI image pulled by digest from a registry, and nothing more: the only source a rebuild that
 /// asks a registry may name.
-fn registry_source(source: &Value) -> bool {
+pub(crate) fn registry_source(source: &Value) -> bool {
     let Some(fields) = source.as_object() else {
         return false;
     };

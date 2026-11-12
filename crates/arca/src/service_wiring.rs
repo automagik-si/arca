@@ -36,7 +36,9 @@ fn arg_name(args: &Value, key: &str) -> Result<String, CallError> {
         .map(str::to_owned)
         .ok_or_else(|| CallError::Invalid(format!("{key}: expected a service name")))
 }
-fn change(config: &ServiceConfig) -> Result<crate::desired_store::EntryChange, CallError> {
+pub(super) fn change(
+    config: &ServiceConfig,
+) -> Result<crate::desired_store::EntryChange, CallError> {
     Ok(crate::desired_store::EntryChange::Put(service_entry(
         &config.entry_id(),
         "arca.service",

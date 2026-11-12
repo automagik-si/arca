@@ -224,6 +224,8 @@ struct Shared {
     rebuilds: Mutex<BTreeMap<(String, String), Vec<String>>>,
     /// The instances whose rebuild from the store's copy is refused, and whether one from a registry is refused too.
     rebuild_refusals: Mutex<BTreeMap<(String, String), bool>>,
+    /// The snapshots each instance was restored to, in order.
+    restores: Mutex<BTreeMap<(String, String), Vec<String>>>,
     counter: AtomicU64,
     /// The `/1.0/resources` document the fake serves, when a test sets one.
     resources: Mutex<Option<Value>>,
@@ -422,6 +424,7 @@ impl Shared {
             exits: Mutex::new(BTreeMap::new()),
             rebuilds: Mutex::new(BTreeMap::new()),
             rebuild_refusals: Mutex::new(BTreeMap::new()),
+            restores: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
         }
@@ -484,6 +487,15 @@ impl FakeIncus {
     /// own copy of an image, `registry` for one that named a registry.
     pub fn rebuilds(&self, project: &str, name: &str) -> Vec<String> {
         lock(&self.shared.rebuilds)
+            .get(&(project.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The snapshots the instance `name` in `project` was restored to, in order. A restore changes nothing else in the
+    /// fake: it keeps no root, and its config and devices are what they were.
+    pub fn restores(&self, project: &str, name: &str) -> Vec<String> {
+        lock(&self.shared.restores)
             .get(&(project.to_string(), name.to_string()))
             .cloned()
             .unwrap_or_default()
@@ -2041,6 +2053,30 @@ fn put(
         return write_project(shared, store, index, &body, true);
     }
     let bad = |message: &str| (400, String::new(), error_envelope(400, message));
+    // A restore names a snapshot the instance holds and replaces nothing the fake keeps.
+    if let Some(Value::String(snapshot)) = body.get("restore") {
+        let held = Address {
+            kind: "snapshot",
+            project: address.project.clone(),
+            parent: address.name.clone(),
+            name: snapshot.clone(),
+        };
+        if store.find(&held).is_none() {
+            return (
+                404,
+                String::new(),
+                error_envelope(404, "snapshot not found"),
+            );
+        }
+        if text_of(&store.objects[index].body, "status") != "Stopped" {
+            return bad("the fake restores only a stopped instance");
+        }
+        lock(&shared.restores)
+            .entry((address.project.clone(), address.name.clone()))
+            .or_default()
+            .push(snapshot.clone());
+        return answered(shared, store, "instance", "PUT", Ok(()));
+    }
     let text_map = |key: &str| match body.get(key) {
         None => Some(Map::new()),
         Some(Value::Object(map)) if map.values().all(Value::is_string) => Some(map.clone()),

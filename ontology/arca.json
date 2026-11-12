@@ -41,6 +41,11 @@
     },
     {
       "kind": "tool",
+      "id": "service_update",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
       "id": "service_remove",
       "status": "live"
     },

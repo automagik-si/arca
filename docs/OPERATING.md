@@ -1100,6 +1100,34 @@ lock. Any reconciliation failure or partial plan run is a typed refusal naming w
 the approval is spent, so another try needs a new one. Secret files are removed only after full success. An adopted
 record is refused.
 
+### Updating a service to a new image digest
+
+`service_update` takes `{name, digest, timeoutSeconds?, tenant?}` and moves a running container service made from an
+image by digest (the shipped `automagik-server` and `automagik-workspace` are two) to another digest of the same image
+in one call. It needs a `doctor` token and asks the owner for nothing; it works inside a tenant as outside one. In
+order, and each step a line in `service-updates.jsonl` in the state directory (an append-only file of JSON lines: a
+`begin`, one line per step, an `end`; never a secret):
+
+1. the instance is stopped, if it runs, and a snapshot of it, `pre-update-<time>`, is taken;
+2. its root is rebuilt from `<repository>@<digest>`. Incus keeps what is not the root: the config, the secrets, the
+   firewall rules and the data volume (a template's `data` path, `/data` for the two above);
+3. it is started;
+4. the first port the service's record names must answer TCP within `timeoutSeconds` (1 to 900, 120 when absent);
+5. the new digest is written into the service's record, so a restart keeps it and `service_status` names it.
+
+A failure at any step puts the old version back: the snapshot is restored, the old version is started if it was
+running before, and the call is refused with code `rolled_back` and the failing step's words. A project that does not
+allow snapshots (a tenant's does not by default) takes no snapshot, and the root is rebuilt from the old digest
+instead. If the old version cannot be put back either, the refusal is `rollback_failed`, says so, and leaves the
+service stopped. A failure before anything is changed (the digest is malformed, the service is not made from an
+image by digest, its instance is not the one Arca created, the snapshot failed) says "Nothing was changed". A call for
+the digest the service already runs changes nothing and answers `updated: false`. A service being updated refuses a
+second update until the first ends.
+
+The snapshot holds the root, the config and the devices. The data volume is the service's own and is not
+snapshotted: a rollback leaves in it what the new version wrote. The snapshot stays after a successful update, named in
+the answer, for you to delete or restore by hand. A virtual machine, a function and an adopted service are refused.
+
 ### Who may call what
 
 | Caller | Result |
@@ -3646,8 +3674,9 @@ install --replace` from a newer release. `service_status` answers both under `up
 key on any other row. Both are read from this node's own records and files: no registry is asked and nothing is
 written. Two digests carry no order, so `differs` never says which version is the newer one. A service made from a
 system image by an alias has no version of this kind and carries no `update` (`baseImage`, above, is what it has),
-and neither does an adopted instance. Today the only way to the template's version is `service_remove` and
-`service_create`: this only tells you that there is one.
+and neither does an adopted instance. For a container made from an image by digest, `service_update` moves it to another digest (see "Updating a service
+to a new image digest"); for a virtual machine the only way is `service_remove` and `service_create`. This only tells you that
+there is one.
 
 A virtual-machine template says where its version is with one key:
 

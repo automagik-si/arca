@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 64] = [
+static VERBS: [Verb; 65] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -401,6 +401,20 @@ static VERBS: [Verb; 64] = [
         cut: no_cut,
         params: service_remove_params,
         result: service_remove_result,
+    },
+    Verb {
+        name: "service_update",
+        summary: "Move a running container service made from an image by digest to another digest of that image in one call: it is stopped, snapshotted, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept), started, and its first port must answer TCP within the timeout (120 seconds unless timeoutSeconds says otherwise). The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_update,
+        cut: no_cut,
+        params: service_update_params,
+        result: service_update_result,
     },
     Verb {
         name: "service_import",
@@ -2899,7 +2913,7 @@ pub fn service_view_schema() -> Value {
             },
             "update": {
                 "additionalProperties": false,
-                "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Today the only way to the template's version is service_remove and service_create.",
+                "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
                 "properties": {
                     "pin": {
                         "description": "service_status only: the version the service was created with, an image by digest.",
@@ -3433,6 +3447,62 @@ pub fn summary_service_import(_: &Value) -> String {
 /// A short line for a successful `service_release`.
 pub fn summary_service_release(_: &Value) -> String {
     "Service released.".to_string()
+}
+
+/// A short line for a successful `service_update`.
+pub fn summary_service_update(v: &Value) -> String {
+    if v["updated"] == false {
+        "Service already on that digest.".to_string()
+    } else {
+        "Service updated.".to_string()
+    }
+}
+
+fn service_update_params() -> Value {
+    with_tenant(service_update_params_base())
+}
+
+fn service_update_params_base() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "digest": {
+                "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository.",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+            },
+            "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter)."),
+            "timeoutSeconds": {
+                "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent.",
+                "maximum": 900,
+                "minimum": 1,
+                "type": "integer"
+            }
+        },
+        "required": ["name", "digest"],
+        "type": "object"
+    })
+}
+
+fn service_update_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "digest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
+            "message": { "type": "string" },
+            "service": { "type": "string" },
+            "snapshot": {
+                "description": "The snapshot of the old version taken before the rebuild, or null when the service's project does not allow snapshots. Absent when nothing was changed.",
+                "type": ["string", "null"]
+            },
+            "updated": {
+                "description": "False when the service already ran this digest and nothing was changed.",
+                "type": "boolean"
+            }
+        },
+        "required": ["updated", "service", "digest", "message"],
+        "type": "object"
+    })
 }
 
 fn service_remove_result() -> Value {

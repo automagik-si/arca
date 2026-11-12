@@ -47,6 +47,11 @@ never taken in its place. A `--token-file` or `ARCA_TOKEN_FILE` that names a fil
 - Merge PR 122: while no passkey is trusted, every card says to set one up first and takes the owner to the setup
 
 ## 0.16.0 (2026-11-12)
+A running service made from an image by digest now moves to a new digest in one call: `service_update {name, digest}`
+snapshots it, rebuilds its root from the new digest (its data volume, config, secrets and firewall rules stay),
+starts it, waits for its first port to answer TCP (120 seconds, or `timeoutSeconds`) and records the digest so a restart
+keeps it. A failure at any step puts the old version back and the answer says it was rolled back. It needs a `doctor`
+token and no owner approval, and works inside a tenant.
 
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and
 removal: every action the kernel lets a viewer propose. Each still waits for the owner's passkey on its card. To know
