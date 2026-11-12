@@ -5277,13 +5277,15 @@ impl ToolHandler for ServiceHandler {
             self.verb,
             "service_publish" | "service_unpublish" | "service_import" | "service_release"
         );
-        if object
+        if let Some(key) = object
             .keys()
-            .any(|key| !(takes_tenant && key == "tenant") && !allowed.contains(&key.as_str()))
+            .find(|key| !(takes_tenant && *key == "tenant") && !allowed.contains(&key.as_str()))
         {
-            return Err(CallError::Invalid(
-                "arguments: a field the schema does not name".into(),
-            ));
+            let mut known = allowed.to_vec();
+            if takes_tenant {
+                known.push("tenant");
+            }
+            return Err(CallError::Invalid(arca_api::unknown_field("", key, &known)));
         }
         if matches!(
             self.verb,

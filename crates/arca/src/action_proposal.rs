@@ -257,11 +257,13 @@ impl ActionKind {
             }
             object.insert("image".to_string(), Value::String(default.to_string()));
         }
-        // The checker names a place inside the action's arguments; the caller passed them as `args`.
+        // The checker names a place inside the action's arguments; the caller passed them as `args`. A refusal about
+        // the arguments themselves has no place, or calls them "the value"; one about a field starts with its pointer.
         conforms(&self.params_schema(), &args).map_err(|why| {
             match why.strip_prefix("the value") {
                 Some(rest) => format!("args{rest}"),
-                None => format!("args{why}"),
+                None if why.starts_with('/') => format!("args{why}"),
+                None => format!("args: {why}"),
             }
         })?;
         match self {
@@ -1377,21 +1379,25 @@ mod tests {
     const OTHER_IMAGE: &str = "docker.io/library/postgres@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
-    fn a_field_the_action_does_not_take_is_refused_by_its_place_and_the_fields_it_takes() {
+    fn a_field_the_action_does_not_take_is_named_with_its_place_and_the_fields_it_takes() {
         let why = ActionKind::InstanceRestart
             .prepare(&json!({ "project": "default", "nmae-7": "x" }), None)
             .expect_err("an unknown field is refused");
         assert!(
-            why.starts_with("args: a field the schema does not name; the fields it takes are "),
-            "the refusal names the place: {why}"
+            why.starts_with("args: unknown field 'nmae-7'; this verb takes: "),
+            "the refusal names the place and the field: {why}"
         );
         assert!(
             why.contains("instance"),
             "it names the field the action takes: {why}"
         );
+        // The case the issue gave: the field is `instance`, and `name` was sent.
+        let why = ActionKind::InstanceRestart
+            .prepare(&json!({ "project": "default", "name": "x" }), None)
+            .expect_err("an unknown field is refused");
         assert!(
-            !why.contains("nmae-7"),
-            "the unknown key is never echoed: {why}"
+            why.starts_with("args: unknown field 'name'; this verb takes: "),
+            "{why}"
         );
     }
 

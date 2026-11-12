@@ -221,33 +221,9 @@ fn with_usage(failure: Failure, command: &str, action: Option<&str>) -> Failure 
     Failure::Usage(format!("{text}\nusage:\n{}", lines.join("\n")))
 }
 
-/// The number of single-character edits (insert, remove, replace) that turn `a` into `b`.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for (i, x) in a.chars().enumerate() {
-        let mut previous = row[0];
-        row[0] = i + 1;
-        for (j, y) in b.iter().enumerate() {
-            let replaced = previous + usize::from(x != *y);
-            previous = row[j + 1];
-            row[j + 1] = replaced.min(previous + 1).min(row[j] + 1);
-        }
-    }
-    row[b.len()]
-}
-
-/// The known word closest to `word`, when one is close enough to be what was meant: at most two edits away, or a third of
-/// the word's length when that is more. Two words equally close give the first in `known`'s order.
-pub fn closest<'a>(word: &str, known: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    let limit = (word.chars().count() / 3).max(2);
-    known
-        .into_iter()
-        .map(|candidate| (edit_distance(word, candidate), candidate))
-        .filter(|(distance, candidate)| *distance <= limit && *distance < candidate.chars().count())
-        .min_by_key(|(distance, _)| *distance)
-        .map(|(_, candidate)| candidate)
-}
+/// The known word closest to a mistyped one, when one is close enough to be what was meant. It is the verb table's own
+/// measure, so a mistyped command, flag, verb or field is answered the same way.
+pub use arca_api::closest;
 
 /// The refusal of a word that is not one of `known`: what kind of word it is, the closest known one when there is one,
 /// and all of them. The word itself is never echoed.
