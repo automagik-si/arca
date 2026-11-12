@@ -549,3 +549,39 @@ fn no_output_of_a_refused_load_carries_a_secret() {
         "no output carries any part of it"
     );
 }
+
+/// An older release let a token be minted under the name approved actions run under. Its file is left out: the
+/// store loads, every other token works, the secret of the left-out one authenticates nobody, and the store names
+/// the file so its loader can say so. The same holds when the file appears before a reload.
+#[test]
+fn a_file_named_for_approved_actions_is_left_out_and_every_other_token_still_loads() {
+    let reserved = format!("{}.hash", arca_mcp::auth::APPROVED_ACTION_ID);
+    let scratch = Scratch::new("reserved-id");
+    let good = mint_into(scratch.path(), "d-good", Scope::Doctor);
+    // The file is a whole, well-formed hash file: only its name sets it apart.
+    let old = mint_into(scratch.path(), "d-old", Scope::Operator);
+    fs::rename(scratch.at("d-old.hash"), scratch.at(&reserved)).expect("rename");
+    let store = TokenStore::load(scratch.path()).expect("the store loads without the file");
+    assert_eq!(store.ignored(), vec![reserved.clone()]);
+    assert_eq!(
+        store.lookup(&good).map(|caller| caller.token_id),
+        Some("d-good".to_string())
+    );
+    assert!(store.lookup(&old).is_none(), "its secret is nobody's");
+    assert_eq!(
+        store.ids(),
+        vec![("d-good".to_string(), Scope::Doctor, None)],
+        "it is not listed as a token"
+    );
+
+    // Removed, then put back while the store is live: each reload says what it found.
+    fs::remove_file(scratch.at(&reserved)).expect("remove");
+    assert_eq!(store.reload(scratch.path()).expect("reload"), 1);
+    assert_eq!(store.ignored(), Vec::<String>::new());
+    let again = mint_into(scratch.path(), "d-again", Scope::Operator);
+    fs::rename(scratch.at("d-again.hash"), scratch.at(&reserved)).expect("rename");
+    assert_eq!(store.reload(scratch.path()).expect("reload"), 1);
+    assert_eq!(store.ignored(), vec![reserved]);
+    assert!(store.lookup(&again).is_none());
+    assert!(store.lookup(&good).is_some());
+}

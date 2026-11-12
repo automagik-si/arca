@@ -33,6 +33,12 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
             "--id is 1 to {MAX_ID_LEN} lowercase letters, digits or hyphens, starting with a letter or a digit"
         )));
     }
+    // The name an approved action runs under is no token's: a token of that name would pass for the owner's approval.
+    if id == arca_mcp::auth::APPROVED_ACTION_ID {
+        return Err(Failure::Usage(format!(
+            "--id {id} is the name an action runs under once the owner approved it, and no token takes it: choose another id"
+        )));
+    }
     let hash_dir = token_node(flags, Does::Acts)?.hash_dir;
     let out = PathBuf::from(flags.required("out")?);
     check_hash_dir(&hash_dir)?;

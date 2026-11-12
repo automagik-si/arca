@@ -7,9 +7,25 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+More of what a `service_create` would refuse is now refused when it is proposed, in the create's words, so no card is
+shown for it: a name that is taken, a deploy the approved create could not add to, a tenant's machine on a host
+bridge, a tenant's service from a template that opens a host port, a MAC another record holds, and a config with no
+service project. A proposal with a bad name is told about the name first. What is read from Incus (a free address,
+an instance Arca does not know, a local image) is still asked by the approved create alone; `docs/OPERATING.md`
+lists it.
+
+No token can be minted with the id `owner-approval` any more: it is the name an approved action runs under. If your
+token directory holds `owner-approval.hash` from an earlier release, the node still starts, ignores that file and says
+so in its log; remove it with `arca token revoke owner-approval`.
+
+The refusal of a create that names a deploy somebody else opened is reworded, so it is true for every caller: "deploy
+<id> was opened by another caller: only the caller that opened a deploy adds to it, and an approved action runs as the
+owner's approval, never as the token that proposed it". A client that matched the old sentence must match this one.
+
 A card that waits while the node is upgraded to the version that binds a template's content (a create, or a database
 made from the template) is now refused when its approval is submitted, and the approval is not used; propose it
 again. Before, the approval was accepted and the create then refused.
+
 A `service_create` the node has no room for is now refused when it is proposed, in the words the create uses (what is
 in use, what is asked, what is allowed, and the config key), so the owner is never shown a card for it. Before, the
 card was shown, the approval was accepted and used up, and only then did the create refuse. This covers the node's

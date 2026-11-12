@@ -1602,8 +1602,13 @@ impl ToolHandler for ActionPropose {
         } else if let Some(storage) = storage {
             crate::storage::enrich(storage, action, &payload, now)?
         } else if let (ActionKind::ServiceCreate, Some(node)) = (action, &self.node) {
+            // The arguments are held to the verb's schema first, so a proposal with a bad name is told about the
+            // name and not about what the node holds. What the node fills in below is checked again after it.
+            action
+                .prepare(&payload, self.postgres_image.as_deref())
+                .map_err(CallError::Invalid)?;
             let entries = lock(&self.kernel)?.entries().to_vec();
-            enrich_service_create(node, &entries, &payload, &mut card_fact)?
+            enrich_service_create(node, &entries, &payload, &mut card_fact, now)?
         } else if let (ActionKind::PostgresCreate, Some(node)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
             enrich_postgres_create(node, &entries, &payload, &mut card_fact)?
@@ -2219,13 +2224,17 @@ impl ActionExecutor {
         handler.call(
             call,
             &Caller {
-                token_id: "owner-approval".to_string(),
+                token_id: APPROVED_CALLER.to_string(),
                 scope: Scope::Operator,
                 tools: None,
             },
         )
     }
 }
+
+/// The token an approved action's handler is called as: no token a person holds, since no token may be minted
+/// under it.
+const APPROVED_CALLER: &str = arca_mcp::auth::APPROVED_ACTION_ID;
 
 /// The kernel's write gate, shared by the service, database and tenant handlers and by the front pass.
 fn write_gate(kernel: &Mutex<Kernel>) -> Arc<Mutex<()>> {
@@ -3497,7 +3506,14 @@ fn enrich_service_create(
     entries: &[arca_kernel::desired::Entry],
     payload: &Value,
     card_fact: &mut Option<String>,
+    now: u64,
 ) -> Result<Value, CallError> {
+    // First, as in the create: the tenant the proposal names, and what the node's config and records refuse before
+    // any template is read.
+    let tenant = tenants::tenant_arg(cfg, payload, entries)?;
+    if let Some(refusal) = proposed_before_template(cfg, entries, payload, tenant.as_ref()) {
+        return Err(refusal);
+    }
     // A private destination comes from the node's config alone, by the service's name. The proposal names it, so the
     // owner's card says it and the approval binds it; a caller that states anything else is refused now.
     let destinations = destinations_for(
@@ -3598,9 +3614,24 @@ fn enrich_service_create(
         }
         crate::service::create_settings(&template, payload.get("settings"))
             .map_err(service_template_error)?;
-        if let Some(refusal) = proposed_room_refusal(cfg, entries, payload, &template)? {
+        if tenant.is_some() && (template.lan.is_some() || template.publishable) {
+            return Err(service_refused(tenant_host_port(&template.name)));
+        }
+        if let Some(refusal) = create_room_refusal(
+            cfg,
+            entries,
+            tenant.as_ref(),
+            payload["name"].as_str().unwrap_or_default(),
+            &template,
+        ) {
             return Err(refusal);
         }
+        // The node's own project and network are written with the first service that needs them: a write the
+        // create would refuse is refused now. Not on a node that only looks, whose proposal is recorded as before.
+        if tenant.is_none() && !node_only_looks(cfg) {
+            ensure_netproject(entries, cfg).map_err(no_service_project)?;
+        }
+        tenants::joinable_deploy(cfg, tenant.as_ref(), payload, APPROVED_CALLER, now)?;
         let mut payload = payload.clone();
         if let (Some(stated), Some(object)) = (stated, payload.as_object_mut()) {
             object.insert("kernelAccess".to_string(), stated);
@@ -3617,7 +3648,16 @@ fn enrich_service_create(
         return Err(service_refused(why));
     }
     let mut payload = payload.clone();
-    match vm_network(cfg, &payload)? {
+    // A tenant's machine joins the managed service network and nothing else.
+    if tenant.is_some() && payload.get("bridge").is_some() {
+        return Err(service_refused(TENANT_BRIDGE));
+    }
+    let network = if tenant.is_some() {
+        VmNetwork::Managed
+    } else {
+        vm_network(cfg, &payload)?
+    };
+    match &network {
         VmNetwork::Managed => {
             if payload.get("mac").is_some() {
                 return Err(service_refused(MANAGED_MAC));
@@ -3633,34 +3673,120 @@ fn enrich_service_create(
                 )));
             }
             if let Some(object) = payload.as_object_mut() {
-                object.insert("bridge".to_string(), Value::String(bridge));
+                object.insert("bridge".to_string(), Value::String(bridge.clone()));
             }
         }
     }
-    // Last, as in the create: a machine the node has no room for is refused now, so the owner is never asked to
-    // approve it.
-    if let Some(refusal) = proposed_room_refusal(cfg, entries, &payload, &template)? {
-        return Err(refusal);
+    // A MAC another of this node's records holds is refused now. Whether an instance Arca holds no record of has
+    // it is read from Incus, and the create asks that.
+    if let Some(mac) = payload
+        .get("mac")
+        .and_then(Value::as_str)
+        .and_then(crate::service::normalize_mac)
+        && record_holds_mac(&tenants::scoped_entries(entries, tenant.as_ref()), &mac)
+    {
+        return Err(service_refused(mac_held(&mac)));
     }
-    Ok(payload)
-}
-
-/// The room check of a proposed `service_create` ([`create_room_refusal`]), for the tenant the proposal names. A
-/// tenant this node does not hold is refused in the create's words: its caps cannot be read.
-fn proposed_room_refusal(
-    cfg: &NodeConfig,
-    entries: &[arca_kernel::desired::Entry],
-    payload: &Value,
-    template: &crate::service::Template,
-) -> Result<Option<CallError>, CallError> {
-    let tenant = tenants::tenant_arg(cfg, payload, entries)?;
-    Ok(create_room_refusal(
+    // As in the create: a machine the node has no room for is refused now, so the owner is never asked to
+    // approve it.
+    if let Some(refusal) = create_room_refusal(
         cfg,
         entries,
         tenant.as_ref(),
         payload["name"].as_str().unwrap_or_default(),
-        template,
-    ))
+        &template,
+    ) {
+        return Err(refusal);
+    }
+    // Last, the write of the node's own project that the create would refuse: its entry would carry a count of
+    // virtual machines below what the node holds. Not on a node that only looks, whose proposal is recorded as
+    // before.
+    if tenant.is_none() && !node_only_looks(cfg) {
+        project_changes(
+            entries,
+            cfg,
+            ProjectNeeds {
+                managed: matches!(network, VmNetwork::Managed),
+                vm: true,
+                host_bridge: matches!(network, VmNetwork::Host(_)),
+            },
+        )
+        .map_err(no_service_project)?;
+    }
+    // A deploy the approved create could not add to: one another token opened, or one that is closed. The approved
+    // create runs as the approval's own caller, and the deploy journal says who opened what.
+    tenants::joinable_deploy(cfg, tenant.as_ref(), &payload, APPROVED_CALLER, now)?;
+    Ok(payload)
+}
+
+/// What a proposed `service_create` is refused for before its template is read, in the words and the order of the
+/// create: a deploy named outside a tenant, a config that sets up no service project for it, a name a function
+/// holds, and a name a service holds. All of it is read from the node's config and its records. Whether an instance
+/// Arca holds no record of has the name is read from Incus, and the create asks that. A node that only looks
+/// records the proposal as before, and its create refuses: neither its config's service project nor the write of
+/// that project ([`enrich_service_create`]) is asked about there.
+fn proposed_before_template(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+    payload: &Value,
+    tenant: Option<&tenants::TenantScope>,
+) -> Option<CallError> {
+    if tenant.is_none() && payload.get("deploy").is_some() {
+        return Some(CallError::Invalid(DEPLOY_OUTSIDE_TENANT.into()));
+    }
+    if !node_only_looks(cfg) {
+        let project = if tenant.is_some() {
+            tenants::network(cfg).map(|_| ())
+        } else if no_service_project_asked(cfg) && holds_service_records(entries) {
+            Err(service_records_without_config())
+        } else if cfg.kernel.bridged.is_some() && cfg.kernel.service_cidr.is_none() {
+            bridged_project(cfg)
+        } else {
+            service_project(cfg).map(|_| ())
+        };
+        if let Err(refusal) = project {
+            return Some(refusal);
+        }
+    }
+    if let Some(refusal) = function_handlers::kind_refusal("service_create", payload, entries) {
+        return Some(refusal);
+    }
+    let name = payload["name"].as_str()?;
+    let id = crate::service::entry_id(tenant.map(|scope| scope.id.as_str()), name);
+    entries
+        .iter()
+        .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
+        .then(|| service_exists(name))
+}
+
+/// The refusal of a create whose name a service already holds.
+fn service_exists(name: &str) -> CallError {
+    service_refused(format!("service {name} exists"))
+}
+
+/// Why a create outside a tenant that names a deploy is not made.
+const DEPLOY_OUTSIDE_TENANT: &str = "deploy: only a call inside a tenant names a deploy";
+
+/// Why a tenant's virtual machine that names a host bridge is not made.
+const TENANT_BRIDGE: &str = "bridge: a virtual machine in a tenant joins the managed service network only, never a host bridge";
+
+/// Why a tenant's service is not made from a template that opens a port on the host or publishes.
+fn tenant_host_port(template: &str) -> String {
+    format!(
+        "template {template} opens a port on the host or publishes a dash, and nothing in a tenant does: a tenant's service is reached through the node's front service"
+    )
+}
+
+/// Whether one of `entries`, the records on the call's own side, is a virtual machine that holds `mac`.
+fn record_holds_mac(entries: &[arca_kernel::desired::Entry], mac: &str) -> bool {
+    service_entries(entries)
+        .iter()
+        .any(|(_, other)| other.vm.as_ref().and_then(|vm| vm.mac.as_deref()) == Some(mac))
+}
+
+/// Why a create that states a MAC something else holds is not made.
+fn mac_held(mac: &str) -> String {
+    format!("the MAC {mac} is already held by another instance")
 }
 
 /// What a `service_create` call brings to a template that declares kernel access: what it stated as `kernelAccess`, and
@@ -6020,9 +6146,7 @@ impl ToolHandler for ServiceHandler {
             Some(_) => tenants::tenant_arg(&self.cfg, &args, lock(&self.kernel)?.entries())?,
         };
         if tenant.is_none() && args.get("deploy").is_some() {
-            return Err(CallError::Invalid(
-                "deploy: only a call inside a tenant names a deploy".into(),
-            ));
+            return Err(CallError::Invalid(DEPLOY_OUTSIDE_TENANT.into()));
         }
         // A node whose config asks for no service project, and whose desired state holds nothing of one, has no service:
         // the list is empty, and Incus is not asked. A node that still holds records of what it ran has not, so no call
@@ -6522,7 +6646,7 @@ impl ToolHandler for ServiceHandler {
                     .iter()
                     .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
                 {
-                    return Err(service_refused(format!("service {name} exists")));
+                    return Err(service_exists(&name));
                 }
                 let instance = crate::service::instance_name(tenant_id, &name);
                 if rows
@@ -6610,9 +6734,7 @@ impl ToolHandler for ServiceHandler {
                     // A tenant's machine joins the managed service network and nothing else: a host bridge would put
                     // it on the host's own network.
                     if tenant.is_some() && args.get("bridge").is_some() {
-                        return Err(service_refused(
-                            "bridge: a virtual machine in a tenant joins the managed service network only, never a host bridge",
-                        ));
+                        return Err(service_refused(TENANT_BRIDGE));
                     }
                     let network = if tenant.is_some() {
                         VmNetwork::Managed
@@ -6648,13 +6770,10 @@ impl ToolHandler for ServiceHandler {
                         VmNetwork::Managed => {}
                     }
                     if let Some(mac) = &mac
-                        && (service_entries(&entries).iter().any(|(_, other)| {
-                            other.vm.as_ref().and_then(|vm| vm.mac.as_ref()) == Some(mac)
-                        }) || rows.iter().any(|row| instance_holds_mac(row, mac)))
+                        && (record_holds_mac(&entries, mac)
+                            || rows.iter().any(|row| instance_holds_mac(row, mac)))
                     {
-                        return Err(service_refused(format!(
-                            "the MAC {mac} is already held by another instance"
-                        )));
+                        return Err(service_refused(mac_held(mac)));
                     }
                     if let Some(refusal) = create_room_refusal(
                         &self.cfg,
@@ -6793,9 +6912,7 @@ impl ToolHandler for ServiceHandler {
                 }
                 if let Some(scope) = &tenant {
                     if template.lan.is_some() || template.publishable {
-                        return Err(service_refused(format!(
-                            "template {template_name} opens a port on the host or publishes a dash, and nothing in a tenant does: a tenant's service is reached through the node's front service"
-                        )));
+                        return Err(service_refused(tenant_host_port(template_name)));
                     }
                     if let Some(refusal) =
                         create_room_refusal(&self.cfg, &all_entries, Some(scope), &name, &template)

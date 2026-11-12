@@ -184,6 +184,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
 
     // The token store is read before anything listens. The server and the SIGHUP handler share it.
     let tokens = TokenStore::load(&cfg.tokens.hash_dir).map_err(token_failure)?;
+    say_ignored_tokens(&tokens);
     let key = NodeKey::load_or_create(&cfg.state_dir.join(NODE_KEY_FILE))
         .map_err(|e| Failure::Runtime(e.to_string()))?;
     let node = key.id().to_hex();
@@ -712,6 +713,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 let tokens = match reload_tokens.reload(&reload_dir) {
                     Ok(count) => {
                         eprintln!("arca: {count} token(s) reloaded");
+                        say_ignored_tokens(&reload_tokens);
                         Some(count)
                     }
                     Err(error) => {
@@ -1238,6 +1240,17 @@ fn approval_failure(error: ApprovalRefusal) -> Failure {
 
 /// The token store's refusals as exits. A directory that cannot be read is an I/O failure (exit 1). A directory or file that
 /// is unsafe, missing or malformed is a config failure (exit 2), and the message says what to change.
+/// One line for each token file the store left out when it was last read: a file under the name approved actions
+/// run under. The node runs without it, and the line says how the file is removed.
+fn say_ignored_tokens(tokens: &TokenStore) {
+    for file in tokens.ignored() {
+        eprintln!(
+            "arca: token file {file} is ignored: it uses the name an action runs under once the owner approved it, so no token of that name is accepted. Remove it with: arca token revoke {}",
+            arca_mcp::auth::APPROVED_ACTION_ID
+        );
+    }
+}
+
 fn token_failure(error: TokenStoreError) -> Failure {
     match &error {
         TokenStoreError::Io { .. } => Failure::Runtime(error.to_string()),

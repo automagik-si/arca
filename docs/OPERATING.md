@@ -573,6 +573,12 @@ The file name is `<id>.hash`, and the id is 1 to 64 lowercase letters, digits or
 and `operator`. The `tools=` line is optional; without it the token reaches every verb its scope admits, and with it the token
 reaches only those named tools. A tool above the scope is refused at mint, so the list only narrows.
 
+One id is no token's: `owner-approval`, the name an action runs under once the owner approved it. `arca token mint`
+refuses it. A release before this one did not, so a file `owner-approval.hash` may exist: the node starts and reads
+every other token, leaves that file out, and writes one line each time it reads its tokens ("token file
+owner-approval.hash is ignored: ..."). Its secret is refused as any unknown token is. Remove the file with `arca
+token revoke owner-approval`.
+
 ### Modes and the umask
 
 **The token directory must be mode 0700 or 0500.** The server refuses any directory with a group or other write bit, and it
@@ -1804,9 +1810,43 @@ waits: another create, or a config that lowers a cap. The owner's approval is th
 retired, and the answer begins "The approval was accepted, but service_create did not complete:" and carries
 `proposeAgain: true`. Proposed again while the node is still full, it is refused when it is made.
 
+A card that waited while the node filled up stays on the owner's page and can still be approved; that approval is
+used up and the create then refuses. Proposing the same create again in that time is refused for want of room, and
+the old card stands until it is declined or its fifteen minutes pass: decline it. A create that fits only once
+something else is removed is refused until that removal has run, because the caps count what the node holds now:
+remove first, then propose the create.
+
 One refusal for want of room can still come after an approval on a node where nothing changed: the service subnet, or
 a tenant's block, has no free address. Addresses in use are read from Incus, and a proposal is answered without
 Incus. `function_create` and `postgres_create` are held to no cap; only the free address applies to them.
+
+**What else a proposed create is refused for when it is made.** The arguments are held to the verb's schema first,
+so a name that is not a service name is told as that. Then everything the create would refuse for what the node's
+config and its own records hold is refused in the create's words, and no card is recorded:
+
+- a name a service of that tenant, or of the node, already holds (`service <name> exists`), and a name a function
+  holds;
+- a `deploy` named outside a tenant; a deploy that is closed; and a deploy a token opened. An approved create runs
+  as the approval itself and not as any token, so a card can open a deploy, and a later card can add to a deploy a
+  card opened while it is provisional, but no card adds to a deploy a token opened. The proposal and the create say
+  it in one sentence, which is also what a token is told about a deploy another token or a card opened: "deploy
+  <id> was opened by another caller: only the caller that opened a deploy adds to it, and an approved action runs
+  as the owner's approval, never as the token that proposed it";
+- a tenant's virtual machine that names a `bridge`, and a tenant's service from a template that opens a port on
+  the host (`lan`) or publishes a dash;
+- a `mac` another of the node's records holds;
+- a config that leaves the service project out or sets up no service network, on a node that makes changes;
+- a virtual-machine count the config sets below the machines the node holds.
+
+What is read from Incus is asked by the approved create alone, so these can still follow an approval: Incus does
+not answer; an instance of that name exists that is not Arca's; a local image the template pins is not there; an
+instance Arca holds no record of has the MAC; the Incus project exists and this node did not make it; the default
+profile names no storage pool; no address is free; and whatever Incus itself refuses while it creates or starts
+the instance. An instance that carries Arca's marks and that the node holds no record of is adopted first, and the
+create then answers `service <name> exists`. The node's own disk can refuse too: the deploy journal or the
+service's secrets cannot be written. So can anything that changed while the card waited: the template (see above), the room, the name, a
+deploy that closed, or a restart of the node with another config. A node that only looks records a proposal as
+before, and its create is refused.
 
 A token's own `service_create` shows no card and binds nothing, as before. It may state `templateDigest` or `image`
 itself, and is then refused when the node's template differs. Not part of the fingerprint: why a service is created
@@ -3266,7 +3306,8 @@ mode must fit the desired state, and the bridge must be an allowed one. A bridge
 then. The owner's card says "Create the virtual machine <name> from template <template> on the host bridge <bridge>"
 and lists the bridge and the MAC. The caps are checked when the proposal is made too (see "A proposal the node has
 no room for is refused when it is made"), and again when the approved create runs, because the node can fill up while
-a proposal waits. The MAC is checked when the approved create runs. `service_remove` needs the owner's approval and retires the virtual machine through the same delete plan.
+a proposal waits. A MAC another of the node's records holds is refused when the proposal is made; whether an instance
+Arca holds no record of has it is read from Incus when the approved create runs. `service_remove` needs the owner's approval and retires the virtual machine through the same delete plan.
 `service_logs` returns the virtual machine's console log.
 
 What a bridged node refuses, and why:
