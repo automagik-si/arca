@@ -103,7 +103,11 @@ fn arca() -> Command {
     command
         .env("HOME", "/nonexistent/arca-test-home")
         .env_remove("ARCA_CONFIG")
-        .env_remove("ARCA_TOKEN_FILE");
+        .env_remove("ARCA_TOKEN_FILE")
+        // No screen, unless a test says there is one: what `init` and `status` say next depends on it, and must not
+        // depend on where the tests run.
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
     command
 }
 
@@ -1116,8 +1120,12 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool) {
             String::from_utf8_lossy(&out.stderr)
         );
         let said = String::from_utf8_lossy(&out.stdout).to_string();
+        // Init's report is short: the page it wrote is named before the question, and the report ends in the one
+        // pointer to the rest.
         assert!(
-            said.contains(&format!("passkey on the page: {origin}/approve")),
+            said.contains(&format!("approvalOrigin: {origin}, the approval page"))
+                && said.contains("A database: ask your assistant for the postgres-autopg service.")
+                && said.contains("More: `arca status --config "),
             "{said}"
         );
         let written: Value =

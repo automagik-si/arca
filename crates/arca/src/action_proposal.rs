@@ -122,6 +122,11 @@ fn setting_words(value: &Value) -> String {
     }
 }
 
+/// Why a proposed `postgres_create` is refused on a node whose config names no image for it, and what to propose
+/// instead. `arca init` writes no `kernel.postgresImage`: the Postgres plugin creates from an image Incus already
+/// holds and fetches none, so a key alone would only move the failure to the moment the owner approves.
+pub const NO_POSTGRES_IMAGE: &str = "this node has no image for a proposed postgres_create: its config sets no kernel.postgresImage, and arca init sets none. For a database on this node, propose service_create with the template postgres-autopg (args: a name, and \"template\": \"postgres-autopg\"): it fetches its own pinned image, and waits for the owner's approval like any change";
+
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
     pub const ALL: [ActionKind; 20] = [
@@ -234,10 +239,9 @@ impl ActionKind {
         }
         if self == Self::PostgresCreate {
             let Some(default) = postgres_image else {
-                return Err(
-                    "the kernel has no configured postgres image; set kernel.postgresImage"
-                        .to_string(),
-                );
+                // The node `arca init` leaves sets no such image, so the refusal names the database that works on
+                // it today: the shipped service template, which fetches its own pinned image.
+                return Err(NO_POSTGRES_IMAGE.to_string());
             };
             if arca_postgres::fingerprint(default).is_err() {
                 return Err(
@@ -1377,6 +1381,29 @@ mod tests {
     const PINNED_IMAGE: &str = "docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     /// Another pinned image, as a kernel configured differently would name.
     const OTHER_IMAGE: &str = "docker.io/library/postgres@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// The node `arca init` leaves names no image for a proposed database. The refusal says so and names what to
+    /// propose instead, so an assistant that reads it can go on without a person editing the config.
+    #[test]
+    fn a_proposed_database_on_a_node_with_no_image_is_refused_with_the_proposal_that_works_there() {
+        let why = ActionKind::PostgresCreate
+            .prepare(&json!({ "name": "db1" }), None)
+            .expect_err("no image, no proposed database");
+        assert_eq!(why, NO_POSTGRES_IMAGE);
+        for said in [
+            "its config sets no kernel.postgresImage, and arca init sets none",
+            "propose service_create with the template postgres-autopg",
+            "waits for the owner's approval like any change",
+        ] {
+            assert!(why.contains(said), "{said:?} is missing: {why}");
+        }
+        // The template it names is one the program ships.
+        assert!(
+            crate::cmd_templates::SHIPPED
+                .iter()
+                .any(|(name, _)| *name == "postgres-autopg.json")
+        );
+    }
 
     #[test]
     fn a_field_the_action_does_not_take_is_named_with_its_place_and_the_fields_it_takes() {

@@ -660,8 +660,16 @@ fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
         )),
         "{words}"
     );
+    // The last two lines: the ONE thing to do next, and the one pointer to everything else, with the config it read.
     assert!(
-        lines.last().is_some_and(|line| line.starts_with("Next: ")),
+        lines.len() >= 2 && lines[lines.len() - 2].starts_with("Next: "),
+        "{words}"
+    );
+    assert_eq!(words.matches("Next: ").count(), 1, "{words}");
+    assert!(
+        lines
+            .last()
+            .is_some_and(|line| line.starts_with("More: arca status --security --config ")),
         "{words}"
     );
 

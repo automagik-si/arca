@@ -13,6 +13,11 @@ refusal and every answer of such a node, `this node only looks: nothing here can
 with changes turned on (arca init --enable-changes, then restart the node if init did not)`. Their codes are unchanged
 (`InstanceLifecycleDisabled`, `StorageDisabled`, `GpuDisabled`): match on the code, not on the words.
 
+**If you installed the templates with 0.12.0 or older:** the shipped `postgres-autopg` template now makes the
+database's password itself, so a database you approve on the page starts by itself. Your node keeps the template it
+already has. To get the new one, run `arca templates install --replace --config <file>`; it overwrites shipped
+templates you edited. A `postgres-autopg` service that already exists is not changed, and keeps its password.
+
 ## 0.12.0 (2026-11-12)
 
 - the installer shows the one line that connects an assistant, arca status says who approves and which tokens do not wait, and a machine with no screen is told what to run
