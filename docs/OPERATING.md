@@ -4604,7 +4604,7 @@ action_propose { "action": "function_create", "args": {
 
 | Field | Rule |
 |-------|------|
-| `name` | A service's grammar. Functions and services share one name space: neither takes a name the other holds, and each verb keeps to its kind (`service_status` of a function, and `function_run` of a service, are refused in words). |
+| `name` | A service's grammar. Functions and services share one name space: neither takes a name the other holds, and each verb keeps to its kind (`service_status` of a function, and `function_run` of a service, are refused in words). A function's instance has the function's name, so a name that is a tenant's instance name (`x-<tenant id>` for that tenant's service `x`) is refused too, when it is proposed and when the approved create runs: `the name <name> is taken on this node: ...`; and a tenant's `x` is refused while the function `x-<tenant id>` is there. |
 | `image`, `digest` | `<registry>/<repository>` in lower case and `sha256:` with 64 hex digits. Never a tag. Arca pulls the image without a credential. |
 | `command` | Optional. The program's absolute path inside the image, then its arguments. No shell runs it. Left out, the image's own entry point runs. |
 | `env` | Plain values by name, at most 32, each at most 160 characters. The card shows each whole. |
