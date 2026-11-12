@@ -25,9 +25,12 @@ its renderer, polling and styles.
 
 ## Install
 
-Use Node **24.9.0 or newer** and **`@deepseek-ai/dsh@0.2.2-rc.1`**. npm's `latest`
-tag was checked against that exact release on 2026-11-05. Install the package at
-an exact full commit containing this directory:
+Use Node **24.9.0 or newer** and **`@deepseek-ai/dsh@0.2.2-rc.1`** or **`0.2.2-rc.2`**:
+the package was checked against those two exact releases (npm's `latest` and `next`
+tags on 2026-11-12). DSH leaves out a plugin whose `engines.dsh` range its own version
+does not meet, and counts prereleases when it compares: the range here is
+`>=0.2.2-rc.1 <0.3.0-0`, which takes every 0.2.2 release from rc.1 on and no 0.3.0
+prerelease. Install the package at an exact full commit containing this directory:
 
 ```sh
 dsh plugin --profile <profile> add -w "github:automagik-si/arca#<commit>&path:/packages/arca-canvas-dsh"
