@@ -13,6 +13,23 @@ newer DSH was refused as an image that exists, and the old one had to be deleted
 installed copy nobody edited is brought up to date by the upgrade. A node's image of before stays, and a service made
 from it keeps running; a new `automagik` service is refused with the new name until that image is built with
 `templates/automagik.build.sh`.
+
+More of a key is hidden in `service_logs`, a failed command's words and a function's output, and less of what follows
+it. A PEM block whose END line was not printed is hidden over the lines after its BEGIN line that look like a key
+(base64 of 16 characters or more, or a PEM header), and no longer to the end of the text, so a log or a function's
+result after it stays shown. A text that begins inside a key (an END line with no BEGIN line before it) is hidden
+from its start to that END line, so a window of a container's journal that starts inside a key shows none of the key
+when the key's END line is inside the window. A run of 16 or more base64 characters that lies inside a stored key's
+body is hidden, printed at another width or with each `/` written `\/`. A label may hold lowercase letters and
+hyphens (`OpenVPN Static key V1`). A function's kept outputs and its runs' lines are redacted again when
+`function_runs` reads them, with the secrets stored then.
+
+Known gaps: for a key that is not a stored secret, its lines after a BEGIN line with no END are still shown when each
+carries a prefix (a journal's timestamp, a colour code), and so is a key longer than a journal window when neither its
+BEGIN nor its END line is inside the window; a stray END line hides the text from its start, so a function's result
+that names such a line is hidden too; a stray BEGIN line hides everything up to the next END line. `docs/OPERATING.md`
+lists them all.
+
 ## 0.14.0 (2026-11-12)
 
 The metrics sampler no longer reads the listing of every instance with its live state each tick. On a node where one
@@ -40,18 +57,9 @@ refused it.
 A secret of several lines, such as a key file a virtual machine reads, is now hidden in `service_logs`, in a failed
 command's words and in a function's output. Before, a log was cleaned line by line before the stored values were looked
 for, so a value of several lines was never found and a key the guest printed on its console was shown to any token
-that may read logs. Each line of such a secret of 16 characters or more is now hidden as a value of its own, and so is
-any piece of 16 or more of its base64 body, printed at another width or with each `/` written `\/`. A PEM block printed
-in a log, a failed command's words or a function's output is hidden whole before the text is cut into lines, a stored
-secret or not: from its BEGIN line to its END line; when no END line follows, over the lines after the BEGIN line that
-look like a key (base64 of 16 characters or more, or a PEM header), so the text after the key, and a function's result,
-stay shown; and when the text begins inside a key (an END line with no BEGIN line before it), from its start to that
-END line, so a window of a container's journal that starts inside a key shows none of it. A label may hold lowercase
-letters and hyphens (`OpenVPN Static key V1`). A function's kept outputs and its runs' lines are redacted again when `function_runs`
-reads them, with the secrets stored then, so an output kept by an earlier release, or before a secret was set, shows
-none of them. What is still shown: the last line of a key printed without its END line when it is shorter than 16
-characters, and a stored key whose letters were changed in case. Certificates, public keys and other public PEM
-blocks are hidden too.
+that may read logs. Each line of such a secret of 16 characters or more is now hidden as a value of its own, and every
+PEM block (BEGIN to END) is hidden whole before the log is cut into lines, a stored secret or not. A PEM block whose
+END line was not printed is hidden to the end of the text, so a log after such a line shows `[secret]` and nothing more.
 
 More of what a `service_create` would refuse is now refused when it is proposed, in the create's words, so no card is
 shown for it: a name that is taken, a deploy the approved create could not add to, a tenant's machine on a host
