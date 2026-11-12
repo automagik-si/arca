@@ -659,6 +659,15 @@ settle_door() {
     esac
     door_want=$door_was
     if ! program_has_door; then
+        # A no the owner wrote by hand has only the config to live in, and this program's config cannot hold it: it
+        # goes into the note, as --no-door's does. A null is that no; so is a config without the key under a program
+        # that had the door.
+        if [ -z "$door_flag" ]; then
+            if [ "$door_was" = null ] ||
+                { [ "$door_was" = absent ] && [ -n "$was_version" ] && version_has_door "$was_version"; }; then
+                : >"$door_no"
+            fi
+        fi
         door_want=absent
         door_note="none: this program is older than $DOOR_SINCE, the first release that has one"
     elif [ "$door_flag" = no-door ] || { [ -z "$door_flag" ] && exists "$door_no" && { [ "$door_was" = new ] || [ "$door_was" = absent ]; }; }; then
@@ -970,6 +979,22 @@ report() {
         return 1
     fi
 
+    if [ -n "$door_shut" ]; then
+        # Another program holds the door's port. Whatever answers there is not this node, so nothing is printed that
+        # would send the token to it: no line to run, and no entry to paste.
+        say "Connect an assistant. One way works right now:"
+        say
+        say "  1. An assistant with a shell on this machine, as the user $user, runs \`arca call <verb>\`:"
+        say "       $status_command"
+        say "     \`watch_report\` in place of \`arca_status\` lists every project and instance with its owner."
+        say
+        say "  The HTTP door is CLOSED: the node could not take port $door_port ($door_shut)."
+        say "  Whatever answers on that port now is not this node, so this script prints no line and no entry for it:"
+        say "  a token sent there would go to that program. The node keeps trying the port. The command above says"
+        say "  \"open\":true under \"loopback\" once it has it; run this script again then, and it prints the line."
+        say "  To have no door at all: sh install.sh --no-door"
+        return "$result"
+    fi
     say "Connect an assistant. Two ways work today:"
     say
     if [ -n "$door_url" ]; then
@@ -990,10 +1015,7 @@ report() {
         say "     port $door_port, and would then receive what a client sends there, the token included. Way 2 below"
         say "     uses a socket only $user can open and is not exposed to that. To have no door at all:"
         say "       sh install.sh --no-door"
-        if [ -n "$door_shut" ]; then
-            say "     The door is closed right now ($door_shut):"
-            say "     the line and the entry work once the node has the port. Until then, do not send the token there."
-        elif [ "$service" != unit ]; then
+        if [ "$service" != unit ]; then
             say "     This script started no node: the door is open once a node has started with this config."
         fi
         say

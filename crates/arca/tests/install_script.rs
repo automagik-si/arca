@@ -1213,6 +1213,63 @@ fn a_door_the_owner_took_out_by_hand_is_not_put_back() {
 }
 
 #[test]
+fn a_no_written_by_hand_survives_a_downgrade_to_a_program_from_before_the_door_and_the_upgrade_back()
+ {
+    let version = door_since();
+    for by_hand in ["the key removed", "the key set to null"] {
+        let machine = Machine::new();
+        machine.release(BEFORE_DOOR);
+        machine.release(&version);
+        machine.run(&["--version", &version]).ok();
+        let config = machine.home(".config/arca/node.json");
+        let with_door = fs::read_to_string(&config).expect("the config");
+        let edited = if by_hand == "the key removed" {
+            with_door.replace(", \"loopback\": \"127.0.0.1:7471\"", "")
+        } else {
+            with_door.replace("\"loopback\": \"127.0.0.1:7471\"", "\"loopback\": null")
+        };
+        assert_ne!(edited, with_door);
+        fs::write(&config, &edited).expect("the edited config");
+
+        // The older program refuses a config that names the key, so a null is dropped from it. The no is not: it
+        // goes into the script's note, as --no-door's does.
+        machine.run(&["--version", BEFORE_DOOR]).ok();
+        assert_eq!(
+            config_on_disk(&machine),
+            quickstart_config(&machine, None),
+            "{by_hand}"
+        );
+        assert!(
+            machine.home(".local/state/arca-install/no-door").exists(),
+            "{by_hand}: the no is kept in the note"
+        );
+
+        // Back on a program with the door: the config says the no again, and no door is opened.
+        let run = machine.run(&["--version", &version]);
+        run.ok()
+            .says("door      none: the config says so")
+            .never_says("claude mcp add")
+            .never_says("the door is all that was added");
+        assert_eq!(
+            config_on_disk(&machine),
+            config_without_a_door(&machine),
+            "{by_hand}"
+        );
+    }
+
+    // A door that was open makes the same trip and comes back open: a downgrade is not a no.
+    let machine = Machine::new();
+    machine.release(BEFORE_DOOR);
+    machine.release(&version);
+    machine.run(&["--version", &version]).ok();
+    machine.run(&["--version", BEFORE_DOOR]).ok();
+    assert!(!machine.home(".local/state/arca-install/no-door").exists());
+    let run = machine.run(&["--version", &version]);
+    run.ok();
+    says_the_door(&machine, &run, 7471);
+}
+
+#[test]
 fn a_no_said_under_a_program_from_before_the_door_is_kept_by_the_upgrade_that_brings_it() {
     let version = door_since();
     let machine = Machine::new();
@@ -1255,10 +1312,26 @@ fn a_flag_changes_nothing_in_a_config_the_script_did_not_write_and_a_closed_door
     run.ok()
         .says("door      CLOSED: the node could not take http://127.0.0.1:7471/mcp")
         .says("(address in use: another program holds this port). It runs without the door and keeps trying the port.")
-        .says("The door is closed right now (address in use: another program holds this port):")
-        .says("Until then, do not send the token there.")
+        .says("The HTTP door is CLOSED: the node could not take port 7471 (address in use: another program holds this port).")
+        .says("run this script again then, and it prints the line.")
+        .says("call arca_status --config")
         .says("node      mode watch-only")
+        // Nothing that would send the token to whatever holds the port: no line to run, no entry to paste, no URL
+        // to copy out of one.
+        .never_says("claude mcp add")
+        .never_says("mcpServers")
+        .never_says("Authorization: Bearer")
         .never_says(TOKEN);
+    // Once the node has the port, the same run prints the line again.
+    machine.switch("node-door-closed", false);
+    let run = machine.run(&["--version", &version]);
+    run.ok();
+    says_the_door(&machine, &run, 7471);
+    machine.switch("node-door-closed", true);
+    machine
+        .run(&["--version", &version])
+        .ok()
+        .never_says("claude mcp add");
     machine.switch("node-door-closed", false);
 
     // A config with one letter of the owner's own: neither flag touches it, and the report says so.
