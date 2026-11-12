@@ -1617,6 +1617,16 @@ impl ToolHandler for ActionPropose {
             let entries = lock(&self.kernel)?.entries().to_vec();
             tenants::check_deploy_remove(node, &entries, &payload, now)?;
             payload
+        } else if action == ActionKind::ServiceRemove && payload.get("tenant").is_none() {
+            // A service a function links to is not removed, so the owner is never shown a card for it.
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            if let Some(refusal) = function_handlers::linked_service_refusal(
+                &entries,
+                payload["name"].as_str().unwrap_or_default(),
+            ) {
+                return Err(refusal);
+            }
+            payload
         } else if let (ActionKind::FunctionCreate, Some(node)) = (action, &self.node) {
             // The proposal names every default and every private destination, so the card shows them and the
             // approval binds them. A create the node would refuse is refused now.
@@ -4752,6 +4762,10 @@ pub(crate) fn adopted_config(
     if row["type"].as_str() == Some(crate::service::VM_KIND) {
         return None;
     }
+    // Neither is a function's instance: a function is made by its create, from the definition its owner approved.
+    if row["config"][crate::service::FUNCTION_KEY].is_string() {
+        return None;
+    }
     let project = row["project"].as_str()?;
     let config = row["config"].as_object()?;
     let template = config.get(crate::service::TEMPLATE_KEY)?.as_str()?;
@@ -5760,6 +5774,14 @@ impl ToolHandler for ServiceHandler {
                 };
                 if config.adopted {
                     return Err(service_wiring::adopted(&name));
+                }
+                // A service a function links to stays until the function is gone: said before any approval is
+                // spent.
+                if tenant.is_none()
+                    && let Some(refusal) =
+                        function_handlers::linked_service_refusal(&all_entries, &name)
+                {
+                    return Err(refusal);
                 }
                 let id = entry.id.clone();
                 let spent = if preapproved {

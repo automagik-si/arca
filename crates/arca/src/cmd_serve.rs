@@ -494,32 +494,43 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // A kernel-mode node with the managed service network runs functions. Before the timer starts, a function
     // instance a stopped kernel left running is stopped: nobody watches that run any more. The meter reads memory and
     // CPU from this machine's cgroup tree only while the node's Incus is this machine's.
+    // Nothing of it stops `serve`: a runner that cannot be made, or a timer that cannot start, is said on the log and
+    // the node serves everything else, with the function verbs answering that it runs no functions.
     let functions = if kernel_mode && cfg.kernel.service_cidr.is_some() {
         let source = Arc::clone(&metrics_source);
-        let runner = Arc::new(
-            crate::function_run::FunctionRunner::new(
-                Arc::clone(&kernel),
-                Arc::new(cfg.clone()),
-                clock.clone(),
-            )
-            .map_err(Failure::Runtime)?
-            .with_cgroup(Arc::new(move || {
-                source
-                    .lock()
-                    .ok()
-                    .filter(|choice| choice.is_local())
-                    .map(|_| PathBuf::from("/sys/fs/cgroup"))
-            })),
-        );
-        for name in runner.sweep() {
-            eprintln!(
-                "arca: a run of function {name} was still going from a kernel that stopped: it was stopped, and the run log says so"
-            );
+        match crate::function_run::FunctionRunner::new(
+            Arc::clone(&kernel),
+            Arc::new(cfg.clone()),
+            clock.clone(),
+        ) {
+            Ok(runner) => {
+                let runner = Arc::new(runner.with_cgroup(Arc::new(move || {
+                    source
+                        .lock()
+                        .ok()
+                        .filter(|choice| choice.is_local())
+                        .map(|_| PathBuf::from("/sys/fs/cgroup"))
+                })));
+                for name in runner.sweep() {
+                    eprintln!(
+                        "arca: a run of function {name} was still going from a kernel that stopped: it was stopped, and the run log says so"
+                    );
+                }
+                match Arc::clone(&runner).spawn_timer() {
+                    Ok(()) => Some(runner),
+                    Err(error) => {
+                        eprintln!(
+                            "arca: the function timer did not start, so this node runs no functions: {error}"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("arca: this node runs no functions: {error}");
+                None
+            }
         }
-        Arc::clone(&runner)
-            .spawn_timer()
-            .map_err(|e| Failure::Runtime(e.to_string()))?;
-        Some(runner)
     } else {
         None
     };

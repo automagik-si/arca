@@ -1,8 +1,9 @@
 //! One run of a function: the writes the kernel sends to a function's own instance, outside the desired-state journal.
 //!
-//! A function is a container the kernel starts for one run and stops itself. This module is the only path that does so,
-//! and the only one in the crate that may force a stop: [`StateChanger`] never forces one, and nothing here is reachable
-//! through it. Every call reads the instance first and refuses one that does not carry the function mark
+//! A function is a container the kernel starts for one run and stops itself. This module is the only path that does so.
+//! It forces a stop when a run passes its time limit; the instance verbs' own writer, [`StateChanger::change`], never
+//! forces one, and nothing here is reachable through it. (A forced stop is also part of the kernel's delete of an
+//! instance and of the folder and adoption writers, each on its own object.) Every call reads the instance first and refuses one that does not carry the function mark
 //! ([`FUNCTION_KEY`]) in its own config, or that is not a container, before anything is written. A service's instance
 //! never carries the mark, so no service is ever started, stopped or force-stopped from here.
 //!

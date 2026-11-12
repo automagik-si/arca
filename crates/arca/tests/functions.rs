@@ -300,6 +300,10 @@ impl Rig {
         }
     }
 
+    fn entries(&self) -> Vec<arca_kernel::desired::Entry> {
+        self.kernel.lock().expect("kernel").entries().to_vec()
+    }
+
     fn runs(&self, name: &str) -> Vec<Value> {
         self.call_as(Scope::Viewer, "function_runs", json!({ "name": name }))
             .expect("runs")["runs"]
@@ -437,7 +441,7 @@ fn a_function_is_created_only_from_an_approved_proposal_whose_card_names_what_it
     assert_eq!(created["lastRun"], Value::Null);
     assert_eq!(created["links"], json!([{ "to": "nats", "port": 4222 }]));
 
-    // Its instance is the function's own container: marked, stopped, limited, never started at boot.
+    // Its instance is the function's own container: marked, stopped, limited, and never started by Incus at boot.
     let instance = rig.instance("relay");
     let config = &instance["config"];
     assert_eq!(instance["status"], "Stopped");
@@ -447,7 +451,7 @@ fn a_function_is_created_only_from_an_approved_proposal_whose_card_names_what_it
     assert_eq!(config["limits.memory.swap"], "false");
     assert_eq!(config["oci.entrypoint"], "/relay --once");
     assert_eq!(config["environment.BATCH"], "500");
-    assert!(config.get("boot.autostart").is_none(), "{config}");
+    assert_eq!(config["boot.autostart"], "false", "{config}");
     // Its root is not read-only: Incus refuses to start an OCI container whose root is (seen on Incus 7.5.1).
     assert!(instance["devices"]["root"].get("readonly").is_none());
     assert_eq!(
@@ -973,6 +977,305 @@ fn a_run_starts_only_the_instance_arca_created_for_its_function() {
     assert_eq!(rig.instance("relay")["status"], "Stopped");
 }
 
+/// The word the owner of the linked database signs in with, in the tests that rotate it.
+const OWNERS_WORD: &str = "owner-word-of-pg";
+
+/// A database address with a user and a word in it, put together when the test runs.
+fn database_url(user: &str, word: &str, database: &str) -> String {
+    let mut url = String::from("postgresql");
+    url.push_str("://");
+    url.push_str(user);
+    url.push(':');
+    url.push_str(word);
+    url.push('@');
+    url.push_str("192.0.2.10:5432/");
+    url.push_str(database);
+    url
+}
+
+/// A Postgres-like template: a secret of its own, and a connection value it hands the services linked to it.
+fn pg_template() -> Value {
+    json!({
+        "name": "pg", "kind": "oci", "image": "registry.example/acme/pg", "digest": DIGEST,
+        "ports": [5432],
+        "env": { "POSTGRES_PASSWORD": "{{secret:POSTGRES_PASSWORD}}" },
+        "secrets": ["POSTGRES_PASSWORD"],
+        "provides": { "env": { "DATABASE_URL": database_url("app", "{{secret:POSTGRES_PASSWORD}}", "app")
+            .replace("192.0.2.10:5432", "{{host}}:{{port}}") } },
+        "publishable": false
+    })
+}
+
+#[test]
+fn a_linked_services_secret_never_enters_a_functions_environment() {
+    let rig = Rig::new();
+    fs::write(rig.dir.join("templates/pg.json"), pg_template().to_string()).expect("template");
+    rig.call("service_create", json!({ "name": "pg", "template": "pg" }))
+        .expect("the service pg");
+    // One function names DATABASE_URL as its own secret, set to a narrow role's. The other names no secret at all.
+    let mut relay = relay_args();
+    relay["links"] = json!([{ "to": "pg", "port": 5432 }]);
+    relay["secrets"] = json!(["DATABASE_URL"]);
+    rig.approved("function_create", relay).expect("relay");
+    let mut tick = relay_args();
+    tick["name"] = json!("tick");
+    tick["links"] = json!([{ "to": "pg", "port": 5432 }]);
+    rig.approved("function_create", tick).expect("tick");
+    let narrow = database_url(
+        "relay_only",
+        &["narrow", "role", "word"].join("-"),
+        "control",
+    );
+    rig.call(
+        "function_secret_set",
+        json!({ "name": "relay", "key": "DATABASE_URL", "value": narrow }),
+    )
+    .expect("set");
+    let records = |rig: &Rig| -> Vec<Value> {
+        rig.entries()
+            .into_iter()
+            .filter(|entry| ["service-relay", "service-tick"].contains(&entry.id.0.as_str()))
+            .map(|entry| entry.config)
+            .collect()
+    };
+    let before = records(&rig);
+    let instances = (
+        rig.instance("relay")["config"].clone(),
+        rig.instance("tick")["config"].clone(),
+    );
+
+    // The linked service's own secret is set, as a routine rotation sets it. A service linked to pg would be handed
+    // pg's DATABASE_URL, the owner of the database's. A function is handed nothing.
+    rig.call(
+        "service_secret_set",
+        json!({ "name": "pg", "key": "POSTGRES_PASSWORD", "value": OWNERS_WORD }),
+    )
+    .expect("the provider's secret is set");
+    assert_eq!(records(&rig), before, "no function's record changed");
+    assert_eq!(rig.instance("relay")["config"], instances.0);
+    assert_eq!(rig.instance("tick")["config"], instances.1);
+    assert_eq!(
+        rig.instance("relay")["config"]["environment.DATABASE_URL"],
+        narrow
+    );
+    assert!(
+        rig.instance("tick")["config"]
+            .get("environment.DATABASE_URL")
+            .is_none()
+    );
+    assert!(
+        !rig.instance("relay")["config"]
+            .to_string()
+            .contains(OWNERS_WORD)
+    );
+
+    // And whatever else tried to put a name into a function's environment, the plugin refuses the record: a run is
+    // given what the definition names and nothing else.
+    let owners = database_url("app", OWNERS_WORD, "app");
+    for (key, value) in [("DATABASE_URL", owners.as_str()), ("EXTRA", "anything")] {
+        let mut entry = rig
+            .entries()
+            .into_iter()
+            .find(|entry| entry.id.0 == "service-tick")
+            .expect("tick's record");
+        entry.config["environment"][key] = json!(value);
+        let outcomes = rig
+            .kernel
+            .lock()
+            .unwrap()
+            .propose(vec![arca::desired_store::EntryChange::Put(entry)], NOW)
+            .expect("the document is taken");
+        let said = format!("{outcomes:?}");
+        assert!(
+            said.contains("Failed") && said.contains("a function is a container"),
+            "{said}"
+        );
+        assert!(
+            rig.instance("tick")["config"]
+                .get(format!("environment.{key}"))
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn a_service_a_function_links_to_is_not_removed_until_the_function_is() {
+    let rig = Rig::new();
+    rig.relay();
+    let said = "remove service nats: the function relay links to it, and what a function reaches is part of what its owner approved. Remove the function relay first (function_remove); nothing was removed and no approval was spent";
+    // Refused when it is proposed, so the owner is never shown the card.
+    let (_, message) = refusal(rig.propose("service_remove", json!({ "name": "nats" })));
+    assert_eq!(message, said);
+    assert!(rig.kernel.lock().unwrap().action_proposals().is_empty());
+    // And in the removal itself, before any approval is looked at.
+    let (_, message) = refusal(rig.call(
+        "service_remove",
+        json!({ "name": "nats", "approval": "not-an-approval" }),
+    ));
+    assert_eq!(message, said);
+    // Nothing of either changed.
+    assert_eq!(rig.instance("nats")["status"], "Running");
+    let record = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "service-relay")
+        .expect("relay's record");
+    assert_eq!(record.config["links"][0]["to"], "nats");
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    assert_eq!(rig.run("relay")["outcome"], "ok");
+    // With the function gone the service is removed as any other.
+    rig.approved("function_remove", json!({ "name": "relay" }))
+        .expect("the function is removed");
+    rig.approved("service_remove", json!({ "name": "nats" }))
+        .expect("the service is removed");
+    assert!(
+        rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
+            .is_none()
+    );
+}
+
+#[test]
+fn a_secret_the_program_prints_escaped_or_spaced_is_in_no_line_result_or_output() {
+    let rig = Rig::new();
+    rig.nats();
+    let mut args = relay_args();
+    args["secrets"] = json!(["TOKEN", "PHRASE"]);
+    rig.approved("function_create", args).expect("created");
+    // One value a JSON encoder must escape, one with two spaces in a row.
+    let token = r#"Tr0ub4dor&3"x\yz"#;
+    let phrase = "correct  horse battery";
+    for (key, value) in [("TOKEN", token), ("PHRASE", phrase)] {
+        rig.call(
+            "function_secret_set",
+            json!({ "name": "relay", "key": key, "value": value }),
+        )
+        .expect("set");
+    }
+    // The program prints both plainly, then a result line as two encoders write it: one escapes the quote and the
+    // backslash, the other writes the ampersand as \u0026 too. The value is a name of the object as well.
+    let outputs = [
+        format!(
+            "auth failed for {token}\nphrase was {phrase}\n{}\n",
+            json!({ "ok": false, "error": format!("auth failed for {token}"), token: 1, "nested": [{ "p": phrase }] })
+        ),
+        "{\"ok\":false,\"error\":\"auth failed for Tr0ub4dor\\u00263\\\"x\\\\yz\"}\n".to_string(),
+    ];
+    for output in outputs {
+        rig.fake.exit_after_start(PROJECT, "relay", 0, &output);
+        let line = rig.run("relay");
+        assert_eq!(line["outcome"], "failed", "{line}");
+        let shown = rig
+            .call_as(
+                Scope::Viewer,
+                "function_runs",
+                json!({ "name": "relay", "run": line["run"] }),
+            )
+            .expect("the run");
+        let listed = rig
+            .call_as(Scope::Viewer, "function_list", json!({}))
+            .expect("list");
+        let kept = fs::read_to_string(
+            rig.dir
+                .join(RUNS_DIR)
+                .join("output/relay")
+                .join(format!("{}.log", line["run"].as_str().unwrap())),
+        )
+        .expect("the kept output");
+        let month =
+            fs::read_to_string(rig.dir.join(RUNS_DIR).join("runs-2026-10.jsonl")).expect("log");
+        for text in [
+            line.to_string(),
+            shown.to_string(),
+            listed.to_string(),
+            kept,
+            month,
+        ] {
+            for part in ["Tr0ub4dor", "x\\yz", "horse"] {
+                assert!(!text.contains(part), "{part} is in: {text}");
+            }
+        }
+        assert!(
+            line["result"]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("auth failed for ")
+        );
+    }
+}
+
+#[test]
+fn a_run_through_the_verb_and_one_through_the_timer_write_only_the_run_log() {
+    let rig = Rig::new();
+    rig.relay();
+    rig.fake.exit_after_start(PROJECT, "relay", 1, OK);
+    let before = rig.state_files();
+    let journal = fs::read(rig.dir.join(arca::kernel::JOURNAL_FILE)).expect("the effect journal");
+    let entries = rig.entries();
+    // The verb, as a doctor token calls it, and then the timer's own tick.
+    rig.call("function_run", json!({ "name": "relay" }))
+        .expect("started");
+    rig.settle("relay");
+    rig.now.store(NOW + 30_000, Ordering::SeqCst);
+    assert_eq!(rig.runner.tick(NOW + 30_000).len(), 1);
+    rig.settle("relay");
+    // And the two reads a viewer makes of them.
+    assert_eq!(rig.runs("relay").len(), 2);
+    rig.call_as(Scope::Viewer, "function_list", json!({}))
+        .expect("list");
+    assert_eq!(
+        rig.state_files(),
+        before,
+        "no file outside the run log changed"
+    );
+    assert_eq!(
+        fs::read(rig.dir.join(arca::kernel::JOURNAL_FILE)).expect("the journal"),
+        journal
+    );
+    assert_eq!(rig.entries(), entries);
+    let triggers: Vec<String> = rig
+        .runs("relay")
+        .iter()
+        .map(|run| {
+            format!(
+                "{}:{}",
+                run["trigger"].as_str().unwrap(),
+                run["outcome"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(triggers, ["timer:ok", "manual:ok"]);
+}
+
+#[test]
+fn a_node_with_no_function_has_no_run_log_and_one_appears_with_the_first_run() {
+    let rig = Rig::new();
+    rig.nats();
+    // Ticks, a sweep and the reads leave no directory behind.
+    assert!(rig.runner.tick(NOW).is_empty());
+    assert!(rig.runner.sweep().is_empty());
+    rig.call_as(Scope::Viewer, "function_list", json!({}))
+        .expect("list");
+    assert!(!rig.dir.join(RUNS_DIR).exists());
+    rig.approved("function_create", relay_args())
+        .expect("created");
+    assert!(
+        !rig.dir.join(RUNS_DIR).exists(),
+        "a create writes no run log either"
+    );
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    rig.run("relay");
+    let dir = rig.dir.join(RUNS_DIR);
+    assert_eq!(
+        fs::metadata(&dir)
+            .expect("the run log's directory")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(dir.join("runs-2026-10.jsonl").is_file());
+}
+
 /// An edit made by an Incus operator, outside the kernel's writer.
 fn put(rig: &Rig, path: &str, body: &Value) {
     use std::io::{Read, Write};
@@ -1054,6 +1357,23 @@ fn a_kernel_that_starts_stops_a_run_nobody_watches() {
     // The service beside it runs on: a sweep is for functions.
     assert_eq!(rig.instance("nats")["status"], "Running");
     assert!(rig.runner.sweep().is_empty());
+    // An instance of the function's name and mark that is not the one Arca created is left alone, running: the
+    // sweep checks the uuid the journal holds, as a run does.
+    put(
+        &rig,
+        &format!("/1.0/instances/relay/state?project={PROJECT}"),
+        &json!({ "action": "start" }),
+    );
+    let mut body = rig.instance("relay");
+    body["config"]["volatile.uuid"] = json!("00000000-0000-4000-8000-00000000dead");
+    put(
+        &rig,
+        &format!("/1.0/instances/relay?project={PROJECT}"),
+        &body,
+    );
+    assert!(rig.runner.sweep().is_empty());
+    assert_eq!(rig.instance("relay")["status"], "Running");
+    assert_eq!(rig.runs("relay").len(), 1);
 }
 
 #[test]

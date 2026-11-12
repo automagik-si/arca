@@ -136,16 +136,29 @@ pub fn classify_object(
                 && object.name == instance
                 && object.parent.is_none() =>
         {
-            &[
-                "user.arca.template",
-                "user.arca.address",
-                "user.arca.ports",
-                "user.arca.links",
-                "user.arca.published",
-                "user.arca.envkeys",
-                // A function's instance: the mark the writer of a run looks for before it starts or stops one.
-                "user.arca.function",
-            ]
+            // A function's instance carries one more: the mark the writer of a run looks for before it starts or
+            // stops one. A function lives in the node's own service project and nowhere else, so the key is the
+            // entry's own there alone: on a tenant's instance it is another owner's key, as it always was.
+            if object.project == "arcak-svc" {
+                &[
+                    "user.arca.template",
+                    "user.arca.address",
+                    "user.arca.ports",
+                    "user.arca.links",
+                    "user.arca.published",
+                    "user.arca.envkeys",
+                    "user.arca.function",
+                ]
+            } else {
+                &[
+                    "user.arca.template",
+                    "user.arca.address",
+                    "user.arca.ports",
+                    "user.arca.links",
+                    "user.arca.published",
+                    "user.arca.envkeys",
+                ]
+            }
         }
         IncusKind::Acl
             if object.project == "default"

@@ -746,6 +746,10 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
         // The mark the writer of a run looks for, and a memory limit that swap does not stretch.
         config.insert(FUNCTION_KEY.into(), json!("true"));
         config.insert("limits.memory.swap".into(), json!("false"));
+        // Never started by Incus. With the key unset Incus puts an instance back in the power state it had when the
+        // host went down: a function that was running then would be started with nothing watching it, no time
+        // limit and no line in the run log.
+        config.insert("boot.autostart".into(), json!("false"));
     }
     let mut devices = Map::new();
     if let Some(data) = &cfg.data {

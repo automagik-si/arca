@@ -89,6 +89,35 @@ pub(super) fn enrich_function_create(
     Ok(payload)
 }
 
+/// Why the service `name` of the node's own project is not removed now: a function links to it. A function's links
+/// are part of the definition its owner approved, so a service is never taken from under one: the function goes
+/// first. `None` when no function links to it. The same words refuse the proposal and the removal itself.
+pub(super) fn linked_service_refusal(entries: &[Entry], name: &str) -> Option<CallError> {
+    let functions: Vec<String> = service_entries(entries)
+        .into_iter()
+        .filter(|(_, config)| {
+            config.function.is_some()
+                && config.tenant.is_none()
+                && config.links.iter().any(|link| link.to == name)
+        })
+        .map(|(_, config)| config.name)
+        .collect();
+    let (first, more) = functions.split_first()?;
+    Some(service_refused(format!(
+        "remove service {name}: {} to it, and what a function reaches is part of what its owner approved. Remove {} first (function_remove); nothing was removed and no approval was spent",
+        if more.is_empty() {
+            format!("the function {first} links")
+        } else {
+            format!("the functions {} link", functions.join(", "))
+        },
+        if more.is_empty() {
+            format!("the function {first}")
+        } else {
+            "them".to_string()
+        },
+    )))
+}
+
 /// A `function_remove` proposal for a name that is not a function's is refused when it is made.
 pub(super) fn check_function_remove(entries: &[Entry], payload: &Value) -> Result<(), CallError> {
     let name = service_name(payload)?;
@@ -201,7 +230,7 @@ fn function_view(config: &ServiceConfig, runner: &crate::function_run::FunctionR
         "env": function.env,
         "secrets": function.secrets.iter().map(|secret| json!({
             "name": secret,
-            "set": config.environment.contains_key(secret),
+            "set": function::secret_set(config, secret),
         })).collect::<Vec<_>>(),
         "links": config.links.iter().map(|link| json!({ "to": link.to, "port": link.port })).collect::<Vec<_>>(),
         "triggers": [{ "timer": { "everySeconds": function.every_seconds } }],
@@ -513,6 +542,15 @@ impl ServiceHandler {
                             &format!("start service {name}"),
                             &format!("create function {name}"),
                             1,
+                        )
+                        // What to do next is a function's own: the instance and service verbs refuse one.
+                        .replace(
+                            "instance_start starts it once the cause is fixed, and service_remove removes it",
+                            "function_remove removes it, and the create is proposed again once the cause is fixed",
+                        )
+                        .replace(
+                            "service_status shows it, and service_remove removes it",
+                            "function_list shows it, and function_remove removes it",
                         ),
                 },
                 other => other,

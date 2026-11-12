@@ -131,8 +131,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl FunctionRunner {
-    /// The runner of the node `cfg` describes. It makes the run log's directory, private to the node's user, and reads
-    /// the newest lines of the newest two months into memory.
+    /// The runner of the node `cfg` describes. It reads the newest lines of the newest two months of the run log into
+    /// memory, when there is a run log. It writes nothing: the run log's directory is made by the first line a run
+    /// writes, so a node with no function has none.
     pub fn new(
         kernel: Arc<Mutex<Kernel>>,
         cfg: Arc<NodeConfig>,
@@ -143,9 +144,8 @@ impl FunctionRunner {
             cfg.kernel.droidd_projects.iter().map(String::as_str),
         )?;
         let dir = cfg.state_dir.join(RUNS_DIR);
-        let log = RunLog::open(dir).map_err(|error| {
-            format!("the function run log cannot be opened in the state directory: {error}")
-        })?;
+        // A run log that cannot be read is not a reason to run nothing: the lines held in memory start empty.
+        let log = RunLog::open(dir);
         Ok(FunctionRunner {
             writer: FunctionRun::new(cfg.incus.socket.clone(), family),
             kernel,
@@ -183,8 +183,9 @@ impl FunctionRunner {
 
     /// Every function the kernel records, with its entry.
     pub fn functions(&self) -> Vec<(Entry, ServiceConfig)> {
-        let kernel = lock(&self.kernel);
-        function_entries(kernel.entries())
+        // The kernel's lock is held for the copy alone: the records are read after it is given back.
+        let entries = lock(&self.kernel).entries().to_vec();
+        function_entries(&entries)
     }
 
     fn function(&self, name: &str) -> Option<(Entry, ServiceConfig)> {
@@ -308,11 +309,21 @@ impl FunctionRunner {
     /// kernel that is gone, so nobody watches it. It is stopped, and the run log says `interrupted`. Returns the names.
     pub fn sweep(&self) -> Vec<String> {
         let mut stopped = Vec::new();
-        for (_, config) in self.functions() {
+        for (entry, config) in self.functions() {
             let Ok(seen) = self.writer.read(&config.project, &config.instance) else {
                 continue;
             };
             if seen.is_stopped() {
+                continue;
+            }
+            // Only the instance Arca created for the function is stopped: the one whose uuid the effect journal
+            // holds for its entry, as a run checks before it starts one.
+            let journalled = lock(&self.kernel).service_uuid(&entry.id, &config.instance);
+            if journalled.is_none() || journalled != seen.uuid {
+                eprintln!(
+                    "arca: an instance named {} runs with a function's mark and is not the one Arca created for that function: it was left alone",
+                    config.name
+                );
                 continue;
             }
             let now = (self.clock)();
@@ -561,6 +572,19 @@ impl FunctionRunner {
                 );
             }
         }
+        // A removal that came while this run was getting ready: nothing is started.
+        if ticket.cancel.load(Ordering::SeqCst) {
+            return self.line(
+                &ticket.run,
+                &config,
+                ticket.trigger,
+                ticket.started_ms,
+                Measured::default(),
+                "interrupted",
+                None,
+                Some("the function is being removed, so its run was not started".to_string()),
+            );
+        }
         let begun = Instant::now();
         if let Err(error) = self.writer.start(&seen) {
             // A start that failed may still have left it running.
@@ -632,7 +656,7 @@ impl FunctionRunner {
         let secrets = self.secrets();
         let clean = clean_output(&output, &secrets);
         self.keep_output(&config.name, &ticket.run, &clean);
-        let result = result_line(&clean);
+        let result = result_line(&clean, &secrets);
         let (outcome, why) = match ended {
             Ended::TimedOut(stop) => (
                 "timeout",
@@ -773,14 +797,18 @@ pub fn function_entries(entries: &[Entry]) -> Vec<(Entry, ServiceConfig)> {
 /// A run's output as it is kept and shown: each line cleaned of control sequences, with every known secret value
 /// taken out, and only its end when it is long.
 pub fn clean_output(output: &str, secrets: &[String]) -> String {
+    let forms = secret_forms(secrets);
     let mut lines = Vec::new();
     for line in output.split(['\n', '\r']) {
         if line.trim().is_empty() {
             continue;
         }
-        let clean = crate::service::clean_log(line);
+        // A value is taken out of the line as the program wrote it, before its white space is folded: a value
+        // that holds two spaces in a row would not be found afterwards. And once more after the folding.
+        let redacted = crate::service::redact_log(line, &forms);
+        let clean = crate::service::clean_log(&redacted);
         if !clean.is_empty() {
-            lines.push(crate::service::redact_log(&clean, secrets));
+            lines.push(crate::service::redact_log(&clean, &forms));
         }
     }
     let mut kept = Vec::new();
@@ -797,14 +825,87 @@ pub fn clean_output(output: &str, secrets: &[String]) -> String {
 }
 
 /// The result of a run: its last output line, when that line is one JSON object with a boolean `"ok"` and is at most
-/// [`RESULT_MAX`] bytes. Anything else is no result.
-pub fn result_line(clean: &str) -> Option<Value> {
+/// [`RESULT_MAX`] bytes. Anything else is no result. Every string of the decoded object, a name or a value at any
+/// depth, has each of `secrets` taken out of it: a value the program wrote in an escaped form no text search of the
+/// line finds is plain again once the line is decoded, and it is the decoded object that is kept and shown.
+pub fn result_line(clean: &str, secrets: &[String]) -> Option<Value> {
     let last = clean.lines().rev().find(|line| !line.trim().is_empty())?;
     if last.len() > RESULT_MAX {
         return None;
     }
-    let value: Value = serde_json::from_str(last.trim()).ok()?;
-    (value.is_object() && value["ok"].is_boolean()).then_some(value)
+    let mut value: Value = serde_json::from_str(last.trim()).ok()?;
+    if !(value.is_object() && value["ok"].is_boolean()) {
+        return None;
+    }
+    redact_value(&mut value, secrets);
+    Some(value)
+}
+
+/// Takes each of `secrets` out of every string in `value`: each value and each name, at any depth.
+fn redact_value(value: &mut Value, secrets: &[String]) {
+    match value {
+        Value::String(text) => *text = crate::service::redact_log(text, secrets),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_value(item, secrets)),
+        Value::Object(map) => {
+            let fields = std::mem::take(map);
+            for (key, mut item) in fields {
+                redact_value(&mut item, secrets);
+                map.insert(crate::service::redact_log(&key, secrets), item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every form a secret value may take in what a program prints: the value itself, and the value as a JSON encoder
+/// writes it inside a string. Encoders differ, so each common form is here: `"` and `\` escaped; `&`, `<` and `>`
+/// written as `\u0026`, `\u003c` and `\u003e` as well; every character outside ASCII written as `\uXXXX`; a `/`
+/// written as `\/`; and those together.
+pub fn secret_forms(secrets: &[String]) -> Vec<String> {
+    let mut forms = std::collections::BTreeSet::new();
+    for secret in secrets {
+        forms.insert(secret.clone());
+        for html in [false, true] {
+            for ascii in [false, true] {
+                for slash in [false, true] {
+                    for upper in [false, true] {
+                        forms.insert(json_escaped(secret, html, ascii, slash, upper));
+                    }
+                }
+            }
+        }
+    }
+    forms.into_iter().collect()
+}
+
+/// `text` as it stands inside a JSON string, with the choices an encoder makes.
+fn json_escaped(text: &str, html: bool, ascii: bool, slash: bool, upper: bool) -> String {
+    let unit = |unit: u16| {
+        if upper {
+            format!("\\u{unit:04X}")
+        } else {
+            format!("\\u{unit:04x}")
+        }
+    };
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '/' if slash => out.push_str("\\/"),
+            '&' | '<' | '>' if html => out.push_str(&unit(ch as u16)),
+            ch if ascii && !ch.is_ascii() => {
+                let mut units = [0u16; 2];
+                for one in ch.encode_utf16(&mut units) {
+                    out.push_str(&unit(*one));
+                }
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Whether `run` is an id this module gives: `fr-<milliseconds>-<number>`.
@@ -821,18 +922,37 @@ pub fn run_id_ok(run: &str) -> bool {
 }
 
 impl RunLog {
-    fn open(dir: PathBuf) -> std::io::Result<RunLog> {
-        for path in [dir.clone(), dir.join("output")] {
+    /// The run log in `dir`, with its newest lines read into memory when the directory is there. Nothing is made:
+    /// a node that never ran a function has no run log.
+    fn open(dir: PathBuf) -> RunLog {
+        let mut log = RunLog {
+            dir,
+            recent: BTreeMap::new(),
+        };
+        if let Err(error) = log.read_recent()
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "arca: the function run log could not be read, so function_runs starts with no line: {error}"
+            );
+        }
+        log
+    }
+
+    /// Makes the run log's directories, private to the node's user, when they are not there yet.
+    fn ensure(&self) -> std::io::Result<()> {
+        for path in [self.dir.clone(), self.dir.join("output")] {
             fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(&path)?;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         }
-        let mut log = RunLog {
-            dir,
-            recent: BTreeMap::new(),
-        };
+        Ok(())
+    }
+
+    fn read_recent(&mut self) -> std::io::Result<()> {
+        let log = self;
         let mut months: Vec<PathBuf> = fs::read_dir(&log.dir)?
             .flatten()
             .map(|entry| entry.path())
@@ -853,7 +973,7 @@ impl RunLog {
                 }
             }
         }
-        Ok(log)
+        Ok(())
     }
 
     fn remember(&mut self, name: &str, line: Value) {
@@ -867,6 +987,7 @@ impl RunLog {
     /// Appends one line to the file of the month its run started in, and holds it in memory.
     fn append(&mut self, name: &str, line: &Value) -> std::io::Result<()> {
         self.remember(name, line.clone());
+        self.ensure()?;
         let started = line["startedAt"].as_u64().unwrap_or(0);
         let month: String = crate::handlers::iso_utc(started).chars().take(7).collect();
         let path = self.dir.join(format!("runs-{month}.jsonl"));
@@ -893,6 +1014,7 @@ impl RunLog {
         if !crate::service::service_name_ok(name) || !run_id_ok(run) {
             return Ok(());
         }
+        self.ensure()?;
         let dir = self.dir.join("output").join(name);
         fs::DirBuilder::new()
             .recursive(true)
@@ -951,11 +1073,11 @@ mod tests {
     #[test]
     fn a_result_is_the_last_line_when_it_is_a_json_object_with_ok() {
         assert_eq!(
-            result_line("working\n{\"ok\":true,\"published\":3}"),
+            result_line("working\n{\"ok\":true,\"published\":3}", &[]),
             Some(json!({ "ok": true, "published": 3 }))
         );
         assert_eq!(
-            result_line("{\"ok\":false}\n\n"),
+            result_line("{\"ok\":false}\n\n", &[]),
             Some(json!({ "ok": false }))
         );
         for none in [
@@ -966,10 +1088,10 @@ mod tests {
             "[true]",
             "{\"published\":3}",
         ] {
-            assert_eq!(result_line(none), None, "{none:?}");
+            assert_eq!(result_line(none, &[]), None, "{none:?}");
         }
         let long = format!("{{\"ok\":true,\"pad\":\"{}\"}}", "x".repeat(RESULT_MAX));
-        assert_eq!(result_line(&long), None);
+        assert_eq!(result_line(&long, &[]), None);
     }
 
     #[test]
@@ -981,13 +1103,47 @@ mod tests {
         assert!(!clean.contains("s3cr3t-value"), "{clean}");
         assert!(!clean.contains('\u{1b}'), "{clean}");
         assert_eq!(clean.lines().count(), 3);
-        assert_eq!(result_line(&clean), Some(json!({ "ok": true })));
+        assert_eq!(result_line(&clean, &[]), Some(json!({ "ok": true })));
         let long: String = (0..5000)
             .map(|n| format!("line {n} {}\n", "x".repeat(40)))
             .collect();
         let kept = clean_output(&long, &[]);
         assert!(kept.len() <= OUTPUT_KEEP, "{}", kept.len());
         assert!(kept.ends_with(&format!("line 4999 {}", "x".repeat(40))));
+    }
+
+    #[test]
+    fn a_secret_is_taken_out_in_each_form_an_encoder_writes_and_out_of_the_decoded_result() {
+        let secret = "p\u{e4}55&w<rd/\"x\\y".to_string();
+        let forms = secret_forms(std::slice::from_ref(&secret));
+        for written in [
+            "p\u{e4}55&w<rd/\\\"x\\\\y",
+            "p\u{e4}55\\u0026w\\u003crd/\\\"x\\\\y",
+            "p\\u00e455&w<rd/\\\"x\\\\y",
+            "p\\u00E455\\u0026w\\u003Crd\\/\\\"x\\\\y",
+        ] {
+            assert!(
+                forms.iter().any(|form| form == written),
+                "{written} is not among {forms:?}"
+            );
+            let line = format!(
+                "{{\"ok\":false,\"error\":\"denied for {written}\",\"{written}\":[\"{written}\"]}}"
+            );
+            let clean = clean_output(&line, std::slice::from_ref(&secret));
+            assert!(!clean.contains("55"), "{clean}");
+            // The decoded object holds the value plainly again, as a value, a name and an element: none is kept.
+            let result = result_line(&line, std::slice::from_ref(&secret)).expect("a result");
+            assert!(!result.to_string().contains("55"), "{result}");
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["error"], "denied for [secret]");
+        }
+        // Two spaces in a row inside a value are not folded away before it is looked for.
+        let phrase = "correct  horse battery".to_string();
+        let clean = clean_output(
+            "said: correct  horse battery\n",
+            std::slice::from_ref(&phrase),
+        );
+        assert_eq!(clean, "said: [secret]");
     }
 
     #[test]

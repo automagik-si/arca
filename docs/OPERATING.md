@@ -4233,16 +4233,21 @@ and a default that rejects both ways:
   the function's name (`kernel.serviceDestinations`), the proposal fills it in, and the card's `Private network` row
   shows it ([A service that may reach one private address](#a-service-that-may-reach-one-private-address));
 - **nothing else.** A service's rules end with one that lets everything else out to the internet. A function's do not:
-  no public address is reachable. There is no setting for it in this build.
+  it can open no connection to a public address. There is no setting for it in this build.
 
-The bridge's own DNS still answers a function, as it answers every instance on the service network.
+**One way out stays open, and the card says so.** The service network's own DNS answers a function, as it answers
+every instance there, and it asks the internet's name servers for a name it does not know. So a program can still
+send a little data out in the names it looks up, to whoever runs the name server of a domain. The `Internet` row of
+the card says this in the owner's words. Closing it is not in this build.
 
 ### Secrets by name
 
 Arca reads no vault. Whoever holds a value sets it into Arca by name, `function_secret_set {name, key, value}`, and a
-run is given the secrets its definition names and no other, as environment values. A value is write-only: no verb, log
-or run line shows it again, and a program that prints one does not put it in the run log (the known values are taken
-out of every output and result). A value is **one line of 8 to 4096 characters**: a credentials file or a PEM
+run is given the secrets its definition names and no other, as environment values: nothing else writes a name into a
+function's environment, a linked service's own connection value least of all. A value is write-only: no verb shows
+it again. A program that prints one does not put it in the run log as it stands: each stored value is taken out of
+the output and of every string of the decoded result, in its plain form and as a JSON encoder writes it. That is a
+search for known text, not a proof: a program that prints a secret cut in pieces, or encoded another way, prints it. A value is **one line of 8 to 4096 characters**: a credentials file or a PEM
 certificate of several lines is not a secret a function can be given. A function with a secret not yet set does not
 run: its run line says `notStarted` and names the secret.
 
@@ -4253,8 +4258,9 @@ one is still going as the next is due, the next is not started, and a `function_
 `FunctionBusy`. Nothing is queued and nothing is retried: the next tick is the next try. After a restart of the
 kernel every function is due at once, and no missed tick is made up.
 
-**What the program must do.** Run one batch and exit. Print what it likes; **its last output line is its result: one
-JSON object, at most 4096 bytes, with `"ok": true` or `"ok": false`**. Incus reports no exit status of a container's
+**What the program must do.** Run one batch and exit. Print what it likes, up to 1 MiB in one run (past that the
+output cannot be read, and the run ends `died` whatever it printed); **its last output line is its result: one JSON
+object, at most 4096 bytes, with `"ok": true` or `"ok": false`**. Incus reports no exit status of a container's
 program, so the line is the only word the program has. It must be safe to kill at any instant and to run again. It runs
 as the container's first process, which ignores a stop it has no handler for: a program that wants to end cleanly at
 its time limit handles `SIGTERM`.
@@ -4269,7 +4275,7 @@ killed.
 |---------|---------|
 | `ok`, `failed` | The program's own word: `"ok"` in its result line. |
 | `timeout` | It passed its time limit and the kernel stopped it. |
-| `memory` | It ended without a result and the node counted a kill at its memory limit. |
+| `memory` | It ended without a result and the node counted a kill at its memory limit. Best effort: the count is gone with the container, so a run killed for memory is often `died`. |
 | `died` | It ended without a result line. |
 | `interrupted` | The kernel stopped it for another reason: the function's removal, or a kernel that started and found a run nobody watched. |
 | `notStarted` | Nothing was started, and `why` says so: a secret is not set, Incus refused the start, the instance is not the one Arca created. |
@@ -4299,7 +4305,9 @@ line and the end of the run's output (64 KiB, kept for the 20 newest runs of eac
 
 **What a run writes.** To Incus: the container's power state, and its console log, which is cleared before each start
 so that what is read afterwards is that run's output alone. To the state directory: the run's line and the end of its
-output. Nothing else: no desired-state entry, no line of the effect journal. `instance_start`, `instance_stop` and
+output. Nothing else: no desired-state entry, no line of the effect journal. The run log's directory is made by the
+first run of the node's first function: a node with no function has none. A function's container is never started
+by Incus itself (`boot.autostart` is `false`), so a host that comes back up starts none. `instance_start`, `instance_stop` and
 `instance_restart` refuse a function's container (`InstanceIsFunction`): only a run starts it.
 
 ### What to know
@@ -4314,6 +4322,12 @@ output. Nothing else: no desired-state entry, no line of the effect journal. `in
   and a forced stop 0.63 s. A network card and its rules add to the start.
 - A function is created in the node's own project only: not in a tenant, and not on a bridged node without the managed
   service network.
+- A service a function links to is not removed while the function is there: `service_remove` is refused, when it is
+  proposed and when it runs, and names the function. Remove the function first.
+- A function's container has no size limit on its root disk beyond the pool's own.
+- A run that cannot start writes a line each time it is tried. A function that is stuck on a 10-second timer writes
+  8,640 lines a day, and the run log is never cut.
+- A kernel that stops between a program's exit and the writing of its line loses that run from the run log.
 - A run of a program that never exits is ended only by its time limit.
 
 ## When an approved action fails

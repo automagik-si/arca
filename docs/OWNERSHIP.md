@@ -1460,7 +1460,10 @@ node is under "Assumptions to confirm".
 ACL, its instance and its secrets are the entry's own, created, patched and retired by the rules above. Its instance
 carries `user.arca.function = true` beside the kernel's entry mark. Keys under `user.arca.` are the other system's
 (Rule 3), and `classify_object` classes a fixed list of them as the entry's own on a service's instance; this key is
-one more on that list, and no other key is. The plugin refuses a function's record that is anything but a
+one more on that list in the node's own service project, and nowhere else: on a tenant's instance it is another
+owner's key, as before. Its environment is its definition's alone: each plain value the definition gives, and for
+each secret that is set the reference to its stored value. A record with any other environment name is refused,
+whatever wrote it, and a linked service's secret change never writes one. The plugin refuses a function's record that is anything but a
 container of the node's own project on the managed service network, created stopped, with no port, no host listener,
 no kernel access, and exactly one opened address for each of its links.
 
@@ -1485,8 +1488,9 @@ Source: `function_egress_rules` in `crates/arca-netproject/src/tenant.rs`, with 
 **Rule 73.** A run is not an effect. `arca_incus::function_run` is a path beside the effect journal, as the state
 writer of the instance verbs is: it reads one instance, refuses it unless it is a container that carries the function
 mark and has the uuid it was read with, and then writes only its `state` (a start, a stop) and clears its console log.
-It is the only path that forces a stop, and nothing reaches it with a service's instance: the instance verbs still
-force nothing, and refuse a function's instance. The kernel starts a run only for the instance whose uuid the effect
+It forces a stop when a run passes its time limit, and nothing reaches it with a service's instance: the instance
+verbs and their writer still force nothing, and refuse a function's instance. (The kernel's own delete of an instance,
+and the folder and adoption writers, force a stop too, each of its own object, as before.) The kernel starts a run only for the instance whose uuid the effect
 journal holds for the function's entry. A run writes one line to the run log and the end of its output, both in the
 state directory, and nothing to the desired state or the effect journal.
 
@@ -1498,7 +1502,8 @@ Source: `FunctionRun` and `is_function` in `crates/arca-incus/src/function_run.r
 `a_run_starts_only_the_instance_arca_created_for_its_function`).
 
 `function_create` and `function_remove` run only from a proposal the owner approved; a removal is the removal of a
-service (the instance is deleted before its ACL), after the run that is going has been stopped.
+service (the instance is deleted before its ACL), after the run that is going has been stopped. A service a function
+links to is not removed while the function exists: the removal is refused when it is proposed and when it runs.
 
 ## Out of scope
 

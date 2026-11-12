@@ -429,7 +429,9 @@ impl ServiceHandler {
             }
             self.put(std::slice::from_ref(&cfg), now)?;
             for (consumer_entry, mut consumer) in service_entries(entries) {
-                if consumer.adopted {
+                // A function's link is a way to the service and nothing else: no value of the service's ever enters
+                // a function's environment, which holds only what its own definition names and its owner approved.
+                if consumer.adopted || consumer.function.is_some() {
                     continue;
                 }
                 if let Some(link) = consumer.links.iter().find(|l| l.to == name).cloned() {

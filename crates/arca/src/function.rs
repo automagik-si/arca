@@ -378,14 +378,45 @@ pub fn missing_secrets(cfg: &ServiceConfig) -> Vec<String> {
     cfg.function
         .iter()
         .flat_map(|function| function.secrets.iter())
-        .filter(|secret| !cfg.environment.contains_key(*secret))
+        .filter(|secret| !secret_set(cfg, secret))
         .cloned()
         .collect()
 }
 
+/// Whether the secret `key` of a function is set: `function_secret_set` stored a value for it, and its environment
+/// value is the reference to that value. An environment value that got there any other way does not count.
+pub fn secret_set(cfg: &ServiceConfig, key: &str) -> bool {
+    cfg.secret_refs.contains_key(key)
+        && cfg
+            .environment
+            .get(key)
+            .is_some_and(|value| value.starts_with(arca_providers::incus::SECRET_PREFIX))
+}
+
+/// Whether a function's environment is exactly its own: each plain value its definition gives, as the definition
+/// gives it, and for each secret that is set the reference to its stored value. No other name, whatever wrote it: a
+/// run is given what its definition names and nothing else.
+fn environment_ok(cfg: &ServiceConfig, function: &Function) -> bool {
+    let secrets: BTreeSet<&str> = function.secrets.iter().map(String::as_str).collect();
+    cfg.secret_refs
+        .keys()
+        .all(|key| secrets.contains(key.as_str()))
+        && function
+            .env
+            .iter()
+            .all(|(key, value)| cfg.environment.get(key) == Some(value))
+        && cfg.environment.iter().all(|(key, value)| {
+            function.env.contains_key(key)
+                || (secrets.contains(key.as_str())
+                    && cfg.secret_refs.contains_key(key)
+                    && value.starts_with(arca_providers::incus::SECRET_PREFIX))
+        })
+}
+
 /// Whether a function's record is one the plugin applies: a container of the node's own project that was created
 /// stopped, opens no port and has nothing a function never has, whose links are each opened by exactly one address
-/// and port, and whose definition keeps every rule [`definition`] checks.
+/// and port, whose environment holds only what its definition names, and whose definition keeps every rule
+/// [`definition`] checks.
 pub fn record_ok(cfg: &ServiceConfig) -> bool {
     let Some(function) = &cfg.function else {
         return true;
@@ -406,12 +437,17 @@ pub fn record_ok(cfg: &ServiceConfig) -> bool {
         && cfg.kernel_access.is_none()
         && cfg.links.len() <= LINKS_MAX
         && cfg.links.iter().all(|link| link.env.is_empty())
+        && environment_ok(cfg, function)
         && function.reach.len() == cfg.links.len()
         && function.reach.iter().all(|one| linked.contains(&one.port))
         && (EVERY_MIN..=EVERY_MAX).contains(&function.every_seconds)
         && (1..=SECONDS_MAX).contains(&function.seconds)
         && function.secrets.len() <= SECRETS_MAX
         && function.secrets.iter().all(|secret| secret_name_ok(secret))
+        && function
+            .env
+            .keys()
+            .all(|key| secret_name_ok(key) && !function.secrets.contains(key))
         && cfg.limits.as_ref().is_some_and(|limits| {
             limits.cpu.is_some()
                 && limits
@@ -451,6 +487,10 @@ pub fn limits_words(seconds: u64, memory: &str, cpu: u64) -> String {
         if cpu == 1 { "" } else { "s" },
     )
 }
+
+/// The `Internet` row of a function's card. It says the one way out that is not closed: names are resolved by this
+/// node's DNS, which asks the internet's, so a program can pass a little data out in the names it asks for.
+pub const INTERNET_WORDS: &str = "No: it can open no connection to a public address. One way out stays: names are looked up through this node's DNS, which asks the internet's name servers, so a program can send a little data out in the names it asks for";
 
 /// The card rows of a `function_create`, as labels and values: what the function is, when it runs, what one run may
 /// use, which secrets it is given by name, and everything it may reach. `args` are a proposal's own, after
@@ -560,10 +600,7 @@ pub fn create_rows(args: &Value) -> Vec<(String, String)> {
             "No: every private address outside this node's services is closed to it".to_string(),
         ));
     }
-    rows.push((
-        "Internet".to_string(),
-        "No: it reaches no public address. Only what the rows above name is open to it".to_string(),
-    ));
+    rows.push(("Internet".to_string(), INTERNET_WORDS.to_string()));
     rows
 }
 
