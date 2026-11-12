@@ -61,5 +61,6 @@ pub use snapshot::{
 };
 #[cfg(feature = "write")]
 pub use write::{
-    Owned, ProjectFamily, Reading, UnixIncusWriter, acl_rules_match, canonical_acl_rules,
+    Owned, ProjectFamily, Reading, RegistryCredential, UnixIncusWriter, acl_rules_match,
+    canonical_acl_rules,
 };

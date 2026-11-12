@@ -849,6 +849,31 @@ impl IncusProvider {
         self.read_secret_file(reference)
     }
 
+    /// The credential this node holds for the registry a create's image is on, when it holds one and the create is
+    /// in the node's own projects: nothing in a tenant's project is fetched with the node's credential.
+    fn registry_credential(
+        &self,
+        project: &str,
+        body: &Value,
+    ) -> Option<arca_incus::RegistryCredential> {
+        if arca_kernel::ownership::tenant_of_project(project).is_some() {
+            return None;
+        }
+        let source = body.get("source")?;
+        if source["protocol"] != "oci" {
+            return None;
+        }
+        let owner = registry_owner(source["server"].as_str()?)?;
+        let read = |file: &str| {
+            self.read_secret_file(&format!("{SECRET_PREFIX}{owner}/{file}"))
+                .ok()
+        };
+        Some(arca_incus::RegistryCredential {
+            username: read("username")?,
+            password: read("password")?,
+        })
+    }
+
     /// Reads a usable secret file without an entry check, including during the directory walk.
     fn read_secret_file(&self, reference: &str) -> Result<String, EffectRefusal> {
         read_secret_file(&self.secrets_dir, self.uid, reference)
@@ -1351,7 +1376,10 @@ impl Provider for IncusProvider {
                     uuid: None,
                 };
                 let writer = self.writer(entry)?;
-                match writer.create(&target, &sent) {
+                // An image on a registry this node holds a credential for is fetched with it. The credential is read
+                // here, at the moment of the request, and goes nowhere but into the address the writer sends.
+                let registry = self.registry_credential(project, &sent);
+                match writer.create_with_registry(&target, &sent, registry.as_ref()) {
                     Ok(owned) => {
                         let object = ObjectRef {
                             uuid: owned.uuid().map(str::to_string),
@@ -1954,6 +1982,25 @@ fn read_secret_file(
 fn secret_owner(name: &str) -> Option<&str> {
     let (owner, _) = name.split_once('/')?;
     EntryId::parse(owner).map(|_| owner)
+}
+
+/// The name, in the secret store, of the directory that holds a registry's credential: `registry-` and the
+/// registry's host in lower case, with each `.` and `:` written as `-`. `None` for an address that is not
+/// `https://` and a plain host with an optional port. No entry has such an id, so no entry may read it as its own.
+pub fn registry_owner(server: &str) -> Option<String> {
+    let host = server.strip_prefix("https://")?;
+    if host.is_empty()
+        || host.len() > 110
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':'))
+    {
+        return None;
+    }
+    Some(format!(
+        "registry-{}",
+        host.to_ascii_lowercase().replace(['.', ':'], "-")
+    ))
 }
 
 fn may_use_secret(entry: &EntryId, name: &str) -> bool {

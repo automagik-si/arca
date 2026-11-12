@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 61] = [
+static VERBS: [Verb; 64] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -934,7 +934,119 @@ static VERBS: [Verb; 61] = [
         params: function_runs_params,
         result: function_runs_result,
     },
+    Verb {
+        name: "registry_secret_set",
+        summary: "Set the credential of a registry that asks for one before it gives an image: its address (https://<host>), a user name and a password. Write-only: no tool, log, record or card shows it again. From then on every image this node's own projects fetch from that registry is fetched with it; nothing in a tenant is. Incus keeps the credential with each image it fetched, for as long as it keeps the image, and whoever may use Incus on this machine can read it there: set only a credential that can read, and only what this node pulls. The password is 8 to 4096 of letters, digits and - . _ ~.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_registry,
+        cut: no_cut,
+        params: registry_secret_set_params,
+        result: registry_result,
+    },
+    Verb {
+        name: "registry_list",
+        summary: "The registries this node holds a credential for, by address. Never a user name or a password.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_registry_list,
+        cut: no_cut,
+        params: empty_params,
+        result: registry_list_result,
+    },
+    Verb {
+        name: "registry_secret_remove",
+        summary: "Remove the credential this node holds for a registry. Images already fetched stay, and Incus still holds the credential with each of them until that image is removed with its last function or service; the next fetch from that registry is made without a credential.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_registry,
+        cut: no_cut,
+        params: registry_server_params,
+        result: registry_result,
+    },
 ];
+
+fn registry_server_schema() -> Value {
+    json!({
+        "description": "The registry's address: https://<host>, with an optional :<port> and nothing after it.",
+        "maxLength": 128,
+        "pattern": "^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$",
+        "type": "string"
+    })
+}
+
+fn registry_secret_set_params() -> Value {
+    params(vec![
+        ("server", true, registry_server_schema()),
+        (
+            "username",
+            true,
+            json!({ "description": "The user name the registry asks for.", "maxLength": 255, "minLength": 1, "type": "string" }),
+        ),
+        (
+            "password",
+            true,
+            json!({
+                "description": "The password or token: 8 to 4096 of letters, digits and - . _ ~. One that can only read, and only what this node pulls.",
+                "maxLength": 4096,
+                "minLength": 8,
+                "pattern": "^[A-Za-z0-9._~-]+$",
+                "type": "string"
+            }),
+        ),
+    ])
+}
+
+fn registry_server_params() -> Value {
+    params(vec![("server", true, registry_server_schema())])
+}
+
+fn registry_result() -> Value {
+    result(vec![
+        ("server", true, string()),
+        ("ok", false, boolean()),
+        ("removed", false, boolean()),
+    ])
+}
+
+fn registry_list_result() -> Value {
+    result(vec![(
+        "registries",
+        true,
+        array(result(vec![("server", true, string())])),
+    )])
+}
+
+fn summary_registry(v: &Value) -> String {
+    format!(
+        "registry {}: {}",
+        v["server"].as_str().unwrap_or("?"),
+        if v["removed"] == true {
+            "credential removed"
+        } else {
+            "credential set"
+        }
+    )
+}
+
+fn summary_registry_list(v: &Value) -> String {
+    format!(
+        "{} registr(ies) with a credential",
+        v["registries"].as_array().map_or(0, Vec::len)
+    )
+}
 
 /// A function's name: the grammar of a service's, since the two share one name space.
 fn function_name_schema() -> Value {
@@ -1025,6 +1137,10 @@ fn function_destinations_schema() -> Value {
 }
 
 fn function_create_params() -> Value {
+    with_registry(function_create_params_base())
+}
+
+fn function_create_params_base() -> Value {
     json!({
         "additionalProperties": false,
         "properties": {
@@ -2929,7 +3045,23 @@ fn service_name_schema(description: &'static str) -> Value {
 }
 
 fn service_create_params() -> Value {
-    with_deploy(with_tenant(service_create_params_base()))
+    with_registry(with_deploy(with_tenant(service_create_params_base())))
+}
+
+/// The same params with the optional `registry` a create names when its image is fetched with a credential.
+fn with_registry(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert(
+            "registry".to_string(),
+            json!({
+                "description": "Only for an image on a registry this node holds a credential for (registry_secret_set): that registry's address. A proposal made with action_propose fills it in, so the owner's card says that the image is fetched with the credential and that Incus then keeps it with the image; a caller has no need to state it. Such a create runs only from an approved proposal.",
+                "maxLength": 128,
+                "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?$",
+                "type": "string"
+            }),
+        );
+    }
+    schema
 }
 
 fn service_create_params_base() -> Value {

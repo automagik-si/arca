@@ -669,6 +669,12 @@ pub fn create_rows(args: &Value) -> Vec<(String, String)> {
         ));
     }
     rows.push(("Internet".to_string(), INTERNET_WORDS.to_string()));
+    if let Some(server) = args.get("registry") {
+        rows.push((
+            "Registry".to_string(),
+            crate::registry::card_words(server.as_str().unwrap_or("(cannot be read)")),
+        ));
+    }
     rows
 }
 

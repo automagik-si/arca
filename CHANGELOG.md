@@ -34,6 +34,14 @@ kept and named, with the command that replaces it. For a node the installer does
 templates install --config <file>` once after the upgrade (or `arca init --enable-changes` again). 0.13.0 said to
 use `--replace` for this, which also overwrites your edits: it is no longer needed. A service that already exists is
 not changed.
+A service's or a function's image can now be on a registry that asks for a credential. The credential is set by the
+registry's address (`registry_secret_set`, with `registry_list` and `registry_secret_remove`) and is kept in the
+node's secret store; no record, proposal, card or journal line holds it. Incus is sent it in the registry's address
+when the image is fetched, and Incus keeps that address with the image for as long as it keeps the image, where
+whoever may use Incus on the machine can read it: so set only a credential that can read, and only what the node
+pulls. A create whose image is fetched that way says so on its card and runs only from an approved proposal; the
+image, and the credential with it, leaves Incus with its last function or service. `docs/OPERATING.md`, "A registry
+that asks for a credential", has the whole of it.
 
 ## 0.13.0 (2026-11-12)
 

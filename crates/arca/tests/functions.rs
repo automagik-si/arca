@@ -171,6 +171,7 @@ impl Rig {
             Arc::clone(&cfg),
             Some(Arc::clone(&runner)),
         ))
+        .chain(arca::registry::registry_handlers(Arc::clone(&cfg)))
         .collect();
         let executor = ActionExecutor::new(
             handlers
@@ -1586,6 +1587,205 @@ fn every_run_starts_from_its_images_own_root_or_does_not_start() {
         "its record's image is not the one its definition names, so nothing was started"
     );
     assert_eq!(rig.fake.rebuilds(PROJECT, "relay").len(), before);
+}
+
+#[test]
+fn an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_rests_in_incus_alone()
+ {
+    let rig = Rig::new();
+    rig.nats();
+    fs::write(rig.dir.join("templates/pg.json"), pg_template().to_string()).expect("template");
+    let server = "https://registry.example";
+    let word = ["pull", "only", "word", "0123"].join("-");
+    let credentialed = |rig: &Rig| -> Vec<Value> {
+        rig.get(&format!("/1.0/images?project={PROJECT}&recursion=1"))
+            .and_then(|images| images.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|image| {
+                image["update_source"]["server"]
+                    .as_str()
+                    .is_some_and(|kept| kept.contains('@'))
+            })
+            .collect()
+    };
+    // Who may set one, and what a password may be.
+    assert!(matches!(
+        rig.call_as(
+            Scope::Viewer,
+            "registry_secret_set",
+            json!({ "server": server, "username": "deploy+token", "password": word })
+        ),
+        Err(CallError::Forbidden { .. })
+    ));
+    for bad in ["short", "has a space in it", "with/a/slash/in/it"] {
+        let (_, message) = refusal(rig.call(
+            "registry_secret_set",
+            json!({ "server": server, "username": "deploy+token", "password": bad }),
+        ));
+        assert!(
+            message.starts_with("password: 8 to 4096 of letters, digits and - . _ ~"),
+            "{message}"
+        );
+    }
+    let (_, message) = refusal(rig.call(
+        "registry_secret_set",
+        json!({ "server": "https://registry.example/path", "username": "u", "password": word }),
+    ));
+    assert!(message.starts_with("server:"), "{message}");
+    let set = rig
+        .call(
+            "registry_secret_set",
+            json!({ "server": server, "username": "deploy+token", "password": word }),
+        )
+        .expect("set");
+    assert_eq!(set["server"], server);
+    let listed = rig
+        .call_as(Scope::Viewer, "registry_list", json!({}))
+        .expect("list");
+    assert_eq!(listed["registries"], json!([{ "server": server }]));
+
+    // The card names the registry and says where the credential will rest. It does not show it.
+    let proposal = rig
+        .propose("function_create", relay_args())
+        .expect("proposed");
+    assert_eq!(proposal["args"]["registry"], server);
+    let row = proposal["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["label"] == "Registry")
+        .expect("the Registry row")["value"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        row.starts_with("https://registry.example: the image is fetched with the credential set for this registry on this node")
+            && row.contains("Incus keeps that credential with the image for as long as the image is kept")
+            && row.contains("whoever may use Incus on this machine can read it there"),
+        "{row}"
+    );
+    // A create that does not say it does not run: a service from an image on that registry, called directly.
+    let (code, message) =
+        refusal(rig.call("service_create", json!({ "name": "pg", "template": "pg" })));
+    assert_eq!(code, "NotApproved", "{message}");
+    assert!(
+        message.contains("holds a credential for the registry https://registry.example"),
+        "{message}"
+    );
+
+    rig.approve("function_create", &proposal).expect("relay");
+    let mut tick = relay_args();
+    tick["name"] = json!("tick");
+    rig.approved("function_create", tick).expect("tick");
+    // Incus was sent the credential in the address, keeps it with the image, and was told not to go back by itself.
+    let images = credentialed(&rig);
+    assert_eq!(images.len(), 1, "{images:?}");
+    let kept = images[0]["update_source"]["server"].as_str().unwrap();
+    assert!(
+        kept.starts_with("https://deploy%2Btoken:")
+            && kept.ends_with("@registry.example")
+            && kept.contains(&word)
+    );
+    assert_eq!(images[0]["auto_update"], false);
+    assert_eq!(
+        rig.fingerprint("relay"),
+        images[0]["fingerprint"].as_str().unwrap()
+    );
+    // Arca holds it in its secret store and nowhere else: no record, proposal, journal, log or answer has it.
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("store"))
+    );
+    let store = rig.dir.join("secrets/registry-registry-example");
+    assert!(store.join("password").is_file());
+    for (path, bytes) in rig.state_files() {
+        if path.starts_with(&store) {
+            continue;
+        }
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(&word),
+            "{} holds the password",
+            path.display()
+        );
+    }
+    let said = format!(
+        "{:?}{}{}{}{}",
+        rig.entries(),
+        proposal,
+        listed,
+        rig.call("function_list", json!({})).expect("list"),
+        fs::read_to_string(rig.dir.join(RUNS_DIR).join("runs-2026-10.jsonl")).expect("the run log")
+    );
+    assert!(!said.contains(&word));
+
+    // The image goes with its last user, and the credential leaves Incus with it.
+    rig.approved("function_remove", json!({ "name": "tick" }))
+        .expect("removed");
+    assert_eq!(credentialed(&rig).len(), 1, "relay was made from it still");
+    rig.approved("function_remove", json!({ "name": "relay" }))
+        .expect("removed");
+    assert!(
+        credentialed(&rig).is_empty(),
+        "the image went with its last function"
+    );
+
+    // With the store's copy gone, a run's root is fetched again from the registry, with the credential.
+    rig.approved("function_create", relay_args())
+        .expect("relay again");
+    let image = rig.fingerprint("relay");
+    send(
+        &rig,
+        "DELETE",
+        &format!("/1.0/images/{image}?project={PROJECT}"),
+        &json!({}),
+    );
+    rig.fake.exit_after_start(PROJECT, "relay", 0, OK);
+    let line = rig.run("relay");
+    assert_eq!(
+        (&line["outcome"], &line["root"]),
+        (&json!("ok"), &json!("registry"))
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay").last().unwrap(),
+        "registry+credential"
+    );
+    assert!(!line.to_string().contains(&word));
+
+    // A card approved after the credential was removed no longer says what would happen: it does not run.
+    let mut tock = relay_args();
+    tock["name"] = json!("tock");
+    let waiting = rig.propose("function_create", tock).expect("proposed");
+    rig.call("registry_secret_remove", json!({ "server": server }))
+        .expect("removed");
+    assert_eq!(
+        rig.call_as(Scope::Viewer, "registry_list", json!({}))
+            .expect("list")["registries"],
+        json!([])
+    );
+    let (_, message) = refusal(rig.approve("function_create", &waiting));
+    assert!(
+        message.contains("this node holds no credential for https://registry.example now"),
+        "{message}"
+    );
+    // And without one, a create names no registry and is sent without a credential.
+    let plain = rig
+        .propose("function_create", {
+            let mut args = relay_args();
+            args["name"] = json!("plain");
+            args
+        })
+        .expect("proposed");
+    assert!(plain["args"].get("registry").is_none());
+    assert!(
+        plain["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["label"] != "Registry")
+    );
 }
 
 /// An edit made by an Incus operator, outside the kernel's writer.

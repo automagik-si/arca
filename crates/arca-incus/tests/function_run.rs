@@ -236,7 +236,7 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
     assert_ne!(seen.own_config["volatile.base_image"], held);
     assert_eq!(
         rig.run
-            .fresh_root(&seen, Some(&held), &source, &never)
+            .fresh_root(&seen, Some(&held), &source, None, &never)
             .expect("rebuilt"),
         FreshRoot::Store
     );
@@ -249,7 +249,7 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
     for recorded in [Some(gone.as_str()), None] {
         assert_eq!(
             rig.run
-                .fresh_root(&seen, recorded, &source, &never)
+                .fresh_root(&seen, recorded, &source, None, &never)
                 .expect("rebuilt"),
             FreshRoot::Registry
         );
@@ -260,7 +260,7 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
     let sent = rig.rebuild_requests();
     let refused = rig
         .run
-        .fresh_root(&seen, Some(&other), &source, &never)
+        .fresh_root(&seen, Some(&other), &source, None, &never)
         .expect_err("the rebuild from the copy fails");
     assert!(
         !matches!(&refused, IncusError::Refused(why) if why.contains("registry")),
@@ -289,7 +289,7 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
         }
         let refused = rig
             .run
-            .fresh_root(&seen, Some(&gone), &odd, &never)
+            .fresh_root(&seen, Some(&gone), &odd, None, &never)
             .expect_err("not a pinned image");
         assert!(
             matches!(&refused, IncusError::Refused(why) if why.contains("no image by digest")),
@@ -298,13 +298,14 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
     }
     // A record whose image is no fingerprint is refused, and a function that is being removed fetches nothing.
     assert!(matches!(
-        rig.run.fresh_root(&seen, Some("../x"), &source, &never),
+        rig.run
+            .fresh_root(&seen, Some("../x"), &source, None, &never),
         Err(IncusError::Refused(_))
     ));
     let removing = || true;
     let cancelled = rig
         .run
-        .fresh_root(&seen, Some(&gone), &source, &removing)
+        .fresh_root(&seen, Some(&gone), &source, None, &removing)
         .expect_err("cancelled");
     assert!(
         matches!(&cancelled, IncusError::Refused(why) if why.contains("being removed")),
@@ -315,7 +316,7 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
     rig.fake.refuse_rebuild(PROJECT, "relay");
     let both = rig
         .run
-        .fresh_root(&seen, Some(&gone), &source, &never)
+        .fresh_root(&seen, Some(&gone), &source, None, &never)
         .expect_err("no image anywhere");
     assert!(
         matches!(&both, IncusError::Refused(why) if why.contains("the registry did not give it again")),
@@ -325,7 +326,8 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
     let busy = rig.run.read(PROJECT, "busy").expect("a function");
     let sent = rig.rebuild_requests();
     assert!(matches!(
-        rig.run.fresh_root(&busy, Some(&held), &source, &never),
+        rig.run
+            .fresh_root(&busy, Some(&held), &source, None, &never),
         Err(IncusError::Refused(_))
     ));
     let family = ProjectFamily::new([PROJECT], std::iter::empty::<&str>()).expect("family");
@@ -333,7 +335,8 @@ fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that
         .read(PROJECT, "web")
         .expect("the service reads");
     assert!(matches!(
-        rig.run.fresh_root(&service, Some(&held), &source, &never),
+        rig.run
+            .fresh_root(&service, Some(&held), &source, None, &never),
         Err(IncusError::Refused(_))
     ));
     assert_eq!(rig.rebuild_requests(), sent, "nothing was sent for either");
@@ -392,6 +395,61 @@ fn a_container_that_never_started_is_not_rebuilt_and_one_that_has_run_is() {
     );
     assert_eq!(rig.fake.rebuilds(PROJECT, "fresh"), ["registry"]);
     rig.run.start(&seen).expect("a start after a rebuild");
+}
+
+#[test]
+fn a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_deleted() {
+    let rig = Rig::new();
+    let source = json!({
+        "type": "image", "mode": "pull", "protocol": "oci",
+        "server": "https://registry.example",
+        "alias": format!("acme/relay@sha256:{}", "a".repeat(64)),
+    });
+    let never = || false;
+    let credential = arca_incus::RegistryCredential {
+        username: "pull+only".to_string(),
+        password: ["a", "word", "for", "pulls"].join("-"),
+    };
+    // The address the credential stands in: the user name is written as an address writes it.
+    let address = credential
+        .address("https://registry.example")
+        .expect("an address");
+    assert!(address.starts_with("https://pull%2Bonly:") && address.ends_with("@registry.example"));
+    assert!(
+        credential
+            .address("https://registry.example/path")
+            .is_none()
+    );
+    assert!(
+        !format!("{credential:?}").contains("word"),
+        "a credential does not print itself"
+    );
+    let seen = rig.run.read(PROJECT, "relay").expect("a function");
+    assert_eq!(
+        rig.run
+            .fresh_root(&seen, None, &source, Some(&credential), &never)
+            .expect("rebuilt"),
+        FreshRoot::Registry
+    );
+    assert_eq!(
+        rig.run
+            .fresh_root(&seen, None, &source, None, &never)
+            .expect("rebuilt"),
+        FreshRoot::Registry
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay"),
+        ["registry+credential", "registry"]
+    );
+    // An image that was put in the store by hand is not a cached one and stays; so does nothing at all.
+    let by_hand = rig.fake.add_image(PROJECT, "kept-by-hand");
+    assert!(!rig.run.drop_unused_image(PROJECT, &by_hand).expect("asked"));
+    assert!(
+        !rig.run
+            .drop_unused_image(PROJECT, &"e".repeat(64))
+            .expect("asked")
+    );
+    assert!(rig.run.drop_unused_image(PROJECT, "../x").is_err());
 }
 
 #[test]

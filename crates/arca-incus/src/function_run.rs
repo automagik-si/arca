@@ -135,6 +135,7 @@ impl FunctionRun {
         seen: &InstanceState,
         fingerprint: Option<&str>,
         source: &Value,
+        registry: Option<&crate::write::RegistryCredential>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<FreshRoot, IncusError> {
         let fresh = self.fresh(seen)?;
@@ -178,15 +179,32 @@ impl FunctionRun {
                 "the function's record names no image by digest on a registry to rebuild its root from",
             ));
         }
+        // A registry that asks for a credential is named with it, in the address that is sent and nowhere else.
+        let mut sent = source.clone();
+        if let Some(address) = registry
+            .and_then(|registry| registry.address(source["server"].as_str().unwrap_or_default()))
+        {
+            sent["server"] = json!(address);
+        }
         match self
             .changer
-            .rebuild(&fresh.project, &fresh.name, &json!({ "source": source }))
+            .rebuild(&fresh.project, &fresh.name, &json!({ "source": sent }))
         {
             Ok(()) => Ok(FreshRoot::Registry),
             Err(remote) => Err(refused(&format!(
                 "the node's own copy of the image is gone, and the registry did not give it again: {remote}"
             ))),
         }
+    }
+
+    /// Deletes a cached image the project's store holds, when no instance of the project was made from it any more.
+    /// Incus keeps, with an image it fetched, the address it fetched it from, a registry's credential included: the
+    /// image goes with its last user, and the credential with it. Returns whether it was deleted.
+    pub fn drop_unused_image(&self, project: &str, fingerprint: &str) -> Result<bool, IncusError> {
+        if !self::fingerprint(fingerprint) {
+            return Err(refused("not an image fingerprint"));
+        }
+        self.changer.delete_unused_image(project, fingerprint)
     }
 
     /// Stops the instance: a graceful stop that Incus gives `grace` to finish, then a forced one. With no grace the stop

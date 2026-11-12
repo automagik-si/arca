@@ -406,6 +406,14 @@ impl ActionKind {
                         &destinations_words(&args["destinations"]),
                     ));
                 }
+                // The image is on a registry this node holds a credential for: the proposal names the registry (it
+                // is filled in when the proposal is made), and the card says where that credential then rests.
+                if let Some(server) = args.get("registry") {
+                    rows.push(row(
+                        "Registry",
+                        &crate::registry::card_words(server.as_str().unwrap_or("(cannot be read)")),
+                    ));
+                }
                 // The row says what will happen, so the owner approves a stopped service knowingly: a create that
                 // said `start: false`, and one whose template is created stopped whatever the call says (the reason
                 // is read from the template when the proposal is made, and is not in its arguments).

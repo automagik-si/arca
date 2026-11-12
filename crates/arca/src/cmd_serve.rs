@@ -565,6 +565,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             service_create,
         ))
         .chain(service_handlers)
+        .chain(crate::registry::registry_handlers(Arc::new(cfg.clone())))
         .chain(crate::handlers::tenant_handlers(
             kernel.clone(),
             clock.clone(),

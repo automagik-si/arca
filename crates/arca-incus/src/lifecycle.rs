@@ -259,6 +259,47 @@ impl StateChanger {
         }
     }
 
+    /// Deletes one cached image from the store the project reads, when no instance of the project says it was made
+    /// from it. Returns whether it was deleted. For [`crate::function_run`] alone.
+    pub(crate) fn delete_unused_image(
+        &self,
+        project: &str,
+        fingerprint: &str,
+    ) -> Result<bool, IncusError> {
+        self.allow(project)?;
+        if !plain_name(project) || !plain_name(fingerprint) {
+            return Err(refused("the project or the fingerprint is not plain"));
+        }
+        let url = format!("/1.0/images/{fingerprint}?project={project}");
+        let image = match checked_envelope(self.send("GET", &url, None)?) {
+            Ok(envelope) => envelope,
+            Err(IncusError::Status { code: 404, .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if image["metadata"]["cached"] != true {
+            return Ok(false);
+        }
+        // Every instance that reads this store counts: the listing is of all projects, and one of this project
+        // that names the image keeps it. A listing that cannot be read keeps it too.
+        let instances = checked_envelope(self.send(
+            "GET",
+            "/1.0/instances?all-projects=true&recursion=1",
+            None,
+        )?)?;
+        let used = instances["metadata"].as_array().is_none_or(|rows| {
+            rows.iter().any(|row| {
+                row["project"].as_str() == Some(project)
+                    && row["config"]["volatile.base_image"].as_str() == Some(fingerprint)
+            })
+        });
+        if used {
+            return Ok(false);
+        }
+        let envelope = checked_envelope(self.send("DELETE", &url, None)?)?;
+        self.wait_for(&envelope)?;
+        Ok(true)
+    }
+
     /// Refuses a project outside the family before any request is sent, a read included.
     fn allow(&self, project: &str) -> Result<(), IncusError> {
         self.allows(project)

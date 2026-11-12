@@ -1916,6 +1916,19 @@ fn patch(
             error_envelope(400, "patch rejected by test"),
         );
     }
+    // An image takes one change here: whether Incus goes back to its registry for it by itself.
+    if address.kind == "image" {
+        let Some(index) = store.find(address) else {
+            return (404, String::new(), error_envelope(404, "not found"));
+        };
+        if let Ok(sent) = serde_json::from_slice::<Value>(&request.body)
+            && let Some(auto) = sent.get("auto_update").and_then(Value::as_bool)
+            && let Some(body) = store.objects[index].body.as_object_mut()
+        {
+            body.insert("auto_update".to_string(), json!(auto));
+        }
+        return (200, String::new(), sync_envelope(Value::Null));
+    }
     let (index, changes) = match written(store, request, address) {
         Ok(found) => found,
         Err(answer) => return answer,
@@ -2833,7 +2846,19 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
         .and_then(|source| source.get("fingerprint"))
         .and_then(Value::as_str)
         .map_or_else(
-            || "registry".to_string(),
+            || {
+                // A registry named with a credential in its address is told from one named without.
+                let with_credential = sent
+                    .get("source")
+                    .and_then(|source| source.get("server"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|server| server.contains('@'));
+                if with_credential {
+                    "registry+credential".to_string()
+                } else {
+                    "registry".to_string()
+                }
+            },
             |fingerprint| format!("store:{fingerprint}"),
         );
     lock(&shared.rebuilds).entry(key).or_default().push(named);

@@ -566,10 +566,14 @@ impl FunctionRunner {
             );
         }
         let cancelled = || ticket.cancel.load(Ordering::SeqCst);
+        // A registry that asks for a credential gets this node's, read now and handed to the one call that needs it.
+        let registry = crate::registry::server_of(&function.image)
+            .and_then(|server| crate::registry::credential(&self.cfg, &server));
         let root = match self.writer.fresh_root(
             &seen,
             function.fingerprint.as_deref(),
             &config.source,
+            registry.as_ref(),
             &cancelled,
         ) {
             Ok(root) => root,

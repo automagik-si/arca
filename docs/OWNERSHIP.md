@@ -1609,6 +1609,27 @@ Source: `TemplateContent`, `load_template_content`, `template_digest`, `template
 `crates/arca/src/action_proposal.rs`
 (`the_image_row_says_what_boots_what_its_name_leaves_open_and_what_a_machine_runs`).
 
+## A registry's credential
+
+**Rule 76.** A registry's credential is a secret of the node, not of an entry: its files stand in the secret store
+under `registry-<host>`, a name no entry has, so no entry may read them as its own. Only the provider reads them, at
+the moment of an instance's create in a project of the node's own, never a tenant's, and hands them to the writer
+beside the create's body. The writer checks the body as it is, which still refuses a credential in a server address,
+and writes the credential only into the address of the body it sends. The desired state, the effect journal (whose
+digest is of the body without it), a proposal and a card never hold it. A create whose image is on a registry the
+node holds a credential for states `registry`, that registry's address, which a proposal fills in and the card says in
+words: without it the create is refused. A function's rebuild from the registry is sent the credential the same way.
+Incus keeps the address in the fetched image's record: the writer turns `auto_update` off on that image, and a
+removal deletes a cached image that was fetched with a credential once no instance of the project was made from it.
+
+Source: `RegistryCredential` and `create_with_registry` in `crates/arca-incus/src/write.rs`; `registry_credential`
+and `registry_owner` in `crates/arca-providers/src/incus.rs`; `crates/arca/src/registry.rs`; `with_registry` and
+`drop_fetched_images` in `crates/arca/src/function_handlers.rs`; `FunctionRun::fresh_root` and `drop_unused_image`
+in `crates/arca-incus/src/function_run.rs`. Tests in `crates/arca/tests/functions.rs`
+(`an_image_on_a_registry_that_asks_is_fetched_with_the_nodes_credential_which_rests_in_incus_alone`) and
+`crates/arca-incus/tests/function_run.rs`
+(`a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_deleted`).
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is

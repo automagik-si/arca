@@ -4538,7 +4538,9 @@ by Incus itself (`boot.autostart` is `false`), so a host that comes back up star
   instead. A function keeps no state in its container: what must outlive a run goes to the services it reaches.
 - A function whose image is gone from the node's store needs its registry for its next run. With the registry out of
   reach that run is `notStarted`, and so is each one after it until the image can be fetched.
-- The image is pulled without a credential, so it must be one the node can pull anonymously.
+- An image on a registry that asks for a credential is fetched with the one set for that registry
+  ([A registry that asks for a credential](#a-registry-that-asks-for-a-credential)); any other is fetched without
+  one.
 - On Incus 7.5.1, on one machine and without a network card on the container, a run of a program that prints two lines
   and exits took a third of a second from the clearing of its log to its output being read (median of 20; start 0.27 s),
   and a forced stop 0.63 s. The rebuild before it took 55 ms from the node's own copy of the image and 1.3 s when the
@@ -4559,6 +4561,52 @@ by Incus itself (`boot.autostart` is `false`), so a host that comes back up star
   8,640 lines a day, and the run log is never cut.
 - A kernel that stops between a program's exit and the writing of its line loses that run from the run log.
 - A run of a program that never exits is ended only by its time limit.
+
+## A registry that asks for a credential
+
+A service's or a function's image may be on a registry that gives nothing without a login. Arca reads no vault:
+whoever holds the registry's credential sets it into the node, by the registry's address.
+
+| Verb | Who runs it | What it does |
+|------|-------------|--------------|
+| `registry_secret_set {server, username, password}` | a `doctor` token | Sets the credential of the registry `https://<host>`. Write-only. |
+| `registry_list` | a `viewer` token | The registries a credential is set for, by address. Never a value. |
+| `registry_secret_remove {server}` | a `doctor` token | Removes it. The next fetch from that registry is made without one. |
+
+From then on every image the node's own projects fetch from that registry is fetched with it. Nothing in a tenant
+is.
+
+**Where the credential goes, and where it rests.** Arca keeps it in its secret store and in nothing else of its own:
+no record, proposal, card, journal line, log or answer holds it. It leaves the store in one place. When an image
+is fetched, the address Arca sends to Incus names the registry with the credential in it, which is how Incus takes
+one. **Incus then keeps that address in the record of the image it fetched, for as long as it keeps the image, and
+whoever may use Incus on this machine can read it there**: root, the members of the group that may use Incus's
+socket, and the user `arca serve` runs as. That is the same reader who already reads a container's environment
+secrets. So:
+
+- **set only a credential that can read, and only what this node pulls.** A registry's own pull token for one
+  project is the right kind. Never one that can push or delete;
+- a create whose image is on such a registry says so on its card, in a `Registry` row, and runs only from an
+  approved proposal: a direct `service_create` is refused with `NotApproved`. The proposal fills the row in. A card
+  approved after the credential was removed does not run;
+- Incus is told not to go back to the registry for the image by itself (`auto_update` is turned off on it): an image
+  by digest never changes;
+- the image, and the credential with it, leaves Incus when its last function or service is removed;
+- a new credential replaces the old one for every later fetch. An image already fetched keeps the address it was
+  fetched with until it is removed.
+
+A password is 8 to 4096 of letters, digits and `- . _ ~`: it stands in an address, and only such a word is known to
+reach the registry as it is. A registry's token is one.
+
+A function whose store copy is gone fetches its image again with the credential set at that moment; with none set,
+or with the registry out of reach, that run is `notStarted`.
+
+Seen on Incus 7.5.1 against a registry that asks for a login: a create without a credential is refused, with it the
+image is fetched; the image's record keeps the address with the credential, the instance's record and the list of
+operations do not; `auto_update` can be turned off. Not seen, and open: what Incus's own log holds, and whether Incus
+hands the credential to the program that fetches for it in a way other users of the machine could read while a
+fetch runs. Keeping the credential out of Incus altogether would take Arca fetching the image itself and handing
+Incus the files: planned, not in this build.
 
 ## When an approved action fails
 
