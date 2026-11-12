@@ -62,6 +62,21 @@ fn pin(rig: &Rig) -> String {
     arca::service::template_pin(&template).expect("it names an image by digest")
 }
 
+/// The fingerprint of the node's database template as it stands now: its file and its entrypoint script.
+fn content(rig: &Rig) -> String {
+    arca::service::load_template_content(&rig.dir.join("templates"), DATABASE_TEMPLATE)
+        .unwrap_or_else(|_| panic!("the database template loads"))
+        .digest
+        .expect("its content has a fingerprint")
+}
+
+/// The card's last row for a template whose content has the fingerprint `digest`.
+fn content_row(digest: &str) -> String {
+    format!(
+        "{digest}. Arca creates this only if the template on the node is still exactly this one."
+    )
+}
+
 fn propose(rig: &Rig, args: Value) -> Result<Value, CallError> {
     rig.call(
         "action_propose",
@@ -150,9 +165,12 @@ fn on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_f
     let pin = pin(&rig);
     let proposal = propose(&rig, json!({ "name": "orders" })).expect("the proposal");
     // The kernel names the template and the image it pins: the card shows the image, and the approval binds both.
+    let content = content(&rig);
     assert_eq!(
         proposal["args"],
-        json!({ "name": "orders", "template": DATABASE_TEMPLATE, "image": pin })
+        json!({
+            "name": "orders", "template": DATABASE_TEMPLATE, "image": pin, "templateDigest": content
+        })
     );
     assert_eq!(
         proposal["details"],
@@ -160,7 +178,8 @@ fn on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_f
             { "label": "Database", "value": "orders" },
             { "label": "Image", "value": pin },
             { "label": "Template", "value": DATABASE_TEMPLATE },
-            { "label": "Made as", "value": MADE_AS }
+            { "label": "Made as", "value": MADE_AS },
+            { "label": "Template content", "value": content_row(&content) }
         ])
     );
     assert!(
@@ -581,7 +600,8 @@ fn a_template_that_generates_no_password_makes_a_stopped_database_and_the_card_s
             { "label": "Image", "value": pin },
             { "label": "Template", "value": DATABASE_TEMPLATE },
             { "label": "Made as", "value": MADE_AS_PLAIN },
-            { "label": "Start", "value": format!("No: it is created stopped because {why}; instance_start starts it later") }
+            { "label": "Start", "value": format!("No: it is created stopped because {why}; instance_start starts it later") },
+            { "label": "Template content", "value": content_row(&content(&rig)) }
         ])
     );
     let made = approve(&rig, &proposal).expect("the approved create");
@@ -711,30 +731,29 @@ fn a_token_whose_tool_list_leaves_out_service_create_makes_no_database_from_the_
 }
 
 #[test]
-fn the_image_checked_and_the_image_created_from_are_one_read_of_the_template() {
-    // The service handler is told the image the database's create was checked against, and compares it with the
-    // template it reads for the create: a template that names another by then makes nothing.
+fn what_a_database_was_checked_against_and_what_it_is_created_from_are_one_read_of_the_template() {
+    // The service handler is told the image and the content the database's create was checked against, and compares
+    // both with the template it reads for the create: a template that is another by then makes nothing.
     let rig = clean();
-    let now = pin(&rig);
-    let stale = format!("ghcr.io/automagik-si/autopg@sha256:{}", "e".repeat(64));
+    let image = pin(&rig);
     let entries = rig.entries();
-    let (code, message) = refusal(rig.call(
-        "service_create",
-        json!({ "name": "orders", "template": DATABASE_TEMPLATE, "pin": stale }),
-    ));
-    assert_eq!(code, "refused");
-    assert_eq!(
-        message,
-        format!(
-            "image: a call cannot choose an image. This node makes a database from its postgres-autopg template, which names {now} now. A proposal that names another was made before the template changed: nothing was created, propose it again"
-        )
-    );
+    for stale in [
+        json!({ "name": "orders", "template": DATABASE_TEMPLATE, "image": image, "templateDigest": "e".repeat(64) }),
+        json!({
+            "name": "orders", "template": DATABASE_TEMPLATE,
+            "image": format!("ghcr.io/automagik-si/autopg@sha256:{}", "e".repeat(64)),
+            "templateDigest": content(&rig)
+        }),
+    ] {
+        let (code, message) = refusal(rig.call("service_create", stale));
+        assert_eq!(code, "refused");
+        assert_eq!(
+            message,
+            "the template postgres-autopg on this node is not the one this create names: it was changed or installed again since the card was shown, or the call states an image or a template content of its own. Nothing was created; propose it again"
+        );
+    }
     assert_eq!(rig.entries(), entries);
     assert!(!password_file(&rig, "orders").exists());
-    // The schema of service_create has no such field: only postgres_create passes it, inside the node.
-    let params = (arca_api::verb("service_create").expect("the verb").params)();
-    assert!(params["properties"].get("pin").is_none());
-    assert_eq!(params["additionalProperties"], false);
 }
 
 #[test]

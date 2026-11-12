@@ -569,7 +569,13 @@ fn the_owners_card_shows_each_replaced_setting_and_a_proposal_with_a_refused_one
         .kernel
         .lock()
         .expect("kernel")
-        .propose_action(ActionKind::ServiceCreate, args.clone(), NOW, None)
+        .propose_action(
+            ActionKind::ServiceCreate,
+            // Bound as the node binds a proposal when it is made.
+            common::bound_create(&rig.dir, args.clone()),
+            NOW,
+            None,
+        )
         .expect("the proposal");
     let statement = action_statement(
         "node1",

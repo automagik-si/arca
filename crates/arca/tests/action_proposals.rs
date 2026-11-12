@@ -282,6 +282,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "settings": { "url": "https://git.example/example-org" },
                 "kernelAccess": { "port": 7461 },
                 "destinations": [{ "address": "10.20.30.40", "port": 443 }],
+                // What the node fills in from the template when the proposal is made: a machine's own system
+                // image, which has no digest here, with the version it runs, and the template's content.
+                "image": format!("images:debian/13 running {TEST_PG_IMAGE}"),
+                "templateDigest": "ab".repeat(32),
             }),
             ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
             ActionKind::ServiceUnpublish
@@ -345,7 +349,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
         let prepared = if action == ActionKind::PostgresCreate {
             action
                 .prepare(
-                    &json!({ "name": "orders", "template": "postgres-autopg", "image": TEST_PG_IMAGE }),
+                    &json!({
+                        "name": "orders", "template": "postgres-autopg", "image": TEST_PG_IMAGE,
+                        "templateDigest": "ab".repeat(32)
+                    }),
                     None,
                 )
                 .expect("the filled sample is valid")
@@ -563,6 +570,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (ActionKind::ServiceCreate, "start") => "Start",
                 (ActionKind::ServiceCreate, "kernelAccess") => "Kernel access",
                 (ActionKind::ServiceCreate, "destinations") => "Private network",
+                (_, "templateDigest") => "Template content",
                 _ => panic!("{action:?} field {field} has no owner label"),
             };
             let row = details
@@ -587,6 +595,30 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     );
                     access.as_str()
                 }
+                // A create's image is shown with what its name leaves open, and the version a machine runs.
+                Value::String(image) if action == ActionKind::ServiceCreate && field == "image" => {
+                    access = arca::action_proposal::image_words(image);
+                    assert_eq!(
+                        access,
+                        format!(
+                            "images:debian/13 (no digest: Incus takes what that name gives when the service is created), running {TEST_PG_IMAGE}"
+                        )
+                    );
+                    access.as_str()
+                }
+                // The template's content is shown whole, with what it means, and it is the card's last row.
+                Value::String(digest) if field == "templateDigest" => {
+                    access = arca::action_proposal::template_content_words(digest);
+                    assert_eq!(
+                        access,
+                        format!(
+                            "{}. Arca creates this only if the template on the node is still exactly this one.",
+                            "ab".repeat(32)
+                        )
+                    );
+                    assert_eq!(details.last().map(|row| row.label.as_str()), Some(label));
+                    access.as_str()
+                }
                 value => value.as_str().expect("a string field"),
             };
             assert_eq!(row.value, expected, "{action:?} {label}");
@@ -594,8 +626,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
         }
         // The card of a template database also says, in words, what the owner gets and which verbs reach it.
         if action == ActionKind::PostgresCreate {
-            let made = details.last().expect("its last row");
-            assert_eq!(made.label, "Made as");
+            let made = details
+                .iter()
+                .find(|row| row.label == "Made as")
+                .expect("its row");
             assert_eq!(
                 made.value,
                 arca::action_proposal::database_service_words("postgres-autopg", false)

@@ -728,7 +728,13 @@ fn a_vm_create_is_proposed_approved_by_the_owner_and_run_by_the_same_handler() {
         .kernel
         .lock()
         .expect("kernel")
-        .propose_action(ActionKind::ServiceCreate, args, NOW, None)
+        .propose_action(
+            ActionKind::ServiceCreate,
+            // Bound as the node binds a proposal when it is made.
+            common::bound_create(&rig.dir, args),
+            NOW,
+            None,
+        )
         .expect("the proposal is inert");
     assert!(
         rig.fake.writes().is_empty() && rig.entry_ids().is_empty(),

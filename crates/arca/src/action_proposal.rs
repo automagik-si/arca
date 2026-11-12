@@ -584,6 +584,19 @@ impl ActionKind {
         {
             rows.push(row("Deploy", deploy));
         }
+        // What the node read from the template when a create was proposed, and filled in. They close the card: the
+        // image, the row a person reads (a database's card has it second already), and last the fingerprint of the
+        // template's content, which the create is held to.
+        if self == Self::ServiceCreate
+            && let Some(image) = args["image"].as_str()
+        {
+            rows.push(row("Image", &image_words(image)));
+        }
+        if matches!(self, Self::ServiceCreate | Self::PostgresCreate)
+            && let Some(digest) = args["templateDigest"].as_str()
+        {
+            rows.push(row("Template content", &template_content_words(digest)));
+        }
         rows
     }
 
@@ -742,6 +755,35 @@ pub fn destinations_list(destinations: &Value) -> String {
         [one] => one.clone(),
         [first @ .., last] => format!("{} and {last}", first.join(", ")),
     }
+}
+
+/// The card's `Image` row for the image a proposal names ([`crate::service::template_image`]): the image by its
+/// digest, or its bare name with the words that say it has none, and after it the version a virtual machine runs.
+pub fn image_words(image: &str) -> String {
+    let (boots, version) = match image.split_once(crate::service::IMAGE_RUNNING) {
+        Some((boots, version)) => (boots, Some(version)),
+        None => (image, None),
+    };
+    let mut words = boots.to_string();
+    if !boots.contains("@sha256:") {
+        words.push_str(NO_DIGEST);
+    }
+    if let Some(version) = version {
+        words.push_str(&format!(", running {version}"));
+    }
+    words
+}
+
+/// What an `Image` row says of an image a template names without a digest.
+const NO_DIGEST: &str =
+    " (no digest: Incus takes what that name gives when the service is created)";
+
+/// The card's last row for a create from a template: the fingerprint of the template's content as the node held it
+/// when the proposal was made, whole, and what it means.
+pub fn template_content_words(digest: &str) -> String {
+    format!(
+        "{digest}. Arca creates this only if the template on the node is still exactly this one."
+    )
 }
 
 /// What the card of a template database is told, in place of a stopped reason, when the node's template generates
@@ -1482,6 +1524,42 @@ mod tests {
     const PINNED_IMAGE: &str = "docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     /// Another pinned image, as a kernel configured differently would name.
     const OTHER_IMAGE: &str = "docker.io/library/postgres@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn the_image_row_says_what_boots_what_its_name_leaves_open_and_what_a_machine_runs() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let open = " (no digest: Incus takes what that name gives when the service is created)";
+        // By its digest: the reference, and nothing more.
+        let pinned = format!("docker.io/library/app@{digest}");
+        assert_eq!(image_words(&pinned), pinned);
+        let local = format!("local:built@{digest}");
+        assert_eq!(image_words(&local), local);
+        // No digest: the name, and the words that say what that leaves open.
+        assert_eq!(
+            image_words("images:debian/13"),
+            format!("images:debian/13{open}")
+        );
+        assert_eq!(image_words("local:built"), format!("local:built{open}"));
+        // A machine that names the version it runs: its own system image first, with those words when it has no
+        // digest, then the version.
+        let version = format!("registry.example/server@{digest}");
+        assert_eq!(
+            image_words(&format!("images:debian/13/cloud running {version}")),
+            format!("images:debian/13/cloud{open}, running {version}")
+        );
+        assert_eq!(
+            image_words(&format!("images:debian/13@{digest} running {version}")),
+            format!("images:debian/13@{digest}, running {version}")
+        );
+        // The template's content: the whole value, and what it means.
+        assert_eq!(
+            template_content_words(&"ab".repeat(32)),
+            format!(
+                "{}. Arca creates this only if the template on the node is still exactly this one.",
+                "ab".repeat(32)
+            )
+        );
+    }
 
     #[test]
     fn a_proposed_database_names_the_configured_image_or_the_template_the_kernel_filled_in() {

@@ -3504,11 +3504,38 @@ fn enrich_service_create(
         }
         payload
     };
-    let Some(template) = payload["template"].as_str().and_then(|name| {
-        crate::service::load_template(&cfg.state_dir.join("templates"), name).ok()
-    }) else {
+    // A proposal that names no template is refused by its schema; one whose template does not load, or names a
+    // script that cannot be read, is refused now in the words the create would use, so the owner is never shown a
+    // card for it.
+    let Some(template_name) = payload["template"].as_str() else {
         return Ok(payload.clone());
     };
+    let content =
+        crate::service::load_template_content(&cfg.state_dir.join("templates"), template_name)
+            .map_err(service_template_error)?;
+    // What the owner is shown is what is created: the proposal is given the image the template names and the
+    // fingerprint of the template's content as this node holds it now, so the card shows the image and the approval
+    // binds both. A caller that states either is only compared with the node's own.
+    let image = crate::service::template_image(&content.template);
+    let digest = content.bound().map_err(service_template_error)?.to_string();
+    if payload
+        .get("image")
+        .is_some_and(|given| given.as_str() != Some(image.as_str()))
+        || payload
+            .get("templateDigest")
+            .is_some_and(|given| given.as_str() != Some(digest.as_str()))
+    {
+        return Err(template_not_the_one_stated(template_name));
+    }
+    let payload = &{
+        let mut payload = payload.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("image".to_string(), json!(image));
+            object.insert("templateDigest".to_string(), json!(digest));
+        }
+        payload
+    };
+    let template = content.template;
     // A create that could never give the kernel access its template declares is refused now, so the owner is never asked
     // to approve it. The proposal then names the access, so the owner's card says it and the approval binds it.
     let stated = kernel_access_for(cfg, &template, payload.get("tenant").is_some(), None)?
@@ -3873,6 +3900,21 @@ fn kernel_access_mismatch(template: &crate::service::Template) -> CallError {
     })
 }
 
+/// The refusal for a create whose stated image or template content is not what the template on this node is: a call
+/// that stated its own, or a card shown before the template was edited or installed again.
+fn template_not_the_one_stated(name: &str) -> CallError {
+    service_refused(format!(
+        "the template {name} on this node is not the one this create names: it was changed or installed again since the card was shown, or the call states an image or a template content of its own. Nothing was created; propose it again"
+    ))
+}
+
+/// The refusal for an approved create whose proposal was made before this node bound a template's content.
+fn template_not_bound(name: &str) -> CallError {
+    service_refused(format!(
+        "this approval was given on a card that did not bind the content of the template {name}. Nothing was created; propose it again"
+    ))
+}
+
 /// Why the template a proposed `service_create` names is created stopped whatever the call's `start` says, for the
 /// owner's card. `None` when a create starts it, or when the template does not load (the create itself refuses that).
 fn service_create_stopped_reason(cfg: &NodeConfig, payload: &Value) -> Option<String> {
@@ -3956,9 +3998,9 @@ enum DatabaseSource {
     /// The image the node's config names (`kernel.postgresImage`): a database of the old kind, made from an image
     /// Incus already holds under that fingerprint.
     Configured(String),
-    /// The node's database template, with the image by digest it names now: a service, fetched as every template's
-    /// image is.
-    Template(String),
+    /// The node's database template, with the image by digest it names now and the fingerprint of its content as
+    /// this node holds it now: a service, fetched as every template's image is.
+    Template { image: String, digest: String },
 }
 
 /// The source of a database this node creates now: the image its config names, or else its database template. A call
@@ -4001,8 +4043,11 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
     }
     // A database is a container on the managed service network: a node that runs no services refuses in those words.
     service_project(cfg)?;
-    let template = crate::service::load_template(&cfg.state_dir.join("templates"), template_name)
-        .map_err(|error| {
+    let content = crate::service::load_template_content(
+        &cfg.state_dir.join("templates"),
+        template_name,
+    )
+    .map_err(|error| {
             if error.not_found {
                 service_refused(format!(
                     "this node has no {template_name} template (templates/{template_name}.json in its state directory), and its config names no kernel.postgresImage: a database is made from one of the two. `arca templates install` puts the template Arca ships there"
@@ -4011,7 +4056,8 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
                 service_template_error(error)
             }
         })?;
-    let pin = crate::service::template_pin(&template)
+    let template = &content.template;
+    let pin = crate::service::template_pin(template)
         .filter(|_| template.kind == "oci")
         .ok_or_else(|| {
             service_refused(format!(
@@ -4021,7 +4067,16 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
     if stated.is_some_and(|image| image != pin) {
         return Err(database_image_changed(&pin));
     }
-    Ok(DatabaseSource::Template(pin))
+    // The content a proposal's card showed is the content now, or nothing is created: the same image with another
+    // script, environment or port is another template.
+    let digest = content.bound().map_err(service_template_error)?.to_string();
+    if args
+        .get("templateDigest")
+        .is_some_and(|stated| stated.as_str() != Some(digest.as_str()))
+    {
+        return Err(template_not_the_one_stated(template_name));
+    }
+    Ok(DatabaseSource::Template { image: pin, digest })
 }
 
 /// The refusal for an image that is not the one the node's database template names now, `pin`.
@@ -4096,7 +4151,7 @@ fn enrich_postgres_create(
     if cfg.kernel.postgres_image.is_some() || !payload.is_object() {
         return Ok(payload.clone());
     }
-    let DatabaseSource::Template(pin) = database_source(cfg, payload)? else {
+    let DatabaseSource::Template { image, digest } = database_source(cfg, payload)? else {
         return Ok(payload.clone());
     };
     if let Some(name) = payload["name"].as_str() {
@@ -4104,7 +4159,8 @@ fn enrich_postgres_create(
     }
     let mut payload = payload.clone();
     payload["template"] = json!(crate::service::DATABASE_TEMPLATE);
-    payload["image"] = json!(pin);
+    payload["image"] = json!(image);
+    payload["templateDigest"] = json!(digest);
     Ok(payload)
 }
 
@@ -4138,17 +4194,18 @@ fn template_databases(
 
 impl PostgresHandler {
     /// `postgres_create` on a node whose config names no image: the service `service_create` makes from the node's
-    /// database template, made by that handler and by nothing else. `pin` is the image the template named when this
-    /// call was checked: the handler compares it with the template it reads for the create, so the image checked and
-    /// the image created from are one read. The password is the template's to generate; from a template that
-    /// generates none the service is created stopped, and the answer says why. The name must be free among databases
-    /// of both kinds and among services. A token whose tool list leaves out `service_create` makes no service this
-    /// way either.
+    /// database template, made by that handler and by nothing else. `image` and `digest` are what the template named
+    /// and was when this call was checked: the handler compares both with the template it reads for the create, so
+    /// what was checked and what is created from are one read. The password is the template's to generate; from a
+    /// template that generates none the service is created stopped, and the answer says why. The name must be free
+    /// among databases of both kinds and among services. A token whose tool list leaves out `service_create` makes
+    /// no service this way either.
     fn create_from_template(
         &self,
         args: &Value,
         caller: &Caller,
-        pin: &str,
+        image: &str,
+        digest: &str,
     ) -> Result<Value, CallError> {
         if !caller.allows_tool("service_create") {
             return Err(service_refused(format!(
@@ -4162,7 +4219,12 @@ impl PostgresHandler {
         }
         database_name_free(lock(&self.kernel)?.entries(), &name)?;
         let made = self.service_create.call(
-            json!({ "name": name, "template": crate::service::DATABASE_TEMPLATE, "pin": pin }),
+            json!({
+                "name": name,
+                "template": crate::service::DATABASE_TEMPLATE,
+                "image": image,
+                "templateDigest": digest
+            }),
             caller,
         )?;
         let mut answer = json!({
@@ -4328,8 +4390,8 @@ impl ToolHandler for PostgresHandler {
         // create is the service handler's own and takes the write gate itself.
         let configured_image = if self.verb == "postgres_create" {
             match database_source(&self.cfg, &args)? {
-                DatabaseSource::Template(pin) => {
-                    return self.create_from_template(&args, caller, &pin);
+                DatabaseSource::Template { image, digest } => {
+                    return self.create_from_template(&args, caller, &image, &digest);
                 }
                 DatabaseSource::Configured(image) => Some(image),
             }
@@ -5406,8 +5468,7 @@ fn service_removal_refused(
 
 fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConfig, CallError> {
     let source = crate::service::source(parts.template).map_err(service_template_error)?;
-    let entrypoint = crate::service::entrypoint(parts.template, parts.templates_dir)
-        .map_err(service_template_error)?;
+    let entrypoint = parts.content.entrypoint().map_err(service_template_error)?;
     let (environment, start) = crate::service::environment(
         parts.template,
         parts.owner,
@@ -5468,17 +5529,16 @@ enum VmPlace {
 /// gets the merged object, and the record keeps the replaced values beside it.
 fn vm_service_config(
     name: &str,
-    template: &crate::service::Template,
-    templates_dir: &std::path::Path,
+    content: &crate::service::TemplateContent,
     settings: Option<&Value>,
     place: VmPlace,
     pool: String,
     now: u64,
 ) -> Result<crate::service::ServiceConfig, CallError> {
+    let template = &content.template;
     let source = crate::service::source(template).map_err(service_template_error)?;
     let root_size = template.root_size.clone().ok_or_else(internal)?;
-    let user_data =
-        crate::service::first_boot(template, templates_dir).map_err(service_template_error)?;
+    let user_data = content.first_boot().map_err(service_template_error)?;
     let settings =
         crate::service::create_settings(template, settings).map_err(service_template_error)?;
     let vendor_data = crate::service::vendor_data_of(&template.name, settings.merged.as_ref())
@@ -5544,7 +5604,8 @@ struct ServiceParts<'a> {
     pool: String,
     now: u64,
     secrets_dir: &'a std::path::Path,
-    templates_dir: &'a std::path::Path,
+    /// The template as it was read for this create: its scripts are the ones read with it.
+    content: &'a crate::service::TemplateContent,
     /// The kernel access of a template that declares it, with the listener this node gives it.
     kernel_access: Option<crate::service::KernelLink>,
 }
@@ -5745,9 +5806,11 @@ impl ToolHandler for ServiceHandler {
                 "settings",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
-                // Only `postgres_create` carries it: the image its template named when that call was checked. The
-                // create refuses when the template it reads names another. It can only refuse, never widen.
-                "pin",
+                // What a proposal is given when it is made: the image the template names and the fingerprint of
+                // the template's content. A call that states either is compared with the template this create
+                // reads, and refused when they differ: they can only refuse, never widen.
+                "image",
+                "templateDigest",
             ],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
@@ -6391,16 +6454,11 @@ impl ToolHandler for ServiceHandler {
                     )));
                 }
                 let templates_dir = self.cfg.state_dir.join("templates");
-                let template = crate::service::load_template(&templates_dir, template_name)
+                // The template's file and the scripts it names are read once, here. What the call states of them
+                // is compared with this read, and the service is made from this read and no other.
+                let content = crate::service::load_template_content(&templates_dir, template_name)
                     .map_err(service_template_error)?;
-                // A database's create was checked against the image its template named: this read, the one the
-                // service is made from, must name the same.
-                if let Some(pin) = args.get("pin") {
-                    let now = crate::service::template_pin(&template);
-                    if pin.as_str().is_none() || pin.as_str() != now.as_deref() {
-                        return Err(database_image_changed(now.as_deref().unwrap_or("no image")));
-                    }
-                }
+                let template = content.template.clone();
                 // Read before the create makes any secret: why this template is created stopped whatever `start` says.
                 let forced = crate::service::template_stopped_reason(
                     &template,
@@ -6420,6 +6478,22 @@ impl ToolHandler for ServiceHandler {
                     }),
                 )?
                 .map(|(port, connect)| crate::service::KernelLink { port, connect });
+                // What the call states of the template is compared with this read: the content its card showed
+                // (an approved proposal always names it) and the image. A template that is no longer that one
+                // creates nothing. It comes after the kernel access above, whose own refusal says more, and
+                // before any write.
+                match args.get("templateDigest") {
+                    Some(stated) if stated.as_str() != content.digest.as_deref() => {
+                        return Err(template_not_the_one_stated(template_name));
+                    }
+                    None if preapproved => return Err(template_not_bound(template_name)),
+                    _ => {}
+                }
+                if args.get("image").is_some_and(|stated| {
+                    stated.as_str() != Some(crate::service::template_image(&template).as_str())
+                }) {
+                    return Err(template_not_the_one_stated(template_name));
+                }
                 // A service the node's config gives a private destination: refused unless the create runs from an
                 // approved proposal that states exactly what the config names now, and when an address is one of
                 // the node's own. All of it comes before any write.
@@ -6585,15 +6659,8 @@ impl ToolHandler for ServiceHandler {
                         project_changes(&all_entries, &self.cfg, needs)
                             .map_err(no_service_project)?
                     };
-                    let mut config = vm_service_config(
-                        &name,
-                        &template,
-                        &templates_dir,
-                        args.get("settings"),
-                        place,
-                        pool,
-                        now,
-                    )?;
+                    let mut config =
+                        vm_service_config(&name, &content, args.get("settings"), place, pool, now)?;
                     config.destinations = destinations.clone();
                     let deploy =
                         tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)?;
@@ -6671,7 +6738,7 @@ impl ToolHandler for ServiceHandler {
                     pool,
                     now,
                     secrets_dir: &secrets_dir,
-                    templates_dir: &templates_dir,
+                    content: &content,
                     kernel_access,
                 })
                 .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;
