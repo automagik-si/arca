@@ -4649,7 +4649,8 @@ secrets. So:
   forward, whatever the machine's own clock does. A round that fails says so once on the log of `arca serve` and
   is tried again at the next; it stops nothing and no create or run waits for it;
 - **what this does not give:** between a fetch and the turn-off that follows it, `auto_update` is on: for seconds,
-  or for up to ten minutes when the turn-off failed. Incus's own round for cached images is hours apart, and what
+  or, when the turn-off failed, until a round can turn it off. A round is tried every ten minutes; while Incus
+  keeps refusing, it stays on. Incus's own round for cached images is hours apart, and what
   it would do in it is ask the same registry for the same digest with the address it keeps. Closing that at the
   source takes a key on the project itself (`images.auto_update_cached`), a change to the config of a project that
   already exists: planned as its own change, after it is seen to work on the Incus the nodes run;

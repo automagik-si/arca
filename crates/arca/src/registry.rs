@@ -85,8 +85,9 @@ pub struct Swept {
 /// (a local one, one imported by hand) and one from an address without a credential are never touched, and an
 /// image an instance of the project is made from is never deleted, a stopped function's included.
 ///
-/// What it does not give: between a fetch and the turn-off that follows it `auto_update` is on, for seconds, or
-/// until the next round ([`SWEEP_EVERY_MS`]) when the turn-off failed. Incus's own round for it is hours apart.
+/// What it does not give: between a fetch and the turn-off that follows it `auto_update` is on, for seconds, or,
+/// when the turn-off failed, until a round can turn it off. A round is tried every [`SWEEP_EVERY_MS`]; while Incus
+/// keeps refusing, it stays on. Incus's own round for it is hours apart.
 pub struct ImageSweep {
     cfg: Arc<NodeConfig>,
     clock: crate::handlers::Clock,
