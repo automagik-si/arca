@@ -1008,7 +1008,16 @@ fn g8_a_real_browser_registers_two_passkeys_and_approves_a_request_and_a_delete_
 #[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
 fn g9_a_real_browser_at_http_localhost_saves_the_first_passkey_with_the_terminals_code_and_approves_a_change()
  {
-    first_passkey_and_first_approved_change("browser-local", false);
+    first_passkey_and_first_approved_change("browser-local", false, false);
+}
+
+/// The same walk with a device that makes only RSA keys (RS256, COSE -257), as some Windows Hello and TPM authenticators
+/// do: the page offers ES256 and RS256, the device takes RS256, and the page's own script saves that passkey and approves
+/// the change with it.
+#[test]
+#[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
+fn a_real_browser_with_an_rs256_only_device_saves_its_passkey_and_approves_a_change() {
+    first_passkey_and_first_approved_change("browser-rs256", false, true);
 }
 
 /// The whole way from the installer's node to the first approved change: the config is the installer's, which only
@@ -1017,12 +1026,26 @@ fn g9_a_real_browser_at_http_localhost_saves_the_first_passkey_with_the_terminal
 #[test]
 #[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
 fn g10_from_the_installers_node_arca_init_then_the_first_passkey_and_the_first_approved_change() {
-    first_passkey_and_first_approved_change("browser-init", true);
+    first_passkey_and_first_approved_change("browser-init", true, false);
 }
 
-/// The walk both tests above make. With `by_init`, the node's config starts as the installer writes it and `arca init
-/// --enable-changes --yes` makes it one that may change things; without, the config is written whole by the test.
-fn first_passkey_and_first_approved_change(tag: &str, by_init: bool) {
+/// What a device that makes only RSA keys leaves of a page's `pubKeyCredParams`: RS256 (-257). It runs before the page's
+/// own script, and records the algorithms the page offered in `window.__arcaOfferedAlgs`.
+const RS256_ONLY_DEVICE: &str = r#"(() => {
+  const create = navigator.credentials.create.bind(navigator.credentials);
+  navigator.credentials.create = (options) => {
+    const offered = options.publicKey.pubKeyCredParams;
+    window.__arcaOfferedAlgs = offered.map((param) => param.alg);
+    const publicKey = { ...options.publicKey, pubKeyCredParams: offered.filter((param) => param.alg === -257) };
+    return create({ ...options, publicKey });
+  };
+})();"#;
+
+/// The walk the tests above make. With `by_init`, the node's config starts as the installer writes it and `arca init
+/// --enable-changes --yes` makes it one that may change things; without, the config is written whole by the test. With
+/// `rs256_only`, the device makes only RSA keys: a script the browser runs before the page's own keeps only RS256 (-257)
+/// of the algorithms the page offers, and records what the page offered.
+fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only: bool) {
     let chrome_binary = std::env::var(CHROME_ENV).unwrap_or_else(|_| DEFAULT_CHROME.to_string());
     let scratch = Scratch::new(tag);
     let state = scratch.at("state");
@@ -1185,6 +1208,12 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool) {
         json!({ "enabled": true }),
     );
     chrome.authenticator("internal");
+    if rs256_only {
+        chrome.page(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": RS256_ONLY_DEVICE }),
+        );
+    }
     chrome.page(
         "Page.navigate",
         json!({ "url": format!("{origin}/approve") }),
@@ -1278,6 +1307,21 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool) {
     assert_eq!(kept.len(), 1, "one passkey is trusted");
     assert_eq!(kept[0].rp_id, "localhost");
     assert_eq!(kept[0].origin, origin);
+    if rs256_only {
+        assert_eq!(
+            chrome.eval("JSON.stringify(window.__arcaOfferedAlgs)"),
+            json!("[-7,-257]"),
+            "the page offers ES256, then RS256"
+        );
+        assert_eq!(
+            kept[0].alg(),
+            arca_approval::PasskeyAlg::Rs256,
+            "the device's RSA key is trusted as RS256"
+        );
+    } else {
+        assert_eq!(kept[0].alg(), arca_approval::PasskeyAlg::Es256);
+    }
+
     // The page draws the cards again once the passkey is trusted, and the button then approves.
     let deadline = Instant::now() + WAIT;
     loop {

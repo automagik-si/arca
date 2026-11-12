@@ -1,28 +1,30 @@
-//! The passkey verifier: a WebAuthn ES256 assertion over an approval statement's challenge, by a passkey that the root-owned
+//! The passkey verifier: a WebAuthn ES256 or RS256 assertion over an approval statement's challenge, by a passkey that the root-owned
 //! passkeys file lists for Arca's namespace, with a sign count that only grows. It reads no CBOR: an assertion's
 //! `authenticatorData` is a fixed 37 bytes.
 //!
 //! The passkeys file `/etc/arca/owner-passkeys` is read under the signers file's trust rule. Each line is exactly
 //!
 //! ```text
-//! owner namespaces="arca-kernel-approve" rp="<rp>" origin="https://<rp or a name under it>[:<port>]" alg="ES256" cred="<base64url>" key="<base64>"[ <comment>]
+//! owner namespaces="arca-kernel-approve" rp="<rp>" origin="https://<rp or a name under it>[:<port>]" alg="<ES256|RS256>" cred="<base64url>" key="<base64>"[ <comment>]
 //! ```
 //!
 //! One origin that is not `https://` is a line's too: `http://localhost:<port>` with the rp `localhost`, the page of a node
 //! on its own machine's loopback listener. A browser runs WebAuthn there because `localhost` is a secure context without
 //! a certificate. No other `http://` origin is: not an IP address, which no browser takes as an rp, and not another name.
 //!
-//! with single spaces, a credential id of 16 to 1023 bytes in unpadded base64url, and a P-256 public key as 91 bytes of SPKI
-//! DER in padded base64. A blank line or a `#` comment is skipped. Any other line refuses the whole file by its number, and no
+//! with single spaces, a credential id of 16 to 1023 bytes in unpadded base64url, and the public key as SPKI DER in padded
+//! base64: for `ES256` a P-256 key in 91 bytes, for `RS256` an RSA key of 2048 to 4096 bits (some Windows Hello and TPM
+//! authenticators make only those), in the one DER form it encodes to. A blank line or a `#` comment is skipped. Any other line refuses the whole file by its number, and no
 //! refusal echoes a field. A line whose list does not name [`ARCA_NAMESPACE`] is read and checked, then not kept.
 //!
 //! A proof is droidd's: the canonical JSON of exactly `alg`, `authenticatorData`, `clientDataJSON`, `credentialId`, `kind`,
-//! `signature` and `v`, with `v` 1, `kind` `webauthn`, `alg` `ES256`, and each buffer unpadded base64url. The checks are
+//! `signature` and `v`, with `v` 1, `kind` `webauthn`, `alg` `ES256` or `RS256`, and each buffer unpadded base64url. The checks are
 //! droidd's, in droidd's order: the credential is on a line; `clientDataJSON` is a `webauthn.get` over this statement's
 //! challenge, from the line's exact origin, with no `crossOrigin` and no `topOrigin`; `authenticatorData` is 37 bytes with the
 //! line's rpIdHash, user presence and user verification set, no attested data or extensions, and a backup state only with
-//! backup eligibility; and the ES256 signature over `authenticatorData || SHA-256(clientDataJSON)` verifies, in strict DER,
-//! a high-S signature normalised to its low-S twin. The challenge's prefix keeps a droidd assertion from verifying here.
+//! backup eligibility; and the proof's `alg` is the line's and its signature over `authenticatorData ||
+//! SHA-256(clientDataJSON)` verifies: an ES256 one in strict DER, a high-S signature normalised to its low-S twin, an RS256
+//! one as RSASSA-PKCS1-v1_5 with SHA-256, exactly as long as the modulus. The challenge's prefix keeps a droidd assertion from verifying here.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -36,6 +38,10 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::{Signature, VerifyingKey};
+use rsa::RsaPublicKey;
+use rsa::pkcs1v15::Pkcs1v15Sign;
+use rsa::pkcs8::{DecodePublicKey as _, EncodePublicKey as _};
+use rsa::traits::PublicKeyParts as _;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
@@ -81,6 +87,15 @@ const P256_SPKI_HEADER: [u8; 27] = [
 const P256_SPKI_LEN: usize = 91;
 /// The SEC1 point inside the SPKI starts at its `04` byte.
 const SPKI_POINT_AT: usize = 26;
+/// The shortest RSA modulus an RS256 passkey may have, in bits.
+const RSA_MIN_BITS: usize = 2048;
+/// A SHA-256 hash's length, in bytes.
+const SHA256_LEN: usize = 32;
+/// The DER `DigestInfo` before a SHA-256 hash in an RSASSA-PKCS1-v1_5 signature (RFC 8017, section 9.2, note 1).
+const SHA256_DIGEST_INFO: [u8; 19] = [
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20,
+];
 /// `authenticatorData`: the rpIdHash (32), the flags (1) and the sign count (4).
 const AUTH_DATA_LEN: usize = 37;
 const FLAGS_AT: usize = 32;
@@ -112,6 +127,75 @@ pub fn localhost_origin_port(origin: &str) -> Option<u16> {
         .filter(|port| *port != 0 && *port != HTTP_DEFAULT_PORT)
 }
 
+/// The signature algorithm of a passkey's key, as its line and its proofs name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasskeyAlg {
+    /// ECDSA over P-256 with SHA-256 (COSE -7): a 91-byte P-256 SPKI, a DER signature.
+    Es256,
+    /// RSASSA-PKCS1-v1_5 with SHA-256 (COSE -257): an RSA SPKI of 2048 to 4096 bits, a signature as long as its modulus.
+    Rs256,
+}
+
+impl PasskeyAlg {
+    /// The name a passkeys line's `alg` and a proof's `alg` carry.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Es256 => "ES256",
+            Self::Rs256 => "RS256",
+        }
+    }
+
+    /// The COSE algorithm number WebAuthn's `pubKeyCredParams` and `getPublicKeyAlgorithm()` use.
+    pub fn cose(self) -> i64 {
+        match self {
+            Self::Es256 => -7,
+            Self::Rs256 => -257,
+        }
+    }
+
+    /// The algorithm a name is, when it is exactly one of [`PasskeyAlg::name`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Es256, Self::Rs256]
+            .into_iter()
+            .find(|alg| alg.name() == name)
+    }
+
+    /// The algorithm a COSE number is, when Arca verifies it.
+    pub fn from_cose(cose: i64) -> Option<Self> {
+        [Self::Es256, Self::Rs256]
+            .into_iter()
+            .find(|alg| alg.cose() == cose)
+    }
+
+    /// The algorithm the key of an SPKI DER signs with, when it is a key a passkey line may hold.
+    pub fn of_key(spki: &[u8]) -> Option<Self> {
+        passkey_key(spki).map(|key| key.alg())
+    }
+}
+
+/// A passkey line's public key, read from its SPKI.
+enum PasskeyKey {
+    P256(VerifyingKey),
+    Rsa(RsaPublicKey),
+}
+
+impl PasskeyKey {
+    fn alg(&self) -> PasskeyAlg {
+        match self {
+            Self::P256(_) => PasskeyAlg::Es256,
+            Self::Rsa(_) => PasskeyAlg::Rs256,
+        }
+    }
+}
+
+/// The key an SPKI DER holds, when it is a key a passkey line may hold: a 91-byte P-256 SPKI of a point on the curve, or an
+/// RSA SPKI of 2048 to 4096 bits in its one DER form.
+fn passkey_key(spki: &[u8]) -> Option<PasskeyKey> {
+    p256_key(spki)
+        .map(PasskeyKey::P256)
+        .or_else(|| rsa_key(spki).map(PasskeyKey::Rsa))
+}
+
 /// A line of the passkeys file that lists Arca's namespace.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PasskeyLine {
@@ -122,7 +206,7 @@ pub struct PasskeyLine {
     /// The one origin the passkey may answer from.
     pub origin: String,
     pub credential_id: Vec<u8>,
-    /// The P-256 public key, SPKI DER (91 bytes).
+    /// The public key, SPKI DER: P-256 in 91 bytes for ES256, RSA for RS256.
     pub spki: Vec<u8>,
     /// The SHA-256 (lowercase hex) of `spki`.
     pub fingerprint: String,
@@ -134,6 +218,13 @@ struct Redacted(usize);
 impl std::fmt::Debug for Redacted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<{} bytes>", self.0)
+    }
+}
+
+impl PasskeyLine {
+    /// The algorithm the line's key signs with, which its `alg` names.
+    pub fn alg(&self) -> PasskeyAlg {
+        PasskeyAlg::of_key(&self.spki).unwrap_or(PasskeyAlg::Es256)
     }
 }
 
@@ -153,6 +244,8 @@ impl std::fmt::Debug for PasskeyLine {
 /// A passkey proof's decoded parts.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PasskeyProof {
+    /// The algorithm the proof's `alg` names, which must be its passkey's.
+    pub alg: PasskeyAlg,
     pub credential_id: Vec<u8>,
     pub authenticator_data: Vec<u8>,
     pub client_data_json: Vec<u8>,
@@ -163,6 +256,7 @@ pub struct PasskeyProof {
 impl std::fmt::Debug for PasskeyProof {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PasskeyProof")
+            .field("alg", &self.alg)
             .field("credential_id", &Redacted(self.credential_id.len()))
             .field(
                 "authenticator_data",
@@ -269,7 +363,7 @@ pub fn parse_passkeys(bytes: &[u8]) -> Result<Vec<PasskeyLine>, ApprovalRefusal>
         let Some(parts) = line_parts(text) else {
             return Err(refuse(
                 "is not blank, a comment or a passkey line (owner namespaces=\"arca-kernel-approve\" rp=\"<rp>\" \
-                 origin=\"https://<rp>[:<port>]\" alg=\"ES256\" cred=\"<base64url>\" key=\"<base64>\" [comment])",
+                 origin=\"https://<rp>[:<port>]\" alg=\"<ES256|RS256>\" cred=\"<base64url>\" key=\"<base64>\" [comment])",
             ));
         };
         if !origin_ok(parts.origin, parts.rp) {
@@ -285,13 +379,25 @@ pub fn parse_passkeys(bytes: &[u8]) -> Result<Vec<PasskeyLine>, ApprovalRefusal>
             })?;
         let spki = decode_exact(parts.key, &STANDARD)
             .ok_or_else(|| refuse("holds a key that is not canonical base64"))?;
-        if spki.len() != P256_SPKI_LEN || spki[..P256_SPKI_HEADER.len()] != P256_SPKI_HEADER {
-            return Err(refuse(
-                "holds a key that is not a 91-byte P-256 public key (SPKI DER)",
-            ));
-        }
-        if p256_key(&spki).is_none() {
-            return Err(refuse("holds a P-256 key that is not a point on the curve"));
+        match parts.alg {
+            PasskeyAlg::Es256 => {
+                if spki.len() != P256_SPKI_LEN || spki[..P256_SPKI_HEADER.len()] != P256_SPKI_HEADER
+                {
+                    return Err(refuse(
+                        "holds an ES256 key that is not a 91-byte P-256 public key (SPKI DER)",
+                    ));
+                }
+                if p256_key(&spki).is_none() {
+                    return Err(refuse("holds a P-256 key that is not a point on the curve"));
+                }
+            }
+            PasskeyAlg::Rs256 => {
+                if rsa_key(&spki).is_none() {
+                    return Err(refuse(
+                        "holds an RS256 key that is not an RSA public key of 2048 to 4096 bits (SPKI DER)",
+                    ));
+                }
+            }
         }
         let fingerprint = hex(&Sha256::digest(&spki));
         if let Some((twin, _)) = read.iter().find(|(seen, _)| {
@@ -325,7 +431,8 @@ pub fn parse_passkeys(bytes: &[u8]) -> Result<Vec<PasskeyLine>, ApprovalRefusal>
 
 /// Formats one passkeys-file line for a registration: the same shape [`parse_passkeys`] accepts, with `rp` as the relying
 /// party, `origin` as its exact page origin, `credential_id` as unpadded base64url and `public_key` as canonical base64 of a
-/// 91-byte P-256 SPKI. It refuses anything the parser would refuse, before returning a line.
+/// 91-byte P-256 SPKI (`alg="ES256"`) or of an RSA SPKI of 2048 to 4096 bits (`alg="RS256"`): the key decides the `alg`.
+/// It refuses anything the parser would refuse, before returning a line.
 pub fn format_passkey_line(
     rp: &str,
     origin: &str,
@@ -348,18 +455,15 @@ pub fn format_passkey_line(
         })?;
     let spki = decode_exact(public_key, &STANDARD)
         .ok_or_else(|| malformed("the public key is not canonical base64"))?;
-    if spki.len() != P256_SPKI_LEN || spki[..P256_SPKI_HEADER.len()] != P256_SPKI_HEADER {
-        return Err(malformed(
-            "the public key is not a 91-byte P-256 public key (SPKI DER)",
-        ));
-    }
-    if p256_key(&spki).is_none() {
-        return Err(malformed(
-            "the public key is not a P-256 point on the curve",
-        ));
-    }
+    let alg = PasskeyAlg::of_key(&spki).ok_or_else(|| {
+        malformed(
+            "the public key is neither a 91-byte P-256 public key on the curve nor an RSA public key of 2048 to 4096 \
+             bits (SPKI DER)",
+        )
+    })?;
     Ok(format!(
-        "owner namespaces=\"{ARCA_NAMESPACE}\" rp=\"{rp}\" origin=\"{origin}\" alg=\"ES256\" cred=\"{credential_id}\" key=\"{public_key}\""
+        "owner namespaces=\"{ARCA_NAMESPACE}\" rp=\"{rp}\" origin=\"{origin}\" alg=\"{}\" cred=\"{credential_id}\" key=\"{public_key}\"",
+        alg.name()
     ))
 }
 
@@ -372,12 +476,13 @@ struct LineParts<'a> {
     namespaces: &'a str,
     rp: &'a str,
     origin: &'a str,
+    alg: PasskeyAlg,
     cred: &'a str,
     key: &'a str,
 }
 
-/// `owner namespaces="<list>" rp="<rp>" origin="<origin>" alg="ES256" cred="<base64url>" key="<base64>"[ <comment>]` as its
-/// parts, or `None` for any other shape. The list is a `namespaces=` list, the rp a lowercase DNS name, the origin holds no
+/// `owner namespaces="<list>" rp="<rp>" origin="<origin>" alg="<ES256|RS256>" cred="<base64url>" key="<base64>"[ <comment>]`
+/// as its parts, or `None` for any other shape. The list is a `namespaces=` list, the rp a lowercase DNS name, the origin holds no
 /// quote (`origin_ok` checks the rest), the credential holds only base64url characters, the key only base64 characters with
 /// at most two `=`, and the comment is printable ASCII.
 fn line_parts(text: &str) -> Option<LineParts<'_>> {
@@ -385,9 +490,9 @@ fn line_parts(text: &str) -> Option<LineParts<'_>> {
     let (namespaces, rest) = rest.split_once('"')?;
     let (rp, rest) = rest.strip_prefix(" rp=\"")?.split_once('"')?;
     let (origin, rest) = rest.strip_prefix(" origin=\"")?.split_once('"')?;
-    let (cred, rest) = rest
-        .strip_prefix(" alg=\"ES256\" cred=\"")?
-        .split_once('"')?;
+    let (alg, rest) = rest.strip_prefix(" alg=\"")?.split_once('"')?;
+    let alg = PasskeyAlg::from_name(alg)?;
+    let (cred, rest) = rest.strip_prefix(" cred=\"")?.split_once('"')?;
     let (key, rest) = rest.strip_prefix(" key=\"")?.split_once('"')?;
     let comment = match rest {
         "" => "",
@@ -409,6 +514,7 @@ fn line_parts(text: &str) -> Option<LineParts<'_>> {
             namespaces,
             rp,
             origin,
+            alg,
             cred,
             key,
         },
@@ -474,8 +580,8 @@ pub fn challenge_for(namespace: &str, statement: &[u8]) -> Result<[u8; 32], Appr
 }
 
 /// A passkey proof's bytes as its parts: at most 8192 bytes of UTF-8 that are their own canonical JSON (else
-/// [`ApprovalRefusal::NotCanonical`]), an object of exactly the proof's seven keys, `v` 1, `kind` `webauthn`, `alg` `ES256`,
-/// and each buffer unpadded base64url of at least one byte.
+/// [`ApprovalRefusal::NotCanonical`]), an object of exactly the proof's seven keys, `v` 1, `kind` `webauthn`, `alg` `ES256` or
+/// `RS256`, and each buffer unpadded base64url of at least one byte.
 pub fn parse_proof(bytes: &[u8]) -> Result<PasskeyProof, ApprovalRefusal> {
     if bytes.is_empty() || bytes.len() > PROOF_MAX_BYTES {
         return Err(malformed(
@@ -497,14 +603,19 @@ pub fn parse_proof(bytes: &[u8]) -> Result<PasskeyProof, ApprovalRefusal> {
             "the passkey proof is not exactly alg, authenticatorData, clientDataJSON, credentialId, kind, signature and v",
         ));
     }
-    if map.get("v").and_then(Value::as_u64) != Some(1)
-        || map.get("kind").and_then(Value::as_str) != Some("webauthn")
-        || map.get("alg").and_then(Value::as_str) != Some("ES256")
-    {
+    let alg = map
+        .get("alg")
+        .and_then(Value::as_str)
+        .and_then(PasskeyAlg::from_name);
+    let (Some(1), Some("webauthn"), Some(alg)) = (
+        map.get("v").and_then(Value::as_u64),
+        map.get("kind").and_then(Value::as_str),
+        alg,
+    ) else {
         return Err(malformed(
-            "the passkey proof is not v 1, kind webauthn, alg ES256",
+            "the passkey proof is not v 1, kind webauthn, alg ES256 or RS256",
         ));
-    }
+    };
     let part = |key: &str| -> Result<Vec<u8>, ApprovalRefusal> {
         map.get(key)
             .and_then(Value::as_str)
@@ -516,6 +627,7 @@ pub fn parse_proof(bytes: &[u8]) -> Result<PasskeyProof, ApprovalRefusal> {
             })
     };
     Ok(PasskeyProof {
+        alg,
         credential_id: part("credentialId")?,
         authenticator_data: part("authenticatorData")?,
         client_data_json: part("clientDataJSON")?,
@@ -579,12 +691,10 @@ pub fn verify_assertion(
         ));
     }
 
-    let key = p256_key(&line.spki).ok_or(ApprovalRefusal::BadSignature)?;
-    let signature = der_signature(&proof.signature).ok_or(ApprovalRefusal::BadSignature)?;
-    let mut signed = data.clone();
-    signed.extend_from_slice(&Sha256::digest(&proof.client_data_json));
-    key.verify(&signed, &signature)
-        .map_err(|_| ApprovalRefusal::BadSignature)?;
+    if proof.alg != line.alg() {
+        return Err(ApprovalRefusal::BadSignature);
+    }
+    verify_passkey_signature(&line.spki, data, &proof.client_data_json, &proof.signature)?;
     let count = [
         data[COUNT_AT],
         data[COUNT_AT + 1],
@@ -631,12 +741,51 @@ fn check_client_data(
     Ok(())
 }
 
+/// Verifies a passkey's `signature` over `authenticatorData || SHA-256(clientDataJSON)` by the key `spki` holds, with the
+/// algorithm that key signs with: ES256 in strict DER, a high-S signature normalised to its low-S twin; RS256 as
+/// RSASSA-PKCS1-v1_5 with SHA-256, the signature exactly as long as the modulus. Only the signature: the assertion's other
+/// checks are [`verify_assertion`]'s. Any failure, a key that is no passkey key among them, is
+/// [`ApprovalRefusal::BadSignature`].
+pub fn verify_passkey_signature(
+    spki: &[u8],
+    authenticator_data: &[u8],
+    client_data_json: &[u8],
+    signature: &[u8],
+) -> Result<(), ApprovalRefusal> {
+    let mut signed = authenticator_data.to_vec();
+    signed.extend_from_slice(&Sha256::digest(client_data_json));
+    let verified = match passkey_key(spki).ok_or(ApprovalRefusal::BadSignature)? {
+        PasskeyKey::P256(key) => der_signature(signature)
+            .is_some_and(|signature| key.verify(&signed, &signature).is_ok()),
+        PasskeyKey::Rsa(key) => {
+            let padding = Pkcs1v15Sign {
+                hash_len: Some(SHA256_LEN),
+                prefix: SHA256_DIGEST_INFO.to_vec().into_boxed_slice(),
+            };
+            signature.len() == key.size()
+                && key
+                    .verify(padding, &Sha256::digest(&signed), signature)
+                    .is_ok()
+        }
+    };
+    verified.then_some(()).ok_or(ApprovalRefusal::BadSignature)
+}
+
 /// The P-256 key an SPKI holds, when it is the 91-byte SPKI of a point on the curve.
 fn p256_key(spki: &[u8]) -> Option<VerifyingKey> {
     if spki.len() != P256_SPKI_LEN || spki[..P256_SPKI_HEADER.len()] != P256_SPKI_HEADER {
         return None;
     }
     VerifyingKey::from_sec1_bytes(&spki[SPKI_POINT_AT..]).ok()
+}
+
+/// The RSA key an SPKI holds, when it is an `rsaEncryption` SPKI whose modulus is 2048 to 4096 bits, written in the one DER
+/// form a key encodes to, so each key has one fingerprint. The RSA crate refuses a modulus over 4096 bits and an exponent
+/// below 2 or over 2^33.
+fn rsa_key(spki: &[u8]) -> Option<RsaPublicKey> {
+    let key = RsaPublicKey::from_public_key_der(spki).ok()?;
+    let canonical = key.to_public_key_der().ok()?;
+    (canonical.as_bytes() == spki && key.n().bits() >= RSA_MIN_BITS).then_some(key)
 }
 
 /// An ECDSA P-256 signature in strict DER: `SEQUENCE { INTEGER r, INTEGER s }`, each a minimal positive integer of at most

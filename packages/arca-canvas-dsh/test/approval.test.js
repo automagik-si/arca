@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
-  APPROVAL_REFUSAL_CODES, approvalErrorText, approvalRefusalText,
+  APPROVAL_REFUSAL_CODES, approvalErrorText, approvalRefusalText, passkeyProofAlg,
 } from '../src/render.js';
 
 const UNCLEAR = 'Arca could not finish this. Check Steps to see whether it ran.';
@@ -98,4 +98,13 @@ test('a known approval refusal never becomes the approved wording', () => {
     assert.equal(sentence, approvalRefusalText(code), code);
   }
   assert.equal(approvalErrorText({ refusal: 'NoSuchPlan', message: 'gone' }), approvalRefusalText('NoSuchPlan'));
+});
+
+test('a passkey proof names RS256 for an RSA signature and ES256 for a DER one', () => {
+  // An ES256 signature is a DER SEQUENCE of at most 72 bytes; an RS256 one is as long as its RSA modulus (256 bytes for
+  // RSA-2048, as Windows Hello and TPM authenticators make them).
+  assert.equal(passkeyProofAlg(new Uint8Array(70)), 'ES256');
+  assert.equal(passkeyProofAlg(new Uint8Array(72)), 'ES256');
+  assert.equal(passkeyProofAlg(new Uint8Array(256)), 'RS256');
+  assert.equal(passkeyProofAlg(new ArrayBuffer(512)), 'RS256');
 });

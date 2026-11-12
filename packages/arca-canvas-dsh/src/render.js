@@ -100,6 +100,12 @@ function b64url(bytes) {
   return b64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+// The alg a passkey proof names, from its signature: an ES256 signature is a DER SEQUENCE of at most 72 bytes, and an
+// RS256 one is as long as its RSA modulus, 256 bytes or more (RSA-2048, as some Windows Hello and TPM authenticators make).
+export function passkeyProofAlg(signature) {
+  return signature.byteLength > 72 ? 'RS256' : 'ES256';
+}
+
 function fromB64url(value) {
   const text = String(value).replace(/-/g, '+').replace(/_/g, '/');
   const padded = text + '='.repeat((4 - (text.length % 4)) % 4);
@@ -1591,7 +1597,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     if (!credential) throw new Error('No passkey was selected.');
     const response = credential.response;
     return {
-      alg: 'ES256',
+      alg: passkeyProofAlg(response.signature),
       authenticatorData: b64url(new Uint8Array(response.authenticatorData)),
       clientDataJSON: b64url(new Uint8Array(response.clientDataJSON)),
       credentialId: b64url(new Uint8Array(credential.rawId)),

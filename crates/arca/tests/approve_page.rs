@@ -1619,6 +1619,47 @@ fn registration_round_trips_through_parse_passkeys_and_refuses_bad_keys() {
     ));
 }
 
+/// A real authenticator's RS256 public key (RSA-2048) as the SPKI DER a browser's `getPublicKey()` returns: the key of
+/// py_webauthn's RS256 authentication test (BSD-3-Clause), never an owner's.
+const RS256_SPKI: &str = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA31dtHqc70D/h7XHQ6V/nBs3Tscu91kBL7FOw56/VFiaKYRH6Z4KLr4J0S12hFJ/3fBxpKfxyMfK66ZMeAVbOl/wemY4S5Xs4yHSWy21Xm/dgWhLJjZ9R1tjfV49kDPHB/ssdvP7wo3/NmoUPYMgK+edgZ/ehttp/I6hUUCnVaTvn/m76b2j9yEPReSwl+wlGsabYG6INUhTuhSOqG+UpVVQdNJVV7GmIPHCA2cQpJBDZBohT4MBGme/feUgm4sgqVCWzKk6CzIKIz5AIVnspLbu05SulAVnSTB3NxTwCLNJR/9v9oSkvphiNbmQBVQH1tV/psyi9HM1Jtj9VJVKMewIDAQAB";
+const RS256_CRED: &str = "ZoIKP1JQvKdrYj1bTUPJ2eTUsbLeFkv-X5xJQNr4k6s";
+
+#[test]
+fn an_rs256_passkey_enrols_and_its_line_names_rs256() {
+    let (rig, key) = Rig::new_empty("page-register-rs256");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    let code = rig.last_code();
+    let mismatched = [
+        (RS256_CRED.to_string(), RS256_SPKI.to_string(), -7),
+        (key.cred_text(), key.key_text(), -257),
+    ];
+    for (cred, public_key, alg) in mismatched {
+        let body = json!({
+            "credentialId": cred,
+            "publicKey": public_key,
+            "publicKeyAlgorithm": alg,
+            "setupCode": code,
+        });
+        assert!(refusal(rig.post("/approve/register", Some(ORIGIN), body).0));
+    }
+    assert!(!rig.state_path().exists());
+
+    let body = json!({
+        "credentialId": RS256_CRED,
+        "publicKey": RS256_SPKI,
+        "publicKeyAlgorithm": -257,
+        "setupCode": code,
+    });
+    let (status, answer) = rig.post("/approve/register", Some(ORIGIN), body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let line = fs::read_to_string(rig.state_path()).expect("the state passkeys file");
+    assert!(line.contains(" alg=\"RS256\" "), "the line names RS256");
+    let parsed = parse_passkeys(line.as_bytes()).expect("the line parses");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].alg(), arca_approval::PasskeyAlg::Rs256);
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 1);
+}
+
 #[test]
 fn registration_without_a_setup_code_is_refused_without_a_developer_line() {
     let (rig, key) = Rig::new_empty("page-no-code");

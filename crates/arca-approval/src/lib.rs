@@ -11,8 +11,9 @@
 //!
 //! - [`SshSigVerifier`]: an `sk-ssh-ed25519@openssh.com` signature in [`ARCA_NAMESPACE`], by a key that the root-owned
 //!   signers file lists for that namespace, with the user-presence flag set.
-//! - [`PasskeyVerifier`]: a WebAuthn ES256 assertion over the statement's challenge, by a passkey that the root-owned
-//!   passkeys file lists for that namespace, with user presence and user verification set, and a sign count that only grows.
+//! - [`PasskeyVerifier`]: a WebAuthn ES256 or RS256 assertion over the statement's challenge, by a passkey that the
+//!   root-owned passkeys file lists for that namespace, with user presence and user verification set, and a sign count that
+//!   only grows.
 //!
 //! Nonces are kept by [`FileNonces`], which makes each spend durable before the action it admits may run.
 
@@ -31,9 +32,10 @@ pub use nonces::FileNonces;
 pub use owner::OwnerKeys;
 pub use passkey::{
     Asserted, FileSignCounts, LOCALHOST_RP, OWNER_PASSKEYS, PASSKEY_CHALLENGE_PREFIX,
-    PASSKEY_COUNTS_FILE, PasskeyLine, PasskeyProof, PasskeyVerifier, STATE_PASSKEYS_FILE,
-    TEST_PASSKEYS_ENV, challenge_for, format_passkey_line, load_passkeys, load_state_passkeys,
-    localhost_origin_port, parse_passkeys, parse_proof, passkeys_trust, verify_assertion,
+    PASSKEY_COUNTS_FILE, PasskeyAlg, PasskeyLine, PasskeyProof, PasskeyVerifier,
+    STATE_PASSKEYS_FILE, TEST_PASSKEYS_ENV, challenge_for, format_passkey_line, load_passkeys,
+    load_state_passkeys, localhost_origin_port, parse_passkeys, parse_proof, passkeys_trust,
+    verify_assertion, verify_passkey_signature,
 };
 pub use peer::{
     PEER_PASSKEYS_FILE, PeerPasskeys, PeerSet, PeerState, normal_lines, normalize_set,

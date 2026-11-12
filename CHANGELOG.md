@@ -24,6 +24,10 @@ The MCP server names the release it is. `serverInfo.version` said `0.1.0`, the v
 `initialize` and beside every `2026-07-28` result; it is now the release, the version `arca --version` prints. A
 `server/discover` answer now carries `serverInfo` too, where before the server was named only inside its `_meta`.
 
+Passkeys can now be RSA keys (RS256) as well as P-256 keys (ES256). Some Windows Hello and TPM authenticators make only
+RSA keys, and setting up such a passkey failed at its last step. The page now offers both, enrols either, and checks
+either's signature on every approval and sign-in. A passkeys line names its key's `alg`, `ES256` or `RS256`.
+
 ## 0.16.0 (2026-11-12)
 
 The canvas Doctor can now propose a tenant's create and removal, a deploy's removal, and a function's create and

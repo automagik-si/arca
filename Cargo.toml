@@ -40,6 +40,9 @@ iroh = "=1.4.1"
 iroh-tickets = "=1.0.0"
 qrcodegen = "=1.8.0"
 regex = "=1.13.1"
+# RS256 passkeys (some Windows Hello and TPM authenticators): RSASSA-PKCS1-v1_5 verification. In the lock already through
+# ssh-key. Only public-key operations are used, so no RSA private key is ever handled outside the tests.
+rsa = { version = "=0.9.10", default-features = false, features = ["std", "u64_digit"] }
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
 # SQLite is compiled from its bundled source, so the static musl build needs no system library.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }

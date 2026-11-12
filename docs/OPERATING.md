@@ -37,7 +37,7 @@ Automagik Arca runs your services on machines you own. Set up the way the quicks
 - **Functions.** A program in an OCI image by digest, run on a timer in a container of its own that is started for
   each run and stopped after it, with a time, a memory and a CPU limit, secrets given by name, and a network card that
   reaches only what the owner's card names ([Functions](#functions)).
-- **Passkeys.** Arca is its own passkey verifier (WebAuthn ES256). The first passkey is enrolled with a one-time code
+- **Passkeys.** Arca is its own passkey verifier (WebAuthn ES256 and RS256). The first passkey is enrolled with a one-time code
   shown on the node's own screen, and a trusted passkey adds or removes another. Until a passkey is trusted, every
   approval fails closed.
 - **Adoption and import.** `arca adopt` takes one listed container from the default project into a kernel project of its
@@ -2048,7 +2048,7 @@ is a passkey proof. Any other proof is an armoured SSH signature.
 
 - **An SSH key.** The owner signs the statement with `ssh-keygen -Y sign -n arca-kernel-approve` and an `sk-ssh-ed25519` key.
   The key is read from the signers file `/etc/arca/owner-signers`, which lists the owner's keys for that namespace.
-- **A passkey.** The proof is a WebAuthn ES256 assertion. The passkey is read from the passkeys file
+- **A passkey.** The proof is a WebAuthn ES256 or RS256 assertion. The passkey is read from the passkeys file
   `/etc/arca/owner-passkeys`.
 
 `serve` reads both files at start, and logs only their counts: `arca: <n> owner signing key(s), <m> passkey(s) kept`. A file
@@ -2057,14 +2057,17 @@ that is not there holds no key, so every approval of that kind is refused with `
 Each line of the passkeys file is one passkey, on one line, with single spaces:
 
 ```
-owner namespaces="arca-kernel-approve" rp="<rp>" origin="<https origin>" alg="ES256" cred="<base64url>" key="<base64>"[ <comment>]
+owner namespaces="arca-kernel-approve" rp="<rp>" origin="<https origin>" alg="<ES256|RS256>" cred="<base64url>" key="<base64>"[ <comment>]
 ```
 
 - `rp` is the relying party the passkey was made for, a lowercase DNS name.
 - `origin` is the one page the passkey may answer from: `https://`, then `rp` or a name under it, then an optional
   `:<port>` (not 443, which a browser leaves out). It is written out because Arca has no fixed serve port.
 - `cred` is the credential id, 16 to 1023 bytes of unpadded base64url.
-- `key` is the P-256 public key, 91 bytes of SPKI DER in base64. Its fingerprint is `base64 -d | sha256sum` of that text.
+- `alg` is the key's algorithm: `ES256` for a P-256 key, `RS256` for an RSA key (some Windows Hello and TPM authenticators
+  make only these).
+- `key` is the public key as SPKI DER in base64: for `ES256` the P-256 key in 91 bytes, for `RS256` an RSA key of 2048 to
+  4096 bits. Its fingerprint is `base64 -d | sha256sum` of that text.
 
 An existing passkey is enrolled by copying its `cred` and `key` into a line of this shape. A blank line or a `#` comment is
 skipped. A line whose `namespaces` list does not name `arca-kernel-approve` is read and checked, but not kept.
@@ -2080,7 +2083,7 @@ never a field of the line. The signers file and its SSH keys are not affected.
 `droid-owner-approval/v1\n`, so an assertion made for droidd never verifies here.
 
 **The proof.** The proof is the canonical JSON of exactly these keys: `alg`, `authenticatorData`, `clientDataJSON`,
-`credentialId`, `kind`, `signature` and `v`. The values are `v` 1, `kind` `webauthn` and `alg` `ES256`, and every buffer is
+`credentialId`, `kind`, `signature` and `v`. The values are `v` 1, `kind` `webauthn` and `alg` `ES256` or `RS256`, and every buffer is
 unpadded base64url. The proof is at most 8192 bytes. A proof that is not its own canonical JSON is refused with
 `NotCanonical`, and any other bad form is refused with `Malformed`.
 
@@ -2096,8 +2099,9 @@ unpadded base64url. The proof is at most 8192 bytes. A proof that is not its own
   - have user presence set (`NoUserPresence`) and user verification set (`NoUserVerification`);
   - set the backup state only with backup eligibility, carry no attested data and no extensions, and be exactly 37 bytes
     (`Malformed`).
-- The ES256 signature over `authenticatorData || SHA-256(clientDataJSON)` must verify (`BadSignature`). It is read as strict
-  DER, and a high-S signature is accepted as its low-S twin.
+- The proof's `alg` must be its line's, and the signature over `authenticatorData || SHA-256(clientDataJSON)` must verify
+  (`BadSignature`). An ES256 signature is read as strict DER, and a high-S signature is accepted as its low-S twin. An RS256
+  signature is RSASSA-PKCS1-v1_5 with SHA-256, exactly as long as the key's modulus.
 
 **The sign count.** A count above 0 must be above the last one kept for that passkey. A count of 0 is accepted only while the
 kept one is 0 or there is none, because a synced passkey always reports 0. Otherwise the approval is refused with
