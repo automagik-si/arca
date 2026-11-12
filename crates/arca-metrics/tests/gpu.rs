@@ -46,6 +46,37 @@ impl Drop for Scratch {
     }
 }
 
+/// Writes a program a test will run. A shell writes it, and not this process. The kernel refuses to run a file that any
+/// process has open for writing (ETXTBSY, "executable file busy"). A file this process wrote is closed here at once,
+/// but a child that another test's thread forks in that moment takes a copy of the open file with it and holds it until
+/// it has become its own program. The program written here and then run in that gap was refused: its reader failed at
+/// once, and the test that waited for the program's start waited for nothing. A file this process never had open for
+/// writing is in no child of it, and the shell and what it started have ended when this returns.
+fn program(path: &Path, text: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut shell = Command::new("sh")
+        .arg("-c")
+        .arg("cat >\"$1\" && chmod 0755 \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("a shell to write the program");
+    shell
+        .stdin
+        .take()
+        .expect("the shell's input")
+        .write_all(text.as_bytes())
+        .expect("the program's text");
+    assert!(
+        shell.wait().expect("the shell").success(),
+        "the program {} is written",
+        path.display()
+    );
+}
+
 fn write(root: &Path, rel: &str, text: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
@@ -588,19 +619,17 @@ fn one_card_without_a_pci_address_is_skipped_with_a_reason() {
 
 #[test]
 fn an_oversize_nvidia_smi_answer_is_refused_at_the_cap() {
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     let scratch = Scratch::new("cap");
     let script = scratch.path().join("large.sh");
     // One byte over the 1 MiB cap, without needing a big fixture file.
-    fs::write(
+    program(
         &script,
         "#!/bin/sh\nhead -c 1048577 /dev/zero | tr '\\0' x\n",
-    )
-    .expect("the script");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode 0755");
-    let reader = NvidiaSmi::at(script).with_timeout(Duration::from_secs(5));
+    );
+    // The time limit is not what this test is about: it is long enough that a loaded machine still gets to the cap.
+    let reader = NvidiaSmi::at(script).with_timeout(Duration::from_secs(60));
     let error = reader.readings().expect_err("the answer is too large");
     assert_eq!(
         error,
@@ -610,29 +639,45 @@ fn an_oversize_nvidia_smi_answer_is_refused_at_the_cap() {
 
 #[test]
 fn separate_programs_do_not_refuse_each_other_as_busy() {
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     let scratch = Scratch::new("separate-gates");
     let started = scratch.path().join("started");
     let script = scratch.path().join("slow.sh");
     // The program marks its start, holds its reader for a second, then answers one card.
-    fs::write(
+    program(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\ntouch '{}'\nsleep 1\nprintf '%s\\n' '00000000:01:00.0, GPU-11111111-1111-1111-1111-111111111111, 0, 0, 16376, 0, 0, 0, 0, 0x0'\n",
             started.display()
         ),
-    )
-    .expect("the script");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode 0755");
+    );
 
-    let slow = NvidiaSmi::at(script).with_timeout(Duration::from_secs(5));
+    // The reader's time limit is not what this test is about either: the program takes a second, and a loaded
+    // machine is given a minute for it.
+    let slow = NvidiaSmi::at(script).with_timeout(Duration::from_secs(60));
     let slow = std::thread::spawn(move || slow.readings());
-    // The marker proves the slow program started, so its reader holds its own gate for the check below.
-    let until = Instant::now() + Duration::from_secs(5);
+    // The marker proves the slow program started, so its reader holds its own gate for the check below. A reader that
+    // has ended without the marker did not start its program at all, and says why; that is not a slow machine.
+    let waited = Duration::from_secs(60);
+    let until = Instant::now() + waited;
     while !started.exists() {
-        assert!(Instant::now() < until, "the slow program started");
+        // Looked at again once the reader has ended: on a machine slow enough, the whole program may have run
+        // between the two looks.
+        if slow.is_finished() {
+            if started.exists() {
+                break;
+            }
+            panic!(
+                "the slow reader ended before its program had marked its start: {:?}",
+                slow.join()
+            );
+        }
+        assert!(
+            Instant::now() < until,
+            "the slow program had not marked its start {waited:?} after its reader was started, and the reader was \
+             still running"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 
