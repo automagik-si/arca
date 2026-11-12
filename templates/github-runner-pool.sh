@@ -390,9 +390,12 @@ api() {
   local method=$1 path=$2 token=$3 body=${4-}
   API_OUT="$POOL_RUN/tmp/api.$BASHPID"
   API_ERROR=''
-  # API_SENT is how many bytes of the request went out. With no answer (000) it tells a request GitHub never had (a
-  # refused connection, curl's exit 7: 0) from one whose answer was lost (the connection closed after it, exit 52, or
-  # the time ran out, exit 28: the whole request).
+  # API_SENT is how many bytes of the request curl handed to the connection. With no answer (000) it tells a request
+  # GitHub never had from one it can have had. It is 0 when the connection or its TLS setup failed: refused (curl's
+  # exit 7), closed or reset during the handshake (35), a bad certificate (60), or a connect or handshake that ran out
+  # of time (28). It is the whole request when the connection closed after it (exit 52 over HTTP, 56 over HTTPS, 16
+  # or 92 over HTTP/2) or the time ran out waiting for the answer (28), as curl was seen to report. Bytes handed over
+  # are not proof that GitHub read them, only that it can have. The exit codes are not read, only the count.
   API_SENT=0
   case $token in *[!A-Za-z0-9._~+/=-]* | '')
     API_CODE=000
@@ -402,8 +405,12 @@ api() {
   esac
   local written args=(-sS -X "$method" -o "$API_OUT" -w '%{http_code} %{size_request}' --max-time 30 --connect-timeout 10 -K -)
   [ -n "$body" ] && args+=(--data-binary "$body" -H 'Content-Type: application/json')
-  written=$(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\nheader = "X-GitHub-Api-Version: 2022-11-28"\nheader = "User-Agent: arca-runner-pool"\n' "$token" |
-    curl "${args[@]}" "$API_URL$path" 2>/dev/null) || written="000 ${written#* }"
+  if ! written=$(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\nheader = "X-GitHub-Api-Version: 2022-11-28"\nheader = "User-Agent: arca-runner-pool"\n' "$token" |
+    curl "${args[@]}" "$API_URL$path" 2>/dev/null); then
+    # curl did not read the answer to its end. A status it printed that is not a yes is GitHub's word all the same (a
+    # 401 whose body was cut off is a 401); a yes that was cut off, or no status, is taken as no answer.
+    case ${written%% *} in [13-9][0-9][0-9]) ;; *) written="000 ${written#* }" ;; esac
+  fi
   API_CODE=${written%% *}
   API_SENT=${written##* }
   case $API_CODE in [0-9][0-9][0-9]) ;; *) API_CODE=000 ;; esac
@@ -623,6 +630,8 @@ slot_cycle() {
   cgroup=$(slot_cgroup "$slot")
   set_state "$slot" registering
 
+  # A slot begun just as the controller was told to stop registers no runner.
+  ! stopping || return 0
   if ! github_token; then
     slot_failed "$slot" "$TOKEN_ERROR"
     return 0
@@ -856,6 +865,7 @@ slot_retire() {
     answer=job
   elif [ "$updating" = 1 ]; then
     answer=updating
+    say "slot $slot ($class): its runner is updating itself, so GitHub is not asked to take it off now: it can be asked to give its place to class $for_class once its update is over"
   elif [ -z "$runner_id" ] || [ -n "${runner_id//[0-9]/}" ]; then
     answer=kept
   elif ! github_token; then
