@@ -389,7 +389,7 @@ mod tests {
             SHIPPED[0].1
         );
 
-        let finished = install_into(&dir, false).ok().expect("the next run");
+        let finished = install_into(&dir, false).expect("the next run");
         assert_eq!(finished["unchanged"], json!([first, second]));
         assert_eq!(
             finished["installed"].as_array().map(Vec::len),

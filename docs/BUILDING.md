@@ -7,7 +7,7 @@ The toolchain is pinned in `rust-toolchain.toml`.
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 A plain `cargo build --release` needs the build machine's glibc or newer on the host that runs the binary.

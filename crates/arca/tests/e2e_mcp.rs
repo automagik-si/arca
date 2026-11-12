@@ -496,7 +496,7 @@ fn the_served_snapshot_list_answers_for_its_tenant_as_every_verb_does() {
         let viewer = bearer(secret_of(&secrets, "viewer-1"));
         let (status, text) = post(
             &socket,
-            &[viewer.clone()],
+            std::slice::from_ref(&viewer),
             &call(1, "snapshot_list", json!({ "tenant": "abcdefgh" })),
         );
         assert_eq!(status, 200);

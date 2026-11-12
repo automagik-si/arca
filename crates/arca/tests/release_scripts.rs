@@ -2946,8 +2946,7 @@ fn when_dev_s_own_files_are_not_as_expected_the_publishing_job_says_which_and_wh
         let last = check
             .said
             .lines()
-            .filter(|line| line.starts_with("::error::"))
-            .last()
+            .rfind(|line| line.starts_with("::error::"))
             .unwrap_or("");
         assert!(
             last.contains(words),

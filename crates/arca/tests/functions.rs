@@ -244,9 +244,8 @@ impl Rig {
     /// Has the owner approve a proposal that waits, and runs it once through the executor.
     fn approve(&self, action: &str, proposal: &Value) -> Result<Value, CallError> {
         let args = self.approval(action, proposal);
-        let result = arca::handlers::run_approved_action(&self.kernel, &self.executor, &args, NOW)
-            .map(|answer| answer["result"].clone());
-        result
+        arca::handlers::run_approved_action(&self.kernel, &self.executor, &args, NOW)
+            .map(|answer| answer["result"].clone())
     }
 
     /// The owner's signed approval of a proposal that waits, as the arguments that run it.

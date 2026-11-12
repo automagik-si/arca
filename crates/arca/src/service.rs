@@ -3326,7 +3326,7 @@ mod redaction_tests {
         // A stored secret of three lines, printed by a failing command on its error stream with the lines apart.
         let secret = format!("{}\n", lines(7, 3, 40).join("\n"));
         let stderr = format!("cannot load:\n{secret}giving up\n");
-        let shown = crate::service_exec::failure_text(&stderr, &[secret.clone()]);
+        let shown = crate::service_exec::failure_text(&stderr, std::slice::from_ref(&secret));
         let leaks = secret.lines().any(|line| shown.contains(line));
         assert!(!leaks, "a line of the secret is in the failure's words");
         assert!(shown.starts_with("cannot load:") && shown.ends_with("giving up"));
@@ -3337,7 +3337,7 @@ mod redaction_tests {
         let long = lines(9, 1, SECRET_LINE_MIN).remove(0);
         let short = lines(11, 1, SECRET_LINE_MIN - 1).remove(0);
         let secret = format!("{long}\n{short}\n");
-        let hidden = redact_log(&format!("a {long} b"), &[secret.clone()]);
+        let hidden = redact_log(&format!("a {long} b"), std::slice::from_ref(&secret));
         assert!(
             hidden == "a [secret] b",
             "a line of the shortest length hidden is not hidden"

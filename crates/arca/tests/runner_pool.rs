@@ -1929,14 +1929,12 @@ fn failures_are_counted_said_without_the_credential_and_paused_and_leftovers_are
     let calls = pool.read("docker/calls.log");
     let last_runner = calls
         .lines()
-        .filter(|line| line.starts_with("run ") && line.contains(RUNNER_IMAGE))
-        .next_back()
+        .rfind(|line| line.starts_with("run ") && line.contains(RUNNER_IMAGE))
         .expect("a runner");
     assert!(!last_runner.contains(":/home/runner "), "{last_runner}");
     let last_daemon = calls
         .lines()
-        .filter(|line| line.starts_with("run ") && line.contains(DOCKER_IMAGE))
-        .next_back()
+        .rfind(|line| line.starts_with("run ") && line.contains(DOCKER_IMAGE))
         .expect("a daemon");
     assert!(
         last_daemon.contains("/externals:/home/runner/externals:ro"),
@@ -2533,8 +2531,7 @@ fn a_runner_github_tells_to_update_updates_inside_its_container_and_then_takes_i
     wait_for(&pool, "a runner without the layer", || {
         pool.read("docker/calls.log")
             .lines()
-            .filter(|line| line.starts_with("run ") && line.contains(RUNNER_IMAGE))
-            .next_back()
+            .rfind(|line| line.starts_with("run ") && line.contains(RUNNER_IMAGE))
             .is_some_and(|run| !run.contains(":/home/runner "))
     });
     assert_eq!(pool.output().matches("with its files layered").count(), 1);
