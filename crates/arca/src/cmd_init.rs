@@ -356,17 +356,24 @@ impl Node<'_> {
                 self.path.display()
             ));
         }
-        if arca_approval::localhost_origin_port(&origin).is_some() {
+        if let Some(port) = arca_approval::localhost_origin_port(&origin) {
             say(
                 "  That page is for a machine where every account is trusted. Before you type a setup code or approve for",
             );
-            say(
-                "  the first time, check that the node says its page is open (\"page\": { \"open\": true } under \"loopback\"):",
-            );
+            say("  the first time, check that the node says the page is open:");
+            say(&format!("    arca status --config {}", self.path.display()));
+            // A machine with no screen and no browser: the page comes to the person's own computer.
+            say("  No browser on this machine? On your own computer run:");
             say(&format!(
-                "    arca status --json --config {}",
-                self.path.display()
+                "    ssh -o ExitOnForwardFailure=yes -L {port}:127.0.0.1:{port} <this machine>"
             ));
+            say(&format!(
+                "  Then open {origin}/approve in its browser: the page is this node's."
+            ));
+            say(
+                "  A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet",
+            );
+            say("  or a domain; the guide's section \"The approval page\" says how.");
         }
         if installed > 0 {
             say(&format!(

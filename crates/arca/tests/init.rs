@@ -589,6 +589,18 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         .says("No passkey is trusted yet, so nothing can be approved until you enrol the first one.")
         .says(&format!("arca setup-code --config {config}"))
         .says("That page is for a machine where every account is trusted.")
+        .says(&format!("    arca status --config {config}"))
+        // A machine with no screen: the one line that brings the page to the person's own computer, and no phone.
+        .says("No browser on this machine? On your own computer run:")
+        .says(&format!(
+            "    ssh -o ExitOnForwardFailure=yes -L {0}:127.0.0.1:{0} <this machine>",
+            node.port
+        ))
+        .says(&format!(
+            "Then open http://localhost:{}/approve in its browser: the page is this node's.",
+            node.port
+        ))
+        .says("A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet")
         .says("this is not the installer's service, so init did not")
         .says(&format!("arca serve --config {config}"))
         .says(&format!("arca init --watch-only --config {config}"))
@@ -1051,6 +1063,8 @@ fn an_approval_page_the_config_already_names_is_kept_whichever_kind_it_is() {
         .says("https://arca.example.com/approve, the page this config already names: it is kept as it is")
         .says("passkey on the page: https://arca.example.com/approve")
         .never_says("localhost")
+        .never_says("ssh ")
+        .never_says("A phone cannot open this page")
         .never_says("That page is for a machine where every account is trusted");
     let after = node.read();
     assert_eq!(after["approvalOrigin"], json!("https://arca.example.com"));
