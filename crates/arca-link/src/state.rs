@@ -413,32 +413,54 @@ mod tests {
     // be up. Asking must never make the start fail.
     #[test]
     fn asking_for_the_status_never_makes_a_starting_serve_think_another_one_runs() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
         let fixture = Fixture::new();
         let state = fixture.0.clone();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(AtomicU64::new(0));
+        // Both sides start together, and the starts go on until the status has been asked 2000 times beside them: the
+        // two race for the whole loop, on a quiet machine or a loaded one.
+        let together = Arc::new(Barrier::new(2));
         let asker = {
-            let (state, stop) = (state.clone(), stop.clone());
+            let (state, stop, asked, together) =
+                (state.clone(), stop.clone(), asked.clone(), together.clone());
             std::thread::spawn(move || {
-                let mut asked = 0u64;
-                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                together.wait();
+                while !stop.load(Ordering::SeqCst) {
                     let _ = state.status();
-                    asked += 1;
+                    asked.fetch_add(1, Ordering::SeqCst);
                 }
-                asked
             })
         };
-        let mut refused = 0;
-        for _ in 0..2000 {
+        together.wait();
+        let waited = Duration::from_secs(30);
+        let deadline = Instant::now() + waited;
+        let (mut starts, mut refused) = (0u64, 0u64);
+        while starts < 2000 || asked.load(Ordering::SeqCst) < 2000 {
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::SeqCst);
+                panic!(
+                    "after {waited:?}, {starts} starts and {} status checks beside them; the test needs 2000 of each",
+                    asked.load(Ordering::SeqCst)
+                );
+            }
             match state.hold_serve() {
                 Ok(lock) => drop(lock),
                 Err(_) => refused += 1,
             }
+            starts += 1;
         }
-        stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let asked = asker.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        asker.join().unwrap();
         assert_eq!(
-            refused, 0,
-            "{refused} of 2000 starts were refused as 'already running' while the status was asked {asked} times, and no other serve ran"
+            refused,
+            0,
+            "{refused} of {starts} starts were refused as 'already running' while the status was asked {} times beside \
+             them, and no other serve ran",
+            asked.load(Ordering::SeqCst)
         );
         // A second serve is still refused.
         let held = state.hold_serve().unwrap();
