@@ -604,6 +604,79 @@ fn a_template_that_generates_no_password_makes_a_stopped_database_and_the_card_s
     assert_eq!(direct["stoppedBecause"], why);
 }
 
+fn waiting(rig: &Rig) -> Vec<Value> {
+    rig.call("plan_list", json!({})).expect("plans")["plans"]
+        .as_array()
+        .expect("plans")
+        .clone()
+}
+
+#[test]
+fn a_waiting_databases_card_says_the_same_after_the_node_restarts() {
+    // What the node read from its template when the database was proposed is not in the proposal's arguments. A
+    // restart inside the proposal's fifteen minutes keeps it: the stopped row above all, so the owner never approves
+    // a card that lost it.
+    let rig = clean();
+    edit_database_template(&rig, |template| {
+        template
+            .as_object_mut()
+            .expect("a template")
+            .remove("generate");
+    });
+    let stopped = propose(&rig, json!({ "name": "orders" })).expect("the proposal");
+    assert_eq!(
+        stopped["details"][4],
+        json!({
+            "label": "Start",
+            "value": "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; instance_start starts it later"
+        })
+    );
+    edit_database_template(&rig, |template| {
+        template["generate"] = json!({ "POSTGRES_PASSWORD": "" });
+    });
+    let generated = propose(&rig, json!({ "name": "bills" })).expect("the proposal");
+    assert_eq!(generated["details"][3]["value"], MADE_AS);
+    let before = waiting(&rig);
+    assert_eq!(before.len(), 2);
+    let rig = rig.restart();
+    let after = waiting(&rig);
+    assert_eq!(after, before, "both cards are the ones the owner was shown");
+    for (proposal, shown) in [("orders", &stopped), ("bills", &generated)] {
+        let kept = after
+            .iter()
+            .find(|plan| plan["args"]["name"] == proposal)
+            .unwrap_or_else(|| panic!("{proposal} still waits"));
+        assert_eq!(kept["details"], shown["details"], "{proposal}");
+        assert_eq!(kept["argsDigest"], shown["argsDigest"], "{proposal}");
+    }
+    // A proposal that waited through the restart is still approved and run.
+    let made = approve(&rig, &generated).expect("the approved create");
+    assert_eq!(made["name"], "bills");
+    assert!(made.get("stoppedBecause").is_none());
+}
+
+#[test]
+fn a_card_does_not_say_generated_when_a_password_is_already_stored_for_the_name() {
+    // The create uses a password that is stored for the name and generates none, so the card claims nothing.
+    let rig = clean();
+    let file = password_file(&rig, "orders");
+    fs::create_dir_all(file.parent().expect("its directory")).expect("the secrets directory");
+    fs::write(&file, "a-password-stored-before").expect("a stored password");
+    let proposal = propose(&rig, json!({ "name": "orders" })).expect("the proposal");
+    assert_eq!(
+        proposal["details"],
+        json!([
+            { "label": "Database", "value": "orders" },
+            { "label": "Image", "value": pin(&rig) },
+            { "label": "Template", "value": DATABASE_TEMPLATE },
+            { "label": "Made as", "value": MADE_AS_PLAIN }
+        ])
+    );
+    // A name with no stored password still gets the claim: the template generates it.
+    let other = propose(&rig, json!({ "name": "bills" })).expect("the proposal");
+    assert_eq!(other["details"][3]["value"], MADE_AS);
+}
+
 #[test]
 fn a_token_whose_tool_list_leaves_out_service_create_makes_no_database_from_the_template() {
     let rig = clean();
