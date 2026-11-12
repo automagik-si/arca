@@ -1084,11 +1084,12 @@ fn id_arg(args: &Value) -> Result<&str, CallError> {
         .ok_or_else(|| CallError::Invalid("id: expected a tenant id".into()))
 }
 
-/// The tenant's instances as Incus lists them, with their state and expanded config.
+/// The tenant's instances as Incus lists them, with their status and expanded config, and without their live state.
 fn tenant_rows(read: &UnixIncus, scope: &TenantScope) -> Result<Vec<Value>, CallError> {
     service_listing(
         read,
         Some(&scope.project),
+        false,
         &format!("tenant {}", scope.id),
         "",
     )
@@ -1539,7 +1540,8 @@ impl TenantHandler {
         }
         // The block: the highest one of the tenant's size that overlaps no tenant's and holds no address in use.
         let subject = format!("tenant {id}");
-        let rows = service_listing(read, None, &subject, "Nothing was created.")?;
+        // A new tenant's block holds no address in use, and a live address is in no record: this one reads the state.
+        let rows = service_listing(read, None, true, &subject, "Nothing was created.")?;
         let leases = service_leases(read, &subject)?;
         let in_use = service_used(&rows, &leases, entries);
         let held = held_blocks(&self.cfg, entries);

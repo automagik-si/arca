@@ -307,6 +307,8 @@ enum Route {
     ListInstances,
     ListInstancesWithState,
     ProjectInstancesWithState(String),
+    /// One project's instances without their state: the `recursion=1` listing with a `project`.
+    ProjectInstances(String),
     ListPools,
     HostInterfaces,
     HostInterfaceState(String),
@@ -1193,6 +1195,9 @@ fn parse(target: &str) -> Option<Route> {
         ["instances"] if query_param(query, "recursion") == Some("2") => {
             Route::ProjectInstancesWithState(project.into())
         }
+        ["instances"] if query_param(query, "recursion") == Some("1") => {
+            Route::ProjectInstances(project.into())
+        }
         ["instances"] => Route::Collection(address("instance", "", "")),
         ["instances", name] => Route::Object(address("instance", "", name)),
         ["instances", name, "state"] => Route::InstanceState(address("instance", "", name)),
@@ -1297,6 +1302,28 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                 sync(Value::Array(
                     store
                         .instances_with_state()
+                        .into_iter()
+                        .filter(|row| row["project"] == project)
+                        .collect(),
+                ))
+            }
+        }
+        ("GET", Route::ProjectInstances(project)) => {
+            if project != "default"
+                && !store
+                    .objects
+                    .iter()
+                    .any(|object| object.kind == "project" && object.name == project)
+            {
+                (
+                    404,
+                    String::new(),
+                    error_envelope(404, "the project is not found"),
+                )
+            } else {
+                sync(Value::Array(
+                    store
+                        .bodies("instance")
                         .into_iter()
                         .filter(|row| row["project"] == project)
                         .collect(),

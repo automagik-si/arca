@@ -2510,6 +2510,34 @@ mod tests {
     }
 
     #[test]
+    fn a_bridged_machines_address_is_its_own_interfaces_and_never_one_the_guest_made() {
+        let state = json!({ "network": {
+            "docker0": { "hwaddr": "02:42:00:00:00:01", "addresses": [
+                { "family": "inet", "address": "172.17.0.1", "scope": "global" } ] },
+            "enp5s0": { "hwaddr": "10:66:6A:00:00:07", "addresses": [
+                { "family": "inet6", "address": "fe80::1", "scope": "link" },
+                { "family": "inet", "address": "198.51.100.7", "scope": "global" } ] },
+            "lo": { "hwaddr": "", "addresses": [
+                { "family": "inet", "address": "127.0.0.1", "scope": "local" } ] }
+        }});
+        let by_incus = json!({ "config": { "volatile.eth0.hwaddr": "10:66:6a:00:00:07" } });
+        let by_device = json!({ "config": {}, "devices": {
+            "eth0": { "type": "nic", "hwaddr": "10:66:6a:00:00:07" } } });
+        for row in [by_incus, by_device] {
+            assert_eq!(
+                bridged_ipv4(&row, &state),
+                Some("198.51.100.7".parse().unwrap())
+            );
+        }
+        // The first interface with a global address is the guest's own bridge: the old reading took that one.
+        assert_eq!(live_ipv4(&state), Some("172.17.0.1".parse().unwrap()));
+        // No interface of the instance's own, or none with an address yet: none.
+        let other = json!({ "config": { "volatile.eth0.hwaddr": "10:66:6a:00:00:99" } });
+        assert_eq!(bridged_ipv4(&other, &state), None);
+        assert_eq!(bridged_ipv4(&other, &json!({})), None);
+    }
+
+    #[test]
     fn generated_secrets_reject_biased_bytes_refill_and_stop_at_length() {
         let mut calls = 0;
         let secret = generated_secret_with("key_", |bytes| {
@@ -2552,7 +2580,7 @@ fn secret_body(value: &str) -> &str {
 /// What a log line or an output must never show for a stored secret: the stored text without the line breaks at its
 /// end, since a line never holds them. `None` for a stored text that no secret can be: one longer than the rule
 /// allows, counted as [`secret_value`] counts it (in characters, not counting one line break at its end), or shorter
-/// than a secret once its line breaks are gone. The two share that count, so no value the node accepts is left out.
+/// than a secret once the line breaks at its end are cut. The two share that count, so no value the node accepts is left out.
 pub fn secret_to_hide(stored: &str) -> Option<&str> {
     if secret_body(stored).chars().count() > SECRET_MAX {
         return None;
@@ -2821,6 +2849,44 @@ pub fn live_ipv4(state: &Value) -> Option<Ipv4Addr> {
         .iter()
         .filter(|(name, _)| name.as_str() != "lo")
         .flat_map(|(_, nic)| nic["addresses"].as_array().into_iter().flatten())
+        .find_map(|address| {
+            (address["family"] == "inet" && address["scope"] == "global")
+                .then(|| address["address"].as_str()?.parse::<Ipv4Addr>().ok())
+                .flatten()
+        })
+}
+
+/// The address a machine on a host bridge holds now: the first global IPv4 address of an interface whose hardware
+/// address is one the instance's own network devices have, as Incus gave it (`volatile.<device>.hwaddr` in `row`'s
+/// config) or as its device states it (`hwaddr`). An interface the guest made for itself, such as a container bridge
+/// inside it, has an address too, and is never the one meant.
+pub fn bridged_ipv4(row: &Value, state: &Value) -> Option<Ipv4Addr> {
+    let mut given: Vec<&str> = row["config"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| key.starts_with("volatile.") && key.ends_with(".hwaddr"))
+        .filter_map(|(_, value)| value.as_str())
+        .collect();
+    for devices in ["devices", "expanded_devices"] {
+        given.extend(
+            row[devices]
+                .as_object()
+                .into_iter()
+                .flat_map(|devices| devices.values())
+                .filter(|device| device["type"] == "nic")
+                .filter_map(|device| device["hwaddr"].as_str()),
+        );
+    }
+    state["network"]
+        .as_object()?
+        .values()
+        .filter(|nic| {
+            nic["hwaddr"]
+                .as_str()
+                .is_some_and(|held| given.iter().any(|mac| mac.eq_ignore_ascii_case(held)))
+        })
+        .flat_map(|nic| nic["addresses"].as_array().into_iter().flatten())
         .find_map(|address| {
             (address["family"] == "inet" && address["scope"] == "global")
                 .then(|| address["address"].as_str()?.parse::<Ipv4Addr>().ok())

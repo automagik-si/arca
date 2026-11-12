@@ -5367,23 +5367,61 @@ fn vm_refusal(name: &str, what: &str) -> CallError {
     service_refused(format!("service {name} is a virtual machine: {what}"))
 }
 
-/// The instances of `project`, or of every project, each with its state. `subject` and `changed` are for the refusal
-/// when Incus does not answer ([`incus_read_refused`]).
+/// How long a read of Incus that failed fast waits before its one second try.
+const READ_AGAIN_AFTER: Duration = Duration::from_millis(200);
+/// A failure that came back within this long is a fast one: Incus was not there, or said so at once.
+const FAST_FAILURE: Duration = Duration::from_secs(1);
+
+/// One read of Incus, made a second time when the first failed fast: the socket was not reached, or Incus answered
+/// with a server error, within a second. "Fast" is the time that passed, not the kind of failure: an error that took
+/// most of the deadline to come is not tried again, and neither is a read that got no answer by its deadline. Both
+/// tries share the one deadline a read is given, since a write holds its gate while it reads. Only the read is made
+/// again; it changes nothing, so the second is safe. The node's log gets a line for it.
+fn read_again_once(read: &UnixIncus, path: &str) -> Result<Value, arca_incus::IncusError> {
+    use arca_incus::IncusError;
+    let began = Instant::now();
+    let first = read.get(path);
+    let Err(error @ (IncusError::Io(_) | IncusError::Status { code: 500.., .. })) = &first else {
+        return first;
+    };
+    if began.elapsed() >= FAST_FAILURE {
+        return first;
+    }
+    eprintln!(
+        "arca: a read of Incus failed at once and is made once more: {}",
+        incus_read_cause(error).1
+    );
+    thread::sleep(READ_AGAIN_AFTER);
+    let left = arca_incus::read::TIMEOUT.saturating_sub(began.elapsed());
+    read.clone().with_timeout(left).get(path)
+}
+
+/// The instances of `project`, or of every project. `with_state` asks Incus for each one's live state too, which for a
+/// running virtual machine it takes from the guest's agent and can take seconds for one machine: only a call that
+/// picks an address or a MAC for a new instance asks for it, since a live address or interface is in no record. Every
+/// other call reads the listing without state, which holds each instance's status, config and devices and is answered
+/// at once. `subject` and `changed` are for the refusal when Incus does not answer ([`incus_read_refused`]).
 fn service_listing(
     read: &UnixIncus,
     project: Option<&str>,
+    with_state: bool,
     subject: &str,
     changed: &str,
 ) -> Result<Vec<Value>, CallError> {
+    let recursion = if with_state { 2 } else { 1 };
     let path = project
-        .map(|project| format!("/1.0/instances?project={project}&recursion=2"))
-        .unwrap_or_else(|| "/1.0/instances?all-projects=true&recursion=2".into());
-    match read.get(&path) {
+        .map(|project| format!("/1.0/instances?project={project}&recursion={recursion}"))
+        .unwrap_or_else(|| format!("/1.0/instances?all-projects=true&recursion={recursion}"));
+    match read_again_once(read, &path) {
         Ok(rows) => Ok(rows.as_array().cloned().unwrap_or_default()),
         Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
         Err(error) => Err(incus_read_refused(
             &error,
-            "the instances and their state",
+            if with_state {
+                "the instances and their live state"
+            } else {
+                "the instances"
+            },
             subject,
             changed,
         )),
@@ -5396,7 +5434,7 @@ fn service_leases(read: &UnixIncus, subject: &str) -> Result<Vec<String>, CallEr
         arca_netproject::BRIDGE,
         arca_netproject::PROJECT
     );
-    match read.get(&path) {
+    match read_again_once(read, &path) {
         Ok(rows) => Ok(rows
             .as_array()
             .into_iter()
@@ -6367,9 +6405,12 @@ impl ToolHandler for ServiceHandler {
         };
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
         let subject = read_subject(self.verb, &args);
+        // Only a create needs an instance's live state: the addresses and the interfaces that are in no record.
+        let picks_an_address = matches!(self.verb, "service_create" | "function_create");
         let rows = service_listing(
             &read,
             None,
+            picks_an_address,
             &subject,
             nothing_changed(self.verb, preapproved),
         )?;
@@ -6463,6 +6504,11 @@ impl ToolHandler for ServiceHandler {
                     }
                     let live = service_live_in(&rows, &config.project, &config.instance);
                     let mut view = crate::service::view(config, live);
+                    // A machine on a host bridge takes its address from that network: it is in no record, and the
+                    // list reads no live state. Said so, so an empty address is not read as "has none".
+                    if config.on_host_bridge() {
+                        view["ipv4In"] = json!("state");
+                    }
                     // Only a service whose installed template names another version carries the key, so every
                     // other row is the one it always was.
                     if service_update(&self.cfg, &mut templates, config)
@@ -6506,6 +6552,32 @@ impl ToolHandler for ServiceHandler {
                 if let Some((_, config)) = record {
                     let live = service_live_in(&rows, &config.project, &config.instance);
                     let mut view = crate::service::view(&config, live);
+                    // A machine on a host bridge has its address only in its live state, so this one call reads the
+                    // state of this one instance, when it runs. A service on the service network has its address
+                    // in its record, and nothing is read for it. A read that fails still answers: the address is
+                    // left empty and the answer says why.
+                    if config.on_host_bridge()
+                        && let Some(row) = live
+                        && row["status"].as_str() == Some("Running")
+                    {
+                        let path = format!(
+                            "/1.0/instances/{}/state?project={}",
+                            config.instance, config.project
+                        );
+                        match read_again_once(&read, &path) {
+                            Ok(state) => {
+                                if let Some(ipv4) = crate::service::bridged_ipv4(row, &state) {
+                                    view["ipv4"] = json!(ipv4.to_string());
+                                }
+                            }
+                            Err(error) => {
+                                let (_, cause) = incus_read_cause(&error);
+                                view["ipv4Problem"] = json!(format!(
+                                    "{cause} when this node read the live state of service {name}, which is where the address of a machine on a host bridge is: the address was not read. Every other field is as usual; ask again for the address"
+                                ));
+                            }
+                        }
+                    }
                     // The image the instance was made from, as Incus recorded it: a template that names an image
                     // by an alias does not say which build that was.
                     if let Some(image) = live.and_then(crate::service::base_image) {
@@ -6749,12 +6821,22 @@ impl ToolHandler for ServiceHandler {
                 }
                 let done = crate::service_import::import(&self.cfg, &name, &entries, now)?;
                 // The mark is on the instance now. Its record is made from it, exactly as a restart reads it.
-                let rows = service_listing(
+                // The import landed and its approval is used: the caller is told to look, never to ask for it again.
+                let rows = match read_again_once(
                     &read,
-                    None,
-                    &subject,
-                    "The instance carries Arca's mark already, and its record is made by the next service call that Incus answers.",
-                )?;
+                    "/1.0/instances?all-projects=true&recursion=1",
+                ) {
+                    Ok(rows) => rows.as_array().cloned().unwrap_or_default(),
+                    Err(arca_incus::IncusError::Status { code: 404, .. }) => Vec::new(),
+                    Err(error) => {
+                        return Err(incus_read_told(
+                            &error,
+                            "the instances",
+                            &subject,
+                            "The instance carries Arca's mark already, and its record is made by the next service call that Incus answers: service_list shows it. Do not propose the import again.",
+                        ));
+                    }
+                };
                 adopt_services(
                     &self.kernel,
                     &self.cfg,

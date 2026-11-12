@@ -281,7 +281,7 @@ pub fn plan(
 
     // A link names its provider by name and uuid, so the record is read against every instance, as the kernel reads it.
     let rows = UnixIncus::new(cfg.incus.socket.clone())
-        .get("/1.0/instances?all-projects=true&recursion=2")?
+        .get("/1.0/instances?all-projects=true&recursion=1")?
         .as_array()
         .cloned()
         .unwrap_or_default();
