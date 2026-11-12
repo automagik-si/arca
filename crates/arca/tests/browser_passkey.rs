@@ -694,7 +694,9 @@ fn g8_a_real_browser_registers_two_passkeys_and_approves_a_request_and_a_delete_
             "approvalHost": "node1",
             "kernel": {
                 "projects": [arca_netproject::PROJECT], "scratch": false, "droiddProjects": ["droid"],
-                "reservedCidrs": [], "serviceCidr": "192.0.2.0/24"
+                "reservedCidrs": [], "serviceCidr": "192.0.2.0/24",
+                // A database of the old kind, whose delete waits as a plan: its image is the config's to name.
+                "postgresImage": format!("example/db@sha256:{}", "b".repeat(64))
             }
         })
         .to_string(),

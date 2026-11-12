@@ -57,6 +57,24 @@ fn scratch() -> PathBuf {
     fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
     p
 }
+/// The image this node's config names for its databases (`kernel.postgresImage`): the only one a create may use.
+fn image() -> String {
+    format!("example/db@sha256:{}", "b".repeat(64))
+}
+/// The database handlers of a node, with its own `service_create` handler as serve gives it.
+fn handlers_of(
+    kernel: &Arc<Mutex<Kernel>>,
+    cfg: &NodeConfig,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    let cfg = Arc::new(cfg.clone());
+    let services = arca::handlers::service_handlers(kernel.clone(), Arc::new(|| NOW), cfg.clone());
+    postgres_handlers(
+        kernel.clone(),
+        Arc::new(|| NOW),
+        cfg,
+        arca::handlers::service_create_handler(&services).unwrap(),
+    )
+}
 impl Rig {
     fn new(dir: PathBuf, running: bool) -> Self {
         let store = store_guard();
@@ -73,7 +91,7 @@ impl Rig {
         )
         .unwrap();
         fake.add_profile("default",json!({"name":"default","config":{},"devices":{"root":{"type":"disk","pool":"pool1","path":"/"}}}));
-        let cfg:NodeConfig = serde_json::from_value(json!({"stateDir":dir,"incus":{"socket":fake.socket()},"listen":{"unix":dir.join("arca.sock")},"tokens":{"hashDir":dir.join("tokens")},"approvalHost":"node1","kernel":{"projects":[PROJECT],"droiddProjects":["other"],"serviceCidr":"192.0.2.0/24","reservedCidrs":["198.51.100.0/24"]}})).unwrap();
+        let cfg:NodeConfig = serde_json::from_value(json!({"stateDir":dir,"incus":{"socket":fake.socket()},"listen":{"unix":dir.join("arca.sock")},"tokens":{"hashDir":dir.join("tokens")},"approvalHost":"node1","kernel":{"projects":[PROJECT],"droiddProjects":["other"],"serviceCidr":"192.0.2.0/24","reservedCidrs":["198.51.100.0/24"],"postgresImage":image()}})).unwrap();
         let cfg_json = json!({"stateDir":dir,"incus":{"socket":fake.socket()},"listen":{"unix":dir.join("arca.sock")},"tokens":{"hashDir":dir.join("tokens")},"kernel":{"projects":[PROJECT],"droiddProjects":["other"],"serviceCidr":"192.0.2.0/24"}});
         fs::write(dir.join("config.json"), cfg_json.to_string()).unwrap();
         let args: Vec<String> = [
@@ -133,9 +151,7 @@ impl Rig {
             )
             .unwrap(),
         ));
-        let handlers = postgres_handlers(kernel.clone(), Arc::new(|| NOW), Arc::new(cfg.clone()))
-            .into_iter()
-            .collect();
+        let handlers = handlers_of(&kernel, &cfg).into_iter().collect();
         Self {
             _store: store,
             dir,
@@ -1100,7 +1116,7 @@ fn postgres_list_releases_kernel_lock_while_instance_state_get_is_stalled() {
     listener.set_nonblocking(true).unwrap();
     let mut cfg = r.cfg.clone();
     cfg.incus.socket = path;
-    let handler = postgres_handlers(r.kernel.clone(), Arc::new(|| NOW), Arc::new(cfg))
+    let handler = handlers_of(&r.kernel, &cfg)
         .into_iter()
         .find(|(name, _)| *name == "postgres_list")
         .unwrap()

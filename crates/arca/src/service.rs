@@ -326,6 +326,11 @@ pub struct TenantRef {
     pub deploy: Option<String>,
 }
 
+/// The template a database is made from on a node whose config names no `kernel.postgresImage`: `postgres_create`
+/// there makes the service `service_create` makes from this template, and `postgres_list` shows every service of the
+/// node's own project made from it.
+pub const DATABASE_TEMPLATE: &str = "postgres-autopg";
+
 /// The name of the Incus instance of the service `name`: the service's own name, and `<name>-<id>` in tenant `id`. Incus
 /// refuses two instances of one name on one bridge, whatever their projects, since the name is the instance's DNS name
 /// there; the tenant's id keeps a tenant's instance apart from every other tenant's and from the node's own.

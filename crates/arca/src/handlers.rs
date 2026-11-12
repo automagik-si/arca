@@ -1601,6 +1601,20 @@ impl ToolHandler for ActionPropose {
         } else if let (ActionKind::ServiceCreate, Some(node)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
             enrich_service_create(node, &entries, &payload)?
+        } else if let (ActionKind::PostgresCreate, Some(node)) = (action, &self.node) {
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            enrich_postgres_create(node, &entries, &payload)?
+        } else if action == ActionKind::PostgresCreate
+            && self.postgres_image.is_none()
+            && payload.get("template").is_some()
+        {
+            // Only the node names the template and its image, from its own template (`enrich_postgres_create`). A
+            // handler given no node cannot, so it records no proposal that names them: no card shows an image the
+            // node did not read from its template.
+            return Err(CallError::Invalid(
+                "args/template: the kernel names the template and the image it pins when the proposal is made; a caller names neither"
+                    .to_string(),
+            ));
         } else if let (ActionKind::TenantCreate | ActionKind::TenantRemove, Some(node)) =
             (action, &self.node)
         {
@@ -1687,6 +1701,12 @@ impl ToolHandler for ActionPropose {
                 .node
                 .as_deref()
                 .and_then(|node| service_create_stopped_reason(node, &payload)),
+            // The card of a database made from the node's template says that the template generates its password
+            // only when it does, and otherwise why the database is created stopped.
+            ActionKind::PostgresCreate => self
+                .node
+                .as_deref()
+                .and_then(|node| database_card_fact(node, &payload)),
             // The card of a deploy's removal lists the deploy's parts as they stand now.
             ActionKind::DeployRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
@@ -3877,10 +3897,24 @@ fn stopped_because(start: bool, template: Option<String>) -> String {
 /// Why a fixed MAC is refused on the managed service network.
 const MANAGED_MAC: &str = "mac: a virtual machine on the managed service network has its address reserved by Arca, so it takes no fixed MAC; mac is for a host bridge";
 
+/// The `service_create` handler among `handlers`, as [`postgres_handlers`] takes it.
+pub fn service_create_handler(
+    handlers: &[(&'static str, Arc<dyn ToolHandler>)],
+) -> Option<Arc<dyn ToolHandler>> {
+    handlers
+        .iter()
+        .find(|(verb, _)| *verb == "service_create")
+        .map(|(_, handler)| Arc::clone(handler))
+}
+
+/// The database verbs. `service_create` is the node's own `service_create` handler ([`service_handlers`]): on a node
+/// whose config names no `kernel.postgresImage`, `postgres_create` makes the service that handler makes from the
+/// node's database template, through that handler and nothing else.
 pub fn postgres_handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
     cfg: Arc<NodeConfig>,
+    service_create: Arc<dyn ToolHandler>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     // Serialize secret/document transactions without blocking other kernel users during I/O.
     // One gate for every handler that picks an address or a block: the kernel's own.
@@ -3902,6 +3936,7 @@ pub fn postgres_handlers(
                 clock: clock.clone(),
                 cfg: cfg.clone(),
                 writes: writes.clone(),
+                service_create: service_create.clone(),
             }) as Arc<dyn ToolHandler>,
         )
     })
@@ -3913,6 +3948,226 @@ struct PostgresHandler {
     clock: Clock,
     cfg: Arc<NodeConfig>,
     writes: Arc<Mutex<()>>,
+    service_create: Arc<dyn ToolHandler>,
+}
+
+/// Where a new database's image comes from. It is never the call's to choose.
+enum DatabaseSource {
+    /// The image the node's config names (`kernel.postgresImage`): a database of the old kind, made from an image
+    /// Incus already holds under that fingerprint.
+    Configured(String),
+    /// The node's database template, with the image by digest it names now: a service, fetched as every template's
+    /// image is.
+    Template(String),
+}
+
+/// The source of a database this node creates now: the image its config names, or else its database template. A call
+/// or a proposal that states an image must state exactly that one, so no caller runs an image of its own choosing,
+/// and a proposal made before the template was changed is refused. The refusal never repeats what the caller stated.
+fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, CallError> {
+    let template_name = crate::service::DATABASE_TEMPLATE;
+    let stated = match args.get("image") {
+        None => None,
+        Some(image) => {
+            let image = image
+                .as_str()
+                .filter(|image| image.len() <= 512)
+                .ok_or_else(|| pg_invalid("image is required"))?;
+            arca_postgres::fingerprint(image)
+                .map_err(|_| pg_invalid("a digest-pinned image is required"))?;
+            Some(image)
+        }
+    };
+    if let Some(configured) = cfg.kernel.postgres_image.as_deref() {
+        if args.get("template").is_some() {
+            return Err(service_refused(
+                "template: this node's config names kernel.postgresImage, so a database is made from that image and from no template",
+            ));
+        }
+        if stated.is_some_and(|image| image != configured) {
+            return Err(service_refused(
+                "image: a call cannot choose an image. This node makes a database from the image its config names (kernel.postgresImage), and from no other",
+            ));
+        }
+        return Ok(DatabaseSource::Configured(configured.to_string()));
+    }
+    if args
+        .get("template")
+        .is_some_and(|template| template.as_str() != Some(template_name))
+    {
+        return Err(service_refused(format!(
+            "template: a database is made from this node's {template_name} template, and from no other"
+        )));
+    }
+    // A database is a container on the managed service network: a node that runs no services refuses in those words.
+    service_project(cfg)?;
+    let template = crate::service::load_template(&cfg.state_dir.join("templates"), template_name)
+        .map_err(|error| {
+            if error.not_found {
+                service_refused(format!(
+                    "this node has no {template_name} template (templates/{template_name}.json in its state directory), and its config names no kernel.postgresImage: a database is made from one of the two. `arca templates install` puts the template Arca ships there"
+                ))
+            } else {
+                service_template_error(error)
+            }
+        })?;
+    let pin = crate::service::template_pin(&template)
+        .filter(|_| template.kind == "oci")
+        .ok_or_else(|| {
+            service_refused(format!(
+                "the {template_name} template on this node names no image by digest, so no database is made from it"
+            ))
+        })?;
+    if stated.is_some_and(|image| image != pin) {
+        return Err(database_image_changed(&pin));
+    }
+    Ok(DatabaseSource::Template(pin))
+}
+
+/// The refusal for an image that is not the one the node's database template names now, `pin`.
+fn database_image_changed(pin: &str) -> CallError {
+    service_refused(format!(
+        "image: a call cannot choose an image. This node makes a database from its {} template, which names {pin} now. A proposal that names another was made before the template changed: nothing was created, propose it again",
+        crate::service::DATABASE_TEMPLATE
+    ))
+}
+
+/// What the owner's card is told about a proposed database made from the node's template, read from that template
+/// now: why it is created stopped (its template generates no password and none is stored for it), or that the
+/// template generates the password. `None` for a database of the old kind, for a template that does not load (the
+/// proposal is refused for that), and for a password already stored, where the card claims nothing.
+fn database_card_fact(cfg: &NodeConfig, payload: &Value) -> Option<String> {
+    let template = crate::service::load_template(
+        &cfg.state_dir.join("templates"),
+        payload["template"].as_str()?,
+    )
+    .ok()?;
+    let owner = crate::service::entry_id(None, payload["name"].as_str()?);
+    crate::service::template_stopped_reason(&template, &owner, &cfg.state_dir.join("secrets"))
+        .or_else(|| {
+            template
+                .generate
+                .contains_key("POSTGRES_PASSWORD")
+                .then(|| crate::action_proposal::DATABASE_PASSWORD_GENERATED.to_string())
+        })
+}
+
+/// Refuses a database made from the template under a name a database of either kind, or a service, holds already.
+fn database_name_free(
+    entries: &[arca_kernel::desired::Entry],
+    name: &str,
+) -> Result<(), CallError> {
+    if entries
+        .iter()
+        .any(|entry| entry.id.0 == format!("postgres-{name}"))
+    {
+        return Err(pg_invalid("database entry already exists"));
+    }
+    if entries
+        .iter()
+        .any(|entry| entry.id.0 == crate::service::entry_id(None, name))
+    {
+        return Err(service_refused(format!(
+            "a service named {name} exists already: a database made from this node's {} template is a service, and takes a name no service holds",
+            crate::service::DATABASE_TEMPLATE
+        )));
+    }
+    Ok(())
+}
+
+/// A proposed `postgres_create` on a node whose config names no image: the proposal is given the node's database
+/// template and the image it pins now, so the owner's card shows the image and the approval binds it. A create this
+/// node is sure to refuse (no template, a name that is taken, an image the caller chose) is refused now, so the owner
+/// is never asked to approve it. On a node whose config names the image the proposal is left as it is: `prepare`
+/// fills that image in, as it always did.
+fn enrich_postgres_create(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+    payload: &Value,
+) -> Result<Value, CallError> {
+    if cfg.kernel.postgres_image.is_some() || !payload.is_object() {
+        return Ok(payload.clone());
+    }
+    let DatabaseSource::Template(pin) = database_source(cfg, payload)? else {
+        return Ok(payload.clone());
+    };
+    if let Some(name) = payload["name"].as_str() {
+        database_name_free(entries, name)?;
+    }
+    let mut payload = payload.clone();
+    payload["template"] = json!(crate::service::DATABASE_TEMPLATE);
+    payload["image"] = json!(pin);
+    Ok(payload)
+}
+
+/// The words for a database verb that names a service: a database made from the template is a service.
+fn database_is_service(verb: &str, name: &str) -> CallError {
+    let instead = match verb {
+        "postgres_delete" => "remove it with service_remove",
+        _ => {
+            "connect a service to it with service_connect, and take the link away with service_disconnect"
+        }
+    };
+    service_refused(format!(
+        "{name} is a service: a database made from this node's {} template is one. {verb} acts on a database of the old kind only; {instead}",
+        crate::service::DATABASE_TEMPLATE
+    ))
+}
+
+/// The services of the node's own project made from the database template, by name.
+fn template_databases(
+    entries: &[arca_kernel::desired::Entry],
+) -> Vec<(arca_kernel::desired::Entry, crate::service::ServiceConfig)> {
+    service_entries(entries)
+        .into_iter()
+        .filter(|(_, config)| {
+            config.template == crate::service::DATABASE_TEMPLATE
+                && config.tenant.is_none()
+                && !config.adopted
+        })
+        .collect()
+}
+
+impl PostgresHandler {
+    /// `postgres_create` on a node whose config names no image: the service `service_create` makes from the node's
+    /// database template, made by that handler and by nothing else. `pin` is the image the template named when this
+    /// call was checked: the handler compares it with the template it reads for the create, so the image checked and
+    /// the image created from are one read. The password is the template's to generate; from a template that
+    /// generates none the service is created stopped, and the answer says why. The name must be free among databases
+    /// of both kinds and among services. A token whose tool list leaves out `service_create` makes no service this
+    /// way either.
+    fn create_from_template(
+        &self,
+        args: &Value,
+        caller: &Caller,
+        pin: &str,
+    ) -> Result<Value, CallError> {
+        if !caller.allows_tool("service_create") {
+            return Err(service_refused(format!(
+                "on this node a database is a service made from the {} template, so postgres_create needs service_create too, and this token's tool list does not have it",
+                crate::service::DATABASE_TEMPLATE
+            )));
+        }
+        let name = pg_name(args, "name", "postgres", 31)?;
+        if !crate::service::service_name_ok(&name) {
+            return Err(pg_invalid("invalid database or consumer name"));
+        }
+        database_name_free(lock(&self.kernel)?.entries(), &name)?;
+        let made = self.service_create.call(
+            json!({ "name": name, "template": crate::service::DATABASE_TEMPLATE, "pin": pin }),
+            caller,
+        )?;
+        let mut answer = json!({
+            "name": name,
+            "entry": crate::service::entry_id(None, &name),
+            "status": "pending",
+            "service": true
+        });
+        if let Some(why) = made.get("stoppedBecause") {
+            answer["stoppedBecause"] = why.clone();
+        }
+        Ok(answer)
+    }
 }
 fn pg_invalid(message: &str) -> CallError {
     CallError::Invalid(message.into())
@@ -4054,11 +4309,6 @@ impl ToolHandler for PostgresHandler {
             return Err(only_looks());
         }
         let now = (self.clock)();
-        let _write = if self.verb == "postgres_list" {
-            None
-        } else {
-            Some(self.writes.lock().map_err(|_| internal())?)
-        };
         // Inside a tenant a database is a service: the postgres service template, linked with service_connect. The
         // database verbs act in the node's own project only, and write nothing for a call that names a tenant.
         if args.get("tenant").is_some() {
@@ -4066,19 +4316,28 @@ impl ToolHandler for PostgresHandler {
             tenants::tenant_arg(&self.cfg, &args, lock(&self.kernel)?.entries())?;
             return Err(tenants::database_route(self.verb));
         }
-        let entries = {
-            let kernel = lock(&self.kernel)?;
-            kernel
-                .entries()
-                .iter()
-                .filter(|e| self.verb != "postgres_list" || e.plugin.0 == "arca.postgres")
-                .cloned()
-                .collect::<Vec<_>>()
+        // The image is the node's, never the call's: the one its config names, or else its database template, whose
+        // create is the service handler's own and takes the write gate itself.
+        let configured_image = if self.verb == "postgres_create" {
+            match database_source(&self.cfg, &args)? {
+                DatabaseSource::Template(pin) => {
+                    return self.create_from_template(&args, caller, &pin);
+                }
+                DatabaseSource::Configured(image) => Some(image),
+            }
+        } else {
+            None
         };
+        let _write = if self.verb == "postgres_list" {
+            None
+        } else {
+            Some(self.writes.lock().map_err(|_| internal())?)
+        };
+        let entries = lock(&self.kernel)?.entries().to_vec();
         if self.verb == "postgres_list" {
             let read = UnixIncus::new(self.cfg.incus.socket.clone());
             let mut rows = Vec::new();
-            for entry in &entries {
+            for entry in entries.iter().filter(|e| e.plugin.0 == "arca.postgres") {
                 let cfg: arca_postgres::PostgresConfig =
                     serde_json::from_value(entry.config.clone()).map_err(|_| internal())?;
                 let state = match read.get(&format!(
@@ -4097,6 +4356,30 @@ impl ToolHandler for PostgresHandler {
                 };
                 rows.push(json!({"name":cfg.name,"entry":entry.id.0,"status":status,"address":address,"port":5432,"links":cfg.allow}));
             }
+            // A database made from the node's template is a service. Its row is the same, and it alone carries
+            // `service`, so a database of the old kind is shown as it always was.
+            for (entry, config) in template_databases(&entries) {
+                let state = match read.get(&format!(
+                    "/1.0/instances/{}/state?project={}",
+                    config.instance, config.project
+                )) {
+                    Ok(state) => state,
+                    Err(arca_incus::IncusError::Status { code: 404, .. }) => Value::Null,
+                    Err(_) => return Err(internal()),
+                };
+                let address = arca_postgres::ipv4(&state).map(|ip| ip.to_string());
+                let status = if address.is_none() {
+                    "pending".into()
+                } else {
+                    state["status"].as_str().unwrap_or("pending").to_lowercase()
+                };
+                let links: Vec<&str> = config
+                    .incoming
+                    .iter()
+                    .map(|grant| grant.consumer.as_str())
+                    .collect();
+                rows.push(json!({"name":config.name,"entry":entry.id.0,"status":status,"address":address,"port":5432,"links":links,"service":true}));
+            }
             return Ok(json!({"databases":rows}));
         }
         let name = pg_name(&args, "name", "postgres", 31)?;
@@ -4107,12 +4390,7 @@ impl ToolHandler for PostgresHandler {
             if entries.iter().any(|e| e.id.0 == id) {
                 return Err(pg_invalid("database entry already exists"));
             }
-            let image = args["image"]
-                .as_str()
-                .filter(|i| i.len() <= 512)
-                .ok_or_else(|| pg_invalid("image is required"))?;
-            arca_postgres::fingerprint(image)
-                .map_err(|_| pg_invalid("a digest-pinned image is required"))?;
+            let image = configured_image.as_deref().ok_or_else(internal)?;
             let pool = service_pool(&self.cfg)?;
             let path = secret_dir(&self.cfg, &id)?.join("password");
             let mut bytes = [0u8; 32];
@@ -4135,6 +4413,14 @@ impl ToolHandler for PostgresHandler {
             };
             pg_reconciled(&outcomes, &[&id])?;
             return Ok(json!({"name":name,"entry":id,"status":"pending"}));
+        }
+        // A database made from the template is a service, and the service verbs act on it.
+        if !entries.iter().any(|entry| entry.id.0 == id)
+            && template_databases(&entries)
+                .iter()
+                .any(|(_, config)| config.name == name)
+        {
+            return Err(database_is_service(self.verb, &name));
         }
         let mut database = pg_entry(&entries, &id, "arca.postgres")?;
         if self.verb == "postgres_delete" {
@@ -5410,6 +5696,9 @@ impl ToolHandler for ServiceHandler {
                 "settings",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
+                // Only `postgres_create` carries it: the image its template named when that call was checked. The
+                // create refuses when the template it reads names another. It can only refuse, never widen.
+                "pin",
             ],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
@@ -6055,6 +6344,14 @@ impl ToolHandler for ServiceHandler {
                 let templates_dir = self.cfg.state_dir.join("templates");
                 let template = crate::service::load_template(&templates_dir, template_name)
                     .map_err(service_template_error)?;
+                // A database's create was checked against the image its template named: this read, the one the
+                // service is made from, must name the same.
+                if let Some(pin) = args.get("pin") {
+                    let now = crate::service::template_pin(&template);
+                    if pin.as_str().is_none() || pin.as_str() != now.as_deref() {
+                        return Err(database_image_changed(now.as_deref().unwrap_or("no image")));
+                    }
+                }
                 // Read before the create makes any secret: why this template is created stopped whatever `start` says.
                 let forced = crate::service::template_stopped_reason(
                     &template,

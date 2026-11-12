@@ -691,19 +691,35 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         !instance_exists(&node.fake, "nats"),
         "a proposal runs nothing"
     );
-    // A database, on the node init leaves. Init sets no image for a proposed postgres_create, so that proposal is
-    // refused, and the refusal names the way that works here today; that way is taken, and waits like any change.
-    let refused = mcp(
-        &node.socket,
-        &viewer,
+    // A database, on the node init leaves. Init sets no image for it and none is needed: a proposed postgres_create
+    // is the service the shipped template makes, with the image that template pins on the card. The same service
+    // can be proposed by its template, and both wait like any change.
+    let database = result(
+        &mcp(
+            &node.socket,
+            &viewer,
+            "action_propose",
+            json!({ "action": "postgres_create", "args": { "name": "db0" } }),
+        ),
         "action_propose",
-        json!({ "action": "postgres_create", "args": { "name": "db1" } }),
     );
-    let why = refused.to_string();
+    assert_eq!(database["args"]["template"], "postgres-autopg");
     assert!(
-        why.contains("kernel.postgresImage")
-            && why.contains("propose service_create with the template postgres-autopg"),
-        "the refusal names what works: {why}"
+        database["args"]["image"]
+            .as_str()
+            .is_some_and(|image| image.contains("@sha256:")),
+        "the card's image is the template's, by digest: {database}"
+    );
+    assert!(
+        database
+            .to_string()
+            .contains("with the password that template generates")
+            && !database.to_string().contains("created stopped"),
+        "the database's card: {database}"
+    );
+    assert!(
+        !instance_exists(&node.fake, "db0"),
+        "a proposal runs nothing"
     );
     let card = result(
         &mcp(
