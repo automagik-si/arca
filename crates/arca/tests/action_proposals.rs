@@ -598,7 +598,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             assert_eq!(made.label, "Made as");
             assert_eq!(
                 made.value,
-                arca::action_proposal::database_service_words("postgres-autopg")
+                arca::action_proposal::database_service_words("postgres-autopg", false)
             );
             seen += 1;
         }
@@ -646,6 +646,16 @@ fn a_proposed_postgres_create_uses_only_the_configured_pinned_image() {
         .propose("postgres_create", json!({ "name": "orders" }))
         .expect_err("no configured image");
     assert!(matches!(error, CallError::Invalid(_)));
+    // Only the node names the template and its image, from its own template: a proposal that states them by hand
+    // is not recorded, so no card ever shows an image the node did not read.
+    let error = no_default
+        .propose(
+            "postgres_create",
+            json!({ "name": "orders", "template": "postgres-autopg", "image": foreign }),
+        )
+        .expect_err("a hand-made template proposal");
+    assert!(matches!(error, CallError::Invalid(_)));
+    assert_eq!(no_default.list()["plans"].as_array().map(Vec::len), Some(0));
 
     let unpinned = Rig::with_image(
         "proposal-postgres-unpinned",

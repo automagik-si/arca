@@ -250,7 +250,7 @@ static VERBS: [Verb; 61] = [
     },
     Verb {
         name: "postgres_create",
-        summary: "Create a Postgres database in the node's service project (arcak-svc), with a password Arca generates and keeps; no tool shows it. Give the name only: the image is the node's, never the call's. With no kernel.postgresImage in the node's config, the database is a service from the node's postgres-autopg template (its digest-pinned image is fetched), and the answer says service: true: connect to it with service_connect, remove it with service_remove. With kernel.postgresImage, it is a database of the old kind from that image, linked with postgres_link. Returns its name, its entry and the status pending; postgres_list shows when it runs. In a tenant, use service_create with that template.",
+        summary: "Create a Postgres database in the node's service project (arcak-svc). Give the name only: the image is the node's, never the call's. With no kernel.postgresImage in the node's config, the database is a service from the node's postgres-autopg template: its digest-pinned image is fetched, the template generates the password (when it does not, the service is created stopped and stoppedBecause says why), and the answer says service: true; connect to it with service_connect, remove it with service_remove. With kernel.postgresImage, it is a database of the old kind from that image, linked with postgres_link. Returns its name, its entry and the status pending; postgres_list shows when it runs.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,

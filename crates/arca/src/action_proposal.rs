@@ -459,7 +459,16 @@ impl ActionKind {
                 // kernel fills it in when the proposal is made), so the card says what the owner gets.
                 if args.get("template").is_some() {
                     rows.push(row("Template", text("template")));
-                    rows.push(row("Made as", &database_service_words(text("template"))));
+                    // What the node read from its template when the proposal was made: that it generates the
+                    // password, or why the database is created stopped. The card claims neither without it.
+                    let generated = gpu_product == Some(DATABASE_PASSWORD_GENERATED);
+                    rows.push(row(
+                        "Made as",
+                        &database_service_words(text("template"), generated),
+                    ));
+                    if let Some(reason) = gpu_product.filter(|_| !generated) {
+                        rows.push(row("Start", &stopped_words(reason)));
+                    }
                 }
                 rows
             }
@@ -740,11 +749,21 @@ pub fn destinations_list(destinations: &Value) -> String {
     }
 }
 
+/// What the card of a template database is told, in place of a stopped reason, when the node's template generates
+/// the database's password. No stopped reason reads so.
+pub const DATABASE_PASSWORD_GENERATED: &str = "generated";
+
 /// The card's words for a database made from the node's template `template`: what the owner gets, and the verbs that
-/// reach it afterwards.
-pub fn database_service_words(template: &str) -> String {
+/// reach it afterwards. They say the password is generated only when `generated`: when the node read its template and
+/// the template generates it.
+pub fn database_service_words(template: &str, generated: bool) -> String {
+    let password = if generated {
+        ", with the password that template generates; Arca keeps it"
+    } else {
+        ""
+    };
     format!(
-        "A service from this node's {template} template, with the password that template generates; Arca keeps it. A database made this way is a service: connect to it with service_connect, remove it with service_remove."
+        "A service from this node's {template} template{password}. A database made this way is a service: connect to it with service_connect, remove it with service_remove."
     )
 }
 
@@ -1522,6 +1541,35 @@ mod tests {
         assert_eq!(
             labels(&filled),
             ["Database", "Image", "Template", "Made as"]
+        );
+        // The card says the password is generated only when the node read that from its template, and carries the
+        // stopped row a create's card has when the template would leave the database stopped.
+        let rows = |fact: Option<&str>| -> Vec<(String, String)> {
+            create
+                .details_with_gpu(&filled, fact)
+                .into_iter()
+                .skip(3)
+                .map(|row| (row.label, row.value))
+                .collect()
+        };
+        let plain = "A service from this node's postgres-autopg template. A database made this way is a service: connect to it with service_connect, remove it with service_remove.";
+        assert_eq!(rows(None), [("Made as".to_string(), plain.to_string())]);
+        assert_eq!(
+            rows(Some(DATABASE_PASSWORD_GENERATED)),
+            [(
+                "Made as".to_string(),
+                "A service from this node's postgres-autopg template, with the password that template generates; Arca keeps it. A database made this way is a service: connect to it with service_connect, remove it with service_remove.".to_string()
+            )]
+        );
+        assert_eq!(
+            rows(Some("its template needs the secret POSTGRES_PASSWORD, which is not set yet")),
+            [
+                ("Made as".to_string(), plain.to_string()),
+                (
+                    "Start".to_string(),
+                    "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; instance_start starts it later".to_string()
+                )
+            ]
         );
         assert_eq!(
             labels(&json!({ "name": "orders", "image": PINNED_IMAGE })),

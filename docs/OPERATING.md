@@ -756,18 +756,23 @@ is the service that `service_create` makes from the node's `postgres-autopg` tem
 
 - Incus fetches the template's image itself, by registry and digest, when it does not hold it. Nothing is put in
   Incus by hand first.
-- The template generates the password, and Arca keeps it in a private file; no tool shows it. A template that
-  generates none (one installed before the shipped template did, or the owner's edit) makes the database stopped,
-  and the answer's `stoppedBecause` says so: `arca templates install --replace` puts the shipped template back.
+- The shipped template generates the password, and Arca keeps it in a private file; no tool shows it. A node that
+  still holds an older `postgres-autopg.json` (one installed before the shipped template generated the password:
+  `arca templates install` keeps a file that differs) or the owner's own edit makes the database stopped. The
+  owner's card then carries a `Start` row that says so, and the answer's `stoppedBecause` says why. Two ways on:
+  `arca templates install --replace` puts the shipped template back for the next database; or, for this one, set
+  the secret with `service_secret_set` (key `POSTGRES_PASSWORD`) and start it with `instance_start`.
 - The answer carries `service: true`, and `postgres_list` shows the database with `service: true` and, under
   `links`, the services connected to it.
 - A database made this way is a service: connect to it with `service_connect`, remove it with `service_remove`.
   The service that connects is given `DATABASE_URL` for the role `app` and the database `app`.
   `postgres_link`, `postgres_unlink` and `postgres_delete` refuse its name and say which verb acts on it.
 - Its name must be one no database and no service holds.
+- A token with a tool list needs `service_create` in it beside `postgres_create`: the database is a service.
 
 A proposal is given the template's name and the image it pins when it is made. The card shows the image by digest,
-the template and a `Made as` row, and the approval binds the image and the template: if the template on the node names another image when the owner
+the template and a `Made as` row, which says that the template generates the password only when it does, and the
+approval binds the image and the template: if the template on the node names another image when the owner
 approves, the create is refused and nothing is made; propose it again. The card binds the image, not the template's
 entrypoint script, which is the node's own file in its state directory.
 

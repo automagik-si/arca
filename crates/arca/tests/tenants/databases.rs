@@ -21,16 +21,11 @@ fn kernel(image: Option<&str>) -> Value {
     kernel
 }
 
-/// Puts the templates Arca ships in the node's state directory, as `arca templates install` does. The database
-/// template is the shipped one with its password generated: the password is the template's to make
-/// (`"generate": { "POSTGRES_PASSWORD": "" }`), and a database made from a template that generates none is created
-/// stopped (`a_template_that_generates_no_password_makes_a_stopped_database_and_says_why`).
+/// Puts the templates Arca ships in the node's state directory, exactly as `arca templates install` does, and one
+/// plain template `app` beside them. The database template is the shipped file, unchanged.
 fn install_templates(rig: &Rig) {
     arca::cmd_templates::install_into(&rig.dir.join("templates"), false)
         .unwrap_or_else(|_| panic!("the shipped templates install"));
-    edit_database_template(rig, |template| {
-        template["generate"] = json!({ "POSTGRES_PASSWORD": "" });
-    });
     rig.template("app", app_template("app"));
 }
 
@@ -134,6 +129,20 @@ fn fetched_source(rig: &Rig) -> Value {
 }
 
 const MADE_AS: &str = "A service from this node's postgres-autopg template, with the password that template generates; Arca keeps it. A database made this way is a service: connect to it with service_connect, remove it with service_remove.";
+/// The same row for a template that generates no password: the card claims none.
+const MADE_AS_PLAIN: &str = "A service from this node's postgres-autopg template. A database made this way is a service: connect to it with service_connect, remove it with service_remove.";
+
+/// The shipped database template generates its password: a database made from a clean install starts by itself,
+/// and no token ever sets its password.
+#[test]
+fn the_shipped_database_template_generates_its_password() {
+    let (_, text) = arca::cmd_templates::SHIPPED
+        .iter()
+        .find(|(name, _)| *name == "postgres-autopg.json")
+        .expect("the shipped database template");
+    let template: Value = serde_json::from_str(text).expect("json");
+    assert_eq!(template["generate"], json!({ "POSTGRES_PASSWORD": "" }));
+}
 
 #[test]
 fn on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_fetched_by_digest() {
@@ -337,6 +346,13 @@ fn no_call_chooses_the_image_of_a_database_through_either_door() {
         assert_eq!(code, "refused", "{door}");
         assert_eq!(message, chosen, "{door}");
         assert!(!message.contains(OTHER_IMAGE), "{door}");
+        // A proposal made by hand, with the template and another image than it pins, is refused when it is
+        // proposed: the owner never sees a card that cannot run.
+        let (code, message) = refusal(call(
+            json!({ "name": "mine", "template": DATABASE_TEMPLATE, "image": OTHER_IMAGE }),
+        ));
+        assert_eq!(code, "refused", "{door}");
+        assert_eq!(message, chosen, "{door}");
         // Another template is not the database template.
         let (code, message) = refusal(call(json!({ "name": "mine", "template": "app" })));
         assert_eq!(code, "refused", "{door}");
@@ -544,8 +560,9 @@ fn a_database_takes_a_name_nothing_holds_and_a_failed_create_leaves_no_password(
 }
 
 #[test]
-fn a_template_that_generates_no_password_makes_a_stopped_database_and_says_why() {
-    // A template installed before the shipped one generated its password, or the owner's own edit.
+fn a_template_that_generates_no_password_makes_a_stopped_database_and_the_card_says_so() {
+    // A node that still holds a database template from before the shipped one generated its password, or the
+    // owner's own edit: `arca templates install` keeps a file that differs.
     let rig = clean();
     edit_database_template(&rig, |template| {
         template
@@ -553,14 +570,26 @@ fn a_template_that_generates_no_password_makes_a_stopped_database_and_says_why()
             .expect("a template")
             .remove("generate");
     });
-    let made = rig
-        .call("postgres_create", json!({ "name": "orders" }))
-        .expect("the create");
+    let pin = pin(&rig);
+    let why = "its template needs the secret POSTGRES_PASSWORD, which is not set yet";
+    // The card claims no generated password, and carries the stopped row a create's card has.
+    let proposal = propose(&rig, json!({ "name": "orders" })).expect("the proposal");
+    assert_eq!(
+        proposal["details"],
+        json!([
+            { "label": "Database", "value": "orders" },
+            { "label": "Image", "value": pin },
+            { "label": "Template", "value": DATABASE_TEMPLATE },
+            { "label": "Made as", "value": MADE_AS_PLAIN },
+            { "label": "Start", "value": format!("No: it is created stopped because {why}; instance_start starts it later") }
+        ])
+    );
+    let made = approve(&rig, &proposal).expect("the approved create");
     assert_eq!(
         made,
         json!({
             "name": "orders", "entry": "service-orders", "status": "pending", "service": true,
-            "stoppedBecause": "its template needs the secret POSTGRES_PASSWORD, which is not set yet"
+            "stoppedBecause": why
         })
     );
     assert_eq!(rig.entry("service-orders")["start"], false);
@@ -568,6 +597,71 @@ fn a_template_that_generates_no_password_makes_a_stopped_database_and_says_why()
         !password_file(&rig, "orders").exists(),
         "Arca invents no password the template does not ask it to generate"
     );
+    // A direct call says the same.
+    let direct = rig
+        .call("postgres_create", json!({ "name": "bills" }))
+        .expect("the direct create");
+    assert_eq!(direct["stoppedBecause"], why);
+}
+
+#[test]
+fn a_token_whose_tool_list_leaves_out_service_create_makes_no_database_from_the_template() {
+    let rig = clean();
+    let entries = rig.entries();
+    let (code, message) = refusal(rig.call_as(
+        "postgres_create",
+        json!({ "name": "orders" }),
+        Some(&["postgres_create", "postgres_list"]),
+    ));
+    assert_eq!(code, "refused");
+    assert_eq!(
+        message,
+        "on this node a database is a service made from the postgres-autopg template, so postgres_create needs service_create too, and this token's tool list does not have it"
+    );
+    assert_eq!(rig.entries(), entries);
+    assert!(!password_file(&rig, "orders").exists());
+    // With both tools in its list the token makes it.
+    rig.call_as(
+        "postgres_create",
+        json!({ "name": "orders" }),
+        Some(&["postgres_create", "service_create"]),
+    )
+    .expect("a token with both tools");
+    // On a node whose config names the image a database is no service, and the list needs postgres_create alone.
+    let rig = configured();
+    rig.call_as(
+        "postgres_create",
+        json!({ "name": "orders" }),
+        Some(&["postgres_create"]),
+    )
+    .expect("the old kind needs no service_create");
+}
+
+#[test]
+fn the_image_checked_and_the_image_created_from_are_one_read_of_the_template() {
+    // The service handler is told the image the database's create was checked against, and compares it with the
+    // template it reads for the create: a template that names another by then makes nothing.
+    let rig = clean();
+    let now = pin(&rig);
+    let stale = format!("ghcr.io/automagik-si/autopg@sha256:{}", "e".repeat(64));
+    let entries = rig.entries();
+    let (code, message) = refusal(rig.call(
+        "service_create",
+        json!({ "name": "orders", "template": DATABASE_TEMPLATE, "pin": stale }),
+    ));
+    assert_eq!(code, "refused");
+    assert_eq!(
+        message,
+        format!(
+            "image: a call cannot choose an image. This node makes a database from its postgres-autopg template, which names {now} now. A proposal that names another was made before the template changed: nothing was created, propose it again"
+        )
+    );
+    assert_eq!(rig.entries(), entries);
+    assert!(!password_file(&rig, "orders").exists());
+    // The schema of service_create has no such field: only postgres_create passes it, inside the node.
+    let params = (arca_api::verb("service_create").expect("the verb").params)();
+    assert!(params["properties"].get("pin").is_none());
+    assert_eq!(params["additionalProperties"], false);
 }
 
 #[test]
