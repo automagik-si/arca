@@ -534,11 +534,13 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             assert_eq!(shown.len(), 4);
             continue;
         }
+        // With nothing read from the node, a tenant's removal says what it holds is read when the removal runs.
         if action == ActionKind::TenantRemove {
             let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
-            assert_eq!(labels, ["Tenant", "Effect"]);
+            assert_eq!(labels, ["Tenant", "Services", "Effect"]);
             assert_eq!(details[0].value, "abcdefgh");
-            assert!(details[1].value.contains("with its data"));
+            assert_eq!(details[1].value, "read when the removal runs");
+            assert!(details[2].value.contains("with its data"));
             continue;
         }
         let schema = action.params_schema();
@@ -1704,5 +1706,76 @@ fn a_proposal_drops_confirm_true_from_what_it_binds_and_proposes_nothing_for_con
         rig.list()["plans"].as_array().map(Vec::len),
         Some(1),
         "one proposal, recorded once; the refusals recorded nothing"
+    );
+}
+
+/// A tenant's card names at most as many services as a tenant may hold instances, and counts the rest; the summary
+/// counts every one. A name is cut, and a control character is shown as a space.
+#[test]
+fn a_tenants_removal_card_names_at_most_sixteen_services_and_counts_the_rest() {
+    use arca::action_proposal::{HeldService, TENANT_SERVICES_NAMED, TenantHeld};
+    let services = (0..TENANT_SERVICES_NAMED + 2)
+        .map(|n| HeldService {
+            name: format!("s{n:02}"),
+            vm: n == 0,
+            database: n == 1 || n == 2,
+        })
+        .collect();
+    let held = TenantHeld {
+        block: "192.0.2.16/28".to_string(),
+        made_ms: 1_793_361_600_000,
+        read_ms: 1_793_361_600_000 + 90 * 60_000,
+        services,
+    };
+    let args = json!({ "id": "abcdefgh" });
+    let fact = held.fact();
+    let details = ActionKind::TenantRemove.details_with_gpu(&args, Some(&fact));
+    let named: Vec<String> = (0..TENANT_SERVICES_NAMED)
+        .map(|n| match n {
+            0 => "s00 (virtual machine)".to_string(),
+            1 | 2 => format!("s{n:02} (database)"),
+            _ => format!("s{n:02} (container)"),
+        })
+        .collect();
+    assert_eq!(details[3].label, "Services");
+    assert_eq!(
+        details[3].value,
+        format!(
+            "As of 2026-10-30 13:30 UTC, when this was proposed: {}, and 2 more",
+            named.join(", ")
+        )
+    );
+    assert_eq!(
+        ActionKind::TenantRemove.summary_with(&args, Some(&fact)),
+        "Remove the tenant abcdefgh (192.0.2.16/28, made 2026-10-30 12:00 UTC) and everything in it when the removal runs, services made after this proposal included; at 2026-10-30 13:30 UTC it held 18 services, 2 of them databases"
+    );
+    // A text that is not what the node writes gives the card without what it held.
+    assert_eq!(
+        ActionKind::TenantRemove.summary_with(&args, Some("not a tenant")),
+        "Remove the tenant abcdefgh and everything in it"
+    );
+    let one = TenantHeld {
+        block: "192.0.2.16/29".to_string(),
+        made_ms: 1_793_361_600_000,
+        read_ms: 1_793_361_600_000,
+        services: vec![HeldService {
+            name: format!("db\n{}", "x".repeat(80)),
+            vm: false,
+            database: true,
+        }],
+    };
+    let fact = one.fact();
+    assert!(
+        ActionKind::TenantRemove
+            .summary_with(&args, Some(&fact))
+            .ends_with("; at 2026-10-30 12:00 UTC it held 1 service, a database")
+    );
+    let shown = &ActionKind::TenantRemove.details_with_gpu(&args, Some(&fact))[3].value;
+    assert_eq!(
+        shown,
+        &format!(
+            "As of 2026-10-30 12:00 UTC, when this was proposed: db {}… (database)",
+            "x".repeat(61)
+        )
     );
 }

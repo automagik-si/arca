@@ -385,7 +385,8 @@ impl ActionKind {
 
     /// The same rows, with the card's product filled in for an attach or detach when the inventory knows it. For a
     /// `service_create` the same argument carries why its template is created stopped whatever the call says, when it
-    /// is (`crate::service::template_stopped_reason`), and for a deploy's removal the deploy's parts. The GPU row
+    /// is (`crate::service::template_stopped_reason`), for a deploy's removal the deploy's parts, and for a tenant's
+    /// removal what the tenant holds ([`TenantHeld`]). The GPU row
     /// always carries the PCI address, so two identical cards are never confused, and the effect row never claims that a
     /// card shared by more than one container has isolated VRAM.
     pub fn details_with_gpu(self, args: &Value, gpu_product: Option<&str>) -> Vec<ActionDetail> {
@@ -562,13 +563,27 @@ impl ActionKind {
                 }
                 rows
             }
-            Self::TenantRemove => vec![
-                row("Tenant", text("id")),
-                row(
-                    "Effect",
-                    "Deletes every service of this tenant, with its data, and then the tenant's project.",
-                ),
-            ],
+            // What the tenant holds as the removal is proposed: the owner sees what goes, and not only a random id.
+            Self::TenantRemove => {
+                let mut rows = vec![row("Tenant", text("id"))];
+                match TenantHeld::read(gpu_product) {
+                    Some(held) => {
+                        rows.push(row("Address block", &held.block));
+                        rows.push(row("Made", &made_words(held.made_ms)));
+                        rows.push(row(
+                            "Services",
+                            &format!(
+                                "As of {}, when this was proposed: {}",
+                                made_words(held.read_ms),
+                                held.services_words()
+                            ),
+                        ));
+                    }
+                    None => rows.push(row("Services", "read when the removal runs")),
+                }
+                rows.push(row("Effect", TENANT_REMOVE_EFFECT));
+                rows
+            }
             Self::FunctionCreate => crate::function::create_rows(args)
                 .iter()
                 .map(|(label, value)| row(label, &shown(value, 4096)))
@@ -617,6 +632,22 @@ impl ActionKind {
             rows.push(row("Template content", &template_content_words(digest)));
         }
         rows
+    }
+
+    /// The same sentence, with what the node read when the proposal was made ([`Self::details_with_gpu`]'s second
+    /// argument). Only a tenant's removal says more with it: the tenant's block, when it was made, and what it holds.
+    pub fn summary_with(self, args: &Value, fact: Option<&str>) -> String {
+        match (self, TenantHeld::read(fact)) {
+            (Self::TenantRemove, Some(held)) => format!(
+                "Remove the tenant {} ({}, made {}) and everything in it when the removal runs, services made after this proposal included; at {} it held {}",
+                args["id"].as_str().unwrap_or_default(),
+                held.block,
+                made_words(held.made_ms),
+                made_words(held.read_ms),
+                held.count_words()
+            ),
+            _ => self.summary(args),
+        }
     }
 
     /// A sentence in the owner's words, built only from fields the schema has already checked. It names the arguments
@@ -746,6 +777,99 @@ impl ActionKind {
             _ => sentence,
         }
     }
+}
+
+/// The `Effect` row of a tenant's removal.
+/// The removal deletes what the tenant holds when it runs, not what the card listed: a service made after the proposal
+/// goes too, and the row says so.
+const TENANT_REMOVE_EFFECT: &str = "Deletes every service of this tenant as it stands when the removal runs, with its data, services made after this proposal included, and then the tenant's project.";
+
+/// The most services a tenant's card names one by one: the most instances a tenant may hold. A record past it is
+/// counted, not named.
+pub const TENANT_SERVICES_NAMED: usize = 16;
+
+/// What a tenant held when its removal was proposed, read from the node's records: its block, when it was made, its
+/// services, and when they were read. The card says the list is as of that time: the removal deletes what the tenant
+/// holds when it runs. It travels to the card as the text [`Self::fact`] writes, and a text that does not read back as one
+/// gives the card that says it is read when the removal runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TenantHeld {
+    pub block: String,
+    pub made_ms: u64,
+    pub read_ms: u64,
+    pub services: Vec<HeldService>,
+}
+
+/// One service of a tenant, as its removal's card names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HeldService {
+    pub name: String,
+    pub vm: bool,
+    pub database: bool,
+}
+
+impl TenantHeld {
+    /// The text the card is built from.
+    pub fn fact(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    fn read(fact: Option<&str>) -> Option<Self> {
+        serde_json::from_str(fact?).ok()
+    }
+
+    /// `3 services, 1 of them a database`, `1 service`, `no service`.
+    fn count_words(&self) -> String {
+        let services = match self.services.len() {
+            0 => return "no service".to_string(),
+            1 => "1 service".to_string(),
+            n => format!("{n} services"),
+        };
+        match self.services.iter().filter(|one| one.database).count() {
+            0 => services,
+            1 if self.services.len() == 1 => format!("{services}, a database"),
+            1 => format!("{services}, 1 of them a database"),
+            n => format!("{services}, {n} of them databases"),
+        }
+    }
+
+    /// The services by name, each with its kind, in name order: `orders (database), web (container)`. Past
+    /// [`TENANT_SERVICES_NAMED`] the rest are counted.
+    fn services_words(&self) -> String {
+        if self.services.is_empty() {
+            return "none".to_string();
+        }
+        let mut named: Vec<String> = self
+            .services
+            .iter()
+            .map(|one| {
+                let kind = if one.database {
+                    "database"
+                } else if one.vm {
+                    "virtual machine"
+                } else {
+                    "container"
+                };
+                format!("{} ({kind})", shown(&one.name, 64))
+            })
+            .collect();
+        named.sort();
+        let more = named.len().saturating_sub(TENANT_SERVICES_NAMED);
+        named.truncate(TENANT_SERVICES_NAMED);
+        let mut words = named.join(", ");
+        if more > 0 {
+            words.push_str(&format!(", and {more} more"));
+        }
+        words
+    }
+}
+
+/// An instant as a card says it: `2026-11-12 10:31 UTC`.
+fn made_words(ms: u64) -> String {
+    let iso = crate::handlers::iso_utc(ms);
+    format!("{} {} UTC", &iso[..10], &iso[11..16])
 }
 
 /// The `Kernel access` row of a `service_create` whose template declares `kernelAccess`, in the owner's words.
@@ -898,8 +1022,9 @@ impl ActionProposal {
 /// The summary and details to show for a proposal read from the journal. A GPU proposal's product is not in its arguments:
 /// the inventory that named it at proposal time may be gone when the kernel next opens. The journal is the kernel's own
 /// private file, so its words are kept for a GPU action when they still carry the proposal's instance and PCI address;
-/// otherwise the rows are rebuilt without a product. A deploy's parts, why a create is stopped, and what the node
-/// read from its database template are kept the same way. Every other action is rebuilt from its arguments.
+/// otherwise the rows are rebuilt without a product. A deploy's parts, what a tenant held, why a create is stopped, and
+/// what the node read from its database template are kept the same way. Every other action is rebuilt from its
+/// arguments.
 fn loaded_words(
     action: ActionKind,
     args: &Value,
@@ -923,6 +1048,24 @@ fn loaded_words(
                 rebuilt
             },
         );
+    }
+    // What a tenant held was read from the desired state when its removal was proposed, and is not in its arguments
+    // either: the journal's words are kept when they are a card this action writes for this tenant.
+    if action == ActionKind::TenantRemove {
+        let id = args["id"].as_str().unwrap_or_default();
+        let labels: Vec<&str> = stored_details
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        let fits = labels == ["Tenant", "Address block", "Made", "Services", "Effect"]
+            && stored_details[0].value == id
+            && stored_details[4].value == TENANT_REMOVE_EFFECT
+            && stored_summary.starts_with(&format!("Remove the tenant {id} ("));
+        return if fits {
+            (stored_summary.to_string(), stored_details.to_vec())
+        } else {
+            (action.summary(args), action.details(args))
+        };
     }
     // Why a template is created stopped was read from the template when the create was proposed, and is not in its
     // arguments either: the journal's `Start` row is kept when it is such a row and every other row is the one this
@@ -1097,7 +1240,7 @@ impl ActionProposalStore {
         let proposal = ActionProposal {
             id,
             action: action.as_str().to_string(),
-            summary: action.summary(&args),
+            summary: action.summary_with(&args, gpu_product),
             details: action.details_with_gpu(&args, gpu_product),
             args,
             args_digest: digest,
@@ -1767,6 +1910,60 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.0.join(ACTION_PROPOSALS_FILE)).expect("the compacted journal"),
             ""
+        );
+    }
+
+    /// A tenant removal's card is kept across a restart only when it is a card this action writes for this tenant:
+    /// another tenant's rows, another Effect, or another tenant's summary each give the card rebuilt from the arguments.
+    #[test]
+    fn a_tenant_removals_card_is_kept_across_a_restart_only_when_it_is_this_tenants() {
+        let held = |id: &str| {
+            let args = json!({ "id": id });
+            let fact = TenantHeld {
+                block: "192.0.2.16/29".to_string(),
+                made_ms: 1_793_361_600_000,
+                read_ms: 1_793_361_600_000,
+                services: vec![HeldService {
+                    name: "web".to_string(),
+                    vm: false,
+                    database: false,
+                }],
+            }
+            .fact();
+            (
+                ActionKind::TenantRemove.summary_with(&args, Some(&fact)),
+                ActionKind::TenantRemove.details_with_gpu(&args, Some(&fact)),
+            )
+        };
+        let args = json!({ "id": "abcdefgh" });
+        let rebuilt = (
+            ActionKind::TenantRemove.summary(&args),
+            ActionKind::TenantRemove.details(&args),
+        );
+        let (summary, details) = held("abcdefgh");
+        assert_ne!((summary.clone(), details.clone()), rebuilt);
+        // This tenant's card is kept whole.
+        assert_eq!(
+            loaded_words(ActionKind::TenantRemove, &args, &summary, &details),
+            (summary.clone(), details.clone())
+        );
+        // Another tenant's rows under this tenant's summary.
+        let (other_summary, other_details) = held("bbbbbbbb");
+        assert_eq!(
+            loaded_words(ActionKind::TenantRemove, &args, &summary, &other_details),
+            rebuilt
+        );
+        // Another Effect.
+        let mut changed = details.clone();
+        changed[4].value = "Deletes nothing.".to_string();
+        assert_eq!(
+            loaded_words(ActionKind::TenantRemove, &args, &summary, &changed),
+            rebuilt
+        );
+        // Another tenant's summary over this tenant's rows.
+        assert_eq!(
+            loaded_words(ActionKind::TenantRemove, &args, &other_summary, &details),
+            rebuilt
         );
     }
 

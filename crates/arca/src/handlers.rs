@@ -1722,6 +1722,11 @@ impl ToolHandler for ActionPropose {
                 let entries = lock(&self.kernel)?.entries().to_vec();
                 Some(tenants::deploy_parts(&entries, &payload))
             }
+            // The card of a tenant's removal says what the tenant holds as it stands now, and that it is as of now.
+            ActionKind::TenantRemove => {
+                let entries = lock(&self.kernel)?.entries().to_vec();
+                tenants::tenant_held(&entries, &payload, now)
+            }
             _ => None,
         };
         let mut kernel = lock(&self.kernel)?;
