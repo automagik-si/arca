@@ -942,3 +942,251 @@ fn a_real_incus_cannot_start_a_container_that_was_rebuilt_before_its_first_start
         std::panic::resume_unwind(panic);
     }
 }
+
+/// The third proof: an image on a registry that asks for a credential. Whether Incus takes the credential inside the
+/// server address of a source sent through its API, and what it then keeps of it. Same switch and scratch project.
+///
+/// - `ARCA_PROOF_REGISTRY_SERVER`: the registry, as `https://<host>`.
+/// - `ARCA_PROOF_REGISTRY_ALIAS`: the image, as `<repository>@sha256:<digest>`.
+/// - `ARCA_PROOF_REGISTRY_USER`: the user name.
+/// - `ARCA_PROOF_REGISTRY_WORD_FILE`: a file that holds the password, one line. It is read here and never printed:
+///   every line this test prints passes through a filter that takes it out, encoded or not.
+#[test]
+#[ignore = "touches a real Incus and a real registry; run by hand with ARCA_REAL_INCUS_PROOF=1"]
+fn a_real_incus_pulls_with_a_registry_credential_in_the_server_address() {
+    if env("ARCA_REAL_INCUS_PROOF").as_deref() != Some("1") {
+        eprintln!("ARCA_REAL_INCUS_PROOF is not 1; nothing was done");
+        return;
+    }
+    let socket = env("ARCA_PROOF_SOCKET").unwrap_or_else(|| "/var/lib/incus/unix.socket".into());
+    let socket = Path::new(&socket);
+    let project = env("ARCA_PROOF_PROJECT").expect("ARCA_PROOF_PROJECT");
+    let pool = env("ARCA_PROOF_POOL").expect("ARCA_PROOF_POOL");
+    let server = env("ARCA_PROOF_REGISTRY_SERVER").expect("ARCA_PROOF_REGISTRY_SERVER");
+    let alias = env("ARCA_PROOF_REGISTRY_ALIAS").expect("ARCA_PROOF_REGISTRY_ALIAS");
+    let user = env("ARCA_PROOF_REGISTRY_USER").expect("ARCA_PROOF_REGISTRY_USER");
+    let word = std::fs::read_to_string(
+        env("ARCA_PROOF_REGISTRY_WORD_FILE").expect("ARCA_PROOF_REGISTRY_WORD_FILE"),
+    )
+    .expect("the password file reads")
+    .trim()
+    .to_string();
+    assert!(
+        project.starts_with("arcak-scratch-"),
+        "the project must be a scratch project"
+    );
+    let host = server.strip_prefix("https://").expect("an https server");
+    // A user name or a password as it stands in an address: everything but letters, digits and - . _ ~ as %XX.
+    let encoded = |text: &str| -> String {
+        text.bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                    (byte as char).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect()
+    };
+    let word_encoded = encoded(&word);
+    // Nothing is printed that has not passed through this.
+    let hide = |text: &str| -> String {
+        text.replace(&word, "[word]")
+            .replace(&word_encoded, "[word]")
+    };
+    let holds = |text: &str| text.contains(&word) || text.contains(&word_encoded);
+    let instance = format!("/1.0/instances/{NAME}?project={project}");
+    let creates = format!("/1.0/instances?project={project}");
+    let body = |server: &str| {
+        json!({
+            "name": NAME,
+            "type": "container",
+            "source": { "type": "image", "mode": "pull", "protocol": "oci", "server": server, "alias": alias },
+            "config": { FUNCTION_KEY: "true", "limits.cpu": "1", "limits.memory": "128MiB" },
+            "devices": { "root": { "type": "disk", "path": "/", "pool": pool } },
+            "start": false,
+        })
+    };
+    if send(socket, "GET", &instance, None).is_ok() {
+        delete(socket, &instance).expect("the container of an earlier run is deleted");
+    }
+    println!(
+        "PROOF the password is {} characters; it needs encoding in an address: {}",
+        word.chars().count(),
+        word != word_encoded
+    );
+    println!(
+        "PROOF the user name needs encoding in an address: {}",
+        user != encoded(&user)
+    );
+
+    // 1. Without a credential the registry refuses.
+    match write(socket, "POST", &creates, Some(&body(&server))) {
+        Ok(()) => {
+            println!(
+                "PROOF a create without a credential: DONE (the registry did not ask for one)"
+            );
+            let _ = delete(socket, &instance);
+        }
+        Err(why) => println!(
+            "PROOF a create without a credential: REFUSED: {}",
+            hide(&why)
+        ),
+    }
+    let _ = delete(socket, &instance);
+
+    // 2. With the credential in the server address: encoded as an address wants it, and as it is.
+    // The registry's address with a user name and a password before the host, put together from its parts.
+    let address_of = |user: &str, word: &str| {
+        let mut address = String::from("https://");
+        address.push_str(user);
+        address.push(':');
+        address.push_str(word);
+        address.push('@');
+        address.push_str(host);
+        address
+    };
+    let with_encoded = address_of(&encoded(&user), &word_encoded);
+    let with_plain = address_of(&user, &word);
+    let mut created_with = None;
+    for (how, address) in [("encoded", &with_encoded), ("as it is", &with_plain)] {
+        let from = Instant::now();
+        match write(socket, "POST", &creates, Some(&body(address))) {
+            Ok(()) => {
+                println!(
+                    "PROOF a create with the credential in the address ({how}): DONE in {} ms",
+                    from.elapsed().as_millis()
+                );
+                created_with = Some(address.clone());
+                break;
+            }
+            Err(why) => {
+                println!(
+                    "PROOF a create with the credential in the address ({how}): REFUSED: {}",
+                    hide(&why)
+                );
+                let _ = delete(socket, &instance);
+            }
+        }
+    }
+    let Some(address) = created_with else {
+        println!("PROOF no form of the address was taken: nothing more to read");
+        return;
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 3. What Incus keeps: the image's record and the instance's.
+        let images = send(
+            socket,
+            "GET",
+            &format!("/1.0/images?project={project}&recursion=1"),
+            None,
+        )
+        .expect("the images");
+        let mut fingerprint = String::new();
+        for image in images["metadata"].as_array().into_iter().flatten() {
+            fingerprint = image["fingerprint"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            println!(
+                "PROOF the image's record: update_source.server = {:?}; the whole record holds the password: {}; cached: {}, auto_update: {}",
+                hide(
+                    image["update_source"]["server"]
+                        .as_str()
+                        .unwrap_or("(none)")
+                ),
+                holds(&image.to_string()),
+                image["cached"],
+                image["auto_update"]
+            );
+        }
+        let record = send(socket, "GET", &instance, None).expect("the instance");
+        println!(
+            "PROOF the instance's record holds the password: {}",
+            holds(&record.to_string())
+        );
+        let operations = send(
+            socket,
+            "GET",
+            "/1.0/operations?all-projects=true&recursion=1",
+            None,
+        )
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+        println!(
+            "PROOF the list of operations holds the password: {}",
+            holds(&operations)
+        );
+
+        // 4. Can Incus be told not to use the stored address again by itself?
+        if !fingerprint.is_empty() {
+            let path = format!("/1.0/images/{fingerprint}?project={project}");
+            match write(
+                socket,
+                "PATCH",
+                &path,
+                Some(&json!({ "auto_update": false })),
+            ) {
+                Ok(()) => {
+                    let after = send(socket, "GET", &path, None).expect("the image");
+                    println!(
+                        "PROOF auto_update set to false on the cached image: now {}",
+                        after["metadata"]["auto_update"]
+                    );
+                }
+                Err(why) => println!("PROOF auto_update could not be set: {}", hide(&why)),
+            }
+        }
+
+        // 5. A rebuild: from the store's copy with no credential, from the registry without and with one.
+        let rebuilds = format!("/1.0/instances/{NAME}/rebuild?project={project}");
+        let source = |server: &str| json!({ "source": { "type": "image", "mode": "pull", "protocol": "oci", "server": server, "alias": alias } });
+        std::thread::sleep(Duration::from_secs(1));
+        let from = Instant::now();
+        match write(
+            socket,
+            "POST",
+            &rebuilds,
+            Some(&json!({ "source": { "type": "image", "fingerprint": fingerprint } })),
+        ) {
+            Ok(()) => println!(
+                "PROOF rebuild from the store's copy, no credential: DONE in {} ms",
+                from.elapsed().as_millis()
+            ),
+            Err(why) => println!(
+                "PROOF rebuild from the store's copy: REFUSED: {}",
+                hide(&why)
+            ),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        match write(socket, "POST", &rebuilds, Some(&source(&server))) {
+            Ok(()) => println!(
+                "PROOF rebuild naming the registry, no credential: DONE (the stored copy or the stored address served it)"
+            ),
+            Err(why) => println!(
+                "PROOF rebuild naming the registry, no credential: REFUSED: {}",
+                hide(&why)
+            ),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let from = Instant::now();
+        match write(socket, "POST", &rebuilds, Some(&source(&address))) {
+            Ok(()) => println!(
+                "PROOF rebuild naming the registry with the credential: DONE in {} ms",
+                from.elapsed().as_millis()
+            ),
+            Err(why) => println!(
+                "PROOF rebuild naming the registry with the credential: REFUSED: {}",
+                hide(&why)
+            ),
+        }
+    }));
+    match delete(socket, &instance) {
+        Ok(()) => println!("PROOF the container was deleted"),
+        Err(why) => println!("PROOF the container was NOT deleted: {}", hide(&why)),
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
