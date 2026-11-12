@@ -2180,6 +2180,38 @@ pub fn service_view_schema() -> Value {
                 "maxItems": 16,
                 "type": "array"
             },
+            "destinations": {
+                "description": "Present only on a service that may reach a private address through this node: each address and the one tcp port open on it, as this node's config (kernel.serviceDestinations) named them when the owner approved the create. Every other private address stays closed to the service. service_status also answers ready for each and, when it is false, problem.",
+                "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                        "address": {
+                            "description": "One IPv4 address in a private range or the tailnet range, outside the service subnet.",
+                            "maxLength": 15,
+                            "type": "string"
+                        },
+                        "port": {
+                            "description": "The one tcp port open on that address.",
+                            "maximum": 65535,
+                            "minimum": 1,
+                            "type": "integer"
+                        },
+                        "problem": {
+                            "description": "service_status only, when ready is false: what does not stand as recorded.",
+                            "maxLength": 300,
+                            "type": "string"
+                        },
+                        "ready": {
+                            "description": "service_status only: the network rules Incus holds for the service are the ones its record gives, and the address is not one of the node's own.",
+                            "type": "boolean"
+                        }
+                    },
+                    "required": ["address", "port"],
+                    "type": "object"
+                },
+                "maxItems": 4,
+                "type": "array"
+            },
             "kernelAccess": {
                 "additionalProperties": false,
                 "description": "Present only on a service whose template declares kernelAccess: the service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given. service_status also answers ready and, when it is false, problem.",
@@ -2444,6 +2476,20 @@ fn service_create_params_base() -> Value {
                 "description": "For a virtual-machine template on a host bridge: a fixed MAC for its NIC, six hex octets joined by \":\". Left out, Incus picks one. Refused on the managed service network.",
                 "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$",
                 "type": "string"
+            },
+            "destinations": {
+                "description": "Only for a service this node's config names in kernel.serviceDestinations: exactly the addresses and tcp ports the config names for it. A proposal made with action_propose fills it in from the config, so the owner's approval binds it and the owner's card shows each address; a caller has no need to state it, and cannot state one of its own. Such a service, and everything that runs in it, can reach each address on its one tcp port through this node; every other private address stays closed. A create of such a service runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant and for a virtual machine on a host bridge.",
+                "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                        "address": { "maxLength": 15, "type": "string" },
+                        "port": { "maximum": 65535, "minimum": 1, "type": "integer" }
+                    },
+                    "required": ["address", "port"],
+                    "type": "object"
+                },
+                "maxItems": 4,
+                "type": "array"
             },
             "kernelAccess": {
                 "additionalProperties": false,

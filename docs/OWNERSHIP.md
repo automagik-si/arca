@@ -1393,6 +1393,67 @@ in `crates/arca/src/config.rs`; `kernel_access_for`, `kernel_access_refusal`, `e
 `metrics_and_alerts_are_held_to_the_tokens_tool_list` in `crates/arca/tests/export_contract.rs`. The device's behaviour on a live Incus is under
 "Assumptions to confirm".
 
+## A service that may reach one private address
+
+**Rule 70.** A private address is opened to a service by two keys together, and through that service's own ACL alone.
+The node's config names it (`kernel.serviceDestinations`: a service of the node's own project by name, one IPv4 address
+in a private or tailnet range outside the service subnet, one tcp port), and the owner approves the create: a
+`service_create` of a named service runs only from an approved proposal whose arguments carry the config's list, so the
+approval binds it and the card shows each address. No call, template or proposal states a destination of its own: what
+a call states is only compared with the config. The record then carries `destinations`, and `egress_rules` builds the
+NIC's egress array from the record: each address is cut out of the reject of the private ranges (Incus weighs a reject
+above an allow whatever the order, so an allow alone opens nothing), one allow opens tcp to it on the named ports, and
+the last allow, the internet's, names every address but the opened ones. Whatever else is sent to an opened address
+then matches no rule and meets the NIC's default egress action, which every service NIC sets to reject: that closes
+every IP protocol, the ones a rule cannot name among them, so only tcp to the address on its port is newly reachable.
+Three rejects of the address's own (every other tcp port, udp, icmp) state the same again. The reject of the host's
+own addresses is never cut, and the network and broadcast addresses of the host's networks are never opened either.
+With no destination the array is the one every service had before, so no existing ACL is written.
+
+Nothing else is written for it: no other Incus object, and nothing of the host (no firewall rule, route or sysctl).
+The array reaches Incus by the ACL's create or by `IncusPatchAclField` on the entry's own ACL (Rule 47), as every
+egress array does.
+
+Four checks keep a destination where the two keys put it. The config check refuses a range, a name, an address outside
+the four ranges or inside the service subnet, the two addresses of the tailnet range a node's own Tailscale and a
+cloud's metadata service answer on, a port of 0, more than 4 entries for a service and 16 in all. The plugin
+refuses a record that carries `destinations` in a tenant, in another project, on a host bridge, or with an address or
+port the config check would refuse, whatever wrote the record; a tenant's rules take no destination at all. A create is
+refused before any write when it does not run from an approved proposal (`NotApproved`), when what the proposal states
+is not what the config names now, when the address is the node's own, and for a virtual machine on a host
+bridge. And `serve` refuses to start while a record carries a destination the config does not name for that service.
+
+Known limit: the record, not the config, is what the rules are built from once the service exists, so taking an entry
+out of the config closes nothing. The address stays open on Incus until the service is removed, and `serve` does not
+start meanwhile.
+
+Source: `Destination`, `refusal`, `without`, `cut`, `other_ports` and `by_address` in
+`crates/arca-netproject/src/destination.rs`, with `node_own` and `NEVER`; `egress_rules` in
+`crates/arca-netproject/src/tenant.rs`; `host_networks` in `crates/arca-providers/src/incus.rs`;
+`ServiceConfig::destinations`, `destinations_ok`, `egress` and `Service::apply` in `crates/arca/src/service.rs`;
+`ServiceDestination`, `KernelConfig::destinations_of` and `check_service_destinations` in `crates/arca/src/config.rs`;
+`destinations_for`, `own_address_refusal`, `destination_problems`, `destinations_refusal`, `enrich_service_create` and
+the `service_create` and `service_status` arms of `ServiceHandler` in `crates/arca/src/handlers.rs`;
+`destinations_words` in `crates/arca/src/action_proposal.rs`; `check_bridged_start` in `crates/arca/src/cmd_serve.rs`.
+Tests in `crates/arca-netproject/src/tenant.rs` (`a_service_with_no_destination_has_the_rules_it_always_had`,
+`a_destination_opens_one_address_on_one_tcp_port_and_nothing_else`, which runs a model of Incus's documented rule over
+the rules before and after, `a_destination_at_the_end_of_a_range_or_beside_another_opens_only_itself`,
+`an_address_of_the_host_or_one_that_is_no_destination_is_never_opened`,
+`the_rules_of_a_destination_are_written_as_incus_reads_them`), in `crates/arca-netproject/src/destination.rs`, in
+`crates/arca/src/config.rs` (`the_destinations_are_empty_by_default_and_refused_unless_every_rule_holds`), in
+`crates/arca/tests/services/destinations.rs`
+(`the_plugin_builds_the_rules_from_the_record_and_writes_them_again_when_it_changes`,
+`the_plugin_refuses_a_record_that_gives_a_destination_to_anything_else`) and in
+`crates/arca/tests/tenants/destinations.rs`
+(`a_named_service_is_created_only_from_a_proposal_whose_card_shows_the_address`,
+`a_config_that_changes_after_the_card_was_shown_is_not_created_by_that_approval`,
+`nothing_in_a_tenant_gets_a_destination`,
+`serve_refuses_to_start_when_the_config_loses_a_destination_a_record_carries`,
+`an_address_of_the_nodes_own_is_never_a_destination`,
+`the_ends_of_the_nodes_own_networks_are_the_nodes_own_too`,
+`a_machine_on_a_host_bridge_is_not_created_with_a_destination`). What Incus and the host do with these rules on a live
+node is under "Assumptions to confirm".
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -1406,6 +1467,16 @@ possible.
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
 
+- Incus orders ACL rules by action and not by their place in the list (drop, then reject, then allow), takes a list of
+  ports and port ranges (`1-442,444-65535`) in `destination_port`, and names the protocols `tcp`, `udp`, `icmp4` and
+  `icmp6` (Rule 70). Read from
+  [the Incus documentation of network ACLs](https://linuxcontainers.org/incus/docs/main/howto/network_acls/); the model
+  the tests run is that reading, and so is that a packet no rule matches meets the NIC's
+  `security.acls.default.egress.action`. Still to confirm on a live Incus 7.6: a bridged NIC takes a reject of up to a
+  hundred ranges, an allow of up to some hundred and thirty, and a port list with ranges; a packet of another IP
+  protocol to an opened address is refused by the default action; Incus reports each host address's prefix length as
+  `netmask`; and a packet to a destination leaves the node with the node's own address on the interface it leaves by
+  (the service bridge's `ipv4.nat`), through a host firewall Arca does not touch.
 - A proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` on a container reaches
   a unix socket of mode 0600 on the host, and the host sees the peer as uid 0, which the services socket serves (Rule
   69): confirmed on a live node (Incus 7.6, SELinux enforcing). Still to confirm: the same on a container of the

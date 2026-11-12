@@ -877,6 +877,18 @@ fn host_addresses_through_the_kernel_needs_the_plugin_to_declare_observes() {
         .observe(Observe::HostAddresses);
     let answer = answer.expect("an observing plugin reads the host");
     assert_eq!(answer, json!(["203.0.113.5"]));
+    // An address whose prefix length Incus gives is answered with it; the address before the slash is the same.
+    fake.set_host_netmask("203.0.113.5".parse().unwrap(), 24);
+    let answer = Ctx::new(entry("toy"), &declared, &mut provider, &mut journal, 1)
+        .observe(Observe::HostAddresses);
+    assert_eq!(answer, Ok(json!(["203.0.113.5/24"])));
+    assert_eq!(
+        arca_providers::incus::host_addresses(&arca_incus::UnixIncus::new(
+            fake.socket().to_path_buf()
+        ))
+        .expect("the addresses"),
+        vec!["203.0.113.5".parse::<std::net::IpAddr>().unwrap()]
+    );
 
     let undeclared = manifest();
     let refused = Ctx::new(entry("toy"), &undeclared, &mut provider, &mut journal, 1)

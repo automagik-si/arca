@@ -3393,6 +3393,44 @@ fn enrich_service_create(
     entries: &[arca_kernel::desired::Entry],
     payload: &Value,
 ) -> Result<Value, CallError> {
+    // A private destination comes from the node's config alone, by the service's name. The proposal names it, so the
+    // owner's card says it and the approval binds it; a caller that states anything else is refused now.
+    let destinations = destinations_for(
+        cfg,
+        payload["name"].as_str().unwrap_or_default(),
+        payload.get("tenant").is_some(),
+        None,
+    )?;
+    if payload
+        .get("destinations")
+        .is_some_and(|given| destinations.is_empty() || *given != json!(destinations))
+    {
+        return Err(destinations_mismatch(
+            payload["name"].as_str().unwrap_or_default(),
+            &destinations,
+            payload.get("tenant").is_some(),
+        ));
+    }
+    let named = !destinations.is_empty();
+    // An address of the node's own is refused now when Incus can be asked, so the owner is never shown a card for it;
+    // the create asks again.
+    if named
+        && let Ok(hosts) = host_observation(&UnixIncus::new(cfg.incus.socket.clone()))
+        && let Some(why) = own_address_refusal(
+            payload["name"].as_str().unwrap_or_default(),
+            &destinations,
+            &hosts,
+        )
+    {
+        return Err(service_refused(why));
+    }
+    let payload = &{
+        let mut payload = payload.clone();
+        if let (true, Some(object)) = (named, payload.as_object_mut()) {
+            object.insert("destinations".to_string(), json!(destinations));
+        }
+        payload
+    };
     let Some(template) = payload["template"].as_str().and_then(|name| {
         crate::service::load_template(&cfg.state_dir.join("templates"), name).ok()
     }) else {
@@ -3444,6 +3482,11 @@ fn enrich_service_create(
         VmNetwork::Host(bridge) => {
             if let Some(why) = host_bridge_refusal(&template) {
                 return Err(service_refused(why));
+            }
+            if named {
+                return Err(service_refused(destinations_on_host_bridge(
+                    payload["name"].as_str().unwrap_or_default(),
+                )));
             }
             if let Some(object) = payload.as_object_mut() {
                 object.insert("bridge".to_string(), Value::String(bridge));
@@ -3507,6 +3550,183 @@ fn kernel_access_for(
         }
     }
     Ok(Some((access.port, connect)))
+}
+
+/// What a `service_create` call brings to a service the node's config gives a private destination: what it stated as
+/// `destinations`, and whether it runs from a proposal the owner approved.
+struct DestinationsCall<'a> {
+    stated: Option<&'a Value>,
+    approved: bool,
+}
+
+/// The private destinations a create of the service `name` records: the ones this node's config names for it
+/// (`kernel.serviceDestinations`), and none for any other service. A tenant's service never has one: the config is not
+/// even read for it, so a tenant's service that bears the name of an entry gets nothing. A create (`call`) of a named
+/// service runs only from a proposal the owner approved, whose card shows each address, and states exactly what the
+/// config names now; a proposal passes `None`, since the destinations are filled in when it is made. No caller can
+/// state one of its own: what a call states is only ever compared with the config.
+fn destinations_for(
+    cfg: &NodeConfig,
+    name: &str,
+    in_tenant: bool,
+    call: Option<DestinationsCall<'_>>,
+) -> Result<Vec<arca_netproject::destination::Destination>, CallError> {
+    let named = if in_tenant {
+        Vec::new()
+    } else {
+        cfg.kernel.destinations_of(name)
+    };
+    let Some(call) = call else {
+        return Ok(named);
+    };
+    if named.is_empty() {
+        return match call.stated {
+            Some(_) => Err(destinations_mismatch(name, &named, in_tenant)),
+            None => Ok(named),
+        };
+    }
+    if !call.approved {
+        return Err(CallError::Refused {
+            code: "NotApproved".into(),
+            message: format!(
+                "this node's config lets the service {name} reach {} through this node (kernel.serviceDestinations), so its create runs only from a proposal the owner approved: propose it with action_propose, and the owner's card shows the address",
+                crate::action_proposal::destinations_list(&json!(named))
+            ),
+        });
+    }
+    if call.stated != Some(&json!(named)) {
+        return Err(service_refused(format!(
+            "this node's config lets the service {name} reach {} through this node (kernel.serviceDestinations), and the proposal the owner approved does not say that: the config changed after it was proposed. Propose the create again, so the owner's card says it",
+            crate::action_proposal::destinations_list(&json!(named))
+        )));
+    }
+    Ok(named)
+}
+
+/// The refusal for a call whose `destinations` is not what this node's config names for the service.
+fn destinations_mismatch(
+    name: &str,
+    named: &[arca_netproject::destination::Destination],
+    in_tenant: bool,
+) -> CallError {
+    CallError::Invalid(if in_tenant {
+        "destinations: nothing in a tenant reaches a private address through the node. Only the node's config names one, and only for a service of the node's own project".to_string()
+    } else if named.is_empty() {
+        format!(
+            "destinations: this node's config (kernel.serviceDestinations) names none for the service {name}. Only the config names one, never a call"
+        )
+    } else {
+        format!(
+            "destinations: this node's config names {} for the service {name}, and the call must state exactly that",
+            crate::action_proposal::destinations_list(&json!(named))
+        )
+    })
+}
+
+/// The host's addresses as the service plugin observes them (`Observe::HostAddresses`), so a handler judges a
+/// destination over the very list the rules are built from.
+fn host_observation(read: &dyn arca_incus::IncusRead) -> Result<Value, CallError> {
+    arca_providers::incus::host_networks(read)
+        .map(|networks| arca_providers::incus::host_addresses_value(&networks))
+        .map_err(|_| internal())
+}
+
+/// Why a create of the service `name` is refused over `hosts`, the node's own addresses: the config names as a
+/// destination one of them, or the network or broadcast address of one of the node's networks, which the node itself
+/// answers on. The rules of a service never open such an address, so the entry would promise what nothing gives.
+fn own_address_refusal(
+    name: &str,
+    destinations: &[arca_netproject::destination::Destination],
+    hosts: &Value,
+) -> Option<String> {
+    let own = arca_netproject::destination::node_own(hosts);
+    let named = destinations.iter().find(|one| own.contains(&one.address))?;
+    Some(format!(
+        "this node's config names {} as a private destination of the service {name}, and that address is this node's own (one of its addresses, or the network or broadcast address of one of its networks): a service's rules never open one. Take the entry out of kernel.serviceDestinations",
+        named.address
+    ))
+}
+
+/// Why a service the config gives a destination is not created on a host bridge.
+fn destinations_on_host_bridge(name: &str) -> String {
+    format!(
+        "this node's config names a private destination for the service {name} (kernel.serviceDestinations), and this create puts it on a host bridge, where Arca writes no network rules: the machine reaches whatever that network reaches. Create it on the managed service network, or take the entry out of the config"
+    )
+}
+
+/// Why each destination a service's record names does not stand as recorded, in the record's order: the address is
+/// one of the node's own (the rules never open one), or the rules Incus holds for the service's NIC are not the ones
+/// the record gives. `None` for one that stands.
+fn destination_problems(
+    config: &crate::service::ServiceConfig,
+    read: &dyn arca_incus::IncusRead,
+) -> Vec<Option<String>> {
+    let hosts = host_observation(read).ok();
+    let own = hosts
+        .as_ref()
+        .map(arca_netproject::destination::node_own)
+        .unwrap_or_default();
+    let rules = read
+        .get(&format!(
+            "/1.0/network-acls/{}?project=default",
+            config.acl()
+        ))
+        .ok();
+    config
+        .destinations
+        .iter()
+        .map(|destination| {
+            let Some(hosts) = &hosts else {
+                return Some("the node's own addresses could not be read from Incus".to_string());
+            };
+            if own.contains(&destination.address) {
+                return Some(format!(
+                    "{} is this node's own (one of its addresses, or the network or broadcast address of one of its networks), and a service's rules never open one",
+                    destination.address
+                ));
+            }
+            let wanted = crate::service::egress(config, hosts);
+            match rules.as_ref().and_then(|acl| acl["egress"].as_array()) {
+                Some(held) if arca_incus::acl_rules_match(held, &wanted) => None,
+                Some(_) => Some(
+                    "the network rules Incus holds for this service are not the ones its record gives"
+                        .to_string(),
+                ),
+                None => Some(
+                    "the network rules of this service could not be read from Incus".to_string(),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Why `serve` does not start over this desired state: a service's record names a private destination this config no
+/// longer names for it. The owner approved that address because the operator's config named it; a start that left
+/// the service's rules open with the config saying otherwise is refused.
+pub fn destinations_refusal(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+) -> Option<String> {
+    entries
+        .iter()
+        .filter(|entry| entry.plugin.0 == "arca.service")
+        .find_map(|entry| {
+            let recorded = entry.config.get("destinations")?.as_array()?;
+            let name = entry.config["name"].as_str().unwrap_or(entry.id.0.as_str());
+            // A tenant's record never carries the key, and the config never names a tenant's service.
+            let named = if entry.config.get("tenant").is_some() {
+                Value::Array(Vec::new())
+            } else {
+                json!(cfg.kernel.destinations_of(name))
+            };
+            let lost = recorded
+                .iter()
+                .find(|one| !named.as_array().is_some_and(|named| named.contains(one)))?;
+            Some(format!(
+                "the service {name} may reach {} through this node, as its owner approved, and this config's kernel.serviceDestinations does not name that for it: put the entry back, or remove the service before taking it out",
+                crate::action_proposal::destinations_list(&json!([lost]))
+            ))
+        })
 }
 
 /// The `kernelAccess` argument of a create whose template has that port.
@@ -4553,6 +4773,8 @@ pub(crate) fn adopted_config(
         kernel_access: (project == arca_netproject::PROJECT)
             .then(|| crate::service::kernel_link_of(row))
             .flatten(),
+        // An instance says nothing of a destination: only a create the owner approved records one.
+        destinations: Vec::new(),
     })
 }
 
@@ -4752,6 +4974,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         vm: None,
         tenant: None,
         kernel_access: parts.kernel_access,
+        destinations: Vec::new(),
     })
 }
 
@@ -4832,6 +5055,7 @@ fn vm_service_config(
         }),
         tenant: None,
         kernel_access: None,
+        destinations: Vec::new(),
     })
 }
 
@@ -5031,6 +5255,7 @@ impl ToolHandler for ServiceHandler {
                 "deploy",
                 "start",
                 "kernelAccess",
+                "destinations",
                 "settings",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
@@ -5273,6 +5498,17 @@ impl ToolHandler for ServiceHandler {
                         view["kernelAccess"]["ready"] = json!(problem.is_none());
                         if let Some(problem) = problem {
                             view["kernelAccess"]["problem"] = json!(problem);
+                        }
+                    }
+                    // Whether each private destination its record names is open as recorded.
+                    if !config.destinations.is_empty() {
+                        for (index, problem) in
+                            destination_problems(&config, &read).into_iter().enumerate()
+                        {
+                            view["destinations"][index]["ready"] = json!(problem.is_none());
+                            if let Some(problem) = problem {
+                                view["destinations"][index]["problem"] = json!(problem);
+                            }
                         }
                     }
                     return Ok(view);
@@ -5573,6 +5809,24 @@ impl ToolHandler for ServiceHandler {
                     }),
                 )?
                 .map(|(port, connect)| crate::service::KernelLink { port, connect });
+                // A service the node's config gives a private destination: refused unless the create runs from an
+                // approved proposal that states exactly what the config names now, and when an address is one of
+                // the node's own. All of it comes before any write.
+                let destinations = destinations_for(
+                    &self.cfg,
+                    &name,
+                    tenant.is_some(),
+                    Some(DestinationsCall {
+                        stated: args.get("destinations"),
+                        approved: preapproved,
+                    }),
+                )?;
+                if !destinations.is_empty() {
+                    let hosts = host_observation(&read)?;
+                    if let Some(why) = own_address_refusal(&name, &destinations, &hosts) {
+                        return Err(service_refused(why));
+                    }
+                }
                 if template.is_vm() {
                     let Some(caps) = self.cfg.kernel.vm_caps() else {
                         return Err(service_refused(no_vm_caps(template_name)));
@@ -5616,6 +5870,9 @@ impl ToolHandler for ServiceHandler {
                         VmNetwork::Host(_) => {
                             if let Some(why) = host_bridge_refusal(&template) {
                                 return Err(service_refused(why));
+                            }
+                            if !destinations.is_empty() {
+                                return Err(service_refused(destinations_on_host_bridge(&name)));
                             }
                         }
                         VmNetwork::Managed => {}
@@ -5721,6 +5978,7 @@ impl ToolHandler for ServiceHandler {
                         pool,
                         now,
                     )?;
+                    config.destinations = destinations.clone();
                     let deploy =
                         tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)?;
                     self.place_in_tenant(&mut config, tenant.as_ref(), &all_entries, deploy);
@@ -5801,6 +6059,7 @@ impl ToolHandler for ServiceHandler {
                     kernel_access,
                 })
                 .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;
+                config.destinations = destinations;
                 let deploy =
                     tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)
                         .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;

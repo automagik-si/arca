@@ -1172,12 +1172,7 @@ impl Provider for IncusProvider {
         query: &Observe,
     ) -> Result<Value, EffectRefusal> {
         match query {
-            Observe::HostAddresses => {
-                let addresses = host_addresses(&self.reader)?;
-                Ok(Value::Array(
-                    addresses.iter().map(|ip| json!(ip.to_string())).collect(),
-                ))
-            }
+            Observe::HostAddresses => Ok(host_addresses_value(&host_networks(&self.reader)?)),
             Observe::IncusGet { path } => {
                 let (route, query) = path.split_once('?').ok_or(EffectRefusal::NotDeclared)?;
                 let project = query
@@ -1611,9 +1606,32 @@ pub fn kind_path(kind: IncusKind, project: &str, name: Option<&str>) -> Option<S
     }
 }
 
-/// Every address of the host's own interfaces, as Incus lists them: the listing of `/1.0/networks?recursion=1`, then the state of
-/// each listed interface. Only those two GETs are sent, and an address of another family is skipped.
+/// Every address of the host's own interfaces, as Incus lists them. See [`host_networks`], which this reads through.
 pub fn host_addresses(read: &dyn IncusRead) -> Result<Vec<IpAddr>, EffectRefusal> {
+    Ok(host_networks(read)?
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect())
+}
+
+/// The host's addresses as an observation answers them: `a.b.c.d/len` for an address whose prefix length Incus gave,
+/// and the bare address otherwise.
+pub fn host_addresses_value(networks: &[(IpAddr, Option<u8>)]) -> Value {
+    Value::Array(
+        networks
+            .iter()
+            .map(|(address, length)| match length {
+                Some(length) => json!(format!("{address}/{length}")),
+                None => json!(address.to_string()),
+            })
+            .collect(),
+    )
+}
+
+/// Every address of the host's own interfaces with its prefix length, as Incus lists them: the listing of
+/// `/1.0/networks?recursion=1`, then the state of each listed interface. Only those two GETs are sent, and an address of
+/// another family is skipped. The length is `None` when Incus gave no `netmask` that is one.
+pub fn host_networks(read: &dyn IncusRead) -> Result<Vec<(IpAddr, Option<u8>)>, EffectRefusal> {
     let listing = read
         .get("/1.0/networks?recursion=1")
         .map_err(incus_refusal)?;
@@ -1647,7 +1665,12 @@ pub fn host_addresses(read: &dyn IncusRead) -> Result<Vec<IpAddr>, EffectRefusal
                 .ok_or_else(|| {
                     EffectRefusal::Provider("an address is not an IP address".to_string())
                 })?;
-            found.push(ip);
+            let length = address
+                .get("netmask")
+                .and_then(Value::as_str)
+                .and_then(|text| text.parse::<u8>().ok())
+                .filter(|length| *length <= if ip.is_ipv4() { 32 } else { 128 });
+            found.push((ip, length));
         }
     }
     Ok(found)

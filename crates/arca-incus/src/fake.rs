@@ -205,6 +205,7 @@ struct Shared {
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
     host_interfaces: Mutex<Vec<HostInterface>>,
+    host_netmasks: Mutex<BTreeMap<IpAddr, u8>>,
     operations_unreadable: AtomicBool,
     /// The operations whose wait answers 404 while the listing still shows them running.
     waits_ended: Mutex<Vec<String>>,
@@ -390,6 +391,7 @@ impl Shared {
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
             host_interfaces: Mutex::new(Vec::new()),
+            host_netmasks: Mutex::new(BTreeMap::new()),
             operations_unreadable: AtomicBool::new(false),
             waits_ended: Mutex::new(Vec::new()),
             console: Mutex::new(BTreeMap::new()),
@@ -456,6 +458,12 @@ impl FakeIncus {
     /// `/1.0/networks?recursion=1` and each `/1.0/networks/<name>/state` from them, and nothing else reads them.
     pub fn set_host_interfaces(&self, interfaces: Vec<(String, Vec<IpAddr>)>) {
         *lock(&self.shared.host_interfaces) = interfaces;
+    }
+
+    /// Gives a host address its prefix length: the fake then answers it as `netmask` in the interface's state, as Incus
+    /// does. An address without one is answered with no `netmask`.
+    pub fn set_host_netmask(&self, address: IpAddr, length: u8) {
+        lock(&self.shared.host_netmasks).insert(address, length);
     }
 
     /// Puts an image with the alias `alias` in the store `project` reads, as a copy by hand would, and returns its fingerprint.
@@ -1178,15 +1186,24 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         ("GET", Route::HostInterfaceState(name)) => {
             let interfaces = lock(&shared.host_interfaces);
             match interfaces.iter().find(|(listed, _)| *listed == name) {
-                Some((_, addresses)) => sync(json!({
-                    "addresses": addresses
-                        .iter()
-                        .map(|address| json!({
-                            "family": if address.is_ipv4() { "inet" } else { "inet6" },
-                            "address": address.to_string(),
-                        }))
-                        .collect::<Vec<Value>>(),
-                })),
+                Some((_, addresses)) => {
+                    let netmasks = lock(&shared.host_netmasks);
+                    sync(json!({
+                        "addresses": addresses
+                            .iter()
+                            .map(|address| {
+                                let mut row = json!({
+                                    "family": if address.is_ipv4() { "inet" } else { "inet6" },
+                                    "address": address.to_string(),
+                                });
+                                if let Some(length) = netmasks.get(address) {
+                                    row["netmask"] = json!(length.to_string());
+                                }
+                                row
+                            })
+                            .collect::<Vec<Value>>(),
+                    }))
+                }
                 None => (404, String::new(), error_envelope(404, "not found")),
             }
         }

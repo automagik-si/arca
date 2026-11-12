@@ -139,6 +139,7 @@ refused without the value being echoed back.
 | `kernel.tenants` | no | `{ "capacity", "maxTenants", "defaultCaps", "createRate", "front"? }`: the node may hold tenants. It needs `kernel.serviceCidr` and is refused beside `kernel.adopt`. See "Tenants". |
 | `kernel.vmLimits` | no | `{ "virtualMachines": n, "cpu": n, "memory": "<size>", "disk": "<size>" }`, every key required: the virtual-machine caps of a node that has `kernel.serviceCidr` and no `kernel.bridged`. Without it such a node creates no virtual machine. It is refused beside `kernel.bridged`, which states the same caps in its `limits`. See "Mixed nodes". |
 | `kernel.importServices` | no | `[{ "name": "<service>", "project": "<project>", "cidr": "<ipv4-network>/24" }]`: the services another manager created that `service_import` may take over where they stand. Each `project` must be listed in `kernel.droiddProjects`, and `cidr` is that project's service subnet. Empty by default: nothing is imported and nothing is written in another manager's project. See "Importing a service another manager created". |
+| `kernel.serviceDestinations` | no | `[{ "service": "<service>", "address": "<one IPv4 address>", "port": n }]`: the private addresses named services of the node's own project may reach through the node, each on one tcp port. It needs `kernel.serviceCidr`. Empty by default: a service reaches no private address. An entry alone opens nothing. See "A service that may reach one private address". |
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`); or `http://localhost:<port>` with the port of `listen.loopback`, the page of a node on its own machine with no domain and no certificate. Its host is the WebAuthn rp id; it is not the host an approval statement names. |
@@ -176,6 +177,12 @@ The config is refused, with exit 2, when:
   project is not listed in `kernel.droiddProjects`, its cidr is not an IPv4 /24, or a name is listed twice; or the list is
   not empty on a node with no `kernel.serviceCidr` (a bridged node among them) or with `kernel.scratch`. A mixed node,
   which sets `kernel.bridged` beside `kernel.serviceCidr`, may list imports.
+- a `kernel.serviceDestinations` entry carries a key other than `service`, `address` and `port`, its service is not a
+  service name, its address is not one IPv4 address (a range and a name are refused), the address is outside the
+  private ranges of RFC 1918 and `100.64.0.0/10` or inside `kernel.serviceCidr`, it is `100.100.100.100` or
+  `100.100.100.200`, its port is 0,
+  an entry is listed twice, one service has more than 4 entries or the list more than 16; or the list is not empty on
+  a node with no `kernel.serviceCidr`.
 
 No command reads Incus before the config passes these checks.
 
@@ -503,6 +510,107 @@ remains restricted; Arca sets and reconciles only `restricted.devices.proxy=allo
 restrictions retain Incus' managed default.
 The `automagik-server` template pins the OCI server image, mounts `/data` owned by uid/gid 1000, overrides the profile to
 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
+
+### A service that may reach one private address
+
+A service's NIC rules reject every private range, the tailnet range (`100.64.0.0/10`) and the node's own addresses, and
+allow the internet. So a service cannot reach a machine on another bridge of the node, on the node's LAN or on its
+tailnet. The node's config may name, for one service, one such address and one tcp port:
+
+```json
+"kernel": {
+  "serviceDestinations": [
+    { "service": "runners", "address": "10.20.30.40", "port": 443 }
+  ]
+}
+```
+
+`service` is the name of a service of the node's own project. `address` is one IPv4 address inside one of the three
+private ranges of RFC 1918 or `100.64.0.0/10`, and outside `kernel.serviceCidr`: never a range, and never a name,
+which could be pointed elsewhere after the owner approved it. Loopback, link-local (where a cloud's metadata answers)
+and every other range are refused, and so are two addresses of the tailnet range: `100.100.100.100`, which the node's
+own Tailscale answers on, and `100.100.100.200`, a cloud's metadata address. `port` is one tcp port. One service may
+have 4 entries, a node 16.
+
+Two keys open it, and neither alone:
+
+- **The operator's config names it.** No call, template or proposal can state a destination of its own: what a call
+  states as `destinations` is only ever compared with the config, and anything else is an invalid call.
+- **The owner approves the create.** A service the config names is created only from a proposal: `action_propose` with
+  `service_create`, then the owner's approval. A direct `service_create` of that name is refused with `NotApproved`,
+  whatever the token's scope. The proposal carries `"destinations": [{ "address", "port" }]`, filled in from the
+  config, so the approval binds it, and the owner's card carries a `Private network` row: "Yes: this service, and
+  everything that runs in it, can reach 10.20.30.40 on tcp port 443 through this node, and is seen there as this node
+  itself: whatever trusts this node's address there trusts everything in this service. Every other private address
+  stays closed." For a pool of CI runners "everything that runs in it" is every job. A config that changes after the
+  card was shown (an entry added, taken out, or another port) is not created by that approval: propose it again.
+
+The service's record then carries `destinations`, and its NIC rules are built from the record. Incus weighs a reject
+above an allow whatever the order of the rules, so an allow alone would open nothing. Each address is cut out of the
+reject of the private ranges, four rules are added for it, and the last rule, which allows the internet, changes from
+every address to every address but the opened ones:
+
+| Action | Destination | Protocol | Ports |
+| --- | --- | --- | --- |
+| reject | `10.20.30.40/32` | tcp | `1-442,444-65535` |
+| reject | `10.20.30.40/32` | udp | every port |
+| reject | `10.20.30.40/32` | icmp4 | |
+| allow | `10.20.30.40/32` | tcp | `443` |
+| allow | every address but `10.20.30.40` (32 ranges) | every protocol | |
+
+Only tcp to that address on that port is newly reachable. A packet to it that is anything else matches no allow, and
+meets the default action of the service's NIC, which is reject: that closes every other tcp port, udp, icmp, and every
+IP protocol a rule cannot name (GRE, IPIP, ESP, SCTP), so nothing can be tunnelled to that address around the one
+port. Every other address is decided exactly as before, and a service with no destination has the five rules it always
+had.
+
+What never gets one:
+
+- **A tenant's service.** The list is not read for a create in a tenant, so a tenant's service that bears a listed name
+  is an ordinary tenant service; a call in a tenant that states `destinations` is refused; the plugin refuses a record
+  that carries the key with a tenant; and a tenant's rules take no destination at all.
+- **An address of the node's own.** The reject of the host's addresses is never cut, so such an address stays closed
+  whatever a record says. The network and broadcast addresses of the node's own networks count as the node's own: the
+  node itself answers on them. A proposal and a create that name one are refused in words.
+- **A virtual machine on a host bridge.** Arca writes no rules there, so the create is refused: the machine reaches
+  whatever that network reaches.
+- **A service that exists.** An entry added for it changes nothing. Remove the service and create it again, through a
+  proposal.
+
+`service_list` and `service_status` carry `destinations: [{ "address", "port" }]` for such a service and no such key
+for any other. `service_status` also answers `ready` for each, and `problem` when it is false: the rules Incus holds
+for the service are not the ones its record gives, or the address has become the node's own.
+
+`serve` refuses to start (exit 2, naming the service and the address) while a service's record carries a destination
+the config no longer names for it. Put the entry back, or remove the service first. Entries the record does not carry
+never stop a start. Known limit: taking the entry out of the config does not close the address. The record is what the
+rules are built from, so the address stays open on Incus until the service is removed, and `serve` meanwhile does not
+start. To close one: remove the service (a proposal, approved), then take the entry out.
+
+Arca changes the service's own Incus ACL and nothing else: no firewall rule, route or sysctl of the host. The packet
+must already have a way through the node, which is the node's to give:
+
+- The host forwards IPv4 (`net.ipv4.ip_forward=1`), as it does for the service network to reach the internet.
+- The service bridge's own NAT (`ipv4.nat`, which Arca sets when it creates the bridge) rewrites the source, so the
+  packet leaves with the node's own address on the interface it leaves by. A destination on another bridge of the node
+  sees the node's address on that bridge; one on the tailnet sees the node's tailnet address. A firewall at the
+  destination must admit that address. That cuts both ways: anything at the destination that trusts the node's address
+  now trusts every process of the service, every CI job among them. A reverse proxy or an allowlist there that takes
+  the node's address for the node itself, and so believes a forwarded-for header from it, believes one a job wrote.
+- The host's firewall lets a packet be forwarded from the service bridge (`arcak-svcbr`) to the interface the
+  destination is behind. Where it does not (a forward policy of drop, or a zone that does not forward), that is the
+  operator's rule to add.
+- A destination on the tailnet needs the node's Tailscale to have an interface (kernel mode); a node whose Tailscale
+  runs in userspace forwards nothing. The tailnet's own access rules must let the node reach it. A service that also
+  joins the tailnet itself routes tailnet addresses through its own Tailscale and never uses the destination.
+- Inside the service the name its clients use must resolve to that address.
+
+None of this path has been checked on a live node yet, and neither has Incus 7.6 taking a reject and an allow of that
+length and a port list with ranges on a bridged NIC; the rules themselves are tested against a model of Incus's
+documented behaviour. Should Incus refuse a list, the ACL is not written and nothing opens. To check one on a node:
+`service_status` answers `ready: true` for it; `incus network acl show arcak-svc-svc-<service>` shows the five rules
+above; from inside the service `curl -sv https://<address>/` connects, and any other port of that address, and any
+neighbouring address, is refused at once.
 
 ### A service that may talk to the kernel
 

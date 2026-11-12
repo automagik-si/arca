@@ -2,7 +2,7 @@
 //! the kernel depends on are checked here, before any command reads Incus: the tailnet and proxy addresses, the project
 //! names the kernel may never write in, the scratch prefix, and the adoption allowlist.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -274,6 +274,11 @@ pub struct KernelConfig {
     /// tenants, each in its own restricted project on the managed service bridge.
     #[serde(default)]
     pub tenants: Option<TenantsConfig>,
+    /// The private addresses named services of the node's own project may reach through the node, each on one tcp
+    /// port. Empty by default: a service's network rules reject every private range. An entry alone opens nothing: the
+    /// service's create runs only from a proposal the owner approved, whose card shows the address.
+    #[serde(default)]
+    pub service_destinations: Vec<ServiceDestination>,
 }
 
 /// The `kernel.tenants` key: what all tenants may hold together, how many there may be, and the caps a tenant gets when
@@ -320,7 +325,35 @@ pub struct ImportService {
     pub cidr: String,
 }
 
+/// One `kernel.serviceDestinations` entry: a service of the node's own project, by name, one IPv4 address and one tcp
+/// port. Never a range and never a name: a name can be pointed elsewhere after the owner approved it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServiceDestination {
+    pub service: String,
+    pub address: String,
+    pub port: u16,
+}
+
 impl KernelConfig {
+    /// The destinations this config names for the service `name` of the node's own project, lowest address first.
+    /// Empty for every service the config does not name.
+    pub fn destinations_of(&self, name: &str) -> Vec<arca_netproject::destination::Destination> {
+        let mut found: Vec<_> = self
+            .service_destinations
+            .iter()
+            .filter(|entry| entry.service == name)
+            .filter_map(|entry| {
+                Some(arca_netproject::destination::Destination {
+                    address: entry.address.parse().ok()?,
+                    port: entry.port,
+                })
+            })
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
     /// The import allowlist entry for the service `name` in `project`, when one is listed.
     pub fn import_service(&self, name: &str, project: &str) -> Option<&ImportService> {
         self.import_services
@@ -414,6 +447,8 @@ pub enum ConfigError {
     ImportServices(&'static str),
     /// The `kernel.tenants` key breaks a rule. The text names the rule, never a value.
     Tenants(&'static str),
+    /// The `kernel.serviceDestinations` list breaks a rule. The text names the rule, never a value.
+    ServiceDestinations(&'static str),
     /// A kernel project carries a tenant prefix: only a tenant's entry makes such a project.
     TenantProject(String),
 }
@@ -457,6 +492,9 @@ impl fmt::Display for ConfigError {
             Self::Bridged(why) => write!(f, "kernel.bridged is refused: {why}"),
             Self::ImportServices(why) => write!(f, "kernel.importServices is refused: {why}"),
             Self::Tenants(why) => write!(f, "kernel.tenants is refused: {why}"),
+            Self::ServiceDestinations(why) => {
+                write!(f, "kernel.serviceDestinations is refused: {why}")
+            }
             Self::TenantProject(name) => write!(
                 f,
                 "kernel project {name} is refused: a name starting arcak-t- or arcak-scratch-t- is a tenant's project, which only tenant_create makes"
@@ -570,6 +608,7 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     check_bridged(kernel)?;
     check_import_services(kernel)?;
     check_tenants(kernel)?;
+    check_service_destinations(kernel)?;
     if kernel.scratch {
         for name in &kernel.projects {
             if !name.starts_with(SCRATCH_PREFIX) {
@@ -861,6 +900,59 @@ fn check_import_services(kernel: &KernelConfig) -> Result<(), ConfigError> {
         }
         if !names.insert(&entry.name) {
             return Err(ConfigError::ImportServices("a name is listed twice"));
+        }
+    }
+    Ok(())
+}
+
+/// The destination rules: the managed service network (a destination is a hole in the rules Arca writes on it), each
+/// entry a service name, one IPv4 address in a private or tailnet range outside the service subnet, and a tcp port;
+/// no entry twice, at most 4 for one service and 16 in all. Whether an address is one of the node's own is not
+/// known here: the rules themselves never open one.
+fn check_service_destinations(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    use arca_netproject::destination;
+    if kernel.service_destinations.is_empty() {
+        return Ok(());
+    }
+    let Some(gateway) = kernel
+        .service_cidr
+        .as_ref()
+        .and_then(|cidr| arca_netproject::check_cidr(cidr, &[]).ok())
+    else {
+        return Err(ConfigError::ServiceDestinations(
+            "it needs kernel.serviceCidr: a destination is cut out of the rules of a service on the managed service network, and a machine on a host bridge has no such rules",
+        ));
+    };
+    if kernel.service_destinations.len() > destination::MAX_PER_NODE {
+        return Err(ConfigError::ServiceDestinations(
+            "at most 16 entries in all",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut count = BTreeMap::new();
+    for entry in &kernel.service_destinations {
+        if !crate::service::service_name_ok(&entry.service) {
+            return Err(ConfigError::ServiceDestinations(
+                "each service must be a service name",
+            ));
+        }
+        let Ok(address) = entry.address.parse::<std::net::Ipv4Addr>() else {
+            return Err(ConfigError::ServiceDestinations(
+                "each address must be one IPv4 address, such as 10.1.2.3: never a range, and never a name, which could be pointed elsewhere later",
+            ));
+        };
+        if let Some(why) = destination::refusal(address, entry.port, gateway) {
+            return Err(ConfigError::ServiceDestinations(why));
+        }
+        if !seen.insert((&entry.service, address, entry.port)) {
+            return Err(ConfigError::ServiceDestinations("an entry is listed twice"));
+        }
+        let held = count.entry(&entry.service).or_insert(0usize);
+        *held += 1;
+        if *held > destination::MAX_PER_SERVICE {
+            return Err(ConfigError::ServiceDestinations(
+                "at most 4 entries for one service",
+            ));
         }
     }
     Ok(())
@@ -1604,6 +1696,112 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn the_destinations_are_empty_by_default_and_refused_unless_every_rule_holds() {
+        use serde_json::json;
+        let none = importing(json!({})).expect("no destinations");
+        assert!(none.kernel.service_destinations.is_empty());
+        assert!(none.kernel.destinations_of("runners").is_empty());
+        // The two a first user needs: an address on another bridge of the node, and one on the tailnet.
+        let bridge = json!({ "service": "runners", "address": "10.20.30.40", "port": 443 });
+        let tailnet = json!({ "service": "runners", "address": "100.101.102.103", "port": 443 });
+        let other = json!({ "service": "mirror", "address": "172.16.9.9", "port": 22 });
+        let listed = importing(json!({ "serviceDestinations": [tailnet, bridge, other] }))
+            .expect("three entries");
+        assert_eq!(
+            serde_json::to_value(listed.kernel.destinations_of("runners")).unwrap(),
+            json!([
+                { "address": "10.20.30.40", "port": 443 },
+                { "address": "100.101.102.103", "port": 443 }
+            ])
+        );
+        assert_eq!(listed.kernel.destinations_of("mirror").len(), 1);
+        assert!(listed.kernel.destinations_of("nats").is_empty());
+        // An unknown key and a port that is no port are parse refusals, never ignored.
+        for bad in [
+            json!({ "service": "runners", "address": "10.20.30.40", "port": 443, "protocol": "udp" }),
+            json!({ "service": "runners", "address": "10.20.30.40", "port": 70000 }),
+            json!({ "service": "runners", "address": "10.20.30.40" }),
+        ] {
+            assert!(
+                matches!(
+                    importing(json!({ "serviceDestinations": [bad] })),
+                    Err(ConfigError::Parse(_))
+                ),
+                "{bad}"
+            );
+        }
+        let entry = |address: &str, port: u16| json!({ "service": "runners", "address": address, "port": port });
+        let five: Vec<_> = (1..=5)
+            .map(|n| entry(&format!("10.20.30.{n}"), 443))
+            .collect();
+        let seventeen: Vec<_> = (0..17)
+            .map(|n| json!({ "service": format!("s{n}"), "address": "10.20.30.40", "port": 443 }))
+            .collect();
+        for bad in [
+            // A range, a name, an address with a port in it, and no address at all.
+            json!([entry("10.20.30.0/24", 443)]),
+            json!([entry("10.20.30.40/32", 443)]),
+            json!([entry("gitlab.example", 443)]),
+            json!([entry("10.20.30.40:443", 443)]),
+            json!([entry("", 443)]),
+            // A public address, loopback, link-local (where a cloud's metadata answers), multicast.
+            json!([entry("203.0.113.9", 443)]),
+            json!([entry("127.0.0.1", 443)]),
+            json!([entry("169.254.169.254", 80)]),
+            json!([entry("224.0.0.1", 443)]),
+            // The test network this rig's service subnet is: outside every private range, so refused as a public
+            // address is. The subnet's own rule is tried below, on a node whose subnet is a private one.
+            json!([entry("192.0.2.1", 443)]),
+            json!([entry("192.0.2.77", 443)]),
+            // An IPv6 address, and an IPv4 one written inside one.
+            json!([entry("fd00::1", 443)]),
+            json!([entry("::ffff:10.20.30.40", 443)]),
+            // The address every Tailscale answers on itself, and a cloud's metadata address in the tailnet range.
+            json!([entry("100.100.100.100", 443)]),
+            json!([entry("100.100.100.200", 80)]),
+            json!([entry("10.20.30.40", 0)]),
+            json!([{ "service": "Runners", "address": "10.20.30.40", "port": 443 }]),
+            json!([bridge, bridge]),
+            json!(five),
+            json!(seventeen),
+        ] {
+            assert!(
+                matches!(
+                    importing(json!({ "serviceDestinations": bad })),
+                    Err(ConfigError::ServiceDestinations(_))
+                ),
+                "{bad}"
+            );
+        }
+        // An address of the node's own service subnet, on a node whose subnet is a private one.
+        for inside in ["10.90.0.1", "10.90.0.77"] {
+            assert_eq!(
+                importing(json!({ "serviceCidr": "10.90.0.0/24", "serviceDestinations": [entry(inside, 443)] }))
+                    .unwrap_err()
+                    .to_string(),
+                "kernel.serviceDestinations is refused: an address is inside kernel.serviceCidr: one service reaches another through a link"
+            );
+        }
+        importing(json!({ "serviceCidr": "10.90.0.0/24", "serviceDestinations": [entry("10.90.1.77", 443)] }))
+            .expect("the next subnet");
+        // Four for one service and sixteen in all are the most there may be.
+        let sixteen: Vec<_> = seventeen[..16].to_vec();
+        importing(json!({ "serviceDestinations": sixteen })).expect("sixteen entries");
+        importing(json!({ "serviceDestinations": five[..4] })).expect("four for one service");
+        // A node with no service network of its own has no rules to cut one out of.
+        let host_bridges =
+            json!({ "bridges": ["br0"], "pool": "vmpool", "limits": LIMITS.clone() });
+        assert!(matches!(
+            importing(
+                json!({ "serviceDestinations": [bridge], "bridged": host_bridges, "serviceCidr": null })
+            ),
+            Err(ConfigError::ServiceDestinations(_))
+        ));
+        importing(json!({ "serviceDestinations": [bridge], "bridged": host_bridges }))
+            .expect("a mixed node");
     }
 
     #[test]

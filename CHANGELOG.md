@@ -17,6 +17,20 @@ no version from a request and now does, so four answers changed for such a clien
 - A `MCP-Protocol-Version` header sent twice, or one that is not visible ASCII, is refused with `400`.
 - A version in `params._meta` is read even with no header: an unknown one, one that is not a string, and one that
   differs from the header are refused with `400`.
+A service of the node's own project can now be let through to one private address on one tcp port, for example a
+GitLab on another bridge of the node or on its tailnet. It takes two keys, and neither alone: the node's config names
+it (`kernel.serviceDestinations: [{ "service", "address", "port" }]`, one IPv4 address, never a range or a name), and
+the owner approves the service's create, whose card carries a `Private network` row with the address. A direct create
+of a named service is refused with `NotApproved`. The service's own Incus ACL is the only thing that changes, and only
+tcp to that address on that port becomes reachable: every other tcp port, udp, icmp and every other IP protocol to it
+stay refused. Nothing of the host's firewall or routing is touched, so the node must already forward and masquerade
+that path, and the destination then sees the node's own address: whatever trusts that address there trusts everything
+in the service. A tenant's service, an address of the node's own and a virtual machine on a host bridge never get one;
+`serve` refuses to start when the config loses an entry a service's record carries; `service_list` and
+`service_status` show `destinations`, and status says for each whether it stands. An existing service is not changed
+by an entry: remove it and create it again. Known limit: taking an entry out of the config does not close the address;
+remove the service first. Not yet run on a live node. See "A service that may reach one private address" in
+`docs/OPERATING.md`.
 
 ## 0.10.0 (2026-11-12)
 
