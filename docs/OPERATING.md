@@ -34,6 +34,9 @@ Automagik Arca runs your services on machines you own. Set up the way the quicks
   proposes waits for the owner, who approves it with a passkey on the approval page that `arca serve` serves. A delete of
   a network, a project or a volume needs a signed owner approval. A node with no kernel project is watch-only and
   writes nothing.
+- **Functions.** A program in an OCI image by digest, run on a timer in a container of its own that is started for
+  each run and stopped after it, with a time, a memory and a CPU limit, secrets given by name, and a network card that
+  reaches only what the owner's card names ([Functions](#functions)).
 - **Passkeys.** Arca is its own passkey verifier (WebAuthn ES256). The first passkey is enrolled with a one-time code
   shown on the node's own screen, and a trusted passkey adds or removes another. Until a passkey is trusted, every
   approval fails closed.
@@ -979,7 +982,7 @@ The 0.1.0 release predates `x-arca-read-only-hint`, so its methods carry only `x
 
 `tools/call` answers a success with a short summary text block and `structuredContent` that carries the result, the untrusted note when the verb is untrusted, and `truncated` only when the result was cut; `_meta` carries `droidd/untrusted` and `droidd/truncated`. A refusal is a JSON-RPC error with `data.refusal`. A tool-level failure that is not a refusal is `isError: true` with `<code>: <message>` and `_meta` `droidd/error`.
 
-Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `service_import`, `service_release`, `gpu_detach`, `storage_add`, `snapshot_delete`, `instance_stop`, `instance_restart`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
+Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `service_import`, `service_release`, `gpu_detach`, `storage_add`, `snapshot_delete`, `instance_stop`, `instance_restart`, `function_remove`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
 
 ### Refusals for want of room and for asking too often
 
@@ -1673,7 +1676,7 @@ database, GPU, storage, snapshot or instance verbs: `service_create`, `service_r
 (see [Importing a service another manager created](#importing-a-service-another-manager-created)), `service_publish`, `service_unpublish`,
 `service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create`,
 `snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`, `instance_stop` or
-`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `function_create` and `function_remove` (see [Functions](#functions)) are proposed the same way. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
 the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses `kernel.postgresImage`, and an explicit image that
 differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains;
@@ -4230,6 +4233,179 @@ ARCA_TENANT_PROBE_DROIDD=<the node's droiddProjects, comma-separated> \
   cargo test -p arca --test tenants -- --ignored --nocapture created_stopped_probe
 ```
 
+## Functions
+
+A function is an OCI image by digest that holds one program, and a rule for when to run it. One run is one start of the
+function's own container: the program does one batch, prints its result as its last line, and exits. Nothing of a
+function runs between its runs. It is for the work that today needs a small service kept running to do something every
+half minute: a relay that drains a table, a consumer that takes what waits on a queue.
+
+A kernel-mode node with the managed service network (`kernel.serviceCidr`) runs functions. Six verbs:
+
+| Verb | Who runs it | What it does |
+|------|-------------|--------------|
+| `function_create {name, image, digest, triggers, command?, env?, secrets?, links?, limits?}` | only an approved action proposal | Creates the function, stopped. Its timer runs it from then on. |
+| `function_remove {name}` | only an approved action proposal | Stops the run that is going, deletes the function with its secrets. Its lines in the run log are kept. |
+| `function_secret_set {name, key, value}` | a `doctor` token | Sets one of the secrets the definition names. Write-only. |
+| `function_list` | a `viewer` token | Every function, with its definition, which secrets are set, whether a run is going, and its newest run. |
+| `function_run {name}` | a `doctor` token | Runs it now, once. Answers at once with the run's id. |
+| `function_runs {name, limit?, run?}` | a `viewer` token | Its newest runs, one line each, or one run with the end of its output. |
+
+### The definition, and the owner's card
+
+A function is created, and removed, only from a proposal the owner approved: `action_propose` with
+`function_create` and the definition. A direct call is refused with `NotApproved`. A new digest is a new function, so
+**every release of a function's program is a card the owner approves**: `function_remove`, then `function_create` with
+the new digest. A run is not a change and needs no approval.
+
+```
+action_propose { "action": "function_create", "args": {
+  "name": "relay",
+  "image": "registry.example/acme/relay",
+  "digest": "sha256:<64 hex digits>",
+  "command": ["/relay", "--once"],
+  "env": { "BATCH": "500" },
+  "secrets": ["DATABASE_URL", "NATS_URL"],
+  "links": [{ "to": "nats", "port": 4222 }],
+  "triggers": [{ "timer": { "everySeconds": 30 } }],
+  "limits": { "seconds": 60, "memory": "128MiB", "cpu": 1 }
+} }
+```
+
+| Field | Rule |
+|-------|------|
+| `name` | A service's grammar. Functions and services share one name space: neither takes a name the other holds, and each verb keeps to its kind (`service_status` of a function, and `function_run` of a service, are refused in words). |
+| `image`, `digest` | `<registry>/<repository>` in lower case and `sha256:` with 64 hex digits. Never a tag. Arca pulls the image without a credential. |
+| `command` | Optional. The program's absolute path inside the image, then its arguments. No shell runs it. Left out, the image's own entry point runs. |
+| `env` | Plain values by name, at most 32, each at most 160 characters. The card shows each whole. |
+| `secrets` | Names only, at most 16. See below. |
+| `links` | Services of this node the function may reach, each on one tcp port that service declares. At most 8. |
+| `triggers` | Exactly one, a timer: `everySeconds` from 10 to 86400. |
+| `limits` | `seconds` 1 to 900 (default 60), `memory` a size of at least 8MiB (default 128MiB), `cpu` 1 to 64 (default 1). |
+
+What the caller leaves out is written into the proposal, so the card shows every limit and the approval binds it. The
+card has one row for each: `Function`, `Program` (image and digest), `Kind`, `Command`, `Runs`, `Limits`, `Secrets`
+(the names, never a value), one `Setting <NAME>` for each plain value, `Services on this node`, `Private network` and
+`Internet`. A proposal the node would refuse (a link to a service that is not there, or to a port it does not declare;
+a name that is taken) is refused when it is made, so the owner is never shown it.
+
+### What a function may reach
+
+Only what its definition names. Its container has its own network card on the service network, with rules of its own
+and a default that rejects both ways:
+
+- each **link** is one rule, tcp to that service's address on the linked port, and one rule on that service's side that
+  lets the function in. A link gives the way and nothing else: no connection value is put in the function's
+  environment. What it connects with is a secret;
+- a **private address** outside the node's services is opened exactly as a service's is: the node's config names it for
+  the function's name (`kernel.serviceDestinations`), the proposal fills it in, and the card's `Private network` row
+  shows it ([A service that may reach one private address](#a-service-that-may-reach-one-private-address));
+- **nothing else.** A service's rules end with one that lets everything else out to the internet. A function's do not:
+  it can open no connection to a public address. There is no setting for it in this build.
+
+**One way out stays open, and the card says so.** The service network's own DNS answers a function, as it answers
+every instance there, and it asks the internet's name servers for a name it does not know. So a program can still
+send a little data out in the names it looks up, to whoever runs the name server of a domain. The `Internet` row of
+the card says this in the owner's words. Closing it is not in this build.
+
+### Secrets by name
+
+Arca reads no vault. Whoever holds a value sets it into Arca by name, `function_secret_set {name, key, value}`, and a
+run is given the secrets its definition names and no other, as environment values: nothing else writes a name into a
+function's environment, a linked service's own connection value least of all. A value is write-only: no verb shows
+it again. A program that prints one does not put it in the run log as it stands: each stored value is taken out of
+the output and of every string of the decoded result, in its plain form and with any of its characters written as a
+JSON escape. That is a search for known text, not a proof: a program that prints a secret cut in pieces or across
+two lines, or encoded another way (base64, a URL's escapes), prints it. A value is **one line of 8 to 4096 characters**: a credentials file or a PEM
+certificate of several lines is not a secret a function can be given. A function with a secret not yet set does not
+run: its run line says `notStarted` and names the secret.
+
+### A run
+
+The timer starts a run every `everySeconds`, counted from the last start. One run of a function goes at a time: when
+one is still going as the next is due, the next is not started, and a `function_run` meanwhile is refused with
+`FunctionBusy`. Nothing is queued and nothing is retried: the next tick is the next try. After a restart of the
+kernel every function is due at once, and no missed tick is made up.
+
+**What the program must do.** Run one batch and exit. Print what it likes, up to 1 MiB in one run (past that the
+output cannot be read, and the run ends `died` whatever it printed); **its last output line is its result: one JSON
+object, at most 4096 bytes, with `"ok": true` or `"ok": false`**. Incus reports no exit status of a container's
+program, so the line is the only word the program has. It must be safe to kill at any instant and to run again. It runs
+as the container's first process, which ignores a stop it has no handler for: a program that wants to end cleanly at
+its time limit handles `SIGTERM`.
+
+**Limits.** At `limits.seconds` the kernel stops the run: a stop the program has 5 seconds to obey, then a kill.
+`limits.memory` and `limits.cpu` are the container's own, enforced by the node; a program that passes its memory is
+killed.
+
+**Outcomes.** Each run ends as one of:
+
+| Outcome | Meaning |
+|---------|---------|
+| `ok`, `failed` | The program's own word: `"ok"` in its result line. |
+| `timeout` | It passed its time limit and the kernel stopped it. |
+| `memory` | It ended without a result and the node counted a kill at its memory limit. Best effort: the count is gone with the container, so a run killed for memory is often `died`. |
+| `died` | It ended without a result line. |
+| `interrupted` | The kernel stopped it for another reason: the function's removal, or a kernel that started and found a run nobody watched. |
+| `notStarted` | Nothing was started, and `why` says so: a secret is not set, Incus refused the start, the instance is not the one Arca created. |
+
+Between the end of one run of a function and its next start the kernel keeps 2 seconds. Incus is still putting a
+container away for a moment after its program exits, and a start in that moment can be refused. The shortest timer is
+10 seconds, so only a `function_run` that follows another run at once waits for it.
+
+### The run log is the meter
+
+One line for each run, appended and never rewritten, in `<stateDir>/function-runs/runs-<year>-<month>.jsonl` (mode
+0600). A month has its own file, and no file is cut: runs will be billed from them.
+
+```
+{"run":"fr-1793361600000-7","function":"relay","digest":"sha256:...","kind":"container","trigger":"timer",
+ "startedAt":1793361600000,"startMs":265,"durationMs":41,"cpuMs":12,"memoryPeakBytes":3194880,
+ "memoryLimitBytes":134217728,"outcome":"ok","result":{"ok":true,"published":3}}
+```
+
+`startMs` is how long Incus took to start the container; `durationMs` runs from there to the exit the kernel saw.
+`cpuMs` and `memoryPeakBytes` are read from the container's cgroup while it runs, and only when the node's Incus is on
+the machine `arca serve` runs on: the files are gone when the container stops, so the peak is the last reading before
+the exit, a lower bound, and both are `null` when nothing could be read. `memoryLimitBytes` is what the run was allowed.
+`function_runs` answers the newest lines (100 of each function are held in memory), newest first; with `run`, that
+line and the end of the run's output (64 KiB, kept for the 20 newest runs of each function under
+`function-runs/output/`). A function's output is untrusted text.
+
+**What a run writes.** To Incus: the container's power state, and its console log, which is cleared before each start
+so that what is read afterwards is that run's output alone. To the state directory: the run's line and the end of its
+output. Nothing else: no desired-state entry, no line of the effect journal. The run log's directory is made by the
+first run of the node's first function: a node with no function has none. A function's container is never started
+by Incus itself (`boot.autostart` is `false`), so a host that comes back up starts none. `instance_start`, `instance_stop` and
+`instance_restart` refuse a function's container (`InstanceIsFunction`): only a run starts it.
+
+### What to know
+
+- **A run's root file system is not read-only and is kept between runs.** Incus refuses to start an OCI container
+  whose root disk is read-only (seen on Incus 7.5.1), so a run can write its container's root, and the next run finds
+  what it wrote. A function's program must not execute what an earlier run could have left, and must keep no state
+  there. Giving every run the image's own root again is a change of its own.
+- The image is pulled without a credential, so it must be one the node can pull anonymously.
+- On Incus 7.5.1, on one machine and without a network card on the container, a run of a program that prints two lines
+  and exits took a third of a second from the clearing of its log to its output being read (median of 20; start 0.27 s),
+  and a forced stop 0.63 s. A network card and its rules add to the start.
+- A function is created in the node's own project only: not in a tenant, and not on a bridged node without the managed
+  service network.
+- A service a function links to is not removed while the function is there: `service_remove` is refused, when it is
+  proposed and when it runs, and names the function. Remove the function first. The kernel itself refuses, so two
+  approved actions in any order never leave a function linked to nothing; a removal refused after its card was
+  approved has used that approval up, and says so.
+- When `arca serve` cannot make the function runner at its start it says so on its log ("this node runs no
+  functions", and why) and serves everything else. Until the cause is put right and `serve` is started again, the
+  function verbs answer that the node runs no functions, `function_remove` among them, so a service a function links
+  to cannot be removed either; and a run that a kernel which stopped left going is not stopped, since the sweep that
+  stops it is the runner's. Starting `serve` again with the cause put right does all of it.
+- A function's container has no size limit on its root disk beyond the pool's own.
+- A run that cannot start writes a line each time it is tried. A function that is stuck on a 10-second timer writes
+  8,640 lines a day, and the run log is never cut.
+- A kernel that stops between a program's exit and the writing of its line loses that run from the run log.
+- A run of a program that never exits is ended only by its time limit.
+
 ## When an approved action fails
 
 An owner's approval is spent when Arca accepts it, before the action runs. When the action then fails, the answer is
@@ -4443,6 +4619,22 @@ Not proven by these tests, because they need a real virtual machine, the images 
 - the sign-in through Cloudflare Access, end to end;
 - the Cloudflare screens named in the steps, which follow the tunnel section above and Cloudflare's documentation
   and were not walked through in this work.
+
+### Functions
+
+`crates/arca/tests/functions.rs` runs the six verbs against the fake Incus: the card and the create it binds, the one
+name space, secrets by name, each outcome of a run, the timer, the removal, and that ten runs leave the effect journal
+and every other file of the state directory byte for byte as they were. `crates/arca-incus/tests/function_run.rs`
+holds the writer of a run to a function's instance: a service's instance is refused there before any write, and the
+service path still forces no stop. `crates/arca-netproject` checks a function's rules against a service's.
+
+What the fake cannot say was read from a real Incus by an ignored test,
+`function_run::proof::a_real_incus_runs_a_function_shaped_container` in `crates/arca-incus`, which does nothing unless
+`ARCA_REAL_INCUS_PROOF=1` and runs only in a project whose name begins with `arcak-scratch-`: how long a start and a
+stop take, that Incus refuses to start an OCI container with a read-only root, that the console log is empty after a
+clear and holds a run's output after it, that Incus reports no exit status, and that two runs with no pause between
+them can find the older run's output in the log. Not proven anywhere yet: a function on a live node with its network
+card and rules, a link that carries a real connection, and a run killed at its memory limit.
 
 ### Service wiring
 

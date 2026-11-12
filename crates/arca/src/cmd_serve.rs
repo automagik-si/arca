@@ -493,6 +493,49 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .map_err(|e| Failure::Runtime(e.to_string()))?;
     }
+    // A kernel-mode node with the managed service network runs functions. Before the timer starts, a function
+    // instance a stopped kernel left running is stopped: nobody watches that run any more. The meter reads memory and
+    // CPU from this machine's cgroup tree only while the node's Incus is this machine's.
+    // Nothing of it stops `serve`: a runner that cannot be made, or a timer that cannot start, is said on the log and
+    // the node serves everything else, with the function verbs answering that it runs no functions.
+    let functions = if kernel_mode && cfg.kernel.service_cidr.is_some() {
+        let source = Arc::clone(&metrics_source);
+        match crate::function_run::FunctionRunner::new(
+            Arc::clone(&kernel),
+            Arc::new(cfg.clone()),
+            clock.clone(),
+        ) {
+            Ok(runner) => {
+                let runner = Arc::new(runner.with_cgroup(Arc::new(move || {
+                    source
+                        .lock()
+                        .ok()
+                        .filter(|choice| choice.is_local())
+                        .map(|_| PathBuf::from("/sys/fs/cgroup"))
+                })));
+                for name in runner.sweep() {
+                    eprintln!(
+                        "arca: a run of function {name} was still going from a kernel that stopped: it was stopped, and the run log says so"
+                    );
+                }
+                match Arc::clone(&runner).spawn_timer() {
+                    Ok(()) => Some(runner),
+                    Err(error) => {
+                        eprintln!(
+                            "arca: the function timer did not start, so this node runs no functions: {error}"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("arca: this node runs no functions: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let action_slot = ActionSlot::default();
     let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> =
         plan_handlers_served(
@@ -511,10 +554,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             clock.clone(),
             Arc::new(cfg.clone()),
         ))
-        .chain(crate::handlers::service_handlers(
+        .chain(crate::handlers::service_handlers_with(
             kernel.clone(),
             clock.clone(),
             Arc::new(cfg.clone()),
+            functions,
         ))
         .chain(crate::handlers::tenant_handlers(
             kernel.clone(),

@@ -1617,6 +1617,26 @@ impl ToolHandler for ActionPropose {
             let entries = lock(&self.kernel)?.entries().to_vec();
             tenants::check_deploy_remove(node, &entries, &payload, now)?;
             payload
+        } else if action == ActionKind::ServiceRemove && payload.get("tenant").is_none() {
+            // A service a function links to is not removed, so the owner is never shown a card for it.
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            if let Some(refusal) = function_handlers::linked_service_refusal(
+                &entries,
+                payload["name"].as_str().unwrap_or_default(),
+                false,
+            ) {
+                return Err(refusal);
+            }
+            payload
+        } else if let (ActionKind::FunctionCreate, Some(node)) = (action, &self.node) {
+            // The proposal names every default and every private destination, so the card shows them and the
+            // approval binds them. A create the node would refuse is refused now.
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            function_handlers::enrich_function_create(node, &entries, &payload)?
+        } else if let (ActionKind::FunctionRemove, Some(_)) = (action, &self.node) {
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            function_handlers::check_function_remove(&entries, &payload)?;
+            payload
         } else {
             payload
         };
@@ -2162,6 +2182,8 @@ impl ActionExecutor {
                 | "tenant_create"
                 | "tenant_remove"
                 | "deploy_remove"
+                | "function_create"
+                | "function_remove"
         ) {
             call["approval"] = json!(grant);
         }
@@ -4259,6 +4281,8 @@ impl ToolHandler for PostgresHandler {
     }
 }
 
+#[path = "function_handlers.rs"]
+mod function_handlers;
 #[path = "service_omni.rs"]
 mod service_omni;
 #[path = "service_wiring.rs"]
@@ -4274,9 +4298,35 @@ pub fn service_handlers(
     clock: Clock,
     cfg: Arc<NodeConfig>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    service_handlers_with(kernel, clock, cfg, None)
+}
+
+/// The function verbs. They are served only by a node that runs functions: one with a runner.
+pub const FUNCTION_VERBS: [&str; 6] = [
+    "function_create",
+    "function_remove",
+    "function_secret_set",
+    "function_list",
+    "function_run",
+    "function_runs",
+];
+
+/// The service verbs and, over `functions`, the function verbs: one handler, one write gate and one record kind, since
+/// a function is a service record with one more key.
+pub fn service_handlers_with(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    cfg: Arc<NodeConfig>,
+    functions: Option<Arc<crate::function_run::FunctionRunner>>,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     // One gate for every handler that picks an address or a block: the kernel's own.
     let writes = write_gate(&kernel);
     let exec = Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()));
+    let function_verbs: &[&'static str] = if functions.is_some() {
+        &FUNCTION_VERBS
+    } else {
+        &[]
+    };
     [
         "service_connect",
         "service_disconnect",
@@ -4292,6 +4342,7 @@ pub fn service_handlers(
         "service_release",
     ]
     .into_iter()
+    .chain(function_verbs.iter().copied())
     .map(|verb| {
         (
             verb,
@@ -4302,6 +4353,7 @@ pub fn service_handlers(
                 cfg: cfg.clone(),
                 writes: writes.clone(),
                 exec: exec.clone(),
+                functions: functions.clone(),
             }) as Arc<dyn ToolHandler>,
         )
     })
@@ -4348,6 +4400,8 @@ struct ServiceHandler {
     cfg: Arc<NodeConfig>,
     writes: Arc<Mutex<()>>,
     exec: Arc<crate::service_exec::ServiceExec>,
+    /// The runner of this node's functions, on a node that runs any. The function verbs need it.
+    functions: Option<Arc<crate::function_run::FunctionRunner>>,
 }
 
 /// A refusal in plain words, under the plain code `refused`. A refusal for want of room is never this one, and neither
@@ -4757,6 +4811,10 @@ pub(crate) fn adopted_config(
     if row["type"].as_str() == Some(crate::service::VM_KIND) {
         return None;
     }
+    // Neither is a function's instance: a function is made by its create, from the definition its owner approved.
+    if row["config"][crate::service::FUNCTION_KEY].is_string() {
+        return None;
+    }
     let project = row["project"].as_str()?;
     let config = row["config"].as_object()?;
     let template = config.get(crate::service::TEMPLATE_KEY)?.as_str()?;
@@ -4854,6 +4912,7 @@ pub(crate) fn adopted_config(
             .flatten(),
         // An instance says nothing of a destination: only a create the owner approved records one.
         destinations: Vec::new(),
+        function: None,
     })
 }
 
@@ -4955,7 +5014,7 @@ fn adopt_services(
     Ok(())
 }
 
-fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
+pub(crate) fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
     let mut values = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return values;
@@ -5054,6 +5113,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         tenant: None,
         kernel_access: parts.kernel_access,
         destinations: Vec::new(),
+        function: None,
     })
 }
 
@@ -5135,6 +5195,7 @@ fn vm_service_config(
         tenant: None,
         kernel_access: None,
         destinations: Vec::new(),
+        function: None,
     })
 }
 
@@ -5257,6 +5318,12 @@ impl ServiceHandler {
                         ),
                         _ => "Its instance exists, in a state Incus did not report: service_status shows it, and service_remove removes it".to_string(),
                     };
+                    // A function is said as one, with the verbs that act on one.
+                    if config.function.is_some() {
+                        return Err(service_refused(format!(
+                            "create function {name}: {why}. Its instance exists: function_list shows the function, function_remove removes it, and the create is proposed again once the cause is fixed"
+                        )));
+                    }
                     return Err(service_refused(format!(
                         "start service {name}: {why}. {left}"
                     )));
@@ -5284,6 +5351,11 @@ impl ServiceHandler {
                 &service_secret_values(&self.cfg.state_dir.join("secrets")),
             );
             let left = service_wiring::left_behind(removal.ok().as_deref(), &id);
+            if config.function.is_some() {
+                return Err(service_refused(format!(
+                    "create function {name}: {why}; {left}"
+                )));
+            }
             return Err(service_refused(format!(
                 "create service {name} from template {template_name}: {why}; {left}"
             )));
@@ -5346,6 +5418,26 @@ impl ToolHandler for ServiceHandler {
             "service_secret_set" => &["name", "key", "value"],
             "service_publish" => &["name", "reach", "approval"],
             "service_unpublish" => &["name"],
+            "function_create" => &[
+                "name",
+                "kind",
+                "image",
+                "digest",
+                "command",
+                "env",
+                "secrets",
+                "links",
+                "destinations",
+                "triggers",
+                "limits",
+                "concurrency",
+                // Only an approved proposal carries it: the one-shot grant of its approval.
+                "approval",
+            ],
+            "function_remove" => &["name", "approval"],
+            "function_secret_set" => &["name", "key", "value"],
+            "function_run" => &["name"],
+            "function_runs" => &["name", "limit", "run"],
             _ => &[],
         };
         let object = args
@@ -5355,7 +5447,7 @@ impl ToolHandler for ServiceHandler {
         let takes_tenant = !matches!(
             self.verb,
             "service_publish" | "service_unpublish" | "service_import" | "service_release"
-        );
+        ) && !self.verb.starts_with("function_");
         if let Some(key) = object
             .keys()
             .find(|key| !(takes_tenant && *key == "tenant") && !allowed.contains(&key.as_str()))
@@ -5382,6 +5474,10 @@ impl ToolHandler for ServiceHandler {
                 | "service_secret_set"
                 | "service_publish"
                 | "service_unpublish"
+                | "function_create"
+                | "function_remove"
+                | "function_secret_set"
+                | "function_run"
         ) && caller.scope < Scope::Doctor
         {
             return Err(CallError::Forbidden {
@@ -5406,6 +5502,8 @@ impl ToolHandler for ServiceHandler {
                 | "service_publish"
                 | "service_import"
                 | "service_release"
+                | "function_create"
+                | "function_remove"
         ) && args
             .get("approval")
             .and_then(Value::as_str)
@@ -5427,6 +5525,8 @@ impl ToolHandler for ServiceHandler {
                 | "service_secret_set"
                 | "service_import"
                 | "service_release"
+                | "function_create"
+                | "function_secret_set"
         ) {
             Some(self.writes.lock().map_err(|_| internal())?)
         } else {
@@ -5530,6 +5630,10 @@ impl ToolHandler for ServiceHandler {
             None => service_owned(row),
         };
         let tenant_id = tenant.as_ref().map(|scope| scope.id.as_str());
+        // One name space, two kinds: a verb of one kind never acts on a record of the other.
+        if let Some(refusal) = function_handlers::kind_refusal(self.verb, &args, &all_entries) {
+            return Err(refusal);
+        }
         if matches!(
             self.verb,
             "service_connect"
@@ -5537,8 +5641,23 @@ impl ToolHandler for ServiceHandler {
                 | "service_secret_set"
                 | "service_publish"
                 | "service_unpublish"
+                | "function_secret_set"
         ) {
             return self.call_wiring(&args, caller, &entries, now, preapproved);
+        }
+        if self.verb.starts_with("function_") {
+            // A create and a secret hold the write gate from above. A removal takes it itself, once the run that is
+            // going has been stopped; a run and the two reads take none.
+            return self.call_function(
+                &args,
+                &read,
+                &all_entries,
+                &all_rows,
+                &cidr,
+                &gateway,
+                now,
+                preapproved,
+            );
         }
         match self.verb {
             "service_list" => {
@@ -5550,6 +5669,11 @@ impl ToolHandler for ServiceHandler {
                     .collect();
                 let mut templates = BTreeMap::new();
                 for (_, config) in &records {
+                    // A function is not a service: function_list shows it. Its instance's name stays known, so the
+                    // rows below never show it as an instance nobody recorded.
+                    if config.function.is_some() {
+                        continue;
+                    }
                     let live = service_live_in(&rows, &config.project, &config.instance);
                     let mut view = crate::service::view(config, live);
                     // Only a service whose installed template names another version carries the key, so every
@@ -5757,6 +5881,15 @@ impl ToolHandler for ServiceHandler {
                 if config.adopted {
                     return Err(service_wiring::adopted(&name));
                 }
+                // A service a function links to stays until the function is gone: said before any approval is
+                // spent.
+                // A removal that runs from an approved card has used that approval up by now, and says so.
+                if tenant.is_none()
+                    && let Some(refusal) =
+                        function_handlers::linked_service_refusal(&all_entries, &name, preapproved)
+                {
+                    return Err(refusal);
+                }
                 let id = entry.id.clone();
                 let spent = if preapproved {
                     lock(&self.kernel)?.spend_service_removal_authorized(&id)
@@ -5794,6 +5927,11 @@ impl ToolHandler for ServiceHandler {
                         }
                         crate::kernel::ServiceRemovalError::Proposal(_) => {
                             service_removal_refused(&read, &config)
+                        }
+                        // A function came to link to it after the check above: the kernel refused under its own
+                        // lock, and the approval this removal ran on is spent.
+                        crate::kernel::ServiceRemovalError::LinkedFunctions(functions) => {
+                            function_handlers::linked_functions_refusal(&name, &functions, true)
                         }
                     })?;
                 let changed = removal

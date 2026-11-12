@@ -165,7 +165,7 @@ impl ServiceHandler {
             retained: kernel.retained_entries().map_err(|_| internal())?,
         })
     }
-    fn put(&self, configs: &[ServiceConfig], now: u64) -> Result<(), CallError> {
+    pub(super) fn put(&self, configs: &[ServiceConfig], now: u64) -> Result<(), CallError> {
         let changes = configs.iter().map(change).collect::<Result<Vec<_>, _>>()?;
         let outcomes = lock(&self.kernel)?
             .propose(changes, now)
@@ -181,10 +181,14 @@ impl ServiceHandler {
         Ok(())
     }
     fn template(&self, cfg: &ServiceConfig) -> Result<service::Template, CallError> {
+        // A function's template is its own definition: there is no file to read.
+        if let Some(template) = crate::function::template(cfg) {
+            return Ok(template);
+        }
         service::load_template(&self.cfg.state_dir.join("templates"), &cfg.template)
             .map_err(service_template_error)
     }
-    fn live_owned(
+    pub(super) fn live_owned(
         &self,
         entry: &Entry,
         cfg: &ServiceConfig,
@@ -312,19 +316,21 @@ impl ServiceHandler {
         }
         // A virtual machine takes its template's secrets on either network: they are stored here and written into its
         // guest at its next start (`crate::guest_secrets`). It is never published.
-        if cfg.on_host_bridge() && self.verb != "service_secret_set" {
+        if cfg.on_host_bridge()
+            && !matches!(self.verb, "service_secret_set" | "function_secret_set")
+        {
             return Err(bridged_refusal(
                 &name,
                 "it cannot be published from here; reach it on its bridge's own network",
             ));
         }
-        if cfg.vm.is_some() && self.verb != "service_secret_set" {
+        if cfg.vm.is_some() && !matches!(self.verb, "service_secret_set" | "function_secret_set") {
             return Err(vm_refusal(
                 &name,
                 "a dash is published by a tailnet node inside an Arca-built container image, and no virtual-machine image carries one",
             ));
         }
-        if self.verb == "service_secret_set" {
+        if matches!(self.verb, "service_secret_set" | "function_secret_set") {
             let key = args["key"]
                 .as_str()
                 .ok_or_else(|| CallError::Invalid("key: expected a secret name".into()))?;
@@ -341,6 +347,18 @@ impl ServiceHandler {
                 )));
             }
             let t = self.template(&cfg)?;
+            if cfg.function.is_some() && !t.secrets.iter().any(|k| k == key) {
+                return Err(service_refused(if t.secrets.is_empty() {
+                    format!(
+                        "the function {name} names no secret in its definition, so none can be set"
+                    )
+                } else {
+                    format!(
+                        "the function {name} does not name the secret {key} in its definition: it names {}",
+                        t.secrets.join(", ")
+                    )
+                }));
+            }
             if !t.secrets.iter().any(|k| k == key) {
                 return Err(service_refused(
                     if cfg.vm.is_some() && t.secrets.is_empty() {
@@ -411,7 +429,9 @@ impl ServiceHandler {
             }
             self.put(std::slice::from_ref(&cfg), now)?;
             for (consumer_entry, mut consumer) in service_entries(entries) {
-                if consumer.adopted {
+                // A function's link is a way to the service and nothing else: no value of the service's ever enters
+                // a function's environment, which holds only what its own definition names and its owner approved.
+                if consumer.adopted || consumer.function.is_some() {
                     continue;
                 }
                 if let Some(link) = consumer.links.iter().find(|l| l.to == name).cloned() {

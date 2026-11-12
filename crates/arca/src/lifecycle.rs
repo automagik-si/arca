@@ -170,6 +170,21 @@ impl InstanceLifecycle {
                     ),
                 ),
             })?;
+        // A function's instance is the kernel's to start and stop, one run at a time, with each run in the run log.
+        // No verb of this module touches it, whoever asks.
+        if state
+            .own_config
+            .get(crate::service::FUNCTION_KEY)
+            .map(String::as_str)
+            == Some("true")
+        {
+            return Err(refused(
+                "InstanceIsFunction",
+                format!(
+                    "the instance {instance} in project {project} is a function's: Arca starts it for each run and stops it itself. function_run runs it now, function_runs shows its runs, and function_remove removes it"
+                ),
+            ));
+        }
         let retained = (self.retained)().map_err(|_| {
             refused(
                 "InstanceUnknown",

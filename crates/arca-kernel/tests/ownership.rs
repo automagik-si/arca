@@ -322,3 +322,52 @@ fn public_service_metadata_is_scoped_to_kernel_service_objects_and_never_changes
     object.name = "another-acl".into();
     assert_eq!(classify_object(&object, &c, &none()), OwnerClass::Contested);
 }
+
+#[test]
+fn the_function_mark_is_the_entrys_own_on_a_service_instance_of_the_nodes_project_and_nowhere_else()
+{
+    use arca_kernel::ownership::{classify_object, tenant_project};
+    let instance = |project: &str, name: &str| ObjectRef {
+        kind: IncusKind::Instance,
+        project: project.into(),
+        parent: None,
+        name: name.into(),
+        uuid: None,
+    };
+    // In the node's own service project the mark stands beside the kernel's entry mark.
+    let own = config(&[
+        (KERNEL_ENTRY_KEY, "service-relay"),
+        ("user.arca.template", "function"),
+        ("user.arca.function", "true"),
+    ]);
+    assert_eq!(
+        classify_object(&instance("arcak-svc", "relay"), &own, &none()),
+        kernel("service-relay")
+    );
+    // Without the kernel's mark it is the other system's key, as every `user.arca.` key is.
+    let bare = config(&[("user.arca.function", "true")]);
+    assert_eq!(
+        classify_object(&instance("arcak-svc", "relay"), &bare, &none()),
+        OwnerClass::Droidd
+    );
+    // A tenant's service instance never carries it: there it contests the object, as any other owner's key does.
+    let tenant = "abcdefgh";
+    let project = tenant_project(tenant, false);
+    let service = config(&[
+        (KERNEL_ENTRY_KEY, "t-abcdefgh-service-relay"),
+        ("user.arca.template", "api"),
+    ]);
+    assert_eq!(
+        classify_object(&instance(&project, "relay-abcdefgh"), &service, &none()),
+        kernel("t-abcdefgh-service-relay")
+    );
+    let marked = config(&[
+        (KERNEL_ENTRY_KEY, "t-abcdefgh-service-relay"),
+        ("user.arca.template", "api"),
+        ("user.arca.function", "true"),
+    ]);
+    assert_eq!(
+        classify_object(&instance(&project, "relay-abcdefgh"), &marked, &none()),
+        OwnerClass::Contested
+    );
+}

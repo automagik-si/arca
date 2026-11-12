@@ -202,6 +202,61 @@ pub fn egress_rules(
     tenant_block: Option<Block>,
     destinations: &[Destination],
 ) -> Vec<Value> {
+    egress_rules_for(gateway, hosts, tenant_block, destinations, true)
+}
+
+/// The egress rules of a function's NIC on the managed service bridge. A function reaches only what its definition
+/// names, so they are a service's rules ([`egress_rules`]) with two differences. The last rule, the allow that lets
+/// everything else out to the internet, is not written: what no rule opens meets the NIC's default action, reject.
+/// And since that allow is also what lets a service's packets reach its neighbours on the service /24, each service
+/// the function is linked to is opened by a rule of its own: tcp to that service's address on the linked port.
+///
+/// `links` are those addresses and ports. One that is outside the service /24, that is one of the node's own
+/// addresses, or whose port is 0 is never opened, whatever a record says. `destinations` are the private addresses the
+/// node's config names for the function, opened exactly as a service's are.
+pub fn function_egress_rules(
+    gateway: Ipv4Addr,
+    hosts: &Value,
+    destinations: &[Destination],
+    links: &[Destination],
+) -> Vec<Value> {
+    let mut rules = egress_rules_for(gateway, hosts, None, destinations, false);
+    let own = u32::from(gateway) & 0xffffff00;
+    let mut closed = destination::node_own(hosts);
+    closed.insert(gateway);
+    let mut open: BTreeMap<Ipv4Addr, std::collections::BTreeSet<u16>> = BTreeMap::new();
+    for link in links {
+        if link.port == 0
+            || closed.contains(&link.address)
+            || !destination::holds(own, 24, u32::from(link.address))
+        {
+            continue;
+        }
+        open.entry(link.address).or_default().insert(link.port);
+    }
+    for (address, ports) in open {
+        let named = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        rules.push(rule(
+            json!({"action":"allow", "destination":format!("{address}/32"),
+            "protocol":"tcp", "destination_port":named,
+            "description":format!("the linked service at {address}, tcp port {named}")}),
+        ));
+    }
+    rules
+}
+
+/// [`egress_rules`], with or without its last rule: the allow that lets everything not rejected out to the internet.
+fn egress_rules_for(
+    gateway: Ipv4Addr,
+    hosts: &Value,
+    tenant_block: Option<Block>,
+    destinations: &[Destination],
+    internet: bool,
+) -> Vec<Value> {
     let own = u32::from(gateway) & 0xffffff00;
     let mut host4 = std::collections::BTreeSet::from([gateway]);
     host4.extend(
@@ -302,6 +357,9 @@ pub fn egress_rules(
         rules.push(rule(json!({"action":"allow", "destination":to,
             "protocol":"tcp", "destination_port":named,
             "description":format!("the private address {address}, tcp port {named}, named in the node's config")})));
+    }
+    if !internet {
+        return rules;
     }
     if open.is_empty() {
         rules.push(rule(json!({"action":"allow", "description":"internet"})));
@@ -1150,5 +1208,108 @@ mod tests {
         let mut bad = caps(4, 4, 1);
         bad.cpu = 0;
         assert!(!caps_ok(&bad, size_text_ok));
+    }
+
+    #[test]
+    fn a_functions_rules_are_a_services_without_the_way_out_and_with_one_allow_for_each_link() {
+        let gateway = Ipv4Addr::new(10, 90, 0, 1);
+        let hosts = json!(["10.90.0.1/24", "172.16.7.5/24"]);
+        let link = |address: [u8; 4], port: u16| Destination {
+            address: Ipv4Addr::from(address),
+            port,
+        };
+        let allows = |rules: &[Value]| -> Vec<(String, String, String)> {
+            rules
+                .iter()
+                .filter(|rule| rule["action"] == "allow")
+                .map(|rule| {
+                    (
+                        rule["destination"].as_str().unwrap_or_default().to_string(),
+                        rule["protocol"].as_str().unwrap_or_default().to_string(),
+                        rule["destination_port"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        };
+        // With no link and no destination nothing is allowed at all: every packet meets the NIC's default, reject.
+        let service = egress_rules(gateway, &hosts, None, &[]);
+        let bare = function_egress_rules(gateway, &hosts, &[], &[]);
+        assert_eq!(service.last().expect("a rule")["description"], "internet");
+        assert_eq!(
+            bare,
+            service[..service.len() - 1],
+            "a service's rules less its last"
+        );
+        assert!(allows(&bare).is_empty());
+        // Each linked service is one allow: tcp, its address, its port. Two ports of one address share a rule.
+        let linked = function_egress_rules(
+            gateway,
+            &hosts,
+            &[],
+            &[
+                link([10, 90, 0, 12], 5432),
+                link([10, 90, 0, 10], 4222),
+                link([10, 90, 0, 10], 8222),
+            ],
+        );
+        assert_eq!(
+            allows(&linked),
+            [
+                (
+                    "10.90.0.10/32".to_string(),
+                    "tcp".to_string(),
+                    "4222,8222".to_string()
+                ),
+                (
+                    "10.90.0.12/32".to_string(),
+                    "tcp".to_string(),
+                    "5432".to_string()
+                ),
+            ]
+        );
+        // A link a record should never hold opens nothing: the gateway, another of the node's addresses, an address
+        // outside the service subnet, a public one, and port 0.
+        let odd = function_egress_rules(
+            gateway,
+            &hosts,
+            &[],
+            &[
+                link([10, 90, 0, 1], 53),
+                link([172, 16, 7, 5], 22),
+                link([10, 91, 0, 10], 4222),
+                link([203, 0, 113, 9], 443),
+                link([10, 90, 0, 10], 0),
+            ],
+        );
+        assert_eq!(odd, bare);
+        // A private destination is opened as a service's is, and still no rule lets everything else out.
+        let destination = [link([10, 4, 0, 9], 443)];
+        let with = function_egress_rules(
+            gateway,
+            &hosts,
+            &destination,
+            &[link([10, 90, 0, 10], 4222)],
+        );
+        assert_eq!(
+            allows(&with),
+            [
+                (
+                    "10.4.0.9/32".to_string(),
+                    "tcp".to_string(),
+                    "443".to_string()
+                ),
+                (
+                    "10.90.0.10/32".to_string(),
+                    "tcp".to_string(),
+                    "4222".to_string()
+                ),
+            ]
+        );
+        assert!(with.iter().all(|rule| rule["description"] != "internet"));
+        let service = egress_rules(gateway, &hosts, None, &destination);
+        assert_eq!(with[..with.len() - 1], service[..service.len() - 1]);
     }
 }

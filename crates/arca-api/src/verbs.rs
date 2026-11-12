@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 55] = [
+static VERBS: [Verb; 61] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -850,7 +850,441 @@ static VERBS: [Verb; 55] = [
         params: deploy_remove_params,
         result: deploy_remove_result,
     },
+    Verb {
+        name: "function_create",
+        summary: "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_function,
+        cut: no_cut,
+        params: function_create_params,
+        result: function_result,
+    },
+    Verb {
+        name: "function_remove",
+        summary: "Remove a function, only from a proposal the owner approved: the run that is going, if one is, is stopped, then its instance, its firewall rules and its secrets are deleted and each linked service closes to it. Its lines in the run log are kept.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_done,
+        cut: no_cut,
+        params: function_remove_params,
+        result: function_remove_result,
+    },
+    Verb {
+        name: "function_secret_set",
+        summary: "Set one of a function's secrets (its definition lists their names). Write-only: no tool, log or run line shows it again. Arca reads no vault: whoever holds the value sets it here, by name, and each run is given the secrets its function names and no other, as environment values. A function with a secret not yet set does not run, and its run line names the secret. A value is one line of 8 to 4096 characters.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_function_secret_set,
+        cut: no_cut,
+        params: function_secret_set_params,
+        result: service_secret_set_result,
+    },
+    Verb {
+        name: "function_list",
+        summary: "The functions of this node, each with its image and digest, its command, its timer, its limits, the names of its secrets and whether each is set, what it may reach, whether a run is going and its newest run.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_function_list,
+        cut: no_cut,
+        params: empty_params,
+        result: function_list_result,
+    },
+    Verb {
+        name: "function_run",
+        summary: "Run a function now, once, outside its timer. It answers at once with the run's id; function_runs shows the run when it ends. One run of a function goes at a time: while one is going the call is refused with FunctionBusy. A run is not a change, so it needs no approval; it writes one line to the run log and nothing else.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_function_run,
+        cut: no_cut,
+        params: function_name_params,
+        result: function_run_result,
+    },
+    Verb {
+        name: "function_runs",
+        summary: "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. With run, that one run and the end of its output, when it is still kept.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_function_runs,
+        cut: no_cut,
+        params: function_runs_params,
+        result: function_runs_result,
+    },
 ];
+
+/// A function's name: the grammar of a service's, since the two share one name space.
+fn function_name_schema() -> Value {
+    service_name_schema(
+        "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+    )
+}
+
+fn env_name_schema(description: &'static str) -> Value {
+    json!({
+        "description": description,
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+        "type": "string"
+    })
+}
+
+/// The triggers of a function: in this build exactly one, a timer.
+fn function_triggers_schema() -> Value {
+    json!({
+        "description": "When the function runs: exactly one trigger, a timer. A run starts every everySeconds, unless one is still going.",
+        "items": {
+            "additionalProperties": false,
+            "properties": {
+                "timer": {
+                    "additionalProperties": false,
+                    "properties": { "everySeconds": bounded_int(10, 86_400) },
+                    "required": ["everySeconds"],
+                    "type": "object"
+                }
+            },
+            "required": ["timer"],
+            "type": "object"
+        },
+        "maxItems": 1,
+        "type": "array"
+    })
+}
+
+fn function_limits_schema(required: bool) -> Value {
+    let mut schema = json!({
+        "additionalProperties": false,
+        "description": "What one run may use. seconds: the longest it may take (default 60); Arca stops a run that passes it, with a stop the program has 5 seconds to obey and then a kill. memory: the most it may use, as a size such as 128MiB (default 128MiB, at least 8MiB); a run that passes it is killed. cpu: the CPUs it may use (default 1).",
+        "properties": {
+            "cpu": bounded_int(1, 64),
+            "memory": { "maxLength": 32, "pattern": "^[1-9][0-9]*(?:MiB|GiB)$", "type": "string" },
+            "seconds": bounded_int(1, 900)
+        },
+        "type": "object"
+    });
+    if required {
+        schema["required"] = json!(["seconds", "memory", "cpu"]);
+    }
+    schema
+}
+
+fn function_links_schema() -> Value {
+    json!({
+        "description": "The services of this node the function may reach, each on one tcp port the service declares. A link opens the way and nothing else: no connection value is put in the function's environment.",
+        "items": {
+            "additionalProperties": false,
+            "properties": {
+                "port": bounded_int(1, 65_535),
+                "to": service_name_schema("A service of this node.")
+            },
+            "required": ["to", "port"],
+            "type": "object"
+        },
+        "maxItems": 8,
+        "type": "array"
+    })
+}
+
+fn function_destinations_schema() -> Value {
+    json!({
+        "description": "Only for a function this node's config names in kernel.serviceDestinations: exactly the addresses and tcp ports the config names for it. A proposal fills it in from the config, so the owner's card shows each address and the approval binds it; a caller cannot state one of its own.",
+        "items": {
+            "additionalProperties": false,
+            "properties": {
+                "address": { "maxLength": 15, "pattern": "^[0-9]{1,3}(?:\\.[0-9]{1,3}){3}$", "type": "string" },
+                "port": bounded_int(1, 65_535)
+            },
+            "required": ["address", "port"],
+            "type": "object"
+        },
+        "maxItems": 4,
+        "type": "array"
+    })
+}
+
+fn function_create_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "approval": {
+                "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+            },
+            "command": {
+                "description": "The program and its arguments: the first is the program's absolute path inside the image. No shell runs it. Left out, the image's own entry point runs.",
+                "items": { "maxLength": 160, "minLength": 1, "type": "string" },
+                "maxItems": 32,
+                "type": "array"
+            },
+            "concurrency": {
+                "description": "How many runs of the function may go at once. This build runs one: the only value is 1, which is also the default.",
+                "enum": [1],
+                "type": "integer"
+            },
+            "destinations": function_destinations_schema(),
+            "digest": {
+                "description": "The image's digest: sha256: and 64 hex digits. A function is an image by digest, never a tag, so a new version is a new function_create that the owner approves.",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+            },
+            "env": {
+                "additionalProperties": { "maxLength": 160, "type": "string" },
+                "description": "Plain environment values, by name, at most 32. The owner's card shows each whole. Never a secret: a secret is named in secrets.",
+                "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$", "type": "string" },
+                "type": "object"
+            },
+            "image": {
+                "description": "The image, as <registry>/<repository> in lower case, such as registry.example/acme/relay. Arca pulls it without a credential.",
+                "maxLength": 255,
+                "pattern": "^[a-z0-9][a-z0-9._:-]*/[a-z0-9._/:-]+$",
+                "type": "string"
+            },
+            "kind": {
+                "description": "How a run is isolated. This build runs a function in a container: the only value is \"container\", which is also the default.",
+                "enum": ["container"],
+                "type": "string"
+            },
+            "limits": function_limits_schema(false),
+            "links": function_links_schema(),
+            "name": function_name_schema(),
+            "secrets": {
+                "description": "The names of the function's secrets, at most 16. Each run is given these as environment values, and no other. function_secret_set sets each value.",
+                "items": env_name_schema("The name of an environment variable."),
+                "maxItems": 16,
+                "type": "array"
+            },
+            "triggers": function_triggers_schema()
+        },
+        "required": ["name", "image", "digest", "triggers"],
+        "type": "object"
+    })
+}
+
+/// One function as `function_create` and `function_list` answer it.
+fn function_result() -> Value {
+    result(vec![
+        ("name", true, function_name_schema()),
+        ("kind", true, one_of(&["container"])),
+        ("image", true, string()),
+        ("digest", true, string()),
+        ("command", true, array(string())),
+        ("env", true, json!({ "type": "object" })),
+        (
+            "secrets",
+            true,
+            array(result(vec![
+                ("name", true, string()),
+                ("set", true, boolean()),
+            ])),
+        ),
+        (
+            "links",
+            true,
+            array(result(vec![
+                ("to", true, string()),
+                ("port", true, bounded_int(1, 65_535)),
+            ])),
+        ),
+        ("destinations", false, json!({ "type": "array" })),
+        ("triggers", true, json!({ "type": "array" })),
+        ("limits", true, json!({ "type": "object" })),
+        ("concurrency", true, bounded_int(1, 1)),
+        ("ipv4", true, string()),
+        ("created", true, at_least(0)),
+        ("running", true, boolean()),
+        ("lastRun", true, nullable(json!({ "type": "object" }))),
+    ])
+}
+
+fn function_list_result() -> Value {
+    result(vec![("functions", true, array(function_result()))])
+}
+
+fn function_remove_params() -> Value {
+    with_confirm(json!({
+        "additionalProperties": false,
+        "properties": {
+            "approval": {
+                "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+            },
+            "name": function_name_schema()
+        },
+        "required": ["name", "approval"],
+        "type": "object"
+    }))
+}
+
+fn function_remove_result() -> Value {
+    result(vec![("removed", true, boolean())])
+}
+
+fn function_secret_set_params() -> Value {
+    params(vec![
+        ("name", true, function_name_schema()),
+        (
+            "key",
+            true,
+            env_name_schema("The secret's name, one of those the function's definition lists."),
+        ),
+        (
+            "value",
+            true,
+            json!({
+                "description": "The secret: one line of 8 to 4096 characters, without control characters.",
+                "maxLength": 4096,
+                "minLength": 8,
+                "type": "string"
+            }),
+        ),
+    ])
+}
+
+fn function_name_params() -> Value {
+    params(vec![("name", true, function_name_schema())])
+}
+
+fn function_run_result() -> Value {
+    result(vec![
+        ("function", true, string()),
+        ("run", true, run_id_schema()),
+        ("started", true, boolean()),
+    ])
+}
+
+fn run_id_schema() -> Value {
+    json!({
+        "description": "A run's id: fr-, the time it began in milliseconds, and a number.",
+        "pattern": "^fr-[0-9]{1,16}-[0-9]{1,12}$",
+        "type": "string"
+    })
+}
+
+fn function_runs_params() -> Value {
+    params(vec![
+        ("name", true, function_name_schema()),
+        (
+            "limit",
+            false,
+            json!({
+                "description": "How many of the newest runs to answer, 1 to 100. The default is 20.",
+                "maximum": 100,
+                "minimum": 1,
+                "type": "integer"
+            }),
+        ),
+        ("run", false, run_id_schema()),
+    ])
+}
+
+/// One line of the run log.
+fn function_run_line() -> Value {
+    result(vec![
+        ("run", true, run_id_schema()),
+        ("function", true, string()),
+        ("digest", false, nullable(string())),
+        ("kind", true, one_of(&["container"])),
+        ("trigger", true, one_of(&["timer", "manual", "kernel"])),
+        ("startedAt", true, at_least(0)),
+        ("startMs", false, nullable(at_least(0))),
+        ("durationMs", false, nullable(at_least(0))),
+        ("cpuMs", false, nullable(at_least(0))),
+        ("memoryPeakBytes", false, nullable(at_least(0))),
+        ("memoryLimitBytes", false, nullable(at_least(0))),
+        (
+            "outcome",
+            true,
+            one_of(&[
+                "ok",
+                "failed",
+                "timeout",
+                "memory",
+                "died",
+                "interrupted",
+                "notStarted",
+            ]),
+        ),
+        ("result", false, nullable(json!({ "type": "object" }))),
+        ("why", false, string()),
+    ])
+}
+
+fn function_runs_result() -> Value {
+    result(vec![
+        ("function", true, string()),
+        ("running", false, boolean()),
+        ("runs", false, array(function_run_line())),
+        ("run", false, function_run_line()),
+        ("output", false, nullable(array(string()))),
+    ])
+}
+
+fn summary_function(v: &Value) -> String {
+    format!(
+        "function {}: created stopped; its timer runs it from now on",
+        v["name"].as_str().unwrap_or("?")
+    )
+}
+
+fn summary_function_secret_set(_: &Value) -> String {
+    "function_secret_set: complete".into()
+}
+
+fn summary_function_list(v: &Value) -> String {
+    format!(
+        "{} function(s)",
+        v["functions"].as_array().map_or(0, Vec::len)
+    )
+}
+
+fn summary_function_run(v: &Value) -> String {
+    format!(
+        "run {} of {} started",
+        v["run"].as_str().unwrap_or("?"),
+        v["function"].as_str().unwrap_or("?")
+    )
+}
+
+fn summary_function_runs(v: &Value) -> String {
+    match v["runs"].as_array() {
+        Some(runs) => format!(
+            "{} run(s) of {}",
+            runs.len(),
+            v["function"].as_str().unwrap_or("?")
+        ),
+        None => format!(
+            "run {}: {}",
+            v["run"]["run"].as_str().unwrap_or("?"),
+            v["run"]["outcome"].as_str().unwrap_or("?")
+        ),
+    }
+}
 
 fn deploy_remove_params() -> Value {
     with_confirm(params(vec![
@@ -1279,6 +1713,7 @@ fn not_confirmed(name: &str) -> String {
         "tenant_remove" => "nothing was removed",
         "deploy_rollback" => "nothing was rolled back",
         "deploy_remove" => "nothing was removed",
+        "function_remove" => "nothing was removed",
         _ => "nothing was deleted",
     };
     let spent = if name == "postgres_delete" || name == "deploy_rollback" {
@@ -1725,8 +2160,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 20] = [
+/// The twenty-two verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 22] = [
     "service_create",
     "service_remove",
     "service_import",
@@ -1747,6 +2182,8 @@ const ACTION_NAMES: [&str; 20] = [
     "tenant_create",
     "tenant_remove",
     "deploy_remove",
+    "function_create",
+    "function_remove",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.

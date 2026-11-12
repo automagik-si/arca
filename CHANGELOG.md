@@ -17,6 +17,20 @@ with changes turned on (arca init --enable-changes, then restart the node if ini
 database's password itself, so a database you approve on the page starts by itself. Your node keeps the template it
 already has. To get the new one, run `arca templates install --replace --config <file>`; it overwrites shipped
 templates you edited. A `postgres-autopg` service that already exists is not changed, and keeps its password.
+Arca now runs functions: a program in an OCI image by digest, run on a timer, each run one start of a container of its
+own that is stopped again when the program exits. A function is created and removed only from a proposal the owner
+approves, and its card shows the image and digest, the command, the timer, the limits of a run (time, memory, CPU), the
+names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the
+private addresses the node's config names for it, and no connection to any public address. One way out stays, and
+the card says it: names are looked up through the node's DNS, which asks the internet's name servers, so a program
+can send a little data out in the names it asks for. Secrets are set by name
+(`function_secret_set`) and a run is given only the ones its function names. Each run writes one line to a run log
+that is also the meter (start, duration, CPU time, memory peak, outcome, the program's result line), read with
+`function_runs`; a run writes nothing to the desired state or the effect journal. A program's last output line is its
+result, one JSON object with `"ok"`. Six new verbs: `function_create`, `function_remove`, `function_secret_set`,
+`function_list`, `function_run`, `function_runs`. Known limit: a run can write its container's root file system, and
+the next run finds what it wrote (Incus refuses to start an OCI container with a read-only root). `docs/OPERATING.md`,
+"Functions", has the whole of it.
 
 ## 0.12.0 (2026-11-12)
 
