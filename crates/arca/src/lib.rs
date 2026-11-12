@@ -71,6 +71,7 @@ const USAGE: &str = "usage: arca <command>
   call (alone: lists the verbs)
   token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] (--config <file> | --hash-dir <dir>)
   token revoke <id> (--config <file> | --hash-dir <dir>)
+  token reload --config <file> (the running node reads its tokens again)
   store check --config <file>
   templates install --config <file> [--replace]
   service import plan --name <service> [--config <file>]
@@ -488,10 +489,13 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
                 })?;
                 cmd_token::revoke_token(id, &parse_flags(rest, &["hash-dir", "config"], &[])?)
             }
+            Some((action, rest)) if action == "reload" => {
+                cmd_token::reload_tokens(&parse_flags(rest, &["config"], &[])?)
+            }
             other => Err(unknown_word(
                 "a token action",
                 other.map(|(action, _)| action.as_str()),
-                &["mint", "revoke"],
+                &["mint", "revoke", "reload"],
             )),
         },
         "shim" => run_shim(&parse_flags(

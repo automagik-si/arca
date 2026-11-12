@@ -282,8 +282,16 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 /// directory or symlink at `path` is refused and left alone. A socket that answers is a live server and is refused; a
 /// socket that refuses connections is stale and is replaced; any other connect error fails the start.
 pub async fn serve_unix(router: Router, path: &Path) -> io::Result<()> {
+    serve_unix_bound(router, path, || {}).await
+}
+
+/// [`serve_unix`], calling `bound` once: after this process holds the socket at `path`, and before it serves a request.
+/// A start that is refused (a live server on the path, something other than a socket there) never calls it, so what
+/// `bound` publishes is true of this process's own listener.
+pub async fn serve_unix_bound(router: Router, path: &Path, bound: impl FnOnce()) -> io::Result<()> {
     clear_stale_socket(path)?;
     let (listener, uid) = bind_staged(path)?;
+    bound();
     let listener = OwnerListener {
         listener,
         uid,

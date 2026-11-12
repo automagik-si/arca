@@ -281,3 +281,88 @@ fn link_rejects_public_state_directory_with_exit_two() {
     );
     assert!(!dir.join("secret.key").exists());
 }
+
+/// Whether `child` still runs.
+fn alive(child: &mut std::process::Child) -> bool {
+    child.try_wait().unwrap().is_none()
+}
+
+#[test]
+fn a_running_link_survives_token_reload_and_token_revoke_on_its_own_config() {
+    use std::os::unix::fs::PermissionsExt;
+    let arca = || std::process::Command::new(env!("CARGO_BIN_EXE_arca"));
+    let temp = Temp::new();
+    let config = temp.config();
+    let state = temp.0.join("state");
+    State::new(&state).unwrap();
+    // A token to revoke later, minted before anything runs.
+    let tokens = temp.0.join("tokens");
+    fs::create_dir(&tokens).unwrap();
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).unwrap();
+    let minted = arca()
+        .args([
+            "token",
+            "mint",
+            "--scope",
+            "viewer",
+            "--id",
+            "link-test-1",
+            "--out",
+        ])
+        .arg(temp.0.join("link-test-1.secret"))
+        .args(["--config", &config])
+        .output()
+        .unwrap();
+    assert!(minted.status.success(), "{minted:?}");
+
+    // The node's own link, on the node's config. No node runs, so both commands look for the node by its command line,
+    // and the link's command line names `serve` and this config too.
+    let mut link = arca()
+        .args(["link", "serve", "--config", &config])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !state.join("status.json").exists() {
+        assert!(
+            alive(&mut link),
+            "the link exited before publishing its status"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the link publishes its status"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let reload = arca()
+        .args(["token", "reload", "--config", &config])
+        .output()
+        .unwrap();
+    let after_reload = alive(&mut link);
+    let revoke = arca()
+        .args(["token", "revoke", "link-test-1", "--config", &config])
+        .output()
+        .unwrap();
+    let after_revoke = alive(&mut link);
+    link.kill().unwrap();
+    link.wait().unwrap();
+
+    assert!(after_reload, "token reload did not signal the link");
+    assert_eq!(reload.status.code(), Some(1), "{reload:?}");
+    assert!(
+        String::from_utf8_lossy(&reload.stderr)
+            .starts_with("arca: no node runs on this config, so nothing was reloaded."),
+        "{reload:?}"
+    );
+    assert!(after_revoke, "token revoke did not signal the link");
+    assert!(revoke.status.success(), "{revoke:?}");
+    let answer: Value = serde_json::from_slice(&revoke.stdout).unwrap();
+    assert_eq!(answer["revoked"], json!(true));
+    assert_eq!(
+        answer["reloadSignalled"],
+        json!(false),
+        "no node was there to signal"
+    );
+}

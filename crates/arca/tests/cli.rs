@@ -1362,6 +1362,10 @@ fn a_command_that_writes_starts_a_node_or_calls_a_peer_reads_no_default_and_no_v
     let cases: Vec<(Vec<&str>, String)> = vec![
         (vec!["serve"], required("serve starts a node")),
         (
+            vec!["token", "reload"],
+            required("token reload signals a node"),
+        ),
+        (
             vec!["adopt", "status", "--instance", "svc1", "--json"],
             required("adopt changes a node"),
         ),
@@ -1504,6 +1508,7 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
         "  Only a command that reads a node takes them; one that writes to a node, starts one or calls a peer takes the flag alone.",
         "  call --peer <name> <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]",
         "  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] (--config <file> | --hash-dir <dir>)",
+        "  token reload --config <file> (the running node reads its tokens again)",
         "  serve --config <file>",
     ] {
         assert!(
@@ -1530,7 +1535,7 @@ fn a_mistyped_command_action_or_flag_is_answered_with_the_closest_known_one() {
         ),
         (
             &["token", "rotate"],
-            "arca: that is not a token action: it is one of mint, revoke\n",
+            "arca: that is not a token action: it is one of mint, revoke, reload\n",
         ),
         (
             &["adopt"],
@@ -1614,10 +1619,10 @@ fn a_token_file_that_is_not_there_says_so_and_how_to_mint_one_the_node_will_read
     let scratch = Scratch::new("token-absent");
     let home = installed_home(&scratch, Some(&config(&scratch, &scratch.at("incus.sock"))));
     let installed = format!("{}/.config/arca", home.display());
-    // What every mint advice ends with: the node reads tokens at its start or on SIGHUP, and the command that sends it.
+    // What every mint advice ends with: the node reads tokens at its start or on SIGHUP, and the command that has a
+    // running node read them, for this node's own config.
     let reload = format!(
-        "A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: kill -HUP $(cat {}/serve.pid)",
-        scratch.at("state").display()
+        "A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: arca token reload --config {installed}/node.json"
     );
     // The installer's own path is named, since nobody typed it, and the mint writes to it, so no flag is needed after.
     let out = arca()
@@ -2254,4 +2259,195 @@ fn while_another_program_holds_the_ports_other_loopback_address_the_page_is_clos
     );
     let summary = rig.shim.stop().expect("stop the shim");
     assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
+}
+
+/// A config whose state directory exists, so a test can put a pid file in it.
+fn config_with_state(scratch: &Scratch) -> (PathBuf, PathBuf) {
+    let state = scratch.at("state");
+    fs::create_dir(&state).expect("the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let path = write_config(
+        scratch,
+        "node.json",
+        &config(scratch, &scratch.at("incus.sock")),
+    );
+    (path, state)
+}
+
+#[test]
+fn token_reload_with_no_node_on_the_config_says_so_and_exits_non_zero() {
+    let scratch = Scratch::new("reload-none");
+    let (config_path, _state) = config_with_state(&scratch);
+    let out = arca()
+        .args(["token", "reload", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_text(&out));
+    assert!(out.stdout.is_empty(), "nothing is claimed on stdout");
+    assert_eq!(
+        stderr_text(&out),
+        format!(
+            "arca: no node runs on this config, so nothing was reloaded. A node reads its tokens when it starts: arca serve --config {}\n",
+            config_path.display()
+        )
+    );
+}
+
+#[test]
+fn token_reload_never_signals_the_stranger_a_stale_pid_file_names() {
+    let scratch = Scratch::new("reload-stale");
+    let (config_path, state) = config_with_state(&scratch);
+    // A node crashed and left its pid file; the pid now belongs to another program of this user. SIGHUP would end it.
+    let mut stranger = Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("a stranger process");
+    fs::write(state.join("serve.pid"), format!("{}\n", stranger.id())).expect("the stale pid file");
+    let out = arca()
+        .args(["token", "reload", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let alive = stranger.try_wait().expect("poll the stranger").is_none();
+    let _ = stranger.kill();
+    let _ = stranger.wait();
+    assert!(alive, "the stranger was not signalled");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_text(&out));
+    assert!(
+        stderr_text(&out)
+            .starts_with("arca: no node runs on this config, so nothing was reloaded."),
+        "{}",
+        stderr_text(&out)
+    );
+}
+
+#[test]
+fn a_program_that_only_names_arcas_words_is_never_taken_for_the_node() {
+    use std::os::unix::process::CommandExt;
+    let scratch = Scratch::new("reload-lookalike");
+    let (config_path, _state) = config_with_state(&scratch);
+    // The config's token directory, for the token the revoke below removes.
+    token_dir(&scratch, "tokens");
+    let minted = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "look-1", "--out",
+        ])
+        .arg(scratch.at("look-1.secret"))
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    assert_eq!(minted.status.code(), Some(0), "{}", stderr_text(&minted));
+
+    // A program of this user that is called arca and has `serve` and `--config <this config>` among its arguments, but
+    // whose command is not `serve`: a shell that reads its input until the test lets go of it.
+    let mut lookalike = Command::new("sh")
+        .arg0("arca")
+        .args(["-c", "while read -r line; do :; done", "serve", "--config"])
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("the look-alike");
+    let reload = arca()
+        .args(["token", "reload", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let after_reload = lookalike.try_wait().expect("poll").is_none();
+    let revoke = arca()
+        .args(["token", "revoke", "look-1", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let after_revoke = lookalike.try_wait().expect("poll").is_none();
+    let _ = lookalike.kill();
+    let _ = lookalike.wait();
+
+    assert!(after_reload, "token reload did not signal the look-alike");
+    assert_eq!(reload.status.code(), Some(1), "{}", stderr_text(&reload));
+    assert!(
+        stderr_text(&reload)
+            .starts_with("arca: no node runs on this config, so nothing was reloaded."),
+        "{}",
+        stderr_text(&reload)
+    );
+    assert!(after_revoke, "token revoke did not signal the look-alike");
+    assert_eq!(revoke.status.code(), Some(0), "{}", stderr_text(&revoke));
+    let answer: Value = serde_json::from_slice(&revoke.stdout).expect("the revoke's answer");
+    assert_eq!(answer["reloadSignalled"], json!(false));
+}
+
+#[test]
+fn a_node_that_does_not_catch_sighup_yet_is_never_signalled_and_is_called_starting() {
+    use std::os::unix::process::CommandExt;
+    let scratch = Scratch::new("reload-starting");
+    let (config_path, _state) = config_with_state(&scratch);
+    // The config's token directory, for the token the revoke below removes.
+    token_dir(&scratch, "tokens");
+    let minted = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "start-1", "--out",
+        ])
+        .arg(scratch.at("start-1.secret"))
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    assert_eq!(minted.status.code(), Some(0), "{}", stderr_text(&minted));
+
+    // A process that is everything the check asks of a node: this user's, called arca, with the command line
+    // `arca serve --config <this config>`. But SIGHUP is at its default, as it is in a node that has only just started,
+    // so the signal would end it. `xargs` waits on its input, which the test holds open, and runs nothing.
+    let mut starting = Command::new("xargs")
+        .arg0("arca")
+        .args(["serve", "--config"])
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the starting node's stand-in");
+    let pid = starting.id();
+    let reload = arca()
+        .args(["token", "reload", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let after_reload = starting.try_wait().expect("poll").is_none();
+    let revoke = arca()
+        .args(["token", "revoke", "start-1", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run the binary");
+    let after_revoke = starting.try_wait().expect("poll").is_none();
+    let _ = starting.kill();
+    let _ = starting.wait();
+
+    assert!(
+        after_reload,
+        "token reload did not signal the starting node"
+    );
+    assert_eq!(reload.status.code(), Some(1), "{}", stderr_text(&reload));
+    assert!(reload.stdout.is_empty(), "nothing is claimed on stdout");
+    assert_eq!(
+        stderr_text(&reload),
+        format!(
+            "arca: the node on this config (pid {pid}) is still starting; nothing was signalled. Run this again in a moment\n"
+        )
+    );
+    assert!(
+        after_revoke,
+        "token revoke did not signal the starting node"
+    );
+    assert_eq!(revoke.status.code(), Some(0), "{}", stderr_text(&revoke));
+    let answer: Value = serde_json::from_slice(&revoke.stdout).expect("the revoke's answer");
+    assert_eq!(answer["reloadSignalled"], json!(false));
+    assert_eq!(
+        stderr_text(&revoke),
+        format!(
+            "arca: the node on this config (pid {pid}) is still starting, so it was not signalled, and it may have read the token before this revoke. Run this in a moment to be sure: arca token reload --config {}\n",
+            config_path.display()
+        )
+    );
 }
