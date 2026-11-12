@@ -510,6 +510,14 @@ impl Said {
 
     fn ok(&self) -> &Said {
         assert_eq!(self.code, Some(0), "init failed:\n{}", self.all());
+        // Nothing it printed reads as a redirection to a shell: a value the person fills in is a word in capitals.
+        for line in self.all().lines() {
+            assert!(
+                !line.contains('<') && !line.contains('>'),
+                "a printed line a shell would read as a redirection: {line:?}\n{}",
+                self.all()
+            );
+        }
         self
     }
 
@@ -650,7 +658,7 @@ fn init_takes_an_installed_node_to_one_that_changes_things_only_after_a_yes_and_
         .says("It is for a machine where every account, and every agent that shares its network, is trusted")
         .says("check that `arca status` says the page is open")
         .says(&format!(
-            "To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>, then open http://localhost:{0}/approve in its browser.",
+            "To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open http://localhost:{0}/approve in its browser.",
             node.port
         ))
         .says("If ssh warns that it could not bind the port, close it")
@@ -835,7 +843,7 @@ fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks
         .says("from an image the token names, remove a database's record, password and links, and use the Omni verbs.")
         .never_says("This node holds tenants")
         .says(&format!(
-            "To take one away first: arca token revoke <id> --config {}",
+            "To take one away first: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
             node.config.display()
         ))
         .says("Let Arca make changes on this machine: what is proposed after your approval, and directly for the tokens named above? [y/N]")
@@ -866,7 +874,7 @@ fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks
     assert_eq!(
         said.report(5)[1],
         format!(
-            "NOT every change waits for you: these tokens change things directly, with no card and no passkey: doctor-1 (doctor). To take one away: arca token revoke <id> --config {}",
+            "NOT every change waits for you: these tokens change things directly, with no card and no passkey: doctor-1 (doctor). To take one away: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
             node.config.display()
         ),
         "{}",
@@ -1466,7 +1474,7 @@ fn status_gives_one_next_step_for_the_first_passkey_and_it_depends_on_whether_th
         [
             format!("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config {config}, and type it on the page, {page}. Until one is trusted, nothing can be approved."),
             format!(
-                "      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} <this machine>, then open {page} there.",
+                "      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{0}:127.0.0.1:{0} THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open {page} there.",
                 node.port
             ),
             "      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain.".to_string(),
@@ -1526,7 +1534,7 @@ fn status_names_a_token_that_changes_things_without_the_page_and_does_not_say_ea
     );
     assert!(
         text.contains(&format!(
-            "To take one away: arca token revoke <id> --config {}",
+            "To take one away: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
             node.config.display()
         )),
         "{text}"

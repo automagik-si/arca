@@ -162,7 +162,7 @@ pub(crate) fn security(cfg: &NodeConfig, config: &Path, tokens: &DirectTokens) -
                 lines.push(format!("  - {caution}"));
             }
             lines.push(format!(
-                "  - To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>, then open {origin}/approve in its browser. If ssh warns that it could not bind the port, close it: another port will not work, since the page's address names this one."
+                "  - To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open {origin}/approve in its browser. If ssh warns that it could not bind the port, close it: another port will not work, since the page's address names this one."
             ));
         } else {
             lines.push(format!(
@@ -366,7 +366,7 @@ pub(crate) fn enrol_step(url: &str, config: &str, screen: bool) -> String {
         .and_then(arca_approval::localhost_origin_port)
     {
         step.push_str(&format!(
-            "\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} <this machine>, then open {url} there.\n      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain."
+            "\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:{port}:127.0.0.1:{port} THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open {url} there.\n      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain."
         ));
     }
     step
@@ -626,7 +626,7 @@ mod tests {
             false,
         );
         assert!(
-            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json, and type it on the page, http://localhost:7471/approve. Until one is trusted, nothing can be approved.\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve there.\n      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain."),
+            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json, and type it on the page, http://localhost:7471/approve. Until one is trusted, nothing can be approved.\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open http://localhost:7471/approve there.\n      A phone cannot open this page: that needs the node reachable under a name, on a tailnet or a domain."),
             "{text}"
         );
         assert!(text.ends_with(MORE), "{text}");
@@ -730,7 +730,7 @@ mod tests {
             "ops (operator)".to_string(),
         ]));
         assert!(
-            text.contains("Changes: on. What an assistant proposes waits for the owner's approval with a passkey. NOT every change does: these tokens change things directly, with no card and no passkey: doctor-1 (doctor), ops (operator). To take one away: arca token revoke <id> --config /home/u/.config/arca/node.json\nApproval page: none\n"),
+            text.contains("Changes: on. What an assistant proposes waits for the owner's approval with a passkey. NOT every change does: these tokens change things directly, with no card and no passkey: doctor-1 (doctor), ops (operator). To take one away: arca token revoke TOKEN_ID --config /home/u/.config/arca/node.json, with its id in place of TOKEN_ID\nApproval page: none\n"),
             "{text}"
         );
         assert!(!text.contains("Each one waits"), "{text}");
@@ -839,8 +839,8 @@ mod tests {
             "NOT every change waits for you. This node has 1 token(s) that may change things directly,".to_string(),
             "    ops (doctor)".to_string(),
             "create a database".to_string(),
-            format!("To take one away first: arca token revoke <id> --config {}", path.display()),
-            "To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve in its browser. If ssh warns that it could not bind the port, close it".to_string(),
+            format!("To take one away first: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID", path.display()),
+            "To open it from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open http://localhost:7471/approve in its browser. If ssh warns that it could not bind the port, close it".to_string(),
             "A phone cannot open this page. Approving from a phone needs the node reachable under a name, on a tailnet or a domain".to_string(),
             "check that `arca status` says the page is open".to_string(),
         ] {

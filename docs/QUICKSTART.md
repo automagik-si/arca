@@ -46,7 +46,7 @@ to run their services.
   anything. It never runs `sudo`, it refuses to run as root, and it writes only in your home directory.
 - **It installs one named release**, the one its own `ARCA_VERSION` line names, at `~/.local/bin/arca`. Each release
   sets that line to its own version.
-  `sh install.sh --version <version>` names another; without it, an older release is never put over a newer program.
+  `sh install.sh --version VERSION` names another release; without it, an older release is never put over a newer program.
   The program is checked against that release's `SHA256SUMS`. That catches a download that was damaged or cut short. It
   does not catch a release that was tampered with, because the checksums come from the same release.
 - **It writes the quickstart's config and mints one `viewer` token**, only where there is no config. The config opens

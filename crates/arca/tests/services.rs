@@ -3256,7 +3256,7 @@ fn service_create_names_the_missing_entrypoint_script_and_how_it_gets_there() {
         "the refusal names the file it looked for and where it belongs: {message}"
     );
     assert!(
-        message.contains("for a template Arca ships, `arca templates install --config <file>`"),
+        message.contains("for a template Arca ships, `arca templates install --config CONFIG_FILE` (this node's config in place of CONFIG_FILE)"),
         "the one-step install is offered for shipped templates only: {message}"
     );
     assert!(

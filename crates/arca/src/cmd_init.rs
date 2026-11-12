@@ -271,7 +271,7 @@ impl Node<'_> {
         // does not answer for a token that would change things with no card and no passkey: that takes a person.
         if !nothing_to_write && self.flags.switch("yes") && !direct.none() {
             return Err(Failure::Refused(format!(
-                "init changed nothing: --yes does not answer for {}, which would then change things without your approval. Run it again without --yes and answer yourself, or take such tokens away first (arca token revoke <id> --config {})",
+                "init changed nothing: --yes does not answer for {}, which would then change things without your approval. Run it again without --yes and answer yourself, or take such tokens away first (arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID)",
                 match direct {
                     DirectTokens::Read(_) => "the tokens named above",
                     DirectTokens::Unread(_) => "tokens it could not read",
@@ -294,7 +294,7 @@ impl Node<'_> {
                     )
                 {
                     return Err(Failure::Refused(
-                        "init changed nothing: name the service network with --service-cidr <a.b.c.0/24> and run it again"
+                        "init changed nothing: name the service network with --service-cidr A.B.C.0/24 (a free network's numbers in place of A.B.C) and run it again"
                             .to_string(),
                     ));
                 }
@@ -545,7 +545,7 @@ impl Node<'_> {
                 })
                 .ok_or_else(|| {
                     Failure::Refused(
-                        "init changed nothing: none of the networks it tries (10.47.0.0/24 to 10.47.255.0/24) is free on this machine. Name one with --service-cidr <a.b.c.0/24>"
+                        "init changed nothing: none of the networks it tries (10.47.0.0/24 to 10.47.255.0/24) is free on this machine. Name one with --service-cidr A.B.C.0/24 (a free network's numbers in place of A.B.C)"
                             .to_string(),
                     )
                 }),
@@ -794,7 +794,7 @@ impl DirectTokens {
                 "No token of this node may do more than look and propose, so every change waits for your passkey.".to_string()
             }
             Self::Read(tokens) => format!(
-                "NOT every change waits for you: these tokens change things directly, with no card and no passkey: {}. To take one away: arca token revoke <id> --config {}",
+                "NOT every change waits for you: these tokens change things directly, with no card and no passkey: {}. To take one away: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
                 tokens.join(", "),
                 config.display()
             ),
@@ -838,7 +838,7 @@ impl DirectTokens {
                     );
                 }
                 lines.push(format!(
-                    "To take one away first: arca token revoke <id> --config {}",
+                    "To take one away first: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
                     config.display()
                 ));
                 lines
@@ -862,7 +862,7 @@ impl DirectTokens {
                 "Changes: on. Each one waits for the owner's approval with a passkey: no token of this node may do more than look and propose".to_string()
             }
             Self::Read(tokens) => format!(
-                "Changes: on. What an assistant proposes waits for the owner's approval with a passkey. NOT every change does: these tokens change things directly, with no card and no passkey: {}. To take one away: arca token revoke <id> --config {}",
+                "Changes: on. What an assistant proposes waits for the owner's approval with a passkey. NOT every change does: these tokens change things directly, with no card and no passkey: {}. To take one away: arca token revoke TOKEN_ID --config {}, with its id in place of TOKEN_ID",
                 tokens.join(", "),
                 config.display()
             ),
@@ -948,7 +948,7 @@ fn unread_sources(
     }
     if yes {
         return Err(Failure::Runtime(format!(
-            "init changed nothing: it could not read {what}, so it cannot tell which network is free, and it does not guess. Name one you know to be free: --service-cidr <a.b.c.0/24> goes on with what could be read"
+            "init changed nothing: it could not read {what}, so it cannot tell which network is free, and it does not guess. Name one you know to be free: --service-cidr A.B.C.0/24 (a free network's numbers in place of A.B.C) goes on with what could be read"
         )));
     }
     if ask(&format!(
@@ -957,7 +957,7 @@ fn unread_sources(
         return Ok(());
     }
     Err(Failure::Refused(
-        "init changed nothing: name a network you know to be free with --service-cidr <a.b.c.0/24>"
+        "init changed nothing: name a network you know to be free with --service-cidr A.B.C.0/24 (a free network's numbers in place of A.B.C)"
             .to_string(),
     ))
 }
@@ -1381,7 +1381,7 @@ mod tests {
         let text =
             enabled_report(&answered, &nobody(), LOCAL, Path::new(CONFIG), false, false).join("\n");
         assert!(
-            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json, and type it on the page, http://localhost:7471/approve. Until one is trusted, nothing can be approved.\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 <this machine>, then open http://localhost:7471/approve there.\n      A phone cannot open this page:"),
+            text.contains("Next: enrol your passkey: this terminal has no screen, so print the setup code with: arca setup-code --config /home/u/.config/arca/node.json, and type it on the page, http://localhost:7471/approve. Until one is trusted, nothing can be approved.\n      To open the page from your own computer: ssh -o ExitOnForwardFailure=yes -L localhost:7471:127.0.0.1:7471 THIS_MACHINE (this machine's name or address in place of THIS_MACHINE), then open http://localhost:7471/approve there.\n      A phone cannot open this page:"),
             "{text}"
         );
         // A page under a name of the owner's own: no ssh line and no word about a phone, screen or not.
@@ -1423,7 +1423,7 @@ mod tests {
         let lines = enabled_report(&answered, &direct, LOCAL, Path::new(CONFIG), false, true);
         assert_eq!(
             lines[1],
-            "NOT every change waits for you: these tokens change things directly, with no card and no passkey: ops (doctor), boss (operator). To take one away: arca token revoke <id> --config /home/u/.config/arca/node.json"
+            "NOT every change waits for you: these tokens change things directly, with no card and no passkey: ops (doctor), boss (operator). To take one away: arca token revoke TOKEN_ID --config /home/u/.config/arca/node.json, with its id in place of TOKEN_ID"
         );
         assert!(
             !lines

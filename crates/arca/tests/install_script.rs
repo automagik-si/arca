@@ -163,6 +163,19 @@ impl Run {
 
     fn ok(&self) -> &Run {
         assert_eq!(self.code, Some(0), "the installer failed:\n{}", self.all());
+        self.pastes()
+    }
+
+    /// Nothing it printed reads as a redirection to a shell: a value the person fills in is a word in capitals. The
+    /// words of `arca init`, which it relays, are held to the same.
+    fn pastes(&self) -> &Run {
+        for line in self.all().lines() {
+            assert!(
+                !line.contains('<') && !line.contains('>'),
+                "the installer printed a line a shell would read as a redirection: {line:?}\n{}",
+                self.all()
+            );
+        }
         self
     }
 
@@ -572,7 +585,7 @@ fn says_the_door(machine: &Machine, run: &Run, port: u16) {
         json!({ "mcpServers": { "arca": {
             "type": "http",
             "url": url,
-            "headers": { "Authorization": "Bearer <token>" }
+            "headers": { "Authorization": "Bearer TOKEN" }
         } } })
     );
 }
@@ -655,7 +668,7 @@ fn is_the_quickstarts_node(machine: &Machine, run: &Run, version: &str) {
         None => {
             run.says("door      none: this program is older than")
                 .says("listen.tailnet")
-                .says("Authorization: Bearer <the content of")
+                .says("\"Authorization: Bearer TOKEN\", with the content of")
                 .never_says("claude mcp add");
         }
     }
@@ -1754,7 +1767,7 @@ fn no_incus_access_is_refused_with_its_reason_and_nothing_is_changed() {
         socket(&machine).display()
     ))
     .says("Install Incus and start it")
-    .says("INCUS_SOCKET=<path>");
+    .says("with its path in place of SOCKET_PATH: INCUS_SOCKET=SOCKET_PATH sh install.sh");
 
     // A socket this user may not open. The superuser may open anything, so there is nothing to refuse for it.
     if uid() != "0" {

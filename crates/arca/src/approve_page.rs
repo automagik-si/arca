@@ -141,7 +141,8 @@ struct PageState {
 }
 
 /// What the page shows for the terminal's command when `serve` gave it none: the command, with the config to fill in.
-const SETUP_COMMAND: &str = "arca setup-code --config <this node's config>";
+const SETUP_COMMAND: &str =
+    "arca setup-code --config CONFIG_FILE (this node's config file in place of CONFIG_FILE)";
 
 /// Why the page is closed right now, in words for the owner, or `None` while it is open. `serve` gives the page of this
 /// machine alone a gate that is closed while the node does not hold both loopback addresses of the page's port.

@@ -425,7 +425,7 @@ const enc = new TextEncoder();
 const NO_PASSKEY = "No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows.";
 // The page of a node on its own machine is served over plain http at localhost; every other page is https.
 // The line that prints the setup code on a terminal of the machine that runs Arca, as that machine's node names it.
-const SETUP_COMMAND = document.body.dataset.setupCommand || "arca setup-code --config <this node's config>";
+const SETUP_COMMAND = document.body.dataset.setupCommand || "arca setup-code --config CONFIG_FILE (this node's config file in place of CONFIG_FILE)";
 for (const node of document.querySelectorAll(".setup-command")) node.textContent = SETUP_COMMAND;
 const LOCAL_PAGE = location.protocol === "http:";
 if (LOCAL_PAGE) {

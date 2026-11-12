@@ -652,7 +652,7 @@ pub fn command(argv: &[String]) -> Result<Option<Value>, Failure> {
         [import, plan, rest @ ..] if import == "import" && plan == "plan" => rest,
         _ => {
             return Err(Failure::Usage(
-                "service takes one action: arca service import plan --name <service>".to_string(),
+                "service takes one action: arca service import plan --name SERVICE_NAME, with the service's name in place of SERVICE_NAME".to_string(),
             ));
         }
     };
