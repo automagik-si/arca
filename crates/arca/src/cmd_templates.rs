@@ -58,6 +58,11 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik.json",
         "30f523e2af19a201266be29b8d38f331b19fce42af698d047ddbc4286c14f7ab",
     ),
+    // 0.15.0: named its image after the DSH lockfile and harness, not every input its build pins.
+    (
+        "automagik.json",
+        "6c6998f5908b506131de8d1ce617db34d70aa70c7b1baecc738600ecc55d7b20",
+    ),
     // 0.8.0 and 0.9.0.
     (
         "automagik-workspace.json",
