@@ -2229,7 +2229,7 @@ fn the_build_lockfile_pins_every_package_by_registry_integrity_and_runs_no_insta
     let lock: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("package-lock.json")).unwrap())
             .unwrap();
-    assert_eq!(pkg["dependencies"]["@deepseek-ai/dsh"], "0.2.1-rc.3");
+    assert_eq!(pkg["dependencies"]["@deepseek-ai/dsh"], "0.2.2-rc.2");
     assert_eq!(pkg["dependencies"]["pnpm"], "11.28.5");
     for (path, package) in lock["packages"].as_object().unwrap() {
         if path.is_empty() {

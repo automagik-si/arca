@@ -3,7 +3,7 @@
   "private": true,
   "description": "DeepSeek Harness and pnpm for the automagik image (templates/automagik.build.sh); package-lock.json pins every package",
   "dependencies": {
-    "@deepseek-ai/dsh": "0.2.1-rc.3",
+    "@deepseek-ai/dsh": "0.2.2-rc.2",
     "pnpm": "11.28.5"
   }
 }
