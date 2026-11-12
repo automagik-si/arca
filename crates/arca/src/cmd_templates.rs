@@ -53,7 +53,7 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
-    // 0.1.0-alpha.7 to 0.13.0: before its image's name carried the harness it is built with.
+    // 0.1.0-alpha.7 to 0.14.0: before its image's name carried the inputs it is built from.
     (
         "automagik.json",
         "30f523e2af19a201266be29b8d38f331b19fce42af698d047ddbc4286c14f7ab",

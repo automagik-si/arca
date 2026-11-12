@@ -44,6 +44,13 @@ its Approve button are drawn in the alert colour.
 - Merge PR 105: the guide's table says one step lets a node change things, and what that step leaves to the config
 - Merge set E fix into set F
 - Merge PR 65 commit 2: the Automagik image is built with DSH 0.2.2-rc.2
+The `automagik` image is now named after everything it is built from: `arca-automagik-<commit>-dsh-<harness>`, 12 hex
+digits of the Automagik commit and of a SHA-256 over the build's other inputs (the build script with its Node, Tailscale
+and plugin pins, the DSH package files, and the dashboard's port). Before, it was named after the commit alone, so a
+build with a newer DSH or any other new pin was refused as an image that exists, and the old one had to be deleted by
+hand. The template changed, so an installed copy nobody edited is brought up to date by the upgrade. A node's image of
+before stays, and a service made from it keeps running; a new `automagik` service is refused with the new name until
+that image is built with `templates/automagik.build.sh`.
 
 ## 0.14.0 (2026-11-12)
 
