@@ -10,12 +10,13 @@ Write under this comment only what a reader needs beyond those lines; the releas
 A stop of an Automagik workspace or of a GitLab runner pool could be lost inside the machine. The script that
 keeps each of them took its stop signal in the same process that did its work, and bash 5.2 can drop such a signal
 without running the script's stop (seen under bash 5.2.21; Debian 13's own bash, which these machines run, was not
-tested). A workspace's keeper then ran on until systemd killed it, a minute and a half later. A pool went on taking
-jobs until systemd killed everything in it: GitLab Runner was never told to stop taking jobs, the jobs that ran got
-no time to finish, and their containers stayed until the pool started again. Both scripts now take the signal in a
-process that does nothing else and stops the work from there, so the stop cannot be dropped. A machine made from an
-earlier release keeps the script it was made with. The GitHub runner pool's script has the same fault; its change is
-a separate one.
+tested). A workspace's keeper then ran on until systemd killed it, a minute and a half later. A pool's controller
+was killed too, after two and a half minutes, and that kill reached the controller alone: GitLab Runner and the
+jobs' containers are Docker's, not the service's. So GitLab Runner was never told to stop taking jobs and went on
+taking them, with no controller, until Docker stopped it as the machine went down or the pool's next start removed
+it. Both scripts now take the signal in a process that does nothing else and stops the work from there, so the stop
+cannot be dropped. A machine made from an earlier release keeps the script it was made with. The GitHub runner
+pool's script has the same fault; its change is a separate one.
 
 A card that waits while the node is upgraded to the version that binds a template's content (a create, or a database
 made from the template) is now refused when its approval is submitted, and the approval is not used; propose it

@@ -1080,9 +1080,11 @@ hold() {
 }
 
 # The controller: everything the pool does, as a child of run_pool. It takes no signal. It learns of a stop from the
-# line, and then stops in its own order. A SIGTERM sent to this process itself, which systemd never does under the
-# unit's KillMode=mixed, ends it at once with no stop. It does not ignore the signal instead, because whatever it
-# starts would ignore it too, and `timeout` could then no longer end the lookup it is set over.
+# line, and then stops in its own order. A SIGTERM sent to this process itself ends it at once with no stop; nothing
+# sends one under the unit's KillMode=mixed. It does not ignore the signal instead, because everything it starts
+# would then ignore it too. GNU's `timeout`, which Debian ships, still ends its program then (it sets its own handler
+# first), but the `timeout` of uutils does not: on a machine that has that one, as the machines these scripts are
+# tested on do, a program under a time limit would run on.
 pool() {
   trap - TERM INT
   load_settings || {

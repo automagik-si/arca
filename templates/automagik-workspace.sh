@@ -957,7 +957,8 @@ run_workspace() {
       KEEPER=''
       # A child that a SIGTERM ended (128 + 15) was stopped with the keeper. systemd signals every process of the
       # service, and it may reach the child before the keeper: that is a stop that was asked for, and the keeper ends
-      # as it does for its own signal.
+      # as it does for its own signal. A SIGTERM that reaches the child alone, with no stop asked, is told the same
+      # way, as a stop, and systemd then starts the keeper again.
       [ "$ended" = 143 ] || exit "$ended"
       STOP=1
     fi
