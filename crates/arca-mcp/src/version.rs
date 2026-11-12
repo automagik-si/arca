@@ -3,9 +3,12 @@
 //! The server keeps no session, so nothing an earlier request said is remembered. A request is *modern* when it declares
 //! `2026-07-28`, in the `MCP-Protocol-Version` header or in `params._meta`; a modern request must then carry everything
 //! that version requires, or it is refused with `400`. A request is *legacy* when it declares `2025-11-25` or one of the
-//! two versions before it, or declares nothing at all: it is answered exactly as the server answered before it knew
-//! `2026-07-28`. `initialize` is the legacy handshake, so it is legacy whatever else it says. A version that is none of
-//! these is refused with the list of the two the server supports.
+//! two versions before it, or declares nothing at all: its method is then answered as it was before the server knew
+//! `2026-07-28`, with no field added. `initialize` is the legacy handshake, so it is legacy whatever else it says.
+//!
+//! What a request declares is judged whichever version it is. A version that is none of these, in the header or in
+//! `params._meta`, is refused with the list of the two the server supports. So is a version header sent twice or not
+//! readable, and a header and a body that name different versions. Before `2026-07-28` the server read neither place.
 
 use std::borrow::Cow;
 
@@ -117,10 +120,22 @@ pub fn era(mirrors: &Mirrors<'_>, method: &str, params: &Value) -> Result<Era, R
     if in_header.is_none() {
         headers.push("the MCP-Protocol-Version header is missing".to_string());
     }
-    check(&mut headers, "Mcp-Method", mirrors.method, Some(method));
+    check(
+        &mut headers,
+        "Mcp-Method",
+        mirrors.method,
+        Some(method),
+        Encoding::Never,
+    );
     if method == "tools/call" {
         let name = params.get("name").and_then(Value::as_str);
-        check(&mut headers, "Mcp-Name", mirrors.name, name);
+        check(
+            &mut headers,
+            "Mcp-Name",
+            mirrors.name,
+            name,
+            Encoding::Allowed,
+        );
     }
     let mut body = Vec::new();
     if in_body.is_none() {
@@ -153,15 +168,33 @@ fn known(version: &str) -> bool {
     SUPPORTED_VERSIONS.contains(&version) || TOLERATED_VERSIONS.contains(&version)
 }
 
+/// Whether a header's value may arrive as `=?base64?…?=`. A tool's name may; a method is always sent as it is, so that
+/// whoever reads the header alone sees the method the server runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    Allowed,
+    Never,
+}
+
 /// Adds to `faults` what is wrong with the header `name`, which must say what the body says.
-fn check(faults: &mut Vec<String>, name: &str, sent: Mirrored<'_>, in_body: Option<&str>) {
+fn check(
+    faults: &mut Vec<String>,
+    name: &str,
+    sent: Mirrored<'_>,
+    in_body: Option<&str>,
+    encoding: Encoding,
+) {
     match sent {
         Mirrored::Absent => faults.push(format!("the {name} header is missing")),
         Mirrored::Unreadable => {
             faults.push(format!("the {name} header is not one readable value"));
         }
         Mirrored::Value(value) => {
-            if plain(value).as_deref() != in_body {
+            let said = match encoding {
+                Encoding::Allowed => plain(value),
+                Encoding::Never => Some(Cow::Borrowed(value)),
+            };
+            if said.as_deref() != in_body {
                 faults.push(format!("the {name} header does not match the body"));
             }
         }
@@ -189,7 +222,11 @@ fn mismatch(message: String) -> Refusal {
     }
 }
 
+/// The most characters of the version a caller asked for that an error says back to it.
+const REQUESTED_MAX_CHARS: usize = 64;
+
 fn unsupported(requested: &str) -> Refusal {
+    let requested: String = requested.chars().take(REQUESTED_MAX_CHARS).collect();
     Refusal {
         code: UNSUPPORTED_PROTOCOL_VERSION,
         message: "unsupported protocol version".to_string(),
@@ -389,6 +426,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_method_header_is_never_read_as_encoded() {
+        // base64 of `tools/list`: the encoding is a tool name's alone, so here it is one more value that does not match.
+        let params = json!({ "_meta": modern_meta() });
+        let mirrors = modern("=?base64?dG9vbHMvbGlzdA==?=", Mirrored::Absent);
+        let refusal = era(&mirrors, "tools/list", &params).expect_err("refused");
+        assert_eq!(refusal.code, HEADER_MISMATCH);
+    }
+
+    #[test]
+    fn the_version_an_error_says_back_is_cut_at_64_characters() {
+        let long = "9".repeat(500);
+        let mirrors = Mirrors {
+            version: Mirrored::Value(&long),
+            ..Mirrors::default()
+        };
+        let refusal = era(&mirrors, "tools/list", &json!({})).expect_err("refused");
+        assert_eq!(refusal.data.expect("data")["requested"], "9".repeat(64));
+        // A version in the body may be any text: the cut falls between characters, never inside one.
+        let params = json!({ "_meta": { VERSION_META: "é".repeat(500) } });
+        let refusal = era(&Mirrors::default(), "tools/list", &params).expect_err("refused");
+        assert_eq!(refusal.data.expect("data")["requested"], "é".repeat(64));
+    }
+
+    #[test]
+    fn a_version_in_the_body_is_judged_without_any_header() {
+        let none = Mirrors::default();
+        let not_text = json!({ "_meta": { VERSION_META: 20260728 } });
+        assert_eq!(
+            era(&none, "tools/list", &not_text)
+                .expect_err("refused")
+                .code,
+            INVALID_PARAMS
+        );
+        // A legacy version there changes nothing: the request is a legacy one.
+        let legacy = json!({ "_meta": { VERSION_META: PROTOCOL_VERSION } });
+        assert_eq!(era(&none, "tools/list", &legacy), Ok(Era::Legacy));
     }
 
     #[test]

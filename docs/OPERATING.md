@@ -669,13 +669,25 @@ same in both versions, and so are the tokens and their scopes.
   only `_meta` is incomplete. A method the server does not have is `404` with `-32601`; `ping` is one of them, since
   this version dropped it. An unknown tool is `-32602`.
 - **`2025-11-25`.** A request with the header `MCP-Protocol-Version: 2025-11-25`, or with no version header at all, is
-  answered exactly as before `2026-07-28` existed: `initialize` answers `2025-11-25` whatever version it asks for,
-  `ping` answers, no result gains a field, and a JSON-RPC error travels inside a `200`. The header values `2025-06-18`
-  and `2025-03-26` are served the same way.
+  a legacy request. `initialize` answers `2025-11-25` whatever version it asks for, `ping` answers, and `tools/list`
+  and `tools/call` return what they returned before `2026-07-28` existed: no result gains a field, and a JSON-RPC
+  error travels inside a `200`. The header values `2025-06-18` and `2025-03-26` are served the same way.
 - **`server/discover`** answers `supportedVersions` (`2026-07-28`, `2025-11-25`), the capabilities and the server's name.
   It answers a request that names no version too, so one `curl` with a token shows what a node speaks.
-- **Any other version** in the header is `400` with the error `-32022`, whose `data` holds `supported` and `requested`.
+- **Any other version**, in the header or in `params._meta`, is `400` with the error `-32022`. Its `data` holds
+  `supported` and `requested`, the latter cut at 64 characters.
 - A `GET` on `/mcp` is `405`. A `Mcp-Session-Id` header is ignored, and the server never issues one.
+- The token is checked first, as always: a request without a valid one is `401` whatever version it declares.
+
+Before `2026-07-28` the server read no version from a request. It now does, so four answers changed for a client that
+never names `2026-07-28`. A client that follows `2025-11-25` meets none of them except the first, and only if it asks:
+
+- `server/discover` answers. It used to be an unknown method, `-32601`.
+- A version header that names a version the server does not know is `400` with `-32022`. It used to be ignored.
+- A version header sent twice, or with a value that is not visible ASCII, is `400` with `-32020`. It used to be ignored.
+- A version in `params._meta` (the key `io.modelcontextprotocol/protocolVersion`) is read even when no header is sent.
+  An unknown one is `400` with `-32022`, one that is not a string is `400` with `-32602`, and one that differs from
+  the header, or names `2026-07-28` with no header, is `400` with `-32020`. It used to be ignored.
 
 `arca call` and the canvas are clients of this same route and still speak `2025-11-25`: `initialize`, then `tools/call`.
 That is deliberate and needs no action. Both are released together with the server they call, the server answers

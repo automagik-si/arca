@@ -1,6 +1,8 @@
 //! The two protocol versions on the one route: a `2026-07-28` request that declares itself, a `2025-11-25` client that
-//! opens with `initialize`, and a client that sends neither a version header nor `initialize`. The last two must get,
-//! byte for byte, what they got before the server knew `2026-07-28`.
+//! opens with `initialize`, and a client that sends neither a version header nor `initialize`. The last two get from
+//! `initialize`, `ping`, `tools/list` and `tools/call` what they got before the server knew `2026-07-28`: the same fields
+//! and none added. What did change for them is pinned here too: `server/discover` answers, and a version the server
+//! does not know is refused.
 
 mod common;
 
@@ -182,6 +184,42 @@ fn discover_needs_a_token_like_every_request() {
         &rpc(json!(1), "server/discover", json!({})),
     );
     assert_eq!(reply.status, 401);
+}
+
+#[test]
+fn a_request_with_no_token_is_401_whatever_version_it_declares() {
+    let fx = Fixture::start("version-noauth");
+    let mut call = status_call();
+    call["_meta"] = meta();
+    let cases = [
+        // A complete 2026-07-28 call, its name encoded.
+        (
+            vec![
+                header("MCP-Protocol-Version", MODERN),
+                header("Mcp-Method", "tools/call"),
+                header("Mcp-Name", "=?base64?YXJjYV9zdGF0dXM=?="),
+            ],
+            call,
+        ),
+        // Requests the server refuses with 400 once it knows the caller.
+        (
+            vec![header("MCP-Protocol-Version", "1900-01-01")],
+            status_call(),
+        ),
+        (vec![header("MCP-Protocol-Version", MODERN)], status_call()),
+    ];
+    for (headers, params) in cases {
+        let mut stream = connect_unix(&fx.socket);
+        let reply = post(&mut stream, &headers, &rpc(json!(1), "tools/call", params));
+        assert_eq!(reply.status, 401, "{headers:?}");
+        assert_eq!(reply.header("www-authenticate"), Some("Bearer"));
+        assert!(
+            reply.body.is_empty(),
+            "the version is not looked at before the token: {}",
+            reply.body
+        );
+    }
+    assert_eq!(fx.ran(), 0);
 }
 
 // A 2026-07-28 request.
@@ -370,6 +408,40 @@ fn a_tool_call_whose_name_header_is_missing_or_wrong_is_400_and_never_runs() {
 }
 
 #[test]
+fn an_encoded_method_header_is_400_header_mismatch() {
+    let fx = Fixture::start("encoded-method");
+    // base64 of `tools/list`. Only a tool's name may be sent encoded.
+    let headers = [
+        header("MCP-Protocol-Version", MODERN),
+        header("Mcp-Method", "=?base64?dG9vbHMvbGlzdA==?="),
+    ];
+    let reply = fx.send(&headers, "tools/list", json!({ "_meta": meta() }));
+    refused(&reply, -32020);
+}
+
+#[test]
+fn a_version_named_only_in_the_body_is_judged_too() {
+    let fx = Fixture::start("body-version");
+    let unknown = json!({ "_meta": { VERSION_META: "1900-01-01" } });
+    let error = refused(&fx.bare("tools/list", unknown), -32022);
+    assert_eq!(error["data"]["requested"], "1900-01-01");
+    let not_text = json!({ "_meta": { VERSION_META: 20260728 } });
+    refused(&fx.bare("tools/list", not_text), -32602);
+}
+
+#[test]
+fn the_version_an_error_says_back_is_cut_short() {
+    let fx = Fixture::start("long-version");
+    let reply = fx.send(
+        &[header("MCP-Protocol-Version", &"9".repeat(500))],
+        "tools/list",
+        json!({}),
+    );
+    let error = refused(&reply, -32022);
+    assert_eq!(error["data"]["requested"], "9".repeat(64));
+}
+
+#[test]
 fn a_modern_request_for_a_method_the_server_lacks_is_404_method_not_found() {
     let fx = Fixture::start("modern-404");
     // `ping` left the protocol with 2026-07-28, so there it is one more unknown method.
@@ -397,7 +469,7 @@ fn an_unknown_tool_is_invalid_params_for_a_modern_request_and_unchanged_for_any_
 
 // A 2025-11-25 client, and a client that declares nothing.
 
-/// The result of a request exactly as the server answered it before it knew `2026-07-28`: no field was added.
+/// A tool list with the fields the server gave it before it knew `2026-07-28`, and none added.
 fn assert_legacy_list(reply: &Reply) {
     assert_eq!(reply.status, 200, "{}", reply.body);
     let body = reply.json();
