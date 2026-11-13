@@ -420,11 +420,19 @@ fn a_template_changed_after_the_card_was_shown_is_not_created() {
         assert!(has_entry(&rig, &format!("service-{name}")), "{template}");
     }
     // The service is made from the script that was read with the template: the one the fingerprint names.
-    assert!(
-        rig.entry("service-of-scripted")["entrypoint"]
-            .as_str()
-            .is_some_and(|entrypoint| entrypoint.contains("exec /usr/local/bin/app --serve")),
-    );
+    let stored = rig.entry("service-of-scripted")["entrypoint"].clone();
+    let encoded = stored
+        .as_str()
+        .and_then(|entrypoint| entrypoint.split("echo${IFS}").nth(1))
+        .and_then(|rest| rest.split('|').next())
+        .expect("the script travels as base64");
+    let script = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64")
+    };
+    assert_eq!(script, b"exec /usr/local/bin/app --serve");
 }
 
 #[test]

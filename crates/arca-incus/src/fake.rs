@@ -48,7 +48,10 @@
 //! from those profiles and its own keys, as Incus expands them. A project reads its own profiles when its config sets
 //! `features.profiles` to `"true"`, and the default project's otherwise; its `default` profile is empty until a test adds one
 //! ([`FakeIncus::add_profile`]). `/1.0/instances/<i>/state` serves the status and each NIC's MAC and IPv4, and a PUT there starts,
-//! stops or restarts the instance as an operation. An instance create with `start: true` starts it too. A graceful stop can be made to
+//! stops or restarts the instance as an operation. An instance create with `start: true` starts it too. Any start, a restart's
+//! included, is refused when the container's init would get other arguments than its `oci.entrypoint` names, by the chain
+//! Incus 7.6 runs and the split of the node's liblxc ([`lxc_execute_argv`], [`FakeIncus::set_lxc_split`]), and when an
+//! `environment.*` value holds a line break or a carriage return, as Incus 7.6 refuses either at start. A graceful stop can be made to
 //! outlast its timeout ([`FakeIncus::hang_stop`]), and then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`,
 //! else its `volatile.<dev>.hwaddr`, else one the start
 //! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
@@ -207,6 +210,8 @@ struct Shared {
     reject_patch: Mutex<Vec<String>>,
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
+    /// How the node's liblxc splits a container's command, which decides whether its entrypoint starts.
+    lxc_split: Mutex<LxcSplit>,
     host_interfaces: Mutex<Vec<HostInterface>>,
     host_netmasks: Mutex<BTreeMap<IpAddr, u8>>,
     operations_unreadable: AtomicBool,
@@ -414,6 +419,7 @@ impl Shared {
             reject_patch: Mutex::new(Vec::new()),
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
+            lxc_split: Mutex::new(LxcSplit::default()),
             host_interfaces: Mutex::new(Vec::new()),
             host_netmasks: Mutex::new(BTreeMap::new()),
             operations_unreadable: AtomicBool::new(false),
@@ -572,6 +578,13 @@ impl FakeIncus {
     /// Fail the start phase of create, leaving the new instance stopped.
     pub fn fail_instance_start_on_create(&self) {
         self.shared.fail_create_start.store(true, Ordering::SeqCst);
+    }
+
+    /// Makes the fake a node whose liblxc splits a container's command as `split` says, [`LxcSplit::Spaces`] until a
+    /// test sets it. Every start after this, a create's with `start: true` among them, is refused when the container's
+    /// init would get other arguments than its `oci.entrypoint` names ([`lxc_execute_argv`]).
+    pub fn set_lxc_split(&self, split: LxcSplit) {
+        *lock(&self.shared.lxc_split) = split;
     }
 
     /// Makes PATCH requests matching this path prefix fail with 400 before changing any object.
@@ -1821,6 +1834,197 @@ impl Store {
     }
 }
 
+/// How a node's liblxc splits `lxc.execute.cmd` (or `lxc.init.cmd`) into the argument list a container's init gets.
+/// Incus 7.6 is built against either, and the fake starts an instance as a node with the one
+/// [`FakeIncus::set_lxc_split`] chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LxcSplit {
+    /// liblxc 5.0 and older, 4.0 among them (`split_init_cmd`, `strtok_r` on `" "`): on single spaces alone, every
+    /// quote kept inside its word. The fake's default, since an entrypoint that starts here starts on 6.0 too.
+    #[default]
+    Spaces,
+    /// liblxc 6.0 and later (`lxc_string_split_quoted`): on whitespace, and a word that starts with `'` or `"` runs to
+    /// the same quote, which is dropped, with no escapes. A quote later in a word is a plain character.
+    Quoted,
+}
+
+/// The whitespace `lxcEncodeCmd` quotes a word for, and what C's `isspace` is in liblxc's quoted split.
+const LXC_WHITESPACE: [char; 6] = [' ', '\t', '\n', '\u{b}', '\u{c}', '\r'];
+
+/// The argument list Incus means by an `oci.entrypoint`: the value split as go-shellquote's `Split` does it. Words
+/// part at spaces, tabs and line breaks; `'...'` is literal; in `"..."` a backslash escapes only `$`, a backtick,
+/// `"`, `\` and a line break, and stays before anything else; outside quotes a backslash escapes the next character.
+/// A backslash before a line break goes with it. An unterminated quote or escape is an error, as in go-shellquote.
+pub fn oci_entrypoint_args(entrypoint: &str) -> Result<Vec<String>, String> {
+    let chars: Vec<char> = entrypoint.chars().collect();
+    let separator = |c: char| matches!(c, ' ' | '\t' | '\n');
+    let mut words = Vec::new();
+    let mut at = 0;
+    loop {
+        match (chars.get(at), chars.get(at + 1)) {
+            (None, _) => return Ok(words),
+            (Some(&c), _) if separator(c) => at += 1,
+            (Some('\\'), None) => return Err("Unterminated backslash-escape".to_string()),
+            (Some('\\'), Some('\n')) => at += 2,
+            _ => {
+                let mut word = String::new();
+                while let Some(&c) = chars.get(at) {
+                    at += 1;
+                    match c {
+                        c if separator(c) => break,
+                        '\'' => {
+                            let close = chars[at..]
+                                .iter()
+                                .position(|&c| c == '\'')
+                                .ok_or("Unterminated single-quoted string")?;
+                            word.extend(&chars[at..at + close]);
+                            at += close + 1;
+                        }
+                        '"' => loop {
+                            let Some(&c) = chars.get(at) else {
+                                return Err("Unterminated double-quoted string".to_string());
+                            };
+                            at += 1;
+                            match (c, chars.get(at)) {
+                                ('"', _) => break,
+                                ('\\', Some('\n')) => at += 1,
+                                ('\\', Some(&escaped @ ('$' | '`' | '"' | '\\'))) => {
+                                    word.push(escaped);
+                                    at += 1;
+                                }
+                                (c, _) => word.push(c),
+                            }
+                        },
+                        '\\' => match chars.get(at) {
+                            None => return Err("Unterminated backslash-escape".to_string()),
+                            Some('\n') => at += 1,
+                            Some(&escaped) => {
+                                word.push(escaped);
+                                at += 1;
+                            }
+                        },
+                        c => word.push(c),
+                    }
+                }
+                words.push(word);
+            }
+        }
+    }
+}
+
+/// The argument list a container's init gets from its `oci.entrypoint` on a node whose liblxc splits as `split`
+/// says, by the chain Incus 7.6 runs (`driver_lxc.go`): the value split by [`oci_entrypoint_args`], each argument
+/// encoded again for LXC by `lxcEncodeCmd` (as it is when it is not empty, holds no whitespace and starts with no
+/// quote; else inside `"` when it holds no `"`; else inside `'` when it holds no `'`), the words joined with spaces
+/// into `lxc.execute.cmd`, and that split by liblxc. An argument with both quotes and whitespace, or with both quotes
+/// and a quote at its start, cannot be encoded: the error is Incus's own, and the start fails with it.
+pub fn lxc_execute_argv(entrypoint: &str, split: LxcSplit) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    for arg in oci_entrypoint_args(entrypoint)? {
+        if !arg.is_empty() && !arg.contains(LXC_WHITESPACE) && !arg.starts_with(['\'', '"']) {
+            words.push(arg);
+        } else if !arg.contains('"') {
+            words.push(format!("\"{arg}\""));
+        } else if !arg.contains('\'') {
+            words.push(format!("'{arg}'"));
+        } else {
+            return Err(format!("Unable to encode command argument: {arg:?}"));
+        }
+    }
+    Ok(lxc_split_cmd(&words.join(" "), split))
+}
+
+/// The argument list liblxc makes of `lxc.execute.cmd`. [`LxcSplit::Spaces`] is `strtok_r` on `" "`, which skips
+/// empty words. [`LxcSplit::Quoted`] is `lxc_string_split_quoted`: C's whitespace parts words, a word that starts
+/// with a quote ends at the same quote (dropped, with no space needed after it), and one that never closes is dropped.
+fn lxc_split_cmd(cmd: &str, split: LxcSplit) -> Vec<String> {
+    if split == LxcSplit::Spaces {
+        return cmd
+            .split(' ')
+            .filter(|word| !word.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    let mut argv = Vec::new();
+    let mut rest = cmd;
+    loop {
+        rest = rest.trim_start_matches(LXC_WHITESPACE);
+        let Some(first) = rest.chars().next() else {
+            return argv;
+        };
+        if first == '"' || first == '\'' {
+            let body = &rest[1..];
+            let Some(end) = body.find(first) else {
+                return argv;
+            };
+            argv.push(body[..end].to_string());
+            rest = &body[end + 1..];
+        } else {
+            let end = rest.find(LXC_WHITESPACE).unwrap_or(rest.len());
+            argv.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+    }
+}
+
+/// Why a container cannot start on a node whose liblxc splits as `split` says. Incus 7.6 refuses a line break or a
+/// carriage return in any LXC config value at start, so in an `environment.*` value too, which its create lets a
+/// carriage return through. Its `oci.entrypoint` may not split or encode, or init would get other arguments than it
+/// names: a real node then fails the start with Incus's own error, or runs the program with the wrong arguments, so
+/// it fails at once; the fake refuses the start in every case. `None` when the start works, and for a virtual machine,
+/// which Incus does not start through LXC.
+fn start_refusal(instance: &Value, split: LxcSplit) -> Option<String> {
+    if instance.get("type").and_then(Value::as_str) == Some("virtual-machine") {
+        return None;
+    }
+    let config = instance.get("config")?.as_object()?;
+    if config.iter().any(|(key, value)| {
+        key.starts_with("environment.") && value.as_str().is_some_and(|v| v.contains(['\r', '\n']))
+    }) {
+        return Some(
+            "Failed to set LXC config: lxc.environment.runtime: Key and value cannot contain line breaks".to_string(),
+        );
+    }
+    let entrypoint = config.get("oci.entrypoint")?.as_str()?;
+    let meant = match oci_entrypoint_args(entrypoint) {
+        Ok(args) => args,
+        Err(reason) => return Some(reason),
+    };
+    let got = match lxc_execute_argv(entrypoint, split) {
+        Ok(argv) => argv,
+        Err(reason) => return Some(reason),
+    };
+    (got != meant).then(|| {
+        let by = match split {
+            LxcSplit::Spaces => {
+                "liblxc 5.0 and older split lxc.execute.cmd on spaces and keep the quotes"
+            }
+            LxcSplit::Quoted => {
+                "liblxc 6.0 and later split lxc.execute.cmd on whitespace and quotes"
+            }
+        };
+        format!("the container's init would get {got:?} for oci.entrypoint {meant:?}: {by}")
+    })
+}
+
+/// What Incus 7.6 refuses in an instance's config whatever the project: a line break in `oci.entrypoint` or `oci.cwd`
+/// ("OCI configuration values cannot contain line breaks"), and in any `environment.*` value. Incus 7.5.1 had the
+/// environment check only.
+fn line_break_refusal(config: &Map<String, Value>) -> Option<&'static str> {
+    config.iter().find_map(|(key, value)| {
+        let text = value.as_str()?;
+        if key.starts_with("environment.") && text.contains('\n') {
+            Some("Environment variables cannot contain line breaks")
+        } else if matches!(key.as_str(), "oci.entrypoint" | "oci.cwd")
+            && text.contains(['\r', '\n'])
+        {
+            Some("OCI configuration values cannot contain line breaks")
+        } else {
+            None
+        }
+    })
+}
+
 /// Creates an object from a POST. A `config` is refused when the switch names this path.
 fn create(
     shared: &Shared,
@@ -1886,6 +2090,12 @@ fn create(
         && let Some(reason) = store.restricted_nic(&project, &body)
     {
         return (403, String::new(), error_envelope(403, reason));
+    }
+    if kind == "instance"
+        && let Some(config) = body.get("config").and_then(Value::as_object)
+        && let Some(reason) = line_break_refusal(config)
+    {
+        return (400, String::new(), error_envelope(400, reason));
     }
     if kind == "instance"
         && let Some(config) = body.get("config").and_then(Value::as_object)
@@ -2028,6 +2238,11 @@ fn create(
                     Err((400, "Failed starting instance".into())),
                 );
             }
+            if let Some(reason) = start_refusal(&store.objects[at].body, *lock(&shared.lxc_split)) {
+                store.objects[at].body["status"] = json!("Stopped");
+                store.expand(at, false);
+                return answered(shared, store, kind, "POST", Err((400, reason)));
+            }
             store.start(at, shared.counter.fetch_add(1, Ordering::SeqCst));
         } else {
             store.expand(at, false);
@@ -2128,6 +2343,9 @@ fn put(
     let Some(config) = text_map("config") else {
         return bad("config must be a map of text");
     };
+    if let Some(reason) = line_break_refusal(&config) {
+        return bad(reason);
+    }
     let devices = match body.get("devices") {
         None => Map::new(),
         Some(Value::Object(devices)) if devices.values().all(Value::is_object) => devices.clone(),
@@ -2205,6 +2423,12 @@ fn patch(
             store.restricted_low_level(&store.objects[index].project.clone(), config)
     {
         return (403, String::new(), error_envelope(403, &reason));
+    }
+    if store.objects[index].kind == "instance"
+        && let Some(config) = changes.get("config").and_then(Value::as_object)
+        && let Some(reason) = line_break_refusal(config)
+    {
+        return (400, String::new(), error_envelope(400, reason));
     }
     let mut changes = changes;
     if store.objects[index].kind == "acl" {
@@ -3215,6 +3439,11 @@ fn change_state(
     match text_in(&sent, "action").as_str() {
         "start" if running => bad("The instance is already running"),
         "start" => {
+            if let Some(reason) =
+                start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
+            {
+                return answered(shared, store, "instance", "PUT", Err((400, reason)));
+            }
             // A container the fake gave an id map starts from the next one, or from the one it last ran with. A
             // rebuild takes the next one away, so a container that was rebuilt before it ever started has neither:
             // Incus refuses its start, and leaves an empty map behind.
@@ -3275,6 +3504,14 @@ fn change_state(
             if hung.is_some_and(|forced_too| forced_too || !force) {
                 let failure = Err((400, "Failed shutting down instance".to_string()));
                 return answered(shared, store, "instance", "PUT", failure);
+            }
+            // Its stop half is done when its start half cannot start the entrypoint: it ends stopped.
+            if let Some(reason) =
+                start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
+            {
+                store.objects[index].body["status"] = json!("Stopped");
+                lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));
+                return answered(shared, store, "instance", "PUT", Err((400, reason)));
             }
             store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
             // The instance that exits after a start exits after a restart too.
@@ -3433,6 +3670,135 @@ fn move_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|word| word.to_string()).collect()
+    }
+
+    /// go-shellquote's `Split`, as Incus reads `oci.entrypoint`: quotes, escapes, an escaped line break, an empty word.
+    #[test]
+    fn an_entrypoint_splits_as_go_shellquote_splits_it() {
+        assert_eq!(
+            oci_entrypoint_args(" /bin/sh  -ec 'a b'\t\"c \\\"d\\\" \\x\" e\\ f ''").unwrap(),
+            words(&["/bin/sh", "-ec", "a b", "c \"d\" \\x", "e f", ""])
+        );
+        assert_eq!(
+            oci_entrypoint_args("one\\\n two\\\nthree").unwrap(),
+            words(&["one", "twothree"])
+        );
+        assert_eq!(oci_entrypoint_args("a\rb").unwrap(), words(&["a\rb"]));
+        for broken in ["'open", "\"open", "end\\", "\"a\\"] {
+            assert!(oci_entrypoint_args(broken).is_err(), "{broken:?}");
+        }
+    }
+
+    /// The form a script word had before it lost its spaces, as a node logged it in `lxc.execute.cmd`: liblxc 6.0 and
+    /// later give init the entrypoint's words, liblxc 5.0 and older split the script on its spaces, so `sh -c` gets
+    /// `'__arca_script=$(printf` and `$0` is `%s`.
+    #[test]
+    fn a_script_word_with_spaces_reaches_init_whole_only_on_liblxc_6() {
+        let entrypoint = "/bin/sh -ec '__arca_script=$(printf %s QUJD | base64 -d) && eval \"$__arca_script\"' nats";
+        let meant = oci_entrypoint_args(entrypoint).unwrap();
+        assert_eq!(meant.len(), 4);
+        assert_eq!(
+            lxc_execute_argv(entrypoint, LxcSplit::Quoted).unwrap(),
+            meant
+        );
+        let old = lxc_execute_argv(entrypoint, LxcSplit::Spaces).unwrap();
+        assert_eq!(old[2], "'__arca_script=$(printf");
+        assert_eq!(old[3], "%s");
+    }
+
+    /// A word with no whitespace that starts with no quote is written bare, so both liblxc splits give it back, a
+    /// quote later in it included; an empty word or one that starts with a quote is quoted, and only liblxc 6.0 and
+    /// later take the quotes off again.
+    #[test]
+    fn only_a_bare_word_reaches_init_alike_on_both_liblxc_splits() {
+        let bare = "/bin/sh -ec '__arca_script=$(echo${IFS}QUJD|base64${IFS}-d)&&eval${IFS}\"$__arca_script\"' nats";
+        let meant = oci_entrypoint_args(bare).unwrap();
+        assert_eq!(
+            meant[2],
+            "__arca_script=$(echo${IFS}QUJD|base64${IFS}-d)&&eval${IFS}\"$__arca_script\""
+        );
+        for split in [LxcSplit::Spaces, LxcSplit::Quoted] {
+            assert_eq!(lxc_execute_argv(bare, split).unwrap(), meant, "{split:?}");
+        }
+        for (entrypoint, quoted) in [
+            ("/x ''", words(&["/x", ""])),
+            ("/x \"'a'\"", words(&["/x", "'a'"])),
+            ("/x '\"a'", words(&["/x", "\"a"])),
+            ("/x 'a\tb'", words(&["/x", "a\tb"])),
+        ] {
+            assert_eq!(
+                oci_entrypoint_args(entrypoint).unwrap(),
+                quoted,
+                "{entrypoint}"
+            );
+            assert_eq!(
+                lxc_execute_argv(entrypoint, LxcSplit::Quoted).unwrap(),
+                quoted,
+                "{entrypoint}"
+            );
+            assert_ne!(
+                lxc_execute_argv(entrypoint, LxcSplit::Spaces).unwrap(),
+                quoted,
+                "{entrypoint}"
+            );
+        }
+    }
+
+    /// A word with whitespace and both kinds of quote cannot be encoded, as postgres-autopg's raw script could not:
+    /// Incus fails the start with its own error, on either liblxc.
+    #[test]
+    fn a_word_with_both_quotes_and_a_space_cannot_be_encoded() {
+        let entrypoint = "/bin/sh -ec 'RULE='\\''host app'\\''; echo \"$X\"' x";
+        for split in [LxcSplit::Spaces, LxcSplit::Quoted] {
+            let error = lxc_execute_argv(entrypoint, split).unwrap_err();
+            assert!(
+                error.starts_with("Unable to encode command argument"),
+                "{error}"
+            );
+        }
+        assert!(
+            start_refusal(
+                &json!({ "config": { "oci.entrypoint": entrypoint } }),
+                LxcSplit::Quoted
+            )
+            .is_some_and(|reason| reason.starts_with("Unable to encode command argument"))
+        );
+    }
+
+    /// liblxc's two splits. 4.0 and 5.0: single spaces alone, empty words skipped, quotes and tabs kept. 6.0 and
+    /// later: C's whitespace only (not a no-break space), a closing quote ends its word with no space after it, a
+    /// quote later in a word is plain, and a quoted word that never closes is dropped.
+    #[test]
+    fn each_liblxc_split_is_liblxcs_own() {
+        assert_eq!(
+            lxc_split_cmd("a  \"b c\"\tx'y", LxcSplit::Spaces),
+            words(&["a", "\"b", "c\"\tx'y"])
+        );
+        assert_eq!(
+            lxc_split_cmd("a \"b c\"d x'y 'e", LxcSplit::Quoted),
+            words(&["a", "b c", "d", "x'y"])
+        );
+        assert_eq!(
+            lxc_split_cmd("a\u{a0}b\u{b}c", LxcSplit::Quoted),
+            words(&["a\u{a0}b", "c"])
+        );
+    }
+
+    /// Incus 7.6 refuses a line break or a carriage return in any LXC config value at start, an environment value's too.
+    #[test]
+    fn a_start_is_refused_for_a_carriage_return_in_the_environment() {
+        let instance = json!({ "config": { "environment.A": "one\rtwo" } });
+        assert!(start_refusal(&instance, LxcSplit::Quoted).is_some());
+        let instance =
+            json!({ "config": { "environment.A": "one two", "oci.entrypoint": "/x y" } });
+        assert_eq!(start_refusal(&instance, LxcSplit::Spaces), None);
+        let machine =
+            json!({ "type": "virtual-machine", "config": { "environment.A": "one\rtwo" } });
+        assert_eq!(start_refusal(&machine, LxcSplit::Spaces), None);
+    }
 
     #[test]
     fn a_query_parameter_is_found_by_its_exact_key() {

@@ -3097,13 +3097,13 @@ fn entrypoint_with(
         return Err(TemplateError::refused("entrypoint: invalid length"));
     }
     let mut out = Vec::new();
-    for part in parts {
-        match part {
+    for (index, part) in parts.iter().enumerate() {
+        let text = match part {
             Value::String(text) => {
                 if text.len() > 16_384 || text.contains('\0') || text.contains("{{") {
                     return Err(TemplateError::refused("entrypoint: invalid argument"));
                 }
-                out.push(shell_quote(text));
+                text.clone()
             }
             Value::Object(object) => {
                 let file = object
@@ -3118,9 +3118,22 @@ fn entrypoint_with(
                 }
                 let script =
                     read(file).map_err(|error| script_unreadable(&template.name, file, &error))?;
-                out.push(shell_quote(script.trim_end_matches('\n')));
+                script.trim_end_matches('\n').to_string()
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),
+        };
+        // A word with whitespace in it, or one that starts with a quote, reaches liblxc 5.0 and older as other words.
+        let split_by_old_liblxc = text.contains([' ', '\t', '\u{b}', '\u{c}', '\n', '\r'])
+            || text.starts_with(['\'', '"']);
+        if split_by_old_liblxc && is_shell_script_argument(parts, index) {
+            out.push(shell_quote(&one_line_script(&text)));
+        } else if text.contains(['\n', '\r']) {
+            return Err(TemplateError::refused(
+                "entrypoint: an argument with a line break must be the script of a shell, as in \
+                 [\"/bin/sh\", \"-ec\", <script>, ...]: Incus refuses a line break anywhere in oci.entrypoint",
+            ));
+        } else {
+            out.push(shell_quote(&text));
         }
     }
     let joined = out.join(" ");
@@ -3128,6 +3141,41 @@ fn entrypoint_with(
         return Err(TemplateError::refused("entrypoint: too long"));
     }
     Ok(Some(joined))
+}
+
+/// Whether `parts[index]` is the script of a shell started as `sh -c <script>` (or `-ec`, `-eu -c` and the like): the
+/// one argument that Arca can carry whitespace, a line break or a leading quote in, because it can decode it again
+/// inside the shell.
+fn is_shell_script_argument(parts: &[Value], index: usize) -> bool {
+    let Some(flag) = index.checked_sub(1).and_then(|i| parts[i].as_str()) else {
+        return false;
+    };
+    let shell = parts[0].as_str().and_then(|s| s.rsplit('/').next());
+    matches!(shell, Some("sh" | "bash" | "ash" | "dash"))
+        && flag.len() > 1
+        && flag.starts_with('-')
+        && !flag.starts_with("--")
+        && flag.ends_with('c')
+        && flag[1..].bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// A shell script as one word that runs the same script. Incus 7.6 refuses a line break in `oci.entrypoint`, and
+/// liblxc 5.0 and older (which Incus 7.6 may link) split `lxc.execute.cmd` on spaces alone, keeping the quotes Incus
+/// puts round a word with whitespace, so the word has no whitespace either and does not start with a quote; liblxc
+/// 6.0 and later split it the same way, since a quote later in a word is a plain character to both. The script goes
+/// as base64 without wrapping, decoded by the image's own `base64` (busybox and coreutils both have it) and run by
+/// `eval` in the same shell, so `$0`, `$1` and the options (`-e`) are the script's own. Each `${IFS}` stands for a
+/// space: unquoted, the shell splits it into fields, so the words are `echo` and the text, `base64` and `-d`, `eval`
+/// and the script, as if typed. A failed decode ends the shell with its status and runs nothing. The text is the
+/// script's bytes exactly. This holds on Incus 7.3 and later, whose `lxcEncodeCmd` writes the word as it is; Incus 7.0
+/// to 7.2 wrote the command with `shellquote.Join`, which escapes the word's `$`, `(` and `|`, and the script does not
+/// run there.
+fn one_line_script(script: &str) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    format!(
+        "__arca_script=$(echo${{IFS}}{encoded}|base64${{IFS}}-d)&&eval${{IFS}}\"$__arca_script\""
+    )
 }
 
 /// Whether `file` is a plain file name, so an entrypoint script is read from the template directory and nowhere else.

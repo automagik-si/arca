@@ -43,7 +43,10 @@ pub use adopt::{
 #[cfg(feature = "write")]
 pub use assign::{DeviceAssigner, GpuChange, InstanceDevices, device_name, normalize_pci};
 pub use fake::{Appears, OpId};
-pub use fake::{FakeIncus, FakeState, RecordedRequest, WriteRecord};
+pub use fake::{
+    FakeIncus, FakeState, LxcSplit, RecordedRequest, WriteRecord, lxc_execute_argv,
+    oci_entrypoint_args,
+};
 #[cfg(feature = "write")]
 pub use import::{ImportRead, ImportTarget, ImportWriter, import_allowance};
 #[cfg(feature = "write")]

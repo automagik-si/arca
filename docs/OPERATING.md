@@ -748,7 +748,24 @@ script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgre
 `github-runner-pool`, `gitlab-runner-pool.sh` for both `gitlab-runner-pool` and `gitlab-runner-pool-large`,
 `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
-`service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
+`service_create` with the file it looked for (`templates/<name>`). Incus 7.6 refuses a line break anywhere in
+`oci.entrypoint`. From Incus 7.3 on, Incus splits the value as a shell would, quotes again each word that holds
+whitespace or starts with a quote, and hands the line to liblxc, which splits it once more: liblxc 6.0 and later honour
+a quote at the start of a word, while liblxc 5.0 and older (an Incus 7.6 build may link liblxc 4.0) split on spaces
+alone and keep the quotes inside the words. So the script of a shell, `["/bin/sh", "-ec", <script>, "name"]` (`sh`,
+`ash`, `dash` or `bash`, flags ending in `c`), that holds whitespace, lines or a leading quote is sent as one word with
+none of them, `__arca_script=$(echo${IFS}<base64>|base64${IFS}-d)&&eval${IFS}"$__arca_script"`, where each `${IFS}`
+stands for a space the shell splits on. The image's own `base64` decodes the script and `eval` runs it in that shell,
+so `$0`, `$1` and `-e` are as if the script had been passed whole, on either liblxc, on Incus 7.3 and later (Incus 7.0
+to 7.2 escape the word's `$`, `(` and `|`, and the script does not run there). The image therefore needs `sh` and
+`base64` (busybox and coreutils both have them), and as the joined entrypoint stays under 32,768 bytes, a script is
+about 24 KB at most. A line break in any other entrypoint argument is refused by `service_create` before anything is
+created. Any other argument goes to Incus as the template has it: one that is empty, holds whitespace or starts with a
+quote starts where liblxc is 6.0 or later, and on liblxc 5.0 or older the container is created and its start fails, so
+a template meant for every node keeps such words out of its entrypoint. A template `env` value goes as it is too:
+Incus refuses a line break in it at create, and Incus 7.6 a carriage return at the container's start. A service made by an
+earlier release from a script entrypoint keeps the entrypoint it was made with, which Incus 7.6 refuses at its start
+and at every update: remove it and create it again. A template whose `image` is `local:<alias>`
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.
