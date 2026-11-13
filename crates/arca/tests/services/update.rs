@@ -973,7 +973,7 @@ fn a_no_new_privileges_write_the_node_cannot_apply_leaves_the_record_as_it_was()
     rig.template("app", strict_app());
     rig.allow_low_level();
     // Incus refuses the instance's config write after the node saved the record.
-    rig.fake.set_reject_patch(&format!("/1.0/instances/app"));
+    rig.fake.set_reject_patch("/1.0/instances/app");
     let refused = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect_err("refused");
     let message = format!("{refused:?}");
     assert!(
