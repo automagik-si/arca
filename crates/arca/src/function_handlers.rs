@@ -650,6 +650,8 @@ impl ServiceHandler {
             kernel_access: None,
             destinations,
             function: Some(function),
+            follow: None,
+            follow_version: None,
         };
         let template = function::template(&config).ok_or_else(internal)?;
         config.source = crate::service::source(&template).map_err(service_template_error)?;

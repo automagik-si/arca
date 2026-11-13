@@ -550,6 +550,23 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     } else {
         None
     };
+    // The services that follow Automagik's releases are looked at on a timer of their own, as the sweep above is. It
+    // asks the network for nothing while no service follows. A timer that cannot start is said on the log.
+    if kernel_mode && cfg.kernel.service_cidr.is_some() {
+        let follower = Arc::new(crate::handlers::Follower::new(
+            kernel.clone(),
+            clock.clone(),
+            Arc::new(cfg.clone()),
+            crate::handlers::UpdateOptions::default(),
+            crate::handlers::FollowEdges::default(),
+        ));
+        if let Err(error) = crate::handlers::spawn_follower(
+            follower,
+            std::time::Duration::from_secs(cfg.follow.interval_seconds),
+        ) {
+            eprintln!("arca: the Automagik follower did not start: {error}");
+        }
+    }
     let action_slot = ActionSlot::default();
     let service_handlers = crate::handlers::service_handlers_with(
         kernel.clone(),

@@ -67,6 +67,30 @@ pub struct NodeConfig {
     /// page serves only its own proposals.
     #[serde(default)]
     pub approval: Option<ApprovalConfig>,
+    /// The follower of Automagik's releases: how often it looks. Absent, every ten minutes.
+    #[serde(default)]
+    pub follow: FollowConfig,
+}
+
+/// The `follow` key: the services that follow Automagik's releases are looked at on this timer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FollowConfig {
+    /// Seconds between two looks, 60 to 86400. 600 when absent.
+    #[serde(default = "default_follow_seconds")]
+    pub interval_seconds: u64,
+}
+
+impl Default for FollowConfig {
+    fn default() -> Self {
+        Self {
+            interval_seconds: default_follow_seconds(),
+        }
+    }
+}
+
+fn default_follow_seconds() -> u64 {
+    600
 }
 
 /// The `approval` key. Every list may be empty.
@@ -422,6 +446,8 @@ pub enum ConfigError {
     ScratchPrefix(String),
     /// The approval host is not a host name. The value is left out of the message.
     ApprovalHost,
+    /// `follow.intervalSeconds` is not from 60 to 86400.
+    FollowInterval,
     /// The approval origin is not an https origin with a host name and at most a non-443 port, nor the localhost origin.
     /// The value is left out.
     ApprovalOrigin,
@@ -502,6 +528,10 @@ impl fmt::Display for ConfigError {
             Self::ApprovalHost => write!(
                 f,
                 "approvalHost is refused: it must be a host name of letters, digits, dots and hyphens"
+            ),
+            Self::FollowInterval => write!(
+                f,
+                "follow.intervalSeconds is refused: it must be a whole number of seconds from 60 to 86400"
             ),
             Self::ApprovalOrigin => write!(
                 f,
@@ -615,6 +645,9 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
                 return Err(ConfigError::ScratchPrefix(name.clone()));
             }
         }
+    }
+    if !(60..=86_400).contains(&config.follow.interval_seconds) {
+        return Err(ConfigError::FollowInterval);
     }
     if let Some(host) = &config.approval_host
         && !host_name_ok(host)
@@ -1600,6 +1633,20 @@ mod tests {
         let unknown: Result<ApprovalConfig, _> =
             serde_json::from_value(serde_json::json!({ "trustOwnerKeys": [] }));
         assert!(unknown.is_err(), "an unknown key is refused");
+    }
+
+    #[test]
+    fn the_follower_looks_every_ten_minutes_unless_the_config_says_otherwise_from_60_to_86400() {
+        assert_eq!(config_with(None).follow.interval_seconds, 600);
+        let with = |seconds: u64| {
+            let mut config = config_with(None);
+            config.follow.interval_seconds = seconds;
+            check(&config)
+        };
+        assert_eq!(with(60), Ok(()));
+        assert_eq!(with(86_400), Ok(()));
+        assert_eq!(with(59), Err(ConfigError::FollowInterval));
+        assert_eq!(with(86_401), Err(ConfigError::FollowInterval));
     }
 
     #[test]
