@@ -3,8 +3,8 @@ use crate::{
     Status,
     guard::{Guard, Slot},
     mesh,
-    path::{self, Named, Prefer},
     pairing::{self, Request, Response, read_line, write_line},
+    path::{self, Named, Prefer},
     runtime,
 };
 use iroh::{

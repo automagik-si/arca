@@ -928,7 +928,15 @@ async fn a_named_address_is_dialled_and_reported_as_the_direct_path() {
     timeout(Duration::from_secs(20), async {
         let (a, b) = (Temp::new(), Temp::new());
         let port = free_port();
-        let host = node_with(&a, "host", Config { port: Some(port), ..Config::default() }).await;
+        let host = node_with(
+            &a,
+            "host",
+            Config {
+                port: Some(port),
+                ..Config::default()
+            },
+        )
+        .await;
         let named: std::net::SocketAddr = host.endpoint().bound_sockets()[0];
         assert_eq!(named.port(), port, "link.port fixes the bound port");
         let first = node(&b, "guest", false).await;
@@ -971,7 +979,10 @@ async fn a_named_address_that_does_not_answer_falls_back_to_the_recorded_one() {
         let paths = guest.paths().await;
         let path = paths.get("host").expect("the host has a path");
         let real = host.endpoint().bound_sockets()[0].to_string();
-        assert_eq!((path.via.as_str(), path.addr.as_deref(), path.named), ("direct", Some(real.as_str()), false));
+        assert_eq!(
+            (path.via.as_str(), path.addr.as_deref(), path.named),
+            ("direct", Some(real.as_str()), false)
+        );
         conn.close(0u32.into(), b"done");
         guest.shutdown().await;
         host.shutdown().await;
@@ -988,9 +999,16 @@ async fn without_the_keys_a_peer_with_no_address_cannot_be_dialled() {
         let first = node(&b, "guest", false).await;
         let guest = paired_and_restarted(&b, &a, &host, first, Config::default()).await;
         let result = timeout(Duration::from_secs(3), guest.connect("host", PAIR_ALPN)).await;
-        assert!(!matches!(result, Ok(Ok(_))), "no named address and no ticket: no path");
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "no named address and no ticket: no path"
+        );
         let paths = guest.paths().await;
-        assert!(paths.get("host").is_none_or(|p| p.via == "idle" && !p.named));
+        assert!(
+            paths
+                .get("host")
+                .is_none_or(|p| p.via == "idle" && !p.named)
+        );
         guest.shutdown().await;
         host.shutdown().await;
     })
@@ -1002,7 +1020,10 @@ async fn without_the_keys_a_peer_with_no_address_cannot_be_dialled() {
 fn config_refuses_bad_addresses_and_ports() {
     for (text, why) in [
         (r#"{"peers":{"host":["192.0.2.10"]}}"#, "no port"),
-        (r#"{"peers":{"host":["not-an-address:7000"]}}"#, "not an address"),
+        (
+            r#"{"peers":{"host":["not-an-address:7000"]}}"#,
+            "not an address",
+        ),
         (r#"{"peers":{"host":["192.0.2.10:0"]}}"#, "port zero"),
         (r#"{"peers":{"host":["0.0.0.0:7000"]}}"#, "unspecified"),
         (r#"{"peers":{"host":["224.0.0.1:7000"]}}"#, "multicast"),
@@ -1012,7 +1033,10 @@ fn config_refuses_bad_addresses_and_ports() {
         (r#"{"port":70000}"#, "port out of range"),
     ] {
         let refused = serde_json::from_str::<Config>(text).is_err()
-            || serde_json::from_str::<Config>(text).unwrap().check().is_err();
+            || serde_json::from_str::<Config>(text)
+                .unwrap()
+                .check()
+                .is_err();
         assert!(refused, "{why}: {text}");
     }
     let good: Config = serde_json::from_str(

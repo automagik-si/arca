@@ -103,7 +103,11 @@ impl PathSelector for Prefer {
 }
 
 /// The path in use for each paired peer, by peer name.
-pub(crate) async fn now(endpoint: &Endpoint, peers: &[Peer], named: &Named) -> BTreeMap<String, PathNow> {
+pub(crate) async fn now(
+    endpoint: &Endpoint,
+    peers: &[Peer],
+    named: &Named,
+) -> BTreeMap<String, PathNow> {
     let at = now_ms();
     let all = named.all();
     let mut out = BTreeMap::new();
@@ -177,7 +181,10 @@ mod tests {
         };
         let named = Named::new(&config);
         let base = EndpointAddr::new(id);
-        assert_eq!(named.dial("host", base.clone()), base.clone().with_ip_addr(addr));
+        assert_eq!(
+            named.dial("host", base.clone()),
+            base.clone().with_ip_addr(addr)
+        );
         assert_eq!(named.dial("other", base.clone()), base);
     }
 }

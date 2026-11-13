@@ -64,7 +64,8 @@ impl Config {
             return Err(Error::Config("link.port must be 1 to 65535"));
         }
         for (name, addrs) in &self.peers {
-            if name.is_empty() || name.chars().count() > 60 || name.chars().any(|c| c <= '\u{001f}') {
+            if name.is_empty() || name.chars().count() > 60 || name.chars().any(|c| c <= '\u{001f}')
+            {
                 return Err(Error::Config(
                     "link.peers names must contain 1 to 60 characters and no controls",
                 ));
