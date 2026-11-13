@@ -119,6 +119,8 @@ struct Ran {
     conf_mode: Option<u32>,
     server_args: Option<String>,
     store_made: bool,
+    /// Whether anything landed where the decoy NATS_CONF or NATS_STORE_DIR point (the script must read neither).
+    used_a_decoy: bool,
 }
 
 /// `nats.sh` as the template names it (`<shell> -ec <script> nats`), with `env` as its environment and a fake
@@ -139,6 +141,7 @@ fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
         work.join("data/jetstream"),
         work.join("args"),
     );
+    let (decoy_conf, decoy_store) = (work.join("decoy.conf"), work.join("decoy/jetstream"));
     let server = work.join("nats-server");
     fs::write(
         &server,
@@ -153,10 +156,11 @@ fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
         .args(&tail)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        // What the official image sets (NATS_SERVER is its version, 2.14.10) and names a script might read by mistake.
+        // What the official image sets (PATH and NATS_SERVER, its version: 2.14.10), and two names a script might read
+        // by mistake, as writable decoys, so a script that read them would get as far as its exec and fail there.
         .env("NATS_SERVER", "2.14.10")
-        .env("NATS_CONF", "/nonexistent/nats.conf")
-        .env("NATS_STORE_DIR", "/nonexistent/jetstream")
+        .env("NATS_CONF", &decoy_conf)
+        .env("NATS_STORE_DIR", &decoy_store)
         .env("ARCA_NATS_CONF", &conf)
         .env("ARCA_NATS_STORE_DIR", &store)
         .env("ARCA_NATS_SERVER", &server)
@@ -176,6 +180,7 @@ fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
             .map(|m| m.permissions().mode() & 0o777),
         server_args: fs::read_to_string(&args).ok(),
         store_made: store.is_dir(),
+        used_a_decoy: decoy_conf.exists() || decoy_store.exists(),
     };
     fs::remove_dir_all(&work).expect("the work dir goes");
     ran
@@ -259,6 +264,10 @@ fn the_script_writes_every_setting_the_design_names_and_starts_the_server_on_it_
         assert_eq!(ran.conf_mode, Some(0o600));
         assert!(!ran.out.contains(PASSWORD) && !ran.err.contains(PASSWORD));
         assert!(ran.store_made, "the store directory was made");
+        assert!(
+            !ran.used_a_decoy,
+            "{shell:?}: NATS_CONF or NATS_STORE_DIR was read"
+        );
     }
 }
 
@@ -290,6 +299,12 @@ fn the_store_is_under_the_volume_and_max_file_store_is_below_its_size() {
         )),
         "store_dir is under {}",
         data.path
+    );
+    // The tests start a fake server, so the default is pinned here: the image's install step moves the binary to
+    // /usr/local/bin/nats-server, and the image's own NATS_SERVER is its version, never a path, so it is not read.
+    assert!(
+        script.contains("SERVER=${ARCA_NATS_SERVER:-/usr/local/bin/nats-server}"),
+        "the server is the image's binary"
     );
     let conf = run(&good()).conf.unwrap();
     let max: u64 = conf

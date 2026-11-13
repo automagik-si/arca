@@ -1,6 +1,6 @@
 # The entrypoint of the nats service (templates/nats.json reads it in, put on one line by service::entrypoint, as
-# `sh -ec <it> nats`). It runs in the public nats:2.14-alpine image, as root, writes the server's configuration and then
-# execs the server. Every setting here is fixed; only what the environment gives changes the file:
+# `sh -ec <it> nats`). It runs in the public nats:2.14.10-alpine image, as root, writes the server's configuration and
+# then execs the server. Every setting here is fixed; only what the environment gives changes the file:
 # - NATS_DOMAIN (the service's name): the JetStream domain, and the server's name, which is unique within a domain;
 # - NATS_LEAF_PASSWORD (a secret the template makes): the password of the one user, `leaf`, that the leaf node listener
 #   accepts. It is letters, digits and . _ ~ - only, so it can go into a leaf's URL as it is.
