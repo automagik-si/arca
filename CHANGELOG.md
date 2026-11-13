@@ -7,6 +7,16 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A service made from `automagik-server` now follows Automagik's releases by itself: every 10 minutes (`follow.intervalSeconds`)
+the node reads Automagik's published record of its newest server image, and when it names another digest and a newer
+version than the service runs, moves the service with `service_update`, which keeps its data and puts the old version
+back if the new one's port does not answer. The version a service runs is kept in its record (it starts from the
+template's pin), so the follower orders it however many releases are cut and across restarts. It does not start a
+service its owner stopped, waits while Incus is still working on the service's instance, and deletes the image a move
+leaves unused. Each change is a line in `service-updates.jsonl`, with the image's attestation result (a failed check
+is logged, not refused). `service_update {name, follow: false}` keeps a service where it is, and `{name, follow: true}`
+follows again. `automagik-workspace` is a virtual machine and does not follow.
+
 ## 0.20.0 (2026-11-13)
 
 `action_propose` now says in its input schema what each of its 22 actions takes: `args` has one branch per action, titled with the action, with that verb's fields, the ones it requires, and an example, so an assistant no longer learns them by trial and error. The door holds `args` to the branch its `action` names, so a refusal names the field of that action (`/args: missing required field name`) before the action's own check runs. A field the kernel fills in when the proposal is made (a GPU's instance kind, a disk's model, a snapshot's pool) takes any value, as before, and its description says the kernel fills it in.
@@ -40,16 +50,6 @@ the file it used, by its name alone; before, it spoke of a token file the owner 
 - Merge PR 135: README and guide say what Arca runs and how paired machines relate, truthfully
 - Merge PR 133: arca status names the token file it used when the node refuses it; tests for the PR 123 guard
 - Merge PR 131: approval cards say in plain words what a change does and uses
-
-A service made from `automagik-server` now follows Automagik's releases by itself: every 10 minutes (`follow.intervalSeconds`)
-the node reads Automagik's published record of its newest server image, and when it names another digest and a newer
-version than the service runs, moves the service with `service_update`, which keeps its data and puts the old version
-back if the new one's port does not answer. The version a service runs is kept in its record (it starts from the
-template's pin), so the follower orders it however many releases are cut and across restarts. It does not start a
-service its owner stopped, waits while Incus is still working on the service's instance, and deletes the image a move
-leaves unused. Each change is a line in `service-updates.jsonl`, with the image's attestation result (a failed check
-is logged, not refused). `service_update {name, follow: false}` keeps a service where it is, and `{name, follow: true}`
-follows again. `automagik-workspace` is a virtual machine and does not follow.
 
 ## 0.18.0 (2026-11-12)
 
