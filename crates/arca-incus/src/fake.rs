@@ -3277,6 +3277,11 @@ fn change_state(
                 return answered(shared, store, "instance", "PUT", failure);
             }
             store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
+            // The instance that exits after a start exits after a restart too.
+            let key = (address.project.clone(), address.name.clone());
+            if let Some(plan) = lock(&shared.exit_plans).get(&key).cloned() {
+                lock(&shared.exits).insert(key, plan);
+            }
             answered(shared, store, "instance", "PUT", Ok(()))
         }
         _ => bad("the fake takes only a start, a stop or a restart"),

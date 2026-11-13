@@ -1108,6 +1108,15 @@ fn a_service_that_stops_under_the_key_is_started_again_with_the_old_setting() {
     );
     assert!(!record_flag(&rig));
     assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    // No state change was refused: a restart of the stopped instance would have been ("already stopped").
+    let refused: Vec<String> = rig
+        .fake
+        .requests()
+        .into_iter()
+        .filter(|request| request.path.contains("/state") && request.status >= 400)
+        .map(|request| request.path)
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}");
 }
 
 #[test]
