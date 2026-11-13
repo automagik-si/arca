@@ -613,12 +613,12 @@ impl ServiceHandler {
                 return Err(key_first(&name, wanted));
             }
             // A card the owner approved names the setting it gave: the template must still say it.
-            if let Some(stated) = args.get("noNewPrivileges") {
-                if stated.as_bool() != Some(wanted) {
-                    return Err(said(
-                        "noNewPrivileges is not what the template says now. Nothing was changed",
-                    ));
-                }
+            if let Some(stated) = args.get("noNewPrivileges")
+                && stated.as_bool() != Some(wanted)
+            {
+                return Err(said(
+                    "noNewPrivileges is not what the template says now. Nothing was changed",
+                ));
             }
             let key = KeyUpdate {
                 port,
