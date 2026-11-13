@@ -7,20 +7,6 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-## 0.24.0 (2026-11-13)
-
-A new token scope, `admin`, sits above `operator`, and a node holds one admin token at a time: `arca token mint --scope
-admin` with another admin token on the node is refused naming it, and `--replace` retires the old one and has a running
-node read its tokens at once. The admin token can approve a waiting action proposal from the terminal of an MCP client
-that declared elicitation: the call stays open, the client is asked in the card's words, and an explicit accept with yes
-approves and runs the proposal once. The journals record it as approved in the terminal by that admin token (the run is
-made as `terminal-approval:<token id>`), never as the owner's. A decline, a cancel or a timeout leaves the proposal on
-its card, and every other token and client is answered as before. See "Approving a plan from the terminal" in
-OPERATING.md.
-
-- Merge PR 102: Automagik's brand is copied into docs/brand from Automagik 00765fdb, and a brand copy cuts no release
-- Merge PR 149: an admin token held by one terminal approves gated actions in that terminal through MCP elicitation; every other client keeps the web card
-
 Arca now owns each host's forwarding and firewall as declared state, so a reboot or a Docker restart cannot take the
 containers' way out again (Docker 29 turns IP forwarding on by itself and sets the `FORWARD` policy to `DROP`). The
 owner's file `/etc/arca/host.json` says whether the host forwards and which bridges may reach out. A new root part of
@@ -35,6 +21,20 @@ the result is the read-back. `arca host-network install --takeover <unit>` write
 has now, copies the binary to a root-owned place, starts the unit and disables the hand-made unit named, so the hand fix
 is replaced and not doubled; `--dry-run` prints every step. See "Host forwarding and the firewall" in docs/OPERATING.md.
 Not done here: IPv6 firewall rules, and the canvas does not yet draw the new card (the owner's approval page does).
+
+## 0.24.0 (2026-11-13)
+
+A new token scope, `admin`, sits above `operator`, and a node holds one admin token at a time: `arca token mint --scope
+admin` with another admin token on the node is refused naming it, and `--replace` retires the old one and has a running
+node read its tokens at once. The admin token can approve a waiting action proposal from the terminal of an MCP client
+that declared elicitation: the call stays open, the client is asked in the card's words, and an explicit accept with yes
+approves and runs the proposal once. The journals record it as approved in the terminal by that admin token (the run is
+made as `terminal-approval:<token id>`), never as the owner's. A decline, a cancel or a timeout leaves the proposal on
+its card, and every other token and client is answered as before. See "Approving a plan from the terminal" in
+OPERATING.md.
+
+- Merge PR 102: Automagik's brand is copied into docs/brand from Automagik 00765fdb, and a brand copy cuts no release
+- Merge PR 149: an admin token held by one terminal approves gated actions in that terminal through MCP elicitation; every other client keeps the web card
 
 ## 0.23.0 (2026-11-13)
 
