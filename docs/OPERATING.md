@@ -755,7 +755,10 @@ script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgre
 `github-runner-pool`, `gitlab-runner-pool.sh` for both `gitlab-runner-pool` and `gitlab-runner-pool-large`,
 `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
-`service_create` with the file it looked for (`templates/<name>`).
+`service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
+(`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
+`service_create` refuses with the alias when the project's image listing answers and no image there carries it,
+before anything is created. A listing that cannot be read decides nothing, and the create goes on.
 
 #### A script entrypoint and the Incus version
 
@@ -776,10 +779,7 @@ quote starts where liblxc is 6.0 or later, and on liblxc 5.0 or older the contai
 a template meant for every node keeps such words out of its entrypoint. A template `env` value goes as it is too:
 Incus refuses a line break in it at create, and Incus 7.6 a carriage return at the container's start. A service made by an
 earlier release from a script entrypoint keeps the entrypoint it was made with, which Incus 7.6 refuses at its start
-and at every update: remove it and create it again. A template whose `image` is `local:<alias>`
-(`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
-`service_create` refuses with the alias when the project's image listing answers and no image there carries it,
-before anything is created. A listing that cannot be read decides nothing, and the create goes on.
+and at every update: remove it and create it again.
 
 A local image may be pinned: a `digest` (`sha256:` and 64 lowercase hex digits, the image's Incus fingerprint) beside
 `local:<alias>`, in a container template or a virtual machine's. Without it the alias is trusted for whatever image
