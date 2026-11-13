@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.25.0 (2026-11-13)
+
 Arca now owns each host's forwarding and firewall as declared state, so a reboot or a Docker restart cannot take the
 containers' way out again (Docker 29 turns IP forwarding on by itself and sets the `FORWARD` policy to `DROP`). The
 owner's file `/etc/arca/host.json` says whether the host forwards and which bridges may reach out. A new root part of
@@ -41,6 +43,11 @@ chooses its paths, so set `port` on both nodes and name each other in `peers`, o
 `port` stops `link serve` with a message that names the port. Without the two keys the link behaves as before; a
 serving node also writes a small `paths.json` every 2 seconds. This turns on iroh's `unstable-custom-transports`
 feature, which iroh 1.4.1 requires to prefer a path; iroh stays pinned to that exact version.
+
+- Merge PR 152: a link prefers a named private path such as a fiber, falls back on its own, and arca link peers shows the path of each open connection
+- Merge PR 150: service_update keeps a service's data, refuses an old-style service that would lose it, and erasing needs the owner
+- chore(lock): arca-hostnet follows the workspace version, 0.24.0
+- Merge PR 148: a node declares its host firewall and forwarding in /etc/arca/host.json, a root unit applies it, and drift raises an alert with a restore action
 
 ## 0.24.0 (2026-11-13)
 

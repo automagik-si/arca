@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "arca"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-alerts",
  "arca-api",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "arca-alerts"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-incus",
  "arca-metrics",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "arca-api"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "regex",
  "serde",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "arca-approval"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-kernel",
  "base64 0.23.1",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "arca-hostnet"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "arca-incus"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-kernel",
  "serde",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "arca-kernel"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "arca-link"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "arca-mcp"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-api",
  "axum",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "arca-metrics"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-api",
  "arca-incus",
@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "arca-netproject"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-incus",
  "arca-kernel",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "arca-postgres"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca",
  "arca-api",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "arca-providers"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-incus",
  "arca-kernel",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "arca-reconcile"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-approval",
  "arca-incus",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "arca-store"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "arca-watch"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "arca-api",
  "arca-kernel",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "arca-wit"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "wasmtime",
  "wit-component",
