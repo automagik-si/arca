@@ -281,7 +281,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let sampler = sampler.with_probes(probe_targets(&alerts_file.probes));
     let ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
         .with_checks(targets)
-        .with_watch(Arc::clone(&watch));
+        .with_watch(Arc::clone(&watch))
+        .with_host_network(cfg.host_network.status.clone());
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let reader = Arc::new(Mutex::new(reader));

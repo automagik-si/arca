@@ -1758,7 +1758,8 @@
                           "tenant_remove",
                           "deploy_remove",
                           "function_create",
-                          "function_remove"
+                          "function_remove",
+                          "host_network_restore"
                         ],
                         "type": "string"
                       },
@@ -1883,7 +1884,8 @@
               "tenant_remove",
               "deploy_remove",
               "function_create",
-              "function_remove"
+              "function_remove",
+              "host_network_restore"
             ],
             "type": "string"
           }
@@ -2972,6 +2974,17 @@
                 ],
                 "title": "function_remove",
                 "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of host_network_restore: Put this host's forwarding and firewall back as the owner's declared file says, once the owner has approved it as an action proposal: IP forwarding, the accepts that let the declared bridges' containers reach out, and the FORWARD policy. It asks the root part of this host, which runs only this and nothing else, and the answer is what the root part read back afterwards: whether the host is as declared, the commands it ran and any drift that is left. It takes no arguments. Example: {}",
+                "examples": [
+                  {}
+                ],
+                "properties": {},
+                "required": [],
+                "title": "host_network_restore",
+                "type": "object"
               }
             ],
             "description": "The action's own arguments: those of the anyOf branch whose title is the action.",
@@ -3007,7 +3020,8 @@
                 "tenant_remove",
                 "deploy_remove",
                 "function_create",
-                "function_remove"
+                "function_remove",
+                "host_network_restore"
               ],
               "type": "string"
             },
@@ -3382,7 +3396,8 @@
                 "tenant_remove",
                 "deploy_remove",
                 "function_create",
-                "function_remove"
+                "function_remove",
+                "host_network_restore"
               ],
               "type": "string"
             },
@@ -10481,6 +10496,83 @@
         }
       },
       "summary": "Remove the credential this node holds for a registry. Images already fetched stay, and Incus still holds the credential with each of them until that image is removed with its last function or service; the next fetch from that registry is made without a credential.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "host_network_restore",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "applied": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "at": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "drift": {
+              "items": {
+                "properties": {
+                  "detail": {
+                    "type": "string"
+                  },
+                  "item": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "item",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "errors": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "inSync": {
+              "type": "boolean"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "inSync",
+            "applied",
+            "drift",
+            "errors",
+            "at",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Put this host's forwarding and firewall back as the owner's declared file says, once the owner has approved it as an action proposal: IP forwarding, the accepts that let the declared bridges' containers reach out, and the FORWARD policy. It asks the root part of this host, which runs only this and nothing else, and the answer is what the root part read back afterwards: whether the host is as declared, the commands it ran and any drift that is left. It takes no arguments.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

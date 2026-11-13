@@ -1,0 +1,14 @@
+[package]
+name = "arca-hostnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Automagik Arca's host forwarding and firewall as declared state: the declared file, the drift check, the plan, the root part's socket and the takeover install"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

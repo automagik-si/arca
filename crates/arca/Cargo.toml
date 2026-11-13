@@ -17,6 +17,7 @@ path = "src/main.rs"
 arca-alerts.workspace = true
 arca-api.workspace = true
 arca-approval.workspace = true
+arca-hostnet.workspace = true
 arca-incus.workspace = true
 arca-kernel.workspace = true
 arca-link.workspace = true

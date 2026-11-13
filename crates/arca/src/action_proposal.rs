@@ -70,6 +70,7 @@ pub enum ActionKind {
     DeployRemove,
     FunctionCreate,
     FunctionRemove,
+    HostNetworkRestore,
 }
 
 /// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
@@ -126,7 +127,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 22] = [
+    pub const ALL: [ActionKind; 23] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceImport,
@@ -149,6 +150,7 @@ impl ActionKind {
         Self::DeployRemove,
         Self::FunctionCreate,
         Self::FunctionRemove,
+        Self::HostNetworkRestore,
     ];
 
     /// How the owner undoes this action once it has run, in the owner's words: the card says it beside what the action
@@ -193,6 +195,9 @@ impl ActionKind {
             Self::FunctionRemove => {
                 "It cannot be undone: the function is deleted with its secrets."
             }
+            Self::HostNetworkRestore => {
+                "There is nothing to undo: it only puts the host back to what its declared file says, and the file is not changed."
+            }
         }
     }
 
@@ -226,6 +231,7 @@ impl ActionKind {
             Self::DeployRemove => "deploy_remove",
             Self::FunctionCreate => "function_create",
             Self::FunctionRemove => "function_remove",
+            Self::HostNetworkRestore => "host_network_restore",
         }
     }
 
@@ -645,6 +651,15 @@ impl ActionKind {
                     "Stops the run that is going, if one is, and deletes the function with its secrets. Its lines in the run log are kept.",
                 ),
             ],
+            // What the host drifted from, read when the proposal was made: the owner sees what is put back.
+            Self::HostNetworkRestore => vec![
+                row("Host", "this host's forwarding and firewall rules"),
+                row("Now", gpu_product.unwrap_or("read when the restore runs")),
+                row(
+                    "Effect",
+                    "Sets IP forwarding as the host's declared file says, adds the firewall rules that let the declared bridges' containers reach out, and sets the FORWARD policy the file records. No container and nothing in Arca's own state changes.",
+                ),
+            ],
             Self::DeployRemove => vec![
                 row("Deploy", text("deploy")),
                 // What the deploy holds as the proposal is made: the owner sees each part he approves the removal of.
@@ -791,6 +806,10 @@ impl ActionKind {
             }
             Self::FunctionCreate => crate::function::create_summary(args),
             Self::FunctionRemove => format!("Remove the function {}", text("name")),
+            Self::HostNetworkRestore => {
+                "Put this host's forwarding and firewall rules back as its declared file says"
+                    .to_string()
+            }
         };
         // A service that can call the kernel is named as one.
         let sentence = if self == Self::ServiceCreate && args.get("kernelAccess").is_some() {

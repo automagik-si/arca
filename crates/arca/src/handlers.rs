@@ -343,6 +343,7 @@ pub struct Ticker<S: TickStore> {
     alerts: AlertsPublished,
     checks: Option<CheckTargets>,
     watch: Option<Arc<WatchHandler>>,
+    host_network: Option<std::path::PathBuf>,
 }
 
 impl<S: TickStore> Ticker<S> {
@@ -359,7 +360,15 @@ impl<S: TickStore> Ticker<S> {
             alerts,
             checks: None,
             watch: None,
+            host_network: None,
         }
+    }
+
+    /// The same ticker, which reads the root part's status file at `path` on each tick and fills `Inputs.host_network` with
+    /// the items that are not as declared. A node with no such file leaves the reading unknown.
+    pub fn with_host_network(mut self, path: std::path::PathBuf) -> Self {
+        self.host_network = Some(path);
+        self
     }
 
     /// The same ticker, which runs the health checks of `targets` on each tick and fills `Inputs.components` with them.
@@ -393,6 +402,9 @@ impl<S: TickStore> Ticker<S> {
                 at: *taken,
                 value: watch_reading(report),
             });
+        }
+        if let Some(path) = &self.host_network {
+            inputs.host_network = crate::host_network::alert_input(path);
         }
         let points = export::points(&self.sampler, &inputs);
         let mut snapshot = self.engine.tick(&inputs, points, now_ms);
@@ -1291,7 +1303,18 @@ pub fn plan_handlers_served(
     let storage_add = storage_handler(ActionKind::StorageAdd);
     let snapshot_create = storage_handler(ActionKind::SnapshotCreate);
     let snapshot_delete = storage_handler(ActionKind::SnapshotDelete);
+    let host_network_socket = node.as_ref().map_or_else(
+        || std::path::PathBuf::from(arca_hostnet::SOCKET_FILE),
+        |node| node.host_network.socket.clone(),
+    );
     vec![
+        (
+            "host_network_restore",
+            Arc::new(crate::host_network::HostNetworkRestore {
+                kernel: Arc::clone(&kernel),
+                socket: host_network_socket,
+            }) as Arc<dyn ToolHandler>,
+        ),
         (
             "plan_list",
             Arc::new(PlanList {
@@ -1512,6 +1535,16 @@ struct ActionPropose {
     storage: Option<Arc<crate::storage::Storage>>,
     node: Option<Arc<NodeConfig>>,
     lifecycle: Option<Arc<crate::lifecycle::InstanceLifecycle>>,
+}
+
+impl ActionPropose {
+    /// The root part's socket, as the node's config names it.
+    fn host_network_socket(&self) -> std::path::PathBuf {
+        self.node.as_ref().map_or_else(
+            || std::path::PathBuf::from(arca_hostnet::SOCKET_FILE),
+            |node| node.host_network.socket.clone(),
+        )
+    }
 }
 
 impl ToolHandler for ActionPropose {
@@ -1750,6 +1783,10 @@ impl ToolHandler for ActionPropose {
             // only when it does, and otherwise why the database is created stopped. Both were read when the
             // proposal was given its template's fingerprint, from that one read of the template.
             ActionKind::ServiceCreate | ActionKind::PostgresCreate => card_fact.take(),
+            // The card of a host restore says what the host has drifted from, read live from the root part now.
+            ActionKind::HostNetworkRestore => Some(crate::host_network::proposal_fact(
+                &self.host_network_socket(),
+            )?),
             // The card of a deploy's removal lists the deploy's parts as they stand now.
             ActionKind::DeployRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
@@ -2412,6 +2449,7 @@ impl ActionExecutor {
                 | "deploy_remove"
                 | "function_create"
                 | "function_remove"
+                | "host_network_restore"
         ) {
             call["approval"] = json!(grant);
         }

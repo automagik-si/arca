@@ -100,6 +100,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "registry_secret_set",
             "registry_list",
             "registry_secret_remove",
+            "host_network_restore",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -174,6 +175,13 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("registry_list", VerbClass::L, Scope::Viewer, false, false),
         (
             "registry_secret_remove",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            false,
+        ),
+        (
+            "host_network_restore",
             VerbClass::L,
             Scope::Doctor,
             true,
@@ -298,6 +306,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "deploy_remove",
         "function_create",
         "function_remove",
+        "host_network_restore",
     ];
     let action_proposal = open(
         json!({
@@ -1616,7 +1625,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 22);
+    assert_eq!(actions.len(), 23);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));

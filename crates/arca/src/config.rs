@@ -70,6 +70,39 @@ pub struct NodeConfig {
     /// The follower of Automagik's releases: how often it looks. Absent, every ten minutes.
     #[serde(default)]
     pub follow: FollowConfig,
+    /// Where this node finds the root part that holds the host's forwarding and firewall as declared state. Absent, the
+    /// places the install writes.
+    #[serde(default)]
+    pub host_network: HostNetworkConfig,
+}
+
+/// The `hostNetwork` key: the socket and the status file of the root part (`arca host-network run`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostNetworkConfig {
+    /// The root part's socket. An absolute path; `/run/arca-host-network/host-network.sock` when absent.
+    #[serde(default = "default_host_network_socket")]
+    pub socket: PathBuf,
+    /// The status file the root part writes. An absolute path; `/run/arca-host-network/status.json` when absent.
+    #[serde(default = "default_host_network_status")]
+    pub status: PathBuf,
+}
+
+impl Default for HostNetworkConfig {
+    fn default() -> Self {
+        Self {
+            socket: default_host_network_socket(),
+            status: default_host_network_status(),
+        }
+    }
+}
+
+fn default_host_network_socket() -> PathBuf {
+    PathBuf::from(arca_hostnet::SOCKET_FILE)
+}
+
+fn default_host_network_status() -> PathBuf {
+    PathBuf::from(arca_hostnet::STATUS_FILE)
 }
 
 /// The `follow` key: the services that follow Automagik's releases are looked at on this timer.
@@ -448,6 +481,8 @@ pub enum ConfigError {
     ApprovalHost,
     /// `follow.intervalSeconds` is not from 60 to 86400.
     FollowInterval,
+    /// `hostNetwork.socket` or `hostNetwork.status` is not an absolute path.
+    HostNetworkPath,
     /// The approval origin is not an https origin with a host name and at most a non-443 port, nor the localhost origin.
     /// The value is left out.
     ApprovalOrigin,
@@ -532,6 +567,10 @@ impl fmt::Display for ConfigError {
             Self::FollowInterval => write!(
                 f,
                 "follow.intervalSeconds is refused: it must be a whole number of seconds from 60 to 86400"
+            ),
+            Self::HostNetworkPath => write!(
+                f,
+                "hostNetwork.socket and hostNetwork.status are refused: each must be an absolute path"
             ),
             Self::ApprovalOrigin => write!(
                 f,
@@ -648,6 +687,9 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     }
     if !(60..=86_400).contains(&config.follow.interval_seconds) {
         return Err(ConfigError::FollowInterval);
+    }
+    if !config.host_network.socket.is_absolute() || !config.host_network.status.is_absolute() {
+        return Err(ConfigError::HostNetworkPath);
     }
     if let Some(host) = &config.approval_host
         && !host_name_ok(host)
@@ -1647,6 +1689,33 @@ mod tests {
         assert_eq!(with(86_400), Ok(()));
         assert_eq!(with(59), Err(ConfigError::FollowInterval));
         assert_eq!(with(86_401), Err(ConfigError::FollowInterval));
+    }
+
+    #[test]
+    fn the_host_network_files_are_where_the_install_writes_them_unless_the_config_names_others() {
+        let config = config_with(None);
+        assert_eq!(
+            config.host_network.socket,
+            PathBuf::from("/run/arca-host-network/host-network.sock")
+        );
+        assert_eq!(
+            config.host_network.status,
+            PathBuf::from("/run/arca-host-network/status.json")
+        );
+        let named: HostNetworkConfig = serde_json::from_value(
+            serde_json::json!({ "socket": "/tmp/host.sock", "status": "/tmp/host.json" }),
+        )
+        .expect("both named");
+        assert_eq!(named.socket, PathBuf::from("/tmp/host.sock"));
+        let unknown: Result<HostNetworkConfig, _> =
+            serde_json::from_value(serde_json::json!({ "sockets": "/tmp/x" }));
+        assert!(unknown.is_err(), "an unknown key is refused");
+        let mut relative = config_with(None);
+        relative.host_network.socket = PathBuf::from("host.sock");
+        assert_eq!(check(&relative), Err(ConfigError::HostNetworkPath));
+        let mut relative = config_with(None);
+        relative.host_network.status = PathBuf::from("status.json");
+        assert_eq!(check(&relative), Err(ConfigError::HostNetworkPath));
     }
 
     #[test]

@@ -17,6 +17,7 @@ arca = { path = "crates/arca" }
 arca-alerts = { path = "crates/arca-alerts" }
 arca-api = { path = "crates/arca-api" }
 arca-approval = { path = "crates/arca-approval" }
+arca-hostnet = { path = "crates/arca-hostnet" }
 arca-incus = { path = "crates/arca-incus" }
 arca-kernel = { path = "crates/arca-kernel" }
 arca-link = { path = "crates/arca-link" }
