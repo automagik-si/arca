@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.21.0 (2026-11-13)
+
 A service made from `automagik-server` now follows Automagik's releases by itself: every 10 minutes (`follow.intervalSeconds`)
 the node reads Automagik's published record of its newest server image, and when it names another digest and a newer
 version than the service runs, moves the service with `service_update`, which keeps its data and puts the old version
@@ -16,6 +18,8 @@ service its owner stopped, waits while Incus is still working on the service's i
 leaves unused. Each change is a line in `service-updates.jsonl`, with the image's attestation result (a failed check
 is logged, not refused). `service_update {name, follow: false}` keeps a service where it is, and `{name, follow: true}`
 follows again. `automagik-workspace` is a virtual machine and does not follow.
+
+- Merge PR 138: Arca follows new Automagik server releases and moves automagik-server to the new digest by itself
 
 ## 0.20.0 (2026-11-13)
 
