@@ -4,17 +4,18 @@ use crate::{
     guard::{Guard, Slot},
     mesh,
     pairing::{self, Request, Response, read_line, write_line},
+    path::{self, Hints, Prefer},
     runtime,
 };
 use iroh::{
     Endpoint, EndpointAddr, RelayMode,
-    endpoint::{Connection, Incoming, presets},
+    endpoint::{BindOpts, Connection, Incoming, presets},
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use std::{
     collections::BTreeMap,
     fs::File,
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -45,6 +46,7 @@ pub struct Link {
     endpoint: Endpoint,
     state: State,
     name: String,
+    named: Hints,
     stop: watch::Sender<bool>,
     refresh: Arc<Notify>,
     task: Option<JoinHandle<()>>,
@@ -62,16 +64,41 @@ impl Link {
         let key = state.secret()?;
         let mut alpns = vec![PAIR_ALPN.to_vec(), PEERS_ALPN.to_vec()];
         alpns.extend(config.forward.keys().map(|a| a.as_bytes().to_vec()));
-        let builder = match network {
-            Network::N0 => Endpoint::builder(presets::N0),
-            Network::Direct(addr) => runtime(
+        let named = Hints::new(&config);
+        let mut builder = match (network, config.port) {
+            (Network::N0, None) => Endpoint::builder(presets::N0),
+            (Network::N0, Some(port)) => {
+                // A fixed port on every address, as the default binds one random port on v4 and v6.
+                let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+                runtime(
+                    runtime(
+                        Endpoint::builder(presets::N0)
+                            .clear_ip_transports()
+                            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))),
+                    )?
+                    .bind_addr_with_opts(v6, BindOpts::default().set_is_required(false)),
+                )?
+            }
+            (Network::Direct(addr), port) => runtime(
                 Endpoint::builder(presets::Minimal)
                     .relay_mode(RelayMode::Disabled)
                     .clear_ip_transports()
-                    .bind_addr(addr),
+                    .bind_addr(SocketAddr::new(addr.ip(), port.unwrap_or(addr.port()))),
             )?,
         };
-        let endpoint = runtime(builder.secret_key(key).alpns(alpns).bind().await)?;
+        if !named.is_empty() {
+            builder = builder.path_selector(Arc::new(Prefer(named.all())));
+        }
+        let endpoint =
+            builder
+                .secret_key(key)
+                .alpns(alpns)
+                .bind()
+                .await
+                .map_err(|_| match config.port {
+                    Some(port) => Error::Port(port),
+                    None => Error::Runtime("link operation failed"),
+                })?;
         let name = config
             .name
             .clone()
@@ -92,6 +119,7 @@ impl Link {
             state.clone(),
             name.clone(),
             config,
+            named.clone(),
             listener,
             receiver,
             refresh.clone(),
@@ -101,10 +129,24 @@ impl Link {
             endpoint,
             state,
             name,
+            named,
             stop,
             refresh,
             task: Some(task),
         })
+    }
+
+    /// Open a connection to a paired peer by name.
+    pub async fn connect(&self, peer: &str, alpn: &[u8]) -> Result<Connection> {
+        let addr = self.named.dial(peer, self.state.peer_addr(peer)?);
+        let connection = runtime(self.endpoint.connect(addr, alpn).await)?;
+        self.named.track(&connection);
+        Ok(connection)
+    }
+    /// The path each paired peer is reached on now, by peer name.
+    pub fn paths(&self) -> std::collections::BTreeMap<String, crate::PathNow> {
+        let peers = self.state.peers().unwrap_or_default();
+        path::now(&peers, &self.named)
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -120,7 +162,7 @@ impl Link {
     }
     /// Exchange full membership snapshots; unreachable members never fail a sync.
     pub async fn sync_peers(&self) -> Result<()> {
-        mesh::sync(&self.endpoint, &self.state).await?;
+        mesh::sync(&self.endpoint, &self.state, &self.named).await?;
         self.refresh.notify_one();
         Ok(())
     }
@@ -154,6 +196,7 @@ struct Cleanup {
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = self.state.delete("status.json");
+        let _ = self.state.delete("paths.json");
         let _ = self.state.delete(".link-control.sock");
     }
 }
@@ -175,6 +218,7 @@ async fn run(
     state: State,
     name: String,
     config: Config,
+    named: Hints,
     listener: UnixListener,
     mut stop: watch::Receiver<bool>,
     refresh: Arc<Notify>,
@@ -195,9 +239,9 @@ async fn run(
         if needs_sync && syncing.is_empty() {
             needs_sync = false;
             let (endpoint, state, refresh) = (endpoint.clone(), state.clone(), refresh.clone());
-            let connections = connections.clone();
+            let (connections, named) = (connections.clone(), named.clone());
             syncing.spawn(async move {
-                if matches!(mesh::sync(&endpoint, &state).await, Ok(true)) {
+                if matches!(mesh::sync(&endpoint, &state, &named).await, Ok(true)) {
                     refresh.notify_one();
                 }
                 sweep(&state, &connections);
@@ -213,6 +257,8 @@ async fn run(
                 let removed = state.snapshot().ok().map(|s| s.removed);
                 if removed != last_removed { last_removed = removed; needs_sync = true; }
                 if publish(&state, &endpoint, &name).is_err() { break; }
+                let peers = state.peers().unwrap_or_default();
+                let _ = state.write("paths.json", &path::now(&peers, &named));
             },
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
@@ -220,13 +266,13 @@ async fn run(
                 if !incoming.remote_addr_validated() { let _ = incoming.retry(); continue; }
                 let Some(slot) = guard.take(incoming.remote_addr()) else { incoming.refuse(); continue; };
                 let deadline = Instant::now() + Duration::from_secs(10);
-                tasks.spawn(handle(incoming, slot, state.clone(), endpoint.id().to_string(), config.clone(), connections.clone(), refresh.clone(), deadline));
+                tasks.spawn(handle(incoming, slot, state.clone(), endpoint.id().to_string(), config.clone(), named.clone(), connections.clone(), refresh.clone(), deadline));
             },
             client = listener.accept() => {
                 if let Ok((client, _)) = client {
                     let (endpoint, state, name) = (endpoint.clone(), state.clone(), name.clone());
-                    let (connections, refresh) = (connections.clone(), refresh.clone());
-                    tasks.spawn(async move { let _ = control(client, endpoint, state, name, connections, refresh).await; });
+                    let (connections, refresh, named) = (connections.clone(), refresh.clone(), named.clone());
+                    tasks.spawn(async move { let _ = control(client, endpoint, state, name, named, connections, refresh).await; });
                 }
             },
             _ = tasks.join_next(), if !tasks.is_empty() => {},
@@ -260,6 +306,7 @@ async fn handle(
     state: State,
     own_id: String,
     config: Config,
+    named: Hints,
     connections: Connections,
     refresh: Arc<Notify>,
     deadline: Instant,
@@ -284,6 +331,7 @@ async fn handle(
                 .lock()
                 .expect("connections lock")
                 .insert(id, connection.clone());
+            named.track(&connection);
             registered = Some(id);
         }
         let (mut send, mut recv) = runtime(connection.accept_bi().await)?;
@@ -404,6 +452,7 @@ async fn control(
     endpoint: Endpoint,
     state: State,
     name: String,
+    named: Hints,
     connections: Connections,
     refresh: Arc<Notify>,
 ) -> Result<()> {
@@ -416,8 +465,9 @@ async fn control(
         let text = read_line(&mut socket).await?;
         if let Ok(request) = serde_json::from_slice::<Dial>(&text) {
             let result: Result<_> = async {
-                let addr = state.peer_addr(&request.dial)?;
+                let addr = named.dial(&request.dial, state.peer_addr(&request.dial)?);
                 let connection = runtime(endpoint.connect(addr, b"arca/mcp/1").await)?;
+                named.track(&connection);
                 let (send, recv) = runtime(connection.open_bi().await)?;
                 Ok((connection, send, recv))
             }

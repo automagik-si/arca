@@ -31,6 +31,17 @@ digest, and it needs the owner's approval: `service_update` can now be proposed 
 that all the data is erased and cannot be brought back. A service that has its volume, and a service whose template
 declares none, update exactly as before.
 
+Two nodes joined by a private link, such as a fiber cable, can now use it for the link between them. The `link` config
+section takes `peers`, a map from a peer's name to the `ip:port` addresses it is also reached on, and `port`, a fixed
+UDP port so that address stays the same. While a named address works it carries the traffic ahead of the VPN, a LAN
+address and the relay; when it does not, the link falls back to the normal path. Only the side that opens a connection
+chooses its paths, so set `port` on both nodes and name each other in `peers`, or one direction may still use the VPN.
+`arca link peers` now shows, while `link serve` runs, the path each peer is reached on from its open connections:
+`direct` or `relay` with the address and whether the config named it, or `idle` when no connection is open. A taken
+`port` stops `link serve` with a message that names the port. Without the two keys the link behaves as before; a
+serving node also writes a small `paths.json` every 2 seconds. This turns on iroh's `unstable-custom-transports`
+feature, which iroh 1.4.1 requires to prefer a path; iroh stays pinned to that exact version.
+
 ## 0.24.0 (2026-11-13)
 
 A new token scope, `admin`, sits above `operator`, and a node holds one admin token at a time: `arca token mint --scope

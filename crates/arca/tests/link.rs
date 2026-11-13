@@ -444,3 +444,50 @@ fn the_variable_alone_never_picks_the_node_a_peer_is_joined_or_paired_on() {
         "{out:?}"
     );
 }
+
+#[test]
+fn link_peers_shows_the_path_in_use_only_while_a_fresh_record_exists() {
+    let temp = Temp::new();
+    let config = temp.config();
+    let state = State::new(temp.0.join("state")).unwrap();
+    let peer = arca_link::Peer {
+        id: state.secret().unwrap().public().to_string(),
+        name: "fiber".to_string(),
+        paired: arca_link::now_ms(),
+        seen: arca_link::now_ms(),
+        ticket: None,
+    };
+    fs::write(
+        temp.0.join("state/peers.json"),
+        serde_json::to_vec(&vec![peer]).unwrap(),
+    )
+    .unwrap();
+    let peers = || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
+            .args(["link", "peers", "--config", &config])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert!(peers()[0].get("path").is_none(), "no running link, no path");
+    let record = |at: u64| json!({"fiber": {"via": "direct", "addr": "10.0.0.2:7000", "named": true, "at": at}});
+    fs::write(
+        temp.0.join("state/paths.json"),
+        serde_json::to_vec(&record(arca_link::now_ms())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        peers()[0]["path"],
+        json!({"via": "direct", "addr": "10.0.0.2:7000", "named": true})
+    );
+    fs::write(
+        temp.0.join("state/paths.json"),
+        serde_json::to_vec(&record(arca_link::now_ms() - 60_000)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        peers()[0].get("path").is_none(),
+        "an old record is not shown"
+    );
+}

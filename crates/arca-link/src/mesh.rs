@@ -2,6 +2,7 @@
 use crate::{
     PEERS_ALPN, Result, State,
     pairing::{read_line_bounded, write_line_bounded},
+    path::Hints,
     runtime,
     state::Snapshot,
 };
@@ -29,9 +30,19 @@ pub(crate) async fn receive(
     Ok(changed)
 }
 
-async fn exchange(endpoint: Endpoint, state: State, peer: crate::Peer) -> Result<bool> {
+async fn exchange(
+    endpoint: Endpoint,
+    state: State,
+    named: Hints,
+    peer: crate::Peer,
+) -> Result<bool> {
     let operation = async {
-        let connection = runtime(endpoint.connect(peer.addr()?, PEERS_ALPN).await)?;
+        let connection = runtime(
+            endpoint
+                .connect(named.dial(&peer.name, peer.addr()?), PEERS_ALPN)
+                .await,
+        )?;
+        named.track(&connection);
         let result = async {
             let (mut send, mut recv) = runtime(connection.open_bi().await)?;
             write_line_bounded(&mut send, &state.snapshot()?, LINE_LIMIT).await?;
@@ -49,7 +60,7 @@ async fn exchange(endpoint: Endpoint, state: State, peer: crate::Peer) -> Result
 }
 
 /// Try each member, including newly learned members, once. Offline peers are harmless.
-pub(crate) async fn sync(endpoint: &Endpoint, state: &State) -> Result<bool> {
+pub(crate) async fn sync(endpoint: &Endpoint, state: &State, named: &Hints) -> Result<bool> {
     let mut attempted = BTreeSet::new();
     let mut changed = false;
     loop {
@@ -66,7 +77,12 @@ pub(crate) async fn sync(endpoint: &Endpoint, state: &State) -> Result<bool> {
             if tasks.len() == 16 {
                 changed |= matches!(tasks.join_next().await, Some(Ok(Ok(true))));
             }
-            tasks.spawn(exchange(endpoint.clone(), state.clone(), peer));
+            tasks.spawn(exchange(
+                endpoint.clone(),
+                state.clone(),
+                named.clone(),
+                peer,
+            ));
         }
         while let Some(result) = tasks.join_next().await {
             changed |= matches!(result, Ok(Ok(true)));
