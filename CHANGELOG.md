@@ -7,6 +7,21 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Arca now owns each host's forwarding and firewall as declared state, so a reboot or a Docker restart cannot take the
+containers' way out again (Docker 29 turns IP forwarding on by itself and sets the `FORWARD` policy to `DROP`). The
+owner's file `/etc/arca/host.json` says whether the host forwards and which bridges may reach out. A new root part of
+the `arca` binary, `arca host-network run`, started by the system unit `arca-host-network.service`, sets the two
+forwarding switches and puts one accept in and one for the answers out for each bridge into Docker's `DOCKER-USER`
+chain, adding nothing twice. It does this when it starts: at boot after `docker.service`, and again on every Docker
+start, since the unit is tied to Docker. Every minute it reads the host again and writes a status file (in sync, or which
+item drifted), and it answers on a socket to two verbs only, `read` and `apply-declared-state`, neither with an
+argument. The node raises the new critical alert `host-network-drift` for each item that drifts, and a new action,
+`host_network_restore`, is a normal approval card: when the owner approves it, the node asks the socket to apply, and
+the result is the read-back. `arca host-network install --takeover <unit>` writes the declared file from what the host
+has now, copies the binary to a root-owned place, starts the unit and disables the hand-made unit named, so the hand fix
+is replaced and not doubled; `--dry-run` prints every step. See "Host forwarding and the firewall" in docs/OPERATING.md.
+Not done here: IPv6 firewall rules, and the canvas does not yet draw the new card (the owner's approval page does).
+
 ## 0.23.0 (2026-11-13)
 
 A node can now record a program that runs outside Incus, such as a macOS LaunchAgent next to the Incus VM, so it shows
@@ -45,21 +60,6 @@ upgrade from a release. `install.sh` picks the binary by `uname -m`: `aarch64` a
 `x86_64` the x86_64 one, and any other machine is refused in plain words, as before.
 
 - Merge PR 143: Arca publishes a linux-aarch64 binary beside x86_64
-
-Arca now owns each host's forwarding and firewall as declared state, so a reboot or a Docker restart cannot take the
-containers' way out again (Docker 29 turns IP forwarding on by itself and sets the `FORWARD` policy to `DROP`). The
-owner's file `/etc/arca/host.json` says whether the host forwards and which bridges may reach out. A new root part of
-the `arca` binary, `arca host-network run`, started by the system unit `arca-host-network.service`, sets the two
-forwarding switches and puts one accept in and one for the answers out for each bridge into Docker's `DOCKER-USER`
-chain, adding nothing twice. It does this when it starts: at boot after `docker.service`, and again on every Docker
-start, since the unit is tied to Docker. Every minute it reads the host again and writes a status file (in sync, or which
-item drifted), and it answers on a socket to two verbs only, `read` and `apply-declared-state`, neither with an
-argument. The node raises the new critical alert `host-network-drift` for each item that drifts, and a new action,
-`host_network_restore`, is a normal approval card: when the owner approves it, the node asks the socket to apply, and
-the result is the read-back. `arca host-network install --takeover <unit>` writes the declared file from what the host
-has now, copies the binary to a root-owned place, starts the unit and disables the hand-made unit named, so the hand fix
-is replaced and not doubled; `--dry-run` prints every step. See "Host forwarding and the firewall" in docs/OPERATING.md.
-Not done here: IPv6 firewall rules, and the canvas does not yet draw the new card (the owner's approval page does).
 
 ## 0.21.0 (2026-11-13)
 
