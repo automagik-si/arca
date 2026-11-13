@@ -821,6 +821,22 @@ fn generate_and_droidd_port_the_key_is_made_at_create_in_its_own_form_before_the
     );
 }
 
+/// The script inside a one-word entrypoint made by `service::entrypoint`: its base64, decoded.
+fn decoded_script(entrypoint: &str) -> String {
+    use base64::Engine as _;
+    let encoded = entrypoint
+        .split("echo${IFS}")
+        .nth(1)
+        .and_then(|rest| rest.split('|').next())
+        .expect("the encoded script");
+    String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64"),
+    )
+    .expect("text")
+}
+
 #[test]
 fn service_create_sets_an_oci_templates_entrypoint_from_the_template_file_alone_no_calls_input_secret_or_link_reaches_it()
  {
@@ -858,10 +874,11 @@ fn service_create_sets_an_oci_templates_entrypoint_from_the_template_file_alone_
     let entrypoint = instance["config"]["oci.entrypoint"]
         .as_str()
         .expect("entrypoint");
-    assert!(entrypoint.contains("echo ok"));
-    assert!(!entrypoint.contains("evil"));
-    assert!(entrypoint.contains("$TOKEN"));
-    assert!(entrypoint.contains("$PROVIDER"));
+    let script = decoded_script(entrypoint);
+    assert!(script.contains("echo ok"));
+    assert!(!entrypoint.contains("evil") && !script.contains("evil"));
+    assert!(script.contains("$TOKEN"));
+    assert!(script.contains("$PROVIDER"));
     let token = fs::read_to_string(rig.dir.join("secrets/service-jet/token")).unwrap();
     assert!(!entrypoint.contains(&token));
     let stored = rig
@@ -3777,9 +3794,10 @@ fn a_netproject_read_failure_does_not_refuse_a_service_remove_or_skip_secret_cle
     );
 }
 
-/// Incus 7.6 refuses a line break in `oci.entrypoint` ("OCI configuration values cannot contain line breaks"), so a
-/// script with lines reaches the container as one line that decodes to the script's own bytes, and the shell sees the
-/// same `$0` and `$1` as it did when the script was passed whole.
+/// Incus 7.6 refuses a line break in `oci.entrypoint` ("OCI configuration values cannot contain line breaks"), and a
+/// node whose Incus links liblxc 5.0 or older splits the container's command on spaces alone. So a script with lines,
+/// spaces and both kinds of quote reaches the container as one word with no whitespace, which decodes to the script's
+/// own bytes, and the shell sees the same `$0` and `$1` as it did when the script was passed whole, on either liblxc.
 #[test]
 fn a_multi_line_entrypoint_script_reaches_the_container_byte_for_byte_on_one_line() {
     let script = "set -eu\n# a 'comment' with \"quotes\", $dollars and `ticks`\ncat <<'EOF'\nheredoc $0 $1\nEOF\nprintf '%s|%s|%s\\n' \"$0\" \"${1-none}\" 'it'\\''s'\n# a carriage return\r inside a comment\nfalse || echo recovered\nexit 7\n\n\n";
@@ -3789,15 +3807,17 @@ fn a_multi_line_entrypoint_script_reaches_the_container_byte_for_byte_on_one_lin
         json!({
             "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
             "ports":[8080],"env":{},"publishable":false,
-            "entrypoint":["/bin/sh","-ec",{"file":"jet.sh"},"jet","arg one"]
+            "entrypoint":["/bin/sh","-ec",{"file":"jet.sh"},"jet"]
         }),
     );
     fs::write(rig.dir.join("templates/jet.sh"), script).expect("script");
+    // The fake is a node whose liblxc splits on spaces: it refuses a start whose init would get other words.
     rig.call("service_create", json!({"name":"jet","template":"jet"}))
-        .expect("Incus 7.6 accepts the create");
+        .expect("Incus 7.6 accepts the create and the start");
     let instance = rig
         .get(&format!("/1.0/instances/jet?project={PROJECT}"))
         .expect("instance");
+    assert_eq!(instance["status"], "Running");
     let entrypoint = instance["config"]["oci.entrypoint"]
         .as_str()
         .expect("entrypoint");
@@ -3805,18 +3825,190 @@ fn a_multi_line_entrypoint_script_reaches_the_container_byte_for_byte_on_one_lin
         !entrypoint.contains(['\n', '\r']),
         "no line break: {entrypoint}"
     );
-    assert!(entrypoint.starts_with("/bin/sh -ec '__arca_script=$(printf %s "));
-    assert!(entrypoint.ends_with("| base64 -d) && eval \"$__arca_script\"' jet 'arg one'"));
-    // What Incus does with it: split into the argument list. Run as the shell reads it, the script is its own text.
-    let out = std::process::Command::new("/bin/sh")
-        .args(["-c", entrypoint])
-        .output()
-        .expect("sh");
-    assert_eq!(out.status.code(), Some(7), "the script's own exit status");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "heredoc $0 $1\njet|arg one|it's\nrecovered\n",
+    let meant = arca_incus::oci_entrypoint_args(entrypoint).expect("Incus splits it");
+    assert_eq!(meant.len(), 4, "{meant:?}");
+    assert_eq!(meant[..2], ["/bin/sh", "-ec"], "{meant:?}");
+    assert_eq!(meant[3], "jet");
+    assert!(
+        !meant[2].contains(char::is_whitespace) && !meant[2].starts_with(['\'', '"']),
+        "{meant:?}"
     );
+    assert_eq!(decoded_script(entrypoint), script.trim_end_matches('\n'));
+    // What init is started with, by Incus 7.6's own chain and by either liblxc: the entrypoint's own words.
+    for split in [arca_incus::LxcSplit::Spaces, arca_incus::LxcSplit::Quoted] {
+        let argv = arca_incus::lxc_execute_argv(entrypoint, split).expect("argv");
+        assert_eq!(argv, meant, "{split:?}");
+        // Run as init runs it, the argument list as it is: the script is its own text, `$0` and `$1` as given.
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .expect("sh");
+        assert_eq!(out.status.code(), Some(7), "the script's own exit status");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "heredoc $0 $1\njet|none|it's\nrecovered\n",
+        );
+    }
+}
+
+/// Every shipped template's entrypoint gives the container's init exactly its own arguments, whichever liblxc the
+/// node's Incus links. postgres-autopg's script, with lines, spaces and both kinds of quote, which Incus cannot encode
+/// as one word, is one word with no whitespace that decodes to the script file.
+#[test]
+fn every_shipped_entrypoint_reaches_init_as_its_own_words_on_either_liblxc() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let mut checked = Vec::new();
+    for entry in fs::read_dir(&dir).expect("the templates") {
+        let path = entry.expect("an entry").path();
+        let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let template = service::load_template(&dir, name).expect("a shipped template");
+        let Some(entrypoint) = service::entrypoint(&template, &dir).expect("its entrypoint") else {
+            continue;
+        };
+        let meant = arca_incus::oci_entrypoint_args(&entrypoint).expect("Incus splits it");
+        for split in [arca_incus::LxcSplit::Spaces, arca_incus::LxcSplit::Quoted] {
+            assert_eq!(
+                arca_incus::lxc_execute_argv(&entrypoint, split).as_ref(),
+                Ok(&meant),
+                "{name} on {split:?}"
+            );
+        }
+        checked.push(name.to_string());
+    }
+    checked.sort();
+    assert_eq!(
+        checked,
+        [
+            "automagik-server",
+            "cloudflare-tunnel",
+            "nats",
+            "postgres-autopg"
+        ]
+    );
+    let script = fs::read_to_string(dir.join("postgres-autopg.sh")).expect("the script");
+    assert!(script.contains(['\'']) && script.contains('"') && script.contains('\n'));
+    let template = service::load_template(&dir, "postgres-autopg").expect("the template");
+    let entrypoint = service::entrypoint(&template, &dir)
+        .expect("its entrypoint")
+        .expect("one");
+    let meant = arca_incus::oci_entrypoint_args(&entrypoint).expect("Incus splits it");
+    assert_eq!(meant.len(), 4);
+    assert_eq!(meant[..2], ["/bin/sh", "-ec"]);
+    assert_eq!(meant[3], "postgres-autopg");
+    assert_eq!(decoded_script(&entrypoint), script.trim_end_matches('\n'));
+}
+
+/// The fake starts a container as a node with the liblxc a test chose: the form a script word had before it lost its
+/// spaces starts where liblxc honours quotes (6.0 and later) and is refused where it splits on spaces alone (5.0 and
+/// older), at a create's start, a start and a restart, which leaves the container stopped. The one-word form starts
+/// on both.
+#[test]
+fn the_fake_starts_an_entrypoint_only_when_the_nodes_liblxc_gives_init_its_words() {
+    use arca_incus::LxcSplit::{Quoted, Spaces};
+    let spaced = "/bin/sh -ec '__arca_script=$(printf %s QUJD | base64 -d) && eval \"$__arca_script\"' probe";
+    let one_word = "/bin/sh -ec '__arca_script=$(echo${IFS}QUJD|base64${IFS}-d)&&eval${IFS}\"$__arca_script\"' probe";
+    let path = format!("/1.0/instances/probe?project={PROJECT}");
+    let state = format!("/1.0/instances/probe/state?project={PROJECT}");
+    let status = |rig: &Rig| rig.get(&path).expect("the instance")["status"].clone();
+    for (split, entrypoint, runs) in [
+        (Spaces, spaced, false),
+        (Quoted, spaced, true),
+        (Spaces, one_word, true),
+        (Quoted, one_word, true),
+    ] {
+        let rig = Rig::new();
+        rig.fake.set_lxc_split(split);
+        rig.edit(
+            "POST",
+            &format!("/1.0/instances?project={PROJECT}"),
+            json!({"name":"probe","type":"container","config":{"oci.entrypoint":entrypoint},"start":true}),
+        );
+        let expected = if runs { "Running" } else { "Stopped" };
+        assert_eq!(
+            status(&rig),
+            expected,
+            "a create's start, {split:?}: {entrypoint}"
+        );
+        if !runs {
+            rig.edit("PUT", &state, json!({"action":"start"}));
+            assert_eq!(status(&rig), "Stopped", "a start, {split:?}");
+        }
+    }
+    // A container that runs where quotes are honoured, restarted where they are not, ends stopped.
+    let rig = Rig::new();
+    rig.fake.set_lxc_split(Quoted);
+    rig.edit(
+        "POST",
+        &format!("/1.0/instances?project={PROJECT}"),
+        json!({"name":"probe","type":"container","config":{"oci.entrypoint":spaced},"start":true}),
+    );
+    assert_eq!(status(&rig), "Running");
+    rig.fake.set_lxc_split(Spaces);
+    rig.edit("PUT", &state, json!({"action":"restart"}));
+    assert_eq!(status(&rig), "Stopped");
+}
+
+#[test]
+fn an_entrypoint_argument_the_oldest_lxc_would_split_is_refused_before_anything_is_created() {
+    for argument in ["two words", "", "'quoted'", "\"quoted\"", "tab\tbed"] {
+        let rig = Rig::new();
+        rig.template(
+            "jet",
+            json!({
+                "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+                "ports":[8080],"env":{},"publishable":false,
+                "entrypoint":["/usr/bin/jet","--banner",argument]
+            }),
+        );
+        let Err(CallError::Refused { message, .. }) =
+            rig.call("service_create", json!({"name":"jet","template":"jet"}))
+        else {
+            panic!("{argument:?} is refused");
+        };
+        assert!(message.contains("liblxc 5.0 or older"), "{message}");
+        assert!(
+            rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
+                .is_none()
+        );
+    }
+}
+
+/// Incus 7.6 refuses a line break in an `environment.*` value at create, and a carriage return at the container's
+/// start, so a template whose `env` holds either is refused before anything is made, a generated secret included.
+#[test]
+fn a_template_env_value_with_a_line_break_or_a_carriage_return_is_refused_before_anything_is_made()
+{
+    for value in ["one\ntwo", "one\rtwo"] {
+        let rig = Rig::new();
+        rig.template(
+            "jet",
+            json!({
+                "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+                "ports":[8080],"env":{"BANNER":value,"TOKEN":"{{secret:TOKEN}}"},"publishable":false,
+                "secrets":["TOKEN"],"generate":{"TOKEN":""}
+            }),
+        );
+        let Err(CallError::Refused { message, .. }) =
+            rig.call("service_create", json!({"name":"jet","template":"jet"}))
+        else {
+            panic!("{value:?} is refused");
+        };
+        assert!(
+            message.contains("env BANNER has a line break or a carriage return"),
+            "{message}"
+        );
+        assert!(
+            rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
+                .is_none()
+        );
+        assert!(!rig.dir.join("secrets/service-jet").exists());
+    }
 }
 
 #[test]
@@ -3836,10 +4028,7 @@ fn a_line_break_in_an_entrypoint_argument_that_is_no_shell_script_is_refused_bef
     else {
         panic!("a line break outside a shell script is refused");
     };
-    assert!(
-        message.contains("must be the script of a shell"),
-        "{message}"
-    );
+    assert!(message.contains("not the script of a shell"), "{message}");
     assert!(
         rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
             .is_none()

@@ -748,12 +748,23 @@ script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgre
 `github-runner-pool`, `gitlab-runner-pool.sh` for both `gitlab-runner-pool` and `gitlab-runner-pool-large`,
 `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
-`service_create` with the file it looked for (`templates/<name>`). Incus 7.6 refuses a line break anywhere in `oci.entrypoint`, so a
-script with lines (a file's, or a string's) must be the script of a shell, `["/bin/sh", "-ec", <script>, "name"]` (`sh`, `ash`,
-`dash` or `bash`, flags ending in `c`), and Arca sends it as one line: its base64, decoded by the image's own `base64` and run
-by `eval` in that shell, so `$0`, `$1` and `-e` are as if the script had been passed whole. The image therefore needs `sh` and
-`base64` (busybox and coreutils both have them). A script of one line is sent as it is. A line break in any other entrypoint
-argument is refused by `service_create` before anything is created. A template whose `image` is `local:<alias>`
+`service_create` with the file it looked for (`templates/<name>`). An entrypoint must reach the container as the same
+words on every node. Incus 7.6 refuses a line break anywhere in `oci.entrypoint`. It splits the value as a shell would,
+quotes again each word that holds whitespace or starts with a quote, and hands the line to liblxc, which splits it once
+more: liblxc 5.0 and older (an Incus 7.6 build may link liblxc 4.0) split on spaces alone and keep the quotes inside the
+words, while liblxc 6.0 and later honour a quote only at the start of a word. So every entrypoint argument must be
+non-empty, hold no whitespace (a line break included) and not start with a quote; `service_create` refuses any other
+before it creates anything. A quote later in a word is fine. The one exception is the script of a shell,
+`["/bin/sh", "-ec", <script>, "name"]` (`sh`, `ash`, `dash` or `bash`, flags ending in `c`): a script with whitespace,
+lines or a leading quote is sent as one word,
+`__arca_script=$(echo${IFS}<base64>|base64${IFS}-d)&&eval${IFS}"$__arca_script"`, where each `${IFS}` stands for a
+space the shell splits on. The image's own `base64` decodes the script and `eval` runs it in that shell, so `$0`, `$1`
+and `-e` are as if the script had been passed whole, on either liblxc. The image therefore needs `sh` and `base64`
+(busybox and coreutils both have them), and as the joined entrypoint stays under 32,768 bytes, a script is about 24 KB
+at most. A template `env` value with a line break or a carriage return is refused too, before anything is made: Incus
+7.6 refuses the first at create and the second at the container's start. A service made by an earlier release from a
+script entrypoint keeps the entrypoint it was made with, which Incus 7.6 refuses at its start and at every update:
+remove it and create it again. A template whose `image` is `local:<alias>`
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.

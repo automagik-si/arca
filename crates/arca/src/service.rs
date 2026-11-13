@@ -2555,7 +2555,9 @@ pub fn candidates(cidr: &str) -> Result<Vec<Ipv4Addr>, TemplateError> {
         .collect())
 }
 
-/// The rendered environment and whether every value the template needs is present.
+/// The rendered environment and whether every value the template needs is present. A value with a line break or a
+/// carriage return is refused before any secret is made: Incus 7.6 refuses the first at create and the second at the
+/// container's start, since LXC's config is one value per line.
 pub fn environment(
     template: &Template,
     owner: &str,
@@ -2564,6 +2566,17 @@ pub fn environment(
     gateway: &str,
     secrets_dir: &Path,
 ) -> Result<(BTreeMap<String, String>, bool), TemplateError> {
+    if let Some(key) = template
+        .env
+        .iter()
+        .find_map(|(key, value)| value.contains(['\n', '\r']).then_some(key))
+    {
+        return Err(TemplateError::refused(format!(
+            "template {}: env {key} has a line break or a carriage return in it, which Incus 7.6 refuses in a \
+             container's environment (LXC's config is one value per line); give it one line",
+            template.name
+        )));
+    }
     let mut start = true;
     let mut references = BTreeMap::new();
     for key in &template.secrets {
@@ -3122,15 +3135,21 @@ fn entrypoint_with(
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),
         };
-        if !text.contains(['\n', '\r']) {
-            out.push(shell_quote(&text));
-        } else if is_shell_script_argument(parts, index) {
+        let unsafe_word = text.is_empty()
+            || text.contains([' ', '\t', '\u{b}', '\u{c}', '\n', '\r'])
+            || text.starts_with(['\'', '"']);
+        if unsafe_word && is_shell_script_argument(parts, index) && !text.is_empty() {
             out.push(shell_quote(&one_line_script(&text)));
+        } else if unsafe_word {
+            return Err(TemplateError::refused(format!(
+                "entrypoint: argument {index} ({text:?}) is empty, has whitespace or a line break in it or starts with \
+                 a quote, and is not the script of a shell as in [\"/bin/sh\", \"-ec\", <script>, ...]. Incus 7.6 \
+                 refuses a line break in oci.entrypoint, and on a node whose Incus links liblxc 5.0 or older the \
+                 container's command is split on spaces alone with its quotes kept, so the container would be created \
+                 and then fail to start; give the argument no whitespace"
+            )));
         } else {
-            return Err(TemplateError::refused(
-                "entrypoint: an argument with a line break must be the script of a shell, as in \
-                 [\"/bin/sh\", \"-ec\", <script>, ...]: Incus refuses a line break anywhere in oci.entrypoint",
-            ));
+            out.push(shell_quote(&text));
         }
     }
     let joined = out.join(" ");
@@ -3141,7 +3160,8 @@ fn entrypoint_with(
 }
 
 /// Whether `parts[index]` is the script of a shell started as `sh -c <script>` (or `-ec`, `-eu -c` and the like): the
-/// one argument that Arca can carry a line break in, because it can decode it again inside the shell.
+/// one argument that Arca can carry whitespace, a line break or a leading quote in, because it can decode it again
+/// inside the shell.
 fn is_shell_script_argument(parts: &[Value], index: usize) -> bool {
     let Some(flag) = index.checked_sub(1).and_then(|i| parts[i].as_str()) else {
         return false;
@@ -3155,14 +3175,21 @@ fn is_shell_script_argument(parts: &[Value], index: usize) -> bool {
         && flag[1..].bytes().all(|b| b.is_ascii_lowercase())
 }
 
-/// A shell script as one line that runs the same script: Incus 7.6 refuses a line break in `oci.entrypoint`, so a
-/// script with any is sent as base64 without wrapping, decoded by the image's own `base64` (busybox and coreutils
-/// both have it) and run by `eval` in the same shell, so `$0`, `$1` and the options (`-e`) are the script's own. The
-/// text is the script's bytes exactly; a failed decode ends the shell with its status and runs nothing.
+/// A shell script as one word that runs the same script. Incus 7.6 refuses a line break in `oci.entrypoint`, and
+/// liblxc 5.0 and older (which Incus 7.6 may link) split `lxc.execute.cmd` on spaces alone, keeping the quotes Incus
+/// puts round a word with whitespace, so the word has no whitespace either and does not start with a quote; liblxc
+/// 6.0 and later split it the same way, since a quote later in a word is a plain character to both. The script goes
+/// as base64 without wrapping, decoded by the image's own `base64` (busybox and coreutils both have it) and run by
+/// `eval` in the same shell, so `$0`, `$1` and the options (`-e`) are the script's own. Each `${IFS}` stands for a
+/// space: unquoted, the shell splits it into fields, so the words are `echo` and the text, `base64` and `-d`, `eval`
+/// and the script, as if typed. A failed decode ends the shell with its status and runs nothing. The text is the
+/// script's bytes exactly.
 fn one_line_script(script: &str) -> String {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
-    format!("__arca_script=$(printf %s {encoded} | base64 -d) && eval \"$__arca_script\"")
+    format!(
+        "__arca_script=$(echo${{IFS}}{encoded}|base64${{IFS}}-d)&&eval${{IFS}}\"$__arca_script\""
+    )
 }
 
 /// Whether `file` is a plain file name, so an entrypoint script is read from the template directory and nowhere else.

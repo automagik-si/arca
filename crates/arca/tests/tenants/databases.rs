@@ -200,15 +200,22 @@ fn on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_f
     assert_eq!(record["source"], fetched_source(&rig));
     assert_eq!(record["start"], true);
     let live = instance(&rig, "orders").expect("its instance");
-    // The script goes to Incus as one line of base64 (Incus 7.6 refuses a line break); it decodes to the template's own.
+    // The script goes to Incus as one word of base64 with no whitespace (Incus 7.6 refuses a line break, and liblxc 5.0
+    // and older split on spaces); it decodes to the template's own, and the database starts on the fake, a node whose
+    // liblxc splits on spaces alone, with init given the entrypoint's own words.
+    assert_eq!(live["status"], "Running");
     let entrypoint = live["config"]["oci.entrypoint"]
         .as_str()
         .expect("entrypoint");
     assert!(!entrypoint.contains('\n'));
+    assert_eq!(
+        arca_incus::lxc_execute_argv(entrypoint, arca_incus::LxcSplit::Spaces),
+        arca_incus::oci_entrypoint_args(entrypoint)
+    );
     let encoded = entrypoint
-        .split("printf %s ")
+        .split("echo${IFS}")
         .nth(1)
-        .and_then(|rest| rest.split(' ').next())
+        .and_then(|rest| rest.split('|').next())
         .expect("the encoded script");
     let decoded = {
         use base64::Engine as _;
