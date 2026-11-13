@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.24.0 (2026-11-13)
+
 A new token scope, `admin`, sits above `operator`, and a node holds one admin token at a time: `arca token mint --scope
 admin` with another admin token on the node is refused naming it, and `--replace` retires the old one and has a running
 node read its tokens at once. The admin token can approve a waiting action proposal from the terminal of an MCP client
@@ -15,6 +17,9 @@ approves and runs the proposal once. The journals record it as approved in the t
 made as `terminal-approval:<token id>`), never as the owner's. A decline, a cancel or a timeout leaves the proposal on
 its card, and every other token and client is answered as before. See "Approving a plan from the terminal" in
 OPERATING.md.
+
+- Merge PR 102: Automagik's brand is copied into docs/brand from Automagik 00765fdb, and a brand copy cuts no release
+- Merge PR 149: an admin token held by one terminal approves gated actions in that terminal through MCP elicitation; every other client keeps the web card
 
 ## 0.23.0 (2026-11-13)
 
