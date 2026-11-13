@@ -7,22 +7,27 @@ name: Release
 # is not built from it; nothing is cut when everything that changed is inert (documents, tests, these workflows).
 # The lists are in scripts/version.sh and nowhere else.
 #
-# Three jobs, and the line between the first two is the point of the design:
+# Four jobs, and the line between the writing one (publish) and the ones that run the repository's code is the point of
+# the design:
 #
 #   cut      reads, and may write nothing. It runs everything that is the repository's or a dependency's code: the
 #            gates (cargo fmt, clippy, the tests, the canvas package's tests), scripts/version.sh, which writes the
 #            version and its CHANGELOG.md section, and scripts/release.sh, which builds the release files. It commits
 #            the version as `chore(release): v<version>`, tags it, and hands over a git bundle (that one commit and
 #            its tag) and the files. Its token is read-only and no step but the one that lists the releases sees it.
+#   aarch64  builds the aarch64 binary on GitHub's hosted arm64 runner, from the release commit's tag, with the same
+#            scripts/release.sh as cut. Like cut, it reads and writes nothing of the repository's: its token is read-only,
+#            and it hands over one file, the binary.
 #   publish  may write, and runs no code of the repository and none of its scripts: git, gh and sha256sum from the
 #            runner's image, on the lines written in this file. It checks what was handed over (the bundle is exactly
 #            one commit on top of dev, named as a release commit, touching only the files that state the version;
 #            the tag points at it; SHA256SUMS matches the binary and the installer; the installer is the release
 #            commit's own), pushes dev and the tag in one atomic push, and publishes the GitHub release `v<version>`
 #            with
-#              arca-<version>-linux-x86_64   the portable binary (glibc 2.34 or newer)
+#              arca-<version>-linux-x86_64   the portable binary for x86_64 (glibc 2.34 or newer)
+#              arca-<version>-linux-aarch64  the portable binary for aarch64 (glibc 2.34 or newer)
 #              install.sh                    scripts/install.sh as the release commit holds it: it installs this release
-#              SHA256SUMS                    the checksums of those two
+#              SHA256SUMS                    the checksums of those three
 #            and that version's CHANGELOG.md section as the notes.
 #   main     moves main to the release commit. main holds released commits and nothing else.
 #
@@ -43,7 +48,9 @@ name: Release
 #     with no control character and no `<`.
 # Of the release files, this is checked: they are the four expected and nothing else; SHA256SUMS is two lines, the
 # binary's and then install.sh's, both files match it, and it is byte for byte what sha256sum writes (each sum, two
-# spaces, the name); install.sh is, byte for byte, scripts/install.sh of the release commit, and its one
+# spaces, the name). The aarch64 binary comes in its own artifact, which holds that one plain file and nothing else;
+# publish then writes the final SHA256SUMS itself with sha256sum: the x86_64 binary, the aarch64 binary, install.sh.
+# install.sh is, byte for byte, scripts/install.sh of the release commit, and its one
 # ARCA_VERSION line names this version. The release fails when any of that is not so.
 # What is not checked: what a list line says (it is a commit's subject, and may hold a link), which number the
 # version is, what the binary is, and what the release notes say. Code that runs in cut can therefore still shape
@@ -250,9 +257,63 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  aarch64:
+    name: Build v<version> for aarch64
+    needs: cut
+    if: needs.cut.outputs.mode == 'cut' || needs.cut.outputs.mode == 'finish'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      MODE: ${{ needs.cut.outputs.mode }}
+      VERSION: ${{ needs.cut.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
+      # The tag to build: a new cut's tag is in the bundle cut handed over (dev has not got it yet), and a tag that
+      # was never published is already here.
+      - name: Check out the tag
+        run: |
+          set -euo pipefail
+          [[ "${VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::not a version: ${VERSION}"; exit 1; }
+          if [[ "${MODE}" == "cut" ]]; then
+            git fetch -q "${RUNNER_TEMP}/release/release.bundle" "refs/tags/v${VERSION}:refs/tags/v${VERSION}"
+          fi
+          git checkout -q --detach "v${VERSION}"
+
+      - name: The Rust toolchain the repository pins
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          [[ -n "${channel}" ]] || { echo "::error::rust-toolchain.toml names no channel"; exit 1; }
+          rustup toolchain install "${channel}" --profile minimal --no-self-update
+          cargo --version
+
+      # At the tag, from a clean tree, as in cut. Here it builds, and checks, the aarch64 binary: it runs it.
+      - name: Build the aarch64 binary
+        run: scripts/release.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-aarch64
+          path: dist/arca-${{ needs.cut.outputs.version }}-linux-aarch64
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Push and publish v<version>
-    needs: cut
+    needs: [cut, aarch64]
     if: needs.cut.outputs.mode == 'cut' || needs.cut.outputs.mode == 'finish'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -280,6 +341,11 @@ jobs:
         with:
           name: release
           path: ${{ runner.temp }}/release
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-aarch64
+          path: ${{ runner.temp }}/release-aarch64
 
       # Everything handed over was made beside code this job does not trust. It is read as data and checked.
       - name: Check what was handed over
@@ -493,6 +559,21 @@ jobs:
           done <<< "${added}"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
+      # The aarch64 binary is read as data like the rest: it must be the one plain file expected. The final SHA256SUMS is
+      # then written here, by sha256sum, over the three files this job holds: it is exactly what sha256sum writes.
+      - name: Add the aarch64 binary
+        if: steps.check.outputs.commit != ''
+        run: |
+          set -euo pipefail
+          stop() { echo "::error::$*"; exit 1; }
+          HANDOVER="${RUNNER_TEMP}/release"
+          ARM="${RUNNER_TEMP}/release-aarch64"
+          asset="arca-${VERSION}-linux-aarch64"
+          [[ "$(cd "${ARM}" && find . -mindepth 1)" == "./${asset}" && -f "${ARM}/${asset}" && ! -L "${ARM}/${asset}" ]] ||
+            stop "the aarch64 files handed over are not exactly ${asset}, a plain file"
+          cp -- "${ARM}/${asset}" "${HANDOVER}/${asset}"
+          (cd "${HANDOVER}" && sha256sum -- "arca-${VERSION}-linux-x86_64" "${asset}" install.sh > SHA256SUMS)
+
       - name: Push dev and the tag
         id: push
         if: needs.cut.outputs.mode == 'cut' && steps.check.outputs.commit != ''
@@ -525,7 +606,7 @@ jobs:
           flags=(--latest)
           [[ "${PRERELEASE}" != "true" ]] || flags=(--prerelease --latest=false)
           cd "${RUNNER_TEMP}/release"
-          gh release create "v${VERSION}" "arca-${VERSION}-linux-x86_64" install.sh SHA256SUMS "${flags[@]}" \
+          gh release create "v${VERSION}" "arca-${VERSION}-linux-x86_64" "arca-${VERSION}-linux-aarch64" install.sh SHA256SUMS "${flags[@]}" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --title "Automagik Arca ${VERSION}" \

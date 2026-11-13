@@ -13,11 +13,12 @@
 # What it does:
 #   1. refuses a tree with uncommitted or untracked files, and a HEAD that is not the tag v<version>, where <version> is
 #      the workspace version in Cargo.toml;
-#   2. builds the portable Linux x86_64 binary with scripts/build-portable.sh, which links against glibc 2.34 and fails
-#      when the binary needs a newer one, so the asset runs on x86_64 Linux with glibc 2.34 or newer (Enterprise Linux 9,
-#      Ubuntu 22.04, Debian 12, and newer);
+#   2. builds the portable Linux binary of the machine it runs on (x86_64 or aarch64) with scripts/build-portable.sh,
+#      which links against glibc 2.34 and fails when the binary needs a newer one, so the asset runs on Linux of that
+#      architecture with glibc 2.34 or newer (Enterprise Linux 9, Ubuntu 22.04, Debian 12, and newer). The release
+#      workflow runs this script on an x86_64 machine and on an aarch64 one, and publishes both binaries;
 #   3. checks that the binary answers `--version` with this version and this commit;
-#   4. writes dist/arca-<version>-linux-x86_64, dist/install.sh (a copy of scripts/install.sh, the installer),
+#   4. writes dist/arca-<version>-linux-<architecture>, dist/install.sh (a copy of scripts/install.sh, the installer),
 #      dist/SHA256SUMS (the checksums of those two) and dist/RELEASE-NOTES.md (this version's CHANGELOG.md section);
 #   5. prints the `gh release create` command for those files (not with --rehearse).
 #
@@ -89,11 +90,15 @@ glibc="$(printf '%s\n' "$report" | sed -n 's/^max GLIBC: *//p')"
 [ -n "$glibc" ] || fail "the build reported no GLIBC version"
 
 # The binary must say it is this version, built from this commit.
-expected="Automagik Arca $version ($commit, x86_64-unknown-linux-gnu)"
+case "$(uname -m)" in
+    x86_64 | aarch64) arch="$(uname -m)" ;;
+    *) fail "this script builds on x86_64 or aarch64 Linux only (found $(uname -m))" ;;
+esac
+expected="Automagik Arca $version ($commit, $arch-unknown-linux-gnu)"
 said="$("$binary" --version)" || fail "$binary --version failed"
 [ "$said" = "$expected" ] || fail "the binary says \"$said\", not \"$expected\""
 
-asset="arca-$version-linux-x86_64"
+asset="arca-$version-linux-$arch"
 dist="$repo/dist"
 rm -rf "$dist"
 mkdir "$dist"
@@ -104,10 +109,12 @@ install -m 0755 scripts/install.sh "$dist/install.sh"
     fail "could not write or check dist/SHA256SUMS"
 {
     printf '%s\n' "$notes" | sed -e '/./,$!d'
-    printf '\n`%s` is one file for x86_64 Linux. It needs glibc %s or newer.' "$asset" "$glibc"
+    printf '\n`arca-%s-linux-x86_64` is one file for x86_64 Linux and `arca-%s-linux-aarch64` one for aarch64 (ARM) Linux.' \
+        "$version" "$version"
+    printf ' Either needs glibc %s or newer.' "$glibc"
     printf ' `install.sh` sets up a read-only node with this release: read it, then run `sh install.sh`.'
-    printf ' Check what you downloaded with `sha256sum --check --ignore-missing SHA256SUMS`, and stop unless it prints `%s: OK`.\n' \
-        "$asset"
+    printf ' Check what you downloaded with `sha256sum --check --ignore-missing SHA256SUMS`, and stop unless it prints `arca-%s-linux-x86_64: OK` or `arca-%s-linux-aarch64: OK`, for the file you took.\n' \
+        "$version" "$version"
 } >"$dist/RELEASE-NOTES.md"
 
 echo

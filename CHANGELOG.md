@@ -7,6 +7,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Each release now also publishes `arca-<version>-linux-aarch64`, beside the x86_64 binary and in `SHA256SUMS`, built
+on GitHub's arm64 runner with the same glibc 2.34 ceiling, so a Linux virtual machine on an ARM Mac can install and
+upgrade from a release. `install.sh` picks the binary by `uname -m`: `aarch64` and `arm64` get the aarch64 one,
+`x86_64` the x86_64 one, and any other machine is refused in plain words, as before.
+
 ## 0.21.0 (2026-11-13)
 
 A service made from `automagik-server` now follows Automagik's releases by itself: every 10 minutes (`follow.intervalSeconds`)
