@@ -3202,6 +3202,11 @@ pub fn service_view_schema() -> Value {
                 "maxItems": 4,
                 "type": "array"
             },
+            "noNewPrivileges": {
+                "const": true,
+                "description": "Present, and true, only on a container that runs with no-new-privileges: a setuid or setcap binary inside it cannot raise privileges. It comes from the template's noNewPrivileges and is kept in the service's record.",
+                "type": "boolean"
+            },
             "kernelAccess": {
                 "additionalProperties": false,
                 "description": "Present only on a service whose template declares kernelAccess: the service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given. service_status also answers ready and, when it is false, problem.",
@@ -3820,6 +3825,8 @@ pub fn summary_service_update(v: &Value) -> String {
         "Service's follow setting changed.".to_string()
     } else if v["updated"] == false {
         "Service already on that digest.".to_string()
+    } else if v.get("noNewPrivileges").is_some() {
+        "Service's no-new-privileges setting changed.".to_string()
     } else {
         "Service updated.".to_string()
     }
@@ -3853,6 +3860,10 @@ fn service_update_params_base() -> Value {
                 "type": "boolean"
             },
             "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter)."),
+            "noNewPrivileges": {
+                "description": "A proposal made with action_propose fills this in when the service's template says something different about no-new-privileges than the service has: the setting the update gives it, so the owner's card says that the service is restarted. A caller has no need to state it; if stated, it must be what the template says now. Give it with the digest the service already runs.",
+                "type": "boolean"
+            },
             "timeoutSeconds": {
                 "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent.",
                 "maximum": 900,
@@ -3875,13 +3886,21 @@ fn service_update_result() -> Value {
                 "type": "boolean"
             },
             "message": { "type": "string" },
+            "noNewPrivileges": {
+                "description": "Present when the call changed whether the service runs with no-new-privileges, to match its template: what it set. The service was restarted when it ran, and its image and data were not touched.",
+                "type": "boolean"
+            },
+            "restarted": {
+                "description": "Present with noNewPrivileges: whether the service was restarted for it (true when it was running).",
+                "type": "boolean"
+            },
             "service": { "type": "string" },
             "snapshot": {
                 "description": "The snapshot of the old version taken before the rebuild, or null when the service's project does not allow snapshots (no project Arca makes does). Absent when nothing was changed.",
                 "type": ["string", "null"]
             },
             "updated": {
-                "description": "False when the service already ran this digest and nothing was changed.",
+                "description": "False when the service already ran this digest and nothing was changed. True when the image moved, or when only the no-new-privileges setting changed to match the template.",
                 "type": "boolean"
             }
         },

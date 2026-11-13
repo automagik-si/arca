@@ -3861,6 +3861,19 @@ fn enrich_service_create(
         if tenant.is_some() && (template.lan.is_some() || template.publishable) {
             return Err(service_refused(tenant_host_port(&template.name)));
         }
+        // A tenant's project refuses `raw.lxc`, the only way Incus 7.5 sets no-new-privileges: refused before any write.
+        if tenant.is_some() && template.no_new_privileges {
+            return Err(service_refused(tenant_no_new_privileges(&template.name)));
+        }
+        // The owner is never shown a card for a create the node would refuse: the service project must allow
+        // low-level container config for this template.
+        if tenant.is_none()
+            && template.no_new_privileges
+            && let Some(why) =
+                no_new_privileges_refusal(&UnixIncus::new(cfg.incus.socket.clone()), &template.name)
+        {
+            return Err(service_refused(why));
+        }
         if let Some(refusal) = create_room_refusal(
             cfg,
             entries,
@@ -4042,6 +4055,39 @@ const DEPLOY_OUTSIDE_TENANT: &str = "deploy: only a call inside a tenant names a
 
 /// Why a tenant's virtual machine that names a host bridge is not made.
 const TENANT_BRIDGE: &str = "bridge: a virtual machine in a tenant joins the managed service network only, never a host bridge";
+
+/// Why the node's own service project cannot take a container with `noNewPrivileges`, or `None` when it can. Every
+/// project Arca makes is restricted, and Incus refuses `raw.lxc` in one unless `restricted.containers.lowlevel` is
+/// `allow`. A project that does not exist yet is made restricted with that key unset, so it counts as refusing; one
+/// that cannot be read decides nothing in its favour. Said before any write.
+pub(crate) fn no_new_privileges_refusal(read: &UnixIncus, template: &str) -> Option<String> {
+    let project = arca_netproject::PROJECT;
+    let why = match read.get(&format!("/1.0/projects/{project}?project={project}")) {
+        Ok(found) => {
+            let restricted = found["config"]["restricted"].as_str() == Some("true");
+            let allowed =
+                found["config"]["restricted.containers.lowlevel"].as_str() == Some("allow");
+            if !restricted || allowed {
+                return None;
+            }
+            "restricts low-level container config"
+        }
+        Err(arca_incus::IncusError::Status { code: 404, .. }) => {
+            "does not exist yet, and Arca makes it restricted"
+        }
+        Err(_) => "cannot be read to check it",
+    };
+    Some(format!(
+        "template {template}: noNewPrivileges needs the LXC config raw.lxc, and the Incus project {project} {why} (restricted.containers.lowlevel is not allow). Nothing was created"
+    ))
+}
+
+/// Why a tenant's service is not made from a template that sets `noNewPrivileges`.
+fn tenant_no_new_privileges(template: &str) -> String {
+    format!(
+        "template {template}: noNewPrivileges is for a service of the node's own project, never one in a tenant, whose project refuses the LXC config it needs"
+    )
+}
 
 /// Why a tenant's service is not made from a template that opens a port on the host or publishes.
 fn tenant_host_port(template: &str) -> String {
@@ -6010,6 +6056,7 @@ pub(crate) fn adopted_config(
         function: None,
         follow: None,
         follow_version: None,
+        no_new_privileges: false,
     })
 }
 
@@ -6218,6 +6265,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         function: None,
         follow: None,
         follow_version: None,
+        no_new_privileges: parts.template.no_new_privileges,
     })
 }
 
@@ -6301,6 +6349,7 @@ fn vm_service_config(
         function: None,
         follow: None,
         follow_version: None,
+        no_new_privileges: false,
     })
 }
 
@@ -6608,6 +6657,8 @@ impl ServiceHandler {
                 "timeoutSeconds",
                 "follow",
                 "eraseData",
+                // What an update of the service's no-new-privileges sets, so its card says it.
+                "noNewPrivileges",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
             ],
@@ -7589,11 +7640,20 @@ impl ServiceHandler {
                     if template.lan.is_some() || template.publishable {
                         return Err(service_refused(tenant_host_port(template_name)));
                     }
+                    if template.no_new_privileges {
+                        return Err(service_refused(tenant_no_new_privileges(template_name)));
+                    }
                     if let Some(refusal) =
                         create_room_refusal(&self.cfg, &all_entries, Some(scope), &name, &template)
                     {
                         return Err(refusal);
                     }
+                }
+                if template.no_new_privileges
+                    && tenant.is_none()
+                    && let Some(why) = no_new_privileges_refusal(&read, template_name)
+                {
+                    return Err(service_refused(why));
                 }
                 let ipv4 = self.free_address(
                     &read,

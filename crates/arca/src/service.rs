@@ -234,6 +234,10 @@ pub fn kernel_link_of(row: &Value) -> Option<KernelLink> {
     .then_some(link)
 }
 
+/// The `raw.lxc` value of a container whose template says `noNewPrivileges`: LXC sets `PR_SET_NO_NEW_PRIVS` on the
+/// container's init, so every process inside inherits it. Incus 7.5 has no config key of its own for this.
+pub const NO_NEW_PRIVS_RAW_LXC: &str = "lxc.no_new_privs=1";
+
 /// Where a virtual machine's guest finds its template's `settings`, as one JSON object.
 pub const GUEST_SETTINGS_PATH: &str = "/etc/arca/settings.json";
 /// The largest first-boot script a template may carry, in bytes.
@@ -317,6 +321,11 @@ pub struct ServiceConfig {
     /// names only: a service moved to another digest by hand has no known version until the follower learns it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_version: Option<FollowVersion>,
+    /// Set from the template's `noNewPrivileges`: the container runs with no-new-privileges, so a setuid or setcap
+    /// binary inside it cannot raise its privileges. Off in a record that never says it, so every older record and every
+    /// template without the key is created as it always was. Only a container of the node's own project carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_new_privileges: bool,
 }
 
 /// An image digest and the version Automagik published it as.
@@ -815,6 +824,9 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     if cfg.autostart {
         config.insert("boot.autostart".into(), json!("true"));
     }
+    if cfg.no_new_privileges {
+        config.insert("raw.lxc".into(), json!(NO_NEW_PRIVS_RAW_LXC));
+    }
     if cfg.function.is_some() {
         // The mark the writer of a run looks for, and a memory limit that swap does not stretch.
         config.insert(FUNCTION_KEY.into(), json!("true"));
@@ -1143,6 +1155,17 @@ impl Plugin for Service {
                     changes.insert(format!("environment.{key}"), None);
                 }
             }
+            // `raw.lxc` follows the record's `noNewPrivileges`. While the record says true, `raw.lxc` is Arca's: it is
+            // written as `lxc.no_new_privs=1`, replacing any other value. When the record says false, it is removed
+            // only if it is exactly that value; any other `raw.lxc` is not Arca's and is left as it is.
+            let raw = current.get("raw.lxc").and_then(Value::as_str);
+            if cfg.no_new_privileges {
+                if raw != Some(NO_NEW_PRIVS_RAW_LXC) {
+                    changes.insert("raw.lxc".into(), Some(NO_NEW_PRIVS_RAW_LXC.into()));
+                }
+            } else if raw == Some(NO_NEW_PRIVS_RAW_LXC) {
+                changes.insert("raw.lxc".into(), None);
+            }
             for key in [ENVKEYS_KEY, LINKS_KEY, PUBLISHED_KEY] {
                 let value = desired["config"]
                     .get(key)
@@ -1251,6 +1274,12 @@ pub struct Template {
     /// template, never one in a tenant.
     #[serde(default)]
     pub kernel_access: Option<KernelAccess>,
+    /// A container template whose service runs with no-new-privileges: a setuid or setcap binary inside it cannot raise
+    /// privileges. Off unless the template says `true`. Incus has no key of its own for it, so it is the LXC key
+    /// `lxc.no_new_privs` in the instance's `raw.lxc` ([`NO_NEW_PRIVS_RAW_LXC`]). Only a service of the node's own
+    /// project is created from such a template, never one in a tenant, whose project refuses `raw.lxc`.
+    #[serde(default)]
+    pub no_new_privileges: bool,
     /// A virtual-machine template whose service runs a version the template names: `{ "pin": "<a key of settings>" }`.
     /// No other kind sets it.
     #[serde(default)]
@@ -1813,6 +1842,11 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     {
         return refused(
             "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan or kernelAccess: they need a container's environment, image or devices",
+        );
+    }
+    if template.no_new_privileges {
+        return refused(
+            "a virtual machine has no noNewPrivileges: it is the LXC config of a container",
         );
     }
     if template.secrets.len() > 16 {
@@ -2716,6 +2750,66 @@ mod tests {
     }
 
     #[test]
+    fn no_new_privileges_is_a_template_key_off_by_default_and_a_virtual_machine_has_none() {
+        let template =
+            |value: Value| -> Template { serde_json::from_value(value).expect("a template") };
+        let base = json!({ "name": "app", "kind": "oci", "image": "docker.io/library/app" });
+        assert!(!template(base.clone()).no_new_privileges);
+        let mut on = base.clone();
+        on["noNewPrivileges"] = json!(true);
+        assert!(template(on).no_new_privileges);
+        // The key is spelled camelCase like every other, and a misspelling is refused, not ignored.
+        let mut snake = base.clone();
+        snake["no_new_privileges"] = json!(true);
+        assert!(serde_json::from_value::<Template>(snake).is_err());
+        // A virtual machine has no LXC config to carry it.
+        let mut vm = json!({
+            "name": "vm", "kind": "virtual-machine", "image": "images:debian/13",
+            "limits": { "cpu": "2", "memory": "4GiB" }, "rootSize": "20GiB", "noNewPrivileges": true
+        });
+        let dir = std::path::Path::new("/nonexistent");
+        assert!(validate_template(&template(vm.clone()), dir).is_err());
+        vm["noNewPrivileges"] = json!(false);
+        assert!(validate_template(&template(vm), dir).is_ok());
+    }
+
+    #[test]
+    fn a_records_no_new_privileges_renders_as_raw_lxc_and_an_older_record_renders_without_it() {
+        let record = |extra: Value| -> ServiceConfig {
+            let mut value = json!({
+                "name": "app", "template": "app", "instance": "app", "ipv4": "192.0.2.10",
+                "ports": [8080], "created": 0,
+                "source": { "type": "image", "protocol": "oci", "server": "https://docker.io", "alias": "library/app" },
+                "pool": "default", "project": PROJECT, "bridge": BRIDGE, "gateway": "192.0.2.1"
+            });
+            for (key, item) in extra.as_object().expect("object") {
+                value[key] = item.clone();
+            }
+            serde_json::from_value(value).expect("a record")
+        };
+        // A record written before the key existed is off, renders with no `raw.lxc`, and serializes without the key.
+        let old = record(json!({}));
+        assert!(!old.no_new_privileges);
+        assert!(create_body(&old)["config"].get("raw.lxc").is_none());
+        assert!(
+            serde_json::to_value(&old)
+                .expect("serialized")
+                .get("noNewPrivileges")
+                .is_none()
+        );
+        let on = record(json!({ "noNewPrivileges": true }));
+        assert_eq!(
+            create_body(&on)["config"]["raw.lxc"],
+            json!(NO_NEW_PRIVS_RAW_LXC)
+        );
+        assert_eq!(NO_NEW_PRIVS_RAW_LXC, "lxc.no_new_privs=1");
+        assert_eq!(
+            serde_json::to_value(&on).expect("serialized")["noNewPrivileges"],
+            json!(true)
+        );
+    }
+
+    #[test]
     fn the_image_of_a_template_is_what_boots_and_then_the_version_a_machine_runs() {
         let template =
             |value: Value| -> Template { serde_json::from_value(value).expect("a template") };
@@ -3175,6 +3269,10 @@ pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
     // Only a service with kernel access carries the key, so every other view is the one it always was.
     if let Some(link) = &cfg.kernel_access {
         view["kernelAccess"] = json!({ "port": link.port, "connect": link.connect });
+    }
+    // Only a service that runs with no-new-privileges carries the key.
+    if cfg.no_new_privileges {
+        view["noNewPrivileges"] = json!(true);
     }
     // Only a service that may reach a private address carries the key.
     if !cfg.destinations.is_empty() {

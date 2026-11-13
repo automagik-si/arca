@@ -897,3 +897,248 @@ fn a_follow_proposal_that_mixes_in_a_digest_or_erase_data_is_refused_when_it_is_
         0
     );
 }
+
+fn strict_app() -> Value {
+    let mut strict = app_template();
+    strict["noNewPrivileges"] = json!(true);
+    strict
+}
+
+fn record_flag(rig: &Rig) -> bool {
+    rig.service_config("app").no_new_privileges
+}
+
+#[test]
+fn a_service_gains_and_drops_no_new_privileges_through_an_update_with_a_restart_and_its_data_in_place()
+ {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    let before = instance(&rig);
+    assert!(before["config"].get("raw.lxc").is_none());
+    // Nothing differs: the update to the digest it runs is the no-op it always was.
+    let same = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("same");
+    assert_eq!(same["updated"], false);
+    // The template now says the key, and the project is as Arca makes it: restricted, low-level config blocked.
+    rig.template("app", strict_app());
+    let refused = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect_err("refused");
+    let message = format!("{refused:?}");
+    assert!(
+        message.contains("restricted.containers.lowlevel")
+            && message.contains("Nothing was changed"),
+        "{message}"
+    );
+    assert!(!record_flag(&rig), "the record was never saved");
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    // A digest that also moves is its own update: refused, and nothing changed.
+    rig.allow_low_level();
+    let mixed = update(&rig, json!({ "name": "app", "digest": NEW })).expect_err("mixed");
+    assert!(format!("{mixed:?}").contains("its own update"), "{mixed:?}");
+    assert!(!record_flag(&rig));
+    assert!(rig.fake.rebuilds(PROJECT, "app").is_empty());
+    // Allowed, the same digest gains the key: a config write and a restart, no rebuild, the data where it was.
+    let done = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("gain");
+    assert_eq!(done["updated"], true);
+    assert_eq!(done["noNewPrivileges"], true);
+    assert_eq!(done["restarted"], true);
+    let verb = arca_api::verb("service_update").expect("the verb");
+    arca_api::conforms(&(verb.result)(), &done).expect("the answer fits its schema");
+    let after = instance(&rig);
+    assert_eq!(after["config"]["raw.lxc"], "lxc.no_new_privs=1");
+    assert!(record_flag(&rig));
+    assert_eq!(after["status"], "Running");
+    assert!(rig.fake.rebuilds(PROJECT, "app").is_empty(), "no rebuild");
+    assert_eq!(after["devices"]["data"], before["devices"]["data"]);
+    assert_eq!(
+        after["config"]["volatile.uuid"],
+        before["config"]["volatile.uuid"]
+    );
+    // It now matches the template: another update to the same digest is the no-op again.
+    let again = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("again");
+    assert_eq!(again["updated"], false);
+    // The template drops the key: the next update takes it away the same way.
+    rig.template("app", app_template());
+    let dropped = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("drop");
+    assert_eq!(dropped["noNewPrivileges"], false);
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    assert!(!record_flag(&rig));
+    assert_eq!(instance(&rig)["devices"]["data"], before["devices"]["data"]);
+    let steps: Vec<String> = journal(&rig).into_iter().map(|(step, _)| step).collect();
+    assert!(steps.contains(&"apply".to_string()) && steps.contains(&"restart".to_string()));
+}
+
+#[test]
+fn a_no_new_privileges_write_the_node_cannot_apply_leaves_the_record_as_it_was() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    rig.template("app", strict_app());
+    rig.allow_low_level();
+    // Incus refuses the instance's config write after the node saved the record.
+    rig.fake.set_reject_patch("/1.0/instances/app");
+    let refused = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect_err("refused");
+    let message = format!("{refused:?}");
+    assert!(
+        message.contains("not applied") && message.contains("record is as it was"),
+        "{message}"
+    );
+    assert!(
+        !record_flag(&rig),
+        "the record claims nothing the instance lacks"
+    );
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    assert_eq!(instance(&rig)["status"], "Running");
+}
+
+#[test]
+fn a_service_that_does_not_come_back_healthy_with_the_key_gets_the_old_setting_back() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    rig.template("app", strict_app());
+    rig.allow_low_level();
+    // The restart is the node's own; the service then does not answer, as an image that needs a setuid helper would not.
+    up.store(false, Ordering::SeqCst);
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": DIGEST, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rolled_back");
+    assert!(
+        message.contains("did not come back healthy with no-new-privileges on")
+            && message.contains("The old setting is back"),
+        "{message}"
+    );
+    assert!(!record_flag(&rig), "the record names the old setting");
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    assert_eq!(instance(&rig)["status"], "Running");
+    let steps: Vec<(String, bool)> = journal(&rig);
+    assert!(steps.contains(&("health".to_string(), false)), "{steps:?}");
+    // The answer of a key change that went well says the service was restarted and answered.
+    up.store(true, Ordering::SeqCst);
+    let done = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("gain");
+    assert!(
+        done["message"]
+            .as_str()
+            .expect("message")
+            .contains("interrupts it"),
+        "{done}"
+    );
+}
+
+#[test]
+fn a_key_change_proposal_has_a_card_of_its_own_and_no_card_is_shown_for_what_the_run_would_refuse()
+{
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    // The template and the service agree: no key can be proposed.
+    let message = format!(
+        "{:?}",
+        propose_update(
+            &rig,
+            json!({ "name": "app", "digest": DIGEST, "noNewPrivileges": true })
+        )
+        .expect_err("refused")
+    );
+    assert!(
+        message.contains("says what the service already has"),
+        "{message}"
+    );
+    rig.template("app", strict_app());
+    rig.allow_low_level();
+    // A digest move while the key differs is refused when proposed, saying to do the key first.
+    let message = format!(
+        "{:?}",
+        propose_update(&rig, json!({ "name": "app", "digest": NEW })).expect_err("refused")
+    );
+    assert!(message.contains("its own update"), "{message}");
+    // The key's own proposal states no eraseData, and with it is refused: nothing is erased.
+    let message = format!(
+        "{:?}",
+        propose_update(
+            &rig,
+            json!({ "name": "app", "digest": DIGEST, "eraseData": true })
+        )
+        .expect_err("refused")
+    );
+    assert!(message.contains("erases nothing"), "{message}");
+    let proposed =
+        propose_update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("the proposal");
+    let summary = proposed["summary"].as_str().expect("a summary");
+    assert_eq!(
+        summary,
+        "Turn no-new-privileges on for the service app (restarting it if it runs)"
+    );
+    assert!(!summary.contains("ERASE"), "{proposed}");
+    let details = proposed["details"].to_string();
+    assert!(
+        details.contains("restarted, which interrupts it")
+            && details.contains("at its next start")
+            && details.contains("puts the old setting back")
+            && details.contains("nothing is erased"),
+        "{details}"
+    );
+    assert!(!details.contains("Erase data"), "{details}");
+    // On a stock project the proposal is refused, so the owner never approves a card the run refuses.
+    let rig = bare_rig(&up);
+    rig.template("app", strict_app());
+    let message = format!(
+        "{:?}",
+        propose_update(&rig, json!({ "name": "app", "digest": DIGEST })).expect_err("refused")
+    );
+    assert!(
+        message.contains("restricted.containers.lowlevel"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_service_that_stops_under_the_key_is_started_again_with_the_old_setting() {
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = bare_rig(&up);
+    rig.template("app", strict_app());
+    rig.allow_low_level();
+    // The container exits as soon as it is restarted: Incus would refuse to restart it, so the rollback starts it.
+    rig.fake.exit_after_start(PROJECT, "app", 1, "exited");
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": DIGEST, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rolled_back");
+    assert!(
+        message.contains("The old setting is back") && !message.contains("could not be restarted"),
+        "{message}"
+    );
+    assert!(!record_flag(&rig));
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    // No state change was refused: a restart of the stopped instance would have been ("already stopped").
+    let refused: Vec<String> = rig
+        .fake
+        .requests()
+        .into_iter()
+        .filter(|request| request.path.contains("/state") && request.status >= 400)
+        .map(|request| request.path)
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+#[test]
+fn no_new_privileges_does_not_go_with_follow() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    let message = format!(
+        "{:?}",
+        update(
+            &rig,
+            json!({ "name": "app", "follow": false, "noNewPrivileges": true })
+        )
+        .expect_err("refused")
+    );
+    assert!(message.contains("not with follow"), "{message}");
+    let message = format!(
+        "{:?}",
+        propose_update(
+            &rig,
+            json!({ "name": "app", "follow": true, "noNewPrivileges": false })
+        )
+        .expect_err("refused")
+    );
+    assert!(message.contains("not with follow"), "{message}");
+}

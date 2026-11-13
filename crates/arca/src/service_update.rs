@@ -297,6 +297,29 @@ fn erasing(config: &ServiceConfig, path: &str) -> CallError {
     ))
 }
 
+/// What the service's template says about no-new-privileges when it differs from what the service has: the setting an
+/// update gives it. `None` when they agree, when the template cannot be read, and in a tenant. The run and the
+/// proposal work it out the same way.
+fn key_change(cfg: &NodeConfig, config: &ServiceConfig) -> Option<bool> {
+    config
+        .tenant
+        .is_none()
+        .then(|| {
+            crate::service::load_template(&cfg.state_dir.join("templates"), &config.template).ok()
+        })
+        .flatten()
+        .map(|template| template.no_new_privileges)
+        .filter(|wanted| *wanted != config.no_new_privileges)
+}
+
+/// The refusal of an update that moves the digest while the template's no-new-privileges differs from the service's.
+fn key_first(name: &str, wanted: bool) -> CallError {
+    refused(format!(
+        "update service {name}: its template now {} noNewPrivileges, which is applied by its own update: call service_update with the digest the service already runs, then move the digest. Or move the digest first and change the template's key afterwards, which is safer for an image that needs a setuid helper. Nothing was changed",
+        if wanted { "sets" } else { "drops" }
+    ))
+}
+
 /// What a proposal of `service_update` is held to when it is made, so the owner is never shown a card for an update
 /// the node would refuse: one that mixes `follow` with what it does not go with, or that would erase the service's
 /// data without `eraseData`. Answers the arguments to record. A card that states `eraseData` for a service that has
@@ -325,6 +348,48 @@ pub(super) fn check_proposal(
     };
     if config.adopted || config.function.is_some() || config.vm.is_some() {
         return Ok(payload.clone());
+    }
+    // The key change the run will make, worked out as the run works it out. A same-digest proposal is that change
+    // alone, with a card of its own: it restarts the service and erases nothing, so it needs no `eraseData`, and a
+    // card that states it is refused. A digest move while the key differs is refused, so the owner never sees a card
+    // the run would refuse.
+    let wanted = key_change(cfg, &config);
+    let moves = payload["digest"]
+        .as_str()
+        .and_then(|digest| source_with(&config.source, digest))
+        .is_some_and(|source| source != config.source);
+    match (
+        wanted,
+        payload.get("noNewPrivileges").and_then(Value::as_bool),
+    ) {
+        (Some(wanted), _) if moves => return Err(key_first(name, wanted)),
+        (Some(wanted), stated) => {
+            if stated.is_some_and(|stated| stated != wanted) || erase {
+                return Err(CallError::Invalid(
+                    "noNewPrivileges, eraseData: the update at the digest the service runs only sets no-new-privileges to what its template says, and erases nothing".into(),
+                ));
+            }
+            if wanted
+                && let Some(why) = crate::handlers::no_new_privileges_refusal(
+                    &arca_incus::UnixIncus::new(cfg.incus.socket.clone()),
+                    &config.template,
+                )
+            {
+                return Err(refused(format!(
+                    "update service {name}: {}",
+                    why.replace("Nothing was created", "Nothing was changed")
+                )));
+            }
+            let mut keyed = payload.clone();
+            keyed["noNewPrivileges"] = json!(wanted);
+            return Ok(keyed);
+        }
+        (None, Some(_)) => {
+            return Err(CallError::Invalid(
+                "noNewPrivileges: the service's template says what the service already has".into(),
+            ));
+        }
+        (None, None) => {}
     }
     let Ok(changer) = state_changer_for(cfg, &config) else {
         return Ok(payload.clone());
@@ -355,6 +420,12 @@ fn conflicts(args: &Value) -> Result<(), CallError> {
     if args.get("eraseData").is_some() {
         return Err(CallError::Invalid(
             "eraseData: give it with a digest, not with follow".into(),
+        ));
+    }
+    if args.get("noNewPrivileges").is_some() {
+        return Err(CallError::Invalid(
+            "noNewPrivileges: it is set by an update at the service's digest, not with follow"
+                .into(),
         ));
     }
     Ok(())
@@ -538,6 +609,35 @@ impl ServiceHandler {
         } else {
             Reach::Running
         };
+        // What the template says now about no-new-privileges, against what the service has. A difference is applied
+        // as a config write and a restart, never a rebuild, so the data stays where it is. It is its own step: an
+        // update that also moves the digest is refused, so no answer mixes the two and a failure of one never
+        // leaves the other half done.
+        let wanted = key_change(&self.cfg, &config);
+        if let Some(wanted) = wanted {
+            if new_source != config.source {
+                return Err(key_first(&name, wanted));
+            }
+            // A card the owner approved names the setting it gave: the template must still say it.
+            if let Some(stated) = args.get("noNewPrivileges")
+                && stated.as_bool() != Some(wanted)
+            {
+                return Err(said(
+                    "noNewPrivileges is not what the template says now. Nothing was changed",
+                ));
+            }
+            let key = KeyUpdate {
+                port,
+                reach,
+                seconds,
+            };
+            return self.change_no_new_privileges(&entry, &config, wanted, &digest, key);
+        }
+        if args.get("noNewPrivileges").is_some() {
+            return Err(said(
+                "noNewPrivileges: the service's template says what the service already has. Nothing was changed",
+            ));
+        }
         if new_source == config.source {
             return Ok(json!({
                 "updated": false,
@@ -621,6 +721,208 @@ impl ServiceHandler {
         drop(claim);
         outcome
     }
+}
+
+impl ServiceHandler {
+    /// Makes a service's no-new-privileges what its template says: the record, the instance's `raw.lxc` and a restart
+    /// when it runs, in that order, and nothing else. The image and the data volume are not touched. The project is
+    /// checked first when the key is gained; a record the node saved and could not apply, or a restart that failed,
+    /// is put back, so every answer says what is true.
+    fn change_no_new_privileges(
+        &self,
+        entry: &Entry,
+        config: &ServiceConfig,
+        wanted: bool,
+        digest: &str,
+        key: KeyUpdate,
+    ) -> Result<Value, CallError> {
+        let name = &config.name;
+        let said = |why: &str| refused(format!("update service {name}: {why}"));
+        let _claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
+            .ok_or_else(|| {
+                said("another update of this service is running. Nothing was changed")
+            })?;
+        let changer = self.state_changer(config)?;
+        let seen = changer
+            .read(&config.project, &config.instance)
+            .map_err(|error| {
+                said(&format!(
+                    "its instance was not read ({}). Nothing was changed",
+                    incus_words(&error)
+                ))
+            })?;
+        let journalled = lock(&self.kernel)?.service_uuid(&entry.id, &config.instance);
+        if seen.kind != "container" || journalled.is_none() || journalled != seen.uuid {
+            return Err(said(
+                "its instance is not the one Arca created for it. Nothing was changed",
+            ));
+        }
+        if wanted
+            && let Some(why) = crate::handlers::no_new_privileges_refusal(
+                &arca_incus::UnixIncus::new(self.cfg.incus.socket.clone()),
+                &config.template,
+            )
+        {
+            return Err(refused(format!(
+                "update service {name}: {}",
+                why.replace("Nothing was created", "Nothing was changed")
+            )));
+        }
+        let journal = Journal {
+            path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
+            id: format!("{}-{}", entry.id.0, (self.clock)()),
+            service: name.clone(),
+            clock: self.clock.clone(),
+        };
+        journal
+            .line(
+                "begin",
+                true,
+                json!({ "noNewPrivileges": wanted, "digest": digest, "rebuild": false }),
+            )
+            .map_err(|_| said("the update journal could not be written. Nothing was changed"))?;
+        // The node saves the record before it writes the instance, so a refused write leaves the new value saved:
+        // it is put back here, and the answer says whether that worked.
+        let put_back = || {
+            self.amend(&entry.id.0, name, |record| {
+                record.no_new_privileges = !wanted
+            })
+            .is_ok()
+        };
+        if let Err(error) = self.amend(&entry.id.0, name, |record| {
+            record.no_new_privileges = wanted
+        }) {
+            let said_so = match &error {
+                CallError::Refused { message, .. } | CallError::Invalid(message) => message.clone(),
+                _ => "the node did not apply it".to_string(),
+            };
+            let restored = put_back();
+            journal.step("apply", false, json!({ "restored": restored }));
+            return Err(refused(format!(
+                "update service {name}: noNewPrivileges was not applied: {said_so}. {}",
+                if restored {
+                    "The service's record is as it was. Nothing was changed"
+                } else {
+                    "The service's record could not be put back: service_status shows what it says"
+                }
+            )));
+        }
+        journal.step("apply", true, json!({}));
+        let was_running = seen.is_running();
+        if was_running && let Err(error) = changer.change(&seen, StateAction::Restart) {
+            let restored = put_back();
+            let running = changer
+                .read(&config.project, &config.instance)
+                .map(|state| state.is_running())
+                .unwrap_or(false);
+            let started = running
+                || changer
+                    .read(&config.project, &config.instance)
+                    .and_then(|state| changer.change(&state, StateAction::Start))
+                    .is_ok();
+            journal.step(
+                "restart",
+                false,
+                json!({ "restored": restored, "running": started }),
+            );
+            return Err(refused(format!(
+                "update service {name}: the restart failed ({}). {} {}",
+                incus_words(&error),
+                if restored {
+                    "The service's record and its instance's config are as they were."
+                } else {
+                    "The service's record could not be put back: service_status shows what it says."
+                },
+                if started {
+                    "The service is running."
+                } else {
+                    "The service is stopped: instance_start starts it."
+                },
+            )));
+        }
+        journal.step("restart", true, json!({ "restarted": was_running }));
+        // The same health check a digest update runs, within the call's timeout: a service that does not come back
+        // (an image whose setuid helper breaks under the key, say) gets the old setting back and a restart.
+        if was_running {
+            let run = Run {
+                handler: self,
+                changer: &changer,
+                config,
+                entry,
+                new_source: &config.source,
+                digest,
+                port: key.port,
+                reach: key.reach,
+                seconds: key.seconds,
+                registry: None,
+                journal: &journal,
+                was_running,
+            };
+            if let Err(failure) = run.healthy() {
+                journal.step("health", false, json!({ "why": failure.why }));
+                let restored = put_back();
+                let restarted = changer
+                    .read(&config.project, &config.instance)
+                    .and_then(|state| {
+                        // Incus refuses to restart a stopped instance: start it, restart a running one.
+                        let action = if state.is_running() {
+                            StateAction::Restart
+                        } else {
+                            StateAction::Start
+                        };
+                        changer.change(&state, action)
+                    })
+                    .is_ok();
+                let answers = restarted && run.answers_within(key.seconds.min(OLD_ANSWERS_SECONDS));
+                journal.step(
+                    "end",
+                    false,
+                    json!({ "rolledBack": restored, "restarted": restarted, "answers": answers }),
+                );
+                return Err(CallError::Refused {
+                    code: "rolled_back".into(),
+                    message: format!(
+                        "update service {name}: it did not come back healthy with no-new-privileges {}: {}. {} {}",
+                        if wanted { "on" } else { "off" },
+                        failure.why,
+                        if restored {
+                            "The old setting is back, in its record and in its instance's config."
+                        } else {
+                            "The old setting could not be put back in its record: service_status shows what it says."
+                        },
+                        if !restarted {
+                            "It could not be restarted again: instance_start starts it."
+                        } else if answers {
+                            "It was restarted again and its port answers."
+                        } else {
+                            "It was restarted again, but its port did not answer yet: service_status and service_logs show how it is."
+                        },
+                    ),
+                });
+            }
+            journal.step("health", true, json!({ "port": key.port }));
+        }
+        journal.step("end", true, json!({ "noNewPrivileges": wanted }));
+        Ok(json!({
+            "updated": true,
+            "service": name,
+            "digest": digest,
+            "noNewPrivileges": wanted,
+            "restarted": was_running,
+            "message": format!(
+                "the service now runs {} no-new-privileges, as its template says{}; its image and data were not touched",
+                if wanted { "with" } else { "without" },
+                if was_running { ", and was restarted for it (the restart interrupts it) and answered its health check" } else { ", from its next start" },
+            ),
+        }))
+    }
+}
+
+/// What the health check after a key update needs: the port it tries, how it reaches it, and how long it waits.
+struct KeyUpdate {
+    port: u16,
+    reach: Reach,
+    seconds: u64,
 }
 
 /// How the node tells that a service answers.

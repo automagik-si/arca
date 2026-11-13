@@ -894,6 +894,47 @@ Templates may also set `limits` with an optional decimal-string `cpu` and/or a s
 shared profile. `cpu`, `memory` and a data `size` must start with a digit 1-9; zero is refused. `autostart` defaults to
 false; true sets `boot.autostart=true`.
 
+`noNewPrivileges` defaults to false. With `true` the container runs with no-new-privileges: the kernel's
+`PR_SET_NO_NEW_PRIVS` is set on its init, so a setuid or setcap binary inside it (`su`, `passwd`, `mount`) cannot raise
+privileges, and a process started with `incus exec` has it too. The key makes the whole container no-new-privileges, not
+only one user: an image that needs a setuid helper to work inside it will not. Incus 7.5 has no config key of its own
+for this, so a create writes the LXC key through the instance's `raw.lxc`: `lxc.no_new_privs=1`. Without the key, or
+with `false`, the create carries no `raw.lxc`, as always.
+
+**It needs a step on the node first.** Every project Arca makes, the service project `arcak-svc` included, is created
+restricted, and Incus refuses any `raw.*` key in a restricted project unless `restricted.containers.lowlevel` is
+`allow`. Arca does not set that key itself. Someone with Incus admin rights on the node (root) runs
+`incus project set arcak-svc restricted.containers.lowlevel=allow`, and Arca keeps the value. What it loosens: the key
+is all or nothing for the project. `allow` admits every `raw.*` key (`raw.lxc`, `raw.apparmor`, `raw.seccomp`,
+`raw.idmap`) and the other low-level keys (the table in "Adopting a container" lists them) on every instance in `arcak-svc`,
+not only on the services that set `noNewPrivileges`; only Arca writes instances there, and it writes `raw.lxc` for this
+key alone. Until it is allowed, a `service_create` or `service_update` of such a template is refused before anything is
+written, naming the key; so is a create on a node whose service project does not exist yet, since Arca would make it
+restricted. A tenant's project blocks it for good: a tenant's service is refused, and so is a virtual-machine template.
+
+The service's record keeps `noNewPrivileges: true`, and `service_list` and `service_status` show `noNewPrivileges: true`
+for such a service and no such key for any other. An existing service gains or loses the key without being removed or
+rebuilt: change `noNewPrivileges` in its template (`arca templates install`), then call `service_update` with the digest
+the service already runs. When the template and the service differ, that call checks the project as above, saves the
+record, writes `raw.lxc` into the instance and **restarts it if it runs, which interrupts it**. The setting takes effect
+at the next start, so a stopped service has it from then and is not restarted. The image and the data volume are not
+touched and nothing is rebuilt. After the restart the call runs the same health check as a digest update (the service's
+first port must answer, or the instance must stay running) and honours `timeoutSeconds`. If the write is refused, the
+restart fails or the service does not come back healthy, the old setting is put back in the record and in the instance's
+config, the service is restarted again, and the answer says so (`rolled_back` for the health check). The answer says
+`noNewPrivileges` and `restarted`. A proposal for it (`action_propose`) gets a card of its own: it says it turns
+no-new-privileges on or off, restarts the service, puts the old setting back if the service does not come back healthy,
+and erases nothing; it states no `eraseData`. A call, and a proposal, that also moves the digest are refused while the
+template's key differs from the service's, so the owner never approves a card the run would refuse. The two orders both
+work: the key first, at the digest the service runs, then the digest; or the digest first, then edit the template and
+apply the key. For an image whose setuid helpers break under the key, moving the digest first is the safer order, since
+the service then runs the new image before it takes the key. With no difference, an update to the digest the service
+already runs is the no-op it always was.
+
+If the owner later sets `restricted.containers.lowlevel` back to `block`, Incus refuses every later write of the
+instance config of a service that has the key, since the whole config is checked: a secret, a link or an environment
+change then fails for that service. Dropping the key still works, through the update above.
+
 `data` names an absolute printable mount `path` of at most 255 bytes that is not the root (`/`, `//` and `/.` are
 refused) and has no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit), and an optional `size` such as
 `8GiB`. Arca creates a custom volume `<service>-data` in the service project's storage pool before the instance, setting
@@ -3802,7 +3843,8 @@ virtual-machine template may also set `description` and `autostart`, and `ports`
 to link to it: a link opens the port in the managed service network's ACL, so a template with `ports` is refused on a
 host bridge. It may also set `firstBoot`, `settings` and `secrets`, which "First boot, settings and secrets of a
 virtual machine" below describes. It may not set `env`, `generate`, `entrypoint`, `publishable`, `dashPort`,
-`droiddPort`, `data` or `lan`: each of those depends on a container's environment, image or devices.
+`droiddPort`, `data` or `lan`: each of those depends on a container's environment, image or devices. It may not set
+`noNewPrivileges` either: that is the LXC config of a container.
 
 `service_create` takes two more arguments for a virtual-machine template:
 
