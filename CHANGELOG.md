@@ -7,11 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.29.0 (2026-11-13)
+
 A function whose `command` is a shell and its script (`["/bin/sh", "-c", <script>]`) now starts on a node whose Incus
 links liblxc 5.0 or older too: the script goes as the one word a service template's script goes as, so the image needs
 `base64`. A function created earlier keeps the entrypoint it was made with: where it does not start, remove it and
 create it again. A service template's script may again be about 32,700 bytes (it was about 24,500 since 0.27.0): the
 entrypoint cap is now 43,760 bytes, measured on the base64 that is sent.
+
+- Merge PR 165: a function's shell script goes as one word
 
 ## 0.28.0 (2026-11-13)
 
