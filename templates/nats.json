@@ -1,13 +1,15 @@
 {
   "name": "nats",
-  "description": "NATS 2.10 (the public nats:2.10-alpine by digest) with JetStream on, storing under /data/jetstream. A link gives NATS_URL.",
+  "description": "NATS 2.14 (the public nats:2.14.10-alpine by digest) with JetStream on a data volume at /data, every message fsynced, a JetStream domain named after the service, a leaf node listener on 7422 for one leaf user whose password is the NATS_LEAF_PASSWORD secret, and monitoring on 8222. Clients on 4222 need no login: only linked services reach it. A link gives NATS_URL.",
   "kind": "oci",
   "image": "docker.io/library/nats",
-  "digest": "sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
-  "entrypoint": ["/usr/local/bin/nats-server", "--jetstream", "--store_dir", "/data/jetstream", "--port", "4222"],
-  "ports": [4222],
+  "digest": "sha256:311da47e2f31c26e99c623cd78d486a1e8ab039c49b32652770bb91a4f70512e",
+  "entrypoint": ["/bin/sh", "-ec", { "file": "nats.sh" }, "nats"],
+  "ports": [4222, 7422, 8222],
   "data": { "path": "/data", "uid": 0, "gid": 0, "size": "10GiB" },
-  "env": {},
+  "env": { "NATS_LEAF_PASSWORD": "{{secret:NATS_LEAF_PASSWORD}}", "NATS_DOMAIN": "{{name}}" },
+  "secrets": ["NATS_LEAF_PASSWORD"],
+  "generate": { "NATS_LEAF_PASSWORD": "" },
   "provides": { "env": { "NATS_URL": "nats://{{host}}:{{port}}" } },
   "publishable": false
 }

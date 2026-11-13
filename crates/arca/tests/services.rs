@@ -2375,12 +2375,13 @@ fn the_eleven_templates_and_nothing_else_load_and_are_pinned() {
     assert!(automagik.publishable);
     assert_eq!(automagik.dash_port, Some(3080));
     let nats = service::load_template(&dir, "nats").unwrap();
+    // JetStream is switched on by the configuration its script writes.
     assert!(
         nats.entrypoint
             .as_ref()
             .unwrap()
             .iter()
-            .any(|v| v == "--jetstream")
+            .any(|v| v.get("file").and_then(Value::as_str) == Some("nats.sh"))
     );
     assert!(!nats.publishable);
     let pg = service::load_template(&dir, "postgres-autopg").unwrap();
@@ -3236,13 +3237,16 @@ fn the_automagik_build_names_its_image_after_every_input_it_builds_with() {
 fn template_entrypoints_nats_jetstream_and_autopg_postgres() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let nats = service::load_template(&dir, "nats").unwrap();
+    // JetStream is switched on by the configuration its script writes (`nats.sh`), no longer by a flag.
     assert!(
         nats.entrypoint
             .as_ref()
             .unwrap()
             .iter()
-            .any(|v| v == "--jetstream")
+            .any(|v| v.get("file").and_then(Value::as_str) == Some("nats.sh"))
     );
+    let script = std::fs::read_to_string(dir.join("nats.sh")).unwrap();
+    assert!(script.contains("jetstream {") && script.contains("sync_interval: always"));
     let pg = service::load_template(&dir, "postgres-autopg").unwrap();
     assert!(
         pg.entrypoint
@@ -3308,6 +3312,8 @@ mod follow;
 mod golden;
 #[path = "services/kernel_access.rs"]
 mod kernel_access;
+#[path = "services/nats.rs"]
+mod nats;
 #[path = "services/omni.rs"]
 mod omni;
 #[path = "services/private_port.rs"]
@@ -4372,6 +4378,7 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
     }
     assert_eq!(templates, 11);
     assert!(installed.contains(&"postgres-autopg.sh"));
+    assert!(installed.contains(&"nats.sh"));
     assert!(installed.contains(&"github-runner-pool.sh"));
     // One script serves both sizes of the GitLab pool.
     assert!(installed.contains(&"gitlab-runner-pool.sh"));

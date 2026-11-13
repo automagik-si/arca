@@ -276,6 +276,11 @@ fn repo_template(rig: &Rig, name: &str) {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let text = fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
     rig.template(name, serde_json::from_str(&text).unwrap());
+    // The script its entrypoint reads goes beside it.
+    if name == "nats" {
+        let script = fs::read_to_string(dir.join("nats.sh")).unwrap();
+        fs::write(rig.dir.join("templates/nats.sh"), script).unwrap();
+    }
 }
 
 fn operator() -> Caller {
