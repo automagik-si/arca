@@ -2275,7 +2275,7 @@ impl arca_mcp::TerminalApprover for TerminalApproval {
         })
     }
 
-    fn approve(&self, plan: &str, caller: &Caller) -> Result<Value, CallError> {
+    fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError> {
         // Only the admin token approves here, whoever else reaches this.
         if caller.scope != Scope::Admin {
             return Err(CallError::Forbidden {
@@ -2288,7 +2288,7 @@ impl arca_mcp::TerminalApprover for TerminalApproval {
         let run_as = format!("{TERMINAL_CALLER}{}", caller.token_id);
         run_approved(&self.kernel, &self.actions, &run_as, |kernel| {
             kernel
-                .approve_action_in_terminal(plan, &caller.token_id, now)
+                .approve_action_in_terminal(plan, &caller.token_id, created_at, now)
                 .map_err(action_approval_failure)
         })
     }

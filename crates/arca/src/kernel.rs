@@ -349,20 +349,25 @@ impl Kernel {
     /// Approves the action proposal `id` in the terminal of the admin token `token`, with no passkey proof: the same checks
     /// as [`Kernel::approve_action`] but the owner verifier's, and the journal says who approved it and where. That is a
     /// client's answer, never the owner's passkey, and the journal never says "by the owner".
+    ///
+    /// `created_ms` is the creation time of the proposal the question stated: only that record is approved. A proposal the
+    /// owner decided on the card meanwhile and that was proposed again has the same id and another creation time, and is
+    /// refused as no longer waiting.
     pub fn approve_action_in_terminal(
         &mut self,
         id: &str,
         token: &str,
+        created_ms: u64,
         now_ms: u64,
     ) -> Result<ApprovedAction, ActionApprovalError> {
-        self.approve_action_proved(id, None, Some(token), now_ms)
+        self.approve_action_proved(id, None, Some((token, created_ms)), now_ms)
     }
 
     fn approve_action_proved(
         &mut self,
         id: &str,
         approval: Option<&str>,
-        terminal_token: Option<&str>,
+        terminal: Option<(&str, u64)>,
         now_ms: u64,
     ) -> Result<ApprovedAction, ActionApprovalError> {
         let proposal = self
@@ -372,6 +377,11 @@ impl Kernel {
             .ok_or(ActionApprovalError::NoSuch)?;
         if proposal.expired(now_ms) {
             return Err(ActionApprovalError::Expired);
+        }
+        if let Some((_, created_ms)) = terminal
+            && proposal.created_ms != created_ms
+        {
+            return Err(ActionApprovalError::NoSuch);
         }
         let action = ActionKind::from_name(&proposal.action).ok_or_else(|| {
             ActionApprovalError::Store(KernelError::Io {
@@ -415,7 +425,7 @@ impl Kernel {
                 .map_err(ActionApprovalError::Approval)?;
         }
         let by =
-            terminal_token.map(|token| format!("approved in the terminal by admin token {token}"));
+            terminal.map(|(token, _)| format!("approved in the terminal by admin token {token}"));
         self.action_proposals
             .approve_noting(id, by.as_deref())
             .map_err(|error| {

@@ -292,9 +292,6 @@ async fn call_tool(
     let terminal = terminal_for(server, caller, params, era);
     let call = crate::elicit::call_digest(name, &arguments);
     let mut asking = terminal.is_some();
-    // On a `2026-07-28` retry that accepted: the plan the signed state names. The call runs as ever, so the reply can carry
-    // the proposal itself, and the plan is approved only if the call still answers with that very plan waiting.
-    let mut approve_plan: Option<String> = None;
     if let (Some(terminal), Era::Modern) = (terminal, era)
         && let Some(state) = params.get("requestState").and_then(Value::as_str)
     {
@@ -308,7 +305,7 @@ async fn call_tool(
                 )));
             }
             crate::elicit::State::Expired => asking = false,
-            crate::elicit::State::Plan(plan) => {
+            crate::elicit::State::Plan { plan, proposal } => {
                 let answer = params
                     .get("inputResponses")
                     .and_then(|responses| responses.get(crate::elicit::APPROVE_KEY));
@@ -322,7 +319,17 @@ async fn call_tool(
                             None,
                         )));
                     }
-                    approve_plan = Some(plan);
+                    // The call is not run again: only the exact proposal the question stated is approved, and the
+                    // reply is built from it, so a plan the owner decided meanwhile is never approved by this yes.
+                    let approving = Approving {
+                        verb: *verb,
+                        proposal,
+                        only_looks: server.only_looks,
+                        log: Arc::clone(&server.log),
+                    };
+                    return Ok(Some(
+                        approved_reply(terminal, caller, id, &plan, approving).await,
+                    ));
                 }
                 // A decline, a cancel or no answer leaves the plan waiting: the call answers as it would without asking.
                 asking = false;
@@ -368,22 +375,6 @@ async fn call_tool(
                     tool_failure("internal", "the tool failed"),
                 )));
             }
-            if let (Some(terminal), Some(plan)) = (terminal, &approve_plan)
-                && terminal
-                    .approver
-                    .pending(name, &value)
-                    .is_some_and(|pending| &pending.id == plan)
-            {
-                let approving = Approving {
-                    verb: *verb,
-                    proposal: value,
-                    only_looks: server.only_looks,
-                    log: Arc::clone(&server.log),
-                };
-                return Ok(Some(
-                    approved_reply(terminal, caller, id, plan, approving).await,
-                ));
-            }
             let waiting = terminal
                 .filter(|_| asking)
                 .and_then(|t| t.approver.pending(name, &value).map(|plan| (t, plan)));
@@ -402,7 +393,13 @@ async fn call_tool(
             };
             match era {
                 Era::Modern => {
-                    let state = terminal.sign(&caller.token_id, &plan.id, &call, now_seconds());
+                    let state = terminal.sign(
+                        &caller.token_id,
+                        &plan.id,
+                        &approving.proposal,
+                        &call,
+                        now_seconds(),
+                    );
                     Ok(Some(result_reply(
                         id,
                         input_required(&plan.message, &state),
@@ -556,8 +553,11 @@ async fn approved_reply(
     approving: Approving,
 ) -> Value {
     let approver = Arc::clone(&terminal.approver);
+    let created_at = approving.proposal["createdAt"].as_u64().unwrap_or(0);
     let (owned_caller, plan) = (caller.clone(), plan.to_string());
-    let run = tokio::task::spawn_blocking(move || approver.approve(&plan, &owned_caller)).await;
+    let run =
+        tokio::task::spawn_blocking(move || approver.approve(&plan, created_at, &owned_caller))
+            .await;
     match run {
         Ok(Ok(output)) => {
             let Approving {

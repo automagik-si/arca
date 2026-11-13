@@ -10,6 +10,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,11 +31,12 @@ const VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
 const CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
 const PLAN: &str = "act-0123456789ab";
 
-/// What `action_propose` answers: one waiting proposal.
-struct Propose;
+/// What `action_propose` answers: one waiting proposal. It counts its calls.
+struct Propose(Arc<AtomicUsize>);
 
 impl ToolHandler for Propose {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
         Ok(json!({
             "kind": "action", "id": PLAN, "action": "service_remove",
             "summary": "Remove the service demo",
@@ -51,6 +53,10 @@ impl ToolHandler for Propose {
 #[derive(Default)]
 struct Approver {
     approved: Mutex<Vec<(String, String)>>,
+    /// The `created_at` each approval named.
+    created: Mutex<Vec<u64>>,
+    /// Answer as the node does when the proposal is no longer waiting.
+    gone: AtomicBool,
 }
 
 impl TerminalApprover for Approver {
@@ -64,7 +70,14 @@ impl TerminalApprover for Approver {
         })
     }
 
-    fn approve(&self, plan: &str, caller: &Caller) -> Result<Value, CallError> {
+    fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError> {
+        if self.gone.load(Ordering::SeqCst) {
+            return Err(CallError::Refused {
+                code: "NoSuchPlan".to_string(),
+                message: "no such plan".to_string(),
+            });
+        }
+        self.created.lock().expect("lock").push(created_at);
         self.approved
             .lock()
             .expect("lock")
@@ -82,6 +95,7 @@ struct Fixture {
     admin: String,
     operator: String,
     approver: Arc<Approver>,
+    proposed: Arc<AtomicUsize>,
 }
 
 impl Fixture {
@@ -92,7 +106,9 @@ impl Fixture {
         let operator = mint_into(scratch.path(), "op-1", Scope::Operator);
         let tokens = TokenStore::load(scratch.path()).expect("the store loads");
         let approver = Arc::new(Approver::default());
-        let mut server = Server::new(verbs(), tokens).handle("action_propose", Arc::new(Propose));
+        let proposed = Arc::new(AtomicUsize::new(0));
+        let mut server = Server::new(verbs(), tokens)
+            .handle("action_propose", Arc::new(Propose(Arc::clone(&proposed))));
         if wired {
             server = server
                 .terminal_approval(approver.clone() as Arc<dyn TerminalApprover>)
@@ -110,6 +126,7 @@ impl Fixture {
             admin,
             operator,
             approver,
+            proposed,
         }
     }
 
@@ -574,5 +591,73 @@ fn a_client_that_declared_url_mode_alone_is_not_sent_a_form() {
     assert_eq!(reply.header("content-type"), Some("application/json"));
     let modern = fixture.modern_call(&fixture.admin, url_only, json!({}), propose_args());
     assert_eq!(modern.json()["result"]["resultType"], "complete");
+    assert!(fixture.approvals().is_empty());
+}
+
+#[test]
+fn a_modern_yes_approves_the_proposal_that_was_shown_and_does_not_run_the_call_again() {
+    let fixture = Fixture::start("modern-exact", true, Duration::from_secs(5));
+    let first = fixture.modern_call(&fixture.admin, form(), json!({}), propose_args());
+    let state = first.json()["result"]["requestState"]
+        .as_str()
+        .expect("state")
+        .to_string();
+    assert_eq!(fixture.proposed.load(Ordering::SeqCst), 1);
+    let yes = json!({ "action": "accept", "content": { "approve": "yes" } });
+    let done = fixture
+        .modern_call(
+            &fixture.admin,
+            form(),
+            json!({ "requestState": state, "inputResponses": { "approve": yes } }),
+            propose_args(),
+        )
+        .json();
+    assert_eq!(
+        done["result"]["structuredContent"]["approvedIn"], "terminal",
+        "{done}"
+    );
+    assert_eq!(
+        fixture.proposed.load(Ordering::SeqCst),
+        1,
+        "the accept did not run the proposal handler again: a proposal made since is never approved by it"
+    );
+    assert_eq!(
+        fixture.approver.created.lock().expect("lock").clone(),
+        vec![1],
+        "it names the shown record"
+    );
+    assert_fits_the_advertised_schema(&done["result"]["structuredContent"]);
+}
+
+#[test]
+fn a_yes_for_a_plan_that_is_no_longer_waiting_is_refused_and_runs_nothing() {
+    let fixture = Fixture::start("gone", true, Duration::from_secs(5));
+    // 2026-07-28
+    let first = fixture.modern_call(&fixture.admin, form(), json!({}), propose_args());
+    let state = first.json()["result"]["requestState"]
+        .as_str()
+        .expect("state")
+        .to_string();
+    fixture.approver.gone.store(true, Ordering::SeqCst);
+    let yes = json!({ "action": "accept", "content": { "approve": "yes" } });
+    let done = fixture
+        .modern_call(
+            &fixture.admin,
+            form(),
+            json!({ "requestState": state, "inputResponses": { "approve": yes.clone() } }),
+            propose_args(),
+        )
+        .json();
+    assert_eq!(done["error"]["data"]["refusal"], "NoSuchPlan", "{done}");
+    assert!(done["result"].is_null(), "no result says it ran");
+    // 2025-11-25
+    fixture.approver.gone.store(false, Ordering::SeqCst);
+    fixture.initialize(&fixture.admin, form());
+    let mut call = Stream::open(&fixture, &fixture.admin);
+    let id = call.request()["id"].clone();
+    fixture.approver.gone.store(true, Ordering::SeqCst);
+    answer(&fixture, &fixture.admin, &id, yes);
+    let reply = call.reply();
+    assert_eq!(reply["error"]["data"]["refusal"], "NoSuchPlan", "{reply}");
     assert!(fixture.approvals().is_empty());
 }

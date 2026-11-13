@@ -47,7 +47,11 @@ pub trait TerminalApprover: Send + Sync {
 
     /// Approves plan `plan` in the terminal for the admin token `caller` and runs it, as the web card's approval does,
     /// recording that it was approved in the terminal by that token. Returns what the run answered.
-    fn approve(&self, plan: &str, caller: &Caller) -> Result<Value, CallError>;
+    ///
+    /// `created_at` is the creation time of the very proposal the question stated. It approves that record only: a plan
+    /// the owner decided on the card meanwhile, and proposed again after, is another record with the same id, and is
+    /// refused.
+    fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError>;
 }
 
 /// The server's side of terminal approval.
@@ -142,10 +146,18 @@ impl Terminal {
             .is_none()
     }
 
-    /// The `requestState` for a plan: signed, naming the token, the plan, the call and an expiry.
-    pub(crate) fn sign(&self, token: &str, plan: &str, call: &str, now_s: u64) -> String {
+    /// The `requestState` for a plan: signed, naming the token, the plan, the proposal that was shown (so the reply is built
+    /// from it and the approval binds its creation time), the call and an expiry.
+    pub(crate) fn sign(
+        &self,
+        token: &str,
+        plan: &str,
+        proposal: &Value,
+        call: &str,
+        now_s: u64,
+    ) -> String {
         let payload = json!({
-            "t": token, "p": plan, "c": call, "x": now_s + self.timeout.as_secs()
+            "t": token, "p": plan, "v": proposal, "c": call, "x": now_s + self.timeout.as_secs()
         })
         .to_string();
         let body = URL_SAFE_NO_PAD.encode(payload);
@@ -178,9 +190,12 @@ impl Terminal {
         if payload["x"].as_u64().is_none_or(|x| x < now_s) {
             return State::Expired;
         }
-        match payload["p"].as_str() {
-            Some(plan) => State::Plan(plan.to_string()),
-            None => State::Invalid,
+        match (payload["p"].as_str(), payload.get("v")) {
+            (Some(plan), Some(proposal)) if proposal.is_object() => State::Plan {
+                plan: plan.to_string(),
+                proposal: proposal.clone(),
+            },
+            _ => State::Invalid,
         }
     }
 }
@@ -188,7 +203,7 @@ impl Terminal {
 /// A `requestState` as [`Terminal::verify`] reads it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum State {
-    Plan(String),
+    Plan { plan: String, proposal: Value },
     Expired,
     Invalid,
 }

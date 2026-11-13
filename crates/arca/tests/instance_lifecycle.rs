@@ -49,6 +49,8 @@ struct Rig {
     key: SkKey,
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     executor: ActionExecutor,
+    /// The kernel's clock, which a test moves on.
+    now: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Rig {
@@ -115,7 +117,11 @@ impl Rig {
                 &scratch.dir,
             ))
         });
-        let clock: Clock = Arc::new(|| NOW);
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(NOW));
+        let clock: Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(std::sync::atomic::Ordering::SeqCst))
+        };
         let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = plan_handlers_node(
             Arc::clone(&kernel),
             clock,
@@ -139,6 +145,7 @@ impl Rig {
             key,
             handlers,
             executor,
+            now,
         }
     }
 
@@ -196,11 +203,17 @@ impl Rig {
             "action_propose",
             json!({ "action": action, "args": args }),
         )?;
+        self.approve_by_card(&proposal)
+    }
+
+    /// The owner approves the shown proposal on its card (a passkey approval), and it runs once.
+    fn approve_by_card(&self, proposal: &Value) -> Result<Value, CallError> {
         let id = proposal["id"].as_str().expect("an id").to_string();
+        let action = proposal["action"].as_str().expect("an action").to_string();
         let statement = arca::handlers::action_statement(
             HOST,
             &id,
-            action,
+            &action,
             proposal["argsDigest"].as_str().expect("a digest"),
             NOW,
             &Digest::of(format!("{id}{}", self.state_writes()).as_bytes()).to_hex()[..32],
@@ -1008,6 +1021,7 @@ fn the_admin_tokens_terminal_approval_runs_a_stop_once_and_the_journal_names_it(
         clock: Arc::new(|| NOW),
         actions: rig.executor.clone(),
     };
+    let shown_at = proposal["createdAt"].as_u64().expect("a creation time");
     // Only a waiting action proposal is asked about, and the question has the card's what, where and when.
     assert!(approver.pending("arca_status", &proposal).is_none());
     let plan = approver
@@ -1042,13 +1056,13 @@ fn the_admin_tokens_terminal_approval_runs_a_stop_once_and_the_journal_names_it(
     };
     // A token below admin approves nothing here.
     assert!(matches!(
-        approver.approve(&plan.id, &caller(Scope::Operator, "op-1")),
+        approver.approve(&plan.id, shown_at, &caller(Scope::Operator, "op-1")),
         Err(CallError::Forbidden { .. })
     ));
     assert_eq!(rig.status(PROJECT, "api"), "Running");
 
     let done = approver
-        .approve(&plan.id, &caller(Scope::Admin, "admin-1"))
+        .approve(&plan.id, shown_at, &caller(Scope::Admin, "admin-1"))
         .expect("the admin approves");
     assert_eq!(done["action"], "instance_stop");
     assert_eq!(rig.status(PROJECT, "api"), "Stopped", "the plan ran");
@@ -1089,8 +1103,81 @@ fn the_admin_tokens_terminal_approval_runs_a_stop_once_and_the_journal_names_it(
     let writes = rig.state_writes();
     assert!(
         approver
-            .approve(&plan.id, &caller(Scope::Admin, "admin-1"))
+            .approve(&plan.id, shown_at, &caller(Scope::Admin, "admin-1"))
             .is_err()
     );
     assert_eq!(rig.state_writes(), writes);
+}
+
+/// The terminal's yes names the proposal it was shown. When the owner decided that proposal on its card first, and the same
+/// action was proposed again (the same id, another creation time), the yes approves nothing and runs nothing.
+#[test]
+fn a_terminal_yes_runs_nothing_when_the_card_decided_the_shown_proposal_first() {
+    use arca::handlers::TerminalApproval;
+    use arca_mcp::TerminalApprover;
+    use std::sync::atomic::Ordering;
+
+    for decided in ["approved", "declined"] {
+        let rig = Rig::new(&format!("life-terminal-{decided}"));
+        let propose = |rig: &Rig| {
+            rig.call(
+                Scope::Viewer,
+                "action_propose",
+                json!({ "action": "instance_stop", "args": at(PROJECT, "api") }),
+            )
+            .expect("a proposal")
+        };
+        let shown = propose(&rig);
+        let shown_at = shown["createdAt"].as_u64().expect("a creation time");
+        let approver = TerminalApproval {
+            kernel: Arc::clone(&rig.kernel),
+            clock: Arc::new(|| NOW),
+            actions: rig.executor.clone(),
+        };
+        let admin = Caller {
+            token_id: "admin-1".to_string(),
+            scope: Scope::Admin,
+            tools: None,
+        };
+        // The owner decides the card while the terminal's question is open.
+        if decided == "approved" {
+            rig.approve_by_card(&shown).expect("the card approves");
+            // The stop ran; start it again so a second run would show.
+            rig.call(Scope::Doctor, "instance_start", at(PROJECT, "api"))
+                .expect("started");
+        } else {
+            assert!(
+                rig.kernel
+                    .lock()
+                    .expect("lock")
+                    .decline_action(shown["id"].as_str().expect("id"))
+                    .expect("declined")
+            );
+        }
+        // The same action is proposed again: the same id, a later creation time.
+        rig.now.store(NOW + 5_000, Ordering::SeqCst);
+        let again = propose(&rig);
+        assert_eq!(again["id"], shown["id"], "content-addressed: the same id");
+        assert_ne!(again["createdAt"], shown["createdAt"]);
+        let writes = rig.state_writes();
+        let result = approver.approve(shown["id"].as_str().expect("id"), shown_at, &admin);
+        assert!(
+            result.is_err(),
+            "{decided}: the yes for the shown record is refused: {result:?}"
+        );
+        assert_eq!(rig.state_writes(), writes, "{decided}: nothing ran");
+        assert_eq!(rig.status(PROJECT, "api"), "Running", "{decided}");
+        // The new proposal still waits on its card, untouched.
+        let waiting = rig
+            .call(Scope::Viewer, "plan_list", json!({}))
+            .expect("the list");
+        assert!(
+            waiting["plans"]
+                .as_array()
+                .expect("plans")
+                .iter()
+                .any(|plan| plan["id"] == again["id"]),
+            "{decided}: the new proposal still waits"
+        );
+    }
 }
