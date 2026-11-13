@@ -7,14 +7,29 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-## 0.18.0 (2026-11-12)
-
 Four sentences in the README and the guide said more, or less, than Arca does. Arca cannot run an app you name as a
 service, but a small program in an image you name can run on a timer as a function once you approve its card. Each
 machine runs its own Arca; machines you pair form a group, and an assistant can call a paired machine with a token that
 machine made, but Arca does not yet spread services across machines by itself. `arca init` does find the default
 config when `--config` is left out, like every command that writes. A function's image is pulled with the credential
 set for its registry, if there is one.
+
+The approval page speaks to the owner. It says "Arca asks before it changes anything", not only before a delete. An
+action's card leads with one sentence of what the assistant wants ("Your assistant wants to create a Postgres database
+called blog."), and says how to undo it in a `To undo` row. A create from a template also says what it takes of the
+node in a `Uses` row (the CPUs and memory its template sets, or Arca's default share for a service, 2 CPUs and 2GiB;
+in a tenant, its 16GiB disk; and its data disk), read from the template the approval binds. The verb's name, the target, the image by digest, the template's content and the fingerprint are in a
+Details disclosure that starts closed and is named for its card, and a delete plan's and a request's fingerprints are
+folded the same way; an image with no digest stays up front, since that row says what runs is not held to the approval. No
+card row names a verb any more: a database's `Made as` row and a stopped create's `Start` row say what can be done
+in words. After an approval the page says "Approved. Done: " and the card's sentence, not the verb that ran. The
+signed statement and what the approval binds are unchanged.
+
+When the node refuses the viewer token `arca status` found beside a missing `assistant-1.secret`, the refusal now names
+the file it used, by its name alone; before, it spoke of a token file the owner never named. `arca --help` and
+`docs/OPERATING.md` now say this step of `arca status` beside the other defaults.
+
+## 0.18.0 (2026-11-12)
 
 On a node that only looks, a read that worked no longer begins with "this node only looks: nothing here can be
 changed ...": the answer comes first and that note after it, so an assistant that reads only the first text block no
@@ -33,21 +48,6 @@ create, which deleted its data.
 - Merge PR 127: service_update rebuilds a running service on a new image digest and rolls back on a failed health check
 - Merge PR 130: watch-only reports put the answer first
 - Merge PR 125 delta: the real-Chromium RS256 test reaches the page and proves an RSA passkey enrols and approves
-
-The approval page speaks to the owner. It says "Arca asks before it changes anything", not only before a delete. An
-action's card leads with one sentence of what the assistant wants ("Your assistant wants to create a Postgres database
-called blog."), and says how to undo it in a `To undo` row. A create from a template also says what it takes of the
-node in a `Uses` row (the CPUs and memory its template sets, or Arca's default share for a service, 2 CPUs and 2GiB;
-in a tenant, its 16GiB disk; and its data disk), read from the template the approval binds. The verb's name, the target, the image by digest, the template's content and the fingerprint are in a
-Details disclosure that starts closed and is named for its card, and a delete plan's and a request's fingerprints are
-folded the same way; an image with no digest stays up front, since that row says what runs is not held to the approval. No
-card row names a verb any more: a database's `Made as` row and a stopped create's `Start` row say what can be done
-in words. After an approval the page says "Approved. Done: " and the card's sentence, not the verb that ran. The
-signed statement and what the approval binds are unchanged.
-
-When the node refuses the viewer token `arca status` found beside a missing `assistant-1.secret`, the refusal now names
-the file it used, by its name alone; before, it spoke of a token file the owner never named. `arca --help` and
-`docs/OPERATING.md` now say this step of `arca status` beside the other defaults.
 
 ## 0.17.0 (2026-11-12)
 
