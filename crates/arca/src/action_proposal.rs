@@ -131,7 +131,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 23] = [
+    pub const ALL: [ActionKind; 24] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,

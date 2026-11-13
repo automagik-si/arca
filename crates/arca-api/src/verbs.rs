@@ -2445,8 +2445,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty-three verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 23] = [
+/// The twenty-four verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 24] = [
     "service_create",
     "service_remove",
     "service_update",
@@ -2543,7 +2543,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 23] = [
+const ACTION_EXAMPLES: [(&str, &str); 24] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
