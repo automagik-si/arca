@@ -7,7 +7,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.20.0 (2026-11-13)
+
 `action_propose` now says in its input schema what each of its 22 actions takes: `args` has one branch per action, titled with the action, with that verb's fields, the ones it requires, and an example, so an assistant no longer learns them by trial and error. The door holds `args` to the branch its `action` names, so a refusal names the field of that action (`/args: missing required field name`) before the action's own check runs. A field the kernel fills in when the proposal is made (a GPU's instance kind, a disk's model, a snapshot's pool) takes any value, as before, and its description says the kernel fills it in.
+
+- Merge PR 136: action_propose's args name each action's fields, and a wrong one is refused in that action's words
 
 ## 0.19.0 (2026-11-13)
 
