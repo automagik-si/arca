@@ -673,6 +673,13 @@ fn an_approved_erase_data_update_runs_and_its_card_says_in_words_that_it_erases_
         let digest = proposed["argsDigest"].as_str().expect("a digest");
         let done = approve_and_run(&rig, &key, id, digest).expect("the approved update runs");
         assert_eq!(done["updated"], true, "{name}: {done}");
+        // The journal's first line says the update ran with eraseData.
+        let journal_text =
+            fs::read_to_string(rig.dir.join("service-updates.jsonl")).expect("the journal");
+        let begin: Value = serde_json::from_str(journal_text.lines().next().expect("a line"))
+            .expect("a JSON line");
+        assert_eq!(begin["step"], "begin");
+        assert_eq!(begin["detail"]["eraseData"], true, "{name}");
         assert_eq!(
             rig.fake.rebuilds(PROJECT, &service),
             vec!["registry"],
@@ -733,8 +740,10 @@ fn a_service_that_has_its_data_volume_updates_as_before() {
 #[test]
 fn a_template_that_declares_no_data_volume_updates_as_before() {
     for template in shipped_shapes() {
-        let template = without_data(&template);
-        let name = template["name"].as_str().expect("a name").to_string();
+        // A name this build does not ship: the shipped template of the same name would declare a volume.
+        let mut template = without_data(&template);
+        let name = format!("{}-plain", template["name"].as_str().expect("a name"));
+        template["name"] = json!(name);
         let service = format!("plain-{name}");
         let rig = rig_with(&template, &service, None);
 
@@ -755,4 +764,136 @@ fn a_template_that_declares_no_data_volume_updates_as_before() {
         )
         .expect("the proposal is recorded");
     }
+}
+
+/// A node whose installed template is still the old file, without `data`: stale, never brought up to date, or
+/// edited. The services made from it keep their data on the root disk, and the template this build ships declares
+/// the volume.
+#[test]
+fn a_stale_installed_template_does_not_hide_a_service_that_keeps_its_data_inside_the_container() {
+    for template in shipped_shapes() {
+        let name = template["name"].as_str().expect("a name").to_string();
+        let service = format!("stale-{name}");
+        // The template is installed without `data` and stays so.
+        let rig = rig_with(&without_data(&template), &service, None);
+        assert!(
+            instance_named(&rig, &service)["devices"]
+                .get("data")
+                .is_none()
+        );
+        let writes = rig.fake.writes().len();
+
+        let (_, message) = refusal_words(update(
+            &rig,
+            json!({ "name": service, "digest": NEW, "timeoutSeconds": 1 }),
+        ));
+        assert!(
+            message.contains("would erase the service's data"),
+            "{name}: {message}"
+        );
+        assert!(message.contains(&name), "{name}: {message}");
+        assert_eq!(rig.fake.writes().len(), writes, "{name}");
+        assert!(rig.fake.rebuilds(PROJECT, &service).is_empty(), "{name}");
+
+        // Its proposal is refused too, and no card is recorded.
+        refusal_words(propose_update(
+            &rig,
+            json!({ "name": service, "digest": NEW }),
+        ));
+        assert_eq!(
+            rig.kernel
+                .lock()
+                .expect("kernel")
+                .action_proposals()
+                .iter()
+                .count(),
+            0,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_card_says_the_data_is_erased_only_when_erase_data_is_set_and_the_service_has_no_volume() {
+    let template = shipped_shapes().remove(1);
+    let args = |service: &str| json!({ "name": service, "digest": NEW, "timeoutSeconds": 1, "eraseData": true });
+
+    // A service that has its volume: the node leaves eraseData out, so the card does not claim an erasure.
+    let kept = rig_with(&template, "kept-nats", None);
+    let proposed = propose_update(&kept, args("kept-nats")).expect("the proposal is recorded");
+    assert!(proposed["args"].get("eraseData").is_none(), "{proposed}");
+    assert!(
+        !proposed["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("ERASE")
+    );
+    assert!(
+        !proposed["details"]
+            .as_array()
+            .expect("details")
+            .iter()
+            .any(|row| row["label"] == "Erase data")
+    );
+    assert!(!proposed["undo"].as_str().expect("undo").contains("erase"));
+
+    // A service that keeps its data inside the container: the card says so, and that it cannot be undone.
+    let old = old_style_rig(&template, "old-nats", None);
+    let proposed = propose_update(&old, args("old-nats")).expect("the proposal is recorded");
+    assert_eq!(proposed["args"]["eraseData"], true);
+    assert!(
+        proposed["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("ERASE ALL OF ITS DATA")
+    );
+    assert!(
+        proposed["undo"]
+            .as_str()
+            .expect("undo")
+            .contains("cannot be undone")
+    );
+    // A plain update of a service that has its volume says nothing of erasing, in its undo words either.
+    let plain = propose_update(
+        &kept,
+        json!({ "name": "kept-nats", "digest": format!("sha256:{}", "3".repeat(64)) }),
+    )
+    .expect("the proposal is recorded");
+    assert!(!plain["undo"].as_str().expect("undo").contains("erase"));
+    assert!(
+        !plain["undo"]
+            .as_str()
+            .expect("undo")
+            .contains("data is gone")
+    );
+}
+
+#[test]
+fn a_follow_proposal_that_mixes_in_a_digest_or_erase_data_is_refused_when_it_is_made() {
+    let template = shipped_shapes().remove(1);
+    let rig = rig_with(&template, "kept-nats", None);
+    for (args, wanted) in [
+        (
+            json!({ "name": "kept-nats", "follow": true, "eraseData": true }),
+            "eraseData",
+        ),
+        (
+            json!({ "name": "kept-nats", "follow": false, "digest": NEW }),
+            "follow: give it alone",
+        ),
+    ] {
+        let CallError::Invalid(message) = propose_update(&rig, args).expect_err("refused") else {
+            panic!("an invalid proposal");
+        };
+        assert!(message.contains(wanted), "{message}");
+    }
+    assert_eq!(
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .action_proposals()
+            .iter()
+            .count(),
+        0
+    );
 }

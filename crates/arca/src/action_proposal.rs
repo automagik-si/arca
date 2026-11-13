@@ -170,7 +170,7 @@ impl ActionKind {
             }
             Self::ServiceRemove => "It cannot be undone: the service is deleted with its data.",
             Self::ServiceUpdate => {
-                "An update that keeps the data is put back on a failed check by Arca itself. An update that erases the data cannot be undone: the data is gone."
+                "If the new version's port does not answer, Arca puts the old version back by itself. To go back after a good update, ask your assistant to update to the old digest."
             }
             Self::ServiceImport => {
                 "Ask your assistant to release it. The service itself is not changed either way."
@@ -207,6 +207,17 @@ impl ActionKind {
                 "There is nothing to undo: it only puts the host back to what its declared file says, and the file is not changed."
             }
         }
+    }
+
+    /// [`Self::undo_words`] for these arguments: an update that states `eraseData` cannot be undone, since the data is
+    /// gone.
+    pub fn undo_words_for(self, args: &Value) -> &'static str {
+        if self == Self::ServiceUpdate
+            && args.get("eraseData").and_then(Value::as_bool) == Some(true)
+        {
+            return "It cannot be undone: the service's data is erased and cannot be brought back.";
+        }
+        self.undo_words()
     }
 
     /// Whether the card says what the action takes of the node: a create from a template does.

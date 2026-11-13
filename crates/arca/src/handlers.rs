@@ -1487,7 +1487,7 @@ fn card_words(value: &mut Value, proposal: &ActionProposal) {
         value["uses"] = json!(uses);
     }
     if let Some(action) = ActionKind::from_name(&proposal.action) {
-        value["undo"] = json!(action.undo_words());
+        value["undo"] = json!(action.undo_words_for(&proposal.args));
     }
 }
 
@@ -1720,8 +1720,7 @@ impl ToolHandler for ActionPropose {
             // An update that would erase what the service keeps inside its container is refused now, so the owner is
             // never asked to approve it.
             let entries = lock(&self.kernel)?.entries().to_vec();
-            service_update::check_proposal(node, &entries, &payload)?;
-            payload
+            service_update::check_proposal(node, &entries, &payload)?
         } else if let (ActionKind::FunctionCreate, Some(node)) = (action, &self.node) {
             // The proposal names every default and every private destination, so the card shows them and the
             // approval binds them. A create the node would refuse is refused now.

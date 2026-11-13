@@ -257,9 +257,11 @@ fn state_changer_for(cfg: &NodeConfig, config: &ServiceConfig) -> Result<StateCh
     Ok(changer)
 }
 
-/// Where the service's template declares a data volume (the template as installed now, or as the record kept it)
-/// while its instance has no `data` device: the path its data is kept at inside the container, which a rebuild of
-/// the root erases. `None` when the template declares none, or the instance has the volume.
+/// Where the service's template declares a data volume while its instance has no `data` device: the path its data is
+/// kept at inside the container, which a rebuild of the root erases. The template is read as the record kept it, then
+/// as installed on the node, then as this build ships it: an installed file that is stale, edited or half installed
+/// must not hide a service that keeps its data on its root. `None` when none of them declares a volume, or the
+/// instance has it.
 fn data_on_the_root(
     cfg: &NodeConfig,
     config: &ServiceConfig,
@@ -268,12 +270,23 @@ fn data_on_the_root(
     if seen.own_devices.contains("data") {
         return None;
     }
-    match &config.data {
-        Some(data) => Some(data.path.clone()),
-        None => crate::service::load_template(&cfg.state_dir.join("templates"), &config.template)
-            .ok()
-            .and_then(|template| template.data.map(|data| data.path)),
+    if let Some(data) = &config.data {
+        return Some(data.path.clone());
     }
+    crate::service::load_template(&cfg.state_dir.join("templates"), &config.template)
+        .ok()
+        .and_then(|template| template.data.map(|data| data.path))
+        .or_else(|| shipped_data_path(&config.template))
+}
+
+/// The data path of the template of this name that this build ships, when it declares one.
+fn shipped_data_path(template: &str) -> Option<String> {
+    let file = format!("{template}.json");
+    let (_, text) = crate::cmd_templates::SHIPPED
+        .iter()
+        .find(|(name, _)| *name == file)?;
+    let shipped: Value = serde_json::from_str(text).ok()?;
+    shipped["data"]["path"].as_str().map(str::to_string)
 }
 
 /// The refusal of an update that would erase the data a service keeps inside its container.
@@ -285,19 +298,22 @@ fn erasing(config: &ServiceConfig, path: &str) -> CallError {
 }
 
 /// What a proposal of `service_update` is held to when it is made, so the owner is never shown a card for an update
-/// the node would refuse for erasing the service's data. What cannot be read now (an instance, a record) is left to
-/// the run, which checks again.
+/// the node would refuse: one that mixes `follow` with what it does not go with, or that would erase the service's
+/// data without `eraseData`. Answers the arguments to record. A card that states `eraseData` for a service that has
+/// its data volume would say the data is erased when it is not, so the node leaves `eraseData` out of such a
+/// proposal. What cannot be read now (an instance, a record) is left to the run, which checks again.
 pub(super) fn check_proposal(
     cfg: &NodeConfig,
     entries: &[Entry],
     payload: &Value,
-) -> Result<(), CallError> {
-    let erase = payload.get("eraseData").and_then(Value::as_bool) == Some(true);
-    if erase || payload.get("follow").is_some() {
-        return Ok(());
+) -> Result<Value, CallError> {
+    if payload.get("follow").is_some() {
+        conflicts(payload)?;
+        return Ok(payload.clone());
     }
+    let erase = payload.get("eraseData").and_then(Value::as_bool) == Some(true);
     let Some(name) = payload["name"].as_str() else {
-        return Ok(());
+        return Ok(payload.clone());
     };
     let scope = tenants::tenant_arg(cfg, payload, entries)?;
     let scoped = tenants::scoped_entries(entries, scope.as_ref());
@@ -305,21 +321,43 @@ pub(super) fn check_proposal(
         .into_iter()
         .find(|(_, config)| config.name == name)
     else {
-        return Ok(());
+        return Ok(payload.clone());
     };
     if config.adopted || config.function.is_some() || config.vm.is_some() {
-        return Ok(());
+        return Ok(payload.clone());
     }
     let Ok(changer) = state_changer_for(cfg, &config) else {
-        return Ok(());
+        return Ok(payload.clone());
     };
     let Ok(seen) = changer.read(&config.project, &config.instance) else {
-        return Ok(());
+        return Ok(payload.clone());
     };
-    match data_on_the_root(cfg, &config, &seen) {
-        Some(path) => Err(erasing(&config, &path)),
-        None => Ok(()),
+    match (data_on_the_root(cfg, &config, &seen), erase) {
+        (Some(path), false) => Err(erasing(&config, &path)),
+        (None, true) => {
+            let mut plain = payload.clone();
+            if let Some(object) = plain.as_object_mut() {
+                object.remove("eraseData");
+            }
+            Ok(plain)
+        }
+        _ => Ok(payload.clone()),
     }
+}
+
+/// What `follow` does not go with: a digest, a timeout, `eraseData`. Said in the words the call uses.
+fn conflicts(args: &Value) -> Result<(), CallError> {
+    if args.get("digest").is_some() || args.get("timeoutSeconds").is_some() {
+        return Err(CallError::Invalid(
+            "follow: give it alone; a call moves a service to a digest or sets whether it follows Automagik, not both".into(),
+        ));
+    }
+    if args.get("eraseData").is_some() {
+        return Err(CallError::Invalid(
+            "eraseData: give it with a digest, not with follow".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// How an update puts the old version back.
@@ -429,10 +467,8 @@ impl ServiceHandler {
                 .as_bool()
                 .ok_or_else(|| CallError::Invalid("eraseData: expected true or false".into()))?,
         };
-        if erase && args.get("follow").is_some() {
-            return Err(CallError::Invalid(
-                "eraseData: give it with a digest, not with follow".into(),
-            ));
+        if args.get("follow").is_some() {
+            conflicts(args)?;
         }
         if erase && !approved {
             return Err(refused(format!(
