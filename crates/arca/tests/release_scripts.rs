@@ -1138,6 +1138,32 @@ fn a_script_only_the_workflows_call_ships_nothing() {
 }
 
 #[test]
+fn a_copy_of_the_brand_ships_nothing() {
+    let scratch = Scratch::new("brand");
+    scratch.commit("crates/a/src/lib.rs", "feat(a): a start");
+    scratch.tag("v0.8.0");
+    // Every path a copy from Automagik writes: the brand, the agents' skill with its record, and the copy tool.
+    for path in [
+        "docs/brand/tokens/tokens.css",
+        "docs/brand/logo/svg/genie-lamp-ink.svg",
+        ".claude/skills/automagik-brand/SKILL.md",
+        ".claude/skills/automagik-brand/SOURCE.json",
+        "scripts/brand-sync.mjs",
+        "AGENTS.md",
+    ] {
+        scratch.commit(path, "chore(brand): a copy");
+        assert_eq!(scratch.answer(&["kind"]), "none", "{path} ships nothing");
+    }
+    // Only the copy tool itself is inert: another script under scripts/ is still classed by its own line.
+    scratch.commit("scripts/brand-sync.mjs.bak", "chore: a stray file");
+    assert_eq!(scratch.answer(&["kind"]), "full");
+    scratch.git(&["reset", "-q", "--hard", "HEAD~1"]);
+    // A copy beside a change the binary is built from is a full release.
+    scratch.commit("crates/a/src/lib.rs", "feat(a): more");
+    assert_eq!(scratch.answer(&["kind"]), "full");
+}
+
+#[test]
 fn a_hostile_subject_is_listed_as_one_plain_line_and_is_never_run() {
     let scratch = Scratch::new("hostile");
     scratch.write("CHANGELOG.md", "# Changelog\n\n## Unreleased\n");

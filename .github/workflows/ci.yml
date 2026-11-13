@@ -98,6 +98,27 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
 
+  # docs/brand/, .claude/skills/automagik-brand/ and scripts/brand-sync.mjs are a byte copy of Automagik's brand
+  # (.claude/skills/automagik-brand/SOURCE.json names the commit). The check fails when a copied file was edited, removed or added here.
+  # It then asks Automagik's repository whether its dev branch has a newer brand: that only warns, and without network
+  # it says so and passes. It needs Node 22.7 or later and git, nothing installed.
+  brand:
+    name: brand copy
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.standard) }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The pool's image has no Node. The same pinned Node as the canvas job.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.11.0
+          package-manager-cache: false
+      - name: brand-sync --check
+        run: node scripts/brand-sync.mjs --check
+
   clippy:
     name: cargo clippy
     needs: runners
