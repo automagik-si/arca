@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.19.0 (2026-11-13)
+
 Four sentences in the README and the guide said more, or less, than Arca does. Arca cannot run an app you name as a
 service, but a small program in an image you name can run on a timer as a function once you approve its card. Each
 machine runs its own Arca; machines you pair form a group, and an assistant can call a paired machine with a token that
@@ -28,6 +30,10 @@ signed statement and what the approval binds are unchanged.
 When the node refuses the viewer token `arca status` found beside a missing `assistant-1.secret`, the refusal now names
 the file it used, by its name alone; before, it spoke of a token file the owner never named. `arca --help` and
 `docs/OPERATING.md` now say this step of `arca status` beside the other defaults.
+
+- Merge PR 135: README and guide say what Arca runs and how paired machines relate, truthfully
+- Merge PR 133: arca status names the token file it used when the node refuses it; tests for the PR 123 guard
+- Merge PR 131: approval cards say in plain words what a change does and uses
 
 ## 0.18.0 (2026-11-12)
 
