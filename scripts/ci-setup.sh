@@ -167,7 +167,9 @@ case $mode in
     if [ "$mode" = test ]; then
       # What the tests start: ssh-keygen, openssl, setfattr and getfattr, kill, tar and mkfifo, for the runner
       # pool's own tests (crates/arca/tests/runner_pool.rs) curl, jq and flock, and for the test of the Automagik
-      # image's build script (crates/arca/tests/services.rs) python3, which that script reads its pins with.
+      # image's build script (crates/arca/tests/services.rs) python3, which that script reads its pins with, and for the
+      # nats entrypoint (crates/arca/tests/services/nats.rs) busybox, whose `ash` is the shell of the nats image: that
+      # test fails in CI where it is missing, so it is never skipped.
       need ssh-keygen openssh-client
       need openssl openssl
       need curl curl
@@ -178,6 +180,7 @@ case $mode in
       need tar tar
       need mkfifo coreutils
       need python3 python3
+      need busybox busybox-static
     fi
     install_wanted
     setup_rust
