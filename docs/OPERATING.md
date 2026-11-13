@@ -755,7 +755,11 @@ script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgre
 `github-runner-pool`, `gitlab-runner-pool.sh` for both `gitlab-runner-pool` and `gitlab-runner-pool-large`,
 `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
-`service_create` with the file it looked for (`templates/<name>`). Incus 7.6 refuses a line break anywhere in
+`service_create` with the file it looked for (`templates/<name>`).
+
+#### A script entrypoint and the Incus version
+
+Incus 7.6 refuses a line break anywhere in
 `oci.entrypoint`. From Incus 7.3 on, Incus splits the value as a shell would, quotes again each word that holds
 whitespace or starts with a quote, and hands the line to liblxc, which splits it once more: liblxc 6.0 and later honour
 a quote at the start of a word, while liblxc 5.0 and older (an Incus 7.6 build may link liblxc 4.0) split on spaces
