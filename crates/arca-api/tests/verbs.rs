@@ -286,6 +286,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
     let action_names = [
         "service_create",
         "service_remove",
+        "service_update",
         "service_import",
         "service_release",
         "service_publish",
@@ -1625,7 +1626,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 23);
+    assert_eq!(actions.len(), 24);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));

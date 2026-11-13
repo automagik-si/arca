@@ -696,6 +696,7 @@ impl Follower {
                     None => json!({ "name": config.name, "digest": newest.digest }),
                 },
                 std::slice::from_ref(entry),
+                false,
             )
             .map(|_| ())
             .map_err(|error| match error {

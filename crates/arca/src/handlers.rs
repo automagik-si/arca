@@ -1487,7 +1487,7 @@ fn card_words(value: &mut Value, proposal: &ActionProposal) {
         value["uses"] = json!(uses);
     }
     if let Some(action) = ActionKind::from_name(&proposal.action) {
-        value["undo"] = json!(action.undo_words());
+        value["undo"] = json!(action.undo_words_for(&proposal.args));
     }
 }
 
@@ -1716,6 +1716,11 @@ impl ToolHandler for ActionPropose {
                 return Err(refusal);
             }
             payload
+        } else if let (ActionKind::ServiceUpdate, Some(node)) = (action, &self.node) {
+            // An update that would erase what the service keeps inside its container is refused now, so the owner is
+            // never asked to approve it.
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            service_update::check_proposal(node, &entries, &payload)?
         } else if let (ActionKind::FunctionCreate, Some(node)) = (action, &self.node) {
             // The proposal names every default and every private destination, so the card shows them and the
             // approval binds them. A create the node would refuse is refused now.
@@ -2434,6 +2439,7 @@ impl ActionExecutor {
             action,
             "service_create"
                 | "service_remove"
+                | "service_update"
                 | "service_publish"
                 | "service_import"
                 | "service_release"
@@ -6596,7 +6602,15 @@ impl ServiceHandler {
             ],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
-            "service_update" => &["name", "digest", "timeoutSeconds", "follow"],
+            "service_update" => &[
+                "name",
+                "digest",
+                "timeoutSeconds",
+                "follow",
+                "eraseData",
+                // Only an approved proposal carries it: the one-shot grant of its approval.
+                "approval",
+            ],
             "service_remove" | "service_import" | "service_release" => &["name", "approval"],
             "service_connect" | "service_disconnect" => &["from", "to"],
             "service_secret_set" => &["name", "key", "value"],
@@ -6684,6 +6698,7 @@ impl ServiceHandler {
             self.verb,
             "service_create"
                 | "service_remove"
+                | "service_update"
                 | "service_publish"
                 | "service_import"
                 | "service_release"
@@ -7100,7 +7115,7 @@ impl ServiceHandler {
                 }
                 Ok(answer)
             }
-            "service_update" => self.call_update(&args, &entries),
+            "service_update" => self.call_update(&args, &entries, preapproved),
             "service_remove" => {
                 let name = service_name(&args)?;
                 let approval = args["approval"]

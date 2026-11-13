@@ -13,6 +13,10 @@
 //!    seconds, since the node may reach nothing else of it;
 //! 5. the new digest is recorded in the service's desired state, so a restart keeps it.
 //!
+//! A service whose template declares a data volume that its instance has not keeps its data on the root, which the
+//! rebuild replaces: it is refused before anything is written, unless the call states `eraseData`, which only an
+//! approved proposal may (see [`ServiceHandler::call_update`]).
+//!
 //! A failure at any step puts the old version back: the snapshot is restored (or, in a project that does not allow
 //! snapshots, the root is rebuilt from the old digest), the old version is started when it was running, and the answer
 //! is the error and the words "rolled back". Nothing is asked of the owner: the verb is a doctor's, and works in a
@@ -236,6 +240,126 @@ impl Journal {
     }
 }
 
+/// The writer of the power state and of the root of the instance `config` names.
+fn state_changer_for(cfg: &NodeConfig, config: &ServiceConfig) -> Result<StateChanger, CallError> {
+    let family = arca_incus::ProjectFamily::new(
+        [arca_netproject::PROJECT],
+        cfg.kernel.droidd_projects.iter().map(String::as_str),
+    )
+    .map_err(|_| internal())?;
+    let mut changer =
+        StateChanger::new(cfg.incus.socket.clone(), family).with_deadline(STEP_DEADLINE);
+    if config.tenant.is_some() {
+        changer = changer
+            .with_tenants([config.project.as_str()])
+            .map_err(|_| internal())?;
+    }
+    Ok(changer)
+}
+
+/// Where the service's template declares a data volume while its instance has no `data` device: the path its data is
+/// kept at inside the container, which a rebuild of the root erases. The template is read as the record kept it, then
+/// as installed on the node, then as this build ships it: an installed file that is stale, edited or half installed
+/// must not hide a service that keeps its data on its root. `None` when none of them declares a volume, or the
+/// instance has it.
+fn data_on_the_root(
+    cfg: &NodeConfig,
+    config: &ServiceConfig,
+    seen: &InstanceState,
+) -> Option<String> {
+    if seen.own_devices.contains("data") {
+        return None;
+    }
+    if let Some(data) = &config.data {
+        return Some(data.path.clone());
+    }
+    crate::service::load_template(&cfg.state_dir.join("templates"), &config.template)
+        .ok()
+        .and_then(|template| template.data.map(|data| data.path))
+        .or_else(|| shipped_data_path(&config.template))
+}
+
+/// The data path of the template of this name that this build ships, when it declares one.
+fn shipped_data_path(template: &str) -> Option<String> {
+    let file = format!("{template}.json");
+    let (_, text) = crate::cmd_templates::SHIPPED
+        .iter()
+        .find(|(name, _)| *name == file)?;
+    let shipped: Value = serde_json::from_str(text).ok()?;
+    shipped["data"]["path"].as_str().map(str::to_string)
+}
+
+/// The refusal of an update that would erase the data a service keeps inside its container.
+fn erasing(config: &ServiceConfig, path: &str) -> CallError {
+    let (name, template) = (&config.name, &config.template);
+    refused(format!(
+        "update service {name}: this update would erase the service's data: {name}, made from the {template} template, keeps its data inside the container, and that template declares a data volume at {path} which {name} does not have. Give eraseData: true, which needs the owner's approval, to update it and start over with no data. Nothing was changed"
+    ))
+}
+
+/// What a proposal of `service_update` is held to when it is made, so the owner is never shown a card for an update
+/// the node would refuse: one that mixes `follow` with what it does not go with, or that would erase the service's
+/// data without `eraseData`. Answers the arguments to record. A card that states `eraseData` for a service that has
+/// its data volume would say the data is erased when it is not, so the node leaves `eraseData` out of such a
+/// proposal. What cannot be read now (an instance, a record) is left to the run, which checks again.
+pub(super) fn check_proposal(
+    cfg: &NodeConfig,
+    entries: &[Entry],
+    payload: &Value,
+) -> Result<Value, CallError> {
+    if payload.get("follow").is_some() {
+        conflicts(payload)?;
+        return Ok(payload.clone());
+    }
+    let erase = payload.get("eraseData").and_then(Value::as_bool) == Some(true);
+    let Some(name) = payload["name"].as_str() else {
+        return Ok(payload.clone());
+    };
+    let scope = tenants::tenant_arg(cfg, payload, entries)?;
+    let scoped = tenants::scoped_entries(entries, scope.as_ref());
+    let Some((_, config)) = service_entries(&scoped)
+        .into_iter()
+        .find(|(_, config)| config.name == name)
+    else {
+        return Ok(payload.clone());
+    };
+    if config.adopted || config.function.is_some() || config.vm.is_some() {
+        return Ok(payload.clone());
+    }
+    let Ok(changer) = state_changer_for(cfg, &config) else {
+        return Ok(payload.clone());
+    };
+    let Ok(seen) = changer.read(&config.project, &config.instance) else {
+        return Ok(payload.clone());
+    };
+    match (data_on_the_root(cfg, &config, &seen), erase) {
+        (Some(path), false) => Err(erasing(&config, &path)),
+        (None, true) => {
+            let mut plain = payload.clone();
+            if let Some(object) = plain.as_object_mut() {
+                object.remove("eraseData");
+            }
+            Ok(plain)
+        }
+        _ => Ok(payload.clone()),
+    }
+}
+
+/// What `follow` does not go with: a digest, a timeout, `eraseData`. Said in the words the call uses.
+fn conflicts(args: &Value) -> Result<(), CallError> {
+    if args.get("digest").is_some() || args.get("timeoutSeconds").is_some() {
+        return Err(CallError::Invalid(
+            "follow: give it alone; a call moves a service to a digest or sets whether it follows Automagik, not both".into(),
+        ));
+    }
+    if args.get("eraseData").is_some() {
+        return Err(CallError::Invalid(
+            "eraseData: give it with a digest, not with follow".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// How an update puts the old version back.
 enum Back {
     /// The snapshot taken before the rebuild.
@@ -247,19 +371,7 @@ enum Back {
 impl ServiceHandler {
     /// The writer of the power state and of the root of this service's instance.
     pub(super) fn state_changer(&self, config: &ServiceConfig) -> Result<StateChanger, CallError> {
-        let family = arca_incus::ProjectFamily::new(
-            [arca_netproject::PROJECT],
-            self.cfg.kernel.droidd_projects.iter().map(String::as_str),
-        )
-        .map_err(|_| internal())?;
-        let mut changer =
-            StateChanger::new(self.cfg.incus.socket.clone(), family).with_deadline(STEP_DEADLINE);
-        if config.tenant.is_some() {
-            changer = changer
-                .with_tenants([config.project.as_str()])
-                .map_err(|_| internal())?;
-        }
-        Ok(changer)
+        state_changer_for(&self.cfg, config)
     }
 
     /// Changes one service's record as the kernel holds it now, under the node's write gate: a change that came
@@ -340,9 +452,29 @@ impl ServiceHandler {
     }
 
     /// `service_update`: moves the service `name` to `digest`. `entries` are the ones the call may see, a tenant's when
-    /// it names one.
-    pub(super) fn call_update(&self, args: &Value, entries: &[Entry]) -> Result<Value, CallError> {
+    /// it names one. `approved` is true when the call runs from an approved proposal: only then may `eraseData` be
+    /// given, since it lets the update erase what the service keeps inside its container.
+    pub(super) fn call_update(
+        &self,
+        args: &Value,
+        entries: &[Entry],
+        approved: bool,
+    ) -> Result<Value, CallError> {
         let name = service_name(args)?;
+        let erase = match args.get("eraseData") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| CallError::Invalid("eraseData: expected true or false".into()))?,
+        };
+        if args.get("follow").is_some() {
+            conflicts(args)?;
+        }
+        if erase && !approved {
+            return Err(refused(format!(
+                "update service {name}: eraseData erases the service's data, so it needs the owner's approval: propose the update with action_propose, and the card says in words that the data is erased. Nothing was changed"
+            )));
+        }
         if let Some(follow) = args.get("follow") {
             if args.get("digest").is_some() || args.get("timeoutSeconds").is_some() {
                 return Err(CallError::Invalid(
@@ -429,6 +561,12 @@ impl ServiceHandler {
         if seen.kind != "container" || journalled.is_none() || journalled != seen.uuid {
             return Err(said("its instance is not the one Arca created for it"));
         }
+        // The rebuild replaces the root disk. A service whose template declares a data volume that its instance does not
+        // have keeps its data on that root disk, so the rebuild would erase all of it: refused before any write unless
+        // the call states eraseData (which only an approved proposal may).
+        if !erase && let Some(path) = data_on_the_root(&self.cfg, &config, &seen) {
+            return Err(erasing(&config, &path));
+        }
         // A rebuild of a container that has never run leaves it unable to start (Incus 7.5.1), as a function's does.
         if !seen
             .own_config
@@ -452,6 +590,7 @@ impl ServiceHandler {
                     "from": config.source["alias"],
                     "to": digest,
                     "timeoutSeconds": seconds,
+                    "eraseData": erase,
                     "tenant": config.tenant.as_ref().map(|tenant| tenant.id.clone()),
                 }),
             )

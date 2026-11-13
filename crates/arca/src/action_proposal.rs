@@ -50,6 +50,7 @@ const MAX_COMPACT_BYTES: u64 = 1024 * 1024;
 pub enum ActionKind {
     ServiceCreate,
     ServiceRemove,
+    ServiceUpdate,
     ServiceImport,
     ServiceRelease,
     ServicePublish,
@@ -86,6 +87,9 @@ fn shown(text: &str, max: usize) -> String {
     cut.push('…');
     cut
 }
+
+/// The `Erase data` row of a `service_update` that states `eraseData`, in the owner's words.
+pub const ERASE_DATA_WORDS: &str = "YES. This service keeps its data inside the container, so the update erases ALL of it: everything it stored is gone and cannot be brought back.";
 
 /// The most characters one card row shows of a setting. A proposal whose setting would need more in one row is
 /// refused when it is made ([`ActionKind::prepare`]), so a card never cuts what the owner approves.
@@ -127,9 +131,10 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 23] = [
+    pub const ALL: [ActionKind; 24] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
+        Self::ServiceUpdate,
         Self::ServiceImport,
         Self::ServiceRelease,
         Self::ServicePublish,
@@ -164,6 +169,9 @@ impl ActionKind {
                 "Ask your assistant to remove it. Removing it deletes the database with its data."
             }
             Self::ServiceRemove => "It cannot be undone: the service is deleted with its data.",
+            Self::ServiceUpdate => {
+                "If the new version's port does not answer, Arca puts the old version back by itself. To go back after a good update, ask your assistant to update to the old digest."
+            }
             Self::ServiceImport => {
                 "Ask your assistant to release it. The service itself is not changed either way."
             }
@@ -201,6 +209,17 @@ impl ActionKind {
         }
     }
 
+    /// [`Self::undo_words`] for these arguments: an update that states `eraseData` cannot be undone, since the data is
+    /// gone.
+    pub fn undo_words_for(self, args: &Value) -> &'static str {
+        if self == Self::ServiceUpdate
+            && args.get("eraseData").and_then(Value::as_bool) == Some(true)
+        {
+            return "It cannot be undone: the service's data is erased and cannot be brought back.";
+        }
+        self.undo_words()
+    }
+
     /// Whether the card says what the action takes of the node: a create from a template does.
     pub fn says_uses(self) -> bool {
         matches!(self, Self::ServiceCreate | Self::PostgresCreate)
@@ -211,6 +230,7 @@ impl ActionKind {
         match self {
             Self::ServiceCreate => "service_create",
             Self::ServiceRemove => "service_remove",
+            Self::ServiceUpdate => "service_update",
             Self::ServiceImport => "service_import",
             Self::ServiceRelease => "service_release",
             Self::ServicePublish => "service_publish",
@@ -503,6 +523,29 @@ impl ActionKind {
                 rows
             }
             Self::ServiceRemove | Self::ServiceUnpublish => vec![row("Name", text("name"))],
+            Self::ServiceUpdate => {
+                let mut rows = vec![row("Name", text("name"))];
+                if let Some(follow) = args.get("follow").and_then(Value::as_bool) {
+                    rows.push(row(
+                        "Follow",
+                        if follow {
+                            "The node moves this service to Automagik's newest published server image by itself."
+                        } else {
+                            "The node leaves this service where it is."
+                        },
+                    ));
+                }
+                if args.get("digest").is_some() {
+                    rows.push(row("Digest", text("digest")));
+                }
+                if let Some(seconds) = args.get("timeoutSeconds").and_then(Value::as_u64) {
+                    rows.push(row("Health check", &format!("{seconds} seconds")));
+                }
+                if args.get("eraseData").and_then(Value::as_bool) == Some(true) {
+                    rows.push(row("Erase data", ERASE_DATA_WORDS));
+                }
+                rows
+            }
             Self::ServiceImport => vec![
                 row("Name", text("name")),
                 row(
@@ -734,6 +777,19 @@ impl ActionKind {
                 text("template")
             ),
             Self::ServiceRemove => format!("Remove the service {}", text("name")),
+            Self::ServiceUpdate if args.get("eraseData").and_then(Value::as_bool) == Some(true) => {
+                format!(
+                    "Update the service {} and ERASE ALL OF ITS DATA",
+                    text("name")
+                )
+            }
+            Self::ServiceUpdate if args.get("follow").is_some() => {
+                format!(
+                    "Change whether the service {} follows Automagik's releases",
+                    text("name")
+                )
+            }
+            Self::ServiceUpdate => format!("Update the service {} to a new image", text("name")),
             Self::ServiceImport => format!(
                 "Import the service {}, which another manager created, where it stands",
                 text("name")

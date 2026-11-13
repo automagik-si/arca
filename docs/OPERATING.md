@@ -876,7 +876,7 @@ The `automagik-server` template pins the OCI server image (Automagik's release 3
 by uid/gid 1000, overrides the profile to 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
 The `postgres-autopg`, `nats` and `omni-api` templates state a data volume of their own (20GiB at
 `/var/lib/autopg/data`, 10GiB at `/data`, 10GiB at `/app/data`; each has a size, which a tenant needs to count the
-disk against its cap). A service made from them up to 0.21.0 keeps its data on its root disk and gets no volume:
+disk against its cap). A service made from them up to 0.22.0 keeps its data on its root disk and gets no volume:
 `templates install` changes the template, not the services already made.
 
 ### A database
@@ -1132,11 +1132,12 @@ record is refused.
 
 ### Updating a service to a new image digest
 
-`service_update` takes `{name, digest, timeoutSeconds?, tenant?}` (or `{name, follow}`, see below) and moves a running container service made from an
-image by digest (today `automagik-server`) to another digest of the same image in one call. It is a destructive
-verb (it takes the optional `confirm`), needs a `doctor` token and asks the owner for nothing; it works inside a
-tenant as outside one. There is no update path for `automagik-workspace` yet: it is a virtual machine, whose Docker
-pulls its own server image, and the verb refuses it. In order, each step a line in `service-updates.jsonl` in the
+`service_update` takes `{name, digest, timeoutSeconds?, eraseData?, tenant?}` (or `{name, follow}`, see below) and
+moves a running container service made from an image by digest (today `automagik-server`) to another digest of the
+same image in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor` token and asks
+the owner for nothing, except for `eraseData` (see below); it works inside a tenant as outside one. There is no
+update path for `automagik-workspace` yet: it is a virtual machine, whose Docker pulls its own server image, and the
+verb refuses it. In order, each step a line in `service-updates.jsonl` in the
 state directory (an append-only file of JSON lines: a `begin`, one line per step, an `end`; never a secret):
 
 1. the instance is stopped, if it runs, and a snapshot of it, `pre-update-<time>`, is taken where the project allows
@@ -1144,11 +1145,11 @@ state directory (an append-only file of JSON lines: a `begin`, one line per step
    so on a node as Arca makes it there is no snapshot, and the answer's `snapshot` is `null`;
 2. its root is rebuilt from `<repository>@<digest>`; Incus may take up to 10 minutes to fetch the image. Incus keeps
    what is not the root: the config, the secrets, the firewall rules and the data volume (a template's `data`
-   path, `/data` for `automagik-server`). Whatever the old version wrote to its own root is gone: **a service without
-   a data volume loses everything it wrote to its root disk when it is updated**. The shipped `postgres-autopg`,
-   `nats` and `omni-api` templates name a data volume (`/var/lib/autopg/data`, `/data`, `/app/data`) after 0.21.0;
-   a service made from them up to 0.21.0 keeps its data on its root disk, gets no volume by itself, and must not be
-   updated without a copy of that data;
+   path, `/data` for `automagik-server`). Whatever the old version wrote to its own root is gone, so **an update of a
+   service that keeps its data on its root disk is refused** (see "A service that keeps its data inside the
+   container" below). The shipped `postgres-autopg`, `nats` and `omni-api` templates name a data volume
+   (`/var/lib/autopg/data`, `/data`, `/app/data`) from 0.23.0; a service made from them up to 0.22.0 keeps its data
+   on its root disk and gets no volume by itself;
 3. it is started;
 4. the health check, within `timeoutSeconds` (1 to 900, 120 when absent). The node can reach a service's port only
    through a proxy, since the firewall opens nothing else to it. A service with a host port (`lan`) is tried
@@ -1168,6 +1169,33 @@ from an image by digest, its instance is not the one Arca created, it has never 
 a reason other than the project not allowing one) says "Nothing was changed". A call for the digest the service
 already runs changes nothing and answers `updated: false`. A service being updated refuses a second update until
 the first ends. The call is synchronous and can take several minutes: the journal keeps what it did.
+
+#### A service that keeps its data inside the container
+
+An update replaces the root disk, so it would erase everything a service keeps there. `service_update` therefore
+refuses, before it writes anything, a service whose template declares a data volume (`data` in the template as
+installed now, or as the service's record kept it) while its instance has no `data` device attached. The refusal says
+in plain words that the update would erase the service's data because the service keeps it inside the container, and
+names the service, its template and the path the volume would be at; it ends "Nothing was changed". It applies to a
+direct call, to `action_propose` (no card is recorded for an update the node would refuse) and to an approved
+proposal when it runs, and to the follower of Automagik's releases, which logs it as a refused move. A service that
+has its data volume, and a service whose template declares none, are updated exactly as before.
+
+The template is read as the service's record kept it, then as installed on the node, then as this build ships it, so
+an installed file that is stale, edited or half installed (see `arca templates install`) does not hide a service that
+keeps its data on its root disk. A proposal that states `eraseData` for a service that has its volume is recorded
+without it, so its card never says the data is erased when it is not.
+
+To update such a service anyway and start over with no data, state `eraseData: true` with the digest. It needs the
+owner's approval: propose `service_update` with `action_propose`, and the card says, in the summary ("Update the
+service ... and ERASE ALL OF ITS DATA") and in an `Erase data` row, that all the data is erased and cannot be brought
+back. A direct call with `eraseData` and no approved proposal behind it is refused before anything is written. The
+shipped way to keep the data is to copy it out first, or to create a new service from the template (which has the
+volume) and move the data across by hand; `service_update` does not move it.
+
+An approved `eraseData` update does not give the service a volume: the rebuild adds none and the record keeps none.
+Every later update of that service is refused the same way and needs another approved card, until the service is
+replaced by a new one made from the template.
 
 The data volume is the service's own and is never snapshotted or touched: a rollback leaves in it what the new
 version wrote, a migration for example, which the old version may not read. A virtual machine, a function and an
@@ -2050,12 +2078,22 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-three gated
-service, database, GPU, storage, snapshot, instance, function or tenant verbs: `service_create`, `service_remove`, `service_import`, `service_release`
-(see [Importing a service another manager created](#importing-a-service-another-manager-created)), `service_publish`, `service_unpublish`,
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-four gated
+service, database, GPU, storage, snapshot, instance, function or tenant verbs: `service_create`, `service_remove`,
+`service_update` (see [Updating a service to a new image digest](#updating-a-service-to-a-new-image-digest)),
+`service_import`, `service_release`
+(see [Importing a service another manager created](#importing-a-service-another-manager-created)), `service_publish`,
+`service_unpublish`,
 `service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create`,
-`snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`, `instance_stop` or
-`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and `deploy_remove` (see [Tenants](#tenants)), are proposed the same way. The canvas Doctor proposes all twenty-two; it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+`snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`,
+`instance_stop` or
+`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)).
+`function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and
+`deploy_remove` (see [Tenants](#tenants)), are proposed the same way. The canvas Doctor proposes twenty-two of them
+(not `service_update` and not `host_network_restore`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
+came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a
+function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against
+that verb's own parameter schema, with
 the inline `approval` field removed because the proposal replaces it. The tool's own input schema says so: `args` has
 one `anyOf` branch per action, titled with the action's name, holding that verb's fields with their descriptions, the
 fields it requires, and an example (`examples`, and in its `description`), so an assistant reads what each action takes

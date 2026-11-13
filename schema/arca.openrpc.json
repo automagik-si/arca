@@ -1739,6 +1739,7 @@
                         "enum": [
                           "service_create",
                           "service_remove",
+                          "service_update",
                           "service_import",
                           "service_release",
                           "service_publish",
@@ -1865,6 +1866,7 @@
             "enum": [
               "service_create",
               "service_remove",
+              "service_update",
               "service_import",
               "service_release",
               "service_publish",
@@ -2035,6 +2037,56 @@
                   "name"
                 ],
                 "title": "service_remove",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_update: Move a running container service made from an image by digest to another digest of that image in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new digest (data volume, config, secrets and firewall rules are kept), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise). On any failure the old version is put back. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose. Example: {\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"name\":\"nats\"}",
+                "examples": [
+                  {
+                    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "name": "nats"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "digest": {
+                    "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository. Give it, or follow, not both.",
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "eraseData": {
+                    "description": "Say true to update a service whose template declares a data volume but whose instance has none: it keeps its data inside the container, so the update erases ALL of it. Without this such an update is refused before anything is changed. It takes the owner's approval (propose it with action_propose): the card says in words that the data is erased. A service that has its data volume, and a service whose template declares none, never need it. Give it with digest.",
+                    "type": "boolean"
+                  },
+                  "follow": {
+                    "description": "Instead of a digest: whether the node moves this service to Automagik's newest published server image by itself (true) or leaves it where it is (false). A service made from the automagik-server template follows until this says false. Only a container of the node's own project made from ghcr.io/automagik-si/automagik-server by digest can say it. Nothing is restarted by this call.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  },
+                  "timeoutSeconds": {
+                    "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent.",
+                    "maximum": 900,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "service_update",
                 "type": "object"
               },
               {
@@ -3001,6 +3053,7 @@
               "enum": [
                 "service_create",
                 "service_remove",
+                "service_update",
                 "service_import",
                 "service_release",
                 "service_publish",
@@ -3377,6 +3430,7 @@
               "enum": [
                 "service_create",
                 "service_remove",
+                "service_update",
                 "service_import",
                 "service_release",
                 "service_publish",
@@ -5552,6 +5606,16 @@
           }
         },
         {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "Only with eraseData: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data; this verb is not called with an approval of its own.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
           "name": "confirm",
           "required": false,
           "schema": {
@@ -5566,6 +5630,14 @@
             "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository. Give it, or follow, not both.",
             "pattern": "^sha256:[0-9a-f]{64}$",
             "type": "string"
+          }
+        },
+        {
+          "name": "eraseData",
+          "required": false,
+          "schema": {
+            "description": "Say true to update a service whose template declares a data volume but whose instance has none: it keeps its data inside the container, so the update erases ALL of it. Without this such an update is refused before anything is changed. It takes the owner's approval (propose it with action_propose): the card says in words that the data is erased. A service that has its data volume, and a service whose template declares none, never need it. Give it with digest.",
+            "type": "boolean"
           }
         },
         {
@@ -5635,7 +5707,7 @@
           "type": "object"
         }
       },
-      "summary": "Move a running container service made from an image by digest to another digest of that image in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
+      "summary": "Move a running container service made from an image by digest to another digest of that image in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new digest (data volume, config, secrets and firewall rules are kept), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise). On any failure the old version is put back. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

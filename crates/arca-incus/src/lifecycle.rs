@@ -7,7 +7,7 @@
 //! with before any request. Whether the instance is the kernel's own is the caller's check, made on the row this module
 //! read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,6 +70,8 @@ pub struct InstanceState {
     pub uuid: Option<String>,
     /// The instance's own config, from the same read. The kernel mark in it tells whose the instance is.
     pub own_config: BTreeMap<String, String>,
+    /// The names of the instance's own devices (not the profiles'), from the same read.
+    pub own_devices: BTreeSet<String>,
     /// The status as Incus spells it: `Running`, `Stopped`, `Frozen`, `Error`.
     pub status: String,
 }
@@ -150,6 +152,11 @@ impl StateChanger {
                     .collect()
             })
             .unwrap_or_default();
+        let own_devices: BTreeSet<String> = metadata
+            .get("devices")
+            .and_then(Value::as_object)
+            .map(|devices| devices.keys().cloned().collect())
+            .unwrap_or_default();
         let uuid = own_config
             .get("volatile.uuid")
             .filter(|uuid| !uuid.is_empty())
@@ -166,6 +173,7 @@ impl StateChanger {
             kind,
             uuid,
             own_config,
+            own_devices,
             status,
         })
     }
