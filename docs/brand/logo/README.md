@@ -33,7 +33,7 @@ The mark with the wordmark: the triskle for `automagik`, and each product's own 
 - `mykes-clean-lockup-ink.svg`, `-cream.svg`: the cords with the mykes word.
 - They share Automagik's frame: 264 units high, the small letters 136 high on a baseline at 18, and the same space from the mark to the word. At one height the letters are the same size in all of them.
 - The vortex and the cords fill the box Automagik's triskle fills. The lamp is wide and short, so it is centred on the small letters, and its foot sits a little under their baseline.
-- The genie and omni words are the files in `wordmark/`, placed whole and unchanged, with their sparkle. The mykes word has no i and so no sparkle; its letters are in its lockup only.
+- The genie and omni words are the files in `wordmark/`, placed whole and unchanged, with their sparkle. The mykes word has no i and so no sparkle; its letters are the same outline as the mykes files in `wordmark/`.
 
 **The `genie-lockup-*` and `omni-lockup-*` files are RETIRED.** They carry the triskle, which is Automagik's alone. Do not use them: Genie's lockup is `genie-lamp-lockup-*` and Omni's is `omni-mark-lockup-*`. The files stay here for older work that points at them, and they are not to be changed.
 
@@ -46,35 +46,55 @@ The notes below are for Automagik's lockup; the retired files were built the sam
 
 ## Wordmark: `wordmark/`
 
-The name alone, in the approved round lowercase lettering, with the product's sparkle on the i. The letters are outlines; no font is needed. A product's word alone is a correct form, as Automagik's name without its mark is (the README's rule 10). There is no wordmark file for Mykes: its letters are in its lockup.
+The name alone, in the approved round lowercase lettering, with the product's sparkle on the i. The letters are outlines; no font is needed. A product's word alone is a correct form, as Automagik's name without its mark is (the README's rule 10). The mykes word has no i and so no sparkle.
 
 - One file per name and letter colour: `-ink` for light grounds, `-cream` for dark grounds.
 - The files are as high as the lockup frame, so a wordmark and a lockup at one height have letters of one size.
-- **This is the one place the lettering is drawn.** The lockups are built from these files. To change the wordmark, replace these files under the same names and rebuild the lockups. (The mykes letters, in its lockup, are the one exception until Mykes has a wordmark file.)
+- **This is the one place the lettering is drawn.** The lockups are built from these files. To change the wordmark, replace these files under the same names and rebuild the lockups. (The mykes lockup is the one exception: it is we unfold's file as handed over, and its letters are the same outline as the mykes wordmark file's.)
+- `mykes-wordmark-ink.svg` and `mykes-wordmark-cream.svg`: the word "mykes" in the same lettering, for the family's menu drawer, where Omni, Genie and Mykes each stand as a word with no mark. They are we unfold's files, the ones the Mykes deck uses, kept here as byte copies (there named `mykes-word-day.svg` and `mykes-word-night.svg`). The word has no sparkle. Its frame is 257 units high where the others' is 264, on the same line: show it at 257/264 of the others' height and the letters are one size.
 
 ## Where Genie's, Omni's and Mykes's files came from
 
-They are we unfold's drawings, from its logo sheets `logo-family-05` (the lamp, the cords) and `logo-family-06` (the vortex, the lockups), handed over on 13 November 2026 as the package `family-marks`. Its `SHA256SUMS` file has the sha256 `14302472abf273b6767687946b86286185d99bf6b229792c4b13fa055d13d831`, and every file here was checked against it. The package's `mykes-clean` files are the redrawn cords (its notes: "Cords as first drawn, redrawn flat"), the drawing the owner picked.
+They are we unfold's drawings, from its logo sheets `logo-family-05` (the lamp, the cords) and `logo-family-06` (the vortex, the lockups), handed over on 13 November 2026 as the package `family-marks`. Its `SHA256SUMS` file has the sha256 `14302472abf273b6767687946b86286185d99bf6b229792c4b13fa055d13d831`, and Genie's and Mykes's files here were checked against it. The package's `mykes-clean` files are the redrawn cords (its notes: "Cords as first drawn, redrawn flat"), the drawing the owner picked.
 
-Each file here is a byte copy of the package's file. Only the name changed, to this folder's naming: `-day` is `-ink`, `-night` is `-cream`, the size comes last, the small lockup is `-header`, and a lockup carries its mark's name so that it is not taken for a retired file.
+Omni's eight files are from a second package, `omni-marks-light`, handed over the same day: the same drawing on curves (the next section). Its `SHA256SUMS` file has the sha256 `57f9f245857ca4aa588959d36137275b219729368585ea5d6dbbc4527d68fc49`, and Omni's files here were checked against it.
+
+Each file here is a byte copy of its package's file. Only the name changed, to this folder's naming: `-day` is `-ink`, `-night` is `-cream`, the size comes last, the small lockup is `-header`, and a lockup carries its mark's name so that it is not taken for a retired file.
+
+From `family-marks`:
 
 | File | In the package | sha256 |
 | --- | --- | --- |
 | `svg/genie-lamp-ink.svg` | `marks/genie-lamp-ink.svg` | `a837a92a18fb4a319ce17b1d91e0f3f347c2feb3e8c49aaa696ea1e5154b6914` |
 | `svg/genie-lamp-cream.svg` | `marks/genie-lamp-cream.svg` | `ef94842939a9219c21d1c75b6570605500e9dcb03ec133b3e9a2b527d5514724` |
-| `svg/omni-mark-ink.svg` | `marks/omni-mark-ink.svg` | `3d3d701164ff71440a9d812872d792e3fe7a0059d416c89153fda82260be8470` |
-| `svg/omni-mark-cream.svg` | `marks/omni-mark-cream.svg` | `b97e2e775edf3ffce1936bea85d7fc6d7512f108cc88978bc6712d9998cda674` |
-| `svg/omni-mark-ink-32.svg` | `marks/omni-mark-32-ink.svg` | `d2a53a02b594c5cb40ce07a503f6b5695b8565f3de81b59fb5ec3439ddfcecac` |
-| `svg/omni-mark-cream-32.svg` | `marks/omni-mark-32-cream.svg` | `9d74dc072235f4941d1534d644570a48cc3db779a31d7921bbc607bfa794fbec` |
 | `svg/mykes-clean-ink.svg` | `marks/mykes-clean-ink.svg` | `464d74f76cfe6ab5ad351d07938736bd68697a3210e0a82cfbe580d068c292ba` |
 | `svg/mykes-clean-cream.svg` | `marks/mykes-clean-cream.svg` | `74cdf63bb480c803d4ea7e63677e78594890fbe598294d997f50a0077780ffd9` |
 | `lockups/genie-lamp-lockup-ink.svg` | `lockups/genie-lockup-day.svg` | `5efc6f5a6a109638a98dd69730e67361c4617f3ccdd60d79546d6712abbb9335` |
 | `lockups/genie-lamp-lockup-cream.svg` | `lockups/genie-lockup-night.svg` | `3bce670e43c4293f5e2617b8f56aeebd820448a66ba88cec7686c7e4f226cc60` |
-| `lockups/omni-mark-lockup-ink.svg` | `lockups/omni-lockup-day.svg` | `1103d79dc9d20c08db2a0804816b0924b5f430eb2c0c5cecefcce22043a13c4b` |
-| `lockups/omni-mark-lockup-cream.svg` | `lockups/omni-lockup-night.svg` | `84fa92c2e5179ddb8809c7f9bd388982888c557a9d2a5067ae37c51c54a7426c` |
-| `lockups/omni-mark-lockup-ink-header.svg` | `lockups/omni-lockup-small-day.svg` | `9ec00aa8dd301e3f1948afc4450cf0d6df138531f4afe8951e631b0eec18f665` |
-| `lockups/omni-mark-lockup-cream-header.svg` | `lockups/omni-lockup-small-night.svg` | `d61327bd465e7233302dd46fa512fd5fd20b249584f777c43007ae118d6ef9c4` |
 | `lockups/mykes-clean-lockup-ink.svg` | `lockups/mykes-clean-lockup-day.svg` | `d5f4c9d4fbdd1b36b1baf3e9d94b43d87a15468e4ee0e669072e06048c5ee6d1` |
 | `lockups/mykes-clean-lockup-cream.svg` | `lockups/mykes-clean-lockup-night.svg` | `3a36b5cbea56c95eec22a01f1166b3bce4adcaad94eb6fd4b5f4e04f38746758` |
 
-A file whose sha256 is not the one in this table was changed: put the package's file back (`scripts/brand-marks.test.ts` checks it).
+From `omni-marks-light`:
+
+| File | In the package | sha256 |
+| --- | --- | --- |
+| `svg/omni-mark-ink.svg` | `omni-mark-ink.svg` | `9b913491327001c9e3e65d38b3bda614b412da14eaa2ed2449eb0c9ac50b953a` |
+| `svg/omni-mark-cream.svg` | `omni-mark-cream.svg` | `cedaf4516d1731ddc338a67df075aa7c5fa595d7dbddc017a72617866f92c29e` |
+| `svg/omni-mark-ink-32.svg` | `omni-mark-32-ink.svg` | `9de3588852dc64ae54783e63fbb53de22b83626ad47139c17655a1e943cb9e2e` |
+| `svg/omni-mark-cream-32.svg` | `omni-mark-32-cream.svg` | `6fb43b5a6fc57c4365bbfc37b696def28fab5cdd8b739d97907621ef5293a5d9` |
+| `lockups/omni-mark-lockup-ink.svg` | `lockups/omni-lockup-day.svg` | `820d20dd9efdab808843829633167056d7c67c4c764f89909f93ae61ff42ea3b` |
+| `lockups/omni-mark-lockup-cream.svg` | `lockups/omni-lockup-night.svg` | `e7132f429a0c94544fe67c5c7450751807a25c6bc9564aa064d8bdeec442eb17` |
+| `lockups/omni-mark-lockup-ink-header.svg` | `lockups/omni-lockup-small-day.svg` | `cef19f7a34cba707c8995eac9ded832bc6b4ddf6361793ed62ddc6d7d20c387a` |
+| `lockups/omni-mark-lockup-cream-header.svg` | `lockups/omni-lockup-small-night.svg` | `8af9ca4d1c5b075c98913b82ae63ef9b9a9b28e0babea28d6e71f0f95fe08f16` |
+
+A file whose sha256 is not the one in these tables was changed: put its package's file back (`scripts/brand-marks.test.ts` checks it).
+
+## Omni's vortex on curves
+
+Omni's files are the same drawing as the one first handed over, with its outline written on curves. The first files traced the vortex with about 4,600 short straight pieces, 55 to 61 KB a file. The files here draw each arm with 12 or 13 curves, its round tip as two arcs and the ten facets of its end at the rim as before: 6.7 KB for the mark, 4.3 KB for its small drawing, 8.5 and 6.1 KB for the lockups.
+
+- It is not a redrawing (the README's rule 8). Only the outline's path data changed: the frame, the label, the colour, the even-odd holes and the single shape are the first files' bytes, and so are the lockups' placing, word and sparkle.
+- The 40 suckers of the large drawing keep their numbers. Both drawings keep their count of shapes: 8 arms and 40 suckers, and 8 arms.
+- Laid over the first files, drawn large and brought down to 128px, the two cover the same area to 0.9996 (the large drawing) and 0.9977 (the small drawing), as intersection over union. On the 120-unit frame the curves stay within 0.0145 of the first outline. The tips, which were many-sided and are now true arcs, stay within 0.042: the one place the outline is smoother than before.
+- Old and new were looked at side by side on 13 November 2026, on both grounds: the marks at 128, 32 and 16px, the lockups at 60 and 28px high. They look the same; the only differences are in how the edge pixels are shaded.
+- At 16px the vortex still closes into a blot, as before: the curves change nothing in the sizes each drawing is for.
