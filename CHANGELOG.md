@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.26.0 (2026-11-13)
+
 A service template may set `noNewPrivileges: true`, so a setuid or setcap binary inside the container cannot raise
 privileges. It is off unless set, so every existing template and service is unchanged. It needs
 `restricted.containers.lowlevel=allow` on the service project, a step on the node that Arca does not take; see
@@ -15,6 +17,9 @@ restart (which interrupts it) and a health check, and no rebuild, so its data st
 
 - The guide names `admin` tokens beside `doctor` and `operator`, and says what puts the declared host network back
   and what does not.
+
+- Merge PR 155: the guide names admin tokens with doctor and operator, and says exactly what is and is not repaired by itself
+- Merge PR 154: a service template can run its container with no-new-privileges, gained or dropped on a running service by an update that restarts it and puts the old setting back if it fails
 
 ## 0.25.0 (2026-11-13)
 
