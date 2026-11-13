@@ -3097,13 +3097,13 @@ fn entrypoint_with(
         return Err(TemplateError::refused("entrypoint: invalid length"));
     }
     let mut out = Vec::new();
-    for part in parts {
-        match part {
+    for (index, part) in parts.iter().enumerate() {
+        let text = match part {
             Value::String(text) => {
                 if text.len() > 16_384 || text.contains('\0') || text.contains("{{") {
                     return Err(TemplateError::refused("entrypoint: invalid argument"));
                 }
-                out.push(shell_quote(text));
+                text.clone()
             }
             Value::Object(object) => {
                 let file = object
@@ -3118,9 +3118,19 @@ fn entrypoint_with(
                 }
                 let script =
                     read(file).map_err(|error| script_unreadable(&template.name, file, &error))?;
-                out.push(shell_quote(script.trim_end_matches('\n')));
+                script.trim_end_matches('\n').to_string()
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),
+        };
+        if !text.contains(['\n', '\r']) {
+            out.push(shell_quote(&text));
+        } else if is_shell_script_argument(parts, index) {
+            out.push(shell_quote(&one_line_script(&text)));
+        } else {
+            return Err(TemplateError::refused(
+                "entrypoint: an argument with a line break must be the script of a shell, as in \
+                 [\"/bin/sh\", \"-ec\", <script>, ...]: Incus refuses a line break anywhere in oci.entrypoint",
+            ));
         }
     }
     let joined = out.join(" ");
@@ -3128,6 +3138,31 @@ fn entrypoint_with(
         return Err(TemplateError::refused("entrypoint: too long"));
     }
     Ok(Some(joined))
+}
+
+/// Whether `parts[index]` is the script of a shell started as `sh -c <script>` (or `-ec`, `-eu -c` and the like): the
+/// one argument that Arca can carry a line break in, because it can decode it again inside the shell.
+fn is_shell_script_argument(parts: &[Value], index: usize) -> bool {
+    let Some(flag) = index.checked_sub(1).and_then(|i| parts[i].as_str()) else {
+        return false;
+    };
+    let shell = parts[0].as_str().and_then(|s| s.rsplit('/').next());
+    matches!(shell, Some("sh" | "bash" | "ash" | "dash"))
+        && flag.len() > 1
+        && flag.starts_with('-')
+        && !flag.starts_with("--")
+        && flag.ends_with('c')
+        && flag[1..].bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// A shell script as one line that runs the same script: Incus 7.6 refuses a line break in `oci.entrypoint`, so a
+/// script with any is sent as base64 without wrapping, decoded by the image's own `base64` (busybox and coreutils
+/// both have it) and run by `eval` in the same shell, so `$0`, `$1` and the options (`-e`) are the script's own. The
+/// text is the script's bytes exactly; a failed decode ends the shell with its status and runs nothing.
+fn one_line_script(script: &str) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    format!("__arca_script=$(printf %s {encoded} | base64 -d) && eval \"$__arca_script\"")
 }
 
 /// Whether `file` is a plain file name, so an entrypoint script is read from the template directory and nowhere else.

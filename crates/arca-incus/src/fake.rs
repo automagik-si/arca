@@ -1822,6 +1822,24 @@ impl Store {
 }
 
 /// Creates an object from a POST. A `config` is refused when the switch names this path.
+/// What Incus 7.6 refuses in an instance's config whatever the project: a line break in `oci.entrypoint` or `oci.cwd`
+/// ("OCI configuration values cannot contain line breaks"), and in any `environment.*` value. Incus 7.5.1 had the
+/// environment check only.
+fn line_break_refusal(config: &Map<String, Value>) -> Option<&'static str> {
+    config.iter().find_map(|(key, value)| {
+        let text = value.as_str()?;
+        if key.starts_with("environment.") && text.contains('\n') {
+            Some("Environment variables cannot contain line breaks")
+        } else if matches!(key.as_str(), "oci.entrypoint" | "oci.cwd")
+            && text.contains(['\r', '\n'])
+        {
+            Some("OCI configuration values cannot contain line breaks")
+        } else {
+            None
+        }
+    })
+}
+
 fn create(
     shared: &Shared,
     store: &mut Store,
@@ -1886,6 +1904,12 @@ fn create(
         && let Some(reason) = store.restricted_nic(&project, &body)
     {
         return (403, String::new(), error_envelope(403, reason));
+    }
+    if kind == "instance"
+        && let Some(config) = body.get("config").and_then(Value::as_object)
+        && let Some(reason) = line_break_refusal(config)
+    {
+        return (400, String::new(), error_envelope(400, reason));
     }
     if kind == "instance"
         && let Some(config) = body.get("config").and_then(Value::as_object)
@@ -2128,6 +2152,9 @@ fn put(
     let Some(config) = text_map("config") else {
         return bad("config must be a map of text");
     };
+    if let Some(reason) = line_break_refusal(&config) {
+        return bad(reason);
+    }
     let devices = match body.get("devices") {
         None => Map::new(),
         Some(Value::Object(devices)) if devices.values().all(Value::is_object) => devices.clone(),
@@ -2205,6 +2232,12 @@ fn patch(
             store.restricted_low_level(&store.objects[index].project.clone(), config)
     {
         return (403, String::new(), error_envelope(403, &reason));
+    }
+    if store.objects[index].kind == "instance"
+        && let Some(config) = changes.get("config").and_then(Value::as_object)
+        && let Some(reason) = line_break_refusal(config)
+    {
+        return (400, String::new(), error_envelope(400, reason));
     }
     let mut changes = changes;
     if store.objects[index].kind == "acl" {

@@ -3777,6 +3777,75 @@ fn a_netproject_read_failure_does_not_refuse_a_service_remove_or_skip_secret_cle
     );
 }
 
+/// Incus 7.6 refuses a line break in `oci.entrypoint` ("OCI configuration values cannot contain line breaks"), so a
+/// script with lines reaches the container as one line that decodes to the script's own bytes, and the shell sees the
+/// same `$0` and `$1` as it did when the script was passed whole.
+#[test]
+fn a_multi_line_entrypoint_script_reaches_the_container_byte_for_byte_on_one_line() {
+    let script = "set -eu\n# a 'comment' with \"quotes\", $dollars and `ticks`\ncat <<'EOF'\nheredoc $0 $1\nEOF\nprintf '%s|%s|%s\\n' \"$0\" \"${1-none}\" 'it'\\''s'\n# a carriage return\r inside a comment\nfalse || echo recovered\nexit 7\n\n\n";
+    let rig = Rig::new();
+    rig.template(
+        "jet",
+        json!({
+            "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+            "ports":[8080],"env":{},"publishable":false,
+            "entrypoint":["/bin/sh","-ec",{"file":"jet.sh"},"jet","arg one"]
+        }),
+    );
+    fs::write(rig.dir.join("templates/jet.sh"), script).expect("script");
+    rig.call("service_create", json!({"name":"jet","template":"jet"}))
+        .expect("Incus 7.6 accepts the create");
+    let instance = rig
+        .get(&format!("/1.0/instances/jet?project={PROJECT}"))
+        .expect("instance");
+    let entrypoint = instance["config"]["oci.entrypoint"]
+        .as_str()
+        .expect("entrypoint");
+    assert!(
+        !entrypoint.contains(['\n', '\r']),
+        "no line break: {entrypoint}"
+    );
+    assert!(entrypoint.starts_with("/bin/sh -ec '__arca_script=$(printf %s "));
+    assert!(entrypoint.ends_with("| base64 -d) && eval \"$__arca_script\"' jet 'arg one'"));
+    // What Incus does with it: split into the argument list. Run as the shell reads it, the script is its own text.
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", entrypoint])
+        .output()
+        .expect("sh");
+    assert_eq!(out.status.code(), Some(7), "the script's own exit status");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "heredoc $0 $1\njet|arg one|it's\nrecovered\n",
+    );
+}
+
+#[test]
+fn a_line_break_in_an_entrypoint_argument_that_is_no_shell_script_is_refused_before_anything_is_created()
+ {
+    let rig = Rig::new();
+    rig.template(
+        "jet",
+        json!({
+            "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+            "ports":[8080],"env":{},"publishable":false,
+            "entrypoint":["/usr/bin/jet","--banner","one\ntwo"]
+        }),
+    );
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"jet","template":"jet"}))
+    else {
+        panic!("a line break outside a shell script is refused");
+    };
+    assert!(
+        message.contains("must be the script of a shell"),
+        "{message}"
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
+            .is_none()
+    );
+}
+
 #[test]
 fn service_create_names_the_missing_entrypoint_script_and_how_it_gets_there() {
     let rig = Rig::new();

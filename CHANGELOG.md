@@ -7,6 +7,9 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+- A service template whose entrypoint embeds a multi-line script (postgres-autopg) can be created on Incus 7.6, which refuses a
+  line break in `oci.entrypoint`: Arca sends the script as one line of base64 that the container's own shell decodes and runs.
+
 ## 0.26.0 (2026-11-13)
 
 A service template may set `noNewPrivileges: true`, so a setuid or setcap binary inside the container cannot raise

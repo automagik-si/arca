@@ -748,7 +748,12 @@ script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgre
 `github-runner-pool`, `gitlab-runner-pool.sh` for both `gitlab-runner-pool` and `gitlab-runner-pool-large`,
 `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
-`service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
+`service_create` with the file it looked for (`templates/<name>`). Incus 7.6 refuses a line break anywhere in `oci.entrypoint`, so a
+script with lines (a file's, or a string's) must be the script of a shell, `["/bin/sh", "-ec", <script>, "name"]` (`sh`, `ash`,
+`dash` or `bash`, flags ending in `c`), and Arca sends it as one line: its base64, decoded by the image's own `base64` and run
+by `eval` in that shell, so `$0`, `$1` and `-e` are as if the script had been passed whole. The image therefore needs `sh` and
+`base64` (busybox and coreutils both have them). A script of one line is sent as it is. A line break in any other entrypoint
+argument is refused by `service_create` before anything is created. A template whose `image` is `local:<alias>`
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.

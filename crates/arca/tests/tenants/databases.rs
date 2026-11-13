@@ -200,10 +200,26 @@ fn on_a_clean_node_a_proposed_database_is_the_templates_service_with_its_image_f
     assert_eq!(record["source"], fetched_source(&rig));
     assert_eq!(record["start"], true);
     let live = instance(&rig, "orders").expect("its instance");
+    // The script goes to Incus as one line of base64 (Incus 7.6 refuses a line break); it decodes to the template's own.
+    let entrypoint = live["config"]["oci.entrypoint"]
+        .as_str()
+        .expect("entrypoint");
+    assert!(!entrypoint.contains('\n'));
+    let encoded = entrypoint
+        .split("printf %s ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .expect("the encoded script");
+    let decoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64")
+    };
     assert!(
-        live["config"]["oci.entrypoint"]
-            .as_str()
-            .is_some_and(|entrypoint| entrypoint.contains("autopg postmaster")),
+        String::from_utf8(decoded)
+            .expect("text")
+            .contains("autopg postmaster"),
         "the template's own entrypoint script opens the database"
     );
     // The password is the one the template generates: 32 letters and digits in a private file, given to the
