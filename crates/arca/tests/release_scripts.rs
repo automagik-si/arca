@@ -939,7 +939,7 @@ fn the_release_files_carry_the_installer_and_an_installer_at_another_version_sto
     assert!(
         notes.contains(
             "`sha256sum --check --ignore-missing SHA256SUMS`, and stop unless it prints \
-             `arca-0.8.0-linux-x86_64: OK`.\n"
+             `arca-0.8.0-linux-x86_64: OK` or `arca-0.8.0-linux-aarch64: OK`, for the file you took.\n"
         ),
         "{notes}"
     );
@@ -1236,8 +1236,10 @@ fn the_release_workflow_runs_on_dev_and_by_hand_only_one_run_at_a_time() {
     assert!(top.contains("\nconcurrency:\n  group: release\n  cancel-in-progress: false\n"));
     assert!(!rules.contains("cancel-in-progress: true"));
     // GitHub's hosted runner, always: a self-hosted one keeps its cache beside this workflow's write token.
-    assert_eq!(rules.matches("runs-on: ubuntu-24.04").count(), 3);
-    assert_eq!(rules.matches("runs-on:").count(), 3);
+    // Three jobs on the x86_64 image, and the one that builds the aarch64 binary on GitHub's own arm64 image.
+    assert_eq!(rules.matches("runs-on: ubuntu-24.04\n").count(), 3);
+    assert_eq!(rules.matches("runs-on: ubuntu-24.04-arm\n").count(), 1);
+    assert_eq!(rules.matches("runs-on:").count(), 4);
     assert!(!rules.contains("self-hosted"));
     assert!(!rules.contains("--force") && !rules.contains("push -f"));
 }
@@ -1275,9 +1277,31 @@ fn the_job_that_runs_the_repository_s_code_can_write_nothing() {
     ] {
         assert!(!cut.contains(never), "the cutting job has no {never}");
     }
-    // It is where everything of the repository runs, and the one place the files are built.
-    assert_eq!(rules.matches("scripts/release.sh").count(), 1);
+    // It is where everything of the repository runs, and with the aarch64 job (checked below) the only place the files
+    // are built.
+    assert_eq!(rules.matches("scripts/release.sh").count(), 2);
     assert_eq!(cut.matches("run: scripts/release.sh").count(), 1);
+    let arm = job(&rules, "aarch64");
+    assert_eq!(arm.matches("run: scripts/release.sh").count(), 1);
+    // The aarch64 job is cut's kind: read-only, no credential left behind, no token, no write.
+    assert!(arm.contains("    permissions:\n      contents: read\n"));
+    assert_eq!(arm.matches("permissions:").count(), 1);
+    assert!(arm.contains("          persist-credentials: false\n"));
+    assert!(arm.contains("    runs-on: ubuntu-24.04-arm\n"));
+    for never in [
+        "GH_TOKEN",
+        "github.token",
+        "git push",
+        "gh ",
+        "write",
+        "secrets.",
+    ] {
+        assert!(!arm.contains(never), "the aarch64 job has no {never}");
+    }
+    // It hands over one file, the binary, and nothing else.
+    assert!(
+        arm.contains("          path: dist/arca-${{ needs.cut.outputs.version }}-linux-aarch64\n")
+    );
     assert!(!rules.contains("build-portable.sh"));
     for here in ["cargo test --workspace", "npm ci", "scripts/version.sh set"] {
         assert!(cut.contains(here));
@@ -1392,7 +1416,14 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
         .filter_map(|line| line.trim_start().strip_prefix("- uses: "))
         .map(|action| action.split('@').next().unwrap_or(""))
         .collect();
-    assert_eq!(uses, ["actions/checkout", "actions/download-artifact"]);
+    assert_eq!(
+        uses,
+        [
+            "actions/checkout",
+            "actions/download-artifact",
+            "actions/download-artifact"
+        ]
+    );
     // One atomic push carries the commit and the tag, and it is the only push of dev in the workflow.
     assert!(publish.contains(
         "git push -q --atomic origin \"${COMMIT}:refs/heads/dev\" \"refs/tags/v${VERSION}\""
@@ -1410,7 +1441,7 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
     assert!(!publish.contains("sha256sum --check"));
     // The installer is published as the release commit holds it, and the cutting job hands it over with the rest.
     assert!(publish.contains(
-        "gh release create \"v${VERSION}\" \"arca-${VERSION}-linux-x86_64\" install.sh SHA256SUMS \"${flags[@]}\""
+        "gh release create \"v${VERSION}\" \"arca-${VERSION}-linux-x86_64\" \"arca-${VERSION}-linux-aarch64\" install.sh SHA256SUMS \"${flags[@]}\""
     ));
     assert!(publish.contains("git hash-object --no-filters \"${HANDOVER}/install.sh\""));
     assert!(job(&rules, "cut").contains(
@@ -2441,6 +2472,59 @@ fn the_publishing_job_checks_what_it_was_handed_pushes_both_at_once_and_publishe
         ("COMMIT", commit.as_str()),
         ("PRERELEASE", "false"),
     ];
+    // The aarch64 binary comes in its own artifact: exactly one plain file, or the release stops. Nothing is pushed.
+    let arm_dir = lab.temp().join("release-aarch64");
+    let arm = "arca-0.8.0-linux-aarch64";
+    let add = |lab: &Lab| lab.step("Add the aarch64 binary", &publish, &env);
+    let before_sums = fs::read(lab.handed().join("SHA256SUMS")).expect("the checksums");
+    fs::create_dir_all(&arm_dir).expect("the artifact");
+    let missing = add(&lab);
+    assert_ne!(missing.code, Some(0), "no aarch64 binary: {}", missing.said);
+    fs::write(arm_dir.join(arm), "an arm binary\n").expect("write");
+    fs::write(arm_dir.join("notes.txt"), "words\n").expect("write");
+    let extra = add(&lab);
+    assert_ne!(extra.code, Some(0), "an extra file: {}", extra.said);
+    assert!(extra.said.contains("not exactly arca-0.8.0-linux-aarch64"));
+    fs::remove_file(arm_dir.join("notes.txt")).expect("remove");
+    fs::remove_file(arm_dir.join(arm)).expect("remove");
+    std::os::unix::fs::symlink(lab.dir().join("bin/gh"), arm_dir.join(arm)).expect("link");
+    let link = add(&lab);
+    assert_ne!(link.code, Some(0), "a link: {}", link.said);
+    assert_eq!(
+        fs::read(lab.handed().join("SHA256SUMS")).expect("the checksums"),
+        before_sums,
+        "a refused artifact changes nothing"
+    );
+    fs::remove_file(arm_dir.join(arm)).expect("remove");
+    fs::write(arm_dir.join(arm), "an arm binary\n").expect("write");
+    let added = add(&lab);
+    assert_eq!(added.code, Some(0), "{}", added.said);
+    // SHA256SUMS is now what sha256sum writes for the three files, in this order, and every line is true.
+    let handed = lab.handed();
+    let sums = fs::read_to_string(handed.join("SHA256SUMS")).expect("the checksums");
+    let names: Vec<&str> = sums
+        .lines()
+        .map(|line| line.split_once("  ").expect("two spaces").1)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "arca-0.8.0-linux-x86_64",
+            "arca-0.8.0-linux-aarch64",
+            "install.sh"
+        ]
+    );
+    let checked = Command::new("sha256sum")
+        .args(["--check", "--strict", "--quiet", "SHA256SUMS"])
+        .current_dir(&handed)
+        .output()
+        .expect("run sha256sum");
+    assert!(checked.status.success(), "{checked:?}");
+    assert_eq!(
+        fs::read_to_string(handed.join(arm)).expect("the binary"),
+        "an arm binary\n"
+    );
+
     let push = lab.step("Push dev and the tag", &publish, &env);
     assert_eq!(push.code, Some(0), "{}", push.said);
     assert_eq!(push.outputs.get("pushed").map(String::as_str), Some("true"));
@@ -2472,7 +2556,7 @@ fn the_publishing_job_checks_what_it_was_handed_pushes_both_at_once_and_publishe
     assert_eq!(done.code, Some(0), "{}", done.said);
     assert_eq!(
         lab.created(),
-        "release create v0.8.0 arca-0.8.0-linux-x86_64 install.sh SHA256SUMS --latest --repo automagik-si/arca --verify-tag \
+        "release create v0.8.0 arca-0.8.0-linux-x86_64 arca-0.8.0-linux-aarch64 install.sh SHA256SUMS --latest --repo automagik-si/arca --verify-tag \
          --title Automagik Arca 0.8.0 --notes-file RELEASE-NOTES.md\n"
     );
     assert_eq!(

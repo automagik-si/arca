@@ -5,6 +5,9 @@
 # that version or newer. This script links against glibc 2.34 instead (Enterprise Linux 9 and
 # newer), using zig as the C compiler and linker through cargo-zigbuild.
 #
+# It builds for the machine it runs on: x86_64 Linux gives the x86_64 binary and aarch64 Linux the aarch64 one, each
+# with that machine's own pinned tools, so the release's two binaries are built where they run.
+#
 # No root is needed. The two tools are fetched once as release archives, checked against the
 # SHA-256 pinned below, and unpacked under the tools directory. Nothing is installed system-wide.
 #
@@ -31,20 +34,34 @@ set -euo pipefail
 
 # The glibc the binary may need at most. 2.34 is Enterprise Linux 9.
 GLIBC_CEILING="2.34"
-RUST_TARGET="x86_64-unknown-linux-gnu"
+
+# The machine, and with it the target and the tools' archives. Anything else is refused further down.
+machine="$(uname -m)"
 
 # Pinned tools. To move a pin, change the version and the SHA-256 together; the SHA-256 values
 # are the ones the projects publish (ziglang.org/download/index.json, and the release's
 # sha256.sum on github.com/rust-cross/cargo-zigbuild).
 ZIG_VERSION="0.17.1"
-ZIG_ARCHIVE="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_ARCHIVE}"
-ZIG_SHA256="3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
-
 ZIGBUILD_VERSION="0.24.1"
-ZIGBUILD_ARCHIVE="cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz"
-ZIGBUILD_URL="https://github.com/rust-cross/cargo-zigbuild/releases/download/v${ZIGBUILD_VERSION}/${ZIGBUILD_ARCHIVE}"
-ZIGBUILD_SHA256="32581c8e13f27a807bb244aaaac870522f5b51263c766cf77b1a99771ce9fa5c"
+case "$machine" in
+    x86_64)
+        RUST_TARGET="x86_64-unknown-linux-gnu"
+        ZIG_ARCHIVE="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        ZIG_SHA256="3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
+        ZIGBUILD_ARCHIVE="cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz"
+        ZIGBUILD_SHA256="32581c8e13f27a807bb244aaaac870522f5b51263c766cf77b1a99771ce9fa5c"
+        ;;
+    aarch64)
+        RUST_TARGET="aarch64-unknown-linux-gnu"
+        ZIG_ARCHIVE="zig-aarch64-linux-${ZIG_VERSION}.tar.xz"
+        ZIG_SHA256="a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795"
+        ZIGBUILD_ARCHIVE="cargo-zigbuild-aarch64-unknown-linux-gnu.tar.xz"
+        ZIGBUILD_SHA256="70bb4c9cc71a6d16211b9079996e3cd588671053312adeff4d043499ed887601"
+        ;;
+    *) RUST_TARGET="" ;;
+esac
+ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_ARCHIVE-}"
+ZIGBUILD_URL="https://github.com/rust-cross/cargo-zigbuild/releases/download/v${ZIGBUILD_VERSION}/${ZIGBUILD_ARCHIVE-}"
 
 fail() {
     echo "build-portable: $*" >&2
@@ -129,8 +146,8 @@ if [ "${1-}" = "--check-paths" ]; then
 fi
 [ "$#" -eq 0 ] || fail "usage: scripts/build-portable.sh [--check-paths <file>]"
 
-[ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ] ||
-    fail "this script builds on x86_64 Linux only (found $(uname -s) $(uname -m))"
+[ "$(uname -s)" = "Linux" ] && [ -n "$RUST_TARGET" ] ||
+    fail "this script builds on x86_64 or aarch64 Linux only (found $(uname -s) $machine)"
 for tool in cargo rustc curl sha256sum tar xz objdump; do
     command -v "$tool" >/dev/null || fail "$tool is not on PATH"
 done

@@ -117,7 +117,7 @@ Install Automagik Arca as a read-only node for this user.
   sh install.sh --uninstall          remove the program and the service; keep the config, the tokens and the state
   sh install.sh --help
 
-It needs Linux on x86_64 with glibc $GLIBC_MAJOR.$GLIBC_MINOR or newer, curl, sha256sum, and an Incus this user can reach.
+It needs Linux on x86_64 or aarch64 with glibc $GLIBC_MAJOR.$GLIBC_MINOR or newer, curl, sha256sum, and an Incus this user can reach.
 It never runs sudo, and it changes nothing outside this user's home and runtime directory.
 A program from release $DOOR_SINCE on answers MCP clients of this machine at http://127.0.0.1:PORT/mcp (PORT is
 ${DOOR_PORTS%% *}, or the next free one), with a token. It opens no address another machine can reach.
@@ -404,6 +404,7 @@ put_config() {
 # ----------------------------------------------------------------------------------------------------------------------
 
 check_machine() {
+    arch=x86_64
     for program in $INSTALL_PROGRAMS; do
         have "$program" || problem "the program \`$program\` is not on PATH." \
             "Install it with the machine's package manager, then run this again."
@@ -414,8 +415,12 @@ check_machine() {
         machine=$(uname -m)
         [ "$system" = Linux ] || problem "this is $system, and Arca's published program is for Linux only." \
             "Run this on a Linux machine with Incus."
-        [ "$machine" = x86_64 ] || problem "this machine is $machine, and Arca's published program is for x86_64 only." \
-            "Run this on an x86_64 machine, or build Arca from source (docs/BUILDING.md, \"Build and test\")."
+        case $machine in
+            x86_64) arch=x86_64 ;;
+            aarch64 | arm64) arch=aarch64 ;;
+            *) problem "this machine is $machine, and Arca's published program is for x86_64 and aarch64 only." \
+                "Run this on an x86_64 or aarch64 machine, or build Arca from source (docs/BUILDING.md, \"Build and test\")." ;;
+        esac
     fi
 
     glibc=
@@ -544,7 +549,7 @@ check_installed() {
 # ----------------------------------------------------------------------------------------------------------------------
 
 install_program() {
-    asset="arca-$version-linux-x86_64"
+    asset="arca-$version-linux-$arch"
     base="$RELEASES/download/v$version"
 
     mkdir -p "$bin_dir"
@@ -1348,7 +1353,7 @@ main() {
     else
         say "Installing Automagik Arca $version as a read-only node for the user $user."
     fi
-    say "Checked: Linux on x86_64, glibc $glibc, and Incus answers on $incus_socket."
+    say "Checked: Linux on $arch, glibc $glibc, and Incus answers on $incus_socket."
     install_program
     write_config
     start_service

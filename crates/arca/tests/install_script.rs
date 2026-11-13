@@ -2331,13 +2331,13 @@ fn a_node_that_already_runs_is_left_as_it_is() {
 #[test]
 fn a_machine_it_cannot_run_on_is_refused_with_every_reason_at_once() {
     let machine = Machine::new();
-    machine.uname("Darwin", "arm64");
+    machine.uname("Darwin", "s390x");
     machine.glibc("");
     fs::remove_file(machine.dir.join("bin/sha256sum")).expect("sha256sum");
     let run = machine.run(&[]);
     run.refused()
         .says("this is Darwin, and Arca's published program is for Linux only")
-        .says("this machine is arm64, and Arca's published program is for x86_64 only")
+        .says("this machine is s390x, and Arca's published program is for x86_64 and aarch64 only")
         .says("does not say which glibc it has")
         .says("the program `sha256sum` is not on PATH")
         .says("nothing was changed");
@@ -2392,6 +2392,65 @@ fn a_machine_it_cannot_run_on_is_refused_with_every_reason_at_once() {
     run.refused()
         .says("is not a path this script can write into the config");
     assert_eq!(fs::read_dir(&odd).expect("the home").count(), 0);
+}
+
+#[test]
+fn each_architecture_gets_its_own_program_and_the_others_are_refused() {
+    let version = current();
+    let x86 = program(&version);
+    let arm = format!("{x86}# built for aarch64\n");
+    // `uname -m` says aarch64 on Linux; arm64 is how some systems name the same machine.
+    for (says, arch) in [
+        ("x86_64", "x86_64"),
+        ("aarch64", "aarch64"),
+        ("arm64", "aarch64"),
+    ] {
+        let machine = Machine::new();
+        machine.uname("Linux", says);
+        let dir = machine.dir.join("fake/release").join(format!("v{version}"));
+        fs::create_dir_all(&dir).expect("the release");
+        fs::write(dir.join(format!("arca-{version}-linux-x86_64")), &x86).expect("x86_64");
+        fs::write(dir.join(format!("arca-{version}-linux-aarch64")), &arm).expect("aarch64");
+        fs::write(
+            dir.join("SHA256SUMS"),
+            format!(
+                "{}  arca-{version}-linux-x86_64\n{}  arca-{version}-linux-aarch64\n{}  install.sh\n",
+                sha256_hex(x86.as_bytes()),
+                sha256_hex(arm.as_bytes()),
+                sha256_hex(b"another file of the release")
+            ),
+        )
+        .expect("the checksums");
+        let run = machine.run(&[]);
+        run.ok().says(&format!("Checked: Linux on {arch}, glibc"));
+        assert_eq!(
+            fs::read_to_string(machine.home(".local/bin/arca")).expect("the program"),
+            if arch == "aarch64" {
+                arm.clone()
+            } else {
+                x86.clone()
+            },
+            "{says}"
+        );
+        let asked: Vec<String> = machine
+            .log("curl")
+            .into_iter()
+            .filter(|line| !line.contains("--unix-socket"))
+            .map(|line| line.rsplit(' ').next().expect("an address").to_string())
+            .collect();
+        assert!(
+            asked
+                .iter()
+                .any(|url| url.ends_with(&format!("/arca-{version}-linux-{arch}"))),
+            "{says}: {asked:?}"
+        );
+        assert!(
+            asked
+                .iter()
+                .all(|url| !url.contains("linux-x86_64") || arch == "x86_64"),
+            "{says}: {asked:?}"
+        );
+    }
 }
 
 #[test]

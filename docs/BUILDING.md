@@ -11,7 +11,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 A plain `cargo build --release` needs the build machine's glibc or newer on the host that runs the binary.
-`scripts/build-portable.sh` builds `arca` against glibc 2.34 (Enterprise Linux 9 and newer) with cargo-zigbuild and zig; both are pinned, checked by SHA-256 and kept under `~/.cache/arca-portable-tools` (or `ARCA_PORTABLE_TOOLS`), with no root. It runs on x86_64 Linux and needs `curl`, `xz`, `sha256sum` and `objdump`.
+`scripts/build-portable.sh` builds `arca` against glibc 2.34 (Enterprise Linux 9 and newer) with cargo-zigbuild and zig;
+both are pinned, checked by SHA-256 and kept under `~/.cache/arca-portable-tools` (or `ARCA_PORTABLE_TOOLS`), with no
+root. It runs on x86_64 or aarch64 Linux, and builds for the machine it runs on. It needs `curl`, `xz`, `sha256sum` and
+`objdump`.
 It prints the zig it used, the binary's path, its SHA-256 and the highest GLIBC symbol version the binary needs, and fails when that version is above 2.34 or cannot be read.
 It also fails when the binary names a path of the build machine (under the home directory, cargo's home, the checkout, the build's own directories, the toolchain or the tools), and lists the paths it found. A line of a committed file the binary is built from is not such a path. `scripts/build-portable.sh --check-paths <file>` runs that check alone, against the same directories.
 
@@ -32,8 +35,9 @@ ships has changed:
    `chore(release): v<version>`, tags the commit `v<version>`, and builds the release files at the tag with
    `scripts/release.sh`.
 4. A second job pushes `dev` and the tag together and publishes the GitHub release with
-   `arca-<version>-linux-x86_64`, `install.sh` (the installer as the release commit holds it, which installs that
-   release) and `SHA256SUMS`, the checksums of those two.
+   `arca-<version>-linux-x86_64`, `arca-<version>-linux-aarch64` (built by its own job on GitHub's arm64 runner, with
+   the same script), `install.sh` (the installer as the release commit holds it, which installs that release) and
+   `SHA256SUMS`, the checksums of those three.
 5. `main` moves to the release commit. `main` holds released commits and nothing else.
    GitHub refuses that push when the release carries a change to a workflow file: the job's own token may not move a
    branch across one, and no other credential is kept for it. The release is already published by then; the job
@@ -89,7 +93,8 @@ runners, never on a self-hosted one, whose kept cache beside a write token would
 
 `scripts/release.sh` is the one way the release files are built, and it publishes nothing. From a clean tree whose
 HEAD is the tag `v<version>` it runs `scripts/build-portable.sh`, checks that the binary's `--version` names that
-version and commit, and writes `dist/arca-<version>-linux-x86_64`, `dist/install.sh` (a copy of
-`scripts/install.sh`), `dist/SHA256SUMS` (the checksums of those two) and `dist/RELEASE-NOTES.md` (that version's
-section of `CHANGELOG.md`). It refuses, before it builds, an installer whose `ARCA_VERSION` line does not name the
-version. `scripts/release.sh --rehearse` builds and checks the same files without the tag, to try a build by hand.
+version and commit, and writes `dist/arca-<version>-linux-<architecture>` (the machine's own: x86_64 or aarch64),
+`dist/install.sh` (a copy of `scripts/install.sh`), `dist/SHA256SUMS` (the checksums of those two) and
+`dist/RELEASE-NOTES.md` (that version's section of `CHANGELOG.md`). It refuses, before it builds, an installer whose
+`ARCA_VERSION` line does not name the version. `scripts/release.sh --rehearse` builds and checks the same files without
+the tag, to try a build by hand.
