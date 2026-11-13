@@ -177,6 +177,7 @@ refused without the value being echoed back.
 | `kernel.vmLimits` | no | `{ "virtualMachines": n, "cpu": n, "memory": "<size>", "disk": "<size>" }`, every key required: the virtual-machine caps of a node that has `kernel.serviceCidr` and no `kernel.bridged`. Without it such a node creates no virtual machine. It is refused beside `kernel.bridged`, which states the same caps in its `limits`. See "Mixed nodes". |
 | `kernel.importServices` | no | `[{ "name": "<service>", "project": "<project>", "cidr": "<ipv4-network>/24" }]`: the services another manager created that `service_import` may take over where they stand. Each `project` must be listed in `kernel.droiddProjects`, and `cidr` is that project's service subnet. Empty by default: nothing is imported and nothing is written in another manager's project. See "Importing a service another manager created". |
 | `kernel.serviceDestinations` | no | `[{ "service": "<service>", "address": "<one IPv4 address>", "port": n }]`: the private addresses named services of the node's own project may reach through the node, each on one tcp port. It needs `kernel.serviceCidr`. Empty by default: a service reaches no private address. An entry alone opens nothing. See "A service that may reach one private address". |
+| `kernel.serviceListenAddresses` | no | `["<one IPv4 address>", ...]`, at most 8: the host addresses a service's private port may listen on, each an address of an interface of this host, such as the address of a private link to a second node. Empty by default: no service has a private port. An entry alone opens nothing. See "A service port on one host address". |
 | `link` | no | The node link: `name`, `forward`, `pairMinutes`, `localOnly`, `port` and `peers`. See "The link". |
 | `follow.intervalSeconds` | no | Seconds between two looks of the Automagik follower at Automagik's published record, 60 to 86400. 600 when absent. |
 | `hostNetwork.socket`, `hostNetwork.status` | no | Absolute paths of the root part's socket and status file; `/run/arca-host-network/host-network.sock` and `/run/arca-host-network/status.json` when absent. See "Host forwarding and the firewall". |
@@ -224,6 +225,11 @@ The config is refused, with exit 2, when:
   `100.100.100.200`, its port is 0,
   an entry is listed twice, one service has more than 4 entries or the list more than 16; or the list is not empty on
   a node with no `kernel.serviceCidr`.
+- a `kernel.serviceListenAddresses` entry is not one IPv4 address written as four plain decimal numbers (a range, a name
+  and an address with a leading zero are refused), is not a unicast address (`0.0.0.0`, a loopback, a multicast
+  address and `255.255.255.255` are refused), is listed twice, or the list has more than 8 entries. Whether an
+  address is on an interface of the host is not asked here, since a config is read on machines that are not the node:
+  `serve` asks at start (see "A service port on one host address").
 
 No command reads Incus before the config passes these checks.
 
@@ -702,8 +708,9 @@ A service is one template-derived container in the service project. Its template
 service profile and NIC ACL, records the desired entry, and starts the container when every environment secret it
 needs is available; with `start: false` it never starts it (see "Creating a service stopped" below). `service_list` and `service_status` derive state from Incus and report instances that Arca did
 not create as `unknown` without touching them. A row's `ports` are the container's own ports;
-`lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
-listener. A row carries `kernelAccess` only when the service's template declares it (see "A service that may talk to the
+`lanPort` is the host proxy port when the template sets `lan`, or null. `lanPort` is a host
+listener on every interface; a row of a service with a private port also carries `privatePort`, its one host address and
+port (see "A service port on one host address"). A row carries `kernelAccess` only when the service's template declares it (see "A service that may talk to the
 kernel"). `service_logs` returns console lines as untrusted text with stored
 secrets redacted and a capped, truncated result. The eleven shipped templates live in `templates/`, with their pinned
 images and vendored npm lockfile. Five of them, `workspace-vm`, `github-runner-pool`, `gitlab-runner-pool`,
@@ -963,7 +970,8 @@ approved service removal.
 `lan: {"port":3081}` requires that port in `ports` and adds a `web` proxy device listening on `tcp:0.0.0.0:3081`,
 connecting to `tcp:127.0.0.1:3081` in the container. The proxy is a forkproxy device, so it connects to the container
 from the host; LAN traffic on `lan.port` therefore bypasses the service NIC ingress ACL. Known side effect: the wildcard
-bind exposes the port on every host IPv4 interface, including a tailnet interface when present. The service project
+bind exposes the port on every host IPv4 interface, including a tailnet interface when present; "A service port on one
+host address" below is the way to publish a port on one address only. The service project
 remains restricted; Arca sets and reconciles only `restricted.devices.proxy=allow` to permit these proxy devices. Disk
 restrictions retain Incus' managed default.
 The `automagik-server` template pins the OCI server image (Automagik's release 3.136.4, by digest), mounts `/data` owned
@@ -1119,6 +1127,85 @@ documented behaviour. Should Incus refuse a list, the ACL is not written and not
 `service_status` answers `ready: true` for it; `incus network acl show arcak-svc-svc-<service>` shows the five rules
 above; from inside the service `curl -sv https://<address>/` connects, and any other port of that address, and any
 neighbouring address, is refused at once.
+
+### A service port on one host address
+
+`lan` publishes a port on every host interface. A service that only a second node should reach, such as a NATS leafnode
+port, takes a private port instead: one port, listening on one host address that the node's config names and not on
+`0.0.0.0`. Three parts, each needed:
+
+1. **The config names the addresses.** `kernel.serviceListenAddresses` is a list of at most 8 IPv4 addresses of this
+   host: the address of a private link to the other node (a private /24 on a dedicated interface, or a VPN address).
+   The config is refused at load when an entry is not one plain IPv4 unicast address (`0.0.0.0`, a loopback, a
+   multicast address, the broadcast address, a range, a name and a repeated entry are refused). At start `serve` asks
+   whether each address is on an interface of the host. One that is not is said on standard error and never stops the
+   start, even when a service uses it: a link without carrier, or a VPN that comes up late, must not take every service
+   of the node down. Only that service's proxy cannot bind, and `service_status` shows `privatePort.ready: false` with
+   the problem until the address is there. A record whose address the config no longer names is the owner's own change
+   and stops the start: put the entry back, or remove the service first.
+2. **The template says which port.** `"privatePort": { "port": 7422 }` must be one of the template's `ports`, and the
+   template has either `lan` or `privatePort`, not both (both would bind the same port). The address is never the
+   template's: a template is the same on every node, and an address is one node's own. A virtual machine template and a
+   tenant's service have none; both are refused.
+3. **The create names the address, and the owner approves it.** `service_create` takes `privatePort: { "address":
+   "<one of the config's>" }`; a node whose config names exactly one address needs no argument. The create runs only
+   from a proposal (`action_propose`): the proposal writes the address and the port into the arguments, so the
+   owner's card carries a `Private port` row ("tcp port 7422 of this service listens on this node's address
+   198.51.100.7 only, and not on every address of this node. Any machine that can send packets to 198.51.100.7 can
+   connect to it...") and the approval binds both. Called directly, the create is
+   refused with `NotApproved`. It is also refused, before anything is written, for an address the config does not
+   name, for an address that no interface of the host holds now, in a tenant, and for a template with no
+   `privatePort`.
+
+The service gets one proxy device, `private`, which listens on `tcp:<address>:<port>` and connects to
+`tcp:127.0.0.1:<port>` inside the container, so the service must listen on its own loopback on that port, as with `lan`.
+Nothing is bound on `0.0.0.0`. The network rules do not stand between that address and the port: the proxy is a
+forkproxy device that connects from the host into the container, so, like `lan`, its traffic skips the service's NIC
+ACL. The ACL is the one of an ordinary service, rule for rule: the proxy needs no rule, and the service's own egress is
+neither widened nor narrowed. The bind is to that one address and Arca adds no filtering of its own: Linux delivers a
+packet for any address of the host to the host whichever interface it arrives on, so any machine that can send packets
+to that address reaches the port, the peer on the private link and also a neighbour on another network of this node
+that routes to that address through the node. The node's firewall decides beyond that: to let only the link's
+interface through, the owner adds a rule of the host's own that accepts the port on that interface and drops it on the
+others. Arca writes no such rule.
+
+`service_status` and `service_list` show `privatePort: { "address", "port" }`; `service_status` adds `ready`, true when
+the instance carries the device as Arca made it and the host still holds the address, and otherwise false with a
+`problem`. `service_update` leaves the device where it is and checks the service after the update through the private
+address (not the node's loopback, where the proxy does not listen). `service_remove` removes the instance with its
+device and the record, as for any service.
+
+A worked example. Two nodes, joined by a private /24 on a dedicated interface; this node holds `198.51.100.7` on it and
+the other `198.51.100.8`. NATS on this node accepts leafnode connections on 7422, and only the other node dials it.
+
+```json
+{ "kernel": { "serviceListenAddresses": ["198.51.100.7"] } }
+```
+
+The template (a copy of the node's `nats` template, with the leafnode port added and the NATS configuration listening
+for leafnodes on its loopback):
+
+```json
+{
+  "name": "nats-leaf",
+  "kind": "oci",
+  "image": "docker.io/library/nats",
+  "digest": "sha256:<the pinned digest>",
+  "ports": [4222, 7422],
+  "env": {},
+  "privatePort": { "port": 7422 }
+}
+```
+
+Restart `serve`, propose the create (`action_propose` with `action: "service_create"` and `args: { "name": "hub",
+"template": "nats-leaf" }`), and approve the card, whose `Private port` row names `198.51.100.7` and tcp port 7422. Then:
+
+- on this node, `ss -ltn` shows `198.51.100.7:7422` listening and nothing on `0.0.0.0:7422`;
+- from the other node, `nc -vz 198.51.100.7 7422` connects, and its leafnode configuration names
+  `nats-leaf://198.51.100.7:7422`;
+- on this node's other addresses, `nc -vz <that address> 7422` is refused: the port is not bound there.
+
+To change the address, remove the service and create it again: the record keeps the address the owner approved.
 
 ### A service that may talk to the kernel
 
@@ -3861,7 +3948,7 @@ virtual-machine template may also set `description` and `autostart`, and `ports`
 to link to it: a link opens the port in the managed service network's ACL, so a template with `ports` is refused on a
 host bridge. It may also set `firstBoot`, `settings` and `secrets`, which "First boot, settings and secrets of a
 virtual machine" below describes. It may not set `env`, `generate`, `entrypoint`, `publishable`, `dashPort`,
-`droiddPort`, `data` or `lan`: each of those depends on a container's environment, image or devices. It may not set
+`droiddPort`, `data`, `lan` or `privatePort`: each of those depends on a container's environment, image or devices. It may not set
 `noNewPrivileges` either: that is the LXC config of a container.
 
 `service_create` takes two more arguments for a virtual-machine template:
@@ -5100,7 +5187,7 @@ beside the `service`, and the instance verbs take either `instance` or, in a ten
   node has no room for is `capacity` with `scope: "node"`: the tenant's own caps were not the reason;
 - a link joins two services of the same tenant only;
 - a virtual machine joins the managed network only; a `bridge` is refused;
-- a template with a `lan` port or a dash is refused, and `service_publish`, `service_unpublish`, `service_import` and
+- a template with a `lan` port, a `privatePort` or a dash is refused, and `service_publish`, `service_unpublish`, `service_import` and
   `service_release` take no `tenant`: a tenant's service is reached through the front;
 - the snapshot verbs with no `tenant` see nothing of any tenant: `snapshot_list` lists no tenant's snapshot, and a
   tenant's project or snapshot is reached only by naming the tenant;

@@ -14,6 +14,8 @@ Write under this comment only what a reader needs beyond those lines; the releas
   anything is created. A service made earlier from a script entrypoint cannot start or be updated on Incus 7.6: remove
   it and create it again.
 
+A service template may set `privatePort`, which offers one port of the service on one host address that the node's config names (`kernel.serviceListenAddresses`), for a second node over a private link, and on no other address; the owner's create card names the address and the port. See OPERATING.md.
+
 ## 0.26.0 (2026-11-13)
 
 A service template may set `noNewPrivileges: true`, so a setuid or setcap binary inside the container cannot raise

@@ -3847,6 +3847,23 @@ fn enrich_service_create(
     {
         return Err(kernel_access_mismatch(&template));
     }
+    // A template with a private port: the address is one of the config's, on this host now, and the proposal names it
+    // with the port, so the owner's card says it and the approval binds it. Refused now in a tenant, on a node that
+    // names no address and for an address that is not the config's, so the owner is never shown a card for it.
+    let private = {
+        let hosts = template
+            .private_port
+            .as_ref()
+            .and_then(|_| host_observation(&UnixIncus::new(cfg.incus.socket.clone())).ok());
+        private_port_for(
+            cfg,
+            &template,
+            payload.get("tenant").is_some(),
+            payload.get("privatePort"),
+            hosts.as_ref(),
+            None,
+        )?
+    };
     if !template.is_vm() {
         if cfg.kernel.bridged.is_some() && cfg.kernel.service_cidr.is_none() {
             return Err(service_refused(bridged_only(&template.name)));
@@ -3892,6 +3909,9 @@ fn enrich_service_create(
         let mut payload = payload.clone();
         if let (Some(stated), Some(object)) = (stated, payload.as_object_mut()) {
             object.insert("kernelAccess".to_string(), stated);
+        }
+        if let (Some(private), Some(object)) = (&private, payload.as_object_mut()) {
+            object.insert("privatePort".to_string(), private_port_arg(private));
         }
         return Ok(payload);
     }
@@ -4337,6 +4357,200 @@ pub fn destinations_refusal(
             Some(format!(
                 "the service {name} may reach {} through this node, as its owner approved, and this config's kernel.serviceDestinations does not name that for it: put the entry back, or remove the service before taking it out",
                 crate::action_proposal::destinations_list(&json!([lost]))
+            ))
+        })
+}
+
+/// What a `service_create` call brings to a template that declares a private port: what it stated as `privatePort`,
+/// and whether it runs from a proposal the owner approved.
+struct PrivatePortCall<'a> {
+    approved: bool,
+    stated: Option<&'a Value>,
+}
+
+/// The private port a create of `template` gives: the template's port on one of the host addresses this node's config
+/// names (`kernel.serviceListenAddresses`), or `None` for a template that declares none. A template that declares one
+/// is refused, before anything is written, in a tenant, on a node that names no address, when the address the call
+/// names is not one of the config's, and when `hosts` (the node's own addresses, when they could be read) does not hold
+/// it. A create (`call`) of one runs only from a proposal the owner approved, whose card says the address and the
+/// port, and states exactly that; a proposal passes `None`, and may name the address (`{ "address": ... }`) or leave it
+/// to a node that names one.
+fn private_port_for(
+    cfg: &NodeConfig,
+    template: &crate::service::Template,
+    in_tenant: bool,
+    given: Option<&Value>,
+    hosts: Option<&Value>,
+    call: Option<PrivatePortCall<'_>>,
+) -> Result<Option<crate::service::PrivateListen>, CallError> {
+    let name = &template.name;
+    let Some(port) = &template.private_port else {
+        return match given {
+            Some(_) => Err(CallError::Invalid(format!(
+                "privatePort: template {name} publishes no private port"
+            ))),
+            None => Ok(None),
+        };
+    };
+    if in_tenant {
+        return Err(service_refused(format!(
+            "template {name} publishes a port on one of this node's host addresses, and nothing in a tenant has a host port: only a service of the node's own project is created from it"
+        )));
+    }
+    let named = cfg.kernel.listen_addresses();
+    if named.is_empty() {
+        return Err(service_refused(format!(
+            "template {name} publishes a port on one of this node's host addresses, and this node names none: set kernel.serviceListenAddresses to the address of the private link in the node's config, and restart serve"
+        )));
+    }
+    let shown = || {
+        named
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // What the call states: an object of the address and the port, nothing else.
+    let stated = match given {
+        None => None,
+        Some(Value::Object(object))
+            if object.keys().all(|key| key == "address" || key == "port") =>
+        {
+            Some(object)
+        }
+        Some(_) => {
+            return Err(CallError::Invalid(
+                "privatePort: expected { \"address\": \"<one of kernel.serviceListenAddresses>\" }"
+                    .into(),
+            ));
+        }
+    };
+    if let Some(stated) = stated
+        && stated
+            .get("port")
+            .is_some_and(|stated| *stated != json!(port.port))
+    {
+        return Err(CallError::Invalid(format!(
+            "privatePort: template {name} publishes port {}, and the call may state only that",
+            port.port
+        )));
+    }
+    let address = match stated.and_then(|stated| stated.get("address")) {
+        Some(Value::String(text)) => named
+            .iter()
+            .find(|address| address.to_string() == *text)
+            .copied()
+            .ok_or_else(|| {
+                service_refused(format!(
+                    "privatePort: that address is not one this node's config names (kernel.serviceListenAddresses): {}",
+                    shown()
+                ))
+            })?,
+        Some(_) => {
+            return Err(CallError::Invalid(
+                "privatePort/address: expected one IPv4 address as text".into(),
+            ));
+        }
+        None => match named.as_slice() {
+            [only] => *only,
+            _ => {
+                return Err(service_refused(format!(
+                    "this node names more than one host address a service may listen on: name one with privatePort {{ \"address\": ... }}: {}",
+                    shown()
+                )));
+            }
+        },
+    };
+    if let Some(hosts) = hosts
+        && !hosts
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|host| host.split('/').next() == Some(address.to_string().as_str()))
+    {
+        return Err(service_refused(format!(
+            "{address} is in kernel.serviceListenAddresses and is not an address of any interface of this host now: bring the private link up, or take the entry out"
+        )));
+    }
+    let listen = crate::service::PrivateListen {
+        address: address.to_string(),
+        port: port.port,
+    };
+    if let Some(call) = call {
+        if !call.approved {
+            return Err(CallError::Refused {
+                code: "NotApproved".into(),
+                message: format!(
+                    "template {name} publishes port {} on the host address {address}, so its create runs only from a proposal the owner approved: propose it with action_propose, and the owner's card says the address and the port",
+                    port.port
+                ),
+            });
+        }
+        if call.stated != Some(&private_port_arg(&listen)) {
+            return Err(service_refused(format!(
+                "template {name} publishes port {} on the host address {address}, and the proposal the owner approved does not say that: the template or the config changed after it was proposed. Propose the create again, so the owner's card says it",
+                port.port
+            )));
+        }
+    }
+    Ok(Some(listen))
+}
+
+/// The `privatePort` argument of a create: the address and the port, as the card says them.
+fn private_port_arg(listen: &crate::service::PrivateListen) -> Value {
+    json!({ "address": listen.address, "port": listen.port })
+}
+
+/// Why the private port a service's record names does not stand as recorded: the device on its instance, then the
+/// address on this host (`hosts`, when it could be read). `None` when both are as the record says.
+fn private_port_problem(
+    private: &crate::service::PrivateListen,
+    live: Option<&Value>,
+    hosts: Option<&Value>,
+) -> Option<String> {
+    let Some(live) = live else {
+        return Some("its instance is gone".to_string());
+    };
+    if live["devices"][crate::service::PRIVATE_DEVICE] != crate::service::private_device(private) {
+        return Some(format!(
+            "its instance does not carry the device {} as Arca made it",
+            crate::service::PRIVATE_DEVICE
+        ));
+    }
+    let held = hosts?
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|host| host.split('/').next() == Some(private.address.as_str()));
+    (!held).then(|| {
+        format!(
+            "{} is not an address of any interface of this host now: bring the private link up",
+            private.address
+        )
+    })
+}
+
+/// Why `serve` does not start over this desired state: a service's record names a host address for its private port that
+/// this config no longer names. That is the owner's own change, and it is refused like a dropped destination. An
+/// address the config still names that no interface holds is never a reason: a link may have no carrier at boot, and
+/// one absent link must not stop every service of the node. Only that service's proxy fails to bind, in Incus, and
+/// `service_status` says why (`privatePort.ready` is false).
+pub fn private_port_refusal(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+) -> Option<String> {
+    let named = cfg.kernel.listen_addresses();
+    entries
+        .iter()
+        .filter(|entry| entry.plugin.0 == "arca.service")
+        .find_map(|entry| {
+            let recorded = entry.config.get("privatePort")?["address"].as_str()?;
+            let name = entry.config["name"].as_str().unwrap_or(entry.id.0.as_str());
+            let address: std::net::Ipv4Addr = recorded.parse().ok()?;
+            (!named.contains(&address)).then(|| format!(
+                "the service {name} listens on the host address {recorded} for its private port, as its owner approved, and this config's kernel.serviceListenAddresses does not name it: put the entry back, or remove the service before taking it out"
             ))
         })
 }
@@ -6041,6 +6255,7 @@ pub(crate) fn adopted_config(
         autostart: false,
         data: None,
         lan: None,
+        private_port: None,
         start: false,
         adopted: true,
         creating: false,
@@ -6255,6 +6470,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         autostart: parts.template.autostart,
         data: parts.template.data.clone(),
         lan: parts.template.lan.clone(),
+        private_port: parts.private_port,
         start,
         adopted: false,
         creating: false,
@@ -6333,6 +6549,7 @@ fn vm_service_config(
         autostart: template.autostart,
         data: None,
         lan: None,
+        private_port: None,
         start: template.secrets.is_empty(),
         adopted: false,
         creating: false,
@@ -6367,6 +6584,8 @@ struct ServiceParts<'a> {
     content: &'a crate::service::TemplateContent,
     /// The kernel access of a template that declares it, with the listener this node gives it.
     kernel_access: Option<crate::service::KernelLink>,
+    /// The private port of a template that declares one, with the host address the owner approved.
+    private_port: Option<crate::service::PrivateListen>,
 }
 
 impl ServiceHandler {
@@ -6639,6 +6858,7 @@ impl ServiceHandler {
                 "deploy",
                 "start",
                 "kernelAccess",
+                "privatePort",
                 "destinations",
                 "settings",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
@@ -7034,6 +7254,16 @@ impl ServiceHandler {
                             view["kernelAccess"]["problem"] = json!(problem);
                         }
                     }
+                    // Whether the proxy of its private port stands as recorded: the device on the instance, and the
+                    // address on this host. An address that cannot be read now is not called missing.
+                    if let Some(private) = &config.private_port {
+                        let hosts = host_observation(&read).ok();
+                        let problem = private_port_problem(private, live, hosts.as_ref());
+                        view["privatePort"]["ready"] = json!(problem.is_none());
+                        if let Some(problem) = problem {
+                            view["privatePort"]["problem"] = json!(problem);
+                        }
+                    }
                     // Whether each private destination its record names is open as recorded.
                     if !config.destinations.is_empty() {
                         for (index, problem) in
@@ -7400,6 +7630,26 @@ impl ServiceHandler {
                     }),
                 )?
                 .map(|(port, connect)| crate::service::KernelLink { port, connect });
+                // A template that publishes a port on one host address: refused in a tenant, on a node that names
+                // no such address, for an address that is not the config's or is not on this host, and unless the
+                // create runs from an approved proposal that states exactly that. All of it comes before any write.
+                let private_port = {
+                    let hosts = template
+                        .private_port
+                        .as_ref()
+                        .and_then(|_| host_observation(&read).ok());
+                    private_port_for(
+                        &self.cfg,
+                        &template,
+                        tenant.is_some(),
+                        args.get("privatePort"),
+                        hosts.as_ref(),
+                        Some(PrivatePortCall {
+                            stated: args.get("privatePort"),
+                            approved: preapproved,
+                        }),
+                    )?
+                };
                 // What the call states of the template is compared with this read: the content its card showed
                 // (an approved proposal always names it) and the image. A template that is no longer that one
                 // creates nothing. It comes after the kernel access above, whose own refusal says more, and
@@ -7685,6 +7935,7 @@ impl ServiceHandler {
                     secrets_dir: &secrets_dir,
                     content: &content,
                     kernel_access,
+                    private_port,
                 })
                 .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;
                 config.destinations = destinations;

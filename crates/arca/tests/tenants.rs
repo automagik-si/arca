@@ -516,6 +516,8 @@ mod isolation;
 mod kernel_access;
 #[path = "tenants/no_new_privileges.rs"]
 mod no_new_privileges;
+#[path = "tenants/private_port.rs"]
+mod private_port;
 #[path = "tenants/real_incus.rs"]
 mod real_incus;
 #[path = "tenants/refusal_codes.rs"]

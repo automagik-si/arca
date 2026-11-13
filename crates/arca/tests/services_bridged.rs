@@ -832,6 +832,10 @@ fn a_vm_template_needs_both_limits_and_a_root_size_and_nothing_of_the_service_ne
             "provides needs a port",
         ),
         (with("lan", json!({"port": 22})), "has no env, generate"),
+        (
+            with("privatePort", json!({"port": 22})),
+            "has no env, generate",
+        ),
         (with("publishable", json!(true)), "has no env, generate"),
         (with("env", json!({"A":"b"})), "has no env, generate"),
         (

@@ -793,7 +793,7 @@ fn a_template_names_a_kernel_access_port_of_its_own_and_only_a_container_templat
         .expect_err("refused");
     assert!(
         refused.starts_with(
-            "template vmk: a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan or kernelAccess"
+            "template vmk: a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan, privatePort or kernelAccess"
         ),
         "{refused}"
     );

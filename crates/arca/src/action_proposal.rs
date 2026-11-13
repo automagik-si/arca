@@ -489,6 +489,14 @@ impl ActionKind {
                 if let Some(port) = args["kernelAccess"]["port"].as_u64() {
                     rows.push(row("Kernel access", &kernel_access_words(port)));
                 }
+                // The template publishes a port on one host address of this node. The proposal names it (it is filled
+                // in when the proposal is made), so the approval binds it and the card says it.
+                if let (Some(address), Some(port)) = (
+                    args["privatePort"]["address"].as_str(),
+                    args["privatePort"]["port"].as_u64(),
+                ) {
+                    rows.push(row("Private port", &private_port_words(address, port)));
+                }
                 // This node's config lets the service reach a private address. The proposal names it (it is filled
                 // in from the config when the proposal is made), so the approval binds it and the card says it.
                 if args.get("destinations").is_some() {
@@ -897,6 +905,12 @@ impl ActionKind {
         } else {
             sentence
         };
+        // A service with a port on one host address is named as one.
+        let sentence = if self == Self::ServiceCreate && args.get("privatePort").is_some() {
+            format!("{sentence}, with a port on one of this node's private addresses")
+        } else {
+            sentence
+        };
         // A service that may reach a private address through the node is named as one.
         let sentence = if self == Self::ServiceCreate && args.get("destinations").is_some() {
             format!("{sentence}, with a way through this node to a private address")
@@ -1016,6 +1030,14 @@ fn made_words(ms: u64) -> String {
 pub fn kernel_access_words(port: u64) -> String {
     format!(
         "Yes: this service can call this node's kernel from inside, at http://127.0.0.1:{port}/mcp, with whatever token it is given. The token's scope and tool list decide what it may do, and a call without a token is refused."
+    )
+}
+
+/// The `Private port` row of a `service_create` whose template publishes a port on a host address, in the owner's
+/// words.
+pub fn private_port_words(address: &str, port: u64) -> String {
+    format!(
+        "Yes: tcp port {port} of this service listens on this node's address {address} only, and not on every address of this node. Any machine that can send packets to {address} can connect to it, a peer node over the private link and also a neighbour on another network of this node that routes to that address through the node; this node's firewall decides beyond that. The service's own network rules do not stand between that address and the port."
     )
 }
 
