@@ -1,8 +1,8 @@
 # Quickstart: a read-only node in five minutes
 
 You need an x86_64 or aarch64 (ARM) Linux host with glibc 2.34 or newer (Enterprise Linux 9, Ubuntu 22.04, Debian 12,
-or newer), a running Incus, and a user who can read the Incus socket (on most installs, a member of the `incus-admin` group). This quickstart
-names no kernel project, so the node only reads: it sends Incus nothing but GET.
+or newer), a running Incus, and a user who can read the Incus socket (on most installs, a member of the
+`incus-admin` group). This quickstart names no kernel project, so the node only reads: it sends Incus nothing but GET.
 
 **What you have at the end:** a node that looks, not one that changes things. An assistant connected to it can read your
 projects, instances, host readings and alerts. It cannot create a database or a service, and there is no approval page.
@@ -41,9 +41,9 @@ docs/QUICKSTART.md, which is done by hand today, and do not start it unless I as
 answers `arca_status` with `"mode":"watch-only"`. That is a node that reads. Do not tell the person that Arca is ready
 to run their services.
 
-- **It checks first.** Linux, x86_64 or aarch64, glibc, `curl`, `sha256sum`, a runtime directory that is yours alone, and an
-  Incus socket this user may open. When one is missing it says which and how to fix it, and stops before it has changed
-  anything. It never runs `sudo`, it refuses to run as root, and it writes only in your home directory.
+- **It checks first.** Linux, x86_64 or aarch64, glibc, `curl`, `sha256sum`, a runtime directory that is yours
+  alone, and an Incus socket this user may open. When one is missing it says which and how to fix it, and stops before
+  it has changed anything. It never runs `sudo`, it refuses to run as root, and it writes only in your home directory.
 - **It installs one named release**, the one its own `ARCA_VERSION` line names, at `~/.local/bin/arca`. Each release
   sets that line to its own version.
   `sh install.sh --version VERSION` names another release; without it, an older release is never put over a newer program.

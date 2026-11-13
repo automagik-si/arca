@@ -4,7 +4,8 @@
 # SAFETY. This repository is public, and a job on our pool runs whatever the commit says and can reach the pool's
 # GitHub credential. So the pool's labels are used only by events that people with write access to this repository
 # cause, and never by a pull request a bot opened or pushed to. The one condition that decides it is in the `runners`
-# job below; every other job takes its runner from there.
+# job below; every other job takes its runner from there, but `portable-aarch64`, which names GitHub's own arm64 runner
+# (our pool is x64) and so never reaches the pool.
 # No job names a pool label itself, and there is no `pull_request_target` trigger and none may be added.
 #
 # That condition routes; it does not guard. For a pull request GitHub reads the workflow files of the pull request
