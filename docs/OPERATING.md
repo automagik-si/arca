@@ -1018,8 +1018,10 @@ always has. Clients on 4222 log in with nothing because the service network reje
 because Omni's NATS client (nats.js 2.29) sends no user or password, so a login there would stop the shipped Omni stack.
 A login belongs where a path opens that the service network does not guard: the leaf node listener, where the user
 `leaf` has a password, the `NATS_LEAF_PASSWORD` secret that Arca makes at create (32 letters and digits) and shows
-nowhere. **Nothing reaches 7422 yet**: a link opens only the first port, so no service, on this node or another, can
-connect there. The listener is for the step that gives a private path to it.
+nowhere. **No link reaches 7422 yet**: a link opens only the first port. Two things still can: in a tenant, the node's
+front service reaches every port a template declares (7422 and 8222 too), and a function whose owner-approved definition
+links to a declared port may name either. The leaf login protects 7422; 8222 has no login. The listener is for the step
+that gives a private path to it, and its password crosses the wire in clear until then (no TLS).
 
 - **Image.** `docker.io/library/nats` by digest `sha256:311da47e2f31c26e99c623cd78d486a1e8ab039c49b32652770bb91a4f70512e`,
   the `2.14.10-alpine` image, the newest 2.14 patch at the time of writing (the template of 0.25.0 pinned 2.10.29).
@@ -1049,7 +1051,9 @@ connect there. The listener is for the step that gives a private path to it.
 publisher gets an error. Whoever creates a stream says which, in the stream's own configuration (`"discard": "new"`, with
 a limit such as `max_bytes` or `max_msgs` for it to bite), because only that person knows whether losing the old
 messages or refusing the new ones is right. The server has no setting that does it for every stream, and this template
-does not pretend to: `max_file_store` only caps what all streams may take together.
+does not pretend to: `max_file_store` only caps what all streams may take together. Likewise the fsync promise is the
+server's default for a stream, not a lock: a stream created with `"persist_mode": "async"` (NATS 2.14) turns the sync
+off for that stream, so whoever creates a stream decides that too.
 
 **A `nats` made before this template.** A `nats` made from the template of 0.23.0 to 0.25.0 has the data volume at
 `/data` (one made up to 0.22.0 keeps its data on its root disk and has none: see "A service that keeps its data inside
@@ -1073,11 +1077,15 @@ the container"). What changes for it:
   to 2.11 in place (a 2.11 rewrites the stream state files; going back to 2.10 rebuilds them by rescanning every block,
   once, without loss); from 2.11 to 2.12 in place, going back only to 2.11.9 or later, where a stream or consumer that uses
   a 2.12 feature is frozen, not deleted, and the stream state files are rebuilt once more; from 2.12 to 2.14 in place, and
-  going back to 2.12 (a durable consumer created with ack and flow-control v2 stays offline until 2.14 returns; remove a
-  `feature_flags` block first). Strict mode is on by default from 2.12: a JetStream API request the server used to log
-  and accept now gets an error. **NATS has no guide for the jump from 2.10 to 2.14 and none for going back from 2.14 to
-  2.10**, and this was not tried here. So: back the streams up first, as above; `service_update` rolls the image back
-  if the new one does not start, but what 2.14 wrote on the volume is not undone by that.
+  going back to 2.12 (a durable consumer created with the `AckFlowControl` ack policy stays offline until 2.14 returns;
+  remove a `feature_flags` block first). Strict mode is on by default from 2.12: a JetStream API request the server used
+  to log and accept now gets an error. **NATS has no guide for the jump from 2.10 to 2.14 and none for going back from
+  2.14 to 2.10**, and this was not tried here. If you move an old nats's image anyway, back the streams up first, then
+  go step by step: `service_update` to a `2.11.x-alpine` digest, then a `2.12.x-alpine` one, then 2.14.10 (read each
+  digest from the registry, as for any pin). Know that `service_update`'s own rollback, after a 2.14 that fails to start,
+  rebuilds the root from the old digest, 2.10.29, over a store 2.14 may have rewritten: a downgrade NATS does not
+  recommend, and the data volume is not rolled back. The safe path is the new service above, which leaves the old
+  store untouched.
 
 ### A service that may reach one private address
 

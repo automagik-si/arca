@@ -197,7 +197,13 @@ fn shells() -> Vec<Vec<&'static str>> {
         {
             shells.push(vec![path, "ash"]);
         }
+        // A passing test's output is not in a log, so a run that skipped ash must not look like one that ran it: in CI
+        // the host has to have it.
         _ => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no busybox ash on this CI host, so the image's shell was not tried: install busybox on the runner"
+            );
             eprintln!("nats.sh: no busybox ash on this host; the script was run under /bin/sh only")
         }
     }

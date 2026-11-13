@@ -10,9 +10,10 @@
 # - monitoring on 8222 (http, no login: it shows how the server is, never a message);
 # - JetStream on the data volume, store_dir /data/jetstream, so what the service stores survives an update;
 # - sync_interval always: the server syncs the file to disk before it acknowledges each message. It costs throughput,
-#   and it is the point of this template. The image is NATS 2.14.10; the promise needs 2.14.6 or later, where a block
-#   compaction (a delete, a work-queue or interest stream) honours it: 2.10 and earlier compacted without a sync, so
-#   a power loss in the next two minutes could lose messages that were acknowledged;
+#   and it is the point of this template (a stream created with persist_mode async turns it off for that stream). The
+#   image is NATS 2.14.10; the promise needs 2.14.6 or later, where a block compaction (a delete, a work-queue or
+#   interest stream) honours it: 2.10 and earlier compacted without a sync, so a power loss in the next two minutes
+#   could lose messages that were acknowledged;
 # - max_file_store 8 GiB, under the volume's 10 GiB (the template states the volume's size; keep this below it), so a
 #   full store is refused by JetStream and never fills the volume the server's own files live on;
 # - a leaf node listener on 7422 that takes only the user `leaf`. Nothing reaches it yet: a link opens only 4222.

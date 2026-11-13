@@ -7,7 +7,7 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-The `nats` template now writes its own configuration (every message fsynced, a JetStream domain, monitoring on 8222, and a leaf node listener on 7422 that only the user `leaf` may join, though nothing reaches it yet) and pins NATS 2.14.10, which keeps the fsync promise that 2.10 does not for a block compaction; clients on 4222 still log in with nothing and `NATS_URL` is unchanged. A `nats` made before keeps its command line: `service_update` moves its image and keeps `/data`, and a new service made from the template has the new settings (see "A message bus: nats" in docs/OPERATING.md).
+The `nats` template now writes its own configuration (every message fsynced, a JetStream domain, monitoring on 8222, and a leaf node listener on 7422 that only the user `leaf` may join, though nothing reaches it yet) and pins NATS 2.14.10, which keeps the fsync promise that 2.10 does not for a block compaction; clients on 4222 still log in with nothing and `NATS_URL` is unchanged. A `nats` made before keeps its command line; `service_update` can move its image and keeps `/data` (a nats made up to 0.22.0 has none and is refused), but NATS documents no jump from 2.10 to 2.14 and its rollback puts 2.10 back over a store 2.14 may have rewritten, so a new service made from the template, which has the new settings, is the safe path (see "A message bus: nats" in docs/OPERATING.md).
 
 ## 0.26.0 (2026-11-13)
 
