@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+- The guide now says that a doctor, operator or admin token acts without a card, and that the host network part re-applies the declared host network where it is installed, while services are not repaired by themselves.
+
 ## 0.25.0 (2026-11-13)
 
 Arca now owns each host's forwarding and firewall as declared state, so a reboot or a Docker restart cannot take the

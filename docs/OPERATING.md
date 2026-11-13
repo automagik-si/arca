@@ -24,7 +24,7 @@ version is on the [releases page](https://github.com/automagik-si/arca/releases)
 | Arca can save snapshots of a service onto a disk you plug in. | Arca cannot yet restore a snapshot for you: restoring is done by hand with Incus. |
 | Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run an app you name as a service: a service comes from a ready template, or Arca takes over one that already runs on the machine. A small program in an image you name can run on a timer as a function, once you approve its card. |
 | Two machines can be paired with a one-time code. | The ChatGPT and Claude apps cannot connect to Arca in one click yet. |
-| Arca checks passkeys itself; no outside sign-in service is involved. | Arca does not repair things by itself. |
+| Arca checks passkeys itself; no outside sign-in service is involved. | Arca does not repair a service by itself. Where the host network part is installed, it re-applies the host network you declared (forwarding and the firewall) each time it starts; if the host drifts later, Arca raises an alert and a restore card, and nothing is put back until you approve it. |
 
 ## What it does today
 
@@ -343,13 +343,13 @@ owner approves it with a passkey on the approval page, and until the first passk
 approved at all. The installer's token is a `viewer` token, which can look and propose and nothing more, so on a
 node as the installer leaves it every change waits for the passkey.
 
-A `doctor` or `operator` token does not wait. On a node that may change things, whoever holds one may, with no card
+A `doctor`, `operator` or `admin` token does not wait. On a node that may change things, whoever holds one may, with no card
 and no passkey, create a service from a template (the shipped ones among them), connect and disconnect services, set
 a service's secret, unpublish one, start an instance, link and unlink a database, create a database from an image
 the token names, remove a database's record, password and links, and use the Omni verbs; on a node that holds
 tenants, also create and remove a tenant. Such a
 token gains that reach the moment the node may change things, so the step reads the token directory first and
-**names every `doctor` and `operator` token before it asks**. With none it says so, and then "every change waits
+**names every `doctor`, `operator` and `admin` token before it asks**. With none it says so, and then "every change waits
 for your passkey" is true as written. `arca token revoke <id> --config <file>` takes one away. `--yes` does not
 answer for such a token: where one exists, or the token directory cannot be read, the step under `--yes` stops,
 names them and changes nothing, and so does `sh install.sh --enable-changes`. Run it without `--yes` to answer
@@ -357,8 +357,8 @@ yourself.
 
 **What it asks**, each with a default:
 
-1. `Let Arca make changes on this machine, each only after you approve it? [y/N]`, or, where a `doctor` or
-   `operator` token exists, `... what is proposed after your approval, and directly for the tokens named above?`.
+1. `Let Arca make changes on this machine, each only after you approve it? [y/N]`, or, where a `doctor`,
+   `operator` or `admin` token exists, `... what is proposed after your approval, and directly for the tokens named above?`.
    The default is no. `--yes` answers it on the command line.
 2. `Service network <a.b.c.0/24> is free. Use it? [Y/n]`. The default is yes. `--service-cidr <a.b.c.0/24>` names
    another, which is checked the same way.
