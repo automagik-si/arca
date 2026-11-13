@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+- The README and the quickstart now name Incus 7.3 or later as what Postgres and NATS need to start.
+
 ## 0.27.0 (2026-11-13)
 
 - A service template whose entrypoint runs a shell script (postgres-autopg) is created and starts on Incus 7.6, which
