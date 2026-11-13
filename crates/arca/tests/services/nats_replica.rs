@@ -197,6 +197,8 @@ fn the_replica_script_writes_one_leaf_remote_to_the_primary_and_every_other_sett
         line(&format!(r#"store_dir: "{}""#, conf_store(&conf)));
         line("remotes: [");
         line(&format!(r#"url: "{}""#, remote_url(PASSWORD, REMOTE)));
+        // The remote dials the configured address only, never one the primary tells it of.
+        line("ignore_discovered_servers: true");
         // One remote, inside the leafnodes block; no listener and no login of its own, so nothing dials a replica.
         assert_eq!(
             conf.lines()

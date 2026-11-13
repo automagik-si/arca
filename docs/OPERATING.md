@@ -1339,14 +1339,23 @@ TLS), the password with it, so the link must be a private one.
 4. **The replica.** Propose `service_create` with `{ "name": "bus-copy", "template": "nats-replica" }`. The card has a
    `Private network` row naming 198.51.100.7 on tcp port 7422, and a `Start` row saying it is created stopped until
    `NATS_LEAF_PASSWORD` and `NATS_LEAF_REMOTE` are set; approve it. Set both with `service_secret_set`:
-   `NATS_LEAF_REMOTE` is `198.51.100.7:7422` (an address or a host name, one colon and a port, and nothing else),
-   `NATS_LEAF_PASSWORD` the password of step 2. Then `instance_start`. The script refuses to start the server on any
-   other form of either, and says which in `service_logs`.
+   `NATS_LEAF_REMOTE` is `198.51.100.7:7422` (the address and the port that the entry of step 3 names, one colon
+   between them, and nothing else), `NATS_LEAF_PASSWORD` the password of step 2. Then `instance_start`. The script
+   refuses to start the server on any other form of either, and says which in `service_logs`.
+
+**The remote is an IP address.** `kernel.serviceDestinations` takes one IPv4 address and never a name, and the service
+reaches that address and nothing else on the link. The script's own check is looser and lets a host name through, but a
+name works only if the service can resolve it and it resolves to exactly the address the entry names, so write the
+address. `NATS_LEAF_REMOTE` is stored as a secret, so `service_logs` shows `[secret]` wherever nats-server's leaf node
+lines name it, and a wrong address cannot be read there. The server's monitoring shows it: `/varz` on 8222 lists the
+host and port it dials under `leaf.remotes`, never the password.
 
 The server dials the primary at start and again every second while it gets no answer, and meanwhile serves its own
-streams. Over the link, the primary's JetStream API answers as `$JS.bus.API`. Nothing published on the replica should
-be meant for the primary: the leaf link joins the subjects of the two servers, so a message published on the replica's
-4222 to a subject that a stream of the primary takes is stored on the primary.
+streams. It dials only the address of `NATS_LEAF_REMOTE`: the primary also tells it the address of its own container,
+and the remote ignores that (`ignore_discovered_servers`). Over the link, the primary's JetStream API answers as
+`$JS.bus.API`. Nothing published on the replica should be meant for the primary: the leaf link joins the subjects of the
+two servers, so a message published on the replica's 4222 to a subject that a stream of the primary takes is stored on
+the primary.
 
 **The mirrors.** The `nats` commands here are natscli 0.5.1, run from a client that reaches the server's 4222: on the
 node, a service linked to it (`service_connect`) whose image has the CLI, which takes the server from the `NATS_URL` the
@@ -1380,10 +1389,21 @@ sequence the mirror holds. A `Last Seen` that keeps growing means the link or th
 
 1. **Stop the primary, or know that it is gone.** Its node is lost, or on it `instance_stop` of `bus` (an approved
    card). A promoted stream on the replica and the primary's own stream would take the same subjects, and the leaf link
-   joins them.
+   joins them. Step 3 cuts that link, for a primary that was only out of reach or that comes back later.
 2. **Write down where each mirror stands:** from `nats stream info ORDERS --json`, `state.last_seq`, `state.messages`,
    `mirror.lag` and `mirror.active`. What the primary acknowledged after the last sequence the mirror holds is lost.
-3. **Turn each mirror into an ordinary stream, in place.** From NATS 2.12.0 a stream's configuration may drop its
+3. **Cut the replica's link to the primary,** now, while the replica has no clients yet. The replica dials its remote
+   again every second for as long as it runs, and nothing takes the remote away: the script does not start without
+   `NATS_LEAF_REMOTE`, and the node's config cannot drop the `kernel.serviceDestinations` entry of a service that
+   exists. So a primary that was only cut off, or whose node comes back and starts `bus` by itself, would be joined to
+   the promoted replica within about a second. Both servers would then hold a stream on the same subjects, every
+   publish would be stored on both, and the consumers on both nodes would each do its work. Set the remote to an
+   address where nothing listens, the container's own loopback: `service_secret_set` with `{ "name": "bus-copy",
+   "key": "NATS_LEAF_REMOTE", "value": "127.0.0.1:1" }`, which the script accepts. Then `instance_restart` of
+   `bus-copy` (an approved card): a secret reaches a container at its next start. The mirrors are on the data volume
+   and keep what they hold. From a client of the replica, `nats --js-domain bus stream ls` no longer answers: that is
+   the link cut, and no start of the old primary can join the replica again.
+4. **Turn each mirror into an ordinary stream, in place.** From NATS 2.12.0 a stream's configuration may drop its
    mirror, and the stream keeps its messages and their sequence numbers; 2.11 refused any change of a mirror, and
    2.14.10 allows this one (`server/stream.go`: "We will allow removing the mirror config to promote the mirror to a
    normal stream"). In the same edit give it the subjects, discard
@@ -1394,34 +1414,51 @@ sequence the mirror holds. A `Last Seen` that keeps growing means the link or th
    restore stream <dir> --config orders.json`, where `orders.json` is that copy (natscli before 0.5 calls the two `nats
    stream backup` and `nats stream restore`, names 0.5.1 still takes). Messages the primary's work queue had already
    handed out and removed are in the mirror, and come back as work.
-4. **Make the consumers again.** They were not mirrored. Create each durable consumer on the promoted stream, starting
+5. **Make the consumers again.** They were not mirrored. Create each durable consumer on the promoted stream, starting
    where its clients had got to as best that is known: `nats consumer add ORDERS <name> --deliver <a sequence, or a
    duration such as 1h>` and the rest of its old settings.
-5. **Point the clients at the replica.** On the replica's node, `service_connect` each consumer to `bus-copy`; it reads
+6. **Point the clients at the replica.** On the replica's node, `service_connect` each consumer to `bus-copy`; it reads
    the new `NATS_URL` at its next start. A client of the lost node comes back only when it is made again on this one.
    The JetStream API now answers in the replica's domain: a client that named the domain `bus` (`--js-domain bus`,
    `$JS.bus.API`) names `bus-copy`, or none.
 
 **When the primary's node comes back.** Its `bus` may start by itself, since Incus restores the state an instance had
-when its node went down, and its streams are older than the replica's and take the same subjects. Stop it
-(`instance_stop`, an approved card) before anything else. To go back to the first roles:
+when its node went down, and its streams are older than the replica's and take the same subjects. With the link cut at
+promotion step 3 the replica does not join it, but the consumers on its own node start with it and work on those old
+streams. Stop it (`instance_stop`, an approved card) before anything else. To go back to the first roles:
 
 1. On the primary's node, remove `bus` (`service_remove`; its data goes with it) and create it again as in step 2 of
-   the set-up, with the same name and password. Its store is empty, and the replica's remote joins it again.
-2. On the primary, make each stream a mirror of the replica's, the other way round:
+   the set-up, with the same name and password. Its store is empty.
+2. On the replica, set the real remote back: `service_secret_set` with `{ "name": "bus-copy", "key":
+   "NATS_LEAF_REMOTE", "value": "198.51.100.7:7422" }`, then `instance_restart` of `bus-copy` (an approved card). Its
+   clients lose their connection for the time of the restart and connect again. Only now does the replica's remote join
+   the primary, and `nats --js-domain bus stream ls` answers again from a client of the replica. Never set the real
+   address back while a `bus` that still holds the old streams can start.
+3. On the primary, make each stream a mirror of the replica's, the other way round:
    `nats stream add ORDERS --mirror '{"name":"ORDERS","external":{"api":"$JS.bus-copy.API"}}' --defaults` with the same
    limits, and wait until its `Lag` is 0.
-3. Stop the clients that write to the replica, check that the lag is still 0, and promote each mirror on the primary as
-   in promotion steps 3 and 4.
-4. On the replica, remove each stream (`nats stream rm ORDERS`) and make it a mirror of the primary's again, as at the
+4. Stop the clients that write to the replica, check that the lag is still 0, and promote each mirror on the primary as
+   in promotion steps 4 and 5. The link stays: the replica is about to mirror the primary again.
+5. On the replica, remove each stream (`nats stream rm ORDERS`) and make it a mirror of the primary's again, as at the
    set-up. Only then point the clients back at `bus` and start them: until this step both servers hold a stream that
    takes the same subjects.
 
+**Changing the pair's password.** Both halves hold it, and each reads it only at its start: the primary as the
+password of its user `leaf`, the replica inside its remote's URL. Make a new one (32 letters and digits; both scripts
+take letters, digits and `. _ ~ -` only) and set it on both, each on its own node: `service_secret_set` with key
+`NATS_LEAF_PASSWORD` for `bus` and for `bus-copy`, the same value. Then `instance_restart` of each (an approved card
+each), in either order. From the first restart to the second the two hold different passwords, the primary refuses the
+replica's login and the mirrors stand still; after the second the link joins again and each mirror carries on from the
+last sequence it holds, until its `Lag` is 0 again. The primary's restart interrupts its clients for the time of a
+restart, and the replica's restart its own, if it has any. Setting the value on one half only leaves the link down
+until the other half has it too and has restarted.
+
 **What was not tried.** The templates, the script, the cards and the creates are tested against a fake Incus and a fake
 server, under the host's `sh` and `busybox ash`. No pair has run on two nodes: not the leaf link through the proxy and
-the destination, not a mirror across it, not a promotion. The NATS behaviour above is read from the source of
-nats-server 2.14.10 (`server/opts.go` for the leaf node remote and its URL, `server/leafnode.go` for the domains across a
-leaf link, `server/stream.go` for promotion) and of natscli 0.5.1, not run.
+the destination, not a mirror across it, not a promotion, not cutting the link and setting it back, not a change of
+password. The NATS behaviour above is read from the source of nats-server 2.14.10 (`server/opts.go` for the leaf node
+remote, its URL and `ignore_discovered_servers`, `server/leafnode.go` for the domains across a leaf link and the
+addresses a primary tells of, `server/stream.go` for promotion) and of natscli 0.5.1, not run.
 
 ### A service that may talk to the kernel
 

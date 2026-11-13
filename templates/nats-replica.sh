@@ -17,7 +17,10 @@
 # - no leaf node listener: nothing dials a replica;
 # - one leaf node remote, nats-leaf://ADDRESS:PORT with the user `leaf` and the password in it. The server dials it
 #   again every second while it does not answer, and meanwhile starts and serves its own streams. Over that link a
-#   mirror here reads a stream there through the primary's JetStream API, $JS.<primary's domain>.API.
+#   mirror here reads a stream there through the primary's JetStream API, $JS.<primary's domain>.API. The remote
+#   ignores the servers the primary tells it of (ignore_discovered_servers): the primary listens on every address of
+#   its container, so it names that container's address on its own node's service network, which this server would
+#   otherwise dial first, with the password, after the first disconnect. Only the configured address is ever dialled.
 # The configuration holds the password, so it is written with mode 600 and under /tmp, not on the data volume. No stream
 # is made here: whoever runs the pair makes each mirror with the nats CLI (docs/OPERATING.md, "A cold replica of nats on
 # a second node").
@@ -78,6 +81,7 @@ leafnodes {
   remotes: [
     {
       url: "nats-leaf://$LEAF_LOGIN@$NATS_LEAF_REMOTE"
+      ignore_discovered_servers: true
     }
   ]
 }
