@@ -153,9 +153,13 @@ fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
         .args(&tail)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("NATS_CONF", &conf)
-        .env("NATS_STORE_DIR", &store)
-        .env("NATS_SERVER", &server)
+        // What the official image sets (NATS_SERVER is its version, 2.14.10) and names a script might read by mistake.
+        .env("NATS_SERVER", "2.14.10")
+        .env("NATS_CONF", "/nonexistent/nats.conf")
+        .env("NATS_STORE_DIR", "/nonexistent/jetstream")
+        .env("ARCA_NATS_CONF", &conf)
+        .env("ARCA_NATS_STORE_DIR", &store)
+        .env("ARCA_NATS_SERVER", &server)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in env {
@@ -281,7 +285,7 @@ fn the_store_is_under_the_volume_and_max_file_store_is_below_its_size() {
     let script = fs::read_to_string(shipped().join("nats.sh")).unwrap();
     assert!(
         script.contains(&format!(
-            "STORE=${{NATS_STORE_DIR:-{}/jetstream}}",
+            "STORE=${{ARCA_NATS_STORE_DIR:-{}/jetstream}}",
             data.path
         )),
         "store_dir is under {}",

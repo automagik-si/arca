@@ -21,9 +21,12 @@
 # Discard new is not set here: it is a setting of each stream, made by whoever creates the stream (docs/OPERATING.md,
 # "A message bus: nats").
 set -eu
-STORE=${NATS_STORE_DIR:-/data/jetstream}
-CONF=${NATS_CONF:-/tmp/nats-server.conf}
-SERVER=${NATS_SERVER:-/usr/local/bin/nats-server}
+# Where things go. The three ARCA_NATS_* names are for the tests; the image sets none of them. (The image does set
+# NATS_SERVER, to its version, 2.14.10: reading that name as a path made the exec fail, so none of the image's names
+# is read here.)
+STORE=${ARCA_NATS_STORE_DIR:-/data/jetstream}
+CONF=${ARCA_NATS_CONF:-/tmp/nats-server.conf}
+SERVER=${ARCA_NATS_SERVER:-/usr/local/bin/nats-server}
 MAX_FILE_STORE=8589934592
 
 : "${NATS_LEAF_PASSWORD:?NATS_LEAF_PASSWORD is not set: this service was created from a template that did not make it (arca templates install, then create it again; or service_secret_set)}"
