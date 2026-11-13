@@ -15,7 +15,7 @@ fn signed_rig() -> (Rig, common::SkKey) {
             projects: vec![],
             instances: vec![],
             networks: vec![],
-            pools: vec![],
+            pools: vec![("pool1".into(), json!({}))],
         },
         vec![PROJECT.into()],
         Some("192.0.2.0/24"),
@@ -215,7 +215,7 @@ fn the_shipped_postgres_template_approved_from_a_card_starts_and_gives_a_linked_
             projects: vec![],
             instances: vec![],
             networks: vec![],
-            pools: vec![],
+            pools: vec![("pool1".into(), json!({}))],
         },
         vec![PROJECT.into()],
         Some("192.0.2.0/24"),
@@ -303,6 +303,14 @@ fn the_shipped_postgres_template_approved_from_a_card_starts_and_gives_a_linked_
             .all(|row| row["label"] != "Start"),
         "{proposed}"
     );
+    // The card says what the database takes of the node, its data disk among it.
+    assert!(
+        proposed["uses"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("a 20GiB disk for its data"),
+        "{proposed}"
+    );
     assert_eq!(created["state"], "running", "{created}");
     // Its password was made at create: letters and digits, which the template's own start script accepts and which
     // goes into a URL as it is. It is in the instance and in no answer.
@@ -358,7 +366,7 @@ fn a_card_that_waited_across_the_replacement_of_its_template_is_refused_and_prop
             projects: vec![],
             instances: vec![],
             networks: vec![],
-            pools: vec![],
+            pools: vec![("pool1".into(), json!({}))],
         },
         vec![PROJECT.into()],
         Some("192.0.2.0/24"),
@@ -466,7 +474,17 @@ fn a_card_that_waited_across_the_replacement_of_its_template_is_refused_and_prop
 /// password by itself, and a password the owner stores for it is the one it gets.
 #[test]
 fn a_node_from_0_12_0_gets_the_new_postgres_template_and_its_old_database_is_left_as_it_is() {
-    let rig = Rig::new();
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+    );
     let templates = rig.dir.join("templates");
     assert!(arca::cmd_templates::install_into(&templates, false).is_ok());
     for name in ["postgres-autopg.json", "postgres-autopg.sh"] {

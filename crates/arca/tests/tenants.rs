@@ -448,7 +448,7 @@ fn empty_state() -> FakeState {
         projects: vec![],
         instances: vec![],
         networks: vec![],
-        pools: vec![],
+        pools: vec![("pool1".into(), json!({}))],
     }
 }
 

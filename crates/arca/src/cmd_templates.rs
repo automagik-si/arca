@@ -128,6 +128,21 @@ pub const EARLIER: &[(&str, &str)] = &[
         "postgres-autopg.json",
         "9d3740130e5a2a0eb48eeb733272ee425a09341bea197a09f74bedbd21db9187",
     ),
+    // 0.13.0 to 0.20.0: before it kept the database on a data volume.
+    (
+        "postgres-autopg.json",
+        "c72e64e193b0cbd0c9e486e2b894f84da3515509e3e3c1ff0cd3dbb00d9e2a0d",
+    ),
+    // 0.1.0-alpha.7 to 0.20.0: before it kept JetStream's files on a data volume.
+    (
+        "nats.json",
+        "f68486a9d336a275162aa5ceeea9d8e7c1e8d2fd70757faedc58b6c2f05797c3",
+    ),
+    // 0.1.0-alpha.7 to 0.20.0: before it kept the media it stores on a data volume.
+    (
+        "omni-api.json",
+        "f198fee6283e93753dfc140b788759bce8eb78bc417386c979d9445c8b4a45b3",
+    ),
     // 0.1.0-alpha.7 to 0.12.0.
     (
         "postgres-autopg.sh",

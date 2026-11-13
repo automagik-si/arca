@@ -25,6 +25,13 @@ its journal) and change nothing on the machine. The row says it is recorded and 
 does one TCP connect to its address (3 seconds) and says up or down. Every verb that changes a service refuses it in
 words that name `external_remove`.
 
+A database (`postgres-autopg`), a nats server and an Omni API (`omni-api`) made from the shipped templates now keep
+their data on a volume of their own: 20GiB for the database, 10GiB for nats and for Omni's media. `service_update`
+rebuilds a service's root disk from the new image and keeps only its data volume, so data on the root disk would be
+gone after an update. A service made before this release keeps its data on its root disk and gets no volume: the
+changed templates are brought up to date by `arca templates install`, and apply to the services made from them
+afterwards. Updating a service that has no data volume erases what it wrote to its root disk, and the docs now say so.
+
 ## 0.21.0 (2026-11-13)
 
 A service made from `automagik-server` now follows Automagik's releases by itself: every 10 minutes (`follow.intervalSeconds`)

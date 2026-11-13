@@ -6,6 +6,7 @@
   "digest": "sha256:62ea0404001b8b04b61173031e86a4577b3d589419ed853895775a7a7a45f377",
   "entrypoint": ["/bin/sh", "-ec", { "file": "postgres-autopg.sh" }, "postgres-autopg"],
   "ports": [5432],
+  "data": { "path": "/var/lib/autopg/data", "uid": 1000, "gid": 1000, "size": "20GiB" },
   "env": { "POSTGRES_PASSWORD": "{{secret:POSTGRES_PASSWORD}}" },
   "secrets": ["POSTGRES_PASSWORD"],
   "generate": { "POSTGRES_PASSWORD": "" },
