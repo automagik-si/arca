@@ -368,13 +368,21 @@ pub fn template(cfg: &ServiceConfig) -> Option<Template> {
     .ok()
 }
 
-/// A function's command as Incus takes an entry point: its parts, each quoted, with a space between. `None` for a
-/// definition that names no command, whose image's own entry point runs.
+/// A function's command as Incus takes an entry point: its parts with a space between, each the word a service
+/// template's entrypoint argument is ([`crate::service::entrypoint_word`]). So the script of a shell
+/// (`/bin/sh -c <script>`) that holds a space is one word with none, which starts on liblxc 5.0 and older too, and
+/// any other part is quoted as it is. `None` for a definition that names no command, whose image's own entry point
+/// runs.
 pub fn entrypoint(command: &[String]) -> Option<String> {
+    let program = command.first().map(String::as_str);
     (!command.is_empty()).then(|| {
         command
             .iter()
-            .map(|part| crate::service::shell_quote(part))
+            .enumerate()
+            .map(|(index, part)| {
+                let flag = index.checked_sub(1).map(|before| command[before].as_str());
+                crate::service::entrypoint_word(program, flag, part)
+            })
             .collect::<Vec<_>>()
             .join(" ")
     })

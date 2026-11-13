@@ -4030,6 +4030,92 @@ fn an_entrypoint_argument_with_a_space_is_created_and_starts_only_where_liblxc_h
     }
 }
 
+/// An argument that holds both kinds of quote, and also holds whitespace or starts with a quote, starts on no liblxc:
+/// Incus writes such a word for LXC inside the quote it does not hold, and this one holds both. Arca sends it as the
+/// template has it, the container is created, and its start fails with Incus's own words, the instance kept, stopped.
+#[test]
+fn an_entrypoint_argument_with_both_quotes_and_whitespace_or_a_leading_quote_starts_on_no_liblxc() {
+    use arca_incus::LxcSplit::{Quoted, Spaces};
+    for argument in ["it's \"two words\"", "'a\"b"] {
+        for split in [Quoted, Spaces] {
+            let rig = Rig::new();
+            rig.fake.set_lxc_split(split);
+            rig.template(
+                "jet",
+                json!({
+                    "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+                    "ports":[8080],"env":{},"publishable":false,
+                    "entrypoint":["/usr/bin/jet","--banner",argument]
+                }),
+            );
+            let Err(CallError::Refused { message, .. }) =
+                rig.call("service_create", json!({"name":"jet","template":"jet"}))
+            else {
+                panic!("{argument:?} does not start on {split:?}");
+            };
+            assert!(
+                message.contains("Incus did not start it")
+                    && message.contains("Unable to encode command argument"),
+                "{message}"
+            );
+            let instance = rig
+                .get(&format!("/1.0/instances/jet?project={PROJECT}"))
+                .expect("the instance is created");
+            assert_eq!(
+                arca_incus::oci_entrypoint_args(
+                    instance["config"]["oci.entrypoint"].as_str().unwrap()
+                )
+                .expect("Incus splits it"),
+                ["/usr/bin/jet", "--banner", argument],
+                "sent as the template has it"
+            );
+            assert_eq!(instance["status"], "Stopped", "{argument:?}");
+        }
+    }
+}
+
+/// The cap on an entrypoint is on what goes to Incus, where a script is base64: four bytes for every three. It is what
+/// the largest script that fit before is in that form, so a script that fit when its own text was measured (32,768
+/// bytes with the words round it) still fits, and the first joined entrypoint over the cap is refused.
+#[test]
+fn a_script_as_large_as_ever_fit_still_fits_now_that_its_base64_is_what_is_measured() {
+    let rig = Rig::new();
+    rig.template(
+        "jet",
+        json!({
+            "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+            "ports":[8080],"env":{},"publishable":false,
+            "entrypoint":["/bin/sh","-ec",{"file":"jet.sh"},"jet"]
+        }),
+    );
+    let templates = rig.dir.join("templates");
+    let entrypoint = |bytes: usize| {
+        let script = format!("# {}", "x".repeat(bytes - 2));
+        fs::write(templates.join("jet.sh"), &script).expect("script");
+        let template = service::load_template(&templates, "jet").expect("the template");
+        (script, service::entrypoint(&template, &templates))
+    };
+    // `/bin/sh -ec '<script>' jet` was 18 bytes and the script: 32,750 bytes of script made the old 32,768.
+    let (script, joined) = entrypoint(32_750);
+    let joined = joined
+        .expect("the largest script that fit before")
+        .expect("one");
+    assert!(
+        joined.len() > 32_768,
+        "its base64 is longer: {}",
+        joined.len()
+    );
+    assert_eq!(decoded_script(&joined), script);
+    // The cap itself: 43,760 bytes joined, which here is a script of 32,754 bytes. One more is the next base64 group.
+    let (_, joined) = entrypoint(32_754);
+    assert_eq!(joined.expect("at the cap").expect("one").len(), 43_760);
+    let (_, joined) = entrypoint(32_755);
+    assert_eq!(
+        joined.expect_err("over the cap").message,
+        "entrypoint: too long"
+    );
+}
+
 /// A template `env` value goes to Incus as the template has it: Arca refuses no line break or carriage return in it.
 /// Incus 7.6 refuses a line break in an environment value at create, and a carriage return at the container's start.
 #[test]

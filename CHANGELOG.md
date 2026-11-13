@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A function whose `command` is a shell and its script (`["/bin/sh", "-c", <script>]`) now starts on a node whose Incus
+links liblxc 5.0 or older too: the script goes as the one word a service template's script goes as, so the image needs
+`base64`. A function created earlier keeps the entrypoint it was made with: where it does not start, remove it and
+create it again. A service template's script may again be about 32,700 bytes (it was about 24,500 since 0.27.0): the
+entrypoint cap is now 43,760 bytes, measured on the base64 that is sent.
+
 ## 0.28.0 (2026-11-13)
 
 Two new templates keep a cold copy of one node's NATS streams on a second node, over a private link between the two: `nats-primary` is the `nats` template with its leaf node port 7422 also offered on the node's link address (`privatePort`, so its create needs `kernel.serviceListenAddresses` and the owner's card), and `nats-replica` is a NATS of its own whose one leaf node remote dials that port, through `kernel.serviceDestinations`, with the address and the primary's leaf password as two secrets the owner sets. Each stream on the replica is a mirror of the primary's, made with the nats CLI, and OPERATING.md gives the set-up, how to read the mirrors' lag, the promotion when the primary is lost (it first cuts the replica's link, so an old primary that comes back cannot join it), and how to change the pair's password. The replica dials only the address the owner set, never one the primary tells it of. The `nats` template is unchanged. No pair has run on two nodes yet.

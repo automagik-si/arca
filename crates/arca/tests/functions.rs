@@ -533,6 +533,74 @@ fn a_function_is_created_only_from_an_approved_proposal_whose_card_names_what_it
     assert_eq!(names, ["nats"]);
 }
 
+/// A function whose command is a shell and its script (`/bin/sh -c <script>`) gets the script as a service template's
+/// script goes: one word with no whitespace, which the shell decodes and runs. Incus quotes a word with a space for
+/// LXC, and liblxc 5.0 and older split on spaces and keep the quotes, so the script as it is starts on no such node.
+/// The card and the record keep the command as the owner wrote it. A part with a space that is no shell's script goes
+/// as it is, as before.
+#[test]
+fn a_functions_shell_script_reaches_init_as_one_word_and_runs_on_either_liblxc() {
+    use arca_incus::LxcSplit::{Quoted, Spaces};
+    let script = "printf '%s|%s\\n' \"$0\" 'two  words'; exit 7";
+    for split in [Spaces, Quoted] {
+        let rig = Rig::new();
+        rig.fake.set_lxc_split(split);
+        rig.nats();
+        let mut args = relay_args();
+        args["command"] = json!(["/bin/sh", "-ec", script, "relay"]);
+        let proposal = rig
+            .propose("function_create", args.clone())
+            .expect("proposed");
+        let shown = proposal["details"]
+            .as_array()
+            .expect("details")
+            .iter()
+            .find(|row| row["label"] == "Command argument 2")
+            .expect("the script's row");
+        assert_eq!(shown["value"], script, "the card shows the script itself");
+        rig.approved("function_create", args).expect("created");
+
+        let instance = rig.instance("relay");
+        let entrypoint = instance["config"]["oci.entrypoint"]
+            .as_str()
+            .expect("entrypoint");
+        let meant = arca_incus::oci_entrypoint_args(entrypoint).expect("Incus splits it");
+        assert_eq!(meant.len(), 4, "{meant:?}");
+        assert_eq!(meant[..2], ["/bin/sh", "-ec"], "{meant:?}");
+        assert_eq!(meant[3], "relay");
+        assert!(
+            !meant[2].contains(char::is_whitespace) && !meant[2].starts_with(['\'', '"']),
+            "one word that no liblxc splits: {meant:?}"
+        );
+        // Init gets the entrypoint's own words from either liblxc, and the shell runs the script as it was written.
+        for liblxc in [Spaces, Quoted] {
+            let argv = arca_incus::lxc_execute_argv(entrypoint, liblxc).expect("argv");
+            assert_eq!(argv, meant, "{liblxc:?}");
+            let out = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()
+                .expect("sh");
+            assert_eq!(out.status.code(), Some(7), "the script's own exit status");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "relay|two  words\n");
+        }
+        // The fake starts a container only when its liblxc gives init those words: the run starts.
+        rig.fake.exit_after_start(PROJECT, "relay", 1, OK);
+        let line = rig.run("relay");
+        assert_eq!(line["outcome"], "ok", "{split:?}: {line}");
+    }
+
+    // No shell, so nothing can decode it: the part goes quoted, as it always did.
+    let rig = Rig::new();
+    rig.nats();
+    let mut args = relay_args();
+    args["command"] = json!(["/relay", "--banner", "two words"]);
+    rig.approved("function_create", args).expect("created");
+    assert_eq!(
+        rig.instance("relay")["config"]["oci.entrypoint"],
+        "/relay --banner 'two words'"
+    );
+}
+
 #[test]
 fn a_proposal_the_node_would_refuse_is_refused_before_the_owner_sees_it() {
     let rig = Rig::new();
