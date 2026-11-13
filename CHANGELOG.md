@@ -13,6 +13,9 @@ privileges. It is off unless set, so every existing template and service is unch
 OPERATING.md. `service_update` gives an existing service the key, or takes it away, to match its template, with a
 restart (which interrupts it) and a health check, and no rebuild, so its data stays where it is.
 
+- The guide names `admin` tokens beside `doctor` and `operator`, and says what puts the declared host network back
+  and what does not.
+
 ## 0.25.0 (2026-11-13)
 
 Arca now owns each host's forwarding and firewall as declared state, so a reboot or a Docker restart cannot take the
