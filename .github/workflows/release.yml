@@ -169,8 +169,9 @@ jobs:
         run: |
           set -euo pipefail
           # The tests call setfattr and getfattr.
+          # The nats test runs its script under busybox ash, the nats image's shell (CI is set, so it is never skipped).
           sudo apt-get update -qq
-          sudo apt-get install -y -qq attr
+          sudo apt-get install -y -qq attr busybox-static
           scripts/version.sh check
           cargo fmt --all --check
           cargo clippy --workspace --all-targets -- -D warnings
