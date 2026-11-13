@@ -138,6 +138,11 @@ pub const EARLIER: &[(&str, &str)] = &[
         "postgres-autopg.sh",
         "226293b22c4dc25d1e207d738538170217f531293c15e19065ce2a319897a750",
     ),
+    // 0.14.0 to 0.19.0: its `app` role was created NOREPLICATION, so no consumer could create a replication slot.
+    (
+        "postgres-autopg.sh",
+        "c43cdb4aeabdf58def761cbe2f814df95fb239dbd65bfa18486ce6aa4738dca2",
+    ),
 ];
 
 /// What one installed file is, beside the shipped one.
