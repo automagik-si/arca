@@ -13,8 +13,8 @@ owner's file `/etc/arca/host.json` says whether the host forwards and which brid
 the `arca` binary, `arca host-network run`, started by the system unit `arca-host-network.service`, sets the two
 forwarding switches and puts one accept in and one for the answers out for each bridge into Docker's `DOCKER-USER`
 chain, adding nothing twice. It does this when it starts: at boot after `docker.service`, and again on every Docker
-start, since the unit is tied to Docker. Every minute it reads the host again and writes a status file (in sync, or which
-item drifted), and it answers on a socket to two verbs only, `read` and `apply-declared-state`, neither with an
+start, since the unit is tied to Docker. Every minute it reads the host again and writes a status file (in sync, or
+which item drifted), and it answers on a socket to two verbs only, `read` and `apply-declared-state`, neither with an
 argument. The node raises the new critical alert `host-network-drift` for each item that drifts, and a new action,
 `host_network_restore`, is a normal approval card: when the owner approves it, the node asks the socket to apply, and
 the result is the read-back. `arca host-network install --takeover <unit>` writes the declared file from what the host

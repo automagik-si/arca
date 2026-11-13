@@ -2004,15 +2004,12 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-three gated service,
-database, GPU, storage, snapshot, instance, function or tenant verbs: `service_create`, `service_remove`, `service_import`, `service_release`
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-three gated
+service, database, GPU, storage, snapshot, instance, function or tenant verbs: `service_create`, `service_remove`, `service_import`, `service_release`
 (see [Importing a service another manager created](#importing-a-service-another-manager-created)), `service_publish`, `service_unpublish`,
 `service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create`,
 `snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`, `instance_stop` or
 `instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and `deploy_remove` (see [Tenants](#tenants)), are proposed the same way. The canvas Doctor proposes all twenty-two; it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
-
-`host_network_restore` (see [Host forwarding and the firewall](#host-forwarding-and-the-firewall)) is proposed the
-same way: it takes no arguments, and its card says what the host has drifted from.
 the inline `approval` field removed because the proposal replaces it. The tool's own input schema says so: `args` has
 one `anyOf` branch per action, titled with the action's name, holding that verb's fields with their descriptions, the
 fields it requires, and an example (`examples`, and in its `description`), so an assistant reads what each action takes
@@ -2026,6 +2023,9 @@ record. A proposal cannot choose a container image: `postgres_create` uses the i
 template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is
 refused (see "A database"). `service_create` names a template from the kernel's catalog, whose name the schema constrains;
 its card has a `Start` row whenever the service will be created stopped, with the reason, so the owner approves a stopped service knowingly.
+
+`host_network_restore` (see [Host forwarding and the firewall](#host-forwarding-and-the-firewall)) is proposed the
+same way: it takes no arguments, and its card says what the host has drifted from.
 
 **What the owner saw is what is created.** When a `service_create` or a `postgres_create` is proposed, the node
 reads the template and gives the proposal two things, which no caller gives:
@@ -3167,6 +3167,9 @@ An unknown key, a bridge name that is not one, a repeated bridge or a file that 
   missing, so a rule a hand-made fix already put in is adopted, not doubled.
 - **Every minute** it reads the host again and writes the status file. It changes nothing on a reread: other drift
   (someone turned forwarding off, a rule was deleted) is reported, and put back when the owner approves the card below.
+- **While Docker is stopped** the root part is stopped with it, since the unit is part of Docker: the status file ages,
+  and the watch goes dark (the alert's reading is unknown, which never clears a firing alert) until Docker starts and
+  starts the root part again. The rules and switches it put in stay in place meanwhile.
 - **On the socket** it answers two verbs, each sent as one line with no argument, and refuses every other line: `read`
   answers with a live reading and changes nothing, `apply-declared-state` puts back the declared state and answers with
   the reading after. No caller can make it run anything else. The socket is open to every local user, because the verbs
