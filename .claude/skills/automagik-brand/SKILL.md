@@ -33,11 +33,22 @@ Every path below is inside that folder.
 
 Each line names where the README says it. When this file and the README differ, the README is right.
 
-- The mark is always the triskle, for Automagik, Genie and Omni. There is no other logo (rule 1).
-- The triskle is always in colour. The ink and cream marks are only for places where colour cannot
-  be used (rule 2).
+- The triskle is Automagik's mark alone. Genie, Omni and Mykes do not carry it (rule 1).
+- The `genie-lockup-*` and `omni-lockup-*` files are RETIRED: they carry the triskle. Never use
+  them (rule 1, "Which logo file").
+- Genie, Omni and Mykes each have their own mark: a flat lamp, a tentacle vortex, the cords.
+  Take the mark from `logo/svg/` or its lockup from `logo/lockups/` (`genie-lamp-lockup-*`,
+  `omni-mark-lockup-*`, `mykes-clean-lockup-*`), by the "Which logo file" table. The word alone is
+  still a correct form. Under Mykes: "Coming soon." in plain words (rules 9 and 10).
+- Beside Genie's, Omni's or Mykes's word goes its own mark from this folder and nothing else: never
+  the triskle, a pet or another drawing. Each of these marks is flat and one colour, with its
+  word's sparkle as the only colour (rule 9).
+- None of the three marks is drawn for 16px: no favicon or 16px icon from them. Under about 56px
+  Omni takes its small drawing (`-32`, and the lockup's `-header`) ("Which logo file").
+- Automagik's triskle is always in colour. The ink and cream marks are only for places where
+  colour cannot be used (rule 2).
 - Pets are never marks. Genie and Omni are characters: never in a header, a favicon or an app icon in
-  the logo's place (rule 3).
+  the logo's place, and never beside a product's word (rules 3 and 10).
 - The only Genie is the full-body one, from `genie/`. Never crop to the head (rule 4, "Genie").
 - Pick the drawing made for the size you show. Never scale the large drawing down to an icon
   (rule 6).
