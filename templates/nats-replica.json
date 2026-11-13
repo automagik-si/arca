@@ -1,0 +1,18 @@
+{
+  "name": "nats-replica",
+  "description": "A cold replica of a nats-primary on another node: NATS 2.14.10 by digest, JetStream on a data volume at /data, every message fsynced, a domain named after the service, and one leaf node remote that dials the primary's leaf port as the user leaf. It starts once the owner sets NATS_LEAF_REMOTE (the primary's ADDRESS:PORT, which kernel.serviceDestinations names for it) and NATS_LEAF_PASSWORD (the primary's). Its streams are mirrors made with the nats CLI. A link gives NATS_URL.",
+  "kind": "oci",
+  "image": "docker.io/library/nats",
+  "digest": "sha256:311da47e2f31c26e99c623cd78d486a1e8ab039c49b32652770bb91a4f70512e",
+  "entrypoint": ["/bin/sh", "-ec", { "file": "nats-replica.sh" }, "nats-replica"],
+  "ports": [4222, 8222],
+  "data": { "path": "/data", "uid": 0, "gid": 0, "size": "10GiB" },
+  "env": {
+    "NATS_LEAF_PASSWORD": "{{secret:NATS_LEAF_PASSWORD}}",
+    "NATS_LEAF_REMOTE": "{{secret:NATS_LEAF_REMOTE}}",
+    "NATS_DOMAIN": "{{name}}"
+  },
+  "secrets": ["NATS_LEAF_PASSWORD", "NATS_LEAF_REMOTE"],
+  "provides": { "env": { "NATS_URL": "nats://{{host}}:{{port}}" } },
+  "publishable": false
+}

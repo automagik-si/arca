@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Two new templates keep a cold copy of one node's NATS streams on a second node, over a private link between the two: `nats-primary` is the `nats` template with its leaf node port 7422 also offered on the node's link address (`privatePort`, so its create needs `kernel.serviceListenAddresses` and the owner's card), and `nats-replica` is a NATS of its own whose one leaf node remote dials that port, through `kernel.serviceDestinations`, with the address and the primary's leaf password as two secrets the owner sets. Each stream on the replica is a mirror of the primary's, made with the nats CLI, and OPERATING.md gives the set-up, how to read the mirrors' lag, and the promotion when the primary is lost. The `nats` template is unchanged. No pair has run on two nodes yet.
+
 ## 0.27.0 (2026-11-13)
 
 - A service template whose entrypoint runs a shell script (postgres-autopg) is created and starts on Incus 7.6, which

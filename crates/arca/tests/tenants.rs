@@ -514,6 +514,8 @@ mod gate;
 mod isolation;
 #[path = "tenants/kernel_access.rs"]
 mod kernel_access;
+#[path = "tenants/nats_pair.rs"]
+mod nats_pair;
 #[path = "tenants/no_new_privileges.rs"]
 mod no_new_privileges;
 #[path = "tenants/private_port.rs"]
