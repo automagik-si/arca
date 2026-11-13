@@ -1971,8 +1971,12 @@ fn lxc_split_cmd(cmd: &str, split: LxcSplit) -> Vec<String> {
 /// carriage return in any LXC config value at start, so in an `environment.*` value too, which its create lets a
 /// carriage return through. Its `oci.entrypoint` may not split or encode, or init would get other arguments than it
 /// names: a real node then fails the start with Incus's own error, or runs the program with the wrong arguments, so
-/// it fails at once; the fake refuses the start in every case. `None` when the start works.
+/// it fails at once; the fake refuses the start in every case. `None` when the start works, and for a virtual machine,
+/// which Incus does not start through LXC.
 fn start_refusal(instance: &Value, split: LxcSplit) -> Option<String> {
+    if instance.get("type").and_then(Value::as_str) == Some("virtual-machine") {
+        return None;
+    }
     let config = instance.get("config")?.as_object()?;
     if config.iter().any(|(key, value)| {
         key.starts_with("environment.") && value.as_str().is_some_and(|v| v.contains(['\r', '\n']))
@@ -3791,6 +3795,9 @@ mod tests {
         let instance =
             json!({ "config": { "environment.A": "one two", "oci.entrypoint": "/x y" } });
         assert_eq!(start_refusal(&instance, LxcSplit::Spaces), None);
+        let machine =
+            json!({ "type": "virtual-machine", "config": { "environment.A": "one\rtwo" } });
+        assert_eq!(start_refusal(&machine, LxcSplit::Spaces), None);
     }
 
     #[test]

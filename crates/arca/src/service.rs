@@ -2555,9 +2555,7 @@ pub fn candidates(cidr: &str) -> Result<Vec<Ipv4Addr>, TemplateError> {
         .collect())
 }
 
-/// The rendered environment and whether every value the template needs is present. A value with a line break or a
-/// carriage return is refused before any secret is made: Incus 7.6 refuses the first at create and the second at the
-/// container's start, since LXC's config is one value per line.
+/// The rendered environment and whether every value the template needs is present.
 pub fn environment(
     template: &Template,
     owner: &str,
@@ -2566,17 +2564,6 @@ pub fn environment(
     gateway: &str,
     secrets_dir: &Path,
 ) -> Result<(BTreeMap<String, String>, bool), TemplateError> {
-    if let Some(key) = template
-        .env
-        .iter()
-        .find_map(|(key, value)| value.contains(['\n', '\r']).then_some(key))
-    {
-        return Err(TemplateError::refused(format!(
-            "template {}: env {key} has a line break or a carriage return in it, which Incus 7.6 refuses in a \
-             container's environment (LXC's config is one value per line); give it one line",
-            template.name
-        )));
-    }
     let mut start = true;
     let mut references = BTreeMap::new();
     for key in &template.secrets {
@@ -3135,19 +3122,16 @@ fn entrypoint_with(
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),
         };
-        let unsafe_word = text.is_empty()
-            || text.contains([' ', '\t', '\u{b}', '\u{c}', '\n', '\r'])
+        // A word with whitespace in it, or one that starts with a quote, reaches liblxc 5.0 and older as other words.
+        let split_by_old_liblxc = text.contains([' ', '\t', '\u{b}', '\u{c}', '\n', '\r'])
             || text.starts_with(['\'', '"']);
-        if unsafe_word && is_shell_script_argument(parts, index) && !text.is_empty() {
+        if split_by_old_liblxc && is_shell_script_argument(parts, index) {
             out.push(shell_quote(&one_line_script(&text)));
-        } else if unsafe_word {
-            return Err(TemplateError::refused(format!(
-                "entrypoint: argument {index} ({text:?}) is empty, has whitespace or a line break in it or starts with \
-                 a quote, and is not the script of a shell as in [\"/bin/sh\", \"-ec\", <script>, ...]. Incus 7.6 \
-                 refuses a line break in oci.entrypoint, and on a node whose Incus links liblxc 5.0 or older the \
-                 container's command is split on spaces alone with its quotes kept, so the container would be created \
-                 and then fail to start; give the argument no whitespace"
-            )));
+        } else if text.contains(['\n', '\r']) {
+            return Err(TemplateError::refused(
+                "entrypoint: an argument with a line break must be the script of a shell, as in \
+                 [\"/bin/sh\", \"-ec\", <script>, ...]: Incus refuses a line break anywhere in oci.entrypoint",
+            ));
         } else {
             out.push(shell_quote(&text));
         }
@@ -3183,7 +3167,9 @@ fn is_shell_script_argument(parts: &[Value], index: usize) -> bool {
 /// `eval` in the same shell, so `$0`, `$1` and the options (`-e`) are the script's own. Each `${IFS}` stands for a
 /// space: unquoted, the shell splits it into fields, so the words are `echo` and the text, `base64` and `-d`, `eval`
 /// and the script, as if typed. A failed decode ends the shell with its status and runs nothing. The text is the
-/// script's bytes exactly.
+/// script's bytes exactly. This holds on Incus 7.3 and later, whose `lxcEncodeCmd` writes the word as it is; Incus 7.0
+/// to 7.2 wrote the command with `shellquote.Join`, which escapes the word's `$`, `(` and `|`, and the script does not
+/// run there.
 fn one_line_script(script: &str) -> String {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());

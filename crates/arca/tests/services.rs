@@ -3954,61 +3954,97 @@ fn the_fake_starts_an_entrypoint_only_when_the_nodes_liblxc_gives_init_its_words
     assert_eq!(status(&rig), "Stopped");
 }
 
+/// An entrypoint argument that is no shell script goes to Incus as the template has it, whitespace, an empty word and a
+/// leading quote included: Arca refuses none of them. Incus quotes such a word for LXC, so the container starts where
+/// liblxc honours a quote at the start of a word (6.0 and later), and where liblxc splits on spaces alone (5.0 and
+/// older) it is created and its start fails, which Arca reports with the instance kept, stopped.
 #[test]
-fn an_entrypoint_argument_the_oldest_lxc_would_split_is_refused_before_anything_is_created() {
+fn an_entrypoint_argument_with_a_space_is_created_and_starts_only_where_liblxc_honours_quotes() {
+    use arca_incus::LxcSplit::{Quoted, Spaces};
     for argument in ["two words", "", "'quoted'", "\"quoted\"", "tab\tbed"] {
-        let rig = Rig::new();
-        rig.template(
-            "jet",
-            json!({
-                "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
-                "ports":[8080],"env":{},"publishable":false,
-                "entrypoint":["/usr/bin/jet","--banner",argument]
-            }),
-        );
-        let Err(CallError::Refused { message, .. }) =
-            rig.call("service_create", json!({"name":"jet","template":"jet"}))
-        else {
-            panic!("{argument:?} is refused");
-        };
-        assert!(message.contains("liblxc 5.0 or older"), "{message}");
-        assert!(
-            rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
-                .is_none()
-        );
+        for split in [Quoted, Spaces] {
+            let rig = Rig::new();
+            rig.fake.set_lxc_split(split);
+            rig.template(
+                "jet",
+                json!({
+                    "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+                    "ports":[8080],"env":{},"publishable":false,
+                    "entrypoint":["/usr/bin/jet","--banner",argument]
+                }),
+            );
+            let created = rig.call("service_create", json!({"name":"jet","template":"jet"}));
+            let instance = rig
+                .get(&format!("/1.0/instances/jet?project={PROJECT}"))
+                .expect("the instance is created");
+            let entrypoint = instance["config"]["oci.entrypoint"]
+                .as_str()
+                .expect("entrypoint");
+            assert_eq!(
+                arca_incus::oci_entrypoint_args(entrypoint).expect("Incus splits it"),
+                ["/usr/bin/jet", "--banner", argument],
+                "sent as the template has it"
+            );
+            if split == Quoted {
+                created.unwrap_or_else(|error| panic!("{argument:?} starts: {error:?}"));
+                assert_eq!(instance["status"], "Running", "{argument:?}");
+            } else {
+                let Err(CallError::Refused { message, .. }) = created else {
+                    panic!("{argument:?} does not start on liblxc 5.0");
+                };
+                assert!(
+                    message.contains("Incus did not start it")
+                        && message.contains("liblxc 5.0 and older"),
+                    "{message}"
+                );
+                assert_eq!(instance["status"], "Stopped", "{argument:?}");
+            }
+        }
     }
 }
 
-/// Incus 7.6 refuses a line break in an `environment.*` value at create, and a carriage return at the container's
-/// start, so a template whose `env` holds either is refused before anything is made, a generated secret included.
+/// A template `env` value goes to Incus as the template has it: Arca refuses no line break or carriage return in it.
+/// Incus 7.6 refuses a line break in an environment value at create, and a carriage return at the container's start.
 #[test]
-fn a_template_env_value_with_a_line_break_or_a_carriage_return_is_refused_before_anything_is_made()
-{
-    for value in ["one\ntwo", "one\rtwo"] {
-        let rig = Rig::new();
-        rig.template(
-            "jet",
-            json!({
-                "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
-                "ports":[8080],"env":{"BANNER":value,"TOKEN":"{{secret:TOKEN}}"},"publishable":false,
-                "secrets":["TOKEN"],"generate":{"TOKEN":""}
-            }),
-        );
-        let Err(CallError::Refused { message, .. }) =
-            rig.call("service_create", json!({"name":"jet","template":"jet"}))
-        else {
-            panic!("{value:?} is refused");
-        };
-        assert!(
-            message.contains("env BANNER has a line break or a carriage return"),
-            "{message}"
-        );
-        assert!(
-            rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
-                .is_none()
-        );
-        assert!(!rig.dir.join("secrets/service-jet").exists());
-    }
+fn a_template_env_value_with_a_line_break_or_a_carriage_return_is_left_to_incus() {
+    let template = |value: &str| {
+        json!({
+            "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+            "ports":[8080],"env":{"BANNER":value},"publishable":false
+        })
+    };
+    let rig = Rig::new();
+    rig.template("jet", template("one\ntwo"));
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"jet","template":"jet"}))
+    else {
+        panic!("Incus refuses the create");
+    };
+    assert!(
+        message.contains("Environment variables cannot contain line breaks"),
+        "{message}"
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
+            .is_none()
+    );
+
+    let rig = Rig::new();
+    rig.template("jet", template("one\rtwo"));
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"jet","template":"jet"}))
+    else {
+        panic!("Incus refuses the start");
+    };
+    assert!(
+        message.contains("Key and value cannot contain line breaks"),
+        "{message}"
+    );
+    let instance = rig
+        .get(&format!("/1.0/instances/jet?project={PROJECT}"))
+        .expect("the instance is created");
+    assert_eq!(instance["config"]["environment.BANNER"], "one\rtwo");
+    assert_eq!(instance["status"], "Stopped");
 }
 
 #[test]
@@ -4028,7 +4064,10 @@ fn a_line_break_in_an_entrypoint_argument_that_is_no_shell_script_is_refused_bef
     else {
         panic!("a line break outside a shell script is refused");
     };
-    assert!(message.contains("not the script of a shell"), "{message}");
+    assert!(
+        message.contains("must be the script of a shell"),
+        "{message}"
+    );
     assert!(
         rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
             .is_none()
