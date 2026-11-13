@@ -885,7 +885,11 @@ is the service that `service_create` makes from the node's `postgres-autopg` tem
 - A token with a tool list needs `service_create` in it beside `postgres_create`: the database is a service.
 - **Logical replication.** A `postgres-autopg` database is ready for logical replication as it is made: the pinned
   autopg image runs every database with `wal_level=logical`, room for 10 replication slots and 10 WAL senders, by its
-  own defaults. There is nothing to ask for. Arca makes no slot; each consumer creates its own on the `app` database.
+  own defaults, and the `app` role has the `REPLICATION` right (it has no other: not a superuser, and it cannot create
+  databases or roles). The consumer connects as `app` to the `app` database, from a service connected to it, and
+  creates its own slot; Arca makes none. The `ALTER ROLE` runs at every start, so a database made by an earlier
+  release gets the right at its next start, once the node holds this release's template: run
+  `arca templates install` (it replaces an unedited `postgres-autopg.sh`; `--replace` an edited one).
 
 A proposal is given the template's name, the image it pins and the fingerprint of the template's content when it is
 made. The card leads with "Your assistant wants to create a Postgres database called NAME.", then shows the template,

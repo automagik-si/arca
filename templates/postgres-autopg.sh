@@ -5,7 +5,8 @@
 # - writes $AUTOPG_CONFIG_DIR/settings.json so postgres listens on every address (postgres._extra.listen_addresses:
 #   autopg reads it from that file only, no variable);
 # - starts the provisioner in the background, then execs the image's own command, `autopg postmaster`, as the service;
-# - the provisioner waits for the Unix socket, then makes role `app` (LOGIN, no other right, password POSTGRES_PASSWORD,
+# - the provisioner waits for the Unix socket, then makes role `app` (LOGIN and REPLICATION, so a consumer can create its
+#   own logical slot, no other right, password POSTGRES_PASSWORD,
 #   the service's write-only secret) and database `app` owned by it, with schema public its own, without logging the
 #   statement; appends one pg_hba.conf rule, `host app app samenet scram-sha-256` (the service subnet: the NIC ACL decides
 #   which consumer reaches 5432), and reloads. The superuser keeps initdb's loopback-only rules (autopg's own admin pool
@@ -40,7 +41,7 @@ provision() {
   psql -X -q -v ON_ERROR_STOP=1 -h "$SOCK" -p "$PORT" -U postgres -d postgres -v pw="$POSTGRES_PASSWORD" <<'SQL'
 SET log_statement = 'none';
 SELECT 'CREATE ROLE app LOGIN' WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app') \gexec
-SELECT format('ALTER ROLE app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L', :'pw') \gexec
+SELECT format('ALTER ROLE app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE REPLICATION PASSWORD %L', :'pw') \gexec
 SELECT 'CREATE DATABASE app OWNER app' WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'app') \gexec
 \connect app
 ALTER SCHEMA public OWNER TO app;

@@ -862,7 +862,10 @@ fn the_app_role_may_replicate_so_a_consumer_can_create_its_own_logical_slot() {
         "{alter}"
     );
     // Still no other right: not a superuser, no database or role creation.
-    assert!(alter.contains("NOSUPERUSER NOCREATEDB NOCREATEROLE"), "{alter}");
+    assert!(
+        alter.contains("NOSUPERUSER NOCREATEDB NOCREATEROLE"),
+        "{alter}"
+    );
     // A logical walsender names the database, so the one rule that lets the role in on database app lets it in.
     let (_, script) = arca::cmd_templates::SHIPPED
         .iter()

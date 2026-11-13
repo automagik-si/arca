@@ -14,7 +14,13 @@ pub fn postgres_file_of_0_12_0(name: &str) -> String {
         "postgres-autopg.json" => now
             .replace(", which Arca makes at create and never shows", "")
             .replace("  \"generate\": { \"POSTGRES_PASSWORD\": \"\" },\n", ""),
-        "postgres-autopg.sh" => now.replace(
+        "postgres-autopg.sh" => now
+            .replace("NOCREATEROLE REPLICATION PASSWORD", "NOCREATEROLE NOREPLICATION PASSWORD")
+            .replace(
+                "(LOGIN and REPLICATION, so a consumer can create its\n#   own logical slot, no other right, password POSTGRES_PASSWORD,",
+                "(LOGIN, no other right, password POSTGRES_PASSWORD,",
+            )
+            .replace(
             "is not set: this service was created from a template that did not make it (arca templates install, then create it again; or service_secret_set)",
             "is not set (service_secret_set)",
         ),

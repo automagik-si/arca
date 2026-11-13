@@ -7,9 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-The Postgres section of the operating guide now says that a `postgres-autopg` database is ready for logical
-replication as it is made: the pinned autopg image runs with `wal_level=logical`, room for 10 replication slots and
-10 WAL senders, and a consumer creates its own slot. No option is needed or added.
+A `postgres-autopg` database is now ready for logical replication as made: the pinned autopg image already runs with
+`wal_level=logical`, room for 10 replication slots and 10 WAL senders, and the template's script now gives the `app`
+role the `REPLICATION` right (it was `NOREPLICATION`, so no consumer could create a slot). Arca makes no slot; the
+consumer creates its own. Nothing else about the role changes. The script runs at every start, so an existing
+database gets the right at its next start once `arca templates install` has put the new script on the node. No option
+is needed or added.
 
 ## 0.19.0 (2026-11-13)
 
