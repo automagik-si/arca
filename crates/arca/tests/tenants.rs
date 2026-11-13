@@ -514,6 +514,8 @@ mod gate;
 mod isolation;
 #[path = "tenants/kernel_access.rs"]
 mod kernel_access;
+#[path = "tenants/no_new_privileges.rs"]
+mod no_new_privileges;
 #[path = "tenants/real_incus.rs"]
 mod real_incus;
 #[path = "tenants/refusal_codes.rs"]

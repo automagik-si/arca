@@ -894,6 +894,23 @@ Templates may also set `limits` with an optional decimal-string `cpu` and/or a s
 shared profile. `cpu`, `memory` and a data `size` must start with a digit 1-9; zero is refused. `autostart` defaults to
 false; true sets `boot.autostart=true`.
 
+`noNewPrivileges` defaults to false. With `true` the container runs with no-new-privileges: the kernel's
+`PR_SET_NO_NEW_PRIVS` is set on its init, so a setuid or setcap binary inside it (`su`, `passwd`, `mount`) cannot raise
+privileges, and a process started with `incus exec` has it too. Incus 7.5 has no config key of its own for this, so a
+create writes the LXC key through the instance's `raw.lxc`: `lxc.no_new_privs=1`. Without the key, or with `false`, the
+create carries no `raw.lxc`, as always. The service's record keeps it (`noNewPrivileges: true`), `service_list` and
+`service_status` show `noNewPrivileges: true` for such a service and no such key for any other, and `service_update`
+keeps it: it rebuilds only the root, and Incus keeps the config. A service made without the key gains it without being
+removed: set `noNewPrivileges` in its template (`arca templates install`), then run `service_update` to a new digest. The
+update gives the service's record the key and writes `raw.lxc` into the instance before the rebuilt container starts, and
+the data volume is never touched. An update to the digest the service already runs changes nothing, so it does not gain
+the key; and a template that drops the key does not take it from a service that has it. Only an OCI or system container of the node's own
+project takes it. A virtual-machine template that sets it is refused, and so is a create in a tenant, whose project
+refuses `raw.lxc`. A node whose service project is restricted must allow low-level container config
+(`restricted.containers.lowlevel=allow`) for the create to go through: Arca does not change that project key, and
+refuses the create, before anything is written, naming it when it is not allowed. The key makes the whole container
+no-new-privileges, not only one user: an image that needs a setuid helper to work inside it will not.
+
 `data` names an absolute printable mount `path` of at most 255 bytes that is not the root (`/`, `//` and `/.` are
 refused) and has no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit), and an optional `size` such as
 `8GiB`. Arca creates a custom volume `<service>-data` in the service project's storage pool before the instance, setting
@@ -3802,7 +3819,8 @@ virtual-machine template may also set `description` and `autostart`, and `ports`
 to link to it: a link opens the port in the managed service network's ACL, so a template with `ports` is refused on a
 host bridge. It may also set `firstBoot`, `settings` and `secrets`, which "First boot, settings and secrets of a
 virtual machine" below describes. It may not set `env`, `generate`, `entrypoint`, `publishable`, `dashPort`,
-`droiddPort`, `data` or `lan`: each of those depends on a container's environment, image or devices.
+`droiddPort`, `data` or `lan`: each of those depends on a container's environment, image or devices. It may not set
+`noNewPrivileges` either: that is the LXC config of a container.
 
 `service_create` takes two more arguments for a virtual-machine template:
 

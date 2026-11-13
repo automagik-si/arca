@@ -3861,6 +3861,10 @@ fn enrich_service_create(
         if tenant.is_some() && (template.lan.is_some() || template.publishable) {
             return Err(service_refused(tenant_host_port(&template.name)));
         }
+        // A tenant's project refuses `raw.lxc`, the only way Incus 7.5 sets no-new-privileges: refused before any write.
+        if tenant.is_some() && template.no_new_privileges {
+            return Err(service_refused(tenant_no_new_privileges(&template.name)));
+        }
         if let Some(refusal) = create_room_refusal(
             cfg,
             entries,
@@ -4042,6 +4046,13 @@ const DEPLOY_OUTSIDE_TENANT: &str = "deploy: only a call inside a tenant names a
 
 /// Why a tenant's virtual machine that names a host bridge is not made.
 const TENANT_BRIDGE: &str = "bridge: a virtual machine in a tenant joins the managed service network only, never a host bridge";
+
+/// Why a tenant's service is not made from a template that sets `noNewPrivileges`.
+fn tenant_no_new_privileges(template: &str) -> String {
+    format!(
+        "template {template}: noNewPrivileges is for a service of the node's own project, never one in a tenant, whose project refuses the LXC config it needs"
+    )
+}
 
 /// Why a tenant's service is not made from a template that opens a port on the host or publishes.
 fn tenant_host_port(template: &str) -> String {
@@ -6010,6 +6021,7 @@ pub(crate) fn adopted_config(
         function: None,
         follow: None,
         follow_version: None,
+        no_new_privileges: false,
     })
 }
 
@@ -6218,6 +6230,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         function: None,
         follow: None,
         follow_version: None,
+        no_new_privileges: parts.template.no_new_privileges,
     })
 }
 
@@ -6301,6 +6314,7 @@ fn vm_service_config(
         function: None,
         follow: None,
         follow_version: None,
+        no_new_privileges: false,
     })
 }
 
@@ -7589,10 +7603,31 @@ impl ServiceHandler {
                     if template.lan.is_some() || template.publishable {
                         return Err(service_refused(tenant_host_port(template_name)));
                     }
+                    if template.no_new_privileges {
+                        return Err(service_refused(tenant_no_new_privileges(template_name)));
+                    }
                     if let Some(refusal) =
                         create_room_refusal(&self.cfg, &all_entries, Some(scope), &name, &template)
                     {
                         return Err(refusal);
+                    }
+                }
+                if template.no_new_privileges && tenant.is_none() {
+                    // A restricted project refuses `raw.lxc` unless it allows low-level config: said here, in words,
+                    // before anything is written. A project not made yet, or one that cannot be read, decides nothing.
+                    let found = read.get(&format!(
+                        "/1.0/projects/{0}?project={0}",
+                        arca_netproject::PROJECT
+                    ));
+                    if let Ok(found) = found
+                        && found["config"]["restricted"].as_str() == Some("true")
+                        && found["config"]["restricted.containers.lowlevel"].as_str()
+                            != Some("allow")
+                    {
+                        return Err(service_refused(format!(
+                            "template {template_name}: noNewPrivileges needs the LXC config raw.lxc, and the Incus project {} is restricted and does not allow low-level container config (restricted.containers.lowlevel). Nothing was created",
+                            arca_netproject::PROJECT
+                        )));
                     }
                 }
                 let ipv4 = self.free_address(

@@ -448,6 +448,107 @@ fn service_create_list_status_round_trip() {
 }
 
 #[test]
+fn a_template_that_sets_no_new_privileges_gives_its_container_the_lxc_key_and_the_record_and_views_say_so()
+ {
+    let rig = Rig::new();
+    let mut strict = nats_template();
+    strict["name"] = json!("strict");
+    strict["noNewPrivileges"] = json!(true);
+    rig.template("strict", strict);
+    rig.template("nats", nats_template());
+    let created = rig
+        .call(
+            "service_create",
+            json!({"name":"strict","template":"strict"}),
+        )
+        .expect("create");
+    assert_eq!(created["noNewPrivileges"], json!(true));
+    let instance = rig
+        .get(&format!("/1.0/instances/strict?project={PROJECT}"))
+        .expect("instance");
+    assert_eq!(instance["config"]["raw.lxc"], "lxc.no_new_privs=1");
+    // The record keeps it: the listing and the status say it from the record, with the rest of the view as it was.
+    let status = rig
+        .call("service_status", json!({"name":"strict"}))
+        .expect("status");
+    assert_eq!(status["noNewPrivileges"], json!(true));
+    let listed = rig.call("service_list", json!({})).expect("list");
+    assert_eq!(listed["services"][0]["noNewPrivileges"], json!(true));
+    // The default is off: another template, without the key, has no `raw.lxc` and no key in its view.
+    let plain = rig
+        .call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("plain create");
+    assert!(plain.get("noNewPrivileges").is_none());
+    let instance = rig
+        .get(&format!("/1.0/instances/nats?project={PROJECT}"))
+        .expect("instance");
+    assert!(instance["config"].get("raw.lxc").is_none());
+    // `false` is the same as no key.
+    let mut off = nats_template();
+    off["name"] = json!("off");
+    off["noNewPrivileges"] = json!(false);
+    rig.template("off", off);
+    rig.call("service_create", json!({"name":"off","template":"off"}))
+        .expect("off create");
+    let instance = rig
+        .get(&format!("/1.0/instances/off?project={PROJECT}"))
+        .expect("instance");
+    assert!(instance["config"].get("raw.lxc").is_none());
+}
+
+#[test]
+fn a_restricted_project_that_refuses_low_level_config_refuses_a_no_new_privileges_create_before_any_write_and_one_that_allows_it_does_not()
+ {
+    let rig = Rig::new();
+    let mut strict = nats_template();
+    strict["name"] = json!("strict");
+    strict["noNewPrivileges"] = json!(true);
+    rig.template("strict", strict);
+    rig.template("nats", nats_template());
+    // The project exists from the node's first service.
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("first service");
+    let project = format!("/1.0/projects/{PROJECT}");
+    let patch = |changes: Value| {
+        let mut config = rig.get(&project).expect("the project")["config"].clone();
+        for (key, value) in changes.as_object().expect("object") {
+            config[key] = value.clone();
+        }
+        rig.edit("PATCH", &project, json!({ "config": config }));
+    };
+    patch(json!({"restricted": "true", "restricted.containers.lowlevel": "block"}));
+    let before = rig.fake.writes().len();
+    let refused = rig
+        .call(
+            "service_create",
+            json!({"name":"strict","template":"strict"}),
+        )
+        .expect_err("refused");
+    let message = format!("{refused:?}");
+    assert!(
+        message.contains("restricted.containers.lowlevel")
+            && message.contains("Nothing was created"),
+        "{message}"
+    );
+    assert_eq!(rig.fake.writes().len(), before, "nothing was written");
+    // A template without the key is untouched by the project's restriction.
+    rig.call("service_create", json!({"name":"nats2","template":"nats"}))
+        .expect("an ordinary create");
+    patch(json!({"restricted.containers.lowlevel": "allow"}));
+    rig.call(
+        "service_create",
+        json!({"name":"strict","template":"strict"}),
+    )
+    .expect("allowed");
+    let instance = rig
+        .get(&format!("/1.0/instances/strict?project={PROJECT}"))
+        .expect("instance");
+    assert_eq!(instance["config"]["raw.lxc"], "lxc.no_new_privs=1");
+    assert!(rig.service_config("strict").no_new_privileges);
+    assert!(!rig.service_config("nats").no_new_privileges);
+}
+
+#[test]
 fn service_list_reports_a_lan_port_only_when_the_template_has_a_lan_proxy() {
     let rig = Rig::new();
     rig.template("nats", nats_template());
@@ -587,6 +688,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         create_settings: Vec::new(),
         setting_rules: Vec::new(),
         kernel_access: None,
+        no_new_privileges: false,
         update: None,
     }
 }

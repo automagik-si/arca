@@ -896,4 +896,37 @@ fn a_follow_proposal_that_mixes_in_a_digest_or_erase_data_is_refused_when_it_is_
             .count(),
         0
     );
+
+#[test]
+fn a_service_made_without_no_new_privileges_gains_it_through_an_update_and_keeps_its_data() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    let before = instance(&rig);
+    assert!(before["config"].get("raw.lxc").is_none());
+    assert!(!rig.service_config("app").no_new_privileges);
+    // Without the key in the template, an update leaves things as they were.
+    update(&rig, json!({ "name": "app", "digest": NEW })).expect("plain update");
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    assert!(!rig.service_config("app").no_new_privileges);
+    // The template now says it: the next update gives the service the key, in its record and in its instance.
+    let mut strict = app_template();
+    strict["noNewPrivileges"] = json!(true);
+    rig.template("app", strict);
+    let newer = format!("sha256:{}", "3".repeat(64));
+    update(&rig, json!({ "name": "app", "digest": newer })).expect("gaining update");
+    let after = instance(&rig);
+    assert_eq!(after["config"]["raw.lxc"], "lxc.no_new_privs=1");
+    assert!(rig.service_config("app").no_new_privileges);
+    assert_eq!(after["devices"]["data"], before["devices"]["data"]);
+    assert_eq!(
+        after["config"]["volatile.uuid"],
+        before["config"]["volatile.uuid"]
+    );
+    assert_eq!(after["status"], "Running");
+    // A template that drops the key does not take it from a service the next update.
+    rig.template("app", app_template());
+    let last = format!("sha256:{}", "4".repeat(64));
+    update(&rig, json!({ "name": "app", "digest": last })).expect("later update");
+    assert_eq!(instance(&rig)["config"]["raw.lxc"], "lxc.no_new_privs=1");
+    assert!(rig.service_config("app").no_new_privileges);
 }

@@ -576,6 +576,19 @@ impl ServiceHandler {
                 "the service has never been started, and a rebuild would leave it unable to start: start it with instance_start first",
             ));
         }
+        // A template that now says `noNewPrivileges` gives it to a service made without it: the record gains the key and
+        // the node writes `raw.lxc` into the instance's config, which Incus keeps through the rebuild, so the start
+        // below runs with it. The data volume is untouched. A template without the key never takes it away.
+        let gains = config.tenant.is_none()
+            && !config.no_new_privileges
+            && crate::service::load_template(
+                &self.cfg.state_dir.join("templates"),
+                &config.template,
+            )
+            .is_ok_and(|template| template.no_new_privileges);
+        if gains {
+            self.amend(&entry.id.0, &name, |record| record.no_new_privileges = true)?;
+        }
         let journal = Journal {
             path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
             id: format!("{}-{}", entry.id.0, (self.clock)()),
