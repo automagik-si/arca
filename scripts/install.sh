@@ -59,7 +59,7 @@ set -eu
 
 # The release this script installs. `--version` names another. The script never asks GitHub which release is the
 # newest: each release carries its own copy of this script, with this line set to that release.
-ARCA_VERSION=0.27.0
+ARCA_VERSION=0.28.0
 
 RELEASES=https://github.com/automagik-si/arca/releases
 GUIDE=https://github.com/automagik-si/arca/blob/dev/docs/OPERATING.md
