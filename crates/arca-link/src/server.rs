@@ -4,7 +4,7 @@ use crate::{
     guard::{Guard, Slot},
     mesh,
     pairing::{self, Request, Response, read_line, write_line},
-    path::{self, Named, Prefer},
+    path::{self, Hints, Prefer},
     runtime,
 };
 use iroh::{
@@ -46,7 +46,7 @@ pub struct Link {
     endpoint: Endpoint,
     state: State,
     name: String,
-    named: Named,
+    named: Hints,
     stop: watch::Sender<bool>,
     refresh: Arc<Notify>,
     task: Option<JoinHandle<()>>,
@@ -64,7 +64,7 @@ impl Link {
         let key = state.secret()?;
         let mut alpns = vec![PAIR_ALPN.to_vec(), PEERS_ALPN.to_vec()];
         alpns.extend(config.forward.keys().map(|a| a.as_bytes().to_vec()));
-        let named = Named::new(&config);
+        let named = Hints::new(&config);
         let mut builder = match (network, config.port) {
             (Network::N0, None) => Endpoint::builder(presets::N0),
             (Network::N0, Some(port)) => {
@@ -89,7 +89,16 @@ impl Link {
         if !named.is_empty() {
             builder = builder.path_selector(Arc::new(Prefer(named.all())));
         }
-        let endpoint = runtime(builder.secret_key(key).alpns(alpns).bind().await)?;
+        let endpoint =
+            builder
+                .secret_key(key)
+                .alpns(alpns)
+                .bind()
+                .await
+                .map_err(|_| match config.port {
+                    Some(port) => Error::Port(port),
+                    None => Error::Runtime("link operation failed"),
+                })?;
         let name = config
             .name
             .clone()
@@ -130,12 +139,14 @@ impl Link {
     /// Open a connection to a paired peer by name.
     pub async fn connect(&self, peer: &str, alpn: &[u8]) -> Result<Connection> {
         let addr = self.named.dial(peer, self.state.peer_addr(peer)?);
-        runtime(self.endpoint.connect(addr, alpn).await)
+        let connection = runtime(self.endpoint.connect(addr, alpn).await)?;
+        self.named.track(&connection);
+        Ok(connection)
     }
     /// The path each paired peer is reached on now, by peer name.
-    pub async fn paths(&self) -> std::collections::BTreeMap<String, crate::PathNow> {
+    pub fn paths(&self) -> std::collections::BTreeMap<String, crate::PathNow> {
         let peers = self.state.peers().unwrap_or_default();
-        path::now(&self.endpoint, &peers, &self.named).await
+        path::now(&peers, &self.named)
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -207,7 +218,7 @@ async fn run(
     state: State,
     name: String,
     config: Config,
-    named: Named,
+    named: Hints,
     listener: UnixListener,
     mut stop: watch::Receiver<bool>,
     refresh: Arc<Notify>,
@@ -247,7 +258,7 @@ async fn run(
                 if removed != last_removed { last_removed = removed; needs_sync = true; }
                 if publish(&state, &endpoint, &name).is_err() { break; }
                 let peers = state.peers().unwrap_or_default();
-                let _ = state.write("paths.json", &path::now(&endpoint, &peers, &named).await);
+                let _ = state.write("paths.json", &path::now(&peers, &named));
             },
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
@@ -255,7 +266,7 @@ async fn run(
                 if !incoming.remote_addr_validated() { let _ = incoming.retry(); continue; }
                 let Some(slot) = guard.take(incoming.remote_addr()) else { incoming.refuse(); continue; };
                 let deadline = Instant::now() + Duration::from_secs(10);
-                tasks.spawn(handle(incoming, slot, state.clone(), endpoint.id().to_string(), config.clone(), connections.clone(), refresh.clone(), deadline));
+                tasks.spawn(handle(incoming, slot, state.clone(), endpoint.id().to_string(), config.clone(), named.clone(), connections.clone(), refresh.clone(), deadline));
             },
             client = listener.accept() => {
                 if let Ok((client, _)) = client {
@@ -295,6 +306,7 @@ async fn handle(
     state: State,
     own_id: String,
     config: Config,
+    named: Hints,
     connections: Connections,
     refresh: Arc<Notify>,
     deadline: Instant,
@@ -319,6 +331,7 @@ async fn handle(
                 .lock()
                 .expect("connections lock")
                 .insert(id, connection.clone());
+            named.track(&connection);
             registered = Some(id);
         }
         let (mut send, mut recv) = runtime(connection.accept_bi().await)?;
@@ -439,7 +452,7 @@ async fn control(
     endpoint: Endpoint,
     state: State,
     name: String,
-    named: Named,
+    named: Hints,
     connections: Connections,
     refresh: Arc<Notify>,
 ) -> Result<()> {
@@ -454,6 +467,7 @@ async fn control(
             let result: Result<_> = async {
                 let addr = named.dial(&request.dial, state.peer_addr(&request.dial)?);
                 let connection = runtime(endpoint.connect(addr, b"arca/mcp/1").await)?;
+                named.track(&connection);
                 let (send, recv) = runtime(connection.open_bi().await)?;
                 Ok((connection, send, recv))
             }

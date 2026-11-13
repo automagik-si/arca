@@ -947,12 +947,27 @@ async fn a_named_address_is_dialled_and_reported_as_the_direct_path() {
         let guest = paired_and_restarted(&b, &a, &host, first, config).await;
         assert_eq!(b.state().peers().unwrap()[0].ticket, None);
         let conn = guest.connect("host", PAIR_ALPN).await.unwrap();
-        let paths = guest.paths().await;
+        let paths = guest.paths();
         let path = paths.get("host").expect("the host has a path");
         assert_eq!(path.via, "direct");
         assert_eq!(path.addr.as_deref(), Some(named.to_string().as_str()));
         assert!(path.named);
+        // Once the connection is closed nothing is in use, whatever iroh remembers of the address.
         conn.close(0u32.into(), b"done");
+        conn.closed().await;
+        // The start-up membership sync may still hold a connection of its own; it ends within moments.
+        for _ in 0..100 {
+            if guest.paths().get("host").is_some_and(|p| p.via == "idle") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let paths = guest.paths();
+        let path = paths.get("host").expect("a paired peer is always listed");
+        assert_eq!(
+            (path.via.as_str(), path.addr.as_deref(), path.named),
+            ("idle", None, false)
+        );
         guest.shutdown().await;
         host.shutdown().await;
     })
@@ -976,7 +991,7 @@ async fn a_named_address_that_does_not_answer_falls_back_to_the_recorded_one() {
         };
         let guest = node_with(&b, "guest", config).await;
         let conn = guest.connect("host", PAIR_ALPN).await.unwrap();
-        let paths = guest.paths().await;
+        let paths = guest.paths();
         let path = paths.get("host").expect("the host has a path");
         let real = host.endpoint().bound_sockets()[0].to_string();
         assert_eq!(
@@ -1003,7 +1018,7 @@ async fn without_the_keys_a_peer_with_no_address_cannot_be_dialled() {
             !matches!(result, Ok(Ok(_))),
             "no named address and no ticket: no path"
         );
-        let paths = guest.paths().await;
+        let paths = guest.paths();
         assert!(
             paths
                 .get("host")
@@ -1053,4 +1068,25 @@ fn without_the_keys_the_config_is_unchanged() {
     assert_eq!(config, Config::default());
     assert!(config.peers.is_empty() && config.port.is_none());
     config.check().unwrap();
+}
+
+#[tokio::test]
+async fn a_fixed_port_that_is_taken_is_named_in_the_error() {
+    let holder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let temp = Temp::new();
+    let result = Link::start(
+        temp.state(),
+        Config {
+            port: Some(port),
+            ..Config::default()
+        },
+        Network::local(),
+    )
+    .await;
+    let message = result
+        .err()
+        .expect("a taken port stops the start")
+        .to_string();
+    assert!(message.contains(&port.to_string()), "{message}");
 }

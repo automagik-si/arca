@@ -2,7 +2,7 @@
 use crate::{
     PEERS_ALPN, Result, State,
     pairing::{read_line_bounded, write_line_bounded},
-    path::Named,
+    path::Hints,
     runtime,
     state::Snapshot,
 };
@@ -33,7 +33,7 @@ pub(crate) async fn receive(
 async fn exchange(
     endpoint: Endpoint,
     state: State,
-    named: Named,
+    named: Hints,
     peer: crate::Peer,
 ) -> Result<bool> {
     let operation = async {
@@ -42,6 +42,7 @@ async fn exchange(
                 .connect(named.dial(&peer.name, peer.addr()?), PEERS_ALPN)
                 .await,
         )?;
+        named.track(&connection);
         let result = async {
             let (mut send, mut recv) = runtime(connection.open_bi().await)?;
             write_line_bounded(&mut send, &state.snapshot()?, LINE_LIMIT).await?;
@@ -59,7 +60,7 @@ async fn exchange(
 }
 
 /// Try each member, including newly learned members, once. Offline peers are harmless.
-pub(crate) async fn sync(endpoint: &Endpoint, state: &State, named: &Named) -> Result<bool> {
+pub(crate) async fn sync(endpoint: &Endpoint, state: &State, named: &Hints) -> Result<bool> {
     let mut attempted = BTreeSet::new();
     let mut changed = false;
     loop {

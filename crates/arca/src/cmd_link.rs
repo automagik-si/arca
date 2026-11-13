@@ -8,7 +8,9 @@ fn failure(error: arca_link::Error) -> Failure {
     match error {
         arca_link::Error::InvalidLink => Failure::Usage(error.to_string()),
         arca_link::Error::Config(_) => Failure::Config(error.to_string()),
-        arca_link::Error::Runtime(_) => Failure::Runtime(error.to_string()),
+        arca_link::Error::Runtime(_) | arca_link::Error::Port(_) => {
+            Failure::Runtime(error.to_string())
+        }
     }
 }
 

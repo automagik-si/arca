@@ -95,6 +95,8 @@ pub enum Error {
     InvalidLink,
     Config(&'static str),
     Runtime(&'static str),
+    /// The endpoint could not bind the fixed `link.port`, most likely because another program holds it.
+    Port(u16),
 }
 
 impl fmt::Display for Error {
@@ -102,6 +104,12 @@ impl fmt::Display for Error {
         f.write_str(match self {
             Self::InvalidLink => "invalid pairing link",
             Self::Config(message) | Self::Runtime(message) => message,
+            Self::Port(port) => {
+                return write!(
+                    f,
+                    "cannot bind link.port {port}; another program may be using that UDP port"
+                );
+            }
         })
     }
 }

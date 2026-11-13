@@ -536,21 +536,26 @@ are used in two ways, and both only add: nothing is excluded, so a peer stays re
 
 - Every connection this node opens to that peer (membership sync, `call --peer`) also tries the named addresses, next
   to the address recorded when the two nodes paired.
-- Among the paths open to a peer, a path on a named address carries the traffic while it works, ahead of any other
-  direct address and the relay. Inside that group the lowest round trip wins, and a switch needs a gain of 5 ms.
-  When the named path closes, the next best path takes over.
+- Among the paths open on a connection this node opens, a path on a named address carries the traffic while it works,
+  ahead of any other direct address and the relay. Inside that group the lowest round trip wins, and a switch needs a
+  gain of 5 ms. When the named path closes, the next best path takes over.
 
-This needs the peer's own `port`, so the address you name stays the same: set `port` on the peer and name
-`<its address on the private link>:<that port>` here, on each node that should prefer the link. The peer must accept UDP
-on that port on the private interface. iroh 1.4.1 has no per-peer setting for this; the rule is a `PathSelector`, an
-unstable iroh interface behind its `unstable-custom-transports` feature, which is why iroh is pinned to that exact
-version.
+Only the side that opens a connection chooses its paths, so each node's `peers` governs the connections that node
+opens. A connection the other node opens is steered by the other node's settings: without `peers` there, it may still
+use the VPN. For the private link to carry both directions, set `port` on both nodes and name each other in `peers`: on
+each node, `<the other node's address on the private link>:<the other node's port>`. Each node must accept UDP on its
+port on the private interface. iroh 1.4.1 has no per-peer setting for this; the rule is a `PathSelector`, an unstable
+iroh interface behind its `unstable-custom-transports` feature, which is why iroh is pinned to that exact version.
+`crates/arca-link/src/path.rs` lists what to re-check when iroh is updated.
 
 To see which path a peer is reached on, run `arca link peers` while `link serve` runs: each peer then has a `path`:
-`{ "via": "direct" | "relay" | "idle", "addr": "<ip:port or relay URL>", "named": true | false }`. `named` is true when
-the address in use is one `peers` names, so `"via": "direct"` with `"named": true` and the fiber's address confirms the
-link in use. `idle` means no path is in use at the moment, as between two syncs (every 30 seconds). A peer with no
-`path` key has no record: `link serve` is not running or its record is older than 10 seconds.
+`{ "via": "direct" | "relay" | "idle", "addr": "<ip:port or relay URL>", "named": true | false }`. It comes from the
+connections open at that moment, each one's selected path, so `"via": "direct"` with `"named": true` and the private
+address confirms the link is in use right now. `idle` means no connection to that peer is open, which is the usual
+state between two syncs (every 30 seconds; a sync lasts moments): run a call to the peer, such as `arca call --peer
+<name>`, and look again while it runs. A peer has no `path` key when `link serve` is not running or its record is older
+than 10 seconds. An older arca refuses a config with `peers` or `port` (the section refuses unknown keys): take the two
+keys out before going back to an older release.
 
 The endpoint accepts `arca/pair/1` for pairing, `arca/peers/1` for membership, `arca/mcp/1` for peer calls, plus the ALPNs
 in `forward`. Both membership and forwarded connections require a live entry in `peers.json`; a forwarded connection checks
