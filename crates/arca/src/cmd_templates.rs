@@ -40,6 +40,7 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
     "gitlab-runner-pool.json",
     "gitlab-runner-pool.sh",
     "nats.json",
+    "nats.sh",
     "omni-api.json",
     "postgres-autopg.json",
     "postgres-autopg.sh",
@@ -133,10 +134,15 @@ pub const EARLIER: &[(&str, &str)] = &[
         "postgres-autopg.json",
         "c72e64e193b0cbd0c9e486e2b894f84da3515509e3e3c1ff0cd3dbb00d9e2a0d",
     ),
-    // 0.1.0-alpha.7 to 0.20.0: before it kept JetStream's files on a data volume.
+    // 0.1.0-alpha.7 to 0.22.0: before it kept JetStream's files on a data volume.
     (
         "nats.json",
         "f68486a9d336a275162aa5ceeea9d8e7c1e8d2fd70757faedc58b6c2f05797c3",
+    ),
+    // 0.23.0 to 0.25.0: before it wrote a configuration of its own (a leaf node listener, monitoring, every message fsynced) and moved to NATS 2.14.
+    (
+        "nats.json",
+        "8a30f73a3c9010e69af082ccd64c4e182f2311e82e5776db8922755f8152939c",
     ),
     // 0.1.0-alpha.7 to 0.20.0: before it kept the media it stores on a data volume.
     (

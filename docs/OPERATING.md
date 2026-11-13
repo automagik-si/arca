@@ -744,7 +744,7 @@ create it again from the new template. A runner pool reads its script when its v
 pool that runs keeps the script it has.
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
-script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `github-runner-pool.sh` for
+script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `nats.sh` for `nats`, `github-runner-pool.sh` for
 `github-runner-pool`, `gitlab-runner-pool.sh` for both `gitlab-runner-pool` and `gitlab-runner-pool-large`,
 `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
@@ -1001,6 +1001,83 @@ the one it always was. A call that states another image than the configured one 
 upgrade: on a node with no `kernel.postgresImage`, a token's own `postgres_create` could name any digest-pinned
 image; it no longer can. A node that relied on that sets `kernel.postgresImage` to that image. A database of the
 old kind is not turned into a service, and stays as it is.
+
+### A message bus: nats
+
+`nats` is a NATS server with JetStream, made to keep what it is given. `service_create` with `"template": "nats"`
+makes it (a card the owner approves, like any create), and it starts: every secret it needs is made at create.
+
+| Port | What | Opened by a link? |
+|---|---|---|
+| 4222 | clients, with no login (the first port, which a link opens) | yes |
+| 7422 | leaf nodes, which log in as the user `leaf` | no |
+| 8222 | monitoring over http (`/varz`, `/jsz`), with no login: it shows how the server is, never a message | no |
+
+A link (`service_connect`) gives the consumer `NATS_URL`, `nats://ADDRESS:4222`, with no user or password in it, as it
+always has. Clients on 4222 log in with nothing because the service network rejects everything that is not linked, and
+because Omni's NATS client (nats.js 2.29) sends no user or password, so a login there would stop the shipped Omni stack.
+A login belongs where a path opens that the service network does not guard: the leaf node listener, where the user
+`leaf` has a password, the `NATS_LEAF_PASSWORD` secret that Arca makes at create (32 letters and digits) and shows
+nowhere. **Nothing reaches 7422 yet**: a link opens only the first port, so no service, on this node or another, can
+connect there. The listener is for the step that gives a private path to it.
+
+- **Image.** `docker.io/library/nats` by digest `sha256:311da47e2f31c26e99c623cd78d486a1e8ab039c49b32652770bb91a4f70512e`,
+  the `2.14.10-alpine` image, the newest 2.14 patch at the time of writing (the template of 0.25.0 pinned 2.10.29).
+  It moved because of the durability promise below: in 2.10 a block compaction (a delete, and so a work-queue or interest
+  stream) writes its new block with no sync, so a power loss in the next two minutes can lose messages that were
+  acknowledged, whatever `sync_interval` says; 2.14.6 fixed it (nats-server PR 8475), and every later 2.14 patch has the
+  fix. Every key the script writes was read again in the source of v2.14.10 (`server/opts.go`: `store_dir`,
+  `sync_interval`, `max_file_store`, `domain`, `http`, the `leafnodes` `listen` and `authorization` `user` and `password`),
+  and `sync_interval: always` is honoured by the compaction's write in `filestore.go`. The server was not run on it.
+- **Data.** A volume of 10GiB at `/data`, and `store_dir` is `/data/jetstream`, so what the server stores survives
+  `service_update`, which rebuilds the root disk and leaves the volume. `max_file_store` is 8GiB, under the volume, so a
+  full store is refused by JetStream instead of filling the disk the server's own files are on. `sync_interval` is
+  `always`: the server syncs to disk before it acknowledges each message, so an acknowledged message is on disk. That
+  lowers the most a server can take in (the NATS documentation says it "lowers maximum throughput"); measure it for the
+  load you have.
+- **The domain.** The server's JetStream domain, and its name, are the service's name (`bus` for `bus`), unique on the
+  node. A stream of this server is reached from a leaf node by `$JS.bus.API`. Another server that is to be a leaf of it
+  needs a name of its own: with the same domain, the API subject is answered locally and no mirror forms.
+- **What the script writes.** `templates/nats.sh` writes the server's configuration at every start, with mode 600 and
+  under `/tmp`, not on the volume, and starts the server on it. Edits to the file are lost; edit the template
+  and the script (see "Templates an earlier release installed").
+- **Tests.** The script is tested against a fake server under the host's `sh` and, where the host has `busybox`, under
+  `busybox ash`, which is the image's shell. It was not run against the real server or on a node.
+
+**Discard new is a setting of a stream, not of the server.** A stream decides what happens when it is full: the default,
+`discard: old`, drops its oldest messages to take a new one; `discard: new` refuses the new message instead, and the
+publisher gets an error. Whoever creates a stream says which, in the stream's own configuration (`"discard": "new"`, with
+a limit such as `max_bytes` or `max_msgs` for it to bite), because only that person knows whether losing the old
+messages or refusing the new ones is right. The server has no setting that does it for every stream, and this template
+does not pretend to: `max_file_store` only caps what all streams may take together.
+
+**A `nats` made before this template.** A `nats` made from the template of 0.23.0 to 0.25.0 has the data volume at
+`/data` (one made up to 0.22.0 keeps its data on its root disk and has none: see "A service that keeps its data inside
+the container"). What changes for it:
+
+- `arca templates install`, which an upgrade runs, replaces `nats.json` and adds `nats.sh` without `--replace`, because
+  the old `nats.json` is an earlier release's own, unedited. `--replace` would also overwrite an edit of the owner's. Either
+  way only **the next create** is made from the new files.
+- Arca then reads the new template for the old service. `service_connect` and `service_disconnect` keep working on it
+  and give the same `NATS_URL`, because that URL holds no secret, which the old service does not have.
+- The old service itself is not changed: its command line (`nats-server --jetstream --store_dir /data/jetstream --port
+  4222`), its environment and its ports are its record's. `service_update` with the new digest moves its image to
+  2.14.10 and keeps `/data`, but only the image: it gets no `sync_interval: always`, no leaf listener, no monitoring and
+  no domain, and so not the durability promise above.
+- **To have the template whole, make a new service from it** (a name of its own, such as `bus2`), link the consumers to
+  it (`service_connect`, then `service_disconnect` from the old one; each consumer takes the new `NATS_URL` at its next
+  start), and move the streams by hand with a client: two nats services share no connection, so back each stream up on
+  the old one (`nats stream backup`) and restore it on the new (`nats stream restore`). When nothing uses the old one,
+  remove it (`service_remove`): its data goes with it.
+- **Moving the image from 2.10 to 2.14 (`service_update`).** NATS documents the steps one release at a time: from 2.10
+  to 2.11 in place (a 2.11 rewrites the stream state files; going back to 2.10 rebuilds them by rescanning every block,
+  once, without loss); from 2.11 to 2.12 in place, going back only to 2.11.9 or later, where a stream or consumer that uses
+  a 2.12 feature is frozen, not deleted, and the stream state files are rebuilt once more; from 2.12 to 2.14 in place, and
+  going back to 2.12 (a durable consumer created with ack and flow-control v2 stays offline until 2.14 returns; remove a
+  `feature_flags` block first). Strict mode is on by default from 2.12: a JetStream API request the server used to log
+  and accept now gets an error. **NATS has no guide for the jump from 2.10 to 2.14 and none for going back from 2.14 to
+  2.10**, and this was not tried here. So: back the streams up first, as above; `service_update` rolls the image back
+  if the new one does not start, but what 2.14 wrote on the volume is not undone by that.
 
 ### A service that may reach one private address
 
