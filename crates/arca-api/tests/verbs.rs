@@ -286,6 +286,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
     let action_names = [
         "service_create",
         "service_remove",
+        "service_update",
         "service_import",
         "service_release",
         "service_publish",

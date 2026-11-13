@@ -293,6 +293,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "registry": "https://registry.example",
             }),
             ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
+            ActionKind::ServiceUpdate => json!({
+                "name": "nats", "tenant": "abcdefgh", "timeoutSeconds": 120, "eraseData": true,
+                "digest": format!("sha256:{}", "2".repeat(64)),
+            }),
             ActionKind::ServiceUnpublish
             | ActionKind::ServiceImport
             | ActionKind::ServiceRelease => json!({ "name": "nats" }),
@@ -496,6 +500,40 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             }
             assert_eq!(row("Command argument 1"), "--once");
             assert!(row("Internet").starts_with("No:"));
+            continue;
+        }
+        if action == ActionKind::ServiceUpdate {
+            // Every argument has its row, and the erasing of the data is said in words.
+            let shown: Vec<(&str, &str)> = details
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(shown[0], ("Name", "nats"));
+            assert_eq!(shown[1].0, "Digest");
+            assert_eq!(shown[2], ("Health check", "120 seconds"));
+            assert_eq!(
+                shown[3],
+                ("Erase data", arca::action_proposal::ERASE_DATA_WORDS)
+            );
+            assert_eq!(shown[4], ("Tenant", "abcdefgh"));
+            assert_eq!(shown.len(), 5);
+            let schema = action.params_schema();
+            assert!(
+                schema["properties"]
+                    .as_object()
+                    .expect("properties")
+                    .keys()
+                    .all(|field| [
+                        "name",
+                        "digest",
+                        "follow",
+                        "timeoutSeconds",
+                        "eraseData",
+                        "tenant"
+                    ]
+                    .contains(&field.as_str())),
+                "the schema has a field the card does not show"
+            );
             continue;
         }
         if action == ActionKind::FunctionRemove {
