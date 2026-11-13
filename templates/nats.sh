@@ -16,7 +16,8 @@
 #   could lose messages that were acknowledged;
 # - max_file_store 8 GiB, under the volume's 10 GiB (the template states the volume's size; keep this below it), so a
 #   full store is refused by JetStream and never fills the volume the server's own files live on;
-# - a leaf node listener on 7422 that takes only the user `leaf`. Nothing reaches it yet: a link opens only 4222.
+# - a leaf node listener on 7422 that takes only the user `leaf`. No link reaches it yet: a link opens only 4222 (a
+#   tenant's front service and a function may still reach it; see docs/OPERATING.md).
 # The configuration holds the leaf password, so it is written with mode 600 and under /tmp, not on the data volume.
 # Discard new is not set here: it is a setting of each stream, made by whoever creates the stream (docs/OPERATING.md,
 # "A message bus: nats").

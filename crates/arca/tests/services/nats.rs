@@ -107,7 +107,32 @@ fn the_script_is_installed_with_the_template_and_read_whole_into_its_entrypoint(
         line.starts_with("/bin/sh -ec '") && line.ends_with("' nats"),
         "{line}"
     );
-    assert!(line.contains("sync_interval: always"));
+    // The installed file, whole: the script word holds it either as it is or as one word that decodes it.
+    let installed = fs::read_to_string(dir.join("nats.sh")).expect("the installed script");
+    assert_eq!(script_in(&line), installed.trim_end_matches('\n'));
+    assert!(installed.contains("sync_interval: always"));
+}
+
+/// The script an entrypoint line `/bin/sh -ec '<word>' nats` runs. The word is the script itself, or, where a node's
+/// liblxc would split a word with whitespace, `__arca_script=$(echo${IFS}<base64>|base64${IFS}-d)&&eval...`, which
+/// is decoded here.
+fn script_in(line: &str) -> String {
+    use base64::Engine as _;
+    let word = line
+        .strip_prefix("/bin/sh -ec '")
+        .and_then(|rest| rest.strip_suffix("' nats"))
+        .expect("the script word")
+        .replace("'\\''", "'");
+    let Some(encoded) = word
+        .strip_prefix("__arca_script=$(echo${IFS}")
+        .and_then(|rest| rest.split('|').next())
+    else {
+        return word;
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("base64");
+    String::from_utf8(bytes).expect("text")
 }
 
 /// What one run of `nats.sh` left: its exit code, what it printed, the configuration it wrote, and the fake server's arguments.
