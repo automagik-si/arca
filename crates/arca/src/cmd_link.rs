@@ -80,7 +80,17 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
     }
     let state = State::new(config.state_dir).map_err(failure)?;
     match command.as_str() {
-        "peers" => return Ok(Some(json!(state.peers().map_err(failure)?))),
+        "peers" => {
+            // While `link serve` runs, each peer also shows the path it is reached on now.
+            let paths = state.paths().map_err(failure)?;
+            let mut peers = json!(state.peers().map_err(failure)?);
+            for peer in peers.as_array_mut().into_iter().flatten() {
+                if let Some(path) = peer["name"].as_str().and_then(|n| paths.get(n)) {
+                    peer["path"] = json!({"via": path.via, "addr": path.addr, "named": path.named});
+                }
+            }
+            return Ok(Some(peers));
+        }
         "pair" => {
             let minutes = flags
                 .value("minutes")

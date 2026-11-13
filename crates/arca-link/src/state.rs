@@ -40,6 +40,8 @@ fn prune_removed(removed: &mut BTreeMap<String, u64>, now: u64) -> bool {
     changed
 }
 
+const PATHS_FRESH_MS: u64 = 10_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Peer {
     pub id: String,
@@ -205,6 +207,16 @@ impl State {
             return Err(Error::Runtime("ambiguous peer name"));
         }
         peer.addr()
+    }
+
+    /// The path each peer was reached on when the running link last looked, by peer name. Empty when the link is
+    /// not running or its record is older than `PATHS_FRESH_MS`.
+    pub fn paths(&self) -> Result<std::collections::BTreeMap<String, crate::PathNow>> {
+        let mut paths: std::collections::BTreeMap<String, crate::PathNow> =
+            self.read("paths.json")?.unwrap_or_default();
+        let now = now_ms();
+        paths.retain(|_, p| now.saturating_sub(p.at) <= PATHS_FRESH_MS);
+        Ok(paths)
     }
 
     pub(crate) fn add(&self, id: String, name: String, ticket: Option<String>) -> Result<Peer> {

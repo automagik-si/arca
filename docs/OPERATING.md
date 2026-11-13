@@ -104,7 +104,7 @@ node takes a new token after `arca token reload` or a restart.
 | `arca link serve [--config <file>]` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair [--config <file>] [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
 | `arca link join [--] <link> [--config <file>]` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
-| `arca link peers [--config <file>]` | the paired peers file | the peers array, as JSON |
+| `arca link peers [--config <file>]` | the paired peers file and, while serving, the path each is reached on | the peers array, as JSON |
 | `arca link remove [--] <name> [--config <file>]` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call <verb> [--config <file>] [--token-file <file>]`, with `--args <json>` or `--args-file <file>`; `arca call` alone lists the verbs | one tool call against the local node | the verb's result, as JSON |
 | `arca call --peer <name> <verb> [--config <file>] --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and `--token-file` is always named: this node's own token is never sent by default | the verb's result, as JSON |
@@ -174,7 +174,7 @@ refused without the value being echoed back.
 | `kernel.vmLimits` | no | `{ "virtualMachines": n, "cpu": n, "memory": "<size>", "disk": "<size>" }`, every key required: the virtual-machine caps of a node that has `kernel.serviceCidr` and no `kernel.bridged`. Without it such a node creates no virtual machine. It is refused beside `kernel.bridged`, which states the same caps in its `limits`. See "Mixed nodes". |
 | `kernel.importServices` | no | `[{ "name": "<service>", "project": "<project>", "cidr": "<ipv4-network>/24" }]`: the services another manager created that `service_import` may take over where they stand. Each `project` must be listed in `kernel.droiddProjects`, and `cidr` is that project's service subnet. Empty by default: nothing is imported and nothing is written in another manager's project. See "Importing a service another manager created". |
 | `kernel.serviceDestinations` | no | `[{ "service": "<service>", "address": "<one IPv4 address>", "port": n }]`: the private addresses named services of the node's own project may reach through the node, each on one tcp port. It needs `kernel.serviceCidr`. Empty by default: a service reaches no private address. An entry alone opens nothing. See "A service that may reach one private address". |
-| `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
+| `link` | no | The node link: `name`, `forward`, `pairMinutes`, `localOnly`, `port` and `peers`. See "The link". |
 | `follow.intervalSeconds` | no | Seconds between two looks of the Automagik follower at Automagik's published record, 60 to 86400. 600 when absent. |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`); or `http://localhost:<port>` with the port of `listen.loopback`, the page of a node on its own machine with no domain and no certificate. Its host is the WebAuthn rp id; it is not the host an approval statement names. |
@@ -521,6 +521,36 @@ camelCase keys and refuses unknown keys:
 - `localOnly`: when true, binds only loopback and disables discovery and relays. The default is false (N0 discovery and
   public relays). It also disables mesh reachability: the node neither reaches peers on other hosts for membership or
   forwarding, nor is reached by them. This also permits testing `link serve` without external network access.
+- `port`: a fixed UDP port, 1 to 65535, that the endpoint binds on every address (IPv4, and IPv6 where the host has
+  it), so this node's address is stable and a firewall can open it. When absent, the port is random. With `localOnly`
+  it applies to the loopback address. A port that is already in use stops `link serve` at start.
+- `peers`: a map from a peer's name (as `arca link peers` shows it) to 1 to 8 `ip:port` addresses it is also reached
+  on, such as `{ "gpu-node": ["10.0.0.2:7000"] }` for the address a private fiber link gives that node (IPv6 is written
+  `[2001:db8::2]:7000`). An address needs a port and must be a unicast address; a bad one stops the config at load.
+  See "Preferring a private network".
+
+### Preferring a private network
+
+Without `peers`, iroh chooses between the relay, a VPN address and a LAN address by itself. With it, the named addresses
+are used in two ways, and both only add: nothing is excluded, so a peer stays reachable when the named link is down.
+
+- Every connection this node opens to that peer (membership sync, `call --peer`) also tries the named addresses, next
+  to the address recorded when the two nodes paired.
+- Among the paths open to a peer, a path on a named address carries the traffic while it works, ahead of any other
+  direct address and the relay. Inside that group the lowest round trip wins, and a switch needs a gain of 5 ms.
+  When the named path closes, the next best path takes over.
+
+This needs the peer's own `port`, so the address you name stays the same: set `port` on the peer and name
+`<its address on the private link>:<that port>` here, on each node that should prefer the link. The peer must accept UDP
+on that port on the private interface. iroh 1.4.1 has no per-peer setting for this; the rule is a `PathSelector`, an
+unstable iroh interface behind its `unstable-custom-transports` feature, which is why iroh is pinned to that exact
+version.
+
+To see which path a peer is reached on, run `arca link peers` while `link serve` runs: each peer then has a `path`:
+`{ "via": "direct" | "relay" | "idle", "addr": "<ip:port or relay URL>", "named": true | false }`. `named` is true when
+the address in use is one `peers` names, so `"via": "direct"` with `"named": true` and the fiber's address confirms the
+link in use. `idle` means no path is in use at the moment, as between two syncs (every 30 seconds). A peer with no
+`path` key has no record: `link serve` is not running or its record is older than 10 seconds.
 
 The endpoint accepts `arca/pair/1` for pairing, `arca/peers/1` for membership, `arca/mcp/1` for peer calls, plus the ALPNs
 in `forward`. Both membership and forwarded connections require a live entry in `peers.json`; a forwarded connection checks
@@ -554,6 +584,7 @@ All link state lives directly in the top-level `stateDir`:
 | `removed.json` | A tombstone map `{ "<endpoint id>": <epoch milliseconds> }`, propagated in membership snapshots. |
 | `pairing.json` | The pending single-use code, expiry, node name and wrong-attempt counters. Deleted after successful pairing. |
 | `status.json` | The running server's `{ "pid", "id", "ticket", "name" }`. Removed on clean stop; stale or absent status prevents `pair`. |
+| `paths.json` | The running server's `{ "<peer name>": { "via", "addr", "named", "at" } }`, rewritten every 2 seconds and read by `link peers`. Removed on clean stop. |
 | `.link-control.sock` | The mode 0600 local socket for joining and dialing through the running endpoint. Removed on clean stop. |
 
 The link creates a missing `stateDir` with mode 0700 and refuses an existing directory with any group or other permission
