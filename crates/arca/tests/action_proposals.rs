@@ -3,6 +3,8 @@
 //! database is touched.
 
 mod common;
+#[path = "../../arca-approval/tests/common/webauthn.rs"]
+mod webauthn;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -822,6 +824,184 @@ fn action_propose_succeeds_through_the_mcp_door() {
         proposal["id"]
             .as_str()
             .is_some_and(|id| id.starts_with("act-") && id.len() == 16)
+    );
+    let texts: Vec<&str> = reply["result"]["content"]
+        .as_array()
+        .expect("content blocks")
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    let next = proposal["nextStep"].as_str().expect("the next step");
+    assert!(
+        texts.iter().any(|text| text.ends_with(next)),
+        "the text a model reads carries the next step: {texts:?}"
+    );
+}
+
+/// A node config whose approval page is served at `origin`, or that serves none.
+fn node_with_page(origin: Option<&str>) -> arca::config::NodeConfig {
+    let mut config: arca::config::NodeConfig = serde_json::from_value(json!({
+        "stateDir": "/nonexistent/state",
+        "incus": { "socket": "/nonexistent/incus.sock", "pools": [] },
+        "listen": { "unix": "/nonexistent/arca.sock" },
+        "tokens": { "hashDir": "/nonexistent/tokens" },
+        "kernel": { "droiddProjects": ["droid"] }
+    }))
+    .expect("the fixture config parses");
+    config.approval_origin = origin.map(str::to_string);
+    config
+}
+
+/// The served `action_propose` of `rig`'s kernel and clock, on a node whose config is `node`.
+fn served_propose(rig: &Rig, node: arca::config::NodeConfig) -> Arc<dyn ToolHandler> {
+    let clock = Arc::clone(&rig.clock);
+    let handlers: std::collections::HashMap<&'static str, Arc<dyn ToolHandler>> =
+        arca::handlers::plan_handlers_served(
+            Arc::clone(&rig.kernel),
+            Arc::new(move || clock.load(Ordering::SeqCst)),
+            Some(TEST_PG_IMAGE.to_string()),
+            None,
+            None,
+            None,
+            arca::handlers::ActionSlot::default(),
+            Some(Arc::new(node)),
+        )
+        .into_iter()
+        .collect();
+    Arc::clone(&handlers["action_propose"])
+}
+
+#[test]
+fn a_proposal_says_where_to_approve_it_when_it_expires_and_how_to_enrol_a_passkey() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-next-step", &key);
+    let until = "The card expires at 12:15 UTC on 2026-10-30, 15 minutes after it was proposed; after that it must be proposed again.";
+
+    let nowhere = rig
+        .propose("service_create", create_args("nats"))
+        .expect("proposed");
+    assert_eq!(nowhere["passkeysTrusted"], json!(0));
+    assert_eq!(nowhere.get("approvalUrl"), None);
+    assert_eq!(
+        nowhere["nextStep"],
+        json!(format!(
+            "This node has no approval page, so nothing can be approved here: the guide's section \"The approval page\" says how to give it one. {until}"
+        ))
+    );
+
+    let local = served_propose(&rig, node_with_page(Some("http://localhost:8443")));
+    let caller = Caller {
+        token_id: "viewer".to_string(),
+        scope: Scope::Viewer,
+        tools: None,
+    };
+    // A removal: a create on a node with a config reads its template from the node's state, which this one has none of.
+    let remove = |name: &str| json!({ "action": "service_remove", "args": { "name": name } });
+    let enrol = local.call(remove("redis"), &caller).expect("proposed");
+    assert_eq!(enrol["approvalUrl"], json!("http://localhost:8443/approve"));
+    assert_eq!(enrol["passkeysTrusted"], json!(0));
+    assert_eq!(
+        enrol["nextStep"],
+        json!(format!(
+            "No passkey is trusted on this node yet, so nothing can be approved until the owner enrols one: open http://localhost:8443/approve and press \"Get a setup code\", or, on a machine with no screen, print the code there with arca setup-code and type it on the page. Then approve it at http://localhost:8443/approve. {until} The page is on this machine only: from another computer, open it through ssh -o ExitOnForwardFailure=yes -L localhost:8443:127.0.0.1:8443 and this machine's name or address."
+        ))
+    );
+
+    let passkey = webauthn::SoftPasskey::from_seed(7);
+    rig.kernel.lock().expect("lock").replace_owner_passkeys(
+        arca_approval::parse_passkeys(passkey.line(NAMESPACE).as_bytes())
+            .expect("the passkey line"),
+    );
+    let public = served_propose(&rig, node_with_page(Some("https://arca.example.org")));
+    let approve = public.call(remove("cache"), &caller).expect("proposed");
+    assert_eq!(
+        approve["approvalUrl"],
+        json!("https://arca.example.org/approve")
+    );
+    assert_eq!(approve["passkeysTrusted"], json!(1));
+    assert_eq!(
+        approve["nextStep"],
+        json!(format!(
+            "The owner approves it at https://arca.example.org/approve. {until}"
+        ))
+    );
+}
+
+#[test]
+fn a_proposal_on_a_node_that_trusts_another_page_hosts_keys_says_it_is_approved_there() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-next-step-linked", &key);
+    let until = "The card expires at 12:15 UTC on 2026-10-30, 15 minutes after it was proposed; after that it must be proposed again.";
+    let caller = Caller {
+        token_id: "viewer".to_string(),
+        scope: Scope::Viewer,
+        tools: None,
+    };
+    let remove = |name: &str| json!({ "action": "service_remove", "args": { "name": name } });
+    let linked = |origin: Option<&str>| {
+        let mut node = node_with_page(origin);
+        node.approval = Some(arca::config::ApprovalConfig {
+            trust_owner_keys_from: vec!["/nonexistent/owner-passkeys".into()],
+            origins: vec!["https://page.example.org".to_string()],
+            ..Default::default()
+        });
+        node
+    };
+    let said = format!(
+        "This node trusts the passkeys of another page host, so the owner approves it on that host's approval page, where this card is approved and relayed here; no passkey is needed on this node. {until}"
+    );
+
+    // Without a page of its own, and with a page of its own but no passkey of its own: both are approved on the page host.
+    let no_page = served_propose(&rig, linked(None))
+        .call(remove("redis"), &caller)
+        .expect("proposed");
+    assert_eq!(no_page["passkeysTrusted"], json!(0));
+    assert_eq!(no_page.get("approvalUrl"), None);
+    assert_eq!(no_page["nextStep"], json!(said));
+    let own_page = served_propose(&rig, linked(Some("http://localhost:8443")))
+        .call(remove("cache"), &caller)
+        .expect("proposed");
+    assert_eq!(own_page["nextStep"], json!(said));
+
+    // The same node with a passkey of its own is approved at its own page, as any node is.
+    let passkey = webauthn::SoftPasskey::from_seed(7);
+    rig.kernel.lock().expect("lock").replace_owner_passkeys(
+        arca_approval::parse_passkeys(passkey.line(NAMESPACE).as_bytes())
+            .expect("the passkey line"),
+    );
+    let own = served_propose(&rig, linked(Some("https://arca.example.org")))
+        .call(remove("db"), &caller)
+        .expect("proposed");
+    assert_eq!(
+        own["nextStep"],
+        json!(format!(
+            "The owner approves it at https://arca.example.org/approve. {until}"
+        ))
+    );
+}
+
+#[test]
+fn a_proposal_on_a_public_page_with_no_passkey_says_to_enrol_one_without_an_ssh_line() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-next-step-https", &key);
+    let until = "The card expires at 12:15 UTC on 2026-10-30, 15 minutes after it was proposed; after that it must be proposed again.";
+    let caller = Caller {
+        token_id: "viewer".to_string(),
+        scope: Scope::Viewer,
+        tools: None,
+    };
+    let answer = served_propose(&rig, node_with_page(Some("https://arca.example.org")))
+        .call(
+            json!({ "action": "service_remove", "args": { "name": "redis" } }),
+            &caller,
+        )
+        .expect("proposed");
+    assert_eq!(answer["passkeysTrusted"], json!(0));
+    assert_eq!(
+        answer["nextStep"],
+        json!(format!(
+            "No passkey is trusted on this node yet, so nothing can be approved until the owner enrols one: open https://arca.example.org/approve and press \"Get a setup code\", or, on a machine with no screen, print the code there with arca setup-code and type it on the page. Then approve it at https://arca.example.org/approve. {until}"
+        ))
     );
 }
 

@@ -369,7 +369,25 @@ fn plan_verb_schemas_equal_their_table_rows() {
             &["action", "args"]
         )
     );
-    assert_eq!((propose.result)(), action_proposal.clone());
+    // The proposal, and what the owner does next: the page, how many passkeys are trusted, and the step in words.
+    let mut answer = (propose.result)();
+    for (field, kind) in [
+        ("approvalUrl", "string"),
+        ("passkeysTrusted", "integer"),
+        ("nextStep", "string"),
+    ] {
+        let property = answer["properties"]
+            .as_object_mut()
+            .and_then(|properties| properties.remove(field))
+            .unwrap_or_else(|| panic!("action_propose answers {field}"));
+        assert_eq!(property["type"], json!(kind), "{field}");
+        assert!(property["description"].is_string(), "{field} is described");
+    }
+    let mut proposal_answer = action_proposal.clone();
+    if let Some(required) = proposal_answer["required"].as_array_mut() {
+        required.extend([json!("passkeysTrusted"), json!("nextStep")]);
+    }
+    assert_eq!(answer, proposal_answer);
 
     let decline = verb("plan_decline").expect("present");
     assert_eq!(

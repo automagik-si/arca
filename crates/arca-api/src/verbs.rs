@@ -1754,13 +1754,18 @@ pub fn summary_plans(v: &Value) -> String {
     )
 }
 
-/// A short line for a successful `action_propose`.
+/// A successful `action_propose`: what was proposed, then the node's own words on what the owner does next: where to
+/// approve, until when, how to enrol a passkey first when none is trusted, or that the card is approved on the linked page host.
 pub fn summary_action_propose(v: &Value) -> String {
-    format!(
+    let proposed = format!(
         "{} proposed: {}",
         v["id"].as_str().unwrap_or("?"),
         v["summary"].as_str().unwrap_or("?")
-    )
+    );
+    match v["nextStep"].as_str() {
+        Some(next) if !next.is_empty() => format!("{proposed}\n{next}"),
+        _ => proposed,
+    }
 }
 
 /// A short line for a successful `plan_decline`.
@@ -2581,8 +2586,26 @@ fn action_args() -> Value {
     })
 }
 
+/// The proposal as `plan_list` shows it, and what the owner does next, which only the answer to the proposal carries.
 fn action_propose_result() -> Value {
-    action_proposal()
+    let mut schema = action_proposal();
+    schema["properties"]["approvalUrl"] = json!({
+        "description": "The approval page of this node, where the owner approves the card: the approval origin and /approve. Absent on a node with no approval page of its own.",
+        "type": "string"
+    });
+    schema["properties"]["passkeysTrusted"] = json!({
+        "description": "How many owner passkeys this node itself trusts. At 0 the owner enrols one first, unless the node trusts another page host's passkeys (approval.trustOwnerKeysFrom or approval.peerKeys): then the card is approved on that host's page and nextStep says so.",
+        "minimum": 0,
+        "type": "integer"
+    });
+    schema["properties"]["nextStep"] = json!({
+        "description": "What the owner does next, in words: where to approve, the time the card expires (expiresAt), how to enrol a passkey first when none is trusted, or that the card is approved on the linked page host.",
+        "type": "string"
+    });
+    if let Some(required) = schema["required"].as_array_mut() {
+        required.extend([json!("passkeysTrusted"), json!("nextStep")]);
+    }
+    schema
 }
 
 /// An action proposal. `statement` is optional because `plan_list` omits it; the open approval page adds it.

@@ -1160,7 +1160,7 @@ fn peer_passkeys(cfg: &NodeConfig) -> Vec<PeerPasskeys> {
 
 /// Whether this kernel accepts approvals relayed from another kernel's page: its config has an `approval` key that names at
 /// least one passkeys file to trust, or keeps another machine's page host's passkeys. Only then is `action_approve` served.
-fn accepts_relayed_approvals(cfg: &NodeConfig) -> bool {
+pub fn accepts_relayed_approvals(cfg: &NodeConfig) -> bool {
     cfg.approval.as_ref().is_some_and(|approval| {
         !approval.trust_owner_keys_from.is_empty() || approval.peer_keys.is_some()
     })

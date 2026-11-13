@@ -32,6 +32,14 @@ gone after an update. A service made before this release keeps its data on its r
 changed templates are brought up to date by `arca templates install`, and apply to the services made from them
 afterwards. Updating a service that has no data volume erases what it wrote to its root disk, and the docs now say so.
 
+An `action_propose` answer now says where and by when: the approval page's address (`approvalUrl`), the time the card
+expires, fifteen minutes after it was proposed, and how many owner passkeys the node itself trusts (`passkeysTrusted`).
+While none is trusted, its `nextStep` says how to enrol one first, with the `ssh -o ExitOnForwardFailure=yes -L` line
+when the page is on localhost only. A node set to trust another page host's passkeys (`approval.trustOwnerKeysFrom` or
+`approval.peerKeys`) says instead that the card is approved on that host's page and needs no passkey on the node.
+Before, the answer named none of this, so the person who asked for the action did not know where to approve it, nor
+that it would lapse.
+
 ## 0.21.0 (2026-11-13)
 
 A service made from `automagik-server` now follows Automagik's releases by itself: every 10 minutes (`follow.intervalSeconds`)
