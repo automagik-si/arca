@@ -1,7 +1,7 @@
 # Quickstart: a read-only node in five minutes
 
-You need an x86_64 or aarch64 (ARM) Linux host with glibc 2.34 or newer (Enterprise Linux 9, Ubuntu 22.04, Debian 12, or newer), a running
-Incus, and a user who can read the Incus socket (on most installs, a member of the `incus-admin` group). This quickstart
+You need an x86_64 or aarch64 (ARM) Linux host with glibc 2.34 or newer (Enterprise Linux 9, Ubuntu 22.04, Debian 12,
+or newer), a running Incus, and a user who can read the Incus socket (on most installs, a member of the `incus-admin` group). This quickstart
 names no kernel project, so the node only reads: it sends Incus nothing but GET.
 
 **What you have at the end:** a node that looks, not one that changes things. An assistant connected to it can read your
@@ -12,8 +12,8 @@ Letting the node change things is a further step, done by hand today:
 ## Install with one command
 
 [`scripts/install.sh`](../scripts/install.sh) does the quickstart below for you, for the user who runs it. It needs what
-the quickstart needs (x86_64 or aarch64 Linux with glibc 2.34 or newer, a running Incus that this user can reach) and `curl` and
-`sha256sum`.
+the quickstart needs (x86_64 or aarch64 Linux with glibc 2.34 or newer, a running Incus that this user can reach) and
+`curl` and `sha256sum`.
 
 **Download it, read it, run it.**
 
@@ -41,8 +41,8 @@ docs/QUICKSTART.md, which is done by hand today, and do not start it unless I as
 answers `arca_status` with `"mode":"watch-only"`. That is a node that reads. Do not tell the person that Arca is ready
 to run their services.
 
-- **It checks first.** Linux, x86_64 or aarch64, glibc, `curl`, `sha256sum`, a runtime directory that is yours alone, and an Incus
-  socket this user may open. When one is missing it says which and how to fix it, and stops before it has changed
+- **It checks first.** Linux, x86_64 or aarch64, glibc, `curl`, `sha256sum`, a runtime directory that is yours alone, and an
+  Incus socket this user may open. When one is missing it says which and how to fix it, and stops before it has changed
   anything. It never runs `sudo`, it refuses to run as root, and it writes only in your home directory.
 - **It installs one named release**, the one its own `ARCA_VERSION` line names, at `~/.local/bin/arca`. Each release
   sets that line to its own version.
@@ -107,10 +107,10 @@ arca --version
 
 The first two lines ask GitHub which release is the newest; a pre-release is never the answer. To install another
 release, set `v` yourself to a version from the releases page, for example `v=0.8.0`. `sha256sum` must answer
-`arca-<version>-linux-<x86_64 or aarch64>: OK`: stop unless it prints that. The release has one binary for each of the two. `--ignore-missing` is there because `SHA256SUMS` also
-lists the release's `install.sh`, which this step does not download. `arca --version` prints
-`Automagik Arca <version> (<commit>, x86_64-unknown-linux-gnu)` (`aarch64-unknown-linux-gnu` on an ARM host); if the shell does not find `arca`, put
-`~/.local/bin` on your `PATH`.
+`arca-<version>-linux-<x86_64 or aarch64>: OK`: stop unless it prints that. The release has one binary for each of
+the two. `--ignore-missing` is there because `SHA256SUMS` also lists the release's `install.sh`, which this step does
+not download. `arca --version` prints `Automagik Arca <version> (<commit>, x86_64-unknown-linux-gnu)`
+(`aarch64-unknown-linux-gnu` on an ARM host); if the shell does not find `arca`, put `~/.local/bin` on your `PATH`.
 
 **2. Write the smallest config.** These five keys are the required ones. The two directories must be mode 0700.
 

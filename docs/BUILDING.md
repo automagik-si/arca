@@ -90,7 +90,7 @@ runners, never on a self-hosted one, whose kept cache beside a write token would
 
 `scripts/release.sh` is the one way the release files are built, and it publishes nothing. From a clean tree whose
 HEAD is the tag `v<version>` it runs `scripts/build-portable.sh`, checks that the binary's `--version` names that
-version and commit, and writes `dist/arca-<version>-linux-<architecture>` (the machine's own: x86_64 or aarch64), `dist/install.sh` (a copy of
-`scripts/install.sh`), `dist/SHA256SUMS` (the checksums of those two) and `dist/RELEASE-NOTES.md` (that version's
+version and commit, and writes `dist/arca-<version>-linux-<architecture>` (the machine's own: x86_64 or aarch64), `dist/install.sh`
+(a copy of `scripts/install.sh`), `dist/SHA256SUMS` (the checksums of those two) and `dist/RELEASE-NOTES.md` (that version's
 section of `CHANGELOG.md`). It refuses, before it builds, an installer whose `ARCA_VERSION` line does not name the
 version. `scripts/release.sh --rehearse` builds and checks the same files without the tag, to try a build by hand.

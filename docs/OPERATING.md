@@ -15,7 +15,7 @@ Automagik Arca runs your services on machines you own. Set up the way the quicks
 
 **Status: alpha.** Arca is an alpha. Each machine runs its own Arca. Machines you pair form a group, and an assistant
 can call a paired machine with a token that machine made; Arca does not yet spread services across machines by itself.
-Today it needs a Linux machine (x86_64) with Incus, and a person comfortable with a terminal. The current version is
+Today it needs a Linux machine (x86_64 or aarch64) with Incus, and a person comfortable with a terminal. The current version is
 on the [releases page](https://github.com/automagik-si/arca/releases).
 
 | Works today | Not yet |

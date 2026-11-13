@@ -212,3 +212,34 @@ jobs:
       # tests all pass but which leaves something open no longer holds the run up, so that kind of leak is not seen.
       - name: node --test
         run: node --test --test-timeout=90000 --test-force-exit ${CANVAS_TEST_CONCURRENCY:+--test-concurrency="$CANVAS_TEST_CONCURRENCY"}
+
+  # The aarch64 release binary, built as the release builds it and checked, and published nowhere: a build that cannot
+  # work on the arm64 runner shows here, on the pull request, and not as a release that stops. It runs on GitHub's own
+  # arm64 runner, never on our pool (which is x64), whoever caused the event.
+  portable-aarch64:
+    name: portable aarch64 build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The Rust toolchain the repository pins
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          [[ -n "${channel}" ]] || { echo "::error::rust-toolchain.toml names no channel"; exit 1; }
+          command -v rustup || echo "::warning::this image has no rustup"
+          rustup toolchain install "${channel}" --profile minimal --no-self-update
+          cargo --version
+      # build-portable.sh links against glibc 2.34 and fails when the binary needs a newer one, or names a path of the
+      # build machine. objdump is its tool for that check.
+      - name: Build, and check the glibc floor
+        run: |
+          uname -m
+          scripts/build-portable.sh | tee build.log
+          grep -qx 'max GLIBC: 2\.[0-9]*' build.log
+      - name: The binary is an aarch64 one and runs
+        run: |
+          binary=$(sed -n 's/^binary: *//p' build.log)
+          file "${binary}"
+          "${binary}" --version | grep -F 'aarch64-unknown-linux-gnu'

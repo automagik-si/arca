@@ -111,7 +111,7 @@ install -m 0755 scripts/install.sh "$dist/install.sh"
     printf '%s\n' "$notes" | sed -e '/./,$!d'
     printf '\n`arca-%s-linux-x86_64` is one file for x86_64 Linux and `arca-%s-linux-aarch64` one for aarch64 (ARM) Linux.' \
         "$version" "$version"
-    printf ' Either needs glibc %s or newer.' "$glibc"
+    printf ' Each is built against glibc 2.34 and needs glibc %s or newer.' "$glibc"
     printf ' `install.sh` sets up a read-only node with this release: read it, then run `sh install.sh`.'
     printf ' Check what you downloaded with `sha256sum --check --ignore-missing SHA256SUMS`, and stop unless it prints `arca-%s-linux-x86_64: OK` or `arca-%s-linux-aarch64: OK`, for the file you took.\n' \
         "$version" "$version"

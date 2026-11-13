@@ -59,7 +59,7 @@ name: Release
 #
 # Nothing is taken when anything before the push fails: no version, no tag. When dev moved while a run was cutting,
 # neither the commit nor the tag lands, the run ends cleanly, and the run for the newer push releases those changes
-# too. Runs queue one at a time, across all three jobs, and a run that has started is never cancelled.
+# too. Runs queue one at a time, across all four jobs, and a run that has started is never cancelled.
 #
 # When the push landed but the publishing failed, the tag has no release (a draft does not count as one). The next
 # run, by a push or by hand, sees that first: it builds that tag again and publishes it, and takes no new version.
