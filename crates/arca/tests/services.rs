@@ -3128,6 +3128,8 @@ mod approval_requests;
 mod destinations;
 #[path = "services/follow.rs"]
 mod follow;
+#[path = "services/external.rs"]
+mod external;
 #[path = "services/golden.rs"]
 mod golden;
 #[path = "services/kernel_access.rs"]

@@ -2968,6 +2968,36 @@ bad `--port`, `--http-path`, `--url` or `--wait` (or both or neither of `--port`
 adoption planned stopped). `1` for a held
 lock, a failed step (the record names it) or a failed verify.
 
+## Recording a program that runs outside Incus
+
+`service_import` adopts an Incus instance. A program that is not one (a macOS LaunchAgent on the machine that holds the
+Incus VM, say) can be **recorded** instead, so it shows beside the services. Recording writes one line in the node's own
+state and changes nothing on the machine: no start, no stop, no probe, no approval card.
+
+```json
+{ "name": "agent", "kind": "host-program", "address": "http://127.0.0.1:9000/mcp", "health": "arca_status" }
+```
+
+`external_add` takes `name` (the service-name rule: 1 to 40 of a-z, 0-9 and inner `-`, starting with a letter, and not
+a name a service or function holds), `kind` (`host-program`, the only one), `address` (an `http` or `https` URL, no
+user or password) and an optional `health`, the name of a tool the program answers, kept as a label that nothing
+calls. A second add of the same name replaces the record. `external_remove {name}` takes the record out and never
+touches the program. Both need a doctor token, run at once, and run on a node that only looks too, since they change
+nothing on the machine.
+
+- `service_list` shows the record as a row of kind `host-program` with its `address`, `managed: false` and
+  `recorded: true`, and the state `recorded`. The list asks nothing of the program. On a node that runs
+  services the canvas shows the same row on the machine's detail, with its kind and "recorded, not managed by Arca"; a
+  node that only looks shows it in `service_list` alone.
+- `service_status` makes one TCP connect to the address's host and port (3 seconds) and says `up` or `down`. It sends
+  nothing and probes nothing else; `health` is not called.
+- Every verb that changes a service (`service_create`, `service_update`, `service_remove`, `service_import`,
+  `service_release`, `service_publish`, `service_unpublish`, `service_connect`, `service_disconnect`,
+  `service_secret_set`), `service_logs` and `function_create` refuses the name in plain words that name
+  `external_remove`, before an approval is spent. An `action_propose` of one of them is refused when it is made.
+- The record is `external.jsonl` in the state directory (mode 0600). It is its own journal: each add and each remove
+  is one line with its time, written whole and synced, and the programs it holds are what the lines leave in order.
+
 ## Importing a service another manager created
 
 `service_import` takes over a service that another manager created, where it stands. It does not move, stop or restart the

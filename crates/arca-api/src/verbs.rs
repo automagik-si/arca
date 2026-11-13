@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 65] = [
+static VERBS: [Verb; 67] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -513,6 +513,39 @@ static VERBS: [Verb; 65] = [
         cut: no_cut,
         params: service_unpublish_params,
         result: service_unpublish_result,
+    },
+    Verb {
+        name: "external_add",
+        summary: "Record a program that runs outside Incus (a host program, such as a LaunchAgent) so service_list \
+            shows it as a row of kind host-program with its address, marked recorded and not managed by Arca. It \
+            only records: nothing is started, stopped or changed on the machine, and no owner approval is asked. \
+            service_status of it makes one TCP connect to the address's host and port (3 s) and says up or down. \
+            Every verb that changes a service refuses it; external_remove removes the record.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_external_add,
+        cut: no_cut,
+        params: external_add_params,
+        result: external_add_result,
+    },
+    Verb {
+        name: "external_remove",
+        summary: "Take a recorded host program out of the node's record, so service_list no longer shows it. Only \
+            the record goes: the program itself is not touched, and no owner approval is asked.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_external_remove,
+        cut: no_cut,
+        params: external_remove_params,
+        result: external_remove_result,
     },
     Verb {
         name: "omni_instance_create",
@@ -3022,6 +3055,35 @@ pub fn service_view_schema() -> Value {
                 "type": "array"
             },
             "name": { "maxLength": 40, "type": "string" },
+            "kind": {
+                "description": "Present only on a program this node records and does not manage (external_add): \
+                    host-program.",
+                "const": "host-program",
+                "type": "string"
+            },
+            "address": {
+                "description": "Present only on a recorded program: the address it was recorded with.",
+                "maxLength": 300,
+                "type": "string"
+            },
+            "health": {
+                "description": "Present only on a recorded program recorded with one: the name of a tool it answers, \
+                    a label.",
+                "maxLength": 64,
+                "type": "string"
+            },
+            "managed": {
+                "description": "Present only on a recorded program: false. Arca does not start, stop, update, \
+                    publish or remove it.",
+                "const": false,
+                "type": "boolean"
+            },
+            "recorded": {
+                "description": "Present only on a recorded program: true. The node holds a record of it, and nothing \
+                    more.",
+                "const": true,
+                "type": "boolean"
+            },
             "ports": {
                 "description": "The ports it listens on; a link opens the first.",
                 "items": { "maximum": 65535, "minimum": 1, "type": "integer" },
@@ -3112,8 +3174,10 @@ pub fn service_view_schema() -> Value {
                 "description": "Its dash on the tailnet (service_publish), or null."
             },
             "state": {
-                "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone.",
-                "enum": ["creating", "running", "stopped", "failed", "unknown"],
+                "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd \
+                    did not create, which it leaves alone. For a recorded program: recorded in service_list, where \
+                    nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
+                "enum": ["creating", "running", "stopped", "failed", "unknown", "recorded", "up", "down"],
                 "type": "string"
             },
             "template": {
@@ -3801,6 +3865,87 @@ fn service_unpublish_result() -> Value {
 }
 fn summary_service_unpublish(_: &Value) -> String {
     "service_unpublish: complete".into()
+}
+
+fn external_add_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "address": {
+                "description": "Where the program answers: an http or https URL. Only its host and port are used, by \
+                    service_status.",
+                "maxLength": 300,
+                "minLength": 8,
+                "pattern": "^https?://[^\\s/?#@]+(?:[/?#]\\S*)?$",
+                "type": "string"
+            },
+            "health": {
+                "description": "The name of a tool the program answers. Kept as a label only: nothing calls it.",
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "type": "string"
+            },
+            "kind": {
+                "description": "The kind of program: host-program, one that runs on the node's machine outside Incus.",
+                "enum": ["host-program"],
+                "type": "string"
+            },
+            "name": service_name_schema(
+                "The name of the record (1-40 of a-z, 0-9 and inner \"-\", starting with a letter), in the name space \
+                 services and functions share."
+            )
+        },
+        "required": ["name", "kind", "address"],
+        "type": "object"
+    })
+}
+fn external_add_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "address": { "maxLength": 300, "type": "string" },
+            "health": { "maxLength": 64, "type": "string" },
+            "kind": { "const": "host-program", "type": "string" },
+            "name": { "maxLength": 40, "type": "string" },
+            "recorded": { "const": true, "type": "boolean" }
+        },
+        "required": ["recorded", "name", "kind", "address"],
+        "type": "object"
+    })
+}
+fn summary_external_add(v: &Value) -> String {
+    format!(
+        "recorded host-program {}: service_list shows it, and Arca does not manage it",
+        v["name"].as_str().unwrap_or("?")
+    )
+}
+fn external_remove_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "name": service_name_schema("The name of a recorded program.")
+        },
+        "required": ["name"],
+        "type": "object"
+    })
+}
+fn external_remove_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "name": { "maxLength": 40, "type": "string" },
+            "removed": { "const": true, "type": "boolean" }
+        },
+        "required": ["removed", "name"],
+        "type": "object"
+    })
+}
+fn summary_external_remove(v: &Value) -> String {
+    format!(
+        "removed the record of {}: the program itself was not touched",
+        v["name"].as_str().unwrap_or("?")
+    )
 }
 
 /// A params object with no fields.

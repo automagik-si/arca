@@ -7,6 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A node can now record a program that runs outside Incus, such as a macOS LaunchAgent next to the Incus VM, so it shows
+in `service_list`, and on the machine's canvas of a node that runs services (a node that only looks shows it in
+`service_list` alone). `external_add` takes a name, the kind `host-program`, an `http` or
+`https` address and an optional `health` label; `external_remove` takes the record out. Both need a doctor token and run
+at once, with no approval card, because they only write a line in the node's state (`external.jsonl`, which is also
+its journal) and change nothing on the machine. The row says it is recorded and not managed by Arca; `service_status`
+does one TCP connect to its address (3 seconds) and says up or down. Every verb that changes a service refuses it in
+words that name `external_remove`.
+
 ## 0.21.0 (2026-11-13)
 
 A service made from `automagik-server` now follows Automagik's releases by itself: every 10 minutes (`follow.intervalSeconds`)

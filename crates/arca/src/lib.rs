@@ -30,6 +30,7 @@ pub mod cmd_token;
 pub mod cmd_watch;
 pub mod config;
 pub mod desired_store;
+pub mod external;
 pub mod function;
 pub mod function_run;
 pub mod gpu;

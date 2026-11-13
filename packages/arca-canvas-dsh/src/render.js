@@ -505,6 +505,7 @@ function domainCard(doc, project, x, y, width, height) {
   return node;
 }
 
+const RECORDED_WHY = 'This node records the program and nothing more: Arca does not start, stop, update or publish it.';
 const VERSION_DIFFERS = 'Other version';
 const VERSION_DIFFERS_WHY = 'The template installed on this machine names another version than the one this service runs.';
 
@@ -1091,7 +1092,18 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       const rows = el(doc, 'ul', 'arca-detail-services-list');
       for (const service of machine.services) {
         const item = el(doc, 'li', 'arca-detail-service');
-        item.append(el(doc, 'span', '', service.name), el(doc, 'span', 'arca-detail-service-state', service.state || 'Unknown'));
+        item.append(el(doc, 'span', '', service.name));
+        if (service.recorded) {
+          // Recorded by this node and not managed by Arca: its kind, and what that means, in place of a state Arca
+          // does not know.
+          const kind = el(doc, 'span', 'arca-detail-service-kind mono', service.kind || 'recorded');
+          kind.title = RECORDED_WHY;
+          const reached = service.state === 'up' || service.state === 'down';
+          item.append(kind, el(doc, 'span', 'arca-detail-service-state', reached ? service.state : 'recorded, not managed by Arca'));
+          item.dataset.recorded = 'true';
+        } else {
+          item.append(el(doc, 'span', 'arca-detail-service-state', service.state || 'Unknown'));
+        }
         if (service.lanPort !== null) item.append(el(doc, 'span', 'arca-detail-service-port mono', `port ${service.lanPort}`));
         if (service.versionDiffers) item.append(versionTag(doc, 'arca-detail-service-version'));
         rows.append(item);
