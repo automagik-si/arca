@@ -1064,12 +1064,13 @@ fn a_key_change_proposal_has_a_card_of_its_own_and_no_card_is_shown_for_what_the
     let summary = proposed["summary"].as_str().expect("a summary");
     assert_eq!(
         summary,
-        "Turn no-new-privileges on for the service app and restart it"
+        "Turn no-new-privileges on for the service app (restarting it if it runs)"
     );
     assert!(!summary.contains("ERASE"), "{proposed}");
     let details = proposed["details"].to_string();
     assert!(
         details.contains("restarted, which interrupts it")
+            && details.contains("at its next start")
             && details.contains("puts the old setting back")
             && details.contains("nothing is erased"),
         "{details}"
@@ -1086,4 +1087,49 @@ fn a_key_change_proposal_has_a_card_of_its_own_and_no_card_is_shown_for_what_the
         message.contains("restricted.containers.lowlevel"),
         "{message}"
     );
+}
+
+#[test]
+fn a_service_that_stops_under_the_key_is_started_again_with_the_old_setting() {
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = bare_rig(&up);
+    rig.template("app", strict_app());
+    rig.allow_low_level();
+    // The container exits as soon as it is restarted: Incus would refuse to restart it, so the rollback starts it.
+    rig.fake.exit_after_start(PROJECT, "app", 1, "exited");
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": DIGEST, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rolled_back");
+    assert!(
+        message.contains("The old setting is back") && !message.contains("could not be restarted"),
+        "{message}"
+    );
+    assert!(!record_flag(&rig));
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+}
+
+#[test]
+fn no_new_privileges_does_not_go_with_follow() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    let message = format!(
+        "{:?}",
+        update(
+            &rig,
+            json!({ "name": "app", "follow": false, "noNewPrivileges": true })
+        )
+        .expect_err("refused")
+    );
+    assert!(message.contains("not with follow"), "{message}");
+    let message = format!(
+        "{:?}",
+        propose_update(
+            &rig,
+            json!({ "name": "app", "follow": true, "noNewPrivileges": false })
+        )
+        .expect_err("refused")
+    );
+    assert!(message.contains("not with follow"), "{message}");
 }

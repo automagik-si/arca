@@ -542,7 +542,7 @@ impl ActionKind {
                     rows.push(row(
                         "Effect",
                         &format!(
-                            "Turns no-new-privileges {} for this service, as its template now says: a setuid or setcap binary inside it {} raise privileges. The service is restarted, which interrupts it, and Arca puts the old setting back and restarts it again if it does not come back healthy. Its image and its data are not touched, and nothing is erased.",
+                            "Turns no-new-privileges {} for this service, as its template now says: a setuid or setcap binary inside it {} raise privileges. A running service is restarted, which interrupts it, and Arca puts the old setting back and restarts it again if it does not come back healthy; a stopped service takes the setting at its next start and is not restarted. Its image and its data are not touched, and nothing is erased.",
                             if on { "on" } else { "off" },
                             if on { "can no longer" } else { "can again" },
                         ),
@@ -798,7 +798,7 @@ impl ActionKind {
             }
             Self::ServiceUpdate if args.get("noNewPrivileges").is_some() => {
                 format!(
-                    "Turn no-new-privileges {} for the service {} and restart it",
+                    "Turn no-new-privileges {} for the service {} (restarting it if it runs)",
                     if args["noNewPrivileges"].as_bool() == Some(true) {
                         "on"
                     } else {

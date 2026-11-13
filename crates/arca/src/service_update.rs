@@ -422,6 +422,12 @@ fn conflicts(args: &Value) -> Result<(), CallError> {
             "eraseData: give it with a digest, not with follow".into(),
         ));
     }
+    if args.get("noNewPrivileges").is_some() {
+        return Err(CallError::Invalid(
+            "noNewPrivileges: it is set by an update at the service's digest, not with follow"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -857,7 +863,15 @@ impl ServiceHandler {
                 let restored = put_back();
                 let restarted = changer
                     .read(&config.project, &config.instance)
-                    .and_then(|state| changer.change(&state, StateAction::Restart))
+                    .and_then(|state| {
+                        // Incus refuses to restart a stopped instance: start it, restart a running one.
+                        let action = if state.is_running() {
+                            StateAction::Restart
+                        } else {
+                            StateAction::Start
+                        };
+                        changer.change(&state, action)
+                    })
                     .is_ok();
                 let answers = restarted && run.answers_within(key.seconds.min(OLD_ANSWERS_SECONDS));
                 journal.step(
