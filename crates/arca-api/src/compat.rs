@@ -248,6 +248,7 @@ fn scope_rank(v: Option<&Value>) -> Option<u8> {
         "viewer" => Some(0),
         "doctor" => Some(1),
         "operator" => Some(2),
+        "admin" => Some(3),
         _ => None,
     }
 }

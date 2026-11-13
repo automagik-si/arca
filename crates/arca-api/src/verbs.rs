@@ -34,6 +34,9 @@ pub enum Scope {
     Viewer,
     Doctor,
     Operator,
+    /// Above `Operator`, and held by one token per node: the token whose holder may approve a plan from the terminal of a
+    /// client that can ask (MCP elicitation). No verb needs it; it admits every verb an operator does.
+    Admin,
 }
 
 impl Scope {
@@ -43,6 +46,7 @@ impl Scope {
             Self::Viewer => "viewer",
             Self::Doctor => "doctor",
             Self::Operator => "operator",
+            Self::Admin => "admin",
         }
     }
 }
@@ -2357,6 +2361,7 @@ fn token_list_result() -> Value {
             ("id", true, string()),
             ("scope", true, one_of(&["viewer", "doctor", "operator"])),
             ("tools", false, array(string())),
+            ("admin", false, boolean()),
         ])),
     )])
 }
@@ -2631,6 +2636,10 @@ fn action_proposal() -> Value {
         ("expiresAt", true, int()),
         ("statement", false, string()),
         ("host", false, string()),
+        // Set on the answer of an action_propose that the admin token approved in the terminal.
+        ("approvedIn", false, string()),
+        ("approvedBy", false, string()),
+        ("approval", false, json!({ "type": "object" })),
     ])
 }
 

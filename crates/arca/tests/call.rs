@@ -455,6 +455,69 @@ fn revoke_removes_the_token_and_a_live_serve_drops_it_without_a_restart() {
 }
 
 #[test]
+fn replacing_the_admin_token_stops_the_old_one_on_a_running_node_at_once() {
+    let node = start_node("admin-replace");
+    let mint = |id: &str, out: &str, extra: &[&str]| {
+        arca()
+            .args(["token", "mint", "--scope", "admin", "--id", id, "--config"])
+            .arg(&node.config)
+            .arg("--out")
+            .arg(node.scratch.path(out))
+            .args(extra)
+            .output()
+            .expect("run token mint")
+    };
+    let first = mint("admin-1", "admin-1.secret", &[]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let reload = arca()
+        .args(["token", "reload", "--config"])
+        .arg(&node.config)
+        .output()
+        .expect("run token reload");
+    assert!(
+        reload.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reload.stderr)
+    );
+    let admin_1 = node.scratch.path("admin-1.secret");
+    assert_eq!(
+        code(&call(&node, &admin_1, "arca_status", &[])),
+        0,
+        "the admin token works"
+    );
+    // A second admin id is refused and the first keeps working.
+    let refused = mint("admin-2", "admin-2.secret", &[]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("admin-1"));
+    // --replace retires it and signals the node: no reload by hand.
+    let replaced = mint("admin-2", "admin-2.secret", &["--replace"]);
+    assert!(
+        replaced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    let printed = stdout_json(&replaced);
+    assert_eq!(printed["retired"], json!(["admin-1"]));
+    assert_eq!(printed["reloadSignalled"], json!(true), "{printed}");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        code(&call(&node, &admin_1, "arca_status", &[])),
+        4,
+        "the old admin token is 401"
+    );
+    let admin_2 = node.scratch.path("admin-2.secret");
+    assert_eq!(
+        code(&call(&node, &admin_2, "arca_status", &[])),
+        0,
+        "the new one works"
+    );
+}
+
+#[test]
 fn a_token_the_server_does_not_hold_is_refused_401_and_the_call_exits_4() {
     let node = start_node("unknown-token");
     let stranger = node.scratch.path("stranger.secret");

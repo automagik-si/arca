@@ -631,6 +631,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
     let actions = ActionExecutor::new(action_handlers);
     let _ = action_slot.set(actions.clone());
+    // The node's one admin token may approve a waiting proposal from the terminal of a client that can ask.
+    if kernel_mode {
+        server = server.terminal_approval(Arc::new(crate::handlers::TerminalApproval {
+            kernel: Arc::clone(&kernel),
+            clock: clock.clone(),
+            actions: actions.clone(),
+        }));
+    }
     let router = server.router();
     let linked_hosts = cfg
         .approval

@@ -361,7 +361,7 @@ pub(super) fn joinable_deploy(
             CallError::Invalid("deploy: expected 1 to 64 of a-z, 0-9 and \"-\"".into())
         })?;
     if let Some(open) = deploys(cfg)?.get(&(scope.id.clone(), id.to_string())) {
-        if open.token != token {
+        if !same_caller(&open.token, token) {
             return Err(service_refused(deploy_of_another_caller(id)));
         }
         if !open.provisional(now) {
@@ -1758,5 +1758,29 @@ impl TenantHandler {
             }));
         }
         Ok(json!({ "removed": true }))
+    }
+}
+
+/// Whether two callers are one for a deploy: the same token, or both an approved run (the owner's card, or the admin
+/// token's terminal), since a deploy an approved create opened is joined by another approved create whichever way it was
+/// approved.
+fn same_caller(opened: &str, token: &str) -> bool {
+    let approved_run = |id: &str| {
+        id == arca_mcp::auth::APPROVED_ACTION_ID || id.starts_with(crate::handlers::TERMINAL_CALLER)
+    };
+    opened == token || (approved_run(opened) && approved_run(token))
+}
+
+#[cfg(test)]
+mod same_caller_tests {
+    use super::same_caller;
+
+    #[test]
+    fn approved_runs_join_each_others_deploys_and_tokens_only_their_own() {
+        assert!(same_caller("owner-approval", "terminal-approval:admin-1"));
+        assert!(same_caller("terminal-approval:admin-1", "owner-approval"));
+        assert!(same_caller("op-1", "op-1"));
+        assert!(!same_caller("op-1", "owner-approval"));
+        assert!(!same_caller("owner-approval", "op-2"));
     }
 }

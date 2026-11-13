@@ -44,11 +44,14 @@ use axum::routing::{get, post};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_stream::StreamExt as _;
 
 use crate::auth::{Caller, TokenStore};
+use crate::elicit::TerminalApprover;
 use crate::fresh::{fresh_dir, process_uid};
 use crate::jsonrpc;
 use crate::tools::{CallError, ToolHandler};
@@ -89,6 +92,11 @@ pub struct Server {
     pub(crate) only_looks: bool,
     /// Where the line for an answer of "internal" goes: the process's standard error, unless a test collects it.
     pub(crate) log: Arc<dyn Fn(&str) + Send + Sync>,
+    /// The node's way to approve a plan from the admin token's terminal ([`Server::terminal_approval`]).
+    approver: Option<Arc<dyn TerminalApprover>>,
+    terminal_timeout: Duration,
+    /// Built by [`Server::router`] from the two above.
+    pub(crate) terminal: Option<crate::elicit::Terminal>,
 }
 
 /// Answers one GET route with a body. The server runs it on a blocking thread, after the bearer check.
@@ -125,7 +133,24 @@ impl Server {
             gets: Vec::new(),
             only_looks: false,
             log: Arc::new(|line| eprintln!("{line}")),
+            approver: None,
+            terminal_timeout: crate::elicit::DEFAULT_TIMEOUT,
+            terminal: None,
         }
+    }
+
+    /// Lets the node's one `admin` token approve a waiting plan from the terminal of a client that declared MCP
+    /// elicitation (see [`crate::elicit`]). Every other caller, and every client that did not declare it, is answered as
+    /// without this.
+    pub fn terminal_approval(mut self, approver: Arc<dyn TerminalApprover>) -> Self {
+        self.approver = Some(approver);
+        self
+    }
+
+    /// How long the terminal's question waits for an answer before the plan is left waiting on its card.
+    pub fn terminal_timeout(mut self, wait: Duration) -> Self {
+        self.terminal_timeout = wait;
+        self
     }
 
     /// Sends the line the door writes when it answers "internal" to `sink` instead of standard error. The caller of a
@@ -189,6 +214,10 @@ impl Server {
     /// The router: `POST /mcp`, with the body limit, and the GET routes. Any request with an `Origin` is refused before the
     /// body is read.
     pub fn router(mut self) -> Router {
+        self.terminal = self
+            .approver
+            .take()
+            .map(|approver| crate::elicit::Terminal::new(approver, self.terminal_timeout));
         let mut router = Router::new().route("/mcp", post(mcp));
         for (path, tool, handler) in std::mem::take(&mut self.gets) {
             router = router.route(
@@ -229,13 +258,46 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
         method: mirrored(&headers, "mcp-method"),
         name: mirrored(&headers, "mcp-name"),
     };
+    // A client's answer to an elicitation request this server sent is not a request: it is handed to the call that asked,
+    // and answered 202 (Streamable HTTP, "Sending Messages to the Server"). Any other body is dispatched as ever.
+    if let Some(terminal) = &server.terminal
+        && let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(&body)
+        && !object.contains_key("method")
+        && (object.contains_key("result") || object.contains_key("error"))
+        && let Some(id) = object.get("id").and_then(Value::as_str)
+        && terminal.deliver(id, &caller.token_id, Value::Object(object.clone()))
+    {
+        return StatusCode::ACCEPTED.into_response();
+    }
     match jsonrpc::dispatch(&server, &caller, &mirrors, &body).await {
+        Ok(Some(answer)) if answer.stream.is_some() => sse(answer),
         Ok(Some(answer)) => (answer.status, Json(answer.body)).into_response(),
         Ok(None) => StatusCode::ACCEPTED.into_response(),
         Err(CallError::Forbidden { .. }) => StatusCode::FORBIDDEN.into_response(),
         Err(CallError::Unauthenticated) => unauthorized(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// An answer that streams: `200` with `text/event-stream`. The first event carries an id and an empty `data`, to prime the
+/// client's reconnect (the transport's SHOULD), then each message is one `data` event, and the stream ends after the last.
+fn sse(answer: jsonrpc::Answer) -> Response {
+    let Some(messages) = answer.stream else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let prime = tokio_stream::once(Ok::<_, io::Error>(Bytes::from_static(b"id: 0\ndata:\n\n")));
+    let events = tokio_stream::wrappers::ReceiverStream::new(messages)
+        .map(|message| Ok::<_, io::Error>(Bytes::from(format!("data: {message}\n\n"))));
+    (
+        answer.status,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        axum::body::Body::from_stream(tokio_stream::StreamExt::chain(prime, events)),
+    )
+        .into_response()
 }
 
 async fn serve_get(

@@ -1188,7 +1188,12 @@ impl ToolHandler for TokenListHandler {
             .ids()
             .into_iter()
             .map(|(id, scope, tools)| {
-                let mut token = json!({ "id": id, "scope": scope.as_str() });
+                // An admin token lists as the operator it is above, and says so: the scope enum is a released result.
+                let shown = scope.min(Scope::Operator);
+                let mut token = json!({ "id": id, "scope": shown.as_str() });
+                if scope == Scope::Admin {
+                    token["admin"] = json!(true);
+                }
                 if let Some(tools) = tools {
                     token["tools"] = json!(tools);
                 }
@@ -2176,14 +2181,27 @@ pub fn run_approved_action(
     args: &Value,
     now: u64,
 ) -> Result<Value, CallError> {
+    run_approved(kernel, actions, APPROVED_CALLER, |kernel| {
+        approve_action(kernel, args, now)
+    })
+}
+
+/// The tail both approvals share: `approve` spends the approval under the kernel lock and retires the proposal, then the
+/// action runs once outside the lock, its grant is revoked and its result journalled.
+fn run_approved(
+    kernel: &Mutex<Kernel>,
+    actions: &ActionExecutor,
+    caller_id: &str,
+    approve: impl FnOnce(&mut Kernel) -> Result<ApprovedAction, CallError>,
+) -> Result<Value, CallError> {
     let approved = {
         let mut kernel = lock(kernel)?;
-        approve_action(&mut kernel, args, now)?
+        approve(&mut kernel)?
     };
     // From here the approval is spent. A failure is the action's own, and it is told as one: the caller, the approval page
     // and the journal all get the handler's refusal message, never a bare code.
     let outcome = actions
-        .run(&approved.action, &approved.args, &approved.grant)
+        .run_as(&approved.action, &approved.args, &approved.grant, caller_id)
         .map_err(|error| {
             let told = |why: &str| {
                 format!(
@@ -2236,6 +2254,69 @@ pub fn run_approved_action(
             "result": result,
         })
     })
+}
+
+/// Approval from the terminal of the admin token (see `arca_mcp::elicit`): what is asked, and what an accept runs.
+pub struct TerminalApproval {
+    pub kernel: Arc<Mutex<Kernel>>,
+    pub clock: Clock,
+    pub actions: ActionExecutor,
+}
+
+impl arca_mcp::TerminalApprover for TerminalApproval {
+    fn pending(&self, verb: &str, result: &Value) -> Option<arca_mcp::PendingPlan> {
+        if verb != "action_propose" || result["kind"] != "action" {
+            return None;
+        }
+        let id = result["id"].as_str().filter(|id| id.starts_with("act-"))?;
+        Some(arca_mcp::PendingPlan {
+            id: id.to_string(),
+            message: terminal_question(result),
+        })
+    }
+
+    fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError> {
+        // Only the admin token approves here, whoever else reaches this.
+        if caller.scope != Scope::Admin {
+            return Err(CallError::Forbidden {
+                verb: "action_propose".to_string(),
+            });
+        }
+        let now = (self.clock)();
+        // The run is made under a caller of its own, so every journal it writes says terminal approval, never the owner's.
+        // No token id holds a colon, so no token is ever this caller.
+        let run_as = format!("{TERMINAL_CALLER}{}", caller.token_id);
+        run_approved(&self.kernel, &self.actions, &run_as, |kernel| {
+            kernel
+                .approve_action_in_terminal(plan, &caller.token_id, created_at, now)
+                .map_err(action_approval_failure)
+        })
+    }
+}
+
+/// The question the terminal is asked for a waiting proposal, in the card's words: what it does, where, and until when.
+fn terminal_question(proposal: &Value) -> String {
+    let mut text = format!(
+        "Approve this plan? {}\n",
+        proposal["summary"].as_str().unwrap_or("(no summary)")
+    );
+    for row in proposal["details"].as_array().into_iter().flatten() {
+        if let (Some(label), Some(value)) = (row["label"].as_str(), row["value"].as_str()) {
+            text.push_str(&format!("{label}: {value}\n"));
+        }
+    }
+    if let Some(expires) = proposal["expiresAt"].as_u64() {
+        let seconds = expires / 1000;
+        text.push_str(&format!(
+            "When: it waits for approval until {:02}:{:02} UTC; approving runs it once, now.\n",
+            seconds / 3600 % 24,
+            seconds / 60 % 60
+        ));
+    }
+    text.push_str(
+        "Approving here is recorded as approved in the terminal by the admin token, not by the owner's passkey.",
+    );
+    text
 }
 
 /// How the message of an approved action that failed begins. The approval page shows a message that begins so in full,
@@ -2296,6 +2377,17 @@ impl ActionExecutor {
     }
 
     pub fn run(&self, action: &str, args: &Value, grant: &str) -> Result<Value, CallError> {
+        self.run_as(action, args, grant, APPROVED_CALLER)
+    }
+
+    /// [`ActionExecutor::run`], with the handler called as `caller_id`: what the action's own journal names.
+    pub fn run_as(
+        &self,
+        action: &str,
+        args: &Value,
+        grant: &str,
+        caller_id: &str,
+    ) -> Result<Value, CallError> {
         let handler =
             self.handlers.get(action).cloned().ok_or_else(|| {
                 CallError::Internal("the approved action has no handler".to_string())
@@ -2326,7 +2418,7 @@ impl ActionExecutor {
         handler.call(
             call,
             &Caller {
-                token_id: APPROVED_CALLER.to_string(),
+                token_id: caller_id.to_string(),
                 scope: Scope::Operator,
                 tools: None,
             },
@@ -2337,6 +2429,9 @@ impl ActionExecutor {
 /// The token an approved action's handler is called as: no token a person holds, since no token may be minted
 /// under it.
 const APPROVED_CALLER: &str = arca_mcp::auth::APPROVED_ACTION_ID;
+
+/// What an action approved in the terminal runs under, followed by the admin token's id: `terminal-approval:admin-1`.
+pub const TERMINAL_CALLER: &str = "terminal-approval:";
 
 /// The kernel's write gate, shared by the service, database and tenant handlers and by the front pass.
 fn write_gate(kernel: &Mutex<Kernel>) -> Arc<Mutex<()>> {

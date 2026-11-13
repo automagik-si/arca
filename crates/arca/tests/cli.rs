@@ -1766,7 +1766,7 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
         "  picks it: when ARCA_CONFIG names another file than the default, they refuse and say the --config to run them with.",
         "  init --watch-only [--config <file>] (back to a node that only looks)",
         "  call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]",
-        "  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] [--config <file> | --hash-dir <dir>]",
+        "  token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--replace] [--config <file> | --hash-dir <dir>]",
         "  token reload [--config <file>] (the running node reads its tokens again)",
         "  serve [--config <file>]",
     ] {

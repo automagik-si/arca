@@ -82,6 +82,9 @@ pub struct ApprovedAction {
     pub action: String,
     pub args: Value,
     pub grant: String,
+    /// Set when the approval was the admin token's in the terminal, never the owner's passkey: who, in words. The run's
+    /// journal lines carry it.
+    pub terminal: Option<String>,
 }
 
 /// Why an action proposal could not be approved. Nothing ran.
@@ -340,6 +343,33 @@ impl Kernel {
         approval: &str,
         now_ms: u64,
     ) -> Result<ApprovedAction, ActionApprovalError> {
+        self.approve_action_proved(id, Some(approval), None, now_ms)
+    }
+
+    /// Approves the action proposal `id` in the terminal of the admin token `token`, with no passkey proof: the same checks
+    /// as [`Kernel::approve_action`] but the owner verifier's, and the journal says who approved it and where. That is a
+    /// client's answer, never the owner's passkey, and the journal never says "by the owner".
+    ///
+    /// `created_ms` is the creation time of the proposal the question stated: only that record is approved. A proposal the
+    /// owner decided on the card meanwhile and that was proposed again has the same id and another creation time, and is
+    /// refused as no longer waiting.
+    pub fn approve_action_in_terminal(
+        &mut self,
+        id: &str,
+        token: &str,
+        created_ms: u64,
+        now_ms: u64,
+    ) -> Result<ApprovedAction, ActionApprovalError> {
+        self.approve_action_proved(id, None, Some((token, created_ms)), now_ms)
+    }
+
+    fn approve_action_proved(
+        &mut self,
+        id: &str,
+        approval: Option<&str>,
+        terminal: Option<(&str, u64)>,
+        now_ms: u64,
+    ) -> Result<ApprovedAction, ActionApprovalError> {
         let proposal = self
             .action_proposals
             .get(id)
@@ -347,6 +377,11 @@ impl Kernel {
             .ok_or(ActionApprovalError::NoSuch)?;
         if proposal.expired(now_ms) {
             return Err(ActionApprovalError::Expired);
+        }
+        if let Some((_, created_ms)) = terminal
+            && proposal.created_ms != created_ms
+        {
+            return Err(ActionApprovalError::NoSuch);
         }
         let action = ActionKind::from_name(&proposal.action).ok_or_else(|| {
             ActionApprovalError::Store(KernelError::Io {
@@ -384,11 +419,15 @@ impl Kernel {
             })
         })?;
         let payload = json!({ "action": proposal.action.clone(), "args": proposal.args.clone() });
-        self.verifier
-            .check(statement_action, id, &payload, approval, now_ms)
-            .map_err(ActionApprovalError::Approval)?;
+        if let Some(approval) = approval {
+            self.verifier
+                .check(statement_action, id, &payload, approval, now_ms)
+                .map_err(ActionApprovalError::Approval)?;
+        }
+        let by =
+            terminal.map(|(token, _)| format!("approved in the terminal by admin token {token}"));
         self.action_proposals
-            .approve(id)
+            .approve_noting(id, by.as_deref())
             .map_err(|error| {
                 ActionApprovalError::Store(KernelError::Io {
                     path: ACTION_PROPOSALS_FILE.to_string(),
@@ -407,6 +446,7 @@ impl Kernel {
             action: action.as_str().to_string(),
             args: proposal.args,
             grant,
+            terminal: by.clone(),
         })
     }
 
@@ -448,7 +488,7 @@ impl Kernel {
     pub fn journal_late_result(&mut self, id: &str, ok: bool, code: &str) {
         if let Err(error) = self
             .action_proposals
-            .journal_result(id, ok, Some(code), None)
+            .journal_result(id, ok, Some(code), None, None)
         {
             eprintln!("arca: the late result of action proposal {id} was not journalled: {error}");
         }
@@ -467,10 +507,13 @@ impl Kernel {
         code: Option<&str>,
         message: Option<&str>,
     ) {
-        if let Err(error) = self
-            .action_proposals
-            .journal_result(&approved.id, ok, code, message)
-        {
+        if let Err(error) = self.action_proposals.journal_result(
+            &approved.id,
+            ok,
+            code,
+            message,
+            approved.terminal.as_deref(),
+        ) {
             eprintln!(
                 "arca: the result of action proposal {} was not journalled: {error}",
                 approved.id

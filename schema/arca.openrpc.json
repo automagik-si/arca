@@ -1442,6 +1442,9 @@
             "tokens": {
               "items": {
                 "properties": {
+                  "admin": {
+                    "type": "boolean"
+                  },
                   "id": {
                     "type": "string"
                   },
@@ -1757,6 +1760,15 @@
                           "function_create",
                           "function_remove"
                         ],
+                        "type": "string"
+                      },
+                      "approval": {
+                        "type": "object"
+                      },
+                      "approvedBy": {
+                        "type": "string"
+                      },
+                      "approvedIn": {
                         "type": "string"
                       },
                       "args": {
@@ -2999,8 +3011,17 @@
               ],
               "type": "string"
             },
+            "approval": {
+              "type": "object"
+            },
             "approvalUrl": {
               "description": "The approval page of this node, where the owner approves the card: the approval origin and /approve. Absent on a node with no approval page of its own.",
+              "type": "string"
+            },
+            "approvedBy": {
+              "type": "string"
+            },
+            "approvedIn": {
               "type": "string"
             },
             "args": {

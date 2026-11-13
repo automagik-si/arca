@@ -225,6 +225,35 @@ impl TokenStore {
     }
 }
 
+/// The ids of the hash files in `dir` whose scope is `admin`, sorted. A node holds at most one admin token, and `token mint`
+/// asks this before it writes a second. A file that cannot be read or does not parse is not counted: the store's own load
+/// refuses it with a word of its own.
+pub fn admin_token_ids(dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|item| {
+            let name = item.file_name().to_string_lossy().into_owned();
+            let id = name
+                .strip_suffix(".hash")
+                .filter(|id| valid_id(id))?
+                .to_string();
+            let mut bytes = Vec::new();
+            File::open(item.path())
+                .ok()?
+                .take(MAX_FILE_BYTES)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            let text = std::str::from_utf8(&bytes).ok()?;
+            let (scope, _, _) = parse_body(text)?;
+            (scope == Scope::Admin).then_some(id)
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// A new secret of `scope`, and the text of its hash file.
 pub fn mint(scope: Scope) -> (String, String) {
     mint_with_tools(scope, None)
@@ -373,6 +402,7 @@ fn parse_scope(text: &str) -> Option<Scope> {
         "viewer" => Some(Scope::Viewer),
         "doctor" => Some(Scope::Doctor),
         "operator" => Some(Scope::Operator),
+        "admin" => Some(Scope::Admin),
         _ => None,
     }
 }

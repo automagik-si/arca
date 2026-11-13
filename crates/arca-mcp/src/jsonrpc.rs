@@ -10,7 +10,9 @@
 //! a string or a number; a `null` id is invalid.
 
 use arca_api::verbs::{NOT_CONFIRMED, take_confirm};
-use arca_api::{Verb, conforms, may_call};
+use std::sync::Arc;
+
+use arca_api::{Scope, Verb, conforms, may_call};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
@@ -34,10 +36,13 @@ pub const ONLY_LOOKS_NOTE: &str = "this node only looks: nothing here can be cha
 const CACHE_TTL_MS: u64 = 300_000;
 
 /// One JSON-RPC reply and the HTTP status it travels in.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Answer {
     pub status: StatusCode,
     pub body: Value,
+    /// When set, the answer is an SSE stream of these messages, the last of which is the call's own reply, and `body` is
+    /// not sent. Only a call by the admin token that the terminal is asked about streams ([`crate::elicit`]).
+    pub stream: Option<tokio::sync::mpsc::Receiver<Value>>,
 }
 
 impl Answer {
@@ -45,6 +50,7 @@ impl Answer {
         Answer {
             status: StatusCode::OK,
             body,
+            stream: None,
         }
     }
 }
@@ -52,7 +58,7 @@ impl Answer {
 /// Answers one request body sent with the headers `mirrors`. `Ok(None)` is a notification, which gets no body. `Err` is
 /// a refusal that is not a JSON-RPC error: the HTTP layer answers it with a status.
 pub async fn dispatch(
-    server: &Server,
+    server: &Arc<Server>,
     caller: &Caller,
     mirrors: &Mirrors<'_>,
     body: &[u8],
@@ -106,13 +112,22 @@ pub async fn dispatch(
             return Ok(Some(Answer {
                 status: StatusCode::BAD_REQUEST,
                 body: error_reply(id, refusal.code, &refusal.message, refusal.data),
+                stream: None,
             }));
         }
     };
     let body = match (era, method) {
         // Discovery is answered to anyone who asks, in the one shape it has: it is how a caller learns the versions.
         (_, "server/discover") => result_reply(id, discover_result()),
-        (Era::Legacy, "initialize") => result_reply(id, initialize_result()),
+        (Era::Legacy, "initialize") => {
+            // The server keeps no session, so what an admin client can be asked is remembered by its token's id.
+            if let Some(terminal) = &server.terminal
+                && caller.scope == Scope::Admin
+            {
+                terminal.note_initialize(&caller.token_id, &params);
+            }
+            result_reply(id, initialize_result())
+        }
         (Era::Legacy, "ping") => result_reply(id, json!({})),
         (Era::Legacy, "tools/list") => {
             result_reply(id, json!({ "tools": tools_for(server, caller) }))
@@ -127,9 +142,18 @@ pub async fn dispatch(
             })),
         ),
         (_, "tools/call") => {
-            let Some(mut reply) = call_tool(server, caller, id, &params, era).await? else {
+            let mut stream = None;
+            let Some(mut reply) = call_tool(server, caller, id, &params, era, &mut stream).await?
+            else {
                 return Ok(None);
             };
+            if stream.is_some() {
+                return Ok(Some(Answer {
+                    status: StatusCode::OK,
+                    body: Value::Null,
+                    stream,
+                }));
+            }
             if era == Era::Modern
                 && let Some(result) = reply.get_mut("result")
             {
@@ -142,6 +166,7 @@ pub async fn dispatch(
             return Ok(Some(Answer {
                 status: StatusCode::NOT_FOUND,
                 body: error_reply(id, METHOD_NOT_FOUND, "method not found", None),
+                stream: None,
             }));
         }
     };
@@ -187,7 +212,9 @@ fn server_info() -> Value {
 
 /// `result` with what every `2026-07-28` result carries: `resultType`, and the server's name beside any `_meta` it has.
 fn modern_result(mut result: Value) -> Value {
-    result["resultType"] = json!("complete");
+    if result.get("resultType").is_none() {
+        result["resultType"] = json!("complete");
+    }
     result["_meta"][SERVER_INFO_META] = server_info();
     result
 }
@@ -212,11 +239,12 @@ fn tools_for(server: &Server, caller: &Caller) -> Vec<Value> {
 }
 
 async fn call_tool(
-    server: &Server,
+    server: &Arc<Server>,
     caller: &Caller,
     id: Value,
     params: &Value,
     era: Era,
+    stream_out: &mut Option<tokio::sync::mpsc::Receiver<Value>>,
 ) -> Result<Option<Value>, CallError> {
     // A tool the server does not have: `2026-07-28` keeps "method not found" for a method, so there it is a bad parameter.
     let unknown_tool = match era {
@@ -259,6 +287,55 @@ async fn call_tool(
     let Some(handler) = server.handlers.get(name).cloned() else {
         return Ok(Some(error_reply(id, unknown_tool, "not_found", None)));
     };
+    // Whether the terminal of this caller may be asked to approve the plan this call answers with, and, on a retry of
+    // `2026-07-28` that carries a state of ours, what the client answered.
+    let terminal = terminal_for(server, caller, params, era);
+    let call = crate::elicit::call_digest(name, &arguments);
+    let mut asking = terminal.is_some();
+    if let (Some(terminal), Era::Modern) = (terminal, era)
+        && let Some(state) = params.get("requestState").and_then(Value::as_str)
+    {
+        match terminal.verify(state, &caller.token_id, &call, now_seconds()) {
+            crate::elicit::State::Invalid => {
+                return Ok(Some(error_reply(
+                    id,
+                    INVALID_PARAMS,
+                    "requestState is not valid for this call",
+                    None,
+                )));
+            }
+            crate::elicit::State::Expired => asking = false,
+            crate::elicit::State::Plan { plan, proposal } => {
+                let answer = params
+                    .get("inputResponses")
+                    .and_then(|responses| responses.get(crate::elicit::APPROVE_KEY));
+                // A state is spent once: a second use of it is as a forged one.
+                if answer.is_some_and(crate::elicit::is_yes) {
+                    if !terminal.claim(state, now_seconds()) {
+                        return Ok(Some(error_reply(
+                            id,
+                            INVALID_PARAMS,
+                            "requestState is not valid for this call",
+                            None,
+                        )));
+                    }
+                    // The call is not run again: only the exact proposal the question stated is approved, and the
+                    // reply is built from it, so a plan the owner decided meanwhile is never approved by this yes.
+                    let approving = Approving {
+                        verb: *verb,
+                        proposal,
+                        only_looks: server.only_looks,
+                        log: Arc::clone(&server.log),
+                    };
+                    return Ok(Some(
+                        approved_reply(terminal, caller, id, &plan, approving).await,
+                    ));
+                }
+                // A decline, a cancel or no answer leaves the plan waiting: the call answers as it would without asking.
+                asking = false;
+            }
+        }
+    }
     let owned_caller = caller.clone();
     let outcome = tokio::task::spawn_blocking(move || handler.call(arguments, &owned_caller)).await;
     let result = match outcome {
@@ -298,10 +375,47 @@ async fn call_tool(
                     tool_failure("internal", "the tool failed"),
                 )));
             }
-            Ok(Some(result_reply(
-                id,
+            let waiting = terminal
+                .filter(|_| asking)
+                .and_then(|t| t.approver.pending(name, &value).map(|plan| (t, plan)));
+            let approving = Approving {
+                verb: *verb,
+                proposal: value.clone(),
+                only_looks: server.only_looks,
+                log: Arc::clone(&server.log),
+            };
+            let reply = result_reply(
+                id.clone(),
                 tool_result(verb, value, cut.as_deref(), server.only_looks),
-            )))
+            );
+            let Some((terminal, plan)) = waiting else {
+                return Ok(Some(reply));
+            };
+            match era {
+                Era::Modern => {
+                    let state = terminal.sign(
+                        &caller.token_id,
+                        &plan.id,
+                        &approving.proposal,
+                        &call,
+                        now_seconds(),
+                    );
+                    Ok(Some(result_reply(
+                        id,
+                        input_required(&plan.message, &state),
+                    )))
+                }
+                Era::Legacy => {
+                    match ask_on_stream(server, caller, id, plan, reply.clone(), approving) {
+                        Some(messages) => {
+                            *stream_out = Some(messages);
+                            Ok(Some(Value::Null))
+                        }
+                        // No request id could be made: the plan waits on its card, and the call answers as ever.
+                        None => Ok(Some(reply)),
+                    }
+                }
+            }
         }
         Err(CallError::NotFound) => Ok(Some(error_reply(id, unknown_tool, "not_found", None))),
         Err(CallError::Invalid(why)) => Ok(Some(result_reply(id, invalid_arguments(&why)))),
@@ -326,6 +440,162 @@ async fn call_tool(
             )))
         }
         Err(other) => Err(other),
+    }
+}
+
+/// The unix time in seconds.
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// The terminal of `caller`, when it may be asked: the server has a way to approve, the caller holds the admin scope, and
+/// its client declared elicitation (at `initialize` on `2025-11-25`, in this request's own `_meta` on `2026-07-28`).
+fn terminal_for<'a>(
+    server: &'a Server,
+    caller: &Caller,
+    params: &Value,
+    era: Era,
+) -> Option<&'a crate::elicit::Terminal> {
+    let terminal = server.terminal.as_ref()?;
+    if caller.scope != Scope::Admin {
+        return None;
+    }
+    let declared = match era {
+        Era::Legacy => terminal.is_capable(&caller.token_id),
+        Era::Modern => crate::elicit::declares_elicitation(
+            params
+                .get("_meta")
+                .and_then(|meta| meta.get(version::CAPABILITIES_META)),
+        ),
+    };
+    declared.then_some(terminal)
+}
+
+/// The `2026-07-28` result that asks for input: one elicitation request and the state the client sends back with its answer.
+fn input_required(message: &str, state: &str) -> Value {
+    json!({
+        "resultType": "input_required",
+        "inputRequests": {
+            crate::elicit::APPROVE_KEY: {
+                "method": "elicitation/create",
+                "params": crate::elicit::request_params(message)
+            }
+        },
+        "requestState": state
+    })
+}
+
+/// Opens the SSE stream of a `2025-11-25` call: first the elicitation request, then, once the terminal answered, timed out
+/// or went away, the call's reply. Yes approves the plan and the reply is the run's; anything else leaves the plan waiting
+/// and the reply is `normal`, the one the call would have had without asking.
+fn ask_on_stream(
+    server: &Arc<Server>,
+    caller: &Caller,
+    id: Value,
+    plan: crate::elicit::PendingPlan,
+    normal: Value,
+    approving: Approving,
+) -> Option<tokio::sync::mpsc::Receiver<Value>> {
+    let terminal = server.terminal.as_ref()?;
+    let (request_id, answer) = terminal.expect(&caller.token_id)?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Value>(4);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "elicitation/create",
+        "params": crate::elicit::request_params(&plan.message)
+    });
+    if tx.try_send(request).is_err() {
+        terminal.forget(&request_id);
+        return None;
+    }
+    let server = Arc::clone(server);
+    let caller = caller.clone();
+    tokio::spawn(async move {
+        let Some(terminal) = server.terminal.as_ref() else {
+            return;
+        };
+        let decision = tokio::select! {
+            answered = tokio::time::timeout(terminal.timeout, answer) => answered.ok().and_then(Result::ok),
+            () = tx.closed() => None,
+        };
+        terminal.forget(&request_id);
+        let reply = match decision {
+            Some(response) if crate::elicit::is_yes(&response["result"]) => {
+                approved_reply(terminal, &caller, id, &plan.id, approving).await
+            }
+            _ => normal,
+        };
+        let _ = tx.send(reply).await;
+    });
+    Some(rx)
+}
+
+/// What the reply of an approved call is made of: the verb, the proposal its handler answered, and what the door needs to
+/// check the reply and say it.
+struct Approving {
+    verb: Verb,
+    proposal: Value,
+    only_looks: bool,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+/// The reply of a call whose plan the terminal approved: the plan runs, as the web card's approval runs it, and the answer
+/// is the proposal itself, as the verb's output schema says, with `approvedIn`, `approvedBy` and the run's outcome under
+/// `approval` beside it. It passes the same result check as any answer. A run that fails is told as the web card tells it.
+async fn approved_reply(
+    terminal: &crate::elicit::Terminal,
+    caller: &Caller,
+    id: Value,
+    plan: &str,
+    approving: Approving,
+) -> Value {
+    let approver = Arc::clone(&terminal.approver);
+    let created_at = approving.proposal["createdAt"].as_u64().unwrap_or(0);
+    let (owned_caller, plan) = (caller.clone(), plan.to_string());
+    let run =
+        tokio::task::spawn_blocking(move || approver.approve(&plan, created_at, &owned_caller))
+            .await;
+    match run {
+        Ok(Ok(output)) => {
+            let Approving {
+                verb,
+                mut proposal,
+                only_looks,
+                log,
+            } = approving;
+            proposal["approvedIn"] = json!("terminal");
+            proposal["approvedBy"] = json!(caller.token_id);
+            proposal["approval"] = output;
+            if let Err(why) = conforms(&(verb.result)(), &proposal) {
+                log(&internal_line(
+                    verb.name,
+                    &format!("its approved answer does not fit the verb's result schema ({why})"),
+                ));
+                return result_reply(id, tool_failure("internal", "the tool failed"));
+            }
+            let summary = (verb.summary_text)(&proposal);
+            let mut result = tool_result(&verb, proposal, None, only_looks);
+            result["content"][0]["text"] = json!(format!(
+                "approved in the terminal by admin token {} and run: {summary}",
+                caller.token_id
+            ));
+            result_reply(id, result)
+        }
+        Ok(Err(
+            refused @ (CallError::Refused { .. }
+            | CallError::UntrustedRefused { .. }
+            | CallError::RefusedWith { .. }),
+        )) => error_reply(
+            id,
+            REFUSED,
+            refused.refusal().map_or("", |(_, message)| message),
+            refused.refusal_data(),
+        ),
+        Ok(Err(CallError::Invalid(why))) => result_reply(id, invalid_arguments(&why)),
+        Ok(Err(_)) | Err(_) => result_reply(id, tool_failure("internal", "the tool failed")),
     }
 }
 

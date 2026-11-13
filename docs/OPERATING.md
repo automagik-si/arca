@@ -579,15 +579,23 @@ sha256=<64 lowercase hex digits>
 tools=service_list,service_logs,journal_list
 ```
 
-The file name is `<id>.hash`, and the id is 1 to 64 lowercase letters, digits or hyphens. The scopes are `viewer`, `doctor`
-and `operator`. The `tools=` line is optional; without it the token reaches every verb its scope admits, and with it the token
-reaches only those named tools. A tool above the scope is refused at mint, so the list only narrows.
+The file name is `<id>.hash`, and the id is 1 to 64 lowercase letters, digits or hyphens. The scopes are `viewer`,
+`doctor`, `operator` and `admin`, in that order. `admin` admits every verb `operator` does and one thing more: approving
+a waiting plan from the terminal, described under "Approving a plan from the terminal". **A node holds one admin token
+at a time.** `arca token mint --scope admin --id <id>` with another admin token on the node is refused with exit 2,
+names the token that exists and writes nothing. `--replace` mints the new one, then removes the old one's hash file and
+signals the running node to read its tokens (as `token revoke` does), so the old token stops at once and the node never
+has two nor none by a failed mint; the answer says `retired` and `reloadSignalled`. `--replace` is for the admin scope
+only. `token_list` shows an admin token as `scope: operator` with `admin: true`. The `tools=` line is optional; without
+it the token reaches every verb its scope admits, and with it the token reaches only those named tools. A tool above the
+scope is refused at mint, so the list only narrows.
 
 One id is no token's: `owner-approval`, the name an action runs under once the owner approved it. `arca token mint`
 refuses it. A release before this one did not, so a file `owner-approval.hash` may exist: the node starts and reads
 every other token, leaves that file out, and writes one line each time it reads its tokens ("token file
 owner-approval.hash is ignored: ..."). Its secret is refused as any unknown token is. Remove the file with `arca
-token revoke owner-approval`.
+token revoke owner-approval`. An action approved in the terminal runs as `terminal-approval:<admin token id>`, which no
+token can be, since an id holds no colon.
 
 ### Modes and the umask
 
@@ -1361,6 +1369,44 @@ and a reason the server wrote (it can name a file of the node or a service, and 
 arca: service_status was answered "internal: the tool failed": the kernel could not complete the call
 ```
 
+### Approving a plan from the terminal
+
+A call by the node's admin token that answers with an action proposal waiting for the owner (`action_propose`) can be
+approved in the terminal of an MCP client that declared the elicitation capability, instead of on the owner's card.
+Every other call is answered as before: a token below `admin`, a client that declared no elicitation, a client that
+declared only URL mode, and any verb that does not answer with a waiting proposal get the same bytes they always got,
+and the card on the approval page waits as always. This path does not touch a delete plan, which keeps its card.
+
+- **`2025-11-25`.** The client declares `capabilities.elicitation` at `initialize`; the node remembers it for that
+  token id, since it keeps no session, so use one client per admin token (the last `initialize` wins, and `arca call`
+  declares none). The call's `POST` is then answered `200` with `text/event-stream`: a priming event, then an
+  `elicitation/create` request in form mode, then, once answered, the call's own reply. The client's answer is a second
+  `POST` of the JSON-RPC response, answered `202`. Only the token that was asked may answer.
+- **`2026-07-28`.** There are no server-to-client requests in this version; the client declares `elicitation` in each
+  request's `params._meta` and the call is answered `resultType: "input_required"` with an `inputRequests.approve`
+  elicitation and a `requestState`. The client sends the call again, with a new id, the same arguments, `inputResponses`
+  and the state. The state is signed (HMAC-SHA256 under a key made when the node starts) and names the token, the plan,
+  the call's verb and arguments and an expiry equal to the wait. A changed, carried-over or spent state is refused
+  (`-32602`); an expired one answers as a call that never asked. A state approves once, and a plan runs once: the
+  proposal is retired as it is approved, so a replay finds none.
+
+The question states the plan in the card's words: what it does, its details (where), and until when it waits. The form
+has one field, `approve`, `yes` or `no`. Only an `accept` with `yes` approves and runs the plan, as the card's approval
+does. The answer to the call is the proposal itself, as `action_propose` advertises it, with `approvedIn: "terminal"`,
+`approvedBy` (the admin token's id) and the run's outcome under `approval`.
+
+Every journal says who approved. `action-proposals.jsonl` records the approval, and the run's result, as `approved in
+the terminal by admin token <id>`; the action runs as the caller `terminal-approval:<id>` (no token id holds a colon),
+so `instance-actions.jsonl` and the other journals name it, and nothing writes the owner's `owner-approval`. A decline,
+a cancel, an accept of `no`, a closed connection or no answer within four minutes leaves the plan waiting with its
+normal card, and the call answers as it would without the question.
+
+What this is not: a client's `accept` is the client's answer. A hook of the client (Claude Code's `Elicitation` hook
+can answer a form with no dialog) can give it with no person at the keyboard, so the admin token is a standing right to
+approve, held by whoever holds the token and its client. Keep it to the one terminal that should have it, and `arca
+token mint --replace` when it moves. Step-up authorization (a `403 insufficient_scope` that sends the person to the
+authorization server) would put the approval where the server can tell a person approved; it is not built here.
+
 ### Protocol versions
 
 The server keeps no session, so each request is judged alone. The tools, their parameters and their results are the
@@ -1635,7 +1681,7 @@ A power state is not a desired-state entry, so these changes are not in `journal
 them. Each call that passes its gate is written to `instance-actions.jsonl` in the state directory instead:
 
 ```
-{"kind":"begin","id":"ia-<ms>-<n>","at_ms":<ms>,"token_id":"<the caller's token, or owner-approval>","proposal":"<act-… of the approved proposal, or null>","action":"start","project":"<project>","instance":"<instance>"}
+{"kind":"begin","id":"ia-<ms>-<n>","at_ms":<ms>,"token_id":"<the caller's token, owner-approval, or terminal-approval:<admin token id>>","proposal":"<act-… of the approved proposal, or null>","action":"start","project":"<project>","instance":"<instance>"}
 {"kind":"end","id":"ia-<ms>-<n>","outcome":"started","code":null,"uuid":"<volatile uuid>","status":"Running"}
 ```
 

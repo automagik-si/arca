@@ -1264,6 +1264,9 @@ struct ActionEvent {
     /// Why an approved action did not run, in the words its caller was given. Absent on every other event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Who approved, when it was not the owner's passkey: the admin token in the terminal. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    by: Option<String>,
 }
 
 /// The longest refusal message a result event keeps, in characters.
@@ -1376,6 +1379,7 @@ impl ActionProposalStore {
             ok: None,
             code: None,
             message: None,
+            by: None,
         })
         .map_err(ProposeError::Store)?;
         self.waiting.push(proposal.clone());
@@ -1385,7 +1389,17 @@ impl ActionProposalStore {
 
     /// Journals an approval and retires the proposal. The caller has already checked its proof.
     pub fn approve(&mut self, id: &str) -> io::Result<Option<ActionProposal>> {
-        self.retire(id, "approved")
+        self.approve_noting(id, None)
+    }
+
+    /// [`ActionProposalStore::approve`], with `note` kept in the journal line: how the approval came, when it did not come
+    /// as the owner's passkey.
+    pub fn approve_noting(
+        &mut self,
+        id: &str,
+        note: Option<&str>,
+    ) -> io::Result<Option<ActionProposal>> {
+        self.retire_noting(id, "approved", note)
     }
 
     /// Journals a decline and retires the proposal.
@@ -1394,6 +1408,15 @@ impl ActionProposalStore {
     }
 
     fn retire(&mut self, id: &str, event: &str) -> io::Result<Option<ActionProposal>> {
+        self.retire_noting(id, event, None)
+    }
+
+    fn retire_noting(
+        &mut self,
+        id: &str,
+        event: &str,
+        note: Option<&str>,
+    ) -> io::Result<Option<ActionProposal>> {
         let Some(index) = self.waiting.iter().position(|proposal| proposal.id == id) else {
             return Ok(None);
         };
@@ -1404,6 +1427,7 @@ impl ActionProposalStore {
             ok: None,
             code: None,
             message: None,
+            by: note.map(str::to_string),
         })?;
         let retired = self.waiting.remove(index);
         self.compact_if_large();
@@ -1417,6 +1441,7 @@ impl ActionProposalStore {
         ok: bool,
         code: Option<&str>,
         message: Option<&str>,
+        terminal: Option<&str>,
     ) -> io::Result<()> {
         self.append(ActionEvent {
             event: "result".to_string(),
@@ -1425,6 +1450,7 @@ impl ActionProposalStore {
             ok: Some(ok),
             code: code.map(str::to_string),
             message: message.map(|message| message.chars().take(RESULT_MESSAGE_MAX).collect()),
+            by: terminal.map(str::to_string),
         })?;
         self.compact_if_large();
         Ok(())
@@ -1530,6 +1556,7 @@ impl ActionProposalStore {
                     ok: None,
                     code: None,
                     message: None,
+                    by: None,
                 })
                 .map_err(io::Error::other)?;
                 bytes.push(b'\n');

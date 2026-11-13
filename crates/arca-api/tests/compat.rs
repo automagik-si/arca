@@ -821,7 +821,7 @@ fn a_method_whose_scope_is_lowered_is_no_break() {
 
 #[test]
 fn the_scope_rule_follows_the_scope_order_of_the_table() {
-    let order = [Scope::Viewer, Scope::Doctor, Scope::Operator];
+    let order = [Scope::Viewer, Scope::Doctor, Scope::Operator, Scope::Admin];
     for old in order {
         for new in order {
             let mut base = released();
