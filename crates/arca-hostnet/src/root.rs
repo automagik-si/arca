@@ -154,8 +154,9 @@ pub fn run<R: Runner + Send + Sync + 'static>(
     interval: Duration,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let listener = socket::bind(&host.paths.socket)?;
+    // The declared state is put back first: a socket that cannot be bound must not leave the host without its rules.
     host.boot();
+    let listener = socket::bind(&host.paths.socket)?;
     let server = {
         let (ops, stop) = (
             Arc::clone(&host) as Arc<dyn Ops + Send + Sync>,
@@ -360,6 +361,26 @@ mod tests {
         assert!(!bad.declared && !bad.in_sync);
         assert_eq!(items(&bad), ["declared-file"]);
         assert!(root.runner.changes().is_empty());
+    }
+
+    #[test]
+    fn a_socket_that_cannot_be_bound_does_not_stop_the_start_apply() {
+        let scratch = Scratch::new("nobind");
+        scratch.declare(DECLARED);
+        let mut paths = scratch.paths();
+        paths.socket = scratch.0.join("missing-directory/host.sock");
+        let root = Arc::new(Host::new(FakeHost::new().docker(), paths, None).with_clock(|| 5_000));
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(run(Arc::clone(&root), Duration::from_millis(20), stop).is_err());
+        assert_eq!(
+            root.runner.docker_user().len(),
+            3,
+            "the rules went in before the socket was tried"
+        );
+        assert_eq!(
+            status::read(&scratch.paths().status).map(|s| s.in_sync),
+            Some(true)
+        );
     }
 
     #[test]

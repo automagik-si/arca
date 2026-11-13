@@ -80,10 +80,10 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostNetworkConfig {
-    /// The root part's socket. An absolute path; `/run/arca/host-network.sock` when absent.
+    /// The root part's socket. An absolute path; `/run/arca-host-network/host-network.sock` when absent.
     #[serde(default = "default_host_network_socket")]
     pub socket: PathBuf,
-    /// The status file the root part writes. An absolute path; `/run/arca/host-network-status.json` when absent.
+    /// The status file the root part writes. An absolute path; `/run/arca-host-network/status.json` when absent.
     #[serde(default = "default_host_network_status")]
     pub status: PathBuf,
 }
@@ -1696,11 +1696,11 @@ mod tests {
         let config = config_with(None);
         assert_eq!(
             config.host_network.socket,
-            PathBuf::from("/run/arca/host-network.sock")
+            PathBuf::from("/run/arca-host-network/host-network.sock")
         );
         assert_eq!(
             config.host_network.status,
-            PathBuf::from("/run/arca/host-network-status.json")
+            PathBuf::from("/run/arca-host-network/status.json")
         );
         let named: HostNetworkConfig = serde_json::from_value(
             serde_json::json!({ "socket": "/tmp/host.sock", "status": "/tmp/host.json" }),

@@ -70,6 +70,7 @@ pub fn unit_text(paths: &Paths) -> String {
 [Unit]\n\
 Description=Arca host forwarding and firewall, as declared\n\
 After=network-online.target docker.service\n\
+PartOf=docker.service\n\
 Wants=network-online.target\n\
 \n\
 [Service]\n\
@@ -77,11 +78,11 @@ Type=simple\n\
 ExecStart={binary} host-network run\n\
 Restart=on-failure\n\
 RestartSec=10\n\
-RuntimeDirectory=arca\n\
+RuntimeDirectory=arca-host-network\n\
 RuntimeDirectoryMode=0755\n\
 \n\
 [Install]\n\
-WantedBy=multi-user.target\n",
+WantedBy=multi-user.target docker.service\n",
         declared = paths.declared.display(),
         binary = paths.installed_binary.display()
     )
@@ -153,11 +154,40 @@ pub fn plan(
         systemctl(&["enable", UNIT_NAME]),
         systemctl(&["restart", UNIT_NAME]),
     ];
-    // Last, and without stopping it: the new unit has adopted the rules the old one put in.
-    if let Some(unit) = &options.takeover {
+    // Last, and without stopping it: the new unit has adopted the rules the old one put in. Not when the declared state has
+    // no bridge: the unit would then put nothing in at the next boot, and the hand unit would be all that did.
+    if let Some(unit) = &options.takeover
+        && !declared.bridges.is_empty()
+    {
         steps.push(systemctl(&["disable", unit]));
     }
     Ok(steps)
+}
+
+/// What the install will not do, or will change, that the declared state does not show: said beside the steps.
+pub fn notes(options: &Options, observed: &Observed) -> Vec<String> {
+    let declared = declared_from(observed, &options.bridges);
+    let mut said = Vec::new();
+    if let (Some(v4), Some(v6)) = (observed.ipv4, observed.ipv6)
+        && v4 != v6
+    {
+        let state = |on: bool| if on { "on" } else { "off" };
+        // The declared file has one switch, read from IPv4, so it is IPv6 that is made to match.
+        said.push(format!(
+            "IPv4 forwarding is {} and IPv6 forwarding is {} now, but the declared file has one switch for both: the root part will turn it {} for IPv6 too. Edit the file to change that.",
+            state(v4),
+            state(v6),
+            state(declared.forwarding)
+        ));
+    }
+    if let Some(unit) = &options.takeover
+        && declared.bridges.is_empty()
+    {
+        said.push(format!(
+            "no bridge was found in DOCKER-USER and none was named with --bridges, so {unit} is not disabled: name the bridges with --bridges to replace it."
+        ));
+    }
+    said
 }
 
 /// Each step as a line, for a dry run.
@@ -284,11 +314,21 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ExecStart=/usr/local/libexec/arca/arca host-network run\n"));
+        // A directory of its own: the node's own sockets live in /run/arca, and systemd would chown and remove them.
+        assert!(text.contains("RuntimeDirectory=arca-host-network\n"));
+        assert!(!text.contains("RuntimeDirectory=arca\n"));
+        assert!(text.contains("RuntimeDirectoryMode=0755\n"));
+        // Tied to Docker, so a Docker restart reruns the start apply within seconds.
+        assert!(text.contains("PartOf=docker.service\n"));
         assert!(
-            text.contains("RuntimeDirectory=arca\n")
-                && text.contains("RuntimeDirectoryMode=0755\n")
+            text.contains("WantedBy=multi-user.target docker.service\n"),
+            "{text}"
         );
-        assert!(text.contains("WantedBy=multi-user.target"));
+        let paths = paths();
+        assert!(
+            paths.socket.starts_with("/run/arca-host-network/")
+                && paths.status.starts_with("/run/arca-host-network/")
+        );
         // Docker is not required: a host without it still starts the unit.
         assert!(!text.contains("Requires=") && !text.contains("Wants=docker"));
     }
@@ -358,6 +398,60 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("--now") || line.contains("stop"))
         );
+    }
+
+    #[test]
+    fn a_hand_unit_is_not_disabled_when_the_install_found_no_bridge_to_replace_it_with() {
+        // The hand rules have another shape (`-i br -o eth0 -j ACCEPT`), so nothing was read from them: the next boot
+        // would have no accepts if the hand unit were disabled.
+        let observed = observe(&FakeHost::new().forwarding(true, true).docker());
+        let options = Options {
+            takeover: Some("hand-fix.service".to_string()),
+            ..Options::default()
+        };
+        let steps =
+            plan(&options, &observed, &paths(), Path::new("/x/arca"), false).expect("plans");
+        assert!(!render(&steps).iter().any(|line| line.contains("disable")));
+        let said = notes(&options, &observed);
+        assert!(
+            said.iter()
+                .any(|note| note.contains("hand-fix.service") && note.contains("no bridge")),
+            "{said:?}"
+        );
+        // With a bridge named on the command line there is something to replace it with.
+        let named = Options {
+            bridges: vec!["incusbr0".to_string()],
+            ..options
+        };
+        let steps = plan(&named, &observed, &paths(), Path::new("/x/arca"), false).expect("plans");
+        assert!(
+            render(&steps)
+                .iter()
+                .any(|line| line.contains("disable hand-fix.service"))
+        );
+    }
+
+    #[test]
+    fn a_host_that_forwards_one_family_is_told_what_the_declaration_will_change() {
+        let one = observe(
+            &FakeHost::new()
+                .forwarding(true, false)
+                .docker()
+                .hand_fix("incusbr0"),
+        );
+        let said = notes(&Options::default(), &one);
+        assert!(
+            said.iter()
+                .any(|note| note.contains("IPv6 forwarding is off") && note.contains("turn it on")),
+            "{said:?}"
+        );
+        let both = observe(
+            &FakeHost::new()
+                .forwarding(true, true)
+                .docker()
+                .hand_fix("incusbr0"),
+        );
+        assert!(notes(&Options::default(), &both).is_empty());
     }
 
     #[test]

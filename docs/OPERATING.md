@@ -102,7 +102,7 @@ node takes a new token after `arca token reload` or a restart.
 | `arca init --watch-only [--config <file>]` | the config | it empties `kernel.projects` and nothing else, and says in a few lines whether the running node took that up; until it has, the first line says the node still makes changes |
 | `arca setup-code [--config <file>]` | asks the running node, on its unix socket, for the setup code of the first passkey; for a machine with no screen | `{ "code", "expiresInSeconds", "page" }` as JSON on stdout, and one sentence on stderr; see "The page on this machine alone" |
 | `arca host-network status [--live] [--config <file>]` | the root part's status file, or with `--live` its socket | the host as declared, or what drifted, with the status's age; see "Host forwarding and the firewall" |
-| `arca host-network install [--takeover <unit>] [--bridges <a,b>] [--replace] [--dry-run]` | the host's forwarding and firewall now (root only, except `--dry-run`) | the steps and the declared state it wrote, and the root part's first reading |
+| `arca host-network install [--takeover <unit>] [--bridges <a,b>] [--replace] [--dry-run]` | the host's forwarding and firewall now (root only, `--dry-run` too) | the steps and the declared state it wrote, and the root part's first reading |
 | `arca host-network run` | nothing: it is the root part the system unit runs (root only) | nothing |
 | `arca link serve [--config <file>]` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair [--config <file>] [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
@@ -179,7 +179,7 @@ refused without the value being echoed back.
 | `kernel.serviceDestinations` | no | `[{ "service": "<service>", "address": "<one IPv4 address>", "port": n }]`: the private addresses named services of the node's own project may reach through the node, each on one tcp port. It needs `kernel.serviceCidr`. Empty by default: a service reaches no private address. An entry alone opens nothing. See "A service that may reach one private address". |
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
 | `follow.intervalSeconds` | no | Seconds between two looks of the Automagik follower at Automagik's published record, 60 to 86400. 600 when absent. |
-| `hostNetwork.socket`, `hostNetwork.status` | no | Absolute paths of the root part's socket and status file; `/run/arca/host-network.sock` and `/run/arca/host-network-status.json` when absent. See "Host forwarding and the firewall". |
+| `hostNetwork.socket`, `hostNetwork.status` | no | Absolute paths of the root part's socket and status file; `/run/arca-host-network/host-network.sock` and `/run/arca-host-network/status.json` when absent. See "Host forwarding and the firewall". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`); or `http://localhost:<port>` with the port of `listen.loopback`, the page of a node on its own machine with no domain and no certificate. Its host is the WebAuthn rp id; it is not the host an approval statement names. |
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
@@ -2009,7 +2009,10 @@ database, GPU, storage, snapshot, instance, function or tenant verbs: `service_c
 (see [Importing a service another manager created](#importing-a-service-another-manager-created)), `service_publish`, `service_unpublish`,
 `service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create`,
 `snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`, `instance_stop` or
-`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and `deploy_remove` (see [Tenants](#tenants)), and `host_network_restore` (see [Host forwarding and the firewall](#host-forwarding-and-the-firewall)), are proposed the same way. The canvas Doctor proposes the first twenty-two; it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and `deploy_remove` (see [Tenants](#tenants)), are proposed the same way. The canvas Doctor proposes all twenty-two; it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+
+`host_network_restore` (see [Host forwarding and the firewall](#host-forwarding-and-the-firewall)) is proposed the
+same way: it takes no arguments, and its card says what the host has drifted from.
 the inline `approval` field removed because the proposal replaces it. The tool's own input schema says so: `args` has
 one `anyOf` branch per action, titled with the action's name, holding that verb's fields with their descriptions, the
 fields it requires, and an example (`examples`, and in its `description`), so an assistant reads what each action takes
@@ -3118,21 +3121,22 @@ release every imported service, and keep the file aside.
 
 ## Host forwarding and the firewall
 
-A host that runs containers must forward their packets, and Docker, when it is on the same host, changes that behind the
-node's back: since Docker 29 it turns IP forwarding on by itself and sets the `FORWARD` policy of the firewall to `DROP`, and
-after a reboot the containers of Incus's bridges had no way out. Arca now owns that as declared state. The owner's file says
-what the host forwards and which bridges may reach out; a small part of `arca` that runs as root puts it back at boot, reads
-the host again every minute, and tells the node when the host has drifted. The node turns the drift into an alert and offers
-the fix as one card.
+A host that runs containers must forward their packets, and Docker, when it is on the same host, changes that behind
+the node's back: since Docker 29 it turns IP forwarding on by itself and sets the `FORWARD` policy of the firewall to
+`DROP`, and after a reboot the containers of Incus's bridges had no way out. Arca now owns that as declared state. The
+owner's file says what the host forwards and which bridges may reach out; a small part of `arca` that runs as root puts
+it back every time it starts, reads the host again every minute, and tells the node when the host has drifted. The node
+turns the drift into an alert and offers the fix as one card.
 
 ### The pieces
 
 | What | Where | Who owns it |
 |------|-------|-------------|
 | The declared state | `/etc/arca/host.json` | root. The root part refuses a file another user owns or anyone else can write |
-| The root part | `arca host-network run`, the system unit `arca-host-network.service` | root, from a root-owned copy of the binary at `/usr/local/libexec/arca/arca` |
-| The status file | `/run/arca/host-network-status.json` | written by the root part, readable by everyone |
-| The socket | `/run/arca/host-network.sock` | root; any local user may connect, because its verbs can only reapply root's file |
+| The root part | `arca host-network run`, the system unit `arca-host-network.service` | root, from a root-owned copy at `/usr/local/libexec/arca/arca` |
+| The unit's runtime directory | `/run/arca-host-network`, its own: `/run/arca` is the node's | the unit; systemd removes it when the unit stops |
+| The status file | `/run/arca-host-network/status.json` | written by the root part, readable by everyone |
+| The socket | `/run/arca-host-network/host-network.sock` | root; any local user may connect (see below) |
 
 The declared file:
 
@@ -3141,12 +3145,13 @@ The declared file:
 ```
 
 - `forwarding`: whether the host forwards packets. `true` means `net.ipv4.ip_forward=1` and
-  `net.ipv6.conf.all.forwarding=1`; `false` means both 0. Required.
+  `net.ipv6.conf.all.forwarding=1`; `false` means both 0. One switch for both families. Required.
 - `bridges`: the bridges whose containers may reach out. For each one, when Docker has made its `DOCKER-USER` chain, the
   root part puts two accepts first in that chain: `-i <bridge> -j ACCEPT`, and `-o <bridge> -m conntrack --ctstate
-  RELATED,ESTABLISHED -j ACCEPT`. A drop in one of Docker's chains beats an accept anywhere else, so those accepts can only
-  live in `DOCKER-USER`, which Docker runs first. A bridge name is up to 15 letters, digits, `.`, `_` and `-`. A host with
-  no Docker chain gets no rule: nothing there drops what the bridges send. IPv6 firewall rules are not managed.
+  RELATED,ESTABLISHED -j ACCEPT`. A drop in one of Docker's chains beats an accept anywhere else, so those accepts can
+  only live in `DOCKER-USER`, which Docker runs first. A bridge name is up to 15 letters, digits, `.`, `_` and `-`. A
+  host with no Docker chain gets no rule: nothing there drops what the bridges send. IPv6 firewall rules are not
+  managed.
 - `forwardPolicy`: `ACCEPT` or `DROP`, the policy the `FORWARD` chain is expected to have. The takeover records what the
   host has. Left out, the policy is not watched.
 
@@ -3154,27 +3159,30 @@ An unknown key, a bridge name that is not one, a repeated bridge or a file that 
 
 ### What the root part does
 
-- **At boot**, after `docker.service` when the host has it, it reads the declared file, sets the two forwarding switches,
-  puts in the accepts that are missing, and sets the `FORWARD` policy when it differs, in that order, so a `DROP` is never
-  set before the accepts that let the bridges through. Reapplying adds nothing twice: it reads the host first and runs only
-  what is missing, so a rule a hand-made fix already put in is adopted, not doubled.
-- **Every minute** it reads the host again and writes the status file. It changes nothing on a reread: a host that drifts
-  after boot (Docker restarted and rewrote its chains, someone turned forwarding off) is reported, and put back only when the
-  owner approves the card below.
+- **When it starts** it reads the declared file, sets the two forwarding switches, puts in the accepts that are missing,
+  and sets the `FORWARD` policy when it differs, in that order, so a `DROP` is never set before the accepts that let the
+  bridges through. It starts at boot, after `docker.service` when the host has it, and the unit is tied to Docker
+  (`PartOf=docker.service`, and wanted by it), so every Docker start or restart starts it again within seconds and puts
+  back what Docker's new chains lack. Reapplying adds nothing twice: it reads the host first and runs only what is
+  missing, so a rule a hand-made fix already put in is adopted, not doubled.
+- **Every minute** it reads the host again and writes the status file. It changes nothing on a reread: other drift
+  (someone turned forwarding off, a rule was deleted) is reported, and put back when the owner approves the card below.
 - **On the socket** it answers two verbs, each sent as one line with no argument, and refuses every other line: `read`
-  answers with a live reading and changes nothing, `apply-declared-state` puts back the declared state and answers with the
-  reading after. No caller can make it run anything else.
+  answers with a live reading and changes nothing, `apply-declared-state` puts back the declared state and answers with
+  the reading after. No caller can make it run anything else. The socket is open to every local user, because the verbs
+  can only read the host or put back what root's own file says; so a local user can also put the declared state back
+  without a card.
 
-The status file is one JSON object: `at` (epoch milliseconds), `declared` (a valid file was read), `inSync`, `drift` (a list
-of `{item, detail}`), `applied` (the commands the last apply ran), `errors` and `version`. The drift items are
-`ipv4-forwarding`, `ipv6-forwarding`, `rule-in:<bridge>`, `rule-out:<bridge>`, `forward-policy`, `firewall-unreadable` and
-`declared-file` (the file is there and is refused).
+The status file is one JSON object: `at` (epoch milliseconds), `declared` (a valid file was read), `inSync`, `drift` (a
+list of `{item, detail}`), `applied` (the commands the last apply ran), `errors` and `version`. The drift items are
+`ipv4-forwarding`, `ipv6-forwarding`, `rule-in:<bridge>`, `rule-out:<bridge>`, `forward-policy`, `firewall-unreadable`
+and `declared-file` (the file is there and is refused).
 
 ### Commands
 
 | Command | What it does |
 |---------|--------------|
-| `arca host-network status [--live]` | prints the status file, with its age; with `--live` asks the socket for a fresh reading. No root needed |
+| `arca host-network status [--live]` | prints the status file, with its age; with `--live` asks the socket for a fresh reading. No root |
 | `arca host-network run` | the root part, for the unit. Refuses to run unless it is root |
 | `arca host-network install [--takeover <unit>] [--bridges <a,b>] [--replace] [--dry-run]` | the takeover below. Root only |
 
@@ -3188,31 +3196,39 @@ arca host-network install --takeover <hand-made-unit>.service --dry-run
 arca host-network install --takeover <hand-made-unit>.service
 ```
 
-`--dry-run` prints every step and changes nothing. The install:
+`--dry-run` needs root too, since the firewall can be read only as root; it prints every step and the declared state,
+and changes nothing. It also prints `notes` for what the declared state does not show: a host that forwards one family
+only (the file has one switch, so the other is made to match), and a takeover with no bridge to replace the hand unit
+with.
+The install:
 
-1. writes `/etc/arca/host.json` from what the host has now: forwarding as it is, the bridges `DOCKER-USER` already accepts
-   from (plus any named with `--bridges`), and the `FORWARD` policy as it is. It refuses to overwrite a file that is there
-   unless told `--replace`;
-2. copies the running `arca` to `/usr/local/libexec/arca/arca`, because a unit that runs as root must not run a file a user
-   can replace;
-3. writes `/etc/systemd/system/arca-host-network.service`, reloads systemd, enables the unit and restarts it, which applies
-   the declared state and finds the hand-made rules already there;
-4. last, runs `systemctl disable <hand-made-unit>.service`, without stopping it, so the hand fix is replaced and not doubled.
+1. writes `/etc/arca/host.json` from what the host has now: forwarding as IPv4 has it, the bridges `DOCKER-USER` already
+   accepts from (plus any named with `--bridges`), and the `FORWARD` policy as it is. It refuses to overwrite a file
+   that is there unless told `--replace`;
+2. copies the running `arca` to `/usr/local/libexec/arca/arca`, because a unit that runs as root must not run a file a
+   user can replace;
+3. writes `/etc/systemd/system/arca-host-network.service`, reloads systemd, enables the unit and restarts it, which
+   applies the declared state and finds the hand-made rules already there;
+4. last, runs `systemctl disable <hand-made-unit>.service`, without stopping it, so the hand fix is replaced and not
+   doubled. It does not when the declared state has no bridge: the new unit would then put nothing in at the next boot.
 
-The `sysctl.d` file of the hand fix sets the same two values the root part sets, so it does no harm and can be removed at
-leisure. After an upgrade of `arca`, run the install again with `--replace` to refresh the root-owned copy. Nothing here is
-run by the node itself: the install is the one step that needs root.
+The `sysctl.d` file of the hand fix sets the same two values the root part sets, so it does no harm and can be removed
+at leisure. After an upgrade of `arca`, run the install again with `--replace` to refresh the root-owned copy; it
+declares the host again from what it has then. Nothing here is run by the node itself: the install is the one step that
+needs root.
 
 ### Alert and card
 
-`host-network-drift` (critical) fires for each drift item that holds for 60 seconds, labelled `item`, and clears when the
-item is put back. It reads the status file on each tick; a node with no status file, or one older than three minutes, has the
-rule unknown, which never resolves a firing alert.
+`host-network-drift` (critical) fires for each drift item that holds for 60 seconds, labelled `item`, and clears when
+the item is put back. It reads the status file on each tick; a node with no status file, or one older than three
+minutes, has the rule unknown, which never resolves a firing alert.
 
-The action `host_network_restore` takes no arguments. It is proposed with `action_propose` like the others, and the owner
-sees a card, "Put back this host's forwarding and firewall rules", with the declared state. When it is approved the node
-calls `apply-declared-state` on the socket, and the result is the read-back: `{restored, inSync, applied, drift, errors}`.
-A node whose socket does not answer refuses the proposal, so the owner is never asked for an action that cannot run.
+The action `host_network_restore` takes no arguments. It is proposed with `action_propose` like the others, and the
+owner sees a card: "Put this host's forwarding and firewall rules back as its declared file says", with the rows Host,
+Now (what has drifted, read from the root part when the card was proposed) and Effect. When it is approved the node
+calls `apply-declared-state` on the socket, and the result is the read-back: `{inSync, applied, drift, errors, at,
+message}`. A proposal is refused when the socket does not answer, when nothing is declared, and when the host is
+already as declared, so the owner is never asked for an action that cannot run or has nothing to do.
 
 ## Alerts
 

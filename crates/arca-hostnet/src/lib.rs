@@ -26,10 +26,11 @@ use std::path::PathBuf;
 
 /// The declared state, owned by root.
 pub const DECLARED_FILE: &str = "/etc/arca/host.json";
-/// The status file the root part writes and the user-level node reads.
-pub const STATUS_FILE: &str = "/run/arca/host-network-status.json";
+/// The status file the root part writes and the user-level node reads. It lives in a directory of the unit's own: the
+/// node's sockets are in `/run/arca`, which a unit's `RuntimeDirectory` would chown to root and remove when it stops.
+pub const STATUS_FILE: &str = "/run/arca-host-network/status.json";
 /// The socket the root part listens on.
-pub const SOCKET_FILE: &str = "/run/arca/host-network.sock";
+pub const SOCKET_FILE: &str = "/run/arca-host-network/host-network.sock";
 /// The systemd system unit the install writes.
 pub const UNIT_NAME: &str = "arca-host-network.service";
 /// Where the unit's file is written.

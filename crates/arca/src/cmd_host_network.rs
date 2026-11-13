@@ -131,9 +131,9 @@ fn bridge_list(text: Option<&str>) -> Vec<String> {
 /// `host-network install [--takeover <unit>] [--bridges <a,b>] [--replace] [--dry-run]`.
 fn install(flags: &Flags) -> Result<Option<Value>, Failure> {
     let dry_run = flags.switch("dry-run");
-    if !dry_run && !is_root() {
+    if !is_root() {
         return Err(Failure::Refused(
-            "host-network install writes /etc and starts a system unit, so it runs only as root; --dry-run prints every step without root and changes nothing".to_string(),
+            "host-network install writes /etc and starts a system unit, so it runs only as root; --dry-run also needs root, since the firewall can be read only as root, and it changes nothing".to_string(),
         ));
     }
     let options = install::Options {
@@ -164,11 +164,13 @@ pub fn install_with(
         }
         _ => Value::Null,
     };
+    let notes = install::notes(options, &observed);
     if dry_run {
         return Ok(Some(json!({
             "dryRun": true,
             "steps": install::render(&steps),
             "declared": declared,
+            "notes": notes,
         })));
     }
     let done = install::execute(&steps, runner).map_err(Failure::Runtime)?;
@@ -187,6 +189,7 @@ pub fn install_with(
         "dryRun": false,
         "steps": done,
         "declared": declared,
+        "notes": notes,
         "status": read_back,
         "note": if read_back.is_none() {
             json!("the unit was started but its socket did not answer in time: run arca host-network status --live")
@@ -289,6 +292,37 @@ mod tests {
         assert_eq!(steps.len(), 7);
         assert_eq!(steps[6], "run systemctl disable hand-fix.service");
         assert!(host.changes().is_empty(), "a dry run runs no change");
+    }
+
+    #[test]
+    fn a_dry_run_carries_the_notes_about_what_the_install_will_not_do_or_will_change() {
+        let host = FakeHost::new().forwarding(true, false).docker();
+        let options = install::Options {
+            takeover: Some("hand-fix.service".to_string()),
+            ..install::Options::default()
+        };
+        let value = install_with(
+            &host,
+            &Paths::system(),
+            &options,
+            Path::new("/x/arca"),
+            true,
+        )
+        .expect("plans")
+        .expect("a result");
+        let notes: Vec<&str> = value["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("IPv6 forwarding is off"))
+        );
+        assert!(notes.iter().any(|note| note.contains("hand-fix.service")));
     }
 
     #[test]
