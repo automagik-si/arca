@@ -896,20 +896,31 @@ false; true sets `boot.autostart=true`.
 
 `noNewPrivileges` defaults to false. With `true` the container runs with no-new-privileges: the kernel's
 `PR_SET_NO_NEW_PRIVS` is set on its init, so a setuid or setcap binary inside it (`su`, `passwd`, `mount`) cannot raise
-privileges, and a process started with `incus exec` has it too. Incus 7.5 has no config key of its own for this, so a
-create writes the LXC key through the instance's `raw.lxc`: `lxc.no_new_privs=1`. Without the key, or with `false`, the
-create carries no `raw.lxc`, as always. The service's record keeps it (`noNewPrivileges: true`), `service_list` and
-`service_status` show `noNewPrivileges: true` for such a service and no such key for any other, and `service_update`
-keeps it: it rebuilds only the root, and Incus keeps the config. A service made without the key gains it without being
-removed: set `noNewPrivileges` in its template (`arca templates install`), then run `service_update` to a new digest. The
-update gives the service's record the key and writes `raw.lxc` into the instance before the rebuilt container starts, and
-the data volume is never touched. An update to the digest the service already runs changes nothing, so it does not gain
-the key; and a template that drops the key does not take it from a service that has it. Only an OCI or system container of the node's own
-project takes it. A virtual-machine template that sets it is refused, and so is a create in a tenant, whose project
-refuses `raw.lxc`. A node whose service project is restricted must allow low-level container config
-(`restricted.containers.lowlevel=allow`) for the create to go through: Arca does not change that project key, and
-refuses the create, before anything is written, naming it when it is not allowed. The key makes the whole container
-no-new-privileges, not only one user: an image that needs a setuid helper to work inside it will not.
+privileges, and a process started with `incus exec` has it too. The key makes the whole container no-new-privileges, not
+only one user: an image that needs a setuid helper to work inside it will not. Incus 7.5 has no config key of its own
+for this, so a create writes the LXC key through the instance's `raw.lxc`: `lxc.no_new_privs=1`. Without the key, or
+with `false`, the create carries no `raw.lxc`, as always.
+
+**It needs a step on the node first.** Every project Arca makes, the service project `arcak-svc` included, is created
+restricted, and Incus refuses any `raw.*` key in a restricted project unless `restricted.containers.lowlevel` is
+`allow`. Arca does not set that key itself. Someone with Incus admin rights on the node (root) runs
+`incus project set arcak-svc restricted.containers.lowlevel=allow`, and Arca keeps the value. What it loosens: the key
+is all or nothing for the project. `allow` admits every `raw.*` key (`raw.lxc`, `raw.apparmor`, `raw.seccomp`,
+`raw.idmap`) and the other low-level keys (the table in "Adopting a container" lists them) on every instance in `arcak-svc`,
+not only on the services that set `noNewPrivileges`; only Arca writes instances there, and it writes `raw.lxc` for this
+key alone. Until it is allowed, a `service_create` or `service_update` of such a template is refused before anything is
+written, naming the key; so is a create on a node whose service project does not exist yet, since Arca would make it
+restricted. A tenant's project blocks it for good: a tenant's service is refused, and so is a virtual-machine template.
+
+The service's record keeps `noNewPrivileges: true`, and `service_list` and `service_status` show `noNewPrivileges: true`
+for such a service and no such key for any other. An existing service gains or loses the key without being removed or
+rebuilt: change `noNewPrivileges` in its template (`arca templates install`), then call `service_update` with the digest
+the service already runs. When the template and the service differ, that call checks the project as above, saves the
+record, writes `raw.lxc` into the instance and restarts it if it runs (the setting takes effect at the next start, so a
+stopped service has it from then); the image and the data volume are not touched, and no rebuild happens. The answer
+says `noNewPrivileges` and `restarted`. If the write is refused or the restart fails, the record is put back and the
+answer says so. The call is refused when it also moves the digest: do the key first, then the digest. Without a
+difference, an update to the digest the service already runs is the no-op it always was.
 
 `data` names an absolute printable mount `path` of at most 255 bytes that is not the root (`/`, `//` and `/.` are
 refused) and has no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit), and an optional `size` such as

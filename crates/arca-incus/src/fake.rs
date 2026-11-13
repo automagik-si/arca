@@ -1701,6 +1701,27 @@ impl Store {
             .and_then(Value::as_object)
     }
 
+    /// Why a restricted project refuses `config`: a `raw.*` key, set to anything, while
+    /// `restricted.containers.lowlevel` is not `allow` (Incus: `Use of low-level config "raw.lxc" ... is forbidden`).
+    /// A project that is not restricted, or a key that is being removed, refuses nothing.
+    fn restricted_low_level(&self, project: &str, config: &Map<String, Value>) -> Option<String> {
+        let held = self.project_config(project)?;
+        if held.get("restricted").and_then(Value::as_str) != Some("true")
+            || held
+                .get("restricted.containers.lowlevel")
+                .and_then(Value::as_str)
+                == Some("allow")
+        {
+            return None;
+        }
+        config
+            .iter()
+            .find(|(key, value)| {
+                key.starts_with("raw.") && value.as_str().is_some_and(|value| !value.is_empty())
+            })
+            .map(|(key, _)| format!("Use of low-level config {key:?} is forbidden"))
+    }
+
     /// The reason an instance body is refused by its project's restriction: a NIC names a network the project's
     /// `restricted.networks.access` does not list (an unset grant lists every network), or names no managed network
     /// while `restricted.devices.nic` is not `allow`.
@@ -1865,6 +1886,12 @@ fn create(
         && let Some(reason) = store.restricted_nic(&project, &body)
     {
         return (403, String::new(), error_envelope(403, reason));
+    }
+    if kind == "instance"
+        && let Some(config) = body.get("config").and_then(Value::as_object)
+        && let Some(reason) = store.restricted_low_level(&project, config)
+    {
+        return (403, String::new(), error_envelope(403, &reason));
     }
     if kind == "instance"
         && let Some(source) = body.get("source").and_then(Value::as_object)
@@ -2171,6 +2198,13 @@ fn patch(
     };
     if store.objects[index].kind == "project" {
         return write_project(shared, store, index, &changes, false);
+    }
+    if store.objects[index].kind == "instance"
+        && let Some(config) = changes.get("config").and_then(Value::as_object)
+        && let Some(reason) =
+            store.restricted_low_level(&store.objects[index].project.clone(), config)
+    {
+        return (403, String::new(), error_envelope(403, &reason));
     }
     let mut changes = changes;
     if store.objects[index].kind == "acl" {

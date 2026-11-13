@@ -538,6 +538,32 @@ impl ServiceHandler {
         } else {
             Reach::Running
         };
+        // What the template says now about no-new-privileges, against what the service has. A difference is applied
+        // as a config write and a restart, never a rebuild, so the data stays where it is. It is its own step: an
+        // update that also moves the digest is refused, so no answer mixes the two and a failure of one never
+        // leaves the other half done.
+        let wanted = config
+            .tenant
+            .is_none()
+            .then(|| {
+                crate::service::load_template(
+                    &self.cfg.state_dir.join("templates"),
+                    &config.template,
+                )
+                .ok()
+            })
+            .flatten()
+            .map(|template| template.no_new_privileges)
+            .filter(|wanted| *wanted != config.no_new_privileges);
+        if let Some(wanted) = wanted {
+            if new_source != config.source {
+                return Err(said(&format!(
+                    "its template now {} noNewPrivileges, which is applied by its own update: call service_update with the digest the service already runs first, then move the digest",
+                    if wanted { "sets" } else { "drops" }
+                )));
+            }
+            return self.change_no_new_privileges(&entry, &config, wanted, &digest);
+        }
         if new_source == config.source {
             return Ok(json!({
                 "updated": false,
@@ -575,19 +601,6 @@ impl ServiceHandler {
             return Err(said(
                 "the service has never been started, and a rebuild would leave it unable to start: start it with instance_start first",
             ));
-        }
-        // A template that now says `noNewPrivileges` gives it to a service made without it: the record gains the key and
-        // the node writes `raw.lxc` into the instance's config, which Incus keeps through the rebuild, so the start
-        // below runs with it. The data volume is untouched. A template without the key never takes it away.
-        let gains = config.tenant.is_none()
-            && !config.no_new_privileges
-            && crate::service::load_template(
-                &self.cfg.state_dir.join("templates"),
-                &config.template,
-            )
-            .is_ok_and(|template| template.no_new_privileges);
-        if gains {
-            self.amend(&entry.id.0, &name, |record| record.no_new_privileges = true)?;
         }
         let journal = Journal {
             path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
@@ -633,6 +646,139 @@ impl ServiceHandler {
         let outcome = run.go(seen);
         drop(claim);
         outcome
+    }
+}
+
+impl ServiceHandler {
+    /// Makes a service's no-new-privileges what its template says: the record, the instance's `raw.lxc` and a restart
+    /// when it runs, in that order, and nothing else. The image and the data volume are not touched. The project is
+    /// checked first when the key is gained; a record the node saved and could not apply, or a restart that failed,
+    /// is put back, so every answer says what is true.
+    fn change_no_new_privileges(
+        &self,
+        entry: &Entry,
+        config: &ServiceConfig,
+        wanted: bool,
+        digest: &str,
+    ) -> Result<Value, CallError> {
+        let name = &config.name;
+        let said = |why: &str| refused(format!("update service {name}: {why}"));
+        let _claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
+            .ok_or_else(|| {
+                said("another update of this service is running. Nothing was changed")
+            })?;
+        let changer = self.state_changer(config)?;
+        let seen = changer
+            .read(&config.project, &config.instance)
+            .map_err(|error| {
+                said(&format!(
+                    "its instance was not read ({}). Nothing was changed",
+                    incus_words(&error)
+                ))
+            })?;
+        let journalled = lock(&self.kernel)?.service_uuid(&entry.id, &config.instance);
+        if seen.kind != "container" || journalled.is_none() || journalled != seen.uuid {
+            return Err(said(
+                "its instance is not the one Arca created for it. Nothing was changed",
+            ));
+        }
+        if wanted
+            && let Some(why) = crate::handlers::no_new_privileges_refusal(
+                &arca_incus::UnixIncus::new(self.cfg.incus.socket.clone()),
+                &config.template,
+            )
+        {
+            return Err(refused(format!(
+                "update service {name}: {}",
+                why.replace("Nothing was created", "Nothing was changed")
+            )));
+        }
+        let journal = Journal {
+            path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
+            id: format!("{}-{}", entry.id.0, (self.clock)()),
+            service: name.clone(),
+            clock: self.clock.clone(),
+        };
+        journal
+            .line(
+                "begin",
+                true,
+                json!({ "noNewPrivileges": wanted, "digest": digest, "rebuild": false }),
+            )
+            .map_err(|_| said("the update journal could not be written. Nothing was changed"))?;
+        // The node saves the record before it writes the instance, so a refused write leaves the new value saved:
+        // it is put back here, and the answer says whether that worked.
+        let put_back = || {
+            self.amend(&entry.id.0, name, |record| {
+                record.no_new_privileges = !wanted
+            })
+            .is_ok()
+        };
+        if let Err(error) = self.amend(&entry.id.0, name, |record| {
+            record.no_new_privileges = wanted
+        }) {
+            let said_so = match &error {
+                CallError::Refused { message, .. } | CallError::Invalid(message) => message.clone(),
+                _ => "the node did not apply it".to_string(),
+            };
+            let restored = put_back();
+            journal.step("apply", false, json!({ "restored": restored }));
+            return Err(refused(format!(
+                "update service {name}: noNewPrivileges was not applied: {said_so}. {}",
+                if restored {
+                    "The service's record is as it was. Nothing was changed"
+                } else {
+                    "The service's record could not be put back: service_status shows what it says"
+                }
+            )));
+        }
+        journal.step("apply", true, json!({}));
+        let was_running = seen.is_running();
+        if was_running && let Err(error) = changer.change(&seen, StateAction::Restart) {
+            let restored = put_back();
+            let running = changer
+                .read(&config.project, &config.instance)
+                .map(|state| state.is_running())
+                .unwrap_or(false);
+            let started = running
+                || changer
+                    .read(&config.project, &config.instance)
+                    .and_then(|state| changer.change(&state, StateAction::Start))
+                    .is_ok();
+            journal.step(
+                "restart",
+                false,
+                json!({ "restored": restored, "running": started }),
+            );
+            return Err(refused(format!(
+                "update service {name}: the restart failed ({}). {} {}",
+                incus_words(&error),
+                if restored {
+                    "The service's record and its instance's config are as they were."
+                } else {
+                    "The service's record could not be put back: service_status shows what it says."
+                },
+                if started {
+                    "The service is running."
+                } else {
+                    "The service is stopped: instance_start starts it."
+                },
+            )));
+        }
+        journal.step("restart", true, json!({ "restarted": was_running }));
+        journal.step("end", true, json!({ "noNewPrivileges": wanted }));
+        Ok(json!({
+            "updated": true,
+            "service": name,
+            "digest": digest,
+            "noNewPrivileges": wanted,
+            "restarted": was_running,
+            "message": format!(
+                "the service now runs {} no-new-privileges, as its template says{}; its image and data were not touched",
+                if wanted { "with" } else { "without" },
+                if was_running { ", and was restarted for it" } else { ", from its next start" },
+            ),
+        }))
     }
 }
 

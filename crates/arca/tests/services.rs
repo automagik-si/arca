@@ -339,6 +339,26 @@ impl Rig {
         );
     }
 
+    /// The status code the fake Incus answers a request with.
+    fn status_of(&self, method: &str, path: &str, body: Value) -> u16 {
+        use std::io::{Read, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(self.fake.socket()).unwrap();
+        let body = body.to_string();
+        write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    /// What the owner does on a node, as an Incus admin, for noNewPrivileges: the service project allows low-level
+    /// container config. Arca never sets this key itself.
+    fn allow_low_level(&self) {
+        let path = format!("/1.0/projects/{PROJECT}");
+        let mut config = self.get(&path).expect("the project")["config"].clone();
+        config["restricted.containers.lowlevel"] = json!("allow");
+        self.edit("PATCH", &path, json!({ "config": config }));
+    }
+
     fn service_config(&self, name: &str) -> service::ServiceConfig {
         serde_json::from_value(
             self.entries()
@@ -456,6 +476,10 @@ fn a_template_that_sets_no_new_privileges_gives_its_container_the_lxc_key_and_th
     strict["noNewPrivileges"] = json!(true);
     rig.template("strict", strict);
     rig.template("nats", nats_template());
+    // The service project is made, restricted, with the node's first service; the owner then allows low-level config.
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("plain create");
+    rig.allow_low_level();
     let created = rig
         .call(
             "service_create",
@@ -473,12 +497,22 @@ fn a_template_that_sets_no_new_privileges_gives_its_container_the_lxc_key_and_th
         .expect("status");
     assert_eq!(status["noNewPrivileges"], json!(true));
     let listed = rig.call("service_list", json!({})).expect("list");
-    assert_eq!(listed["services"][0]["noNewPrivileges"], json!(true));
-    // The default is off: another template, without the key, has no `raw.lxc` and no key in its view.
-    let plain = rig
-        .call("service_create", json!({"name":"nats","template":"nats"}))
-        .expect("plain create");
-    assert!(plain.get("noNewPrivileges").is_none());
+    let rows = listed["services"].as_array().expect("rows");
+    let row = |name: &str| rows.iter().find(|row| row["name"] == name).expect("row");
+    assert_eq!(row("strict")["noNewPrivileges"], json!(true));
+    // The MCP door checks each answer against its verb's closed result schema, and a service that fails that is
+    // answered "the tool failed": the three answers of a service with the key must fit.
+    for (verb_name, answer) in [
+        ("service_create", &created),
+        ("service_status", &status),
+        ("service_list", &listed),
+    ] {
+        let verb = arca_api::verb(verb_name).expect("the verb");
+        arca_api::conforms(&(verb.result)(), answer)
+            .unwrap_or_else(|why| panic!("{verb_name}: {why}"));
+    }
+    // The default is off: the service made without the key has no `raw.lxc` and no key in its view.
+    assert!(row("nats").get("noNewPrivileges").is_none());
     let instance = rig
         .get(&format!("/1.0/instances/nats?project={PROJECT}"))
         .expect("instance");
@@ -488,8 +522,10 @@ fn a_template_that_sets_no_new_privileges_gives_its_container_the_lxc_key_and_th
     off["name"] = json!("off");
     off["noNewPrivileges"] = json!(false);
     rig.template("off", off);
-    rig.call("service_create", json!({"name":"off","template":"off"}))
+    let off = rig
+        .call("service_create", json!({"name":"off","template":"off"}))
         .expect("off create");
+    assert!(off.get("noNewPrivileges").is_none());
     let instance = rig
         .get(&format!("/1.0/instances/off?project={PROJECT}"))
         .expect("instance");
@@ -497,7 +533,7 @@ fn a_template_that_sets_no_new_privileges_gives_its_container_the_lxc_key_and_th
 }
 
 #[test]
-fn a_restricted_project_that_refuses_low_level_config_refuses_a_no_new_privileges_create_before_any_write_and_one_that_allows_it_does_not()
+fn every_project_arca_makes_is_restricted_so_a_no_new_privileges_create_is_refused_before_any_write_until_the_owner_allows_it()
  {
     let rig = Rig::new();
     let mut strict = nats_template();
@@ -505,36 +541,54 @@ fn a_restricted_project_that_refuses_low_level_config_refuses_a_no_new_privilege
     strict["noNewPrivileges"] = json!(true);
     rig.template("strict", strict);
     rig.template("nats", nats_template());
-    // The project exists from the node's first service.
+    let refuses = |rig: &Rig, why: &str| {
+        let before = rig.fake.writes().len();
+        let refused = rig
+            .call(
+                "service_create",
+                json!({"name":"strict","template":"strict"}),
+            )
+            .expect_err("refused");
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("restricted.containers.lowlevel")
+                && message.contains("Nothing was created")
+                && message.contains(why),
+            "{message}"
+        );
+        assert_eq!(rig.fake.writes().len(), before, "nothing was written");
+        assert!(
+            rig.get(&format!("/1.0/instances/strict?project={PROJECT}"))
+                .is_none()
+        );
+    };
+    // A node whose first service uses the key: the project does not exist yet and Arca would make it restricted.
+    refuses(&rig, "does not exist yet");
+    // The project exists from the first service, restricted, with the key unset.
     rig.call("service_create", json!({"name":"nats","template":"nats"}))
         .expect("first service");
-    let project = format!("/1.0/projects/{PROJECT}");
-    let patch = |changes: Value| {
-        let mut config = rig.get(&project).expect("the project")["config"].clone();
-        for (key, value) in changes.as_object().expect("object") {
-            config[key] = value.clone();
-        }
-        rig.edit("PATCH", &project, json!({ "config": config }));
-    };
-    patch(json!({"restricted": "true", "restricted.containers.lowlevel": "block"}));
-    let before = rig.fake.writes().len();
-    let refused = rig
-        .call(
-            "service_create",
-            json!({"name":"strict","template":"strict"}),
-        )
-        .expect_err("refused");
-    let message = format!("{refused:?}");
-    assert!(
-        message.contains("restricted.containers.lowlevel")
-            && message.contains("Nothing was created"),
-        "{message}"
+    assert_eq!(
+        rig.get(&format!("/1.0/projects/{PROJECT}"))
+            .expect("project")["config"]["restricted"],
+        "true"
     );
-    assert_eq!(rig.fake.writes().len(), before, "nothing was written");
-    // A template without the key is untouched by the project's restriction.
+    refuses(&rig, "restricts low-level container config");
+    // Beneath Arca's own refusal Incus refuses `raw.lxc` there, on a patch as on a create, and the fake does too.
+    let patch = |value: &str| {
+        rig.status_of(
+            "PATCH",
+            &format!("/1.0/instances/nats?project={PROJECT}"),
+            json!({"config": {"raw.lxc": value}}),
+        )
+    };
+    assert_eq!(patch("lxc.no_new_privs=1"), 403);
+    assert_eq!(patch(""), 200, "a key being removed is not refused");
+    // A template without the key is untouched by the restriction.
     rig.call("service_create", json!({"name":"nats2","template":"nats"}))
         .expect("an ordinary create");
-    patch(json!({"restricted.containers.lowlevel": "allow"}));
+    rig.allow_low_level();
+    assert_eq!(patch("lxc.no_new_privs=1"), 200);
+    assert_eq!(patch(""), 200);
     rig.call(
         "service_create",
         json!({"name":"strict","template":"strict"}),

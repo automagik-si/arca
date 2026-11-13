@@ -1155,8 +1155,9 @@ impl Plugin for Service {
                     changes.insert(format!("environment.{key}"), None);
                 }
             }
-            // `raw.lxc` follows the record's `noNewPrivileges`: gained, it is written; lost, it is removed only when it
-            // is exactly the value Arca writes. Any other `raw.lxc` is not Arca's and is left as it is.
+            // `raw.lxc` follows the record's `noNewPrivileges`. While the record says true, `raw.lxc` is Arca's: it is
+            // written as `lxc.no_new_privs=1`, replacing any other value. When the record says false, it is removed
+            // only if it is exactly that value; any other `raw.lxc` is not Arca's and is left as it is.
             let raw = current.get("raw.lxc").and_then(Value::as_str);
             if cfg.no_new_privileges {
                 if raw != Some(NO_NEW_PRIVS_RAW_LXC) {

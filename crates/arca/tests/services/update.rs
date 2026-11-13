@@ -896,37 +896,94 @@ fn a_follow_proposal_that_mixes_in_a_digest_or_erase_data_is_refused_when_it_is_
             .count(),
         0
     );
+}
+
+fn strict_app() -> Value {
+    let mut strict = app_template();
+    strict["noNewPrivileges"] = json!(true);
+    strict
+}
+
+fn record_flag(rig: &Rig) -> bool {
+    rig.service_config("app").no_new_privileges
+}
 
 #[test]
-fn a_service_made_without_no_new_privileges_gains_it_through_an_update_and_keeps_its_data() {
+fn a_service_gains_and_drops_no_new_privileges_through_an_update_with_a_restart_and_its_data_in_place()
+ {
     let up = Arc::new(AtomicBool::new(true));
     let rig = bare_rig(&up);
     let before = instance(&rig);
     assert!(before["config"].get("raw.lxc").is_none());
-    assert!(!rig.service_config("app").no_new_privileges);
-    // Without the key in the template, an update leaves things as they were.
-    update(&rig, json!({ "name": "app", "digest": NEW })).expect("plain update");
+    // Nothing differs: the update to the digest it runs is the no-op it always was.
+    let same = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("same");
+    assert_eq!(same["updated"], false);
+    // The template now says the key, and the project is as Arca makes it: restricted, low-level config blocked.
+    rig.template("app", strict_app());
+    let refused = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect_err("refused");
+    let message = format!("{refused:?}");
+    assert!(
+        message.contains("restricted.containers.lowlevel")
+            && message.contains("Nothing was changed"),
+        "{message}"
+    );
+    assert!(!record_flag(&rig), "the record was never saved");
     assert!(instance(&rig)["config"].get("raw.lxc").is_none());
-    assert!(!rig.service_config("app").no_new_privileges);
-    // The template now says it: the next update gives the service the key, in its record and in its instance.
-    let mut strict = app_template();
-    strict["noNewPrivileges"] = json!(true);
-    rig.template("app", strict);
-    let newer = format!("sha256:{}", "3".repeat(64));
-    update(&rig, json!({ "name": "app", "digest": newer })).expect("gaining update");
+    // A digest that also moves is its own update: refused, and nothing changed.
+    rig.allow_low_level();
+    let mixed = update(&rig, json!({ "name": "app", "digest": NEW })).expect_err("mixed");
+    assert!(format!("{mixed:?}").contains("its own update"), "{mixed:?}");
+    assert!(!record_flag(&rig));
+    assert!(rig.fake.rebuilds(PROJECT, "app").is_empty());
+    // Allowed, the same digest gains the key: a config write and a restart, no rebuild, the data where it was.
+    let done = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("gain");
+    assert_eq!(done["updated"], true);
+    assert_eq!(done["noNewPrivileges"], true);
+    assert_eq!(done["restarted"], true);
+    let verb = arca_api::verb("service_update").expect("the verb");
+    arca_api::conforms(&(verb.result)(), &done).expect("the answer fits its schema");
     let after = instance(&rig);
     assert_eq!(after["config"]["raw.lxc"], "lxc.no_new_privs=1");
-    assert!(rig.service_config("app").no_new_privileges);
+    assert!(record_flag(&rig));
+    assert_eq!(after["status"], "Running");
+    assert!(rig.fake.rebuilds(PROJECT, "app").is_empty(), "no rebuild");
     assert_eq!(after["devices"]["data"], before["devices"]["data"]);
     assert_eq!(
         after["config"]["volatile.uuid"],
         before["config"]["volatile.uuid"]
     );
-    assert_eq!(after["status"], "Running");
-    // A template that drops the key does not take it from a service the next update.
+    // It now matches the template: another update to the same digest is the no-op again.
+    let again = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("again");
+    assert_eq!(again["updated"], false);
+    // The template drops the key: the next update takes it away the same way.
     rig.template("app", app_template());
-    let last = format!("sha256:{}", "4".repeat(64));
-    update(&rig, json!({ "name": "app", "digest": last })).expect("later update");
-    assert_eq!(instance(&rig)["config"]["raw.lxc"], "lxc.no_new_privs=1");
-    assert!(rig.service_config("app").no_new_privileges);
+    let dropped = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("drop");
+    assert_eq!(dropped["noNewPrivileges"], false);
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    assert!(!record_flag(&rig));
+    assert_eq!(instance(&rig)["devices"]["data"], before["devices"]["data"]);
+    let steps: Vec<String> = journal(&rig).into_iter().map(|(step, _)| step).collect();
+    assert!(steps.contains(&"apply".to_string()) && steps.contains(&"restart".to_string()));
+}
+
+#[test]
+fn a_no_new_privileges_write_the_node_cannot_apply_leaves_the_record_as_it_was() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    rig.template("app", strict_app());
+    rig.allow_low_level();
+    // Incus refuses the instance's config write after the node saved the record.
+    rig.fake.set_reject_patch(&format!("/1.0/instances/app"));
+    let refused = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect_err("refused");
+    let message = format!("{refused:?}");
+    assert!(
+        message.contains("not applied") && message.contains("record is as it was"),
+        "{message}"
+    );
+    assert!(
+        !record_flag(&rig),
+        "the record claims nothing the instance lacks"
+    );
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    assert_eq!(instance(&rig)["status"], "Running");
 }

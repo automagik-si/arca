@@ -4047,6 +4047,32 @@ const DEPLOY_OUTSIDE_TENANT: &str = "deploy: only a call inside a tenant names a
 /// Why a tenant's virtual machine that names a host bridge is not made.
 const TENANT_BRIDGE: &str = "bridge: a virtual machine in a tenant joins the managed service network only, never a host bridge";
 
+/// Why the node's own service project cannot take a container with `noNewPrivileges`, or `None` when it can. Every
+/// project Arca makes is restricted, and Incus refuses `raw.lxc` in one unless `restricted.containers.lowlevel` is
+/// `allow`. A project that does not exist yet is made restricted with that key unset, so it counts as refusing; one
+/// that cannot be read decides nothing in its favour. Said before any write.
+pub(crate) fn no_new_privileges_refusal(read: &UnixIncus, template: &str) -> Option<String> {
+    let project = arca_netproject::PROJECT;
+    let why = match read.get(&format!("/1.0/projects/{project}?project={project}")) {
+        Ok(found) => {
+            let restricted = found["config"]["restricted"].as_str() == Some("true");
+            let allowed =
+                found["config"]["restricted.containers.lowlevel"].as_str() == Some("allow");
+            if !restricted || allowed {
+                return None;
+            }
+            "restricts low-level container config"
+        }
+        Err(arca_incus::IncusError::Status { code: 404, .. }) => {
+            "does not exist yet, and Arca makes it restricted"
+        }
+        Err(_) => "cannot be read to check it",
+    };
+    Some(format!(
+        "template {template}: noNewPrivileges needs the LXC config raw.lxc, and the Incus project {project} {why} (restricted.containers.lowlevel is not allow). Nothing was created"
+    ))
+}
+
 /// Why a tenant's service is not made from a template that sets `noNewPrivileges`.
 fn tenant_no_new_privileges(template: &str) -> String {
     format!(
@@ -7612,23 +7638,11 @@ impl ServiceHandler {
                         return Err(refusal);
                     }
                 }
-                if template.no_new_privileges && tenant.is_none() {
-                    // A restricted project refuses `raw.lxc` unless it allows low-level config: said here, in words,
-                    // before anything is written. A project not made yet, or one that cannot be read, decides nothing.
-                    let found = read.get(&format!(
-                        "/1.0/projects/{0}?project={0}",
-                        arca_netproject::PROJECT
-                    ));
-                    if let Ok(found) = found
-                        && found["config"]["restricted"].as_str() == Some("true")
-                        && found["config"]["restricted.containers.lowlevel"].as_str()
-                            != Some("allow")
-                    {
-                        return Err(service_refused(format!(
-                            "template {template_name}: noNewPrivileges needs the LXC config raw.lxc, and the Incus project {} is restricted and does not allow low-level container config (restricted.containers.lowlevel). Nothing was created",
-                            arca_netproject::PROJECT
-                        )));
-                    }
+                if template.no_new_privileges
+                    && tenant.is_none()
+                    && let Some(why) = no_new_privileges_refusal(&read, template_name)
+                {
+                    return Err(service_refused(why));
                 }
                 let ipv4 = self.free_address(
                     &read,

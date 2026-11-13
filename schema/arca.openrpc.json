@@ -4726,6 +4726,11 @@
               "maxLength": 40,
               "type": "string"
             },
+            "noNewPrivileges": {
+              "const": true,
+              "description": "Present, and true, only on a container that runs with no-new-privileges: a setuid or setcap binary inside it cannot raise privileges. It comes from the template's noNewPrivileges and is kept in the service's record.",
+              "type": "boolean"
+            },
             "note": {
               "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
               "maxLength": 200,
@@ -5023,6 +5028,11 @@
                   "name": {
                     "maxLength": 40,
                     "type": "string"
+                  },
+                  "noNewPrivileges": {
+                    "const": true,
+                    "description": "Present, and true, only on a container that runs with no-new-privileges: a setuid or setcap binary inside it cannot raise privileges. It comes from the template's noNewPrivileges and is kept in the service's record.",
+                    "type": "boolean"
                   },
                   "note": {
                     "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
@@ -5335,6 +5345,11 @@
             "name": {
               "maxLength": 40,
               "type": "string"
+            },
+            "noNewPrivileges": {
+              "const": true,
+              "description": "Present, and true, only on a container that runs with no-new-privileges: a setuid or setcap binary inside it cannot raise privileges. It comes from the template's noNewPrivileges and is kept in the service's record.",
+              "type": "boolean"
             },
             "note": {
               "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
@@ -5684,6 +5699,14 @@
             "message": {
               "type": "string"
             },
+            "noNewPrivileges": {
+              "description": "Present when the call changed whether the service runs with no-new-privileges, to match its template: what it set. The service was restarted when it ran, and its image and data were not touched.",
+              "type": "boolean"
+            },
+            "restarted": {
+              "description": "Present with noNewPrivileges: whether the service was restarted for it (true when it was running).",
+              "type": "boolean"
+            },
             "service": {
               "type": "string"
             },
@@ -5695,7 +5718,7 @@
               ]
             },
             "updated": {
-              "description": "False when the service already ran this digest and nothing was changed.",
+              "description": "False when the service already ran this digest and nothing was changed. True when the image moved, or when only the no-new-privileges setting changed to match the template.",
               "type": "boolean"
             }
           },
@@ -5912,6 +5935,11 @@
                 "name": {
                   "maxLength": 40,
                   "type": "string"
+                },
+                "noNewPrivileges": {
+                  "const": true,
+                  "description": "Present, and true, only on a container that runs with no-new-privileges: a setuid or setcap binary inside it cannot raise privileges. It comes from the template's noNewPrivileges and is kept in the service's record.",
+                  "type": "boolean"
                 },
                 "note": {
                   "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
