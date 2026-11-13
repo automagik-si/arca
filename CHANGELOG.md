@@ -11,9 +11,9 @@ An `action_propose` answer now says where and by when: the approval page's addre
 expires, fifteen minutes after it was proposed, and how many owner passkeys the node itself trusts (`passkeysTrusted`).
 While none is trusted, its `nextStep` says how to enrol one first, with the `ssh -o ExitOnForwardFailure=yes -L` line
 when the page is on localhost only. A node set to trust another page host's passkeys (`approval.trustOwnerKeysFrom` or
-`approval.peerKeys`) says instead that the card is approved on that host's page and needs no passkey on the node. Before,
-the answer named none of this, so the person who asked for the action did not know where to approve it, nor that it
-would lapse.
+`approval.peerKeys`) says instead that the card is approved on that host's page and needs no passkey on the node.
+Before, the answer named none of this, so the person who asked for the action did not know where to approve it, nor
+that it would lapse.
 
 ## 0.21.0 (2026-11-13)
 
