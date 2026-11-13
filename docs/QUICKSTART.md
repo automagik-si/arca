@@ -3,6 +3,7 @@
 You need an x86_64 or aarch64 (ARM) Linux host with glibc 2.34 or newer (Enterprise Linux 9, Ubuntu 22.04, Debian 12,
 or newer), a running Incus, and a user who can read the Incus socket (on most installs, a member of the
 `incus-admin` group). This quickstart names no kernel project, so the node only reads: it sends Incus nothing but GET.
+Running Postgres or NATS later needs Incus 7.3 or later: [why](OPERATING.md#modes-and-the-umask).
 
 **What you have at the end:** a node that looks, not one that changes things. An assistant connected to it can read your
 projects, instances, host readings and alerts. It cannot create a database or a service, and there is no approval page.
