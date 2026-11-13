@@ -22,6 +22,15 @@ has now, copies the binary to a root-owned place, starts the unit and disables t
 is replaced and not doubled; `--dry-run` prints every step. See "Host forwarding and the firewall" in docs/OPERATING.md.
 Not done here: IPv6 firewall rules, and the canvas does not yet draw the new card (the owner's approval page does).
 
+`service_update` no longer erases a service's data silently. It refuses, before it writes anything, a service whose
+template declares a data volume but whose instance has none, which is how a database, a nats server or an Omni API made
+before the volumes keep their data: the update would rebuild the root disk and the data with it. The refusal says so in
+plain words and names the service and its template; it holds for a direct call, for `action_propose` and for an approved
+proposal when it runs. To update such a service and start over with no data, `eraseData: true` is stated with the
+digest, and it needs the owner's approval: `service_update` can now be proposed with `action_propose`, and the card says
+that all the data is erased and cannot be brought back. A service that has its volume, and a service whose template
+declares none, update exactly as before.
+
 ## 0.24.0 (2026-11-13)
 
 A new token scope, `admin`, sits above `operator`, and a node holds one admin token at a time: `arca token mint --scope

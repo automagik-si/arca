@@ -408,7 +408,7 @@ static VERBS: [Verb; 68] = [
     },
     Verb {
         name: "service_update",
-        summary: "Move a running container service made from an image by digest to another digest of that image in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
+        summary: "Move a running container service made from an image by digest to another digest of that image in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. A service whose template declares a data volume that its instance does not have keeps its data inside the container, so the update would erase it: it is refused before anything is changed, unless eraseData is given, which needs the owner's approval (propose it with action_propose; the card says the data is erased). No other owner approval is asked.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -2449,6 +2449,7 @@ fn plan_list_result() -> Value {
 const ACTION_NAMES: [&str; 23] = [
     "service_create",
     "service_remove",
+    "service_update",
     "service_import",
     "service_release",
     "service_publish",
@@ -2545,6 +2546,10 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 const ACTION_EXAMPLES: [(&str, &str); 23] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
+    (
+        "service_update",
+        r#"{"name":"nats","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#,
+    ),
     ("service_import", r#"{"name":"web"}"#),
     ("service_release", r#"{"name":"web"}"#),
     ("service_publish", r#"{"name":"dash","reach":"tailnet"}"#),
@@ -3828,10 +3833,20 @@ fn service_update_params_base() -> Value {
     with_confirm(json!({
         "additionalProperties": false,
         "properties": {
+            "approval": {
+                "description": "Only with eraseData: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data; this verb is not called with an approval of its own.",
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+            },
             "digest": {
                 "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository. Give it, or follow, not both.",
                 "pattern": "^sha256:[0-9a-f]{64}$",
                 "type": "string"
+            },
+            "eraseData": {
+                "description": "Say true to update a service whose template declares a data volume but whose instance has none: it keeps its data inside the container, so the update erases ALL of it. Without this such an update is refused before anything is changed. It takes the owner's approval (propose it with action_propose): the card says in words that the data is erased. A service that has its data volume, and a service whose template declares none, never need it. Give it with digest.",
+                "type": "boolean"
             },
             "follow": {
                 "description": "Instead of a digest: whether the node moves this service to Automagik's newest published server image by itself (true) or leaves it where it is (false). A service made from the automagik-server template follows until this says false. Only a container of the node's own project made from ghcr.io/automagik-si/automagik-server by digest can say it. Nothing is restarted by this call.",
