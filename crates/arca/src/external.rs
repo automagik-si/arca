@@ -217,7 +217,11 @@ pub fn reachable(address: &str) -> bool {
     // The name lookup has no timeout of its own, so it runs apart and is waited for only until the deadline.
     let (send, receive) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = send.send((host.as_str(), port).to_socket_addrs().map(Iterator::collect::<Vec<_>>));
+        let _ = send.send(
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect::<Vec<_>>),
+        );
     });
     let Ok(Ok(addresses)) = receive.recv_timeout(PROBE_TIMEOUT) else {
         return false;

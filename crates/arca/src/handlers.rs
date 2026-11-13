@@ -4918,10 +4918,10 @@ impl ToolHandler for PostgresHandler {
 
 #[path = "function_handlers.rs"]
 mod function_handlers;
-#[path = "service_follow.rs"]
-mod service_follow;
 #[path = "service_external.rs"]
 mod service_external;
+#[path = "service_follow.rs"]
+mod service_follow;
 #[path = "service_omni.rs"]
 mod service_omni;
 pub use service_follow::{Attestation, FollowEdges, Followed, Follower, spawn_follower};

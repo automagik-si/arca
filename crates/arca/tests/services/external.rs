@@ -440,7 +440,9 @@ fn a_node_started_again_reads_the_record_back_through_its_own_handlers() {
         scope: Scope::Doctor,
         tools: None,
     };
-    let listed = again["service_list"].call(json!({}), &caller).expect("list");
+    let listed = again["service_list"]
+        .call(json!({}), &caller)
+        .expect("list");
     assert_eq!(listed["services"][0]["name"], "agent");
     let status = again["service_status"]
         .call(json!({"name":"agent"}), &caller)
