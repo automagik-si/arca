@@ -8,7 +8,7 @@ const NATS_DIGEST: &str = "sha256:311da47e2f31c26e99c623cd78d486a1e8ab039c49b326
 const PASSWORD: &str = "Synthetic0Leaf.password_with~safe-chars";
 const GIB: u64 = 1 << 30;
 
-fn shipped() -> std::path::PathBuf {
+pub(super) fn shipped() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates")
 }
 fn op(rig: &Rig, verb: &str, args: Value) -> Result<Value, CallError> {
@@ -31,7 +31,7 @@ fn acl(rig: &Rig, name: &str) -> Value {
     ))
     .expect("acl")
 }
-fn load(name: &str) -> service::Template {
+pub(super) fn load(name: &str) -> service::Template {
     service::load_template(&shipped(), name).expect("the shipped template loads")
 }
 fn rig() -> Rig {
@@ -109,18 +109,18 @@ fn the_script_is_installed_with_the_template_and_read_whole_into_its_entrypoint(
     );
     // The installed file, whole: the script word holds it either as it is or as one word that decodes it.
     let installed = fs::read_to_string(dir.join("nats.sh")).expect("the installed script");
-    assert_eq!(script_in(&line), installed.trim_end_matches('\n'));
+    assert_eq!(script_in(&line, "nats"), installed.trim_end_matches('\n'));
     assert!(installed.contains("sync_interval: always"));
 }
 
-/// The script an entrypoint line `/bin/sh -ec '<word>' nats` runs. The word is the script itself, or, where a node's
+/// The script an entrypoint line `/bin/sh -ec '<word>' <name>` runs. The word is the script itself, or, where a node's
 /// liblxc would split a word with whitespace, `__arca_script=$(echo${IFS}<base64>|base64${IFS}-d)&&eval...`, which
 /// is decoded here.
-fn script_in(line: &str) -> String {
+pub(super) fn script_in(line: &str, name: &str) -> String {
     use base64::Engine as _;
     let word = line
         .strip_prefix("/bin/sh -ec '")
-        .and_then(|rest| rest.strip_suffix("' nats"))
+        .and_then(|rest| rest.strip_suffix(&format!("' {name}")))
         .expect("the script word")
         .replace("'\\''", "'");
     let Some(encoded) = word
@@ -135,24 +135,32 @@ fn script_in(line: &str) -> String {
     String::from_utf8(bytes).expect("text")
 }
 
-/// What one run of `nats.sh` left: its exit code, what it printed, the configuration it wrote, and the fake server's arguments.
-struct Ran {
-    code: Option<i32>,
-    out: String,
-    err: String,
-    conf: Option<String>,
-    conf_mode: Option<u32>,
-    server_args: Option<String>,
-    store_made: bool,
+/// What one run of a nats script left: its exit code, what it printed, the configuration it wrote, and the fake server's
+/// arguments.
+pub(super) struct Ran {
+    pub(super) code: Option<i32>,
+    pub(super) out: String,
+    pub(super) err: String,
+    pub(super) conf: Option<String>,
+    pub(super) conf_mode: Option<u32>,
+    pub(super) server_args: Option<String>,
+    pub(super) store_made: bool,
     /// Whether anything landed where the decoy NATS_CONF or NATS_STORE_DIR point (the script must read neither).
-    used_a_decoy: bool,
+    pub(super) used_a_decoy: bool,
 }
 
 /// `nats.sh` as the template names it (`<shell> -ec <script> nats`), with `env` as its environment and a fake
 /// `nats-server` that records its arguments. `shell` is the program and the words before `-ec`.
 fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
-    let parts = load("nats").entrypoint.expect("an entrypoint");
-    let script = fs::read_to_string(shipped().join("nats.sh")).expect("the script");
+    run_template_in("nats", shell, env)
+}
+
+/// The script the shipped template `template` names in its entrypoint, run as that entrypoint runs it
+/// (`<shell> -ec <script> <name>`), with `env` as its environment and a fake `nats-server` that records its arguments.
+pub(super) fn run_template_in(template: &str, shell: &[&str], env: &[(&str, &str)]) -> Ran {
+    let parts = load(template).entrypoint.expect("an entrypoint");
+    let file = parts[2]["file"].as_str().expect("the script's file");
+    let script = fs::read_to_string(shipped().join(file)).expect("the script");
     let tail: Vec<&str> = parts.iter().filter_map(Value::as_str).skip(2).collect();
     static RUNS: AtomicU64 = AtomicU64::new(0);
     let work = std::env::temp_dir().join(format!(
@@ -217,7 +225,7 @@ fn run(env: &[(&str, &str)]) -> Ran {
 
 /// The image's own shell is busybox's `ash`. Where this host has busybox (a distribution's, not a download), the same
 /// script runs under it too; where it has none the test says so and runs the host's `sh` alone.
-fn shells() -> Vec<Vec<&'static str>> {
+pub(super) fn shells() -> Vec<Vec<&'static str>> {
     let mut shells = vec![vec!["/bin/sh"]];
     let busybox = ["/usr/bin/busybox", "/bin/busybox"]
         .into_iter()
@@ -297,7 +305,7 @@ fn the_script_writes_every_setting_the_design_names_and_starts_the_server_on_it_
 }
 
 /// The `store_dir` the run wrote, which is under the test's own work directory.
-fn conf_store(conf: &str) -> String {
+pub(super) fn conf_store(conf: &str) -> String {
     conf.lines()
         .find_map(|l| l.trim().strip_prefix("store_dir: \""))
         .and_then(|rest| rest.strip_suffix('"'))

@@ -431,12 +431,16 @@ fn an_ordinary_template_cannot_ask_for_a_private_port() {
     assert!(proxies(&instance(&rig, "web").expect("web")).is_empty());
     assert!(rig.entry("service-web").get("privatePort").is_none());
 
-    // No template Arca ships declares it.
+    // Of the templates Arca ships, only nats-primary declares it: nats and every other one are ordinary.
     let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     for (file, _) in arca::cmd_templates::SHIPPED {
         if let Some(name) = file.strip_suffix(".json") {
             let template = arca::service::load_template(&shipped, name).expect("it loads");
-            assert!(template.private_port.is_none(), "{name}");
+            assert_eq!(
+                template.private_port.is_some(),
+                name == "nats-primary",
+                "{name}"
+            );
         }
     }
 }

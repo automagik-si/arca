@@ -2288,7 +2288,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_eleven_templates_and_nothing_else_load_and_are_pinned() {
+fn the_thirteen_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -2309,6 +2309,8 @@ fn the_eleven_templates_and_nothing_else_load_and_are_pinned() {
             "gitlab-runner-pool",
             "gitlab-runner-pool-large",
             "nats",
+            "nats-primary",
+            "nats-replica",
             "omni-api",
             "postgres-autopg",
             "workspace-vm"
@@ -3314,6 +3316,8 @@ mod golden;
 mod kernel_access;
 #[path = "services/nats.rs"]
 mod nats;
+#[path = "services/nats_replica.rs"]
+mod nats_replica;
 #[path = "services/omni.rs"]
 mod omni;
 #[path = "services/private_port.rs"]
@@ -3909,6 +3913,8 @@ fn every_shipped_entrypoint_reaches_init_as_its_own_words_on_either_liblxc() {
             "automagik-server",
             "cloudflare-tunnel",
             "nats",
+            "nats-primary",
+            "nats-replica",
             "postgres-autopg"
         ]
     );
@@ -4376,9 +4382,11 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
         service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
         service::first_boot(&loaded, &dir).expect("its first-boot script is installed with it");
     }
-    assert_eq!(templates, 11);
+    assert_eq!(templates, 13);
     assert!(installed.contains(&"postgres-autopg.sh"));
+    // One script serves nats and nats-primary; the replica has its own.
     assert!(installed.contains(&"nats.sh"));
+    assert!(installed.contains(&"nats-replica.sh"));
     assert!(installed.contains(&"github-runner-pool.sh"));
     // One script serves both sizes of the GitLab pool.
     assert!(installed.contains(&"gitlab-runner-pool.sh"));
