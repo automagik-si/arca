@@ -1972,6 +1972,22 @@
                     "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
                     "type": "string"
                   },
+                  "privatePort": {
+                    "additionalProperties": false,
+                    "description": "Only for a template that declares privatePort: the one host address, one of this node's kernel.serviceListenAddresses, that the template's port listens on, for a peer over a private link. Left out, a node that names exactly one address uses it. A proposal made with action_propose fills in the address and the port, so the owner's approval binds them and the owner's card says them. The proxy listens on that address and on no other, never on every interface, and the service's own network rules do not stand between it and the port. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, for a virtual machine, on a node that names no address, and for an address the node does not name or that is not on one of its interfaces.",
+                    "properties": {
+                      "address": {
+                        "maxLength": 15,
+                        "type": "string"
+                      },
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "registry": {
                     "description": "Only for an image on a registry this node holds a credential for (registry_secret_set): that registry's address. A proposal made with action_propose fills it in, so the owner's card says that the image is fetched with the credential and that Incus then keeps it with the image; a caller has no need to state it. Such a create runs only from an approved proposal.",
                     "maxLength": 128,
@@ -4535,6 +4551,26 @@
           }
         },
         {
+          "name": "privatePort",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "description": "Only for a template that declares privatePort: the one host address, one of this node's kernel.serviceListenAddresses, that the template's port listens on, for a peer over a private link. Left out, a node that names exactly one address uses it. A proposal made with action_propose fills in the address and the port, so the owner's approval binds them and the owner's card says them. The proxy listens on that address and on no other, never on every interface, and the service's own network rules do not stand between it and the port. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, for a virtual machine, on a node that names no address, and for an address the node does not name or that is not on one of its interfaces.",
+            "properties": {
+              "address": {
+                "maxLength": 15,
+                "type": "string"
+              },
+              "port": {
+                "maximum": 65535,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
           "name": "registry",
           "required": false,
           "schema": {
@@ -4749,6 +4785,33 @@
               },
               "maxItems": 16,
               "type": "array"
+            },
+            "privatePort": {
+              "additionalProperties": false,
+              "description": "Present only on a service created with a private port: the one host address its port listens on, and the port, as the owner approved them. Not on any other address of the node. service_status also answers ready and, when it is false, problem.",
+              "properties": {
+                "address": {
+                  "type": "string"
+                },
+                "port": {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "problem": {
+                  "description": "service_status only: what is wrong, when ready is false.",
+                  "type": "string"
+                },
+                "ready": {
+                  "description": "service_status only: its instance carries the proxy device as Arca made it, and this host holds the address.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "address",
+                "port"
+              ],
+              "type": "object"
             },
             "published": {
               "anyOf": [
@@ -5052,6 +5115,33 @@
                     },
                     "maxItems": 16,
                     "type": "array"
+                  },
+                  "privatePort": {
+                    "additionalProperties": false,
+                    "description": "Present only on a service created with a private port: the one host address its port listens on, and the port, as the owner approved them. Not on any other address of the node. service_status also answers ready and, when it is false, problem.",
+                    "properties": {
+                      "address": {
+                        "type": "string"
+                      },
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "problem": {
+                        "description": "service_status only: what is wrong, when ready is false.",
+                        "type": "string"
+                      },
+                      "ready": {
+                        "description": "service_status only: its instance carries the proxy device as Arca made it, and this host holds the address.",
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "address",
+                      "port"
+                    ],
+                    "type": "object"
                   },
                   "published": {
                     "anyOf": [
@@ -5369,6 +5459,33 @@
               },
               "maxItems": 16,
               "type": "array"
+            },
+            "privatePort": {
+              "additionalProperties": false,
+              "description": "Present only on a service created with a private port: the one host address its port listens on, and the port, as the owner approved them. Not on any other address of the node. service_status also answers ready and, when it is false, problem.",
+              "properties": {
+                "address": {
+                  "type": "string"
+                },
+                "port": {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "problem": {
+                  "description": "service_status only: what is wrong, when ready is false.",
+                  "type": "string"
+                },
+                "ready": {
+                  "description": "service_status only: its instance carries the proxy device as Arca made it, and this host holds the address.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "address",
+                "port"
+              ],
+              "type": "object"
             },
             "published": {
               "anyOf": [
@@ -5967,6 +6084,33 @@
                   },
                   "maxItems": 16,
                   "type": "array"
+                },
+                "privatePort": {
+                  "additionalProperties": false,
+                  "description": "Present only on a service created with a private port: the one host address its port listens on, and the port, as the owner approved them. Not on any other address of the node. service_status also answers ready and, when it is false, problem.",
+                  "properties": {
+                    "address": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "maximum": 65535,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "problem": {
+                      "description": "service_status only: what is wrong, when ready is false.",
+                      "type": "string"
+                    },
+                    "ready": {
+                      "description": "service_status only: its instance carries the proxy device as Arca made it, and this host holds the address.",
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "address",
+                    "port"
+                  ],
+                  "type": "object"
                 },
                 "published": {
                   "anyOf": [

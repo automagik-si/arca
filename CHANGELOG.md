@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A service template may set `privatePort`, which offers one port of the service on one host address that the node's config names (`kernel.serviceListenAddresses`), for a second node over a private link, and on no other address; the owner's create card names the address and the port. See OPERATING.md.
+
 ## 0.26.0 (2026-11-13)
 
 A service template may set `noNewPrivileges: true`, so a setuid or setcap binary inside the container cannot raise

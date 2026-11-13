@@ -3207,6 +3207,24 @@ pub fn service_view_schema() -> Value {
                 "description": "Present, and true, only on a container that runs with no-new-privileges: a setuid or setcap binary inside it cannot raise privileges. It comes from the template's noNewPrivileges and is kept in the service's record.",
                 "type": "boolean"
             },
+            "privatePort": {
+                "additionalProperties": false,
+                "description": "Present only on a service created with a private port: the one host address its port listens on, and the port, as the owner approved them. Not on any other address of the node. service_status also answers ready and, when it is false, problem.",
+                "properties": {
+                    "address": { "type": "string" },
+                    "port": { "maximum": 65535, "minimum": 1, "type": "integer" },
+                    "ready": {
+                        "description": "service_status only: its instance carries the proxy device as Arca made it, and this host holds the address.",
+                        "type": "boolean"
+                    },
+                    "problem": {
+                        "description": "service_status only: what is wrong, when ready is false.",
+                        "type": "string"
+                    }
+                },
+                "required": ["address", "port"],
+                "type": "object"
+            },
             "kernelAccess": {
                 "additionalProperties": false,
                 "description": "Present only on a service whose template declares kernelAccess: the service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given. service_status also answers ready and, when it is false, problem.",
@@ -3525,6 +3543,15 @@ fn service_create_params_base() -> Value {
                 },
                 "maxItems": 4,
                 "type": "array"
+            },
+            "privatePort": {
+                "additionalProperties": false,
+                "description": "Only for a template that declares privatePort: the one host address, one of this node's kernel.serviceListenAddresses, that the template's port listens on, for a peer over a private link. Left out, a node that names exactly one address uses it. A proposal made with action_propose fills in the address and the port, so the owner's approval binds them and the owner's card says them. The proxy listens on that address and on no other, never on every interface, and the service's own network rules do not stand between it and the port. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, for a virtual machine, on a node that names no address, and for an address the node does not name or that is not on one of its interfaces.",
+                "properties": {
+                    "address": { "maxLength": 15, "type": "string" },
+                    "port": { "maximum": 65535, "minimum": 1, "type": "integer" }
+                },
+                "type": "object"
             },
             "kernelAccess": {
                 "additionalProperties": false,

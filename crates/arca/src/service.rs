@@ -90,6 +90,41 @@ pub struct Lan {
     pub port: u16,
 }
 
+/// A template's `privatePort`: the one port of the service that a host address named in the node's config may listen
+/// on, for a peer node over a private link. The address is the create's, never the template's.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivatePort {
+    pub port: u16,
+}
+
+/// What a service with a private port records: the host address its proxy listens on (one of the node's
+/// `kernel.serviceListenAddresses`, as it was when the owner approved the create) and the port, on that address
+/// and inside the service.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateListen {
+    pub address: String,
+    pub port: u16,
+}
+
+impl PrivateListen {
+    /// Whether the record is one a service may have: a unicast IPv4 address written plainly, and a port.
+    pub fn ok(&self) -> bool {
+        self.port != 0
+            && self.address.parse::<Ipv4Addr>().is_ok_and(|address| {
+                !(address.is_unspecified()
+                    || address.is_loopback()
+                    || address.is_multicast()
+                    || address.is_broadcast())
+                    && address.to_string() == self.address
+            })
+    }
+}
+
+/// The name of the proxy device of a private port.
+pub const PRIVATE_DEVICE: &str = "private";
+
 /// A virtual-machine template's `update`: the key of its `settings` that holds the version its service runs, an image
 /// by digest. It is how `service_status` knows the version a machine was created with from the one the installed
 /// template names now. A container template needs none: its version is its `digest`.
@@ -284,6 +319,9 @@ pub struct ServiceConfig {
     pub data: Option<Data>,
     #[serde(default)]
     pub lan: Option<Lan>,
+    /// Present on a service with a private port. Every other record never carries the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_port: Option<PrivateListen>,
     #[serde(default)]
     pub start: bool,
     /// An instance Arca adopted instead of creating; its project is the instance's own.
@@ -853,6 +891,10 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             "connect":format!("tcp:127.0.0.1:{}", lan.port)}),
         );
     }
+    if let Some(private) = &cfg.private_port {
+        // One address only, never the wildcard: the port is reachable there and from nowhere else.
+        devices.insert(PRIVATE_DEVICE.into(), private_device(private));
+    }
     if let Some(link) = &cfg.kernel_access {
         devices.insert(KERNEL_DEVICE.into(), kernel_device(link));
     }
@@ -889,6 +931,14 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
         "devices": devices,
         "start": cfg.start
     })
+}
+
+/// The proxy device of a private port: it listens on the one address the record names, and connects to the port on the
+/// instance's own loopback, as the `lan` device does.
+pub fn private_device(private: &PrivateListen) -> Value {
+    json!({"type":"proxy",
+        "listen":format!("tcp:{}:{}", private.address, private.port),
+        "connect":format!("tcp:127.0.0.1:{}", private.port)})
 }
 
 /// The body of the create of a service on the managed network, exactly as its record gives it. The effect journal
@@ -935,6 +985,20 @@ impl Plugin for Service {
                 "kernel access is for a container of the node's own service project, on a port of 1024 or above that is not one of its own, to the kernel's services socket".into(),
             ));
         }
+        // A private port is a container's, in the node's own project, on a port of its own, on one unicast address,
+        // and never beside a `lan` port: a record that says otherwise is never applied, whatever else it holds.
+        if let Some(private) = &cfg.private_port
+            && (cfg.tenant.is_some()
+                || cfg.project != PROJECT
+                || cfg.vm.is_some()
+                || !private.ok()
+                || !cfg.ports.contains(&private.port)
+                || cfg.lan.is_some())
+        {
+            return Err(PluginError::Config(
+                "a private port is for a container of the node's own service project, on one of its own ports and one unicast host address, and never beside a lan port".into(),
+            ));
+        }
         // A destination is for a service of the node's own project on the managed network, whose NIC rules Arca
         // writes: a record that says otherwise is never applied, whatever else it holds.
         if !cfg.destinations.is_empty() && !destinations_ok(cfg) {
@@ -976,7 +1040,7 @@ impl Plugin for Service {
         }
         // A tenant's service takes its address from the tenant's block, and has no host listener.
         if matches!(cfg.tenant_block(), Some(Err(())))
-            || (cfg.tenant.is_some() && cfg.lan.is_some())
+            || (cfg.tenant.is_some() && (cfg.lan.is_some() || cfg.private_port.is_some()))
         {
             return Err(PluginError::Config(
                 "a tenant's service has an address in its tenant's block and no host port".into(),
@@ -1249,6 +1313,11 @@ pub struct Template {
     pub data: Option<Data>,
     #[serde(default)]
     pub lan: Option<Lan>,
+    /// A container template with a port that may be offered on one host address of the node's config
+    /// (`kernel.serviceListenAddresses`), to a peer over a private link: `{ "port": <n> }`, one of its `ports`. The
+    /// address is the create's. Unlike `lan`, the proxy never listens on every interface.
+    #[serde(default)]
+    pub private_port: Option<PrivatePort>,
     /// The root disk size of a virtual-machine template, such as `20GiB`. No other kind sets it.
     #[serde(default)]
     pub root_size: Option<String>,
@@ -1730,6 +1799,18 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             "template {name}: lan port is one of its ports"
         )));
     }
+    if let Some(private) = &template.private_port
+        && (private.port == 0 || !template.ports.contains(&private.port))
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: privatePort is one of its ports"
+        )));
+    }
+    if template.private_port.is_some() && template.lan.is_some() {
+        return Err(TemplateError::refused(format!(
+            "template {name}: lan and privatePort are two ways to publish a port on the host, and a template has one"
+        )));
+    }
     if let Some(access) = &template.kernel_access
         && (access.port < KERNEL_ACCESS_PORT_MIN
             || template.ports.contains(&access.port)
@@ -1838,10 +1919,11 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         || template.droidd_port.is_some()
         || template.data.is_some()
         || template.lan.is_some()
+        || template.private_port.is_some()
         || template.kernel_access.is_some()
     {
         return refused(
-            "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan or kernelAccess: they need a container's environment, image or devices",
+            "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan, privatePort or kernelAccess: they need a container's environment, image or devices",
         );
     }
     if template.no_new_privileges {
@@ -3269,6 +3351,10 @@ pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
     // Only a service with kernel access carries the key, so every other view is the one it always was.
     if let Some(link) = &cfg.kernel_access {
         view["kernelAccess"] = json!({ "port": link.port, "connect": link.connect });
+    }
+    // Only a service with a private port carries the key.
+    if let Some(private) = &cfg.private_port {
+        view["privatePort"] = json!({ "address": private.address, "port": private.port });
     }
     // Only a service that runs with no-new-privileges carries the key.
     if cfg.no_new_privileges {

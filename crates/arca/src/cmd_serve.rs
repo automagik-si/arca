@@ -147,6 +147,20 @@ pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> 
     if let Some(why) = crate::handlers::destinations_refusal(cfg, &entries) {
         return Err(Failure::Config(why));
     }
+    // A service whose record names a host address for its private port that this config does not name, or that no
+    // interface holds: see `private_port_refusal`. An address the config names that no service uses and that no
+    // interface holds is said, and does not stop the start: a link that comes up later is no reason to stop the node.
+    let is_local = |address: std::net::Ipv4Addr| std::net::TcpListener::bind((address, 0)).is_ok();
+    if let Some(why) = crate::handlers::private_port_refusal(cfg, &entries, &is_local) {
+        return Err(Failure::Config(why));
+    }
+    for address in cfg.kernel.listen_addresses() {
+        if !is_local(address) {
+            eprintln!(
+                "arca: kernel.serviceListenAddresses names {address}, which is not an address of any interface of this host; a create that uses it is refused until it is"
+            );
+        }
+    }
     match crate::handlers::mode_refusal(cfg, &entries) {
         Some(why) => Err(Failure::Config(why)),
         None => Ok(()),

@@ -500,6 +500,7 @@ pub fn record_ok(cfg: &ServiceConfig) -> bool {
         && cfg.droidd_port.is_none()
         && cfg.data.is_none()
         && cfg.lan.is_none()
+        && cfg.private_port.is_none()
         && cfg.kernel_access.is_none()
         && cfg.links.len() <= LINKS_MAX
         && cfg.links.iter().all(|link| link.env.is_empty())

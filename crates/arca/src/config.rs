@@ -336,6 +336,22 @@ pub struct KernelConfig {
     /// service's create runs only from a proposal the owner approved, whose card shows the address.
     #[serde(default)]
     pub service_destinations: Vec<ServiceDestination>,
+    /// The host addresses a service's private port may listen on, each one IPv4 unicast address that exists on this
+    /// host (a private link between two nodes, or a VPN address). Empty by default: no service has a private port. An
+    /// entry alone opens nothing: the service's create runs only from a proposal the owner approved, whose card shows
+    /// the address and the port.
+    #[serde(default)]
+    pub service_listen_addresses: Vec<String>,
+}
+
+impl KernelConfig {
+    /// The addresses of `serviceListenAddresses`, as the load checked them.
+    pub fn listen_addresses(&self) -> Vec<std::net::Ipv4Addr> {
+        self.service_listen_addresses
+            .iter()
+            .filter_map(|address| address.parse().ok())
+            .collect()
+    }
 }
 
 /// The `kernel.tenants` key: what all tenants may hold together, how many there may be, and the caps a tenant gets when
@@ -510,6 +526,8 @@ pub enum ConfigError {
     Tenants(&'static str),
     /// The `kernel.serviceDestinations` list breaks a rule. The text names the rule, never a value.
     ServiceDestinations(&'static str),
+    /// The `kernel.serviceListenAddresses` list breaks a rule. The text names the rule, never a value.
+    ServiceListenAddresses(&'static str),
     /// A kernel project carries a tenant prefix: only a tenant's entry makes such a project.
     TenantProject(String),
 }
@@ -555,6 +573,9 @@ impl fmt::Display for ConfigError {
             Self::Tenants(why) => write!(f, "kernel.tenants is refused: {why}"),
             Self::ServiceDestinations(why) => {
                 write!(f, "kernel.serviceDestinations is refused: {why}")
+            }
+            Self::ServiceListenAddresses(why) => {
+                write!(f, "kernel.serviceListenAddresses is refused: {why}")
             }
             Self::TenantProject(name) => write!(
                 f,
@@ -678,6 +699,7 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     check_import_services(kernel)?;
     check_tenants(kernel)?;
     check_service_destinations(kernel)?;
+    check_service_listen_addresses(kernel)?;
     if kernel.scratch {
         for name in &kernel.projects {
             if !name.starts_with(SCRATCH_PREFIX) {
@@ -1032,6 +1054,46 @@ fn check_service_destinations(kernel: &KernelConfig) -> Result<(), ConfigError> 
     }
     Ok(())
 }
+
+/// The `kernel.serviceListenAddresses` rules: at most 8 entries, each one IPv4 address written out (never a range or a
+/// name), a unicast address (not unspecified, loopback, multicast or broadcast), none twice. Whether an address is on an
+/// interface of this host is asked at start, not here: a config is read on machines that are not the node.
+fn check_service_listen_addresses(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    if kernel.service_listen_addresses.len() > MAX_LISTEN_ADDRESSES {
+        return Err(ConfigError::ServiceListenAddresses("at most 8 entries"));
+    }
+    let mut seen = BTreeSet::new();
+    for entry in &kernel.service_listen_addresses {
+        let Ok(address) = entry.parse::<std::net::Ipv4Addr>() else {
+            return Err(ConfigError::ServiceListenAddresses(
+                "each entry must be one IPv4 address, such as 192.0.2.10: never a range, and never a name, which could be pointed elsewhere later",
+            ));
+        };
+        if address.is_unspecified()
+            || address.is_loopback()
+            || address.is_multicast()
+            || address.is_broadcast()
+        {
+            return Err(ConfigError::ServiceListenAddresses(
+                "each entry must be a unicast address of this host: not 0.0.0.0, a loopback, a multicast or the broadcast address",
+            ));
+        }
+        if entry != &address.to_string() {
+            return Err(ConfigError::ServiceListenAddresses(
+                "each entry is written as four plain decimal numbers, such as 192.0.2.10",
+            ));
+        }
+        if !seen.insert(address) {
+            return Err(ConfigError::ServiceListenAddresses(
+                "an address is listed twice",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The most addresses `kernel.serviceListenAddresses` names.
+const MAX_LISTEN_ADDRESSES: usize = 8;
 
 /// The tenants rules: the managed service network (tenants share its /24), no adoption allowlist, a capacity with every
 /// value set, at most 30 tenants (each holds a /29 or a /28 above the gateway's), default caps a tenant may hold and that
@@ -1772,6 +1834,68 @@ mod tests {
             serde_json::from_value(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
         check(&config)?;
         Ok(config)
+    }
+
+    #[test]
+    fn the_service_listen_addresses_are_empty_by_default_and_refused_unless_every_rule_holds() {
+        use serde_json::json;
+        let none = importing(json!({})).expect("no addresses");
+        assert!(none.kernel.service_listen_addresses.is_empty());
+        let two = importing(json!({ "serviceListenAddresses": ["198.51.100.7", "203.0.113.9"] }))
+            .expect("two unicast addresses");
+        assert_eq!(
+            two.kernel.listen_addresses(),
+            vec![
+                "198.51.100.7".parse::<std::net::Ipv4Addr>().unwrap(),
+                "203.0.113.9".parse().unwrap()
+            ]
+        );
+        // Not unicast, not one plain address, or listed twice.
+        for bad in [
+            json!(["0.0.0.0"]),
+            json!(["127.0.0.1"]),
+            json!(["224.0.0.1"]),
+            json!(["255.255.255.255"]),
+            json!(["198.51.100.0/24"]),
+            json!(["198.51.100.007"]),
+            json!(["host.example"]),
+            json!(["::1"]),
+            json!([""]),
+            json!(["198.51.100.7", "198.51.100.7"]),
+            json!([
+                "198.51.100.1",
+                "198.51.100.2",
+                "198.51.100.3",
+                "198.51.100.4",
+                "198.51.100.5",
+                "198.51.100.6",
+                "198.51.100.7",
+                "198.51.100.8",
+                "198.51.100.9"
+            ]),
+        ] {
+            match importing(json!({ "serviceListenAddresses": bad })) {
+                Err(ConfigError::ServiceListenAddresses(_)) => {}
+                other => panic!("{bad}: expected the refusal, got {other:?}"),
+            }
+        }
+        // The words name the key and never a value.
+        let why = importing(json!({ "serviceListenAddresses": ["255.255.255.255"] }))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            why.starts_with("kernel.serviceListenAddresses is refused: "),
+            "{why}"
+        );
+        assert!(!why.contains("255.255.255.255"), "{why}");
+        // Eight are the most.
+        importing(json!({ "serviceListenAddresses": ["198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4", "198.51.100.5", "198.51.100.6", "198.51.100.7", "198.51.100.8"] }))
+            .expect("eight");
+        // Anything but a list of text is a parse error.
+        assert!(matches!(
+            importing(json!({ "serviceListenAddresses": [7] })),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     #[test]

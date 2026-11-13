@@ -642,6 +642,7 @@ impl ServiceHandler {
             autostart: false,
             data: None,
             lan: None,
+            private_port: None,
             start: false,
             adopted: false,
             creating: false,

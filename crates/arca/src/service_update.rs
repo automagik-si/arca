@@ -604,6 +604,12 @@ impl ServiceHandler {
         // How the node can tell that it answers: the host port's proxy, the droidd port, or only that it runs.
         let reach = if let Some(lan) = &config.lan {
             Reach::Lan(lan.port)
+        } else if let Some((address, port)) = config
+            .private_port
+            .as_ref()
+            .and_then(|private| Some((private.address.parse().ok()?, private.port)))
+        {
+            Reach::Private(address, port)
         } else if config.droidd_port == Some(port) {
             Reach::Direct(port)
         } else {
@@ -930,6 +936,8 @@ struct KeyUpdate {
 enum Reach {
     /// Through the proxy of the service's host port: the node's own loopback, this port.
     Lan(u16),
+    /// Through the proxy of the service's private port: its one host address, which is the only one it listens on.
+    Private(std::net::Ipv4Addr, u16),
     /// At the service's address, on a port its firewall opens to the node.
     Direct(u16),
     /// The node can reach nothing of it: the instance must stay running.
@@ -1175,6 +1183,7 @@ impl Run<'_> {
         loop {
             let up = match self.reach {
                 Reach::Lan(port) => (options.probe)("127.0.0.1", port, true),
+                Reach::Private(address, port) => (options.probe)(&address.to_string(), port, true),
                 Reach::Direct(port) => (options.probe)(&self.config.ipv4, port, false),
                 Reach::Running => true,
             };

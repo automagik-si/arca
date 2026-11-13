@@ -285,6 +285,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "tenant": "abcdefgh", "deploy": "d1", "start": false,
                 "settings": { "url": "https://git.example/example-org" },
                 "kernelAccess": { "port": 7461 },
+                "privatePort": { "address": "198.51.100.7", "port": 7422 },
                 "destinations": [{ "address": "10.20.30.40", "port": 443 }],
                 // What the node fills in from the template when the proposal is made: a machine's own system
                 // image, which has no digest here, with the version it runs, and the template's content.
@@ -633,6 +634,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (_, "mac") => "MAC address",
                 (ActionKind::ServiceCreate, "start") => "Start",
                 (ActionKind::ServiceCreate, "kernelAccess") => "Kernel access",
+                (ActionKind::ServiceCreate, "privatePort") => "Private port",
                 (ActionKind::ServiceCreate, "destinations") => "Private network",
                 (_, "templateDigest") => "Template content",
                 (ActionKind::ServiceCreate, "registry") => "Registry",
@@ -665,6 +667,13 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     assert_eq!(
                         access,
                         "Yes: this service, and everything that runs in it, can reach 10.20.30.40 on tcp port 443 through this node, and is seen there as this node itself: whatever trusts this node's address there trusts everything in this service. Every other private address stays closed."
+                    );
+                    access.as_str()
+                }
+                Value::Object(stated) if field == "privatePort" => {
+                    access = arca::action_proposal::private_port_words(
+                        stated["address"].as_str().expect("an address"),
+                        stated["port"].as_u64().expect("a port"),
                     );
                     access.as_str()
                 }

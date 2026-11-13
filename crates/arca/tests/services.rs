@@ -736,6 +736,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         autostart: false,
         data: None,
         lan: None,
+        private_port: None,
         root_size: None,
         first_boot: None,
         settings: None,
@@ -3292,6 +3293,8 @@ mod golden;
 mod kernel_access;
 #[path = "services/omni.rs"]
 mod omni;
+#[path = "services/private_port.rs"]
+mod private_port;
 #[path = "services/tunnel.rs"]
 mod tunnel;
 #[path = "services/update.rs"]
@@ -3333,6 +3336,11 @@ fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
         json!({"lan":{"port":3081}}),
         json!({"lan":{"port":0}}),
         json!({"lan":{"port":4222,"other":true}}),
+        json!({"privatePort":{"port":3081}}),
+        json!({"privatePort":{"port":0}}),
+        json!({"privatePort":{"port":4222,"other":true}}),
+        json!({"privatePort":{"port":4222,"address":"192.0.2.9"}}),
+        json!({"privatePort":{"port":4222},"lan":{"port":4222}}),
     ] {
         let mut template = nats_template();
         template
@@ -3351,6 +3359,7 @@ fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
         json!({"data":{"path":"/data/file..name","size":"8GiB","uid":0,"gid":4294967295_u64}}),
         json!({"data":{"path": format!("/{}", "a".repeat(254))}}),
         json!({"lan":{"port":4222}}),
+        json!({"privatePort":{"port":4222}}),
     ] {
         let mut template = nats_template();
         template
@@ -3362,11 +3371,17 @@ fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
     }
     rig.template("nats", nats_template());
     let old = service::load_template(&rig.dir.join("templates"), "nats").unwrap();
-    assert!(old.limits.is_none() && old.data.is_none() && old.lan.is_none() && !old.autostart);
+    assert!(
+        old.limits.is_none()
+            && old.data.is_none()
+            && old.lan.is_none()
+            && old.private_port.is_none()
+            && !old.autostart
+    );
     rig.call("service_create", json!({"name":"nats","template":"nats"}))
         .unwrap();
     let mut document = serde_json::to_value(rig.service_config("nats")).unwrap();
-    for key in ["limits", "autostart", "data", "lan"] {
+    for key in ["limits", "autostart", "data", "lan", "privatePort"] {
         document.as_object_mut().unwrap().remove(key);
     }
     let old: service::ServiceConfig = serde_json::from_value(document).unwrap();
