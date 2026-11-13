@@ -17,7 +17,7 @@ pub fn postgres_file_of_0_12_0(name: &str) -> String {
         "postgres-autopg.sh" => now
             .replace("NOCREATEROLE REPLICATION PASSWORD", "NOCREATEROLE NOREPLICATION PASSWORD")
             .replace(
-                "(LOGIN and REPLICATION, so a consumer can create its\n#   own logical slot, no other right, password POSTGRES_PASSWORD,",
+                "(LOGIN and REPLICATION, so a consumer can create\n#   its own logical slot, no other right, password POSTGRES_PASSWORD,",
                 "(LOGIN, no other right, password POSTGRES_PASSWORD,",
             )
             .replace(

@@ -5,8 +5,8 @@
 # - writes $AUTOPG_CONFIG_DIR/settings.json so postgres listens on every address (postgres._extra.listen_addresses:
 #   autopg reads it from that file only, no variable);
 # - starts the provisioner in the background, then execs the image's own command, `autopg postmaster`, as the service;
-# - the provisioner waits for the Unix socket, then makes role `app` (LOGIN and REPLICATION, so a consumer can create its
-#   own logical slot, no other right, password POSTGRES_PASSWORD,
+# - the provisioner waits for the Unix socket, then makes role `app` (LOGIN and REPLICATION, so a consumer can create
+#   its own logical slot, no other right, password POSTGRES_PASSWORD,
 #   the service's write-only secret) and database `app` owned by it, with schema public its own, without logging the
 #   statement; appends one pg_hba.conf rule, `host app app samenet scram-sha-256` (the service subnet: the NIC ACL decides
 #   which consumer reaches 5432), and reloads. The superuser keeps initdb's loopback-only rules (autopg's own admin pool

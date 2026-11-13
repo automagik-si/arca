@@ -832,6 +832,7 @@ fn sql_the_database_script_sends() -> String {
         .env("PATH", &bin)
         .env("AUTOPG_CONFIG_DIR", &dir)
         .env("POSTGRES_PASSWORD", "abcDEF123")
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

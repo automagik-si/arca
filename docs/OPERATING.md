@@ -883,13 +883,18 @@ is the service that `service_create` makes from the node's `postgres-autopg` tem
   `postgres_link`, `postgres_unlink` and `postgres_delete` refuse its name and say which verb acts on it.
 - Its name must be one no database and no service holds.
 - A token with a tool list needs `service_create` in it beside `postgres_create`: the database is a service.
-- **Logical replication.** A `postgres-autopg` database is ready for logical replication as it is made: the pinned
-  autopg image runs every database with `wal_level=logical`, room for 10 replication slots and 10 WAL senders, by its
-  own defaults, and the `app` role has the `REPLICATION` right (it has no other: not a superuser, and it cannot create
-  databases or roles). The consumer connects as `app` to the `app` database, from a service connected to it, and
-  creates its own slot; Arca makes none. The `ALTER ROLE` runs at every start, so a database made by an earlier
-  release gets the right at its next start, once the node holds this release's template: run
-  `arca templates install` (it replaces an unedited `postgres-autopg.sh`; `--replace` an edited one).
+- **Logical replication.** A `postgres-autopg` database made once the node holds this release's templates is ready
+  for logical replication: the pinned autopg image runs every database with `wal_level=logical`, room for 10
+  replication slots and 10 WAL senders, by its own defaults, and the `app` role has the `REPLICATION` right. That
+  right lets `app` read the decoded changes of its own database, and nothing else; the role is still no superuser and
+  cannot create databases or roles. The consumer connects as `app` to the `app` database, from a service connected to
+  it, and creates its own slot; Arca makes none. A publication must name its tables: `FOR ALL TABLES` needs the
+  superuser, which `app` is not. Take care of the slot: one that nobody reads keeps the database's log on disk without
+  limit, which can fill the disk and stop the database, and every linked service shares the `app` role, so one of them
+  can drop another's slot. A database made before this release keeps its `NOREPLICATION` role: its script was saved
+  into the instance when it was created, and nothing rewrites it, not `arca templates install` nor `service_update`.
+  To have the right, make a new database (after `arca templates install` has put this release's script on the node;
+  `--replace` replaces an edited one) and move the data.
 
 A proposal is given the template's name, the image it pins and the fingerprint of the template's content when it is
 made. The card leads with "Your assistant wants to create a Postgres database called NAME.", then shows the template,
