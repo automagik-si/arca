@@ -47,6 +47,12 @@ INERT=(
     # A script only the workflows call. scripts/release.sh and scripts/version.sh are not among them: a person runs
     # them too, and they are in the patch list below.
     '^scripts/ci-[^/]+$'
+    # Instructions and skills for the agents working in this repository, among them the brand's copy record
+    # (.claude/skills/automagik-brand/SOURCE.json). The binary is built from none of it.
+    '^\.claude/'
+    # The brand's copy tool, copied from Automagik with docs/brand. CI and the person who copies run it; the
+    # binary is not built from it, so a copy of the brand alone cuts no release.
+    '^scripts/brand-sync\.mjs$'
 )
 # A change under one of these ships, but the binary is not built from it: a patch. scripts/install.sh is a release
 # file of its own. scripts/build-portable.sh is not here, because its flags change the binary.
