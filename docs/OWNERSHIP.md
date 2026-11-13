@@ -1580,8 +1580,9 @@ its length. The bytes are hashed as they stand, so any edit, a changed space amo
 are arguments, so the approval's digest binds them and a restart keeps them; a caller that states either is only
 compared with the node's own, and refused when it differs.
 
-The card ends with them: an `Image` row, which for an image with no digest says in words that Incus takes what that
-name gives when the service is created, and last a `Template content` row with the fingerprint whole. The create reads
+The card carries them in its Details, which start closed: an `Image` row and a `Template content` row with the
+fingerprint whole. An `Image` row for an image with no digest, which says in words that Incus takes what that name
+gives when the service is created, stays up front, where the owner reads it before approving. The create reads
 the template's file and its scripts once (`load_template_content`), compares what the call states with that read, and
 builds the service from that same read: its entrypoint and its first-boot script are the ones that were hashed, so
 nothing stands between the check and the create. A template that was edited, or installed again by an upgrade, since

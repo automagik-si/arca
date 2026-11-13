@@ -305,8 +305,20 @@ impl Kernel {
         now_ms: u64,
         gpu_product: Option<&str>,
     ) -> Result<ActionProposal, ProposeError> {
+        self.propose_action_using(action, args, now_ms, gpu_product, None)
+    }
+
+    /// The same, with what a create takes of the node, read from the template the proposal binds; the proposal keeps it.
+    pub fn propose_action_using(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now_ms: u64,
+        gpu_product: Option<&str>,
+        uses: Option<String>,
+    ) -> Result<ActionProposal, ProposeError> {
         self.action_proposals
-            .propose(action, args, now_ms, gpu_product)
+            .propose_using(action, args, now_ms, gpu_product, uses)
     }
 
     /// Declines one waiting action proposal, whatever its age. Returns whether one waited under `id`.

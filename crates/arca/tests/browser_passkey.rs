@@ -1261,6 +1261,51 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only:
     );
     assert!(!instance_exists(&fake, "nats"), "nothing ran");
 
+    // 0b. Issue 117: the card speaks to the owner. It leads with one sentence of what the assistant wants, says what the
+    //     service takes of the node and how to undo it, and keeps the verb name, the image digest, the template's
+    //     content and the fingerprint in a Details disclosure that starts closed.
+    let card = chrome.eval(
+        "(() => { const card = document.querySelector('#plans article.action'); const more = card.querySelector('details'); \
+         const shown = card.cloneNode(true); shown.querySelector('details').remove(); \
+         return { lead: card.querySelector('h3').textContent, shown: shown.textContent, open: more.open, \
+                  folded: more.textContent, lede: document.querySelector('.lede').textContent }; })()",
+    );
+    assert_eq!(
+        card["lead"],
+        json!("Your assistant wants to create the service nats from template nats."),
+        "{card}"
+    );
+    let shown = card["shown"].as_str().expect("the card's text");
+    for word in ["service_create", "sha256", "Fingerprint", &"a".repeat(64)] {
+        assert!(
+            !shown.contains(word),
+            "the card shows {word} up front: {shown}"
+        );
+    }
+    assert!(
+        shown.contains("Uses")
+            && shown.contains("Up to 2 CPUs and 2GiB of memory (Arca's default for a service)")
+            && shown.contains("To undo")
+            && shown.contains("Ask your assistant to remove it."),
+        "{shown}"
+    );
+    assert_eq!(card["open"], json!(false), "Details starts closed");
+    let folded = card["folded"].as_str().expect("the details' text");
+    for word in [
+        "service_create",
+        "sha256:",
+        "Template content",
+        "Fingerprint",
+    ] {
+        assert!(folded.contains(word), "Details holds {word}: {folded}");
+    }
+    assert!(
+        card["lede"]
+            .as_str()
+            .is_some_and(|lede| lede.starts_with("Arca asks before it changes anything.")),
+        "{card}"
+    );
+
     // 1. The machine has no screen: the page says so, and names the command for the terminal.
     chrome.click("#get-code");
     let deadline = Instant::now() + WAIT;
@@ -1337,7 +1382,10 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only:
     // 3. The first approved change: the owner approves the assistant's proposal, and it runs once.
     chrome.click("#plans button.approve");
     let said = chrome.status_ok("Approved.", &serve);
-    assert!(said.contains("service_create"), "{said}");
+    assert_eq!(
+        said, "Approved. Done: create the service nats from template nats.",
+        "the page says what was done in the card's words, not the verb's name"
+    );
     assert!(instance_exists(&fake, "nats"), "the approved change ran");
 
     // 4. The same page under the IP address is another origin: its POSTs are refused, and the browser itself refuses a

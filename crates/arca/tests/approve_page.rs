@@ -1324,6 +1324,11 @@ fn action_proposals_are_listed_next_to_delete_plans_and_decline_removes_one() {
         action["summary"],
         json!("Create the service nats from template nats")
     );
+    // Issue 117: how the owner undoes it, in words, beside what it does.
+    assert_eq!(
+        action["undo"],
+        json!("Ask your assistant to remove it. Removing it deletes the service with its data.")
+    );
     assert_eq!(
         action["args"],
         json!({ "name": "nats", "template": "nats", "templateDigest": "ab".repeat(32) })
@@ -3982,14 +3987,76 @@ fn action_cards_render_every_kernel_detail_row_as_text() {
     let html = include_str!("../src/approve_page.html");
     assert!(
         html.contains("const details = Array.isArray(plan.details) ? plan.details : [];")
-            && html
-                .contains("for (const detail of details) fact(detail.label, detail.value, false);"),
-        "the action card renders every details row"
+            && html.contains(
+                "for (const detail of details) (folded(detail) ? audit : fact)(detail.label, detail.value);"
+            ),
+        "the action card renders every details row, up front or in its Details"
     );
     assert!(
         !html.contains("innerHTML"),
         "the page builds rows with textContent, never innerHTML"
     );
+}
+
+/// Issue 117: the page speaks to the owner. It says Arca asks before every change, leads each card with what the
+/// assistant wants, says what it uses and how to undo it, and folds the audit rows into a Details disclosure.
+#[test]
+fn the_cards_lead_with_plain_words_and_fold_the_audit_rows_into_details() {
+    let html = include_str!("../src/approve_page.html");
+    assert!(html.contains("Arca asks before it changes anything."));
+    assert!(!html.contains("asks before it deletes anything"));
+    assert!(!html.contains("Nothing is deleted without your passkey"));
+    assert!(html.contains(r#"const AUDIT_ROWS = new Set(["Image", "Template content"]);"#));
+    // An image with no digest is not held to the approval: its row says so, and stays up front.
+    let folded = html
+        .split("function folded(detail) {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("the folding rule");
+    assert!(
+        folded.contains(r#"!detail.value.includes("(no digest:")"#),
+        "{folded}"
+    );
+    // Each card's Details names its card, so a screen reader's list of disclosures tells them apart.
+    assert!(html.contains(r#"summary.setAttribute("aria-label", "Details: " + name);"#));
+    for call in [
+        "moreDetails(title)",
+        "moreDetails(plan.summary)",
+        "moreDetails(title)",
+    ] {
+        assert!(html.contains(call), "{call}");
+    }
+    let action = html
+        .split("function actionCard(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction ").next())
+        .expect("the action card");
+    assert!(action.contains(r#""Your assistant wants to " + "#));
+    assert!(action.contains(r#"fact("Uses", plan.uses)"#));
+    assert!(action.contains(r#"fact("To undo", plan.undo)"#));
+    for row in [
+        r#"audit("Action", plan.action, true)"#,
+        r#"audit("Target", plan.id, true)"#,
+        r#"audit("Fingerprint", digest, true)"#,
+    ] {
+        assert!(action.contains(row), "{row} is in Details");
+    }
+    assert!(!action.contains(r#"fact("Action""#) && !action.contains(r#"fact("Fingerprint""#));
+    assert!(
+        !html.contains(r#""Approved. " + plan.action"#),
+        "the status after an approval says what was done, not the verb's name"
+    );
+    for card in ["function planCard(", "function requestCard("] {
+        let body = html
+            .split(card)
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("the card");
+        assert!(
+            body.contains("moreDetails("),
+            "{card} folds its fingerprint into Details"
+        );
+    }
 }
 
 #[test]
@@ -4074,8 +4141,9 @@ fn the_request_card_keeps_its_enroll_sentence_and_its_large_code_element() {
     );
     assert!(
         html.contains(r#"el("p", "enroll-code", String(fields.target))"#)
-            && html
-                .contains("card.append(meta, heading, ...(code ? [code] : []), facts, buttons);"),
+            && html.contains(
+                "card.append(meta, heading, ...(code ? [code] : []), facts, more.box, buttons);"
+            ),
         "the code is its own element, set as text, on the card"
     );
     let rule = html

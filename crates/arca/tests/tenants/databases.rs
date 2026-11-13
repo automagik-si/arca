@@ -143,9 +143,9 @@ fn fetched_source(rig: &Rig) -> Value {
     })
 }
 
-const MADE_AS: &str = "A service from this node's postgres-autopg template, with the password that template generates; Arca keeps it. A database made this way is a service: connect to it with service_connect, remove it with service_remove.";
+const MADE_AS: &str = "A service from this node's postgres-autopg template, with the password that template generates; Arca keeps it. Your assistant can connect it to your other services, and removing that service deletes the database with its data.";
 /// The same row for a template that generates no password: the card claims none.
-const MADE_AS_PLAIN: &str = "A service from this node's postgres-autopg template. A database made this way is a service: connect to it with service_connect, remove it with service_remove.";
+const MADE_AS_PLAIN: &str = "A service from this node's postgres-autopg template. Your assistant can connect it to your other services, and removing that service deletes the database with its data.";
 
 /// The shipped database template generates its password: a database made from a clean install starts by itself,
 /// and no token ever sets its password.
@@ -600,7 +600,7 @@ fn a_template_that_generates_no_password_makes_a_stopped_database_and_the_card_s
             { "label": "Image", "value": pin },
             { "label": "Template", "value": DATABASE_TEMPLATE },
             { "label": "Made as", "value": MADE_AS_PLAIN },
-            { "label": "Start", "value": format!("No: it is created stopped because {why}; instance_start starts it later") },
+            { "label": "Start", "value": format!("No: it is created stopped because {why}; it can be started later") },
             { "label": "Template content", "value": content_row(&content(&rig)) }
         ])
     );
@@ -648,7 +648,7 @@ fn a_waiting_databases_card_says_the_same_after_the_node_restarts() {
         stopped["details"][4],
         json!({
             "label": "Start",
-            "value": "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; instance_start starts it later"
+            "value": "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; it can be started later"
         })
     );
     edit_database_template(&rig, |template| {

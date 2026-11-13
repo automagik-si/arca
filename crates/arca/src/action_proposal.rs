@@ -151,6 +151,56 @@ impl ActionKind {
         Self::FunctionRemove,
     ];
 
+    /// How the owner undoes this action once it has run, in the owner's words: the card says it beside what the action
+    /// does. An action that deletes says that it cannot be undone.
+    pub fn undo_words(self) -> &'static str {
+        match self {
+            Self::ServiceCreate => {
+                "Ask your assistant to remove it. Removing it deletes the service with its data."
+            }
+            Self::PostgresCreate => {
+                "Ask your assistant to remove it. Removing it deletes the database with its data."
+            }
+            Self::ServiceRemove => "It cannot be undone: the service is deleted with its data.",
+            Self::ServiceImport => {
+                "Ask your assistant to release it. The service itself is not changed either way."
+            }
+            Self::ServiceRelease => {
+                "Ask your assistant to import it again. The service itself is not changed either way."
+            }
+            Self::ServicePublish => "Ask your assistant to unpublish it.",
+            Self::ServiceUnpublish => "Ask your assistant to publish it again.",
+            Self::ServiceConnect => "Ask your assistant to disconnect them.",
+            Self::ServiceDisconnect => "Ask your assistant to connect them again.",
+            Self::GpuAttach => "Ask your assistant to detach the card.",
+            Self::GpuDetach => "Ask your assistant to attach the card again.",
+            Self::StorageAdd => {
+                "If a disk was erased for it, what was on that disk cannot be brought back. A folder added as storage keeps what it holds."
+            }
+            Self::SnapshotCreate => "Ask your assistant to delete the snapshot.",
+            Self::SnapshotDelete => "It cannot be undone: the snapshot is deleted.",
+            Self::InstanceStart => "Ask your assistant to stop it.",
+            Self::InstanceStop => "Ask your assistant to start it again.",
+            Self::InstanceRestart => "There is nothing to undo: it runs again once it is back.",
+            Self::TenantCreate => "Ask your assistant to remove the tenant.",
+            Self::TenantRemove => {
+                "It cannot be undone: the tenant is deleted with every service in it and their data."
+            }
+            Self::DeployRemove => {
+                "It cannot be undone: the deploy's services are deleted with their data."
+            }
+            Self::FunctionCreate => "Ask your assistant to remove the function.",
+            Self::FunctionRemove => {
+                "It cannot be undone: the function is deleted with its secrets."
+            }
+        }
+    }
+
+    /// Whether the card says what the action takes of the node: a create from a template does.
+    pub fn says_uses(self) -> bool {
+        matches!(self, Self::ServiceCreate | Self::PostgresCreate)
+    }
+
     /// The verb name this action runs.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -654,12 +704,6 @@ impl ActionKind {
     /// that decide what the action does; the exact values are in [`ActionKind::details`].
     pub fn summary(self, args: &Value) -> String {
         let text = |key: &str| args[key].as_str().unwrap_or_default();
-        let image = |key: &str| {
-            text(key)
-                .split_once('@')
-                .map_or_else(|| text(key), |(reference, _)| reference)
-                .to_string()
-        };
         let sentence = match self {
             // Only a virtual machine on a host bridge names a bridge, and a proposal for one always does: a bridge left out
             // on a bridged node is filled in when the proposal is made.
@@ -698,11 +742,8 @@ impl ActionKind {
                 text("from"),
                 text("to")
             ),
-            Self::PostgresCreate => format!(
-                "Create the database {} from {}",
-                text("name"),
-                image("image")
-            ),
+            // The image is in the card's Details; the sentence says what the owner gets.
+            Self::PostgresCreate => format!("Create a Postgres database called {}", text("name")),
             Self::GpuAttach if !text("project").is_empty() => format!(
                 "Attach the GPU at {} to instance {} in project {}",
                 text("pci"),
@@ -929,12 +970,75 @@ pub fn template_content_words(digest: &str) -> String {
     )
 }
 
+/// The longest `uses` line a card shows.
+const USES_MAX: usize = 512;
+
+/// The card's `Uses` line for a create from `template`: what the new service takes of this node, read from the template
+/// the proposal's fingerprint binds. A container runs at Arca's service profile's share of CPUs and memory where its
+/// template sets no limit of its own, so the line names that share and says it is the default. A container's root disk
+/// has no size of its own on the node; in a tenant (`in_tenant`) it has the tenant profile's fixed size.
+pub fn uses_words(template: &crate::service::Template, in_tenant: bool) -> String {
+    use arca_netproject::tenant::{CONTAINER_ROOT_SIZE, PROFILE_CPU, PROFILE_MEMORY};
+    let limits = template.limits.as_ref();
+    let cpu = limits.and_then(|limits| limits.cpu.as_deref());
+    let memory = limits.and_then(|limits| limits.memory.as_deref());
+    let cpus = |count: &str| {
+        if count == "1" {
+            "1 CPU".to_string()
+        } else {
+            format!("{count} CPUs")
+        }
+    };
+    let data = template
+        .data
+        .as_ref()
+        .map(|data| match data.size.as_deref() {
+            Some(size) => format!("a {size} disk for its data"),
+            None => "the disk its data takes".to_string(),
+        });
+    if template.is_vm() {
+        let cpu = cpu.map_or_else(|| "what it needs of this node's CPUs".to_string(), cpus);
+        let memory = memory.map_or_else(
+            || "what it needs of this node's memory".to_string(),
+            |memory| format!("{memory} of memory"),
+        );
+        let root = template.root_size.as_deref().map_or_else(
+            || "the disk its files take".to_string(),
+            |size| format!("a {size} disk"),
+        );
+        return format!("{cpu}, {memory} and {root}.");
+    }
+    // The service profile's share, which a container takes where its template states none: the node's own profile and
+    // a tenant's state the same.
+    let default_cpu = PROFILE_CPU.to_string();
+    let note = match (cpu, memory) {
+        (None, None) => " (Arca's default for a service)",
+        (None, Some(_)) => " (the CPUs are Arca's default for a service)",
+        (Some(_), None) => " (the memory is Arca's default for a service)",
+        (Some(_), Some(_)) => "",
+    };
+    let share = format!(
+        "Up to {} and {} of memory{note}",
+        cpus(cpu.unwrap_or(&default_cpu)),
+        memory.unwrap_or(PROFILE_MEMORY)
+    );
+    let root = if in_tenant {
+        format!("a {CONTAINER_ROOT_SIZE} disk")
+    } else {
+        "the disk its files take".to_string()
+    };
+    match data {
+        Some(data) => format!("{share}, {root}, and {data}."),
+        None => format!("{share}, and {root}."),
+    }
+}
+
 /// What the card of a template database is told, in place of a stopped reason, when the node's template generates
 /// the database's password. No stopped reason reads so.
 pub const DATABASE_PASSWORD_GENERATED: &str = "generated";
 
-/// The card's words for a database made from the node's template `template`: what the owner gets, and the verbs that
-/// reach it afterwards. They say the password is generated only when `generated`: when the node read its template and
+/// The card's words for a database made from the node's template `template`: what the owner gets, and what can be done
+/// with it afterwards, in the owner's words. They say the password is generated only when `generated`: when the node read its template and
 /// the template generates it.
 pub fn database_service_words(template: &str, generated: bool) -> String {
     let password = if generated {
@@ -943,7 +1047,7 @@ pub fn database_service_words(template: &str, generated: bool) -> String {
         ""
     };
     format!(
-        "A service from this node's {template} template{password}. A database made this way is a service: connect to it with service_connect, remove it with service_remove."
+        "A service from this node's {template} template{password}. Your assistant can connect it to your other services, and removing that service deletes the database with its data."
     )
 }
 
@@ -962,7 +1066,7 @@ pub fn start_words(start: bool) -> &'static str {
     if start {
         "Yes: it is started once it is created"
     } else {
-        "No: it is created stopped, and instance_start starts it later"
+        "No: it is created stopped, and can be started later"
     }
 }
 
@@ -973,7 +1077,7 @@ pub fn stopped_words(reason: &str) -> String {
 }
 
 /// How every [`stopped_words`] row ends.
-const STOPPED_THEN: &str = "; instance_start starts it later";
+const STOPPED_THEN: &str = "; it can be started later";
 
 /// How every [`stopped_words`] row begins.
 const STOPPED_BECAUSE: &str = "No: it is created stopped because ";
@@ -1010,6 +1114,8 @@ pub struct ActionProposal {
     pub summary: String,
     #[serde(default)]
     pub details: Vec<ActionDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses: Option<String>,
 }
 
 impl ActionProposal {
@@ -1219,6 +1325,19 @@ impl ActionProposalStore {
         now: u64,
         gpu_product: Option<&str>,
     ) -> Result<ActionProposal, ProposeError> {
+        self.propose_using(action, args, now, gpu_product, None)
+    }
+
+    /// The same, with what a create takes of the node ([`uses_words`]), read from the template the proposal binds: it is
+    /// kept with the proposal, so the card says it after the kernel opens again.
+    pub fn propose_using(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now: u64,
+        gpu_product: Option<&str>,
+        uses: Option<String>,
+    ) -> Result<ActionProposal, ProposeError> {
         self.waiting.retain(|proposal| !proposal.expired(now));
         let digest = action_args_digest(action.as_str(), &args).ok_or_else(|| {
             ProposeError::Store(io::Error::other("arguments do not canonicalize"))
@@ -1242,6 +1361,9 @@ impl ActionProposalStore {
             action: action.as_str().to_string(),
             summary: action.summary_with(&args, gpu_product),
             details: action.details_with_gpu(&args, gpu_product),
+            uses: uses
+                .filter(|_| action.says_uses())
+                .map(|words| shown(&words, USES_MAX)),
             args,
             args_digest: digest,
             created_ms: now,
@@ -1366,6 +1488,11 @@ impl ActionProposalStore {
                         action: action.as_str().to_string(),
                         summary,
                         details,
+                        // The kernel's own words from when it was proposed, as a card shows them.
+                        uses: proposal
+                            .uses
+                            .filter(|_| action.says_uses())
+                            .map(|words| shown(&words, USES_MAX)),
                         args,
                         args_digest: digest,
                         created_ms: proposal.created_ms,
@@ -1799,13 +1926,13 @@ mod tests {
                 .map(|row| (row.label, row.value))
                 .collect()
         };
-        let plain = "A service from this node's postgres-autopg template. A database made this way is a service: connect to it with service_connect, remove it with service_remove.";
+        let plain = "A service from this node's postgres-autopg template. Your assistant can connect it to your other services, and removing that service deletes the database with its data.";
         assert_eq!(rows(None), [("Made as".to_string(), plain.to_string())]);
         assert_eq!(
             rows(Some(DATABASE_PASSWORD_GENERATED)),
             [(
                 "Made as".to_string(),
-                "A service from this node's postgres-autopg template, with the password that template generates; Arca keeps it. A database made this way is a service: connect to it with service_connect, remove it with service_remove.".to_string()
+                "A service from this node's postgres-autopg template, with the password that template generates; Arca keeps it. Your assistant can connect it to your other services, and removing that service deletes the database with its data.".to_string()
             )]
         );
         assert_eq!(
@@ -1814,7 +1941,7 @@ mod tests {
                 ("Made as".to_string(), plain.to_string()),
                 (
                     "Start".to_string(),
-                    "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; instance_start starts it later".to_string()
+                    "No: it is created stopped because its template needs the secret POSTGRES_PASSWORD, which is not set yet; it can be started later".to_string()
                 )
             ]
         );
@@ -2356,5 +2483,181 @@ mod tests {
             limiter.allow("one", 1_000 + PROPOSAL_RATE_WINDOW_MS),
             "the first entry left the window"
         );
+    }
+
+    /// Issue 117: the card is read by the owner, so its words name no verb an assistant calls. Every action's sentence,
+    /// rows (with each fact a card can carry) and undo line are checked against every gated verb name.
+    #[test]
+    fn no_card_word_is_a_verb_name() {
+        let args = json!({
+            "name": "blog", "template": crate::service::DATABASE_TEMPLATE, "image": PINNED_IMAGE,
+            "templateDigest": "ab".repeat(32), "start": false, "from": "web", "to": "blog", "reach": "tailnet",
+            "instance": "web", "project": "default", "pci": "0000:01:00.0", "kind": "container", "id": "t-1",
+            "deploy": "d-1", "pool": "snapshots", "snapshot": "s-1"
+        });
+        let facts = [
+            None,
+            Some(DATABASE_PASSWORD_GENERATED),
+            Some("its template needs the secret POSTGRES_PASSWORD, which is not set yet"),
+        ];
+        for kind in ActionKind::ALL {
+            let mut words = vec![kind.summary(&args), kind.undo_words().to_string()];
+            for fact in facts {
+                words.extend(
+                    kind.details_with_gpu(&args, fact)
+                        .into_iter()
+                        .map(|row| row.value),
+                );
+            }
+            words.push(start_words(false).to_string());
+            for word in &words {
+                for verb in ActionKind::ALL {
+                    assert!(
+                        !word.contains(verb.as_str()),
+                        "{}: {word:?} names {}",
+                        kind.as_str(),
+                        verb.as_str()
+                    );
+                }
+            }
+            assert!(!kind.undo_words().is_empty(), "{}", kind.as_str());
+        }
+    }
+
+    /// Issue 117: a database's card leads with what the owner gets, not with the image it is made from.
+    #[test]
+    fn a_database_card_says_a_postgres_database_called_its_name() {
+        let args = json!({ "name": "blog", "template": crate::service::DATABASE_TEMPLATE, "image": PINNED_IMAGE });
+        assert_eq!(
+            ActionKind::PostgresCreate.summary(&args),
+            "Create a Postgres database called blog"
+        );
+        assert_eq!(
+            ActionKind::PostgresCreate.undo_words(),
+            "Ask your assistant to remove it. Removing it deletes the database with its data."
+        );
+    }
+
+    /// Issue 117: what a create from a template takes of the node, read from the template its fingerprint is of. A
+    /// container whose template sets no limit runs at the share of Arca's service profile, so the card names that share;
+    /// a container in a tenant also has a root disk of a fixed size.
+    #[test]
+    fn a_create_says_what_it_uses_of_the_node() {
+        let template = |extra: Value| -> crate::service::Template {
+            let mut base = json!({ "name": "t", "kind": "oci", "image": "docker.io/library/nats" });
+            for (key, value) in extra.as_object().expect("an object") {
+                base[key] = value.clone();
+            }
+            serde_json::from_value(base).expect("a template")
+        };
+        let node = false;
+        let tenant = true;
+        assert_eq!(
+            uses_words(&template(json!({})), node),
+            "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), and the disk its files take."
+        );
+        assert_eq!(
+            uses_words(
+                &template(json!({ "limits": { "cpu": "2", "memory": "4GiB" } })),
+                node
+            ),
+            "Up to 2 CPUs and 4GiB of memory, and the disk its files take."
+        );
+        assert_eq!(
+            uses_words(
+                &template(
+                    json!({ "limits": { "cpu": "1" }, "data": { "path": "/data", "size": "10GiB" } })
+                ),
+                node
+            ),
+            "Up to 1 CPU and 2GiB of memory (the memory is Arca's default for a service), the disk its files take, and a 10GiB disk for its data."
+        );
+        assert_eq!(
+            uses_words(&template(json!({ "limits": { "memory": "1GiB" } })), node),
+            "Up to 2 CPUs and 1GiB of memory (the CPUs are Arca's default for a service), and the disk its files take."
+        );
+        assert_eq!(
+            uses_words(&template(json!({})), tenant),
+            "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), and a 16GiB disk."
+        );
+        assert_eq!(
+            uses_words(
+                &template(json!({ "data": { "path": "/data", "size": "10GiB" } })),
+                tenant
+            ),
+            "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), a 16GiB disk, and a 10GiB disk for its data."
+        );
+        assert_eq!(
+            uses_words(
+                &template(json!({
+                    "kind": "virtual-machine", "limits": { "cpu": "4", "memory": "8GiB" }, "rootSize": "40GiB"
+                })),
+                node
+            ),
+            "4 CPUs, 8GiB of memory and a 40GiB disk."
+        );
+        // The default named is the service profile's own, the one a tenant's project is given.
+        assert_eq!(arca_netproject::tenant::PROFILE_CPU, 2);
+        assert_eq!(arca_netproject::tenant::PROFILE_MEMORY, "2GiB");
+        assert_eq!(arca_netproject::tenant::CONTAINER_ROOT_SIZE, "16GiB");
+    }
+
+    /// Only a create says what it uses: a proposal of another action is given no `uses`, and a journal line that
+    /// carries one for such an action loads without it.
+    #[test]
+    fn only_a_create_carries_what_it_uses() {
+        let dir = Temp::new("uses-only-create");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let restart = json!({ "project": "default", "instance": "web" });
+        let proposed = store
+            .propose_using(
+                ActionKind::InstanceRestart,
+                restart.clone(),
+                1_000,
+                None,
+                Some("Up to 2 CPUs".to_string()),
+            )
+            .expect("proposed");
+        assert_eq!(proposed.uses, None);
+        let other = Temp::new("uses-planted");
+        let mut line: Value =
+            serde_json::from_str(&proposed_line("instance_restart", &restart, 1_000))
+                .expect("JSON");
+        line["proposal"]["uses"] = json!("Planted words");
+        write_journal(&other.0, &format!("{line}\n"));
+        let reopened = ActionProposalStore::open(&other.0, 1_001, None);
+        assert_eq!(reopened.waiting().len(), 1);
+        assert_eq!(reopened.waiting()[0].uses, None);
+    }
+
+    /// Storage is added from a folder as well as from a disk: the undo line claims no erased disk for a folder.
+    #[test]
+    fn storage_add_undo_claims_no_erase_for_a_folder() {
+        let undo = ActionKind::StorageAdd.undo_words();
+        assert!(!undo.contains("A disk that was erased"), "{undo}");
+        assert!(undo.starts_with("If a disk was erased for it"), "{undo}");
+    }
+
+    /// A proposal keeps what its create uses through the journal, so the card says it after the kernel opens again.
+    #[test]
+    fn what_a_create_uses_is_kept_with_its_proposal() {
+        let dir = Temp::new("uses");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let proposed = store
+            .propose_using(
+                ActionKind::ServiceCreate,
+                create_args("web"),
+                1_000,
+                None,
+                Some("Up to 2 CPUs".to_string()),
+            )
+            .expect("proposed");
+        assert_eq!(proposed.uses.as_deref(), Some("Up to 2 CPUs"));
+        let reopened = ActionProposalStore::open(&dir.0, 1_001, None);
+        assert_eq!(reopened.waiting()[0].uses.as_deref(), Some("Up to 2 CPUs"));
+        let other = store
+            .propose(ActionKind::ServiceCreate, create_args("db"), 1_000, None)
+            .expect("proposed");
+        assert_eq!(other.uses, None);
     }
 }
