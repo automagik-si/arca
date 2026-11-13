@@ -2636,6 +2636,10 @@ fn action_proposal() -> Value {
         ("expiresAt", true, int()),
         ("statement", false, string()),
         ("host", false, string()),
+        // Set on the answer of an action_propose that the admin token approved in the terminal.
+        ("approvedIn", false, string()),
+        ("approvedBy", false, string()),
+        ("approval", false, json!({ "type": "object" })),
     ])
 }
 

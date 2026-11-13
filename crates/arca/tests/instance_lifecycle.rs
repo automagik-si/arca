@@ -1062,6 +1062,29 @@ fn the_admin_tokens_terminal_approval_runs_a_stop_once_and_the_journal_names_it(
         "{journal}"
     );
     assert!(!journal.contains("by the owner"), "{journal}");
+    // The run's own journals say terminal approval too, never the caller that means the owner approved.
+    assert!(
+        journal
+            .matches("approved in the terminal by admin token admin-1")
+            .count()
+            >= 2,
+        "the approval and its result both say so: {journal}"
+    );
+    let lines = rig.journal();
+    assert!(!lines.is_empty(), "the stop is journalled");
+    let named: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line.get("token_id").is_some())
+        .collect();
+    assert!(!named.is_empty(), "a line names the caller: {lines:?}");
+    for line in named {
+        assert_eq!(line["token_id"], "terminal-approval:admin-1", "{line}");
+    }
+    assert!(
+        !fs::read_to_string(rig.scratch.path(INSTANCE_ACTIONS_FILE))
+            .expect("journal")
+            .contains("owner-approval")
+    );
     // Once: the proposal is retired, so a second approval finds none and nothing runs again.
     let writes = rig.state_writes();
     assert!(

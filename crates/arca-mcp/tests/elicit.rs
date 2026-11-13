@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arca_api::{Scope, verbs};
+use arca_api::{Scope, conforms, verb, verbs};
 use arca_mcp::{
     CallError, Caller, PendingPlan, Server, TerminalApprover, TokenStore, ToolHandler, serve_unix,
 };
@@ -41,7 +41,8 @@ impl ToolHandler for Propose {
             "details": [{ "label": "Service", "value": "demo" }],
             "args": { "name": "demo" },
             "argsDigest": "a".repeat(64),
-            "createdAt": 1, "expiresAt": 900001
+            "createdAt": 1, "expiresAt": 900001,
+            "passkeysTrusted": 1, "nextStep": "Approve it on the approval page."
         }))
     }
 }
@@ -164,6 +165,12 @@ impl Fixture {
         ];
         self.post(secret, &rpc(json!(3), "tools/call", params), &headers)
     }
+}
+
+/// The reply of an approved call must meet the output schema the tool advertises, or an SDK client rejects a call that ran.
+fn assert_fits_the_advertised_schema(structured: &Value) {
+    let schema = (verb("action_propose").expect("in the table").result)();
+    conforms(&schema, structured).unwrap_or_else(|why| panic!("{why}: {structured}"));
 }
 
 fn propose_args() -> Value {
@@ -322,8 +329,10 @@ fn an_accept_with_yes_approves_and_runs_the_plan_for_the_admin_token() {
     let structured = &reply["result"]["structuredContent"];
     assert_eq!(structured["approvedIn"], "terminal");
     assert_eq!(structured["approvedBy"], "admin-1");
-    assert_eq!(structured["result"]["removed"], true);
+    assert_eq!(structured["approval"]["result"]["removed"], true);
+    assert_eq!(structured["id"], PLAN, "the proposal's own fields are kept");
     assert_eq!(reply["result"]["isError"], false);
+    assert_fits_the_advertised_schema(structured);
 }
 
 #[test]
@@ -426,7 +435,15 @@ fn a_token_below_admin_is_never_asked_even_when_its_client_declares_elicitation(
     assert_eq!(reply.body, plain);
     // Its modern request, declaring the capability in `_meta`, is answered as `complete` too.
     let modern = fixture.modern_call(&fixture.operator, form(), json!({}), propose_args());
-    assert_eq!(modern.json()["result"]["resultType"], "complete");
+    let plain_modern = {
+        let f = Fixture::start("operator-modern-plain", false, Duration::from_secs(1));
+        f.modern_call(&f.operator, form(), json!({}), propose_args())
+            .body
+    };
+    assert_eq!(
+        modern.body, plain_modern,
+        "byte for byte, as without the feature"
+    );
     assert!(fixture.approvals().is_empty());
 }
 
@@ -494,16 +511,21 @@ fn modern_asks_with_input_required_and_a_signed_state_and_an_accept_approves() {
     }
     assert!(fixture.approvals().is_empty());
     // The accept approves.
-    let done = retry(&state, propose_args(), yes).json();
+    let done = retry(&state, propose_args(), yes.clone()).json();
     assert_eq!(done["result"]["resultType"], "complete", "{done}");
     assert_eq!(
         done["result"]["structuredContent"]["approvedIn"],
         "terminal"
     );
+    assert_fits_the_advertised_schema(&done["result"]["structuredContent"]);
     assert_eq!(
         fixture.approvals(),
         vec![(PLAN.to_string(), "admin-1".to_string())]
     );
+    // A state approves once: sent again, even with the same proposal waiting anew, it is refused and approves nothing.
+    let replay = retry(&state, propose_args(), yes).json();
+    assert_eq!(replay["error"]["code"], -32602, "{replay}");
+    assert_eq!(fixture.approvals().len(), 1, "a spent state approved again");
 }
 
 #[test]
@@ -541,4 +563,16 @@ fn an_expired_modern_state_leaves_the_plan_waiting() {
         fixture.approvals().is_empty(),
         "an expired state approves nothing"
     );
+}
+
+#[test]
+fn a_client_that_declared_url_mode_alone_is_not_sent_a_form() {
+    let fixture = Fixture::start("url-only", true, Duration::from_secs(5));
+    let url_only = json!({ "elicitation": { "url": {} } });
+    fixture.initialize(&fixture.admin, url_only.clone());
+    let reply = fixture.legacy_call(&fixture.admin);
+    assert_eq!(reply.header("content-type"), Some("application/json"));
+    let modern = fixture.modern_call(&fixture.admin, url_only, json!({}), propose_args());
+    assert_eq!(modern.json()["result"]["resultType"], "complete");
+    assert!(fixture.approvals().is_empty());
 }

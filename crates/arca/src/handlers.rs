@@ -2181,7 +2181,9 @@ pub fn run_approved_action(
     args: &Value,
     now: u64,
 ) -> Result<Value, CallError> {
-    run_approved(kernel, actions, |kernel| approve_action(kernel, args, now))
+    run_approved(kernel, actions, APPROVED_CALLER, |kernel| {
+        approve_action(kernel, args, now)
+    })
 }
 
 /// The tail both approvals share: `approve` spends the approval under the kernel lock and retires the proposal, then the
@@ -2189,6 +2191,7 @@ pub fn run_approved_action(
 fn run_approved(
     kernel: &Mutex<Kernel>,
     actions: &ActionExecutor,
+    caller_id: &str,
     approve: impl FnOnce(&mut Kernel) -> Result<ApprovedAction, CallError>,
 ) -> Result<Value, CallError> {
     let approved = {
@@ -2198,7 +2201,7 @@ fn run_approved(
     // From here the approval is spent. A failure is the action's own, and it is told as one: the caller, the approval page
     // and the journal all get the handler's refusal message, never a bare code.
     let outcome = actions
-        .run(&approved.action, &approved.args, &approved.grant)
+        .run_as(&approved.action, &approved.args, &approved.grant, caller_id)
         .map_err(|error| {
             let told = |why: &str| {
                 format!(
@@ -2280,7 +2283,10 @@ impl arca_mcp::TerminalApprover for TerminalApproval {
             });
         }
         let now = (self.clock)();
-        run_approved(&self.kernel, &self.actions, |kernel| {
+        // The run is made under a caller of its own, so every journal it writes says terminal approval, never the owner's.
+        // No token id holds a colon, so no token is ever this caller.
+        let run_as = format!("{TERMINAL_CALLER}{}", caller.token_id);
+        run_approved(&self.kernel, &self.actions, &run_as, |kernel| {
             kernel
                 .approve_action_in_terminal(plan, &caller.token_id, now)
                 .map_err(action_approval_failure)
@@ -2371,6 +2377,17 @@ impl ActionExecutor {
     }
 
     pub fn run(&self, action: &str, args: &Value, grant: &str) -> Result<Value, CallError> {
+        self.run_as(action, args, grant, APPROVED_CALLER)
+    }
+
+    /// [`ActionExecutor::run`], with the handler called as `caller_id`: what the action's own journal names.
+    pub fn run_as(
+        &self,
+        action: &str,
+        args: &Value,
+        grant: &str,
+        caller_id: &str,
+    ) -> Result<Value, CallError> {
         let handler =
             self.handlers.get(action).cloned().ok_or_else(|| {
                 CallError::Internal("the approved action has no handler".to_string())
@@ -2401,7 +2418,7 @@ impl ActionExecutor {
         handler.call(
             call,
             &Caller {
-                token_id: APPROVED_CALLER.to_string(),
+                token_id: caller_id.to_string(),
                 scope: Scope::Operator,
                 tools: None,
             },
@@ -2412,6 +2429,9 @@ impl ActionExecutor {
 /// The token an approved action's handler is called as: no token a person holds, since no token may be minted
 /// under it.
 const APPROVED_CALLER: &str = arca_mcp::auth::APPROVED_ACTION_ID;
+
+/// What an action approved in the terminal runs under, followed by the admin token's id: `terminal-approval:admin-1`.
+pub const TERMINAL_CALLER: &str = "terminal-approval:";
 
 /// The kernel's write gate, shared by the service, database and tenant handlers and by the front pass.
 fn write_gate(kernel: &Mutex<Kernel>) -> Arc<Mutex<()>> {

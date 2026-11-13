@@ -82,6 +82,9 @@ pub struct ApprovedAction {
     pub action: String,
     pub args: Value,
     pub grant: String,
+    /// Set when the approval was the admin token's in the terminal, never the owner's passkey: who, in words. The run's
+    /// journal lines carry it.
+    pub terminal: Option<String>,
 }
 
 /// Why an action proposal could not be approved. Nothing ran.
@@ -433,6 +436,7 @@ impl Kernel {
             action: action.as_str().to_string(),
             args: proposal.args,
             grant,
+            terminal: by.clone(),
         })
     }
 
@@ -474,7 +478,7 @@ impl Kernel {
     pub fn journal_late_result(&mut self, id: &str, ok: bool, code: &str) {
         if let Err(error) = self
             .action_proposals
-            .journal_result(id, ok, Some(code), None)
+            .journal_result(id, ok, Some(code), None, None)
         {
             eprintln!("arca: the late result of action proposal {id} was not journalled: {error}");
         }
@@ -493,10 +497,13 @@ impl Kernel {
         code: Option<&str>,
         message: Option<&str>,
     ) {
-        if let Err(error) = self
-            .action_proposals
-            .journal_result(&approved.id, ok, code, message)
-        {
+        if let Err(error) = self.action_proposals.journal_result(
+            &approved.id,
+            ok,
+            code,
+            message,
+            approved.terminal.as_deref(),
+        ) {
             eprintln!(
                 "arca: the result of action proposal {} was not journalled: {error}",
                 approved.id

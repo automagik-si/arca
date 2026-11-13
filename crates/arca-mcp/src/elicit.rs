@@ -58,6 +58,8 @@ pub(crate) struct Terminal {
     waiting: Mutex<HashMap<String, (String, oneshot::Sender<Value>)>>,
     /// The ids of the admin tokens whose last `initialize` declared the elicitation capability.
     capable: Mutex<HashSet<String>>,
+    /// The states already used to approve, each until it expires: a state approves once.
+    spent: Mutex<HashMap<String, u64>>,
     key: [u8; 32],
 }
 
@@ -70,6 +72,7 @@ impl Terminal {
             timeout,
             waiting: Mutex::new(HashMap::new()),
             capable: Mutex::new(HashSet::new()),
+            spent: Mutex::new(HashMap::new()),
             key,
         }
     }
@@ -127,6 +130,18 @@ impl Terminal {
         true
     }
 
+    /// Spends `state`: `true` the first time, `false` when it was spent already. A spent state is remembered until it would
+    /// have expired anyway, so a replay inside its lifetime cannot approve an identical new proposal.
+    pub(crate) fn claim(&self, state: &str, now_s: u64) -> bool {
+        let Ok(mut spent) = self.spent.lock() else {
+            return false;
+        };
+        spent.retain(|_, until| *until >= now_s);
+        spent
+            .insert(state.to_string(), now_s + self.timeout.as_secs() + 1)
+            .is_none()
+    }
+
     /// The `requestState` for a plan: signed, naming the token, the plan, the call and an expiry.
     pub(crate) fn sign(&self, token: &str, plan: &str, call: &str, now_s: u64) -> String {
         let payload = json!({
@@ -180,9 +195,11 @@ pub(crate) enum State {
 
 /// Whether a `capabilities` object declares elicitation. `{"elicitation":{}}` is form mode, which is all this asks for.
 pub(crate) fn declares_elicitation(capabilities: Option<&Value>) -> bool {
+    // `{}` is form mode; a client that declared `url` alone cannot be sent a form.
     capabilities
         .and_then(|c| c.get("elicitation"))
-        .is_some_and(Value::is_object)
+        .and_then(Value::as_object)
+        .is_some_and(|modes| modes.is_empty() || modes.contains_key("form"))
 }
 
 /// The `elicitation/create` params that ask the one question: approve, yes or no. A flat object of one enum, as form mode allows.

@@ -292,6 +292,9 @@ async fn call_tool(
     let terminal = terminal_for(server, caller, params, era);
     let call = crate::elicit::call_digest(name, &arguments);
     let mut asking = terminal.is_some();
+    // On a `2026-07-28` retry that accepted: the plan the signed state names. The call runs as ever, so the reply can carry
+    // the proposal itself, and the plan is approved only if the call still answers with that very plan waiting.
+    let mut approve_plan: Option<String> = None;
     if let (Some(terminal), Era::Modern) = (terminal, era)
         && let Some(state) = params.get("requestState").and_then(Value::as_str)
     {
@@ -309,8 +312,17 @@ async fn call_tool(
                 let answer = params
                     .get("inputResponses")
                     .and_then(|responses| responses.get(crate::elicit::APPROVE_KEY));
+                // A state is spent once: a second use of it is as a forged one.
                 if answer.is_some_and(crate::elicit::is_yes) {
-                    return Ok(Some(approved_reply(terminal, caller, id, &plan).await));
+                    if !terminal.claim(state, now_seconds()) {
+                        return Ok(Some(error_reply(
+                            id,
+                            INVALID_PARAMS,
+                            "requestState is not valid for this call",
+                            None,
+                        )));
+                    }
+                    approve_plan = Some(plan);
                 }
                 // A decline, a cancel or no answer leaves the plan waiting: the call answers as it would without asking.
                 asking = false;
@@ -356,9 +368,31 @@ async fn call_tool(
                     tool_failure("internal", "the tool failed"),
                 )));
             }
+            if let (Some(terminal), Some(plan)) = (terminal, &approve_plan)
+                && terminal
+                    .approver
+                    .pending(name, &value)
+                    .is_some_and(|pending| &pending.id == plan)
+            {
+                let approving = Approving {
+                    verb: *verb,
+                    proposal: value,
+                    only_looks: server.only_looks,
+                    log: Arc::clone(&server.log),
+                };
+                return Ok(Some(
+                    approved_reply(terminal, caller, id, plan, approving).await,
+                ));
+            }
             let waiting = terminal
                 .filter(|_| asking)
                 .and_then(|t| t.approver.pending(name, &value).map(|plan| (t, plan)));
+            let approving = Approving {
+                verb: *verb,
+                proposal: value.clone(),
+                only_looks: server.only_looks,
+                log: Arc::clone(&server.log),
+            };
             let reply = result_reply(
                 id.clone(),
                 tool_result(verb, value, cut.as_deref(), server.only_looks),
@@ -375,7 +409,7 @@ async fn call_tool(
                     )))
                 }
                 Era::Legacy => {
-                    match ask_on_stream(server, caller, id, plan, reply.clone()) {
+                    match ask_on_stream(server, caller, id, plan, reply.clone(), approving) {
                         Some(messages) => {
                             *stream_out = Some(messages);
                             Ok(Some(Value::Null))
@@ -465,6 +499,7 @@ fn ask_on_stream(
     id: Value,
     plan: crate::elicit::PendingPlan,
     normal: Value,
+    approving: Approving,
 ) -> Option<tokio::sync::mpsc::Receiver<Value>> {
     let terminal = server.terminal.as_ref()?;
     let (request_id, answer) = terminal.expect(&caller.token_id)?;
@@ -492,7 +527,7 @@ fn ask_on_stream(
         terminal.forget(&request_id);
         let reply = match decision {
             Some(response) if crate::elicit::is_yes(&response["result"]) => {
-                approved_reply(terminal, &caller, id, &plan.id).await
+                approved_reply(terminal, &caller, id, &plan.id, approving).await
             }
             _ => normal,
         };
@@ -501,36 +536,53 @@ fn ask_on_stream(
     Some(rx)
 }
 
+/// What the reply of an approved call is made of: the verb, the proposal its handler answered, and what the door needs to
+/// check the reply and say it.
+struct Approving {
+    verb: Verb,
+    proposal: Value,
+    only_looks: bool,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
 /// The reply of a call whose plan the terminal approved: the plan runs, as the web card's approval runs it, and the answer
-/// says it was approved in the terminal. A run that fails is told as the web card tells it.
+/// is the proposal itself, as the verb's output schema says, with `approvedIn`, `approvedBy` and the run's outcome under
+/// `approval` beside it. It passes the same result check as any answer. A run that fails is told as the web card tells it.
 async fn approved_reply(
     terminal: &crate::elicit::Terminal,
     caller: &Caller,
     id: Value,
     plan: &str,
+    approving: Approving,
 ) -> Value {
     let approver = Arc::clone(&terminal.approver);
     let (owned_caller, plan) = (caller.clone(), plan.to_string());
     let run = tokio::task::spawn_blocking(move || approver.approve(&plan, &owned_caller)).await;
     match run {
         Ok(Ok(output)) => {
-            let mut structured = serde_json::Map::new();
-            structured.insert("approvedIn".into(), json!("terminal"));
-            structured.insert("approvedBy".into(), json!(caller.token_id));
-            if let Value::Object(fields) = output {
-                structured.extend(fields);
+            let Approving {
+                verb,
+                mut proposal,
+                only_looks,
+                log,
+            } = approving;
+            proposal["approvedIn"] = json!("terminal");
+            proposal["approvedBy"] = json!(caller.token_id);
+            proposal["approval"] = output;
+            if let Err(why) = conforms(&(verb.result)(), &proposal) {
+                log(&internal_line(
+                    verb.name,
+                    &format!("its approved answer does not fit the verb's result schema ({why})"),
+                ));
+                return result_reply(id, tool_failure("internal", "the tool failed"));
             }
-            result_reply(
-                id,
-                json!({
-                    "content": [{
-                        "type": "text",
-                        "text": format!("approved in the terminal by admin token {} and run", caller.token_id)
-                    }],
-                    "structuredContent": Value::Object(structured),
-                    "isError": false
-                }),
-            )
+            let summary = (verb.summary_text)(&proposal);
+            let mut result = tool_result(&verb, proposal, None, only_looks);
+            result["content"][0]["text"] = json!(format!(
+                "approved in the terminal by admin token {} and run: {summary}",
+                caller.token_id
+            ));
+            result_reply(id, result)
         }
         Ok(Err(
             refused @ (CallError::Refused { .. }

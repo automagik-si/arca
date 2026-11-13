@@ -5,7 +5,9 @@
 //!
 //! `token reload --config <c>` makes the node that runs on that config read its tokens again, and says what happened. A
 //! node reads its tokens when it starts and on SIGHUP, and `token mint` sends no signal, so this is the step after a mint
-//! on a running node. It signals only a process it has checked to be `arca serve` on that very config.
+//! on a running node. It signals only a process it has checked to be `arca serve` on that very config. `token mint --replace`
+//! is the one mint that signals: it retires the old admin token, so the running node reads its tokens at once, as it does
+//! for `token revoke`.
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::{self, Write};
@@ -39,7 +41,8 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
             "--id {id} is the name an action runs under once the owner approved it, and no token takes it: choose another id"
         )));
     }
-    let hash_dir = token_node(flags, Does::Acts)?.hash_dir;
+    let node = token_node(flags, Does::Acts)?;
+    let hash_dir = node.hash_dir.clone();
     let out = PathBuf::from(flags.required("out")?);
     check_hash_dir(&hash_dir)?;
     if exists(&out) {
@@ -96,9 +99,14 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
     if retire.is_empty() {
         Ok(Some(json!({ "id": id, "scope": scope.as_str() })))
     } else {
-        Ok(Some(
-            json!({ "id": id, "scope": scope.as_str(), "retired": retire }),
-        ))
+        // The old admin token must stop at once, so the running node reads its tokens now, as a revoke does.
+        let reload_signalled = signal_node(&node);
+        Ok(Some(json!({
+            "id": id,
+            "scope": scope.as_str(),
+            "retired": retire,
+            "reloadSignalled": reload_signalled
+        })))
     }
 }
 
@@ -119,6 +127,17 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     }
     fs::remove_file(&hash_path)
         .map_err(|e| Failure::Runtime(format!("cannot remove the hash file: {e}")))?;
+    let reload_signalled = signal_node(&node);
+    Ok(Some(json!({
+        "id": id,
+        "revoked": true,
+        "reloadSignalled": reload_signalled
+    })))
+}
+
+/// Has the running node on this config read its tokens again (SIGHUP), as `token revoke` and a `token mint --replace` that
+/// retires a token do, so a retired token stops at once. Says on stderr what it could not do. Whether the signal was sent.
+fn signal_node(node: &TokenNode) -> bool {
     let mut reload_signalled = false;
     if let Some((config, cfg)) = &node.config {
         let config_path = config.path.as_path();
@@ -148,11 +167,7 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
             }
         }
     }
-    Ok(Some(json!({
-        "id": id,
-        "revoked": true,
-        "reloadSignalled": reload_signalled
-    })))
+    reload_signalled
 }
 
 /// How long `token reload` waits for the node to record that it read its tokens: a bound for a busy machine, since the node
