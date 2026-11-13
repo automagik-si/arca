@@ -747,6 +747,144 @@ fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
     );
 }
 
+/// A home as an upgraded node leaves it: its config, and each of `files` (a name and the secret file to copy) beside it
+/// at mode 0600. No `assistant-1.secret`.
+fn upgraded_home(node: &Node, name: &str, files: &[(&str, &Path)]) -> PathBuf {
+    let home = node.scratch.path(name);
+    let dir = home.join(".config/arca");
+    fs::create_dir_all(&dir).expect("the config directory");
+    fs::copy(&node.config, dir.join("node.json")).expect("the config");
+    for (file, from) in files {
+        let secret = fs::read_to_string(from).expect("the minted secret");
+        write_mode(&dir.join(file), &secret, 0o600);
+    }
+    home
+}
+
+/// `arca status` in `home`, with what `with` adds to the command.
+fn status_in(home: &Path, with: &dyn Fn(&mut Command)) -> Output {
+    let mut command = arca();
+    command.arg("status").env("HOME", home);
+    with(&mut command);
+    command.output().expect("run arca")
+}
+
+/// The fallback to a viewer token is `arca status`'s own step when nothing named a token file and the installer's is
+/// not there, and no other. A file the flag or the variable names is read alone, even when it is missing and a viewer
+/// token sits beside it; and an installer's file that is there but refused keeps its own refusal, so the owner fixes it.
+#[test]
+fn status_reads_a_named_token_file_alone_and_a_broken_installers_file_keeps_its_refusal() {
+    let node = start_node("status-named-alone");
+    let home = upgraded_home(&node, "named-home", &[("viewer.secret", &node.viewer)]);
+    let dir = home.join(".config/arca");
+    let missing = dir.join("missing.secret");
+    for by_variable in [false, true] {
+        let out = status_in(&home, &|command| {
+            if by_variable {
+                command.env("ARCA_TOKEN_FILE", &missing);
+            } else {
+                command.arg("--token-file").arg(&missing);
+            }
+        });
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(code(&out), 2, "variable {by_variable}: {said}");
+        assert!(
+            said.starts_with("arca: the token file does not exist: "),
+            "variable {by_variable}: {said}"
+        );
+    }
+    // The installer's file is there, but others may read it: its own refusal, not the viewer token beside it.
+    let installers = dir.join("assistant-1.secret");
+    let secret = fs::read_to_string(&node.viewer).expect("the minted secret");
+    write_mode(&installers, &secret, 0o644);
+    let out = status_in(&home, &|_| {});
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(code(&out), 2, "{said}");
+    assert!(
+        said.contains("can be read by its group or by others"),
+        "{said}"
+    );
+    // It is there and private, but holds no token: its own refusal again.
+    write_mode(&installers, "not a token\n", 0o600);
+    let out = status_in(&home, &|_| {});
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(code(&out), 2, "{said}");
+    assert!(said.contains("does not hold a token"), "{said}");
+}
+
+/// A viewer token minted with a `--tools` list that leaves out `arca_status` is passed over: the node would refuse it.
+/// It sorts before the viewer token that may ask, so a status that took it would be refused with 403.
+#[test]
+fn status_passes_over_a_viewer_token_whose_tools_leave_out_arca_status() {
+    let narrow = std::cell::RefCell::new(PathBuf::new());
+    let node = start_node_prepared(
+        "status-narrow",
+        &format!("{}\n", SkKey::from_seed(1).line(NAMESPACE)),
+        None,
+        &|scratch, hash_dir| {
+            let out = scratch.path("a-narrow.secret");
+            let minted = arca()
+                .args([
+                    "token",
+                    "mint",
+                    "--scope",
+                    "viewer",
+                    "--id",
+                    "a-narrow",
+                    "--tools",
+                    "service_list",
+                ])
+                .arg("--hash-dir")
+                .arg(hash_dir)
+                .arg("--out")
+                .arg(&out)
+                .output()
+                .expect("run token mint");
+            assert!(minted.status.success(), "minting a-narrow succeeds");
+            *narrow.borrow_mut() = out;
+        },
+    );
+    let narrow = narrow.into_inner();
+    let home = upgraded_home(
+        &node,
+        "narrow-home",
+        &[
+            ("a-narrow.secret", &narrow),
+            ("viewer.secret", &node.viewer),
+        ],
+    );
+    let out = status_in(&home, &|_| {});
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A viewer token the node does not accept (minted after the node read its tokens) is refused as any token is, and the
+/// refusal says which file `arca status` found, by its name, since the owner never named one. No secret is printed.
+#[test]
+fn a_refusal_of_the_token_status_found_names_its_file() {
+    let node = start_node("status-found-refused");
+    let late = mint(
+        &node.scratch,
+        &node.scratch.path("tokens"),
+        "viewer",
+        "late-1",
+    );
+    let home = upgraded_home(&node, "late-home", &[("late.secret", &late)]);
+    let out = status_in(&home, &|_| {});
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    // First, with nothing of the output in the message: no secret is printed.
+    let secret = fs::read_to_string(&late).expect("the minted secret");
+    let printed = format!("{said}{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        !printed.contains(secret.trim_end()),
+        "the secret is printed"
+    );
+    assert_eq!(code(&out), 4, "{said}");
+    assert!(
+        said.starts_with("arca: the installer's token file assistant-1.secret is not there, so arca status used the viewer token in late.secret beside it, and the node does not accept this token"),
+        "{said}"
+    );
+}
+
 /// A node installed before the installer named its token `assistant-1.secret` keeps its viewer token beside the
 /// config under another name. `arca status` with no flag finds that one, and the first command after an upgrade answers
 /// instead of telling the owner to mint a token. A doctor token beside it is never taken in a viewer's place.

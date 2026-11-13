@@ -56,14 +56,18 @@ states what the kernel may touch.
 
 `--config` and `--token-file` have defaults, the files the installer writes: `~/.config/arca/node.json` and
 `~/.config/arca/assistant-1.secret`. The order is the flag, then the variable (`ARCA_CONFIG`, `ARCA_TOKEN_FILE`), then
-the default, and every command finds its config this way. A command that writes to a node or acts on it, and was not
-given `--config`, first says on stderr which config it uses and how it was found (`arca: using the config <path> (the
-default)` or `(from ARCA_CONFIG)`). A command that removes or cuts something off (`token revoke`, `link remove`, `probe
-consumer remove`, `adopt apply`, `adopt release`, `init --watch-only`, `templates install --replace`) also names the node's
-state directory in that line. A command that
-only reads says nothing, and a config named with `--config` is not said back. One thing has no default: a call with
-`--peer` sends its token to another node, so its `--token-file` is always named. `token mint` and `token revoke` with
-`--hash-dir` alone read no config at all, not even the variable's.
+the default, and every command finds its config this way. `arca status` alone takes one step more: when no token file is
+named and `~/.config/arca/assistant-1.secret` is not there, it uses a viewer token of this node from that directory, the
+first `.secret` file there that the node's token directory holds as a viewer that may call `arca_status` (the
+`viewer.secret` of a node installed before that default existed). A token of a wider scope is never taken, a token file
+the flag or the variable names is read alone, and a refusal of the token it found names that file. A command that writes
+to a node or acts on it, and was not given `--config`, first says on stderr which config it uses and how it was found
+(`arca: using the config <path> (the default)` or `(from ARCA_CONFIG)`). A command that removes or cuts something off
+(`token revoke`, `link remove`, `probe consumer remove`, `adopt apply`, `adopt release`, `init --watch-only`, `templates
+install --replace`) also names the node's state directory in that line. A command that only reads says nothing, and a
+config named with `--config` is not said back. One thing has no default: a call with `--peer` sends its token to another
+node, so its `--token-file` is always named. `token mint` and `token revoke` with `--hash-dir` alone read no config at
+all, not even the variable's.
 
 **The variable alone never picks the node for a command that hands out, removes or rewrites something.** `token mint`,
 `token revoke`, `token reload`, `call --peer`, `link pair`, `link join`, `link remove`, `probe consumer remove`, `adopt
