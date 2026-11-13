@@ -7,7 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-- The guide now says that a doctor, operator or admin token acts without a card, and that the host network part re-applies the declared host network where it is installed, while services are not repaired by themselves.
+- The guide names `admin` tokens beside `doctor` and `operator`, and says what puts the declared host network back
+  and what does not.
 
 ## 0.25.0 (2026-11-13)
 
