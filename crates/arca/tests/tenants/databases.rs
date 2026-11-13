@@ -803,3 +803,70 @@ fn a_node_whose_config_sets_up_no_services_refuses_a_database_in_those_words() {
     assert!(!password_file(&rig, "orders").exists());
     assert!(!has_entry(&rig, "service-orders"));
 }
+
+/// Runs the shipped entrypoint script with stand-ins for the programs it starts, and returns the SQL it sent to psql.
+fn sql_the_database_script_sends() -> String {
+    use std::process::{Command, Stdio};
+    let (_, script) = arca::cmd_templates::SHIPPED
+        .iter()
+        .find(|(name, _)| *name == "postgres-autopg.sh")
+        .expect("the shipped script");
+    let dir = std::env::temp_dir().join(format!("arca-pg-sql-{}", std::process::id()));
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).expect("a scratch directory");
+    let stand_in = |name: &str, body: &str| {
+        let path = bin.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("a stand-in");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable");
+    };
+    stand_in("autopg", "exit 0");
+    stand_in("pg_isready", "exit 0");
+    stand_in(
+        "psql",
+        "while read -r line; do printf '%s\\n' \"$line\" >> \"$AUTOPG_CONFIG_DIR/sql.txt\"; done",
+    );
+    stand_in("grep", "exit 0");
+    let status = Command::new("/bin/sh")
+        .args(["-ec", script, "postgres-autopg"])
+        .env_clear()
+        .env("PATH", &bin)
+        .env("AUTOPG_CONFIG_DIR", &dir)
+        .env("POSTGRES_PASSWORD", "abcDEF123")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("the script runs");
+    assert!(status.success());
+    // The provisioner runs in the background after the script has handed over to the postmaster stand-in.
+    let sql = dir.join("sql.txt");
+    for _ in 0..100 {
+        if fs::read_to_string(&sql).is_ok_and(|text| text.contains("ALTER SCHEMA")) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let text = fs::read_to_string(&sql).expect("the provisioner sent its SQL");
+    let _ = fs::remove_dir_all(&dir);
+    text
+}
+
+#[test]
+fn the_app_role_may_replicate_so_a_consumer_can_create_its_own_logical_slot() {
+    let sql = sql_the_database_script_sends();
+    let alter = sql
+        .lines()
+        .find(|line| line.contains("ALTER ROLE app"))
+        .expect("the role statement");
+    assert!(
+        alter.contains(" REPLICATION ") && !alter.contains("NOREPLICATION"),
+        "{alter}"
+    );
+    // Still no other right: not a superuser, no database or role creation.
+    assert!(alter.contains("NOSUPERUSER NOCREATEDB NOCREATEROLE"), "{alter}");
+    // A logical walsender names the database, so the one rule that lets the role in on database app lets it in.
+    let (_, script) = arca::cmd_templates::SHIPPED
+        .iter()
+        .find(|(name, _)| *name == "postgres-autopg.sh")
+        .expect("the script");
+    assert!(script.contains("RULE='host app app samenet scram-sha-256'"));
+}
