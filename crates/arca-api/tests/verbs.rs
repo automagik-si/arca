@@ -64,6 +64,8 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "service_secret_set",
             "service_publish",
             "service_unpublish",
+            "external_add",
+            "external_remove",
             "omni_instance_create",
             "omni_pair",
             "omni_status",

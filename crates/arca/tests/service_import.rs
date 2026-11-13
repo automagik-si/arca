@@ -1019,6 +1019,65 @@ fn every_other_writing_verb_still_refuses_an_imported_service() {
 }
 
 #[test]
+fn a_proposal_that_names_a_recorded_program_is_refused_when_it_is_made() {
+    let rig = standard();
+    arca::external::add(
+        &rig.state_dir(),
+        arca::external::External {
+            name: "agent".into(),
+            kind: arca::external::HOST_PROGRAM.into(),
+            address: "http://127.0.0.1:9000/mcp".into(),
+            health: None,
+        },
+        NOW,
+    )
+    .expect("the program is recorded");
+    for action in [
+        "service_remove",
+        "service_import",
+        "service_release",
+        "service_publish",
+        "service_unpublish",
+        "service_connect",
+        "service_disconnect",
+    ] {
+        let args = match action {
+            "service_publish" => json!({"name":"agent","reach":"tailnet"}),
+            "service_connect" | "service_disconnect" => json!({"from":"agent","to":"db1"}),
+            _ => json!({"name":"agent"}),
+        };
+        let (_, words) = refusal(rig.call_as(
+            Scope::Viewer,
+            "action_propose",
+            json!({"action": action, "args": args}),
+        ));
+        assert!(words.contains("external_remove agent"), "{action}: {words}");
+    }
+    let (_, words) = refusal(rig.call_as(
+        Scope::Viewer,
+        "action_propose",
+        json!({"action": "service_create", "args": {"name":"agent","template":"nats"}}),
+    ));
+    assert!(words.contains("external_remove agent"), "{words}");
+    let plans = rig.call("plan_list", json!({})).expect("plan_list");
+    assert_eq!(plans["plans"], json!([]), "no card was recorded");
+}
+
+#[test]
+fn a_recorded_program_cannot_take_the_name_of_an_imported_service() {
+    let rig = standard();
+    rig.approved("service_import", "db1").expect("the import");
+    let (_, words) = refusal(rig.call(
+        "external_add",
+        json!({"name":"db1","kind":"host-program","address":"http://127.0.0.1:9000/mcp"}),
+    ));
+    assert!(words.contains("one name space"), "{words}");
+    assert!(!rig.state_dir().join(arca::external::EXTERNAL_FILE).exists());
+    let rows = rig.call("service_list", json!({})).expect("list")["services"].clone();
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+}
+
+#[test]
 fn an_import_that_fails_a_check_is_refused_before_any_write() {
     // Each of these is refused when it is proposed, so the owner is never asked.
     let vm = {

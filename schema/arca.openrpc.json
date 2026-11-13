@@ -4475,6 +4475,11 @@
         "schema": {
           "additionalProperties": false,
           "properties": {
+            "address": {
+              "description": "Present only on a recorded program: the address it was recorded with.",
+              "maxLength": 300,
+              "type": "string"
+            },
             "destinations": {
               "description": "Present only on a service that may reach a private address through this node: each address and the one tcp port open on it, as this node's config (kernel.serviceDestinations) named them when the owner approved the create. Every other private address stays closed to the service. service_status also answers ready for each and, when it is false, problem.",
               "items": {
@@ -4513,6 +4518,11 @@
             "follow": {
               "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
               "type": "boolean"
+            },
+            "health": {
+              "description": "Present only on a recorded program recorded with one: the name of a tool it answers, a label.",
+              "maxLength": 64,
+              "type": "string"
             },
             "ipv4": {
               "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
@@ -4560,6 +4570,11 @@
               ],
               "type": "object"
             },
+            "kind": {
+              "const": "host-program",
+              "description": "Present only on a program this node records and does not manage (external_add): host-program.",
+              "type": "string"
+            },
             "lanPort": {
               "anyOf": [
                 {
@@ -4596,6 +4611,11 @@
               },
               "maxItems": 64,
               "type": "array"
+            },
+            "managed": {
+              "const": false,
+              "description": "Present only on a recorded program: false. Arca does not start, stop, update, publish or remove it.",
+              "type": "boolean"
             },
             "name": {
               "maxLength": 40,
@@ -4647,14 +4667,22 @@
               ],
               "description": "Its dash on the tailnet (service_publish), or null."
             },
+            "recorded": {
+              "const": true,
+              "description": "Present only on a recorded program: true. The node holds a record of it, and nothing more.",
+              "type": "boolean"
+            },
             "state": {
-              "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone.",
+              "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
               "enum": [
                 "creating",
                 "running",
                 "stopped",
                 "failed",
-                "unknown"
+                "unknown",
+                "recorded",
+                "up",
+                "down"
               ],
               "type": "string"
             },
@@ -4745,6 +4773,11 @@
               "items": {
                 "additionalProperties": false,
                 "properties": {
+                  "address": {
+                    "description": "Present only on a recorded program: the address it was recorded with.",
+                    "maxLength": 300,
+                    "type": "string"
+                  },
                   "destinations": {
                     "description": "Present only on a service that may reach a private address through this node: each address and the one tcp port open on it, as this node's config (kernel.serviceDestinations) named them when the owner approved the create. Every other private address stays closed to the service. service_status also answers ready for each and, when it is false, problem.",
                     "items": {
@@ -4783,6 +4816,11 @@
                   "follow": {
                     "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
                     "type": "boolean"
+                  },
+                  "health": {
+                    "description": "Present only on a recorded program recorded with one: the name of a tool it answers, a label.",
+                    "maxLength": 64,
+                    "type": "string"
                   },
                   "ipv4": {
                     "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
@@ -4830,6 +4868,11 @@
                     ],
                     "type": "object"
                   },
+                  "kind": {
+                    "const": "host-program",
+                    "description": "Present only on a program this node records and does not manage (external_add): host-program.",
+                    "type": "string"
+                  },
                   "lanPort": {
                     "anyOf": [
                       {
@@ -4866,6 +4909,11 @@
                     },
                     "maxItems": 64,
                     "type": "array"
+                  },
+                  "managed": {
+                    "const": false,
+                    "description": "Present only on a recorded program: false. Arca does not start, stop, update, publish or remove it.",
+                    "type": "boolean"
                   },
                   "name": {
                     "maxLength": 40,
@@ -4917,14 +4965,22 @@
                     ],
                     "description": "Its dash on the tailnet (service_publish), or null."
                   },
+                  "recorded": {
+                    "const": true,
+                    "description": "Present only on a recorded program: true. The node holds a record of it, and nothing more.",
+                    "type": "boolean"
+                  },
                   "state": {
-                    "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone.",
+                    "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
                     "enum": [
                       "creating",
                       "running",
                       "stopped",
                       "failed",
-                      "unknown"
+                      "unknown",
+                      "recorded",
+                      "up",
+                      "down"
                     ],
                     "type": "string"
                   },
@@ -5024,6 +5080,11 @@
         "schema": {
           "additionalProperties": false,
           "properties": {
+            "address": {
+              "description": "Present only on a recorded program: the address it was recorded with.",
+              "maxLength": 300,
+              "type": "string"
+            },
             "baseImage": {
               "description": "The fingerprint (SHA-256) of the image its instance was created from, as Incus recorded it. Absent when Incus recorded none.",
               "maxLength": 64,
@@ -5067,6 +5128,11 @@
             "follow": {
               "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
               "type": "boolean"
+            },
+            "health": {
+              "description": "Present only on a recorded program recorded with one: the name of a tool it answers, a label.",
+              "maxLength": 64,
+              "type": "string"
             },
             "ipv4": {
               "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
@@ -5114,6 +5180,11 @@
               ],
               "type": "object"
             },
+            "kind": {
+              "const": "host-program",
+              "description": "Present only on a program this node records and does not manage (external_add): host-program.",
+              "type": "string"
+            },
             "lanPort": {
               "anyOf": [
                 {
@@ -5150,6 +5221,11 @@
               },
               "maxItems": 64,
               "type": "array"
+            },
+            "managed": {
+              "const": false,
+              "description": "Present only on a recorded program: false. Arca does not start, stop, update, publish or remove it.",
+              "type": "boolean"
             },
             "name": {
               "maxLength": 40,
@@ -5201,18 +5277,26 @@
               ],
               "description": "Its dash on the tailnet (service_publish), or null."
             },
+            "recorded": {
+              "const": true,
+              "description": "Present only on a recorded program: true. The node holds a record of it, and nothing more.",
+              "type": "boolean"
+            },
             "settings": {
               "description": "For a virtual machine with settings: the settings object it was created with, as its guest reads it (the template's, with the values its create replaced). Never a secret.",
               "type": "object"
             },
             "state": {
-              "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone.",
+              "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
               "enum": [
                 "creating",
                 "running",
                 "stopped",
                 "failed",
-                "unknown"
+                "unknown",
+                "recorded",
+                "up",
+                "down"
               ],
               "type": "string"
             },
@@ -5555,6 +5639,11 @@
             "service": {
               "additionalProperties": false,
               "properties": {
+                "address": {
+                  "description": "Present only on a recorded program: the address it was recorded with.",
+                  "maxLength": 300,
+                  "type": "string"
+                },
                 "baseImage": {
                   "description": "The fingerprint (SHA-256) of the image its instance was created from, as Incus recorded it. Absent when Incus recorded none.",
                   "maxLength": 64,
@@ -5598,6 +5687,11 @@
                 "follow": {
                   "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
                   "type": "boolean"
+                },
+                "health": {
+                  "description": "Present only on a recorded program recorded with one: the name of a tool it answers, a label.",
+                  "maxLength": 64,
+                  "type": "string"
                 },
                 "ipv4": {
                   "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
@@ -5645,6 +5739,11 @@
                   ],
                   "type": "object"
                 },
+                "kind": {
+                  "const": "host-program",
+                  "description": "Present only on a program this node records and does not manage (external_add): host-program.",
+                  "type": "string"
+                },
                 "lanPort": {
                   "anyOf": [
                     {
@@ -5681,6 +5780,11 @@
                   },
                   "maxItems": 64,
                   "type": "array"
+                },
+                "managed": {
+                  "const": false,
+                  "description": "Present only on a recorded program: false. Arca does not start, stop, update, publish or remove it.",
+                  "type": "boolean"
                 },
                 "name": {
                   "maxLength": 40,
@@ -5732,18 +5836,26 @@
                   ],
                   "description": "Its dash on the tailnet (service_publish), or null."
                 },
+                "recorded": {
+                  "const": true,
+                  "description": "Present only on a recorded program: true. The node holds a record of it, and nothing more.",
+                  "type": "boolean"
+                },
                 "settings": {
                   "description": "For a virtual machine with settings: the settings object it was created with, as its guest reads it (the template's, with the values its create replaced). Never a secret.",
                   "type": "object"
                 },
                 "state": {
-                  "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone.",
+                  "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
                   "enum": [
                     "creating",
                     "running",
                     "stopped",
                     "failed",
-                    "unknown"
+                    "unknown",
+                    "recorded",
+                    "up",
+                    "down"
                   ],
                   "type": "string"
                 },
@@ -6157,6 +6269,135 @@
         }
       },
       "summary": "Take a service's dash off the tailnet: it stops serving 8443, its node logs out and leaves the tailnet, and tailscaled stops. Runs whether or not a publish finished.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "external_add",
+      "params": [
+        {
+          "name": "address",
+          "required": true,
+          "schema": {
+            "description": "Where the program answers: an http or https URL. Only its host and port are used, by service_status.",
+            "maxLength": 300,
+            "minLength": 8,
+            "pattern": "^https?://[^\\s/?#@]+(?:[/?#]\\S*)?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": true,
+          "schema": {
+            "description": "The kind of program: host-program, one that runs on the node's machine outside Incus.",
+            "enum": [
+              "host-program"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The name of the record (1-40 of a-z, 0-9 and inner \"-\", starting with a letter), in the name space services and functions share.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "health",
+          "required": false,
+          "schema": {
+            "description": "The name of a tool the program answers. Kept as a label only: nothing calls it.",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "address": {
+              "maxLength": 300,
+              "type": "string"
+            },
+            "health": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "kind": {
+              "const": "host-program",
+              "type": "string"
+            },
+            "name": {
+              "maxLength": 40,
+              "type": "string"
+            },
+            "recorded": {
+              "const": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "recorded",
+            "name",
+            "kind",
+            "address"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Record a program that runs outside Incus (a host program, such as a LaunchAgent) so service_list shows it as a row of kind host-program with its address, marked recorded and not managed by Arca. It only records: nothing is started, stopped or changed on the machine, and no owner approval is asked. service_status of it makes one TCP connect to the address's host and port (3 s) and says up or down. Every verb that changes a service refuses it; external_remove removes the record.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "external_remove",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The name of a recorded program.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 40,
+              "type": "string"
+            },
+            "removed": {
+              "const": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "removed",
+            "name"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Take a recorded host program out of the node's record, so service_list no longer shows it. Only the record goes: the program itself is not touched, and no owner approval is asked.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

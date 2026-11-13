@@ -1608,6 +1608,13 @@ impl ToolHandler for ActionPropose {
         let mut card_fact: Option<String> = None;
         // What a create from a template takes of the node, for the card's `Uses` line: read from that same template.
         let mut card_uses: Option<String> = None;
+        // A program this node only records is not a service to act on: no card is shown for it.
+        if let Some(node) = &self.node
+            && let Some(refusal) =
+                service_external::recorded_refusal(node, action.as_str(), &payload)
+        {
+            return Err(refusal);
+        }
         let payload = if is_gpu {
             let Some(gpu) = &self.gpu else {
                 return Err(gpu_refusal(GpuRefusal::Disabled));
@@ -4911,6 +4918,8 @@ impl ToolHandler for PostgresHandler {
 
 #[path = "function_handlers.rs"]
 mod function_handlers;
+#[path = "service_external.rs"]
+mod service_external;
 #[path = "service_follow.rs"]
 mod service_follow;
 #[path = "service_omni.rs"]
@@ -5011,6 +5020,18 @@ pub fn service_handlers_updating(
             }) as Arc<dyn ToolHandler>,
         )
     })
+    .chain(["external_add", "external_remove"].into_iter().map(|verb| {
+        (
+            verb,
+            Arc::new(service_external::ExternalHandler {
+                verb,
+                kernel: kernel.clone(),
+                clock: clock.clone(),
+                cfg: cfg.clone(),
+                writes: writes.clone(),
+            }) as Arc<dyn ToolHandler>,
+        )
+    }))
     .chain(omni_handlers(
         kernel.clone(),
         clock.clone(),
@@ -6323,6 +6344,42 @@ fn service_name(args: &Value) -> Result<String, CallError> {
 
 impl ToolHandler for ServiceHandler {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
+        // A program this node only records is the node's own row, read from its record before Incus is asked, and
+        // a verb that acts on a service refuses it in words before a grant is spent.
+        if let Some(refusal) = service_external::recorded_refusal(&self.cfg, self.verb, &args) {
+            return Err(refusal);
+        }
+        if self.verb == "service_status"
+            && args.as_object().is_some_and(|object| object.len() == 1)
+            && let Some(name) = args["name"].as_str()
+            && let Ok(Some(record)) = crate::external::find(&self.cfg.state_dir, name)
+        {
+            let up = crate::external::reachable(&record.address);
+            return Ok(crate::external::view(
+                &record,
+                if up { "up" } else { "down" },
+            ));
+        }
+        let mut answer = self.call_service(args.clone(), caller)?;
+        // The list shows each recorded program as a row of its own kind, beside the services.
+        if self.verb == "service_list"
+            && args.get("tenant").is_none()
+            && let Some(rows) = answer["services"].as_array_mut()
+            && let Ok(held) = crate::external::read(&self.cfg.state_dir)
+            && !held.is_empty()
+        {
+            rows.extend(
+                held.iter()
+                    .map(|record| crate::external::view(record, "recorded")),
+            );
+            rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        }
+        Ok(answer)
+    }
+}
+
+impl ServiceHandler {
+    fn call_service(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
         let allowed: &[&str] = match self.verb {
             "service_create" => &[
                 "name",

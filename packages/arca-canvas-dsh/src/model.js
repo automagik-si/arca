@@ -460,6 +460,10 @@ function buildMachine(host) {
         state: text(service?.state).trim(),
         lanPort: finite(service?.lanPort),
         versionDiffers: versionDiffers(service),
+        // A program the node only records (external_add) says its kind and that Arca does not manage it. Every
+        // other row carries neither, so it is the row it always was.
+        kind: service?.recorded === true ? text(service.kind).trim() : '',
+        recorded: service?.recorded === true,
       }))
       .filter((service) => service.name),
     // Older snapshots have no flag: treat their empty list as known-empty, as before.

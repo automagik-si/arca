@@ -537,3 +537,28 @@ test('README matches the fixed Doctor SSE error and the card tooltip rule', asyn
   assert.match(readme, /Whenever the card has no CPU load, the host's `reason` is the meter's tooltip/);
   assert.match(readme, /A memory `reason` renders `Mem n\/a` with the same tooltip and no bar/);
 });
+
+test('a program the node only records keeps its kind and its recorded mark, and no other service carries them', () => {
+  const recorded = {
+    name: 'agent', template: '', state: 'recorded', ipv4: '', ports: [], links: [], published: null, lanPort: null,
+    kind: 'host-program', address: 'http://127.0.0.1:9000/mcp', managed: false, recorded: true,
+  };
+  const withRow = (row) => buildDashboard({
+    ...fixture,
+    hosts: fixture.hosts.map((host) => host.name === 'alpha' ? { ...host, services: [...host.services, row] } : host),
+  });
+  const alpha = (dashboard) => dashboard.hosts.find((machine) => machine.name === 'alpha');
+  const row = alpha(withRow(recorded)).services.find((service) => service.name === 'agent');
+  assert.equal(row.kind, 'host-program');
+  assert.equal(row.recorded, true);
+  assert.equal(row.state, 'recorded');
+  assert.equal(row.lanPort, null);
+  // A row that merely says a kind, without the recorded mark, is not shown as recorded.
+  const loose = alpha(withRow({ ...recorded, recorded: false })).services.find((service) => service.name === 'agent');
+  assert.equal(loose.recorded, false);
+  assert.equal(loose.kind, '');
+  for (const service of alpha(buildDashboard(fixture)).services) {
+    assert.equal(service.recorded, false);
+    assert.equal(service.kind, '');
+  }
+});

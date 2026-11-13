@@ -391,7 +391,11 @@
         name: text(service?.name).trim(),
         state: text(service?.state).trim(),
         lanPort: finite(service?.lanPort),
-        versionDiffers: versionDiffers(service)
+        versionDiffers: versionDiffers(service),
+        // A program the node only records (external_add) says its kind and that Arca does not manage it. Every
+        // other row carries neither, so it is the row it always was.
+        kind: service?.recorded === true ? text(service.kind).trim() : "",
+        recorded: service?.recorded === true
       })).filter((service) => service.name),
       // Older snapshots have no flag: treat their empty list as known-empty, as before.
       servicesKnown: host.servicesKnown !== false,
@@ -1157,6 +1161,7 @@
     node.append(foot);
     return node;
   }
+  var RECORDED_WHY = "This node records the program and nothing more: Arca does not start, stop, update or publish it.";
   var VERSION_DIFFERS = "Other version";
   var VERSION_DIFFERS_WHY = "The template installed on this machine names another version than the one this service runs.";
   function versionTag(doc, className) {
@@ -1696,7 +1701,16 @@
         const rows = el(doc, "ul", "arca-detail-services-list");
         for (const service of machine.services) {
           const item = el(doc, "li", "arca-detail-service");
-          item.append(el(doc, "span", "", service.name), el(doc, "span", "arca-detail-service-state", service.state || "Unknown"));
+          item.append(el(doc, "span", "", service.name));
+          if (service.recorded) {
+            const kind = el(doc, "span", "arca-detail-service-kind mono", service.kind || "recorded");
+            kind.title = RECORDED_WHY;
+            const reached = service.state === "up" || service.state === "down";
+            item.append(kind, el(doc, "span", "arca-detail-service-state", reached ? service.state : "recorded, not managed by Arca"));
+            item.dataset.recorded = "true";
+          } else {
+            item.append(el(doc, "span", "arca-detail-service-state", service.state || "Unknown"));
+          }
           if (service.lanPort !== null) item.append(el(doc, "span", "arca-detail-service-port mono", `port ${service.lanPort}`));
           if (service.versionDiffers) item.append(versionTag(doc, "arca-detail-service-version"));
           rows.append(item);
