@@ -6,6 +6,7 @@
   "digest": "sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
   "entrypoint": ["/usr/local/bin/nats-server", "--jetstream", "--store_dir", "/data/jetstream", "--port", "4222"],
   "ports": [4222],
+  "data": { "path": "/data", "uid": 0, "gid": 0, "size": "10GiB" },
   "env": {},
   "provides": { "env": { "NATS_URL": "nats://{{host}}:{{port}}" } },
   "publishable": false
