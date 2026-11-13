@@ -765,11 +765,16 @@ none of them, `__arca_script=$(echo${IFS}<base64>|base64${IFS}-d)&&eval${IFS}"$_
 stands for a space the shell splits on. The image's own `base64` decodes the script and `eval` runs it in that shell,
 so `$0`, `$1` and `-e` are as if the script had been passed whole, on either liblxc, on Incus 7.3 and later (Incus 7.0
 to 7.2 escape the word's `$`, `(` and `|`, and the script does not run there). The image therefore needs `sh` and
-`base64` (busybox and coreutils both have them), and as the joined entrypoint stays under 32,768 bytes, a script is
-about 24 KB at most. A line break in any other entrypoint argument is refused by `service_create` before anything is
-created. Any other argument goes to Incus as the template has it: one that is empty, holds whitespace or starts with a
-quote starts where liblxc is 6.0 or later, and on liblxc 5.0 or older the container is created and its start fails, so
-a template meant for every node keeps such words out of its entrypoint. A template `env` value goes as it is too:
+`base64` (busybox and coreutils both have them). The joined entrypoint may be 43,760 bytes, which is what 32,768 bytes
+of script are as base64 in that word, so a script may be about 32,700 bytes, as it could before it went as base64. A
+line break in any other entrypoint argument is refused by `service_create` before anything is created. Any other
+argument goes to Incus as the template has it. One that is empty, holds whitespace or starts with a quote starts where
+liblxc is 6.0 or later, and on liblxc 5.0 or older the container is created and its start fails. One that holds both
+kinds of quote (`'` and `"`) and also holds whitespace or starts with a quote is created and fails at its start on
+every liblxc: Incus writes such a word for LXC inside the quote it does not hold, and refuses one that holds both
+(`Unable to encode command argument`). So a template meant for every node keeps such words out of its entrypoint. A
+function's `command` goes the same way: the script of its shell as that one word, any other part as it is. A template
+`env` value goes as it is too:
 Incus refuses a line break in it at create, and Incus 7.6 a carriage return at the container's start. A service made by an
 earlier release from a script entrypoint keeps the entrypoint it was made with, which Incus 7.6 refuses at its start
 and at every update: remove it and create it again. A template whose `image` is `local:<alias>`
@@ -5349,7 +5354,7 @@ action_propose { "action": "function_create", "args": {
 |-------|------|
 | `name` | A service's grammar. Functions and services share one name space: neither takes a name the other holds, and each verb keeps to its kind (`service_status` of a function, and `function_run` of a service, are refused in words). |
 | `image`, `digest` | `<registry>/<repository>` in lower case and `sha256:` with 64 hex digits. Never a tag. Arca pulls the image with the credential set for its registry, if there is one, and without one otherwise ([A registry that asks for a credential](#a-registry-that-asks-for-a-credential)). |
-| `command` | Optional. The program's absolute path inside the image, then its arguments. No shell runs it. Left out, the image's own entry point runs. |
+| `command` | Optional. The program's absolute path inside the image, then its arguments. No shell runs it. Left out, the image's own entry point runs. Where the program is itself a shell given its script (`["/bin/sh", "-c", <script>]`: `sh`, `ash`, `dash` or `bash`, flags ending in `c`) and the script holds whitespace or starts with a quote, the script reaches the container as one word of base64 that the shell decodes and runs, as a service template's script does, so it starts whichever liblxc the node's Incus links, and the image needs `base64`. Any other part that holds whitespace or starts with a quote starts only where liblxc is 6.0 or later, and on no liblxc when it also holds both kinds of quote. The card and `function_list` show the command as it was written. |
 | `env` | Plain values by name, at most 32, each at most 160 characters. The card shows each whole. |
 | `secrets` | Names only, at most 16. See below. |
 | `links` | Services of this node the function may reach, each on one tcp port that service declares. At most 8. |

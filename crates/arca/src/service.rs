@@ -3204,35 +3204,55 @@ fn entrypoint_with(
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),
         };
-        // A word with whitespace in it, or one that starts with a quote, reaches liblxc 5.0 and older as other words.
-        let split_by_old_liblxc = text.contains([' ', '\t', '\u{b}', '\u{c}', '\n', '\r'])
-            || text.starts_with(['\'', '"']);
-        if split_by_old_liblxc && is_shell_script_argument(parts, index) {
-            out.push(shell_quote(&one_line_script(&text)));
-        } else if text.contains(['\n', '\r']) {
+        let flag = index
+            .checked_sub(1)
+            .and_then(|before| parts[before].as_str());
+        let word = entrypoint_word(parts[0].as_str(), flag, &text);
+        // The one word of a shell's script holds no line break; any other argument is its own text, quoted.
+        if word.contains(['\n', '\r']) {
             return Err(TemplateError::refused(
                 "entrypoint: an argument with a line break must be the script of a shell, as in \
                  [\"/bin/sh\", \"-ec\", <script>, ...]: Incus refuses a line break anywhere in oci.entrypoint",
             ));
-        } else {
-            out.push(shell_quote(&text));
         }
+        out.push(word);
     }
     let joined = out.join(" ");
-    if joined.len() > 32_768 {
+    if joined.len() > ENTRYPOINT_MAX {
         return Err(TemplateError::refused("entrypoint: too long"));
     }
     Ok(Some(joined))
 }
 
-/// Whether `parts[index]` is the script of a shell started as `sh -c <script>` (or `-ec`, `-eu -c` and the like): the
-/// one argument that Arca can carry whitespace, a line break or a leading quote in, because it can decode it again
-/// inside the shell.
-fn is_shell_script_argument(parts: &[Value], index: usize) -> bool {
-    let Some(flag) = index.checked_sub(1).and_then(|i| parts[i].as_str()) else {
+/// The most bytes of a joined entrypoint, as it goes to Incus. Until a script went as base64 the cap was 32,768 bytes
+/// of its own text, so a script was at most the 32,766 bytes between its two quotes. Base64 makes four bytes of every
+/// three, and [`one_line_script`] puts 70 bytes round them, inside the same two quotes: this is that script in that
+/// form, 43,760 bytes. So every entrypoint that fit before still fits, and a script may be as large as it could be.
+const ENTRYPOINT_MAX: usize = 72 + (32_768_usize - 2).div_ceil(3) * 4;
+
+/// One argument of an entrypoint as the word that stands for it in `oci.entrypoint`: a template's argument, and a
+/// part of a function's command. `program` is the entrypoint's first argument and `flag` the one before `text`, each
+/// `None` where there is none or it is no plain text. The script of a shell that liblxc 5.0 and older would split is
+/// the one word [`one_line_script`] makes of it; any other argument is its own text, quoted for Incus.
+pub(crate) fn entrypoint_word(program: Option<&str>, flag: Option<&str>, text: &str) -> String {
+    // A word with whitespace in it, or one that starts with a quote, reaches liblxc 5.0 and older as other words.
+    let split_by_old_liblxc =
+        text.contains([' ', '\t', '\u{b}', '\u{c}', '\n', '\r']) || text.starts_with(['\'', '"']);
+    if split_by_old_liblxc && is_shell_script_argument(program, flag) {
+        shell_quote(&one_line_script(text))
+    } else {
+        shell_quote(text)
+    }
+}
+
+/// Whether the argument after `flag` is the script of a shell started as `sh -c <script>` (or `-ec`, `-eu -c` and the
+/// like), `program` being the entrypoint's first argument: the one argument that Arca can carry whitespace, a line
+/// break or a leading quote in, because it can decode it again inside the shell.
+fn is_shell_script_argument(program: Option<&str>, flag: Option<&str>) -> bool {
+    let Some(flag) = flag else {
         return false;
     };
-    let shell = parts[0].as_str().and_then(|s| s.rsplit('/').next());
+    let shell = program.and_then(|s| s.rsplit('/').next());
     matches!(shell, Some("sh" | "bash" | "ash" | "dash"))
         && flag.len() > 1
         && flag.starts_with('-')
