@@ -3860,6 +3860,10 @@ fn service_update_params_base() -> Value {
                 "type": "boolean"
             },
             "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter)."),
+            "noNewPrivileges": {
+                "description": "A proposal made with action_propose fills this in when the service's template says something different about no-new-privileges than the service has: the setting the update gives it, so the owner's card says that the service is restarted. A caller has no need to state it; if stated, it must be what the template says now. Give it with the digest the service already runs.",
+                "type": "boolean"
+            },
             "timeoutSeconds": {
                 "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent.",
                 "maximum": 900,

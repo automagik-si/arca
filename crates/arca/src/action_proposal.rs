@@ -217,6 +217,9 @@ impl ActionKind {
         {
             return "It cannot be undone: the service's data is erased and cannot be brought back.";
         }
+        if self == Self::ServiceUpdate && args.get("noNewPrivileges").is_some() {
+            return "If the service does not come back healthy, Arca puts the old setting back by itself. To go back after a good change, change the setting in the template and ask your assistant to update the service to the digest it already runs.";
+        }
         self.undo_words()
     }
 
@@ -535,6 +538,16 @@ impl ActionKind {
                         },
                     ));
                 }
+                if let Some(on) = args.get("noNewPrivileges").and_then(Value::as_bool) {
+                    rows.push(row(
+                        "Effect",
+                        &format!(
+                            "Turns no-new-privileges {} for this service, as its template now says: a setuid or setcap binary inside it {} raise privileges. The service is restarted, which interrupts it, and Arca puts the old setting back and restarts it again if it does not come back healthy. Its image and its data are not touched, and nothing is erased.",
+                            if on { "on" } else { "off" },
+                            if on { "can no longer" } else { "can again" },
+                        ),
+                    ));
+                }
                 if args.get("digest").is_some() {
                     rows.push(row("Digest", text("digest")));
                 }
@@ -780,6 +793,17 @@ impl ActionKind {
             Self::ServiceUpdate if args.get("eraseData").and_then(Value::as_bool) == Some(true) => {
                 format!(
                     "Update the service {} and ERASE ALL OF ITS DATA",
+                    text("name")
+                )
+            }
+            Self::ServiceUpdate if args.get("noNewPrivileges").is_some() => {
+                format!(
+                    "Turn no-new-privileges {} for the service {} and restart it",
+                    if args["noNewPrivileges"].as_bool() == Some(true) {
+                        "on"
+                    } else {
+                        "off"
+                    },
                     text("name")
                 )
             }

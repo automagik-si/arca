@@ -2071,6 +2071,10 @@
                     "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
                     "type": "string"
                   },
+                  "noNewPrivileges": {
+                    "description": "A proposal made with action_propose fills this in when the service's template says something different about no-new-privileges than the service has: the setting the update gives it, so the owner's card says that the service is restarted. A caller has no need to state it; if stated, it must be what the template says now. Give it with the digest the service already runs.",
+                    "type": "boolean"
+                  },
                   "tenant": {
                     "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
                     "pattern": "^[a-z2-7]{8}$",
@@ -5660,6 +5664,14 @@
           "required": false,
           "schema": {
             "description": "Instead of a digest: whether the node moves this service to Automagik's newest published server image by itself (true) or leaves it where it is (false). A service made from the automagik-server template follows until this says false. Only a container of the node's own project made from ghcr.io/automagik-si/automagik-server by digest can say it. Nothing is restarted by this call.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "noNewPrivileges",
+          "required": false,
+          "schema": {
+            "description": "A proposal made with action_propose fills this in when the service's template says something different about no-new-privileges than the service has: the setting the update gives it, so the owner's card says that the service is restarted. A caller has no need to state it; if stated, it must be what the template says now. Give it with the digest the service already runs.",
             "type": "boolean"
           }
         },

@@ -297,6 +297,29 @@ fn erasing(config: &ServiceConfig, path: &str) -> CallError {
     ))
 }
 
+/// What the service's template says about no-new-privileges when it differs from what the service has: the setting an
+/// update gives it. `None` when they agree, when the template cannot be read, and in a tenant. The run and the
+/// proposal work it out the same way.
+fn key_change(cfg: &NodeConfig, config: &ServiceConfig) -> Option<bool> {
+    config
+        .tenant
+        .is_none()
+        .then(|| {
+            crate::service::load_template(&cfg.state_dir.join("templates"), &config.template).ok()
+        })
+        .flatten()
+        .map(|template| template.no_new_privileges)
+        .filter(|wanted| *wanted != config.no_new_privileges)
+}
+
+/// The refusal of an update that moves the digest while the template's no-new-privileges differs from the service's.
+fn key_first(name: &str, wanted: bool) -> CallError {
+    refused(format!(
+        "update service {name}: its template now {} noNewPrivileges, which is applied by its own update: call service_update with the digest the service already runs, then move the digest. Or move the digest first and change the template's key afterwards, which is safer for an image that needs a setuid helper. Nothing was changed",
+        if wanted { "sets" } else { "drops" }
+    ))
+}
+
 /// What a proposal of `service_update` is held to when it is made, so the owner is never shown a card for an update
 /// the node would refuse: one that mixes `follow` with what it does not go with, or that would erase the service's
 /// data without `eraseData`. Answers the arguments to record. A card that states `eraseData` for a service that has
@@ -325,6 +348,48 @@ pub(super) fn check_proposal(
     };
     if config.adopted || config.function.is_some() || config.vm.is_some() {
         return Ok(payload.clone());
+    }
+    // The key change the run will make, worked out as the run works it out. A same-digest proposal is that change
+    // alone, with a card of its own: it restarts the service and erases nothing, so it needs no `eraseData`, and a
+    // card that states it is refused. A digest move while the key differs is refused, so the owner never sees a card
+    // the run would refuse.
+    let wanted = key_change(cfg, &config);
+    let moves = payload["digest"]
+        .as_str()
+        .and_then(|digest| source_with(&config.source, digest))
+        .is_some_and(|source| source != config.source);
+    match (
+        wanted,
+        payload.get("noNewPrivileges").and_then(Value::as_bool),
+    ) {
+        (Some(wanted), _) if moves => return Err(key_first(name, wanted)),
+        (Some(wanted), stated) => {
+            if stated.is_some_and(|stated| stated != wanted) || erase {
+                return Err(CallError::Invalid(
+                    "noNewPrivileges, eraseData: the update at the digest the service runs only sets no-new-privileges to what its template says, and erases nothing".into(),
+                ));
+            }
+            if wanted
+                && let Some(why) = crate::handlers::no_new_privileges_refusal(
+                    &arca_incus::UnixIncus::new(cfg.incus.socket.clone()),
+                    &config.template,
+                )
+            {
+                return Err(refused(format!(
+                    "update service {name}: {}",
+                    why.replace("Nothing was created", "Nothing was changed")
+                )));
+            }
+            let mut keyed = payload.clone();
+            keyed["noNewPrivileges"] = json!(wanted);
+            return Ok(keyed);
+        }
+        (None, Some(_)) => {
+            return Err(CallError::Invalid(
+                "noNewPrivileges: the service's template says what the service already has".into(),
+            ));
+        }
+        (None, None) => {}
     }
     let Ok(changer) = state_changer_for(cfg, &config) else {
         return Ok(payload.clone());
@@ -542,27 +607,30 @@ impl ServiceHandler {
         // as a config write and a restart, never a rebuild, so the data stays where it is. It is its own step: an
         // update that also moves the digest is refused, so no answer mixes the two and a failure of one never
         // leaves the other half done.
-        let wanted = config
-            .tenant
-            .is_none()
-            .then(|| {
-                crate::service::load_template(
-                    &self.cfg.state_dir.join("templates"),
-                    &config.template,
-                )
-                .ok()
-            })
-            .flatten()
-            .map(|template| template.no_new_privileges)
-            .filter(|wanted| *wanted != config.no_new_privileges);
+        let wanted = key_change(&self.cfg, &config);
         if let Some(wanted) = wanted {
             if new_source != config.source {
-                return Err(said(&format!(
-                    "its template now {} noNewPrivileges, which is applied by its own update: call service_update with the digest the service already runs first, then move the digest",
-                    if wanted { "sets" } else { "drops" }
-                )));
+                return Err(key_first(&name, wanted));
             }
-            return self.change_no_new_privileges(&entry, &config, wanted, &digest);
+            // A card the owner approved names the setting it gave: the template must still say it.
+            if let Some(stated) = args.get("noNewPrivileges") {
+                if stated.as_bool() != Some(wanted) {
+                    return Err(said(
+                        "noNewPrivileges is not what the template says now. Nothing was changed",
+                    ));
+                }
+            }
+            let key = KeyUpdate {
+                port,
+                reach,
+                seconds,
+            };
+            return self.change_no_new_privileges(&entry, &config, wanted, &digest, key);
+        }
+        if args.get("noNewPrivileges").is_some() {
+            return Err(said(
+                "noNewPrivileges: the service's template says what the service already has. Nothing was changed",
+            ));
         }
         if new_source == config.source {
             return Ok(json!({
@@ -660,6 +728,7 @@ impl ServiceHandler {
         config: &ServiceConfig,
         wanted: bool,
         digest: &str,
+        key: KeyUpdate,
     ) -> Result<Value, CallError> {
         let name = &config.name;
         let said = |why: &str| refused(format!("update service {name}: {why}"));
@@ -766,6 +835,59 @@ impl ServiceHandler {
             )));
         }
         journal.step("restart", true, json!({ "restarted": was_running }));
+        // The same health check a digest update runs, within the call's timeout: a service that does not come back
+        // (an image whose setuid helper breaks under the key, say) gets the old setting back and a restart.
+        if was_running {
+            let run = Run {
+                handler: self,
+                changer: &changer,
+                config,
+                entry,
+                new_source: &config.source,
+                digest,
+                port: key.port,
+                reach: key.reach,
+                seconds: key.seconds,
+                registry: None,
+                journal: &journal,
+                was_running,
+            };
+            if let Err(failure) = run.healthy() {
+                journal.step("health", false, json!({ "why": failure.why }));
+                let restored = put_back();
+                let restarted = changer
+                    .read(&config.project, &config.instance)
+                    .and_then(|state| changer.change(&state, StateAction::Restart))
+                    .is_ok();
+                let answers = restarted && run.answers_within(key.seconds.min(OLD_ANSWERS_SECONDS));
+                journal.step(
+                    "end",
+                    false,
+                    json!({ "rolledBack": restored, "restarted": restarted, "answers": answers }),
+                );
+                return Err(CallError::Refused {
+                    code: "rolled_back".into(),
+                    message: format!(
+                        "update service {name}: it did not come back healthy with no-new-privileges {}: {}. {} {}",
+                        if wanted { "on" } else { "off" },
+                        failure.why,
+                        if restored {
+                            "The old setting is back, in its record and in its instance's config."
+                        } else {
+                            "The old setting could not be put back in its record: service_status shows what it says."
+                        },
+                        if !restarted {
+                            "It could not be restarted again: instance_start starts it."
+                        } else if answers {
+                            "It was restarted again and its port answers."
+                        } else {
+                            "It was restarted again, but its port did not answer yet: service_status and service_logs show how it is."
+                        },
+                    ),
+                });
+            }
+            journal.step("health", true, json!({ "port": key.port }));
+        }
         journal.step("end", true, json!({ "noNewPrivileges": wanted }));
         Ok(json!({
             "updated": true,
@@ -776,10 +898,17 @@ impl ServiceHandler {
             "message": format!(
                 "the service now runs {} no-new-privileges, as its template says{}; its image and data were not touched",
                 if wanted { "with" } else { "without" },
-                if was_running { ", and was restarted for it" } else { ", from its next start" },
+                if was_running { ", and was restarted for it (the restart interrupts it) and answered its health check" } else { ", from its next start" },
             ),
         }))
     }
+}
+
+/// What the health check after a key update needs: the port it tries, how it reaches it, and how long it waits.
+struct KeyUpdate {
+    port: u16,
+    reach: Reach,
+    seconds: u64,
 }
 
 /// How the node tells that a service answers.

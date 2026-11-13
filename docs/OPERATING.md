@@ -916,11 +916,24 @@ The service's record keeps `noNewPrivileges: true`, and `service_list` and `serv
 for such a service and no such key for any other. An existing service gains or loses the key without being removed or
 rebuilt: change `noNewPrivileges` in its template (`arca templates install`), then call `service_update` with the digest
 the service already runs. When the template and the service differ, that call checks the project as above, saves the
-record, writes `raw.lxc` into the instance and restarts it if it runs (the setting takes effect at the next start, so a
-stopped service has it from then); the image and the data volume are not touched, and no rebuild happens. The answer
-says `noNewPrivileges` and `restarted`. If the write is refused or the restart fails, the record is put back and the
-answer says so. The call is refused when it also moves the digest: do the key first, then the digest. Without a
-difference, an update to the digest the service already runs is the no-op it always was.
+record, writes `raw.lxc` into the instance and **restarts it if it runs, which interrupts it**. The setting takes effect
+at the next start, so a stopped service has it from then and is not restarted. The image and the data volume are not
+touched and nothing is rebuilt. After the restart the call runs the same health check as a digest update (the service's
+first port must answer, or the instance must stay running) and honours `timeoutSeconds`. If the write is refused, the
+restart fails or the service does not come back healthy, the old setting is put back in the record and in the instance's
+config, the service is restarted again, and the answer says so (`rolled_back` for the health check). The answer says
+`noNewPrivileges` and `restarted`. A proposal for it (`action_propose`) gets a card of its own: it says it turns
+no-new-privileges on or off, restarts the service, puts the old setting back if the service does not come back healthy,
+and erases nothing; it states no `eraseData`. A call, and a proposal, that also moves the digest are refused while the
+template's key differs from the service's, so the owner never approves a card the run would refuse. The two orders both
+work: the key first, at the digest the service runs, then the digest; or the digest first, then edit the template and
+apply the key. For an image whose setuid helpers break under the key, moving the digest first is the safer order, since
+the service then runs the new image before it takes the key. With no difference, an update to the digest the service
+already runs is the no-op it always was.
+
+If the owner later sets `restricted.containers.lowlevel` back to `block`, Incus refuses every later write of the
+instance config of a service that has the key, since the whole config is checked: a secret, a link or an environment
+change then fails for that service. Dropping the key still works, through the update above.
 
 `data` names an absolute printable mount `path` of at most 255 bytes that is not the root (`/`, `//` and `/.` are
 refused) and has no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit), and an optional `size` such as

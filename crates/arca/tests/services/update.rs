@@ -987,3 +987,103 @@ fn a_no_new_privileges_write_the_node_cannot_apply_leaves_the_record_as_it_was()
     assert!(instance(&rig)["config"].get("raw.lxc").is_none());
     assert_eq!(instance(&rig)["status"], "Running");
 }
+
+#[test]
+fn a_service_that_does_not_come_back_healthy_with_the_key_gets_the_old_setting_back() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    rig.template("app", strict_app());
+    rig.allow_low_level();
+    // The restart is the node's own; the service then does not answer, as an image that needs a setuid helper would not.
+    up.store(false, Ordering::SeqCst);
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": DIGEST, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rolled_back");
+    assert!(
+        message.contains("did not come back healthy with no-new-privileges on")
+            && message.contains("The old setting is back"),
+        "{message}"
+    );
+    assert!(!record_flag(&rig), "the record names the old setting");
+    assert!(instance(&rig)["config"].get("raw.lxc").is_none());
+    assert_eq!(instance(&rig)["status"], "Running");
+    let steps: Vec<(String, bool)> = journal(&rig);
+    assert!(steps.contains(&("health".to_string(), false)), "{steps:?}");
+    // The answer of a key change that went well says the service was restarted and answered.
+    up.store(true, Ordering::SeqCst);
+    let done = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("gain");
+    assert!(
+        done["message"]
+            .as_str()
+            .expect("message")
+            .contains("interrupts it"),
+        "{done}"
+    );
+}
+
+#[test]
+fn a_key_change_proposal_has_a_card_of_its_own_and_no_card_is_shown_for_what_the_run_would_refuse()
+{
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_rig(&up);
+    // The template and the service agree: no key can be proposed.
+    let message = format!(
+        "{:?}",
+        propose_update(
+            &rig,
+            json!({ "name": "app", "digest": DIGEST, "noNewPrivileges": true })
+        )
+        .expect_err("refused")
+    );
+    assert!(
+        message.contains("says what the service already has"),
+        "{message}"
+    );
+    rig.template("app", strict_app());
+    rig.allow_low_level();
+    // A digest move while the key differs is refused when proposed, saying to do the key first.
+    let message = format!(
+        "{:?}",
+        propose_update(&rig, json!({ "name": "app", "digest": NEW })).expect_err("refused")
+    );
+    assert!(message.contains("its own update"), "{message}");
+    // The key's own proposal states no eraseData, and with it is refused: nothing is erased.
+    let message = format!(
+        "{:?}",
+        propose_update(
+            &rig,
+            json!({ "name": "app", "digest": DIGEST, "eraseData": true })
+        )
+        .expect_err("refused")
+    );
+    assert!(message.contains("erases nothing"), "{message}");
+    let proposed =
+        propose_update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("the proposal");
+    let summary = proposed["summary"].as_str().expect("a summary");
+    assert_eq!(
+        summary,
+        "Turn no-new-privileges on for the service app and restart it"
+    );
+    assert!(!summary.contains("ERASE"), "{proposed}");
+    let details = proposed["details"].to_string();
+    assert!(
+        details.contains("restarted, which interrupts it")
+            && details.contains("puts the old setting back")
+            && details.contains("nothing is erased"),
+        "{details}"
+    );
+    assert!(!details.contains("Erase data"), "{details}");
+    // On a stock project the proposal is refused, so the owner never approves a card the run refuses.
+    let rig = bare_rig(&up);
+    rig.template("app", strict_app());
+    let message = format!(
+        "{:?}",
+        propose_update(&rig, json!({ "name": "app", "digest": DIGEST })).expect_err("refused")
+    );
+    assert!(
+        message.contains("restricted.containers.lowlevel"),
+        "{message}"
+    );
+}

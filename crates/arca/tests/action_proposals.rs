@@ -529,6 +529,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                         "follow",
                         "timeoutSeconds",
                         "eraseData",
+                        "noNewPrivileges",
                         "tenant"
                     ]
                     .contains(&field.as_str())),

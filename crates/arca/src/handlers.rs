@@ -3865,6 +3865,15 @@ fn enrich_service_create(
         if tenant.is_some() && template.no_new_privileges {
             return Err(service_refused(tenant_no_new_privileges(&template.name)));
         }
+        // The owner is never shown a card for a create the node would refuse: the service project must allow
+        // low-level container config for this template.
+        if tenant.is_none()
+            && template.no_new_privileges
+            && let Some(why) =
+                no_new_privileges_refusal(&UnixIncus::new(cfg.incus.socket.clone()), &template.name)
+        {
+            return Err(service_refused(why));
+        }
         if let Some(refusal) = create_room_refusal(
             cfg,
             entries,
@@ -6648,6 +6657,8 @@ impl ServiceHandler {
                 "timeoutSeconds",
                 "follow",
                 "eraseData",
+                // What an update of the service's no-new-privileges sets, so its card says it.
+                "noNewPrivileges",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
             ],
