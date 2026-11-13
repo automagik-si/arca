@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.23.0 (2026-11-13)
+
 A node can now record a program that runs outside Incus, such as a macOS LaunchAgent next to the Incus VM, so it shows
 in `service_list`, and on the machine's canvas of a node that runs services (a node that only looks shows it in
 `service_list` alone). `external_add` takes a name, the kind `host-program`, an `http` or
@@ -30,6 +32,10 @@ when the page is on localhost only. A node set to trust another page host's pass
 `approval.peerKeys`) says instead that the card is approved on that host's page and needs no passkey on the node.
 Before, the answer named none of this, so the person who asked for the action did not know where to approve it, nor
 that it would lapse.
+
+- Merge PR 137: an action_propose answer says where to approve the card and by when
+- Merge PR 144: postgres-autopg, nats and omni-api keep their data on a volume of their own
+- Merge PR 145: a node records a program that runs outside Incus, and status checks it by one TCP connect
 
 ## 0.22.0 (2026-11-13)
 
