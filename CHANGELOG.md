@@ -7,6 +7,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The Postgres section of the operating guide now says that a `postgres-autopg` database is ready for logical
+replication as it is made: the pinned autopg image runs with `wal_level=logical`, room for 10 replication slots and
+10 WAL senders, and a consumer creates its own slot. No option is needed or added.
+
 ## 0.19.0 (2026-11-13)
 
 Four sentences in the README and the guide said more, or less, than Arca does. Arca cannot run an app you name as a

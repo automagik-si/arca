@@ -883,6 +883,9 @@ is the service that `service_create` makes from the node's `postgres-autopg` tem
   `postgres_link`, `postgres_unlink` and `postgres_delete` refuse its name and say which verb acts on it.
 - Its name must be one no database and no service holds.
 - A token with a tool list needs `service_create` in it beside `postgres_create`: the database is a service.
+- **Logical replication.** A `postgres-autopg` database is ready for logical replication as it is made: the pinned
+  autopg image runs every database with `wal_level=logical`, room for 10 replication slots and 10 WAL senders, by its
+  own defaults. There is nothing to ask for. Arca makes no slot; each consumer creates its own on the `app` database.
 
 A proposal is given the template's name, the image it pins and the fingerprint of the template's content when it is
 made. The card leads with "Your assistant wants to create a Postgres database called NAME.", then shows the template,
