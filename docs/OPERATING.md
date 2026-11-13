@@ -859,12 +859,12 @@ from the host; LAN traffic on `lan.port` therefore bypasses the service NIC ingr
 bind exposes the port on every host IPv4 interface, including a tailnet interface when present. The service project
 remains restricted; Arca sets and reconciles only `restricted.devices.proxy=allow` to permit these proxy devices. Disk
 restrictions retain Incus' managed default.
-The `postgres-autopg`, `nats` and `omni-api` templates state a data volume too (20GiB at `/var/lib/autopg/data`, 10GiB
-at `/data`, 10GiB at `/app/data`; each has a size, which a tenant needs to count the disk against its cap). A service
-made from them before 0.21.0 keeps its data on its root disk and gets no volume: `templates install` changes the
-template, not the services already made.
 The `automagik-server` template pins the OCI server image (Automagik's release 3.136.4, by digest), mounts `/data` owned
 by uid/gid 1000, overrides the profile to 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
+The `postgres-autopg`, `nats` and `omni-api` templates state a data volume of their own (20GiB at
+`/var/lib/autopg/data`, 10GiB at `/data`, 10GiB at `/app/data`; each has a size, which a tenant needs to count the disk
+against its cap). A service made from them up to 0.21.0 keeps its data on its root disk and gets no volume: `templates install` changes the
+template, not the services already made.
 
 ### A database
 
@@ -1133,8 +1133,8 @@ state directory (an append-only file of JSON lines: a `begin`, one line per step
    what is not the root: the config, the secrets, the firewall rules and the data volume (a template's `data`
    path, `/data` for `automagik-server`). Whatever the old version wrote to its own root is gone: **a service without
    a data volume loses everything it wrote to its root disk when it is updated**. The shipped `postgres-autopg`,
-   `nats` and `omni-api` templates name a data volume (`/var/lib/autopg/data`, `/data`, `/app/data`) from 0.21.0; a
-   service made from them before that keeps its data on its root disk, gets no volume by itself, and must not be
+   `nats` and `omni-api` templates name a data volume (`/var/lib/autopg/data`, `/data`, `/app/data`) after 0.21.0;
+   a service made from them up to 0.21.0 keeps its data on its root disk, gets no volume by itself, and must not be
    updated without a copy of that data;
 3. it is started;
 4. the health check, within `timeoutSeconds` (1 to 900, 120 when absent). The node can reach a service's port only
@@ -4763,7 +4763,9 @@ beside the `service`, and the instance verbs take either `instance` or, in a ten
   `service_release` take no `tenant`: a tenant's service is reached through the front;
 - the snapshot verbs with no `tenant` see nothing of any tenant: `snapshot_list` lists no tenant's snapshot, and a
   tenant's project or snapshot is reached only by naming the tenant;
-- a container template's data volume must state its size, so it counts against the disk cap;
+- a container template's data volume must state its size, so it counts against the disk cap. A container is charged its
+  16GiB root disk and its data volume on top of it: a database made from `postgres-autopg` takes 36GiB of the cap
+  (20GiB of data), and `nats` and `omni-api` 26GiB each (10GiB of data);
 - `service_remove` needs the owner's approval as everywhere; proposed with `action_propose`, the proposal names the tenant.
   A direct call's statement names the target `tenant.<id>.<name>` and the arguments `{"name", "tenant"}`;
 - a database is a service: the postgres service template, created with `service_create` and linked with

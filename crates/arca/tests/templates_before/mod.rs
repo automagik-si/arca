@@ -13,7 +13,11 @@ pub fn postgres_file_of_0_12_0(name: &str) -> String {
     let before = match name {
         "postgres-autopg.json" => now
             .replace(", which Arca makes at create and never shows", "")
-            .replace("  \"generate\": { \"POSTGRES_PASSWORD\": \"\" },\n", ""),
+            .replace("  \"generate\": { \"POSTGRES_PASSWORD\": \"\" },\n", "")
+            .replace(
+                "  \"data\": { \"path\": \"/var/lib/autopg/data\", \"uid\": 1000, \"gid\": 1000, \"size\": \"20GiB\" },\n",
+                "",
+            ),
         "postgres-autopg.sh" => now.replace(
             "is not set: this service was created from a template that did not make it (arca templates install, then create it again; or service_secret_set)",
             "is not set (service_secret_set)",

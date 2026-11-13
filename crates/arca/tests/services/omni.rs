@@ -288,7 +288,17 @@ fn operator() -> Caller {
 
 /// A rig with the Omni handlers pointed at a fake Omni (or at `o.base`), and no service yet.
 fn omni_rig(o: Opts) -> OmniRig {
-    let rig = Rig::new();
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+    );
     let omni = FakeOmni::start();
     let base = o.base.unwrap_or(omni.addr);
     let now = Arc::new(AtomicU64::new(NOW));
