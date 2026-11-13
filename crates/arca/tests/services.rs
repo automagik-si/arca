@@ -3126,6 +3126,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 mod approval_requests;
 #[path = "services/destinations.rs"]
 mod destinations;
+#[path = "services/follow.rs"]
+mod follow;
 #[path = "services/golden.rs"]
 mod golden;
 #[path = "services/kernel_access.rs"]

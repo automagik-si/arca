@@ -175,6 +175,7 @@ refused without the value being echoed back.
 | `kernel.importServices` | no | `[{ "name": "<service>", "project": "<project>", "cidr": "<ipv4-network>/24" }]`: the services another manager created that `service_import` may take over where they stand. Each `project` must be listed in `kernel.droiddProjects`, and `cidr` is that project's service subnet. Empty by default: nothing is imported and nothing is written in another manager's project. See "Importing a service another manager created". |
 | `kernel.serviceDestinations` | no | `[{ "service": "<service>", "address": "<one IPv4 address>", "port": n }]`: the private addresses named services of the node's own project may reach through the node, each on one tcp port. It needs `kernel.serviceCidr`. Empty by default: a service reaches no private address. An entry alone opens nothing. See "A service that may reach one private address". |
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
+| `follow.intervalSeconds` | no | Seconds between two looks of the Automagik follower at Automagik's published record, 60 to 86400. 600 when absent. |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`); or `http://localhost:<port>` with the port of `listen.loopback`, the page of a node on its own machine with no domain and no certificate. Its host is the WebAuthn rp id; it is not the host an approval statement names. |
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
@@ -185,6 +186,7 @@ refused without the value being echoed back.
 The config is refused, with exit 2, when:
 
 - a key is unknown, a required key is missing, or a value has the wrong form;
+- `follow.intervalSeconds` is not a whole number from 60 to 86400;
 - `approvalHost` is not a host name: one letter or digit, then up to 252 letters, digits, dots or hyphens;
 - `approvalOrigin` is not `https://`, a lowercase host name, and at most a non-443 port, with no path, nor
   `http://localhost:<port>`; or it is `http://localhost:<port>` and `listen.loopback` is not set to `127.0.0.1` or
@@ -1113,7 +1115,7 @@ record is refused.
 
 ### Updating a service to a new image digest
 
-`service_update` takes `{name, digest, timeoutSeconds?, tenant?}` and moves a running container service made from an
+`service_update` takes `{name, digest, timeoutSeconds?, tenant?}` (or `{name, follow}`, see below) and moves a running container service made from an
 image by digest (today `automagik-server`) to another digest of the same image in one call. It is a destructive
 verb (it takes the optional `confirm`), needs a `doctor` token and asks the owner for nothing; it works inside a
 tenant as outside one. There is no update path for `automagik-workspace` yet: it is a virtual machine, whose Docker
@@ -1150,6 +1152,49 @@ The data volume is the service's own and is never snapshotted or touched: a roll
 version wrote, a migration for example, which the old version may not read. A virtual machine, a function and an
 adopted service are refused. Where a snapshot was taken it stays, named in the answer, for you to delete or restore
 by hand.
+
+### A service that follows Automagik's releases
+
+A service made from the `automagik-server` template follows Automagik's releases by default, so it stays easy to
+update: the node moves it to each newer server image Automagik publishes, with `service_update`, and nobody has to ask.
+(`automagik-workspace` is a virtual machine, which `service_update` does not move, so it does not follow.) Only a
+container of the node's own project made from `ghcr.io/automagik-si/automagik-server` by digest can follow.
+
+On a timer of its own, every 10 minutes (`follow.intervalSeconds` in the node config, 60 to 86400), the node reads
+Automagik's record of its newest server image, `releases/download/server-lane/server-image.json` of
+`automagik-si/automagik`. Until that lane exists it reads the `server-image.json` of the newest `v<version>` release that
+carries one, found through the GitHub releases API. It never reads `releases/latest`. The record holds `image`,
+`digest`, `ref`, `version`, `revision` and `tag`. A node with no service that follows asks the network for nothing.
+
+For each followed service, the node moves it when the record's digest is not the one it runs **and** the record's
+version is newer (semantic versioning: a different digest of the same or an older version never moves it; a release is
+newer than its own pre-release). The version a running digest is comes from the service's own record: the follower
+writes it there when it moves a service or sees the record name the digest the service runs, and a service made from the
+shipped template starts with the version the template pinned. It is never guessed from a list of releases. A digest
+whose version is not known is left where it is, and the journal says so once (`follow skipped`), since there is no order
+to go by. The move is the whole of `service_update`
+above: snapshot, rebuild, start, port check, and a rollback on failure. A move that failed is not tried again for the
+same digest; the next newer record is tried.
+
+The follower does not start a service its owner stopped: it skips a service that is not running, says so once in the
+journal (`follow skipped`), and moves it the next time it runs and a newer release is out. It starts no move while Incus
+shows an operation that may write on the service's instance (an earlier rebuild that did not settle, for one): the
+journal says so once (`follow held`), and the move goes ahead when Incus is idle. After a move it deletes the image the
+service left from the image store when no instance is made from it, so a release a day does not fill the disk
+(`follow image` in the journal). A manual `service_update` is not changed by any of this.
+
+Provenance is checked first: `gh attestation verify oci://ghcr.io/automagik-si/automagik-server@<digest> --repo
+automagik-si/automagik`, or, where `gh` cannot run, a look at GitHub's attestations API for the digest. The result
+(`verified`, `found, not verified`, or `failed` with the reason) is in the journal. A failed check is logged and does
+not stop the update; refusing a digest that cannot be shown is not done yet.
+
+Every change, and no look that changes nothing, is a line in `service-updates.jsonl`: `follow` (the digest it runs, the
+digest and version it goes to, the record's `ref`, `revision` and `tag`, and the provenance result), then the update's
+own lines, then `follow end` (with the update's refusal code when it failed).
+
+To keep one service where it is: `service_update {name, follow: false}` (a `doctor` token; nothing is restarted).
+`{name, follow: true}` makes it follow again. A call gives `follow` alone, never with a `digest`. `service_status`
+shows `follow` for a service that can.
 
 ### Who may call what
 

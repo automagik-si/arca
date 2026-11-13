@@ -4911,8 +4911,11 @@ impl ToolHandler for PostgresHandler {
 
 #[path = "function_handlers.rs"]
 mod function_handlers;
+#[path = "service_follow.rs"]
+mod service_follow;
 #[path = "service_omni.rs"]
 mod service_omni;
+pub use service_follow::{Attestation, FollowEdges, Followed, Follower, spawn_follower};
 #[path = "service_update.rs"]
 mod service_update;
 #[path = "service_wiring.rs"]
@@ -5784,6 +5787,8 @@ pub(crate) fn adopted_config(
         // An instance says nothing of a destination: only a create the owner approved records one.
         destinations: Vec::new(),
         function: None,
+        follow: None,
+        follow_version: None,
     })
 }
 
@@ -5990,6 +5995,8 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         kernel_access: parts.kernel_access,
         destinations: Vec::new(),
         function: None,
+        follow: None,
+        follow_version: None,
     })
 }
 
@@ -6071,6 +6078,8 @@ fn vm_service_config(
         kernel_access: None,
         destinations: Vec::new(),
         function: None,
+        follow: None,
+        follow_version: None,
     })
 }
 
@@ -6336,7 +6345,7 @@ impl ToolHandler for ServiceHandler {
             ],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
-            "service_update" => &["name", "digest", "timeoutSeconds"],
+            "service_update" => &["name", "digest", "timeoutSeconds", "follow"],
             "service_remove" | "service_import" | "service_release" => &["name", "approval"],
             "service_connect" | "service_disconnect" => &["from", "to"],
             "service_secret_set" => &["name", "key", "value"],
@@ -6691,6 +6700,9 @@ impl ToolHandler for ServiceHandler {
                     // a template's secrets are named apart and are never part of this object.
                     if let Some(settings) = config.vm.as_ref().and_then(|vm| vm.guest_settings()) {
                         view["settings"] = settings;
+                    }
+                    if config.can_follow_automagik() {
+                        view["follow"] = json!(config.follows_automagik());
                     }
                     // The version it was created with beside the one its installed template names now.
                     if let Some(update) = service_update(&self.cfg, &mut BTreeMap::new(), &config) {

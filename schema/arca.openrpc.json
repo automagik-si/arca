@@ -3426,6 +3426,10 @@
               "maxItems": 4,
               "type": "array"
             },
+            "follow": {
+              "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
+              "type": "boolean"
+            },
             "ipv4": {
               "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
               "maxLength": 15,
@@ -3691,6 +3695,10 @@
                     },
                     "maxItems": 4,
                     "type": "array"
+                  },
+                  "follow": {
+                    "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
+                    "type": "boolean"
                   },
                   "ipv4": {
                     "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
@@ -3971,6 +3979,10 @@
               },
               "maxItems": 4,
               "type": "array"
+            },
+            "follow": {
+              "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
+              "type": "boolean"
             },
             "ipv4": {
               "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
@@ -4312,15 +4324,6 @@
       "name": "service_update",
       "params": [
         {
-          "name": "digest",
-          "required": true,
-          "schema": {
-            "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository.",
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "type": "string"
-          }
-        },
-        {
           "name": "name",
           "required": true,
           "schema": {
@@ -4334,6 +4337,23 @@
           "required": false,
           "schema": {
             "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "digest",
+          "required": false,
+          "schema": {
+            "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository. Give it, or follow, not both.",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "follow",
+          "required": false,
+          "schema": {
+            "description": "Instead of a digest: whether the node moves this service to Automagik's newest published server image by itself (true) or leaves it where it is (false). A service made from the automagik-server template follows until this says false. Only a container of the node's own project made from ghcr.io/automagik-si/automagik-server by digest can say it. Nothing is restarted by this call.",
             "type": "boolean"
           }
         },
@@ -4366,6 +4386,10 @@
               "pattern": "^sha256:[0-9a-f]{64}$",
               "type": "string"
             },
+            "follow": {
+              "description": "Present when the call set whether the service follows Automagik's releases: what it set.",
+              "type": "boolean"
+            },
             "message": {
               "type": "string"
             },
@@ -4387,13 +4411,12 @@
           "required": [
             "updated",
             "service",
-            "digest",
             "message"
           ],
           "type": "object"
         }
       },
-      "summary": "Move a running container service made from an image by digest to another digest of that image in one call: it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
+      "summary": "Move a running container service made from an image by digest to another digest of that image in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -4487,6 +4510,10 @@
                   },
                   "maxItems": 4,
                   "type": "array"
+                },
+                "follow": {
+                  "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
+                  "type": "boolean"
                 },
                 "ipv4": {
                   "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",

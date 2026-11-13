@@ -184,11 +184,11 @@ fn incus_words(error: &IncusError) -> String {
     }
 }
 
-struct Journal {
-    path: PathBuf,
-    id: String,
-    service: String,
-    clock: Clock,
+pub(super) struct Journal {
+    pub(super) path: PathBuf,
+    pub(super) id: String,
+    pub(super) service: String,
+    pub(super) clock: Clock,
 }
 
 impl Journal {
@@ -229,7 +229,7 @@ impl Journal {
 
     /// A line after the first: a journal that cannot be written is said on the log and does not stop an update that is
     /// already under way, which must still be able to put the old version back.
-    fn step(&self, step: &str, ok: bool, detail: Value) {
+    pub(super) fn step(&self, step: &str, ok: bool, detail: Value) {
         if let Err(error) = self.line(step, ok, detail) {
             eprintln!("arca: the service update journal could not be written: {error}");
         }
@@ -245,10 +245,115 @@ enum Back {
 }
 
 impl ServiceHandler {
+    /// The writer of the power state and of the root of this service's instance.
+    pub(super) fn state_changer(&self, config: &ServiceConfig) -> Result<StateChanger, CallError> {
+        let family = arca_incus::ProjectFamily::new(
+            [arca_netproject::PROJECT],
+            self.cfg.kernel.droidd_projects.iter().map(String::as_str),
+        )
+        .map_err(|_| internal())?;
+        let mut changer =
+            StateChanger::new(self.cfg.incus.socket.clone(), family).with_deadline(STEP_DEADLINE);
+        if config.tenant.is_some() {
+            changer = changer
+                .with_tenants([config.project.as_str()])
+                .map_err(|_| internal())?;
+        }
+        Ok(changer)
+    }
+
+    /// Changes one service's record as the kernel holds it now, under the node's write gate: a change that came
+    /// meanwhile is kept. Answers the record before and after.
+    pub(super) fn amend(
+        &self,
+        entry_id: &str,
+        name: &str,
+        change: impl FnOnce(&mut ServiceConfig),
+    ) -> Result<(ServiceConfig, ServiceConfig), CallError> {
+        let _write = self.writes.lock().map_err(|_| internal())?;
+        let mut kernel = lock(&self.kernel)?;
+        let before = service_entries(kernel.entries())
+            .into_iter()
+            .find(|(entry, _)| entry.id.0 == entry_id)
+            .map(|(_, config)| config)
+            .ok_or_else(|| service_not_found(format!("service {name}: not found")))?;
+        let mut after = before.clone();
+        change(&mut after);
+        let change = service_wiring::change(&after)?;
+        let ids = [entry_id];
+        let outcomes = kernel
+            .propose(vec![change], (self.clock)())
+            .map_err(|error| service_wiring::state_not_saved("service_update", &error))?;
+        if service_wiring::failed_for(&outcomes, &ids) {
+            return Err(refused(format!(
+                "service {name}: {}",
+                service_wiring::failure_reason(&outcomes, &ids)
+                    .unwrap_or_else(|| "the node did not apply the change".to_string())
+            )));
+        }
+        Ok((before, after))
+    }
+
+    /// `service_update` with `follow`: whether the node's follower moves this service to Automagik's newest published
+    /// server image. Only a container of the node's own project made from that image by digest can say it.
+    fn set_follow(&self, name: &str, follow: bool, entries: &[Entry]) -> Result<Value, CallError> {
+        let Some((entry, config)) = service_entries(entries)
+            .into_iter()
+            .find(|(_, config)| config.name == name)
+        else {
+            return Err(service_not_found(format!("service {name}: not found")));
+        };
+        if !config.can_follow_automagik() {
+            return Err(refused(format!(
+                "service {name}: only a container of this node's own project made from {} by digest can follow Automagik. Nothing was changed",
+                crate::service::AUTOMAGIK_IMAGE
+            )));
+        }
+        let value = if follow {
+            crate::service::FOLLOW_AUTOMAGIK
+        } else {
+            crate::service::FOLLOW_NONE
+        };
+        let (before, _) = self.amend(&entry.id.0, name, |record| {
+            record.follow = Some(value.to_string());
+        })?;
+        let changed = before.follows_automagik() != follow;
+        if changed {
+            Journal {
+                path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
+                id: format!("follow-{}-{}", entry.id.0, (self.clock)()),
+                service: name.to_string(),
+                clock: self.clock.clone(),
+            }
+            .step("follow set", true, json!({ "follow": follow }));
+        }
+        Ok(json!({
+            "updated": false,
+            "service": name,
+            "follow": follow,
+            "message": if follow {
+                format!("service {name} follows Automagik's releases")
+            } else {
+                format!("service {name} stays where it is: it no longer follows Automagik's releases")
+            },
+        }))
+    }
+
     /// `service_update`: moves the service `name` to `digest`. `entries` are the ones the call may see, a tenant's when
     /// it names one.
     pub(super) fn call_update(&self, args: &Value, entries: &[Entry]) -> Result<Value, CallError> {
         let name = service_name(args)?;
+        if let Some(follow) = args.get("follow") {
+            if args.get("digest").is_some() || args.get("timeoutSeconds").is_some() {
+                return Err(CallError::Invalid(
+                    "follow: give it alone; a call moves a service to a digest or sets whether it follows Automagik, not both".into(),
+                ));
+            }
+            let follow = follow
+                .as_bool()
+                .ok_or_else(|| CallError::Invalid("follow: expected true or false".into()))?;
+            return self.set_follow(&name, follow, entries);
+        }
         let digest = args["digest"]
             .as_str()
             .filter(|digest| digest_ok(digest))
@@ -311,18 +416,7 @@ impl ServiceHandler {
         }
         let claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
             .ok_or_else(|| said("another update of this service is running"))?;
-        let family = arca_incus::ProjectFamily::new(
-            [arca_netproject::PROJECT],
-            self.cfg.kernel.droidd_projects.iter().map(String::as_str),
-        )
-        .map_err(|_| internal())?;
-        let mut changer =
-            StateChanger::new(self.cfg.incus.socket.clone(), family).with_deadline(STEP_DEADLINE);
-        if config.tenant.is_some() {
-            changer = changer
-                .with_tenants([config.project.as_str()])
-                .map_err(|_| internal())?;
-        }
+        let changer = self.state_changer(&config)?;
         let seen = changer
             .read(&config.project, &config.instance)
             .map_err(|error| {

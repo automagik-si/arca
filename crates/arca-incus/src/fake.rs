@@ -801,6 +801,22 @@ impl FakeIncus {
         }
     }
 
+    /// Sets one config key of the instance `name` in `project`, as Incus itself writes a `volatile.` key: no request is
+    /// answered and no write is recorded. Panics when no such instance is held.
+    pub fn set_instance_config(&self, project: &str, name: &str, key: &str, value: &str) {
+        let mut store = lock(&self.shared.store);
+        let object = store
+            .objects
+            .iter_mut()
+            .find(|object| {
+                object.kind == "instance" && object.project == project && object.name == name
+            })
+            .unwrap_or_else(|| panic!("no instance {project}/{name} to set {key} of"));
+        if let Some(config) = object.body.get_mut("config").and_then(Value::as_object_mut) {
+            config.insert(key.to_string(), json!(value));
+        }
+    }
+
     fn end_operation(&self, id: &OpId, failure: Option<&str>) {
         let mut guard = lock(&self.shared.store);
         let store: &mut Store = &mut guard;

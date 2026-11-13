@@ -307,6 +307,24 @@ pub struct ServiceConfig {
     /// service's record carries the key, and nothing in a tenant ever does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function: Option<crate::function::Function>,
+    /// What the node's follower does with this service: `automagik` moves it to Automagik's newest published server
+    /// image, `none` never does. Absent, a service made from the `automagik-server` template follows and every other
+    /// service does not ([`ServiceConfig::follows_automagik`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow: Option<String>,
+    /// The version the image at `digest` is, as the follower learned it (from Automagik's record or the template's pin),
+    /// so the follower can order the service's image against a newer one after any restart. It holds for the image it
+    /// names only: a service moved to another digest by hand has no known version until the follower learns it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_version: Option<FollowVersion>,
+}
+
+/// An image digest and the version Automagik published it as.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FollowVersion {
+    pub digest: String,
+    pub version: String,
 }
 
 /// What only a service in a tenant records: the tenant, its address block, and the address of the node's front service
@@ -350,7 +368,57 @@ pub fn entry_id(tenant: Option<&str>, name: &str) -> String {
     }
 }
 
+/// The image repository the Automagik follower moves a service within.
+pub const AUTOMAGIK_IMAGE: &str = "ghcr.io/automagik-si/automagik-server";
+/// The template that follows Automagik's releases unless its service says `follow: none`.
+pub const AUTOMAGIK_TEMPLATE: &str = "automagik-server";
+/// The `follow` value that moves a service to Automagik's newest published server image.
+pub const FOLLOW_AUTOMAGIK: &str = "automagik";
+/// The `follow` value that keeps a service where it is.
+pub const FOLLOW_NONE: &str = "none";
+
 impl ServiceConfig {
+    /// Whether a service of this record can follow Automagik at all: a container of the node's own project, made from
+    /// Automagik's server image by digest. A virtual machine, a function, an adopted service and a tenant's service
+    /// cannot.
+    pub fn can_follow_automagik(&self) -> bool {
+        !self.adopted
+            && self.vm.is_none()
+            && self.function.is_none()
+            && self.tenant.is_none()
+            && self.source["server"]
+                .as_str()
+                .and_then(|server| server.strip_prefix("https://"))
+                .zip(
+                    self.source["alias"]
+                        .as_str()
+                        .and_then(|alias| alias.rsplit_once("@sha256:")),
+                )
+                .is_some_and(|(server, (repository, _))| {
+                    AUTOMAGIK_IMAGE
+                        .strip_prefix(server)
+                        .and_then(|rest| rest.strip_prefix('/'))
+                        == Some(repository)
+                })
+    }
+
+    /// Whether the node's follower moves this service: it can follow, and is not opted out.
+    pub fn follows_automagik(&self) -> bool {
+        self.can_follow_automagik()
+            && match self.follow.as_deref() {
+                Some(value) => value == FOLLOW_AUTOMAGIK,
+                None => self.template == AUTOMAGIK_TEMPLATE,
+            }
+    }
+
+    /// The version the follower recorded for `digest`, the image this service runs now, when it recorded one.
+    pub fn followed_version(&self, digest: &str) -> Option<&str> {
+        self.follow_version
+            .as_ref()
+            .filter(|known| known.digest == digest)
+            .map(|known| known.version.as_str())
+    }
+
     pub fn acl(&self) -> String {
         acl_name(&self.project, &self.name)
     }

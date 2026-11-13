@@ -29,6 +29,16 @@ When the node refuses the viewer token `arca status` found beside a missing `ass
 the file it used, by its name alone; before, it spoke of a token file the owner never named. `arca --help` and
 `docs/OPERATING.md` now say this step of `arca status` beside the other defaults.
 
+A service made from `automagik-server` now follows Automagik's releases by itself: every 10 minutes (`follow.intervalSeconds`)
+the node reads Automagik's published record of its newest server image, and when it names another digest and a newer
+version than the service runs, moves the service with `service_update`, which keeps its data and puts the old version
+back if the new one's port does not answer. The version a service runs is kept in its record (it starts from the
+template's pin), so the follower orders it however many releases are cut and across restarts. It does not start a
+service its owner stopped, waits while Incus is still working on the service's instance, and deletes the image a move
+leaves unused. Each change is a line in `service-updates.jsonl`, with the image's attestation result (a failed check
+is logged, not refused). `service_update {name, follow: false}` keeps a service where it is, and `{name, follow: true}`
+follows again. `automagik-workspace` is a virtual machine and does not follow.
+
 ## 0.18.0 (2026-11-12)
 
 On a node that only looks, a read that worked no longer begins with "this node only looks: nothing here can be

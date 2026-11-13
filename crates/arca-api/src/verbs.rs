@@ -404,7 +404,7 @@ static VERBS: [Verb; 65] = [
     },
     Verb {
         name: "service_update",
-        summary: "Move a running container service made from an image by digest to another digest of that image in one call: it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
+        summary: "Move a running container service made from an image by digest to another digest of that image in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new digest (its data volume, config, secrets and firewall rules are kept; the old root is not kept, since no Arca project allows a snapshot), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise): through its host port when it has one, else it must stay running. The new digest is recorded so a restart keeps it. On any failure the old version is put back and the answer says it was rolled back. No owner approval is asked.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -2977,6 +2977,10 @@ pub fn service_view_schema() -> Value {
                 "maxLength": 40,
                 "type": "string"
             },
+            "follow": {
+                "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
+                "type": "boolean"
+            },
             "update": {
                 "additionalProperties": false,
                 "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
@@ -3517,7 +3521,9 @@ pub fn summary_service_release(_: &Value) -> String {
 
 /// A short line for a successful `service_update`.
 pub fn summary_service_update(v: &Value) -> String {
-    if v["updated"] == false {
+    if v.get("follow").is_some() {
+        "Service's follow setting changed.".to_string()
+    } else if v["updated"] == false {
         "Service already on that digest.".to_string()
     } else {
         "Service updated.".to_string()
@@ -3533,9 +3539,13 @@ fn service_update_params_base() -> Value {
         "additionalProperties": false,
         "properties": {
             "digest": {
-                "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository.",
+                "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository. Give it, or follow, not both.",
                 "pattern": "^sha256:[0-9a-f]{64}$",
                 "type": "string"
+            },
+            "follow": {
+                "description": "Instead of a digest: whether the node moves this service to Automagik's newest published server image by itself (true) or leaves it where it is (false). A service made from the automagik-server template follows until this says false. Only a container of the node's own project made from ghcr.io/automagik-si/automagik-server by digest can say it. Nothing is restarted by this call.",
+                "type": "boolean"
             },
             "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter)."),
             "timeoutSeconds": {
@@ -3545,7 +3555,7 @@ fn service_update_params_base() -> Value {
                 "type": "integer"
             }
         },
-        "required": ["name", "digest"],
+        "required": ["name"],
         "type": "object"
     }))
 }
@@ -3555,6 +3565,10 @@ fn service_update_result() -> Value {
         "additionalProperties": false,
         "properties": {
             "digest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
+            "follow": {
+                "description": "Present when the call set whether the service follows Automagik's releases: what it set.",
+                "type": "boolean"
+            },
             "message": { "type": "string" },
             "service": { "type": "string" },
             "snapshot": {
@@ -3566,7 +3580,7 @@ fn service_update_result() -> Value {
                 "type": "boolean"
             }
         },
-        "required": ["updated", "service", "digest", "message"],
+        "required": ["updated", "service", "message"],
         "type": "object"
     })
 }

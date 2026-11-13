@@ -446,8 +446,8 @@ impl StateChanger {
     }
 
     /// Deletes one cached image from the store the project reads, when no instance of the project says it was made
-    /// from it. Returns whether it was deleted. For [`crate::function_run`] alone.
-    pub(crate) fn delete_unused_image(
+    /// from it. Returns whether it was deleted. For [`crate::function_run`] and the Automagik follower.
+    pub fn delete_unused_image(
         &self,
         project: &str,
         fingerprint: &str,
