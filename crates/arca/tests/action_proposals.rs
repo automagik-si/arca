@@ -1815,7 +1815,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
     };
     assert_eq!(
         failure(json!({ "action": "function_create", "args": {} })),
-        "invalid_arguments: args: missing required field name"
+        "invalid_arguments: /args: missing required field name"
     );
     let params = (verb("action_propose").expect("the verb").params)();
     let all: Vec<&str> = params["properties"]["action"]["enum"]
@@ -1833,4 +1833,66 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         )
     );
     assert_eq!(rig.list()["plans"].as_array().map(Vec::len), Some(0));
+}
+
+/// Each example the tool's schema gives for an action's `args` is one the action takes: its own check passes it, or,
+/// for an action whose card carries what the kernel reads at propose (a GPU's instance kind, a disk's model), it gets
+/// past every check of what the caller gives and stops only at the first field the kernel fills in.
+#[test]
+fn every_example_in_the_schema_of_action_propose_is_one_its_action_takes() {
+    let params = (verb("action_propose").expect("the verb").params)();
+    let branches = params["properties"]["args"]["anyOf"]
+        .as_array()
+        .expect("one branch per action");
+    assert_eq!(branches.len(), ActionKind::ALL.len());
+    for action in ActionKind::ALL {
+        let branch = branches
+            .iter()
+            .find(|branch| branch["title"] == json!(action.as_str()))
+            .unwrap_or_else(|| panic!("{action:?} has a branch"));
+        let example = &branch["examples"][0];
+        if let Err(why) = action.prepare(example, Some(TEST_PG_IMAGE)) {
+            assert!(
+                why.ends_with(": the kernel resolves it when the proposal is made"),
+                "{action:?} takes its example {example}: {why}"
+            );
+        }
+    }
+}
+
+/// A field the kernel fills in when the proposal is made passes the door with a value off its own rule, as on 0.17.0:
+/// the kernel removes or replaces it before the action's own check. Whatever the node answers next, it is not the
+/// door's `invalid_arguments`. Review M1 of PR 136.
+#[test]
+fn a_field_the_kernel_fills_in_passes_the_door_with_any_value() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-mcp-kernel-filled", &key);
+    let (_runtime, socket, secret) = propose_door(&rig);
+    let params = (verb("action_propose").expect("the verb").params)();
+    let branches = params["properties"]["args"]["anyOf"]
+        .as_array()
+        .expect("one branch per action");
+    let passes = |action: &str, args: Value| {
+        let reply = propose_through(&socket, &secret, json!({ "action": action, "args": args }));
+        assert_ne!(
+            reply["result"]["_meta"]["droidd/error"],
+            json!("invalid_arguments"),
+            "{action}: {reply}"
+        );
+    };
+    for (action, fields) in arca_api::verbs::KERNEL_FILLED {
+        let branch = branches
+            .iter()
+            .find(|branch| branch["title"] == json!(action))
+            .expect("a branch");
+        for field in fields {
+            let mut args = branch["examples"][0].clone();
+            args[*field] = json!({ "off": "rule" });
+            passes(action, args);
+        }
+    }
+    passes(
+        "snapshot_delete",
+        json!({ "name": "shop--web--20261030T1200", "pool": "usb1", "kind": "container" }),
+    );
 }

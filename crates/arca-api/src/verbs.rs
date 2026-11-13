@@ -2400,8 +2400,152 @@ fn plan_ref() -> Value {
 fn action_propose_params() -> Value {
     params(vec![
         ("action", true, one_of(&ACTION_NAMES)),
-        ("args", true, json!({ "type": "object" })),
+        ("args", true, action_args()),
     ])
+}
+
+/// The fields of an action's `args` the kernel fills in when the proposal is made: whatever the caller sends there is
+/// removed or overwritten before the action's own check runs (the GPU verbs from the instance, storage_add from the
+/// disk survey, the snapshot verbs from the source or the snapshot). A branch takes any value for them, as the door did
+/// before it held `args` to a branch, and says so.
+pub const KERNEL_FILLED: [(&str, &[&str]); 5] = [
+    ("gpu_attach", &["project", "kind", "uuid"]),
+    ("gpu_detach", &["project", "kind", "uuid"]),
+    (
+        "storage_add",
+        &[
+            "disk",
+            "model",
+            "serial",
+            "transport",
+            "size",
+            "contents",
+            "mount",
+            "fsUuid",
+            "inUseCheck",
+        ],
+    ),
+    (
+        "snapshot_create",
+        &[
+            "name",
+            "kind",
+            "uuid",
+            "sourcePool",
+            "fsUuid",
+            "size",
+            "allocated",
+            "files",
+            "unreadable",
+            "separate",
+            "separateCount",
+            "poolFree",
+        ],
+    ),
+    ("snapshot_delete", &["kind", "pool", "source"]),
+];
+
+/// What a branch says of a field in [`KERNEL_FILLED`].
+pub const KERNEL_FILLS_IN: &str = "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced.";
+
+/// The fields of `action`'s `args` the kernel fills in, from [`KERNEL_FILLED`].
+pub fn kernel_filled(action: &str) -> &'static [&'static str] {
+    KERNEL_FILLED
+        .iter()
+        .find(|(name, _)| *name == action)
+        .map_or(&[], |(_, fields)| fields)
+}
+
+/// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
+const ACTION_EXAMPLES: [(&str, &str); 22] = [
+    ("service_create", r#"{"name":"nats","template":"nats"}"#),
+    ("service_remove", r#"{"name":"nats"}"#),
+    ("service_import", r#"{"name":"web"}"#),
+    ("service_release", r#"{"name":"web"}"#),
+    ("service_publish", r#"{"name":"dash","reach":"tailnet"}"#),
+    ("service_unpublish", r#"{"name":"dash"}"#),
+    ("service_connect", r#"{"from":"api","to":"nats"}"#),
+    ("service_disconnect", r#"{"from":"api","to":"nats"}"#),
+    ("postgres_create", r#"{"name":"orders"}"#),
+    ("gpu_attach", r#"{"instance":"llm","pci":"0000:01:00.0"}"#),
+    ("gpu_detach", r#"{"instance":"llm","pci":"0000:01:00.0"}"#),
+    ("storage_add", r#"{"name":"usb1","device":"sdb"}"#),
+    (
+        "snapshot_create",
+        r#"{"project":"shop","instance":"web","pool":"usb1"}"#,
+    ),
+    ("snapshot_delete", r#"{"name":"shop--web--20261030T1200"}"#),
+    (
+        "instance_start",
+        r#"{"project":"arcak-svc","instance":"web"}"#,
+    ),
+    (
+        "instance_stop",
+        r#"{"project":"arcak-svc","instance":"web"}"#,
+    ),
+    (
+        "instance_restart",
+        r#"{"project":"arcak-svc","instance":"web"}"#,
+    ),
+    ("tenant_create", r#"{}"#),
+    ("tenant_remove", r#"{"id":"abcdefgh"}"#),
+    ("deploy_remove", r#"{"tenant":"abcdefgh","deploy":"d1"}"#),
+    (
+        "function_create",
+        r#"{"name":"relay","image":"registry.example/acme/relay","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","triggers":[{"timer":{"everySeconds":60}}]}"#,
+    ),
+    ("function_remove", r#"{"name":"relay"}"#),
+];
+
+/// The schema keyword that tells the door's check which branch of an `anyOf` a value is held to: the one whose `title`
+/// is the value of the sibling field it names.
+pub const BRANCH_BY: &str = "x-arca-by";
+
+/// The `args` of `action_propose`: one branch per action, titled with the action's name, with the fields of the verb it
+/// proposes (less `approval`, which the proposal replaces; a destructive verb's `confirm` stays, as the proposal drops
+/// `true` and refuses `false`), what each does, and an example. The door holds `args` to the branch `action` names
+/// ([`BRANCH_BY`]), so a refusal keeps that branch's own words.
+fn action_args() -> Value {
+    let branches: Vec<Value> = ACTION_NAMES
+        .iter()
+        .map(|name| {
+            let verb = verb(name).expect("every action is a verb in the table");
+            let mut schema = (verb.params)();
+            if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+                required.retain(|field| field.as_str() != Some("approval"));
+            }
+            if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                properties.remove("approval");
+                for field in kernel_filled(name) {
+                    if let Some(own) = properties.get_mut(*field) {
+                        let words = own["description"]
+                            .as_str()
+                            .map(|said| format!("{said} "))
+                            .unwrap_or_default();
+                        *own = json!({ "description": format!("{words}{KERNEL_FILLS_IN}") });
+                    }
+                }
+            }
+            let example: Value = ACTION_EXAMPLES
+                .iter()
+                .find(|(action, _)| action == name)
+                .map(|(_, example)| serde_json::from_str(example).expect("an example is JSON"))
+                .expect("every action has an example");
+            schema["title"] = json!(name);
+            schema["description"] = json!(format!(
+                "The args of {name}: {} Example: {example}",
+                verb.summary
+            ));
+            schema["examples"] = json!([example]);
+            schema
+        })
+        .collect();
+    json!({
+        "type": "object",
+        "description": "The action's own arguments: those of the anyOf branch whose title is the action.",
+        BRANCH_BY: "action",
+        "anyOf": branches
+    })
 }
 
 fn action_propose_result() -> Value {
@@ -3063,11 +3207,18 @@ fn gpu_params() -> Value {
     params(vec![
         ("instance", true, instance_name_schema()),
         ("pci", true, pci_schema()),
-        ("project", false, instance_name_schema()),
+        ("project", false, gpu_project_schema()),
         ("kind", false, one_of(&["container", "virtual-machine"])),
         ("uuid", false, nullable(string())),
         ("approval", true, approval_schema()),
     ])
+}
+
+/// The Incus project of a GPU verb's instance: an instance name's grammar, described as the project it is.
+fn gpu_project_schema() -> Value {
+    let mut schema = instance_name_schema();
+    schema["description"] = json!("The Incus project the instance is in.");
+    schema
 }
 
 fn gpu_attach_params() -> Value {

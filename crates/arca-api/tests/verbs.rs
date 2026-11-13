@@ -2,6 +2,7 @@
 //! the table, so a typo in the constructors fails here.
 
 use arca_api::openrpc::{check_document, check_released_document, openrpc};
+use arca_api::verbs::{KERNEL_FILLED, KERNEL_FILLS_IN, kernel_filled};
 use arca_api::{API_VERSION, Scope, VerbClass, conforms, may_call, verb, verbs};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -360,7 +361,8 @@ fn plan_verb_schemas_equal_their_table_rows() {
         closed_with(
             json!({
                 "action": { "type": "string", "enum": action_names },
-                "args": { "type": "object" },
+                // One branch per action, each pinned by the issue 113 test below.
+                "args": (propose.params)()["properties"]["args"].clone(),
             }),
             &["action", "args"]
         )
@@ -1575,5 +1577,167 @@ fn the_text_of_a_watch_report_a_service_list_and_a_status_carries_the_answer() {
     assert!(
         text.ends_with("\n- i49 in p: container, Running\n- and 3 more"),
         "{text}"
+    );
+}
+
+/// `action_propose` describes each action's `args`: one branch per action, titled with its name, holding the fields
+/// of the verb it proposes (less `approval`) and an example that the branch takes. An assistant reads
+/// what each action takes from the tool's own schema, not from refusals. Issue 113.
+#[test]
+fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() {
+    let params = (verb("action_propose").expect("the verb").params)();
+    let actions: Vec<&str> = params["properties"]["action"]["enum"]
+        .as_array()
+        .expect("the actions")
+        .iter()
+        .map(|action| action.as_str().expect("a name"))
+        .collect();
+    assert_eq!(actions.len(), 22);
+    let args = &params["properties"]["args"];
+    assert_eq!(args["type"], json!("object"));
+    assert_eq!(args["x-arca-by"], json!("action"));
+    let branches = args["anyOf"].as_array().expect("one branch per action");
+    let titles: Vec<&str> = branches
+        .iter()
+        .map(|branch| branch["title"].as_str().expect("a title"))
+        .collect();
+    assert_eq!(titles, actions, "one branch per action, in the same order");
+    for (action, branch) in actions.iter().zip(branches) {
+        let mut own = (verb(action).expect("a verb").params)();
+        if let Some(required) = own["required"].as_array_mut() {
+            required.retain(|field| field != "approval");
+        }
+        let fields = own["properties"].as_object_mut().expect("properties");
+        fields.remove("approval");
+        for field in kernel_filled(action) {
+            let said = fields[*field]["description"]
+                .as_str()
+                .map(|said| format!("{said} "))
+                .unwrap_or_default();
+            fields.insert(
+                (*field).to_string(),
+                json!({ "description": format!("{said}{KERNEL_FILLS_IN}") }),
+            );
+        }
+        assert_eq!(branch["properties"], own["properties"], "{action}");
+        assert_eq!(branch["required"], own["required"], "{action}");
+        assert_eq!(branch["additionalProperties"], json!(false), "{action}");
+        let example = &branch["examples"][0];
+        for field in kernel_filled(action) {
+            assert!(
+                example.get(*field).is_none(),
+                "{action}: the example holds {field}, which the kernel fills in"
+            );
+        }
+        let description = branch["description"].as_str().expect("a description");
+        assert!(
+            description.starts_with(&format!("The args of {action}: "))
+                && description.ends_with(&format!("Example: {example}")),
+            "{action}: {description}"
+        );
+        // The example is one the branch, and the whole call, take.
+        assert_eq!(conforms(branch, example), Ok(()), "{action}");
+        assert_eq!(
+            conforms(&params, &json!({ "action": action, "args": example })),
+            Ok(()),
+            "{action}"
+        );
+    }
+}
+
+/// The door holds `args` to the branch its `action` names, so a refusal is in that branch's own words; an action that
+/// is not one is refused by its own list, with the nearest name.
+#[test]
+fn action_propose_args_are_refused_in_the_words_of_the_actions_own_branch() {
+    let params = (verb("action_propose").expect("the verb").params)();
+    let refused = |call: Value| conforms(&params, &call).expect_err("refused");
+    assert_eq!(
+        refused(json!({ "action": "function_create", "args": {} })),
+        "/args: missing required field name"
+    );
+    assert_eq!(
+        refused(json!({ "action": "function_create", "args": { "name": "relay", "imgae": "x" } })),
+        "/args: missing required field image"
+    );
+    assert_eq!(
+        refused(json!({ "action": "tenant_remove", "args": { "id": "abcdefgh", "nmae": 1 } })),
+        "/args: unknown field 'nmae'; it takes: confirm, id"
+    );
+    assert_eq!(
+        refused(json!({ "action": "service_publish", "args": { "name": "dash", "reach": 7 } })),
+        "/args/reach: expected string"
+    );
+    // Fields another action takes are not this one's.
+    assert_eq!(
+        refused(json!({ "action": "tenant_remove", "args": { "name": "nats" } })),
+        "/args: missing required field id"
+    );
+    assert!(
+        refused(json!({ "action": "postgres_creat", "args": { "name": "orders" } }))
+            .ends_with("; did you mean postgres_create?")
+    );
+}
+
+/// No tool's input schema has `anyOf`, `oneOf` or `allOf` at its top level: a client that sends the schema to a
+/// model's API is refused for one there, so each union stays inside a field.
+#[test]
+fn no_input_schema_has_a_union_at_its_top_level() {
+    for v in verbs() {
+        let params = (v.params)();
+        for union in ["anyOf", "oneOf", "allOf"] {
+            assert!(
+                params.get(union).is_none(),
+                "{} has {union} at its top",
+                v.name
+            );
+        }
+        assert_eq!(params["type"], json!("object"), "{}", v.name);
+    }
+}
+
+/// A field the kernel fills in when the proposal is made takes any value at the door, as it did before `args` was held
+/// to a branch: the kernel removes or replaces it before the action's own check runs. Each one is sent with a value
+/// its verb's own rule refuses, and the call conforms. Review M1 of PR 136.
+#[test]
+fn a_field_the_kernel_fills_in_is_taken_at_the_door_with_any_value() {
+    let params = (verb("action_propose").expect("the verb").params)();
+    let branches = params["properties"]["args"]["anyOf"]
+        .as_array()
+        .expect("one branch per action");
+    let off_rule = json!({ "off": "rule" });
+    for (action, fields) in KERNEL_FILLED {
+        let own = (verb(action).expect("a verb").params)();
+        let branch = branches
+            .iter()
+            .find(|branch| branch["title"] == json!(action))
+            .expect("a branch");
+        for field in fields {
+            let rule = &own["properties"][*field];
+            assert!(rule.is_object(), "{action} takes {field}");
+            assert!(
+                conforms(rule, &off_rule).is_err(),
+                "{action}/{field}: off its rule"
+            );
+            let said = branch["properties"][*field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(said.ends_with(KERNEL_FILLS_IN), "{action}/{field}: {said}");
+            let mut args = branch["examples"][0].clone();
+            args[*field] = off_rule.clone();
+            assert_eq!(
+                conforms(&params, &json!({ "action": action, "args": args })),
+                Ok(()),
+                "{action}/{field}"
+            );
+        }
+    }
+    // A snapshot_list row's kind, copied into a delete.
+    let row = json!({ "name": "shop--web--20261030T1200", "pool": "usb1", "kind": "container" });
+    assert_eq!(
+        conforms(
+            &params,
+            &json!({ "action": "snapshot_delete", "args": row })
+        ),
+        Ok(())
     );
 }

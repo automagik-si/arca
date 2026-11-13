@@ -35,6 +35,8 @@ the file it used, by its name alone; before, it spoke of a token file the owner 
 - Merge PR 133: arca status names the token file it used when the node refuses it; tests for the PR 123 guard
 - Merge PR 131: approval cards say in plain words what a change does and uses
 
+`action_propose` now says in its input schema what each of its 22 actions takes: `args` has one branch per action, titled with the action, with that verb's fields, the ones it requires, and an example, so an assistant no longer learns them by trial and error. The door holds `args` to the branch its `action` names, so a refusal names the field of that action (`/args: missing required field name`) before the action's own check runs. A field the kernel fills in when the proposal is made (a GPU's instance kind, a disk's model, a snapshot's pool) takes any value, as before, and its description says the kernel fills it in.
+
 ## 0.18.0 (2026-11-12)
 
 On a node that only looks, a read that worked no longer begins with "this node only looks: nothing here can be
