@@ -862,9 +862,9 @@ restrictions retain Incus' managed default.
 The `automagik-server` template pins the OCI server image (Automagik's release 3.136.4, by digest), mounts `/data` owned
 by uid/gid 1000, overrides the profile to 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
 The `postgres-autopg`, `nats` and `omni-api` templates state a data volume of their own (20GiB at
-`/var/lib/autopg/data`, 10GiB at `/data`, 10GiB at `/app/data`; each has a size, which a tenant needs to count the disk
-against its cap). A service made from them up to 0.21.0 keeps its data on its root disk and gets no volume: `templates install` changes the
-template, not the services already made.
+`/var/lib/autopg/data`, 10GiB at `/data`, 10GiB at `/app/data`; each has a size, which a tenant needs to count the
+disk against its cap). A service made from them up to 0.21.0 keeps its data on its root disk and gets no volume:
+`templates install` changes the template, not the services already made.
 
 ### A database
 
