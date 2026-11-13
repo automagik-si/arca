@@ -622,11 +622,11 @@ fn the_scenario_health_line_shows_its_unknown_rules_as_a_count() {
     let scratch = Scratch::new("scenario-line");
     let state = state_dir(&scratch);
     let snapshot = run(&state);
-    // The four rules with no input (update-failed, smart-warning, gpu-vram-high, gpu-gone) stay unknown, and the
+    // The five rules with no input (update-failed, smart-warning, gpu-vram-high, gpu-gone, host-network-drift) stay unknown, and the
     // line counts them. This scenario builds its inputs by hand; a live node's sampler supplies the GPU sources.
     assert_eq!(
         alerts_line(&snapshot, NOW + 185_000),
-        "alerts 2 firing: cpu-hot, drift · 4 unknown"
+        "alerts 2 firing: cpu-hot, drift · 5 unknown"
     );
 }
 
@@ -1071,7 +1071,7 @@ fn watch_report_ages_from_its_sweep_and_alerts_list_conforms_over_the_server() {
     );
     assert_eq!(
         list["unknown"].as_array().map(Vec::len),
-        Some(4),
-        "four rules have no input in this hand-built scenario"
+        Some(5),
+        "five rules have no input in this hand-built scenario"
     );
 }

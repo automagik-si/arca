@@ -343,6 +343,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "limits": { "seconds": 60, "memory": "128MiB", "cpu": 1 },
             }),
             ActionKind::FunctionRemove => json!({ "name": "relay" }),
+            ActionKind::HostNetworkRestore => json!({}),
         }
     }
 
@@ -522,6 +523,18 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     ("Disk", "100GiB"),
                 ]
             );
+            continue;
+        }
+        if action == ActionKind::HostNetworkRestore {
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(labels, ["Host", "Now", "Effect"]);
+            assert_eq!(details[1].value, "read when the restore runs");
+            assert!(details[2].value.contains("No container"));
+            assert_eq!(
+                action.summary(&prepared),
+                "Put this host's forwarding and firewall rules back as its declared file says"
+            );
+            assert!(action.undo_words().contains("nothing to undo"));
             continue;
         }
         if action == ActionKind::DeployRemove {
@@ -2004,7 +2017,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(all.len(), 22);
+    assert_eq!(all.len(), 23);
     assert_eq!(
         failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
         format!(

@@ -14,9 +14,10 @@ use std::thread;
 use std::time::Duration;
 
 use arca_alerts::eval::{
-    Component, ComponentName, DriveUse, Evaluator, GpuGone, GpuUse, HEALTH_MAX_AGE_MS, Inputs,
-    InstanceUse, OSD_MAX_AGE_MS, PoolUse, RuleId, Rules, SAMPLE_MAX_AGE_MS, SMART_MAX_AGE_MS,
-    Severity, Timed, UpdateUse, WATCH_MAX_AGE_MS, WatchReading,
+    Component, ComponentName, DriveUse, Evaluator, GpuGone, GpuUse, HEALTH_MAX_AGE_MS,
+    HOST_NETWORK_MAX_AGE_MS, HostNetworkItem, Inputs, InstanceUse, OSD_MAX_AGE_MS, PoolUse, RuleId,
+    Rules, SAMPLE_MAX_AGE_MS, SMART_MAX_AGE_MS, Severity, Timed, UpdateUse, WATCH_MAX_AGE_MS,
+    WatchReading,
 };
 use arca_alerts::rules::{AlertsFile, Probes, RulesError};
 use arca_alerts::{
@@ -74,6 +75,7 @@ fn max_age(id: RuleId) -> u64 {
         RuleId::Drift => WATCH_MAX_AGE_MS,
         RuleId::UpdateFailed => OSD_MAX_AGE_MS,
         RuleId::SmartWarning => SMART_MAX_AGE_MS,
+        RuleId::HostNetwork => HOST_NETWORK_MAX_AGE_MS,
     }
 }
 
@@ -169,6 +171,18 @@ fn reading_of(id: RuleId, value: f64, at: u64) -> Inputs {
                 },
             });
         }
+        RuleId::HostNetwork => {
+            inputs.host_network = Some(Timed {
+                at,
+                value: if value > 0.0 {
+                    vec![HostNetworkItem {
+                        item: "ipv4-forwarding".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            });
+        }
     }
     inputs
 }
@@ -187,7 +201,7 @@ struct Case {
     low: f64,
 }
 
-const CASES: [Case; 10] = [
+const CASES: [Case; 11] = [
     Case {
         id: RuleId::DiskPoolFull,
         high: 95.0,
@@ -248,12 +262,22 @@ const CASES: [Case; 10] = [
         band: None,
         low: 0.0,
     },
+    Case {
+        id: RuleId::HostNetwork,
+        high: 1.0,
+        band: None,
+        low: 0.0,
+    },
 ];
 
 /// Whether a case's rule uses the default 60 s fire window. The GPU VRAM rule holds for five minutes, so the default-timing
-/// tests skip it and the GPU tests below drive its own clock.
+/// tests skip it and the GPU tests below drive its own clock. A rule whose alert ends by its subject leaving the reading
+/// (`gpu-gone`, `host-network-drift`) has no clearing window to hold, so it is skipped too.
 fn default_timing(id: RuleId) -> bool {
-    !matches!(id, RuleId::GpuVramHigh | RuleId::GpuGone)
+    !matches!(
+        id,
+        RuleId::GpuVramHigh | RuleId::GpuGone | RuleId::HostNetwork
+    )
 }
 
 /// The reason the newest reading of `id` is unknown, if it is.
@@ -2290,6 +2314,70 @@ mod gpu_alerts {
         assert_eq!(resolved[0].state, EventState::Resolved);
         assert_eq!(resolved[0].reason, Some(ResolveReason::SubjectGone));
         assert!(eval.firing().is_empty());
+    }
+
+    #[test]
+    fn each_host_network_item_that_drifts_has_its_own_alert_that_resolves_when_it_is_put_back() {
+        let rules = Rules::default();
+        let mut eval = Evaluator::default();
+        let drifted = |items: &[&str], at: u64| Inputs {
+            at,
+            host_network: Some(Timed {
+                at,
+                value: items
+                    .iter()
+                    .map(|item| HostNetworkItem {
+                        item: (*item).to_string(),
+                    })
+                    .collect(),
+            }),
+            ..Inputs::default()
+        };
+        let both = ["ipv4-forwarding", "rule-in:incusbr0"];
+        for t in [0, 30_000] {
+            assert!(
+                eval.step(&rules, &drifted(&both, T0 + t), T0 + t)
+                    .is_empty()
+            );
+        }
+        let fired = eval.step(&rules, &drifted(&both, T0 + 60_000), T0 + 60_000);
+        let mut named: Vec<String> = fired
+            .iter()
+            .map(|event| event.labels["item"].clone())
+            .collect();
+        named.sort();
+        assert_eq!(named, ["ipv4-forwarding", "rule-in:incusbr0"]);
+        assert!(fired.iter().all(|event| event.rule == "host-network-drift"));
+        assert!(fired.iter().all(|event| event.severity == "critical"));
+        // The rule is put back: the item is gone from the fresh reading, and its alert resolves once.
+        let resolved = eval.step(
+            &rules,
+            &drifted(&["rule-in:incusbr0"], T0 + 65_000),
+            T0 + 65_000,
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].labels["item"], "ipv4-forwarding");
+        assert_eq!(resolved[0].reason, Some(ResolveReason::SubjectGone));
+        // No status file, or a stale one, is unknown and never a resolve.
+        assert!(
+            eval.step(&rules, &Inputs::default(), T0 + 70_000)
+                .is_empty()
+        );
+        assert_eq!(
+            unknown_of(&eval, RuleId::HostNetwork),
+            Some(UnknownReason::Missing)
+        );
+        assert_eq!(eval.firing().len(), 1);
+        let late = T0 + 65_000 + HOST_NETWORK_MAX_AGE_MS + 1_000;
+        assert!(
+            eval.step(&rules, &drifted(&["rule-in:incusbr0"], T0 + 65_000), late)
+                .is_empty()
+        );
+        assert_eq!(
+            unknown_of(&eval, RuleId::HostNetwork),
+            Some(UnknownReason::Stale)
+        );
+        assert_eq!(eval.firing().len(), 1);
     }
 
     #[test]

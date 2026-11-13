@@ -98,6 +98,7 @@ dependencies = [
  "arca-alerts",
  "arca-api",
  "arca-approval",
+ "arca-hostnet",
  "arca-incus",
  "arca-kernel",
  "arca-link",
@@ -161,6 +162,14 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "ssh-key",
+]
+
+[[package]]
+name = "arca-hostnet"
+version = "0.21.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

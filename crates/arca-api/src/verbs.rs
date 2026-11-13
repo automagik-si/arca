@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 67] = [
+static VERBS: [Verb; 68] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1023,7 +1023,48 @@ static VERBS: [Verb; 67] = [
         params: registry_server_params,
         result: registry_result,
     },
+    Verb {
+        name: "host_network_restore",
+        summary: "Put this host's forwarding and firewall back as the owner's declared file says, once the owner has approved it as an action proposal: IP forwarding, the accepts that let the declared bridges' containers reach out, and the FORWARD policy. It asks the root part of this host, which runs only this and nothing else, and the answer is what the root part read back afterwards: whether the host is as declared, the commands it ran and any drift that is left. It takes no arguments.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_host_network,
+        cut: no_cut,
+        params: host_network_restore_params,
+        result: host_network_restore_result,
+    },
 ];
+
+fn host_network_restore_params() -> Value {
+    params(vec![("approval", true, approval_schema())])
+}
+
+fn host_network_restore_result() -> Value {
+    result(vec![
+        ("inSync", true, boolean()),
+        ("applied", true, array(string())),
+        (
+            "drift",
+            true,
+            array(result(vec![
+                ("item", true, string()),
+                ("detail", true, string()),
+            ])),
+        ),
+        ("errors", true, array(string())),
+        ("at", true, at_least(0)),
+        ("message", true, string()),
+    ])
+}
+
+/// A short line for `host_network_restore`: the handler's own sentence.
+pub fn summary_host_network(v: &Value) -> String {
+    v["message"].as_str().unwrap_or("done").to_string()
+}
 
 fn registry_server_schema() -> Value {
     json!({
@@ -2399,8 +2440,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty-two verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 22] = [
+/// The twenty-three verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 23] = [
     "service_create",
     "service_remove",
     "service_import",
@@ -2423,6 +2464,7 @@ const ACTION_NAMES: [&str; 22] = [
     "deploy_remove",
     "function_create",
     "function_remove",
+    "host_network_restore",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -2495,7 +2537,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 22] = [
+const ACTION_EXAMPLES: [(&str, &str); 23] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     ("service_import", r#"{"name":"web"}"#),
@@ -2533,6 +2575,7 @@ const ACTION_EXAMPLES: [(&str, &str); 22] = [
         r#"{"name":"relay","image":"registry.example/acme/relay","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","triggers":[{"timer":{"everySeconds":60}}]}"#,
     ),
     ("function_remove", r#"{"name":"relay"}"#),
+    ("host_network_restore", r#"{}"#),
 ];
 
 /// The schema keyword that tells the door's check which branch of an `anyOf` a value is held to: the one whose `title`

@@ -18,6 +18,7 @@ pub mod approve_page;
 pub mod canvas;
 pub mod cmd_adopt;
 pub mod cmd_call;
+pub mod cmd_host_network;
 pub mod cmd_init;
 pub mod cmd_link;
 pub mod cmd_probe;
@@ -36,6 +37,7 @@ pub mod function_run;
 pub mod gpu;
 pub mod guest_secrets;
 pub mod handlers;
+pub mod host_network;
 pub mod kernel;
 pub mod lifecycle;
 pub mod linked;
@@ -75,6 +77,9 @@ const USAGE: &str = "usage: arca <command>
   init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>] (let this node make changes; what is proposed waits for the owner's approval)
   init --watch-only [--config <file>] (back to a node that only looks)
   setup-code [--config <file>] (the code for the first passkey, on this terminal, for a machine with no screen)
+  host-network status [--live] [--config <file>] (what the root part found: the host as declared, or what drifted)
+  host-network install [--takeover <unit>] [--bridges <a,b>] [--replace] [--dry-run] (as root: declare what the host forwards now and start the root part)
+  host-network run (the root part itself, as root; the system unit runs it)
   call <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
   call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]
   call (alone: lists the verbs)
@@ -552,6 +557,7 @@ const COMMANDS: &[&str] = &[
     "serve",
     "init",
     "setup-code",
+    "host-network",
     "call",
     "token",
     "store",
@@ -589,6 +595,7 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
             &["enable-changes", "watch-only", "yes"],
         )?),
         "call" => cmd_call::call(rest),
+        "host-network" => cmd_host_network::host_network(rest),
         "link" => cmd_link::link(rest),
         "probe" => cmd_probe::probe(rest),
         "adopt" => cmd_adopt::adopt(rest),

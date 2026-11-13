@@ -47,6 +47,7 @@ pub enum ArcaAction {
     DeployRemove,
     FunctionCreate,
     FunctionRemove,
+    HostNetworkRestore,
 }
 
 impl ArcaAction {
@@ -83,6 +84,7 @@ impl ArcaAction {
             Self::DeployRemove => "deploy_remove",
             Self::FunctionCreate => "function_create",
             Self::FunctionRemove => "function_remove",
+            Self::HostNetworkRestore => "host_network_restore",
         }
     }
 
@@ -119,6 +121,7 @@ impl ArcaAction {
             "deploy_remove" => Some(Self::DeployRemove),
             "function_create" => Some(Self::FunctionCreate),
             "function_remove" => Some(Self::FunctionRemove),
+            "host_network_restore" => Some(Self::HostNetworkRestore),
             _ => None,
         }
     }
