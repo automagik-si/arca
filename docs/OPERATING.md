@@ -13,13 +13,16 @@ Automagik Arca runs your services on machines you own. Set up the way the quicks
 - Arca is self-hosted: it runs on machines you own, and Arca itself needs no outside service to work.
 - Arca keeps an append-only journal of the changes it applies. Starts, stops and restarts are logged separately.
 
-**Status: alpha.** Arca is an alpha, for one machine at a time. Today it needs a Linux machine (x86_64) with Incus, and a person comfortable with a terminal. The current version is on the [releases page](https://github.com/automagik-si/arca/releases).
+**Status: alpha.** Arca is an alpha. Each machine runs its own Arca. Machines you pair form a group, and an assistant
+can call a paired machine with a token that machine made; Arca does not yet spread services across machines by itself.
+Today it needs a Linux machine (x86_64) with Incus, and a person comfortable with a terminal. The current version is
+on the [releases page](https://github.com/automagik-si/arca/releases).
 
 | Works today | Not yet |
 |---|---|
 | Ready to run today: Postgres, NATS, Omni, Automagik, a Cloudflare tunnel and a workspace virtual machine. | The installer leaves a node that only looks, and one step lets it change things: `arca init --enable-changes`, or `--enable-changes` on the install line. That step does not turn on virtual machines (the workspace and the GitHub and GitLab runner pools), tenants, or taking over a service that already runs on the machine: each is set in the config by hand ([Turning on changes](#turning-on-changes)). |
 | Arca can save snapshots of a service onto a disk you plug in. | Arca cannot yet restore a snapshot for you: restoring is done by hand with Incus. |
-| Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run any app or container image you name: a service comes from a ready template, or Arca takes over one that already runs on the machine. |
+| Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run an app you name as a service: a service comes from a ready template, or Arca takes over one that already runs on the machine. A small program in an image you name can run on a timer as a function, once you approve its card. |
 | Two machines can be paired with a one-time code. | The ChatGPT and Claude apps cannot connect to Arca in one click yet. |
 | Arca checks passkeys itself; no outside sign-in service is involved. | Arca does not repair things by itself. |
 
@@ -425,7 +428,8 @@ under `--yes` it stops. A network named with `--service-cidr` must be an IPv4 /2
 - root. It runs as the node's user and never runs `sudo`. The one program it starts is `systemctl --user`, to
   restart the installer's unit.
 
-It takes `--config` as a flag and reads no default, like every command that writes.
+It finds its config like every command that writes: the flag, then `ARCA_CONFIG` (which alone never picks the node for
+`init`), then the default file.
 
 **Going back.**
 
@@ -4768,7 +4772,7 @@ action_propose { "action": "function_create", "args": {
 | Field | Rule |
 |-------|------|
 | `name` | A service's grammar. Functions and services share one name space: neither takes a name the other holds, and each verb keeps to its kind (`service_status` of a function, and `function_run` of a service, are refused in words). |
-| `image`, `digest` | `<registry>/<repository>` in lower case and `sha256:` with 64 hex digits. Never a tag. Arca pulls the image without a credential. |
+| `image`, `digest` | `<registry>/<repository>` in lower case and `sha256:` with 64 hex digits. Never a tag. Arca pulls the image with the credential set for its registry, if there is one, and without one otherwise ([A registry that asks for a credential](#a-registry-that-asks-for-a-credential)). |
 | `command` | Optional. The program's absolute path inside the image, then its arguments. No shell runs it. Left out, the image's own entry point runs. |
 | `env` | Plain values by name, at most 32, each at most 160 characters. The card shows each whole. |
 | `secrets` | Names only, at most 16. See below. |
