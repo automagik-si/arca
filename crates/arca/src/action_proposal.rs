@@ -1385,7 +1385,17 @@ impl ActionProposalStore {
 
     /// Journals an approval and retires the proposal. The caller has already checked its proof.
     pub fn approve(&mut self, id: &str) -> io::Result<Option<ActionProposal>> {
-        self.retire(id, "approved")
+        self.approve_noting(id, None)
+    }
+
+    /// [`ActionProposalStore::approve`], with `note` kept in the journal line: how the approval came, when it did not come
+    /// as the owner's passkey.
+    pub fn approve_noting(
+        &mut self,
+        id: &str,
+        note: Option<&str>,
+    ) -> io::Result<Option<ActionProposal>> {
+        self.retire_noting(id, "approved", note)
     }
 
     /// Journals a decline and retires the proposal.
@@ -1394,6 +1404,15 @@ impl ActionProposalStore {
     }
 
     fn retire(&mut self, id: &str, event: &str) -> io::Result<Option<ActionProposal>> {
+        self.retire_noting(id, event, None)
+    }
+
+    fn retire_noting(
+        &mut self,
+        id: &str,
+        event: &str,
+        note: Option<&str>,
+    ) -> io::Result<Option<ActionProposal>> {
         let Some(index) = self.waiting.iter().position(|proposal| proposal.id == id) else {
             return Ok(None);
         };
@@ -1403,7 +1422,7 @@ impl ActionProposalStore {
             id: Some(id.to_string()),
             ok: None,
             code: None,
-            message: None,
+            message: note.map(str::to_string),
         })?;
         let retired = self.waiting.remove(index);
         self.compact_if_large();

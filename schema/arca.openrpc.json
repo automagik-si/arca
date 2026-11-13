@@ -1442,6 +1442,9 @@
             "tokens": {
               "items": {
                 "properties": {
+                  "admin": {
+                    "type": "boolean"
+                  },
                   "id": {
                     "type": "string"
                   },

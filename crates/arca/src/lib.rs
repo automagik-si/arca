@@ -78,7 +78,7 @@ const USAGE: &str = "usage: arca <command>
   call <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
   call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]
   call (alone: lists the verbs)
-  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] [--config <file> | --hash-dir <dir>]
+  token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--replace] [--config <file> | --hash-dir <dir>]
   token revoke <id> [--config <file> | --hash-dir <dir>]
   token reload [--config <file>] (the running node reads its tokens again)
   store check [--config <file>]
@@ -617,7 +617,7 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
             Some((action, rest)) if action == "mint" => cmd_token::mint_token(&parse_flags(
                 rest,
                 &["scope", "id", "hash-dir", "out", "config", "tools"],
-                &[],
+                &["replace"],
             )?),
             Some((action, rest)) if action == "revoke" => {
                 let (id, rest) = rest.split_first().ok_or_else(|| {

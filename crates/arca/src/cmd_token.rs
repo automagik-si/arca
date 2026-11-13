@@ -58,6 +58,25 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
         None => None,
     };
 
+    // One admin token per node. A second id is refused naming the first, unless `--replace` retires it.
+    let mut retire = Vec::new();
+    if scope == Scope::Admin {
+        let holders = arca_mcp::admin_token_ids(&hash_dir);
+        if !holders.is_empty() {
+            if !flags.switch("replace") {
+                return Err(Failure::Config(format!(
+                    "this node already has an admin token, {}: only one may exist. Mint with --replace to retire it and mint this one",
+                    holders.join(", ")
+                )));
+            }
+            retire = holders;
+        }
+    } else if flags.switch("replace") {
+        return Err(Failure::Usage(
+            "--replace is for the admin scope: it retires the node's one admin token".to_string(),
+        ));
+    }
+
     let (secret, hash_text) = mint_with_tools(scope, tools.as_deref());
     write_new(&hash_path, hash_text.as_bytes())
         .map_err(|e| Failure::Runtime(format!("cannot write the hash file: {e}")))?;
@@ -68,7 +87,19 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
             "cannot write the secret file: {e}"
         )));
     }
-    Ok(Some(json!({ "id": id, "scope": scope.as_str() })))
+    // The new token is in place, so the old admin token goes: a node never holds two, and never none by a failed mint.
+    for old in &retire {
+        fs::remove_file(hash_dir.join(format!("{old}.hash"))).map_err(|e| {
+            Failure::Runtime(format!("cannot retire the old admin token {old}: {e}"))
+        })?;
+    }
+    if retire.is_empty() {
+        Ok(Some(json!({ "id": id, "scope": scope.as_str() })))
+    } else {
+        Ok(Some(
+            json!({ "id": id, "scope": scope.as_str(), "retired": retire }),
+        ))
+    }
 }
 
 /// `token revoke <id> [--config <c> | --hash-dir <d>]`: removes the token's hash file and sends a running serve SIGHUP.
@@ -481,8 +512,9 @@ fn parse_scope(text: &str) -> Result<Scope, Failure> {
         "viewer" => Ok(Scope::Viewer),
         "doctor" => Ok(Scope::Doctor),
         "operator" => Ok(Scope::Operator),
+        "admin" => Ok(Scope::Admin),
         _ => Err(Failure::Usage(
-            "--scope is viewer, doctor or operator".to_string(),
+            "--scope is viewer, doctor, operator or admin".to_string(),
         )),
     }
 }

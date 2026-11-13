@@ -579,8 +579,12 @@ sha256=<64 lowercase hex digits>
 tools=service_list,service_logs,journal_list
 ```
 
-The file name is `<id>.hash`, and the id is 1 to 64 lowercase letters, digits or hyphens. The scopes are `viewer`, `doctor`
-and `operator`. The `tools=` line is optional; without it the token reaches every verb its scope admits, and with it the token
+The file name is `<id>.hash`, and the id is 1 to 64 lowercase letters, digits or hyphens. The scopes are `viewer`, `doctor`,
+`operator` and `admin`, in that order. `admin` admits every verb `operator` does and one thing more: the terminal approval
+described under "Approving a plan from the terminal". **A node holds one admin token at a time.** `arca token mint --scope
+admin --id <id>` with another admin token on the node is refused with exit 2, names the token that exists and writes
+nothing; `--replace` mints the new one and then removes the old one's hash file, so a node never has two and never none by
+a failed mint. `--replace` is for the admin scope only. A running node reads the change on the next `arca token reload`. The `tools=` line is optional; without it the token reaches every verb its scope admits, and with it the token
 reaches only those named tools. A tool above the scope is refused at mint, so the list only narrows.
 
 One id is no token's: `owner-approval`, the name an action runs under once the owner approved it. `arca token mint`
@@ -1360,6 +1364,38 @@ and a reason the server wrote (it can name a file of the node or a service, and 
 ```
 arca: service_status was answered "internal: the tool failed": the kernel could not complete the call
 ```
+
+### Approving a plan from the terminal
+
+A call by the node's admin token that answers with an action proposal waiting for the owner (`action_propose`) can be
+approved in the terminal of an MCP client that declared the elicitation capability, instead of on the owner's card. Every
+other call is answered as before: a token below `admin`, a client that declared no elicitation and any verb that does not
+answer with a waiting proposal get the same bytes they always got, and the card on the approval page waits as always. This
+path does not touch a delete plan, which keeps its card.
+
+- **`2025-11-25`.** The client declares `capabilities.elicitation` at `initialize`; the node remembers it for that token id,
+  since it keeps no session. The call's `POST` is then answered `200` with `text/event-stream`: a priming event, then an
+  `elicitation/create` request in form mode, then, once answered, the call's own reply. The client's answer is a second
+  `POST` of the JSON-RPC response, answered `202`. Only the token that was asked may answer.
+- **`2026-07-28`.** There are no server-to-client requests in this version; the client declares `elicitation` in each
+  request's `params._meta` and the call is answered `resultType: "input_required"` with an `inputRequests.approve`
+  elicitation and a `requestState`. The client sends the call again, with a new id, the same arguments, `inputResponses`
+  and the state. The state is signed (HMAC-SHA256 under a key made when the node starts) and names the token, the plan,
+  the call's verb and arguments and an expiry of `terminal timeout` seconds, so a changed, expired or carried-over state is
+  refused (`-32602`) or, once expired, answers as a call that never asked. A plan runs once: the proposal is retired as it
+  is approved, so a replay finds none.
+
+The question states the plan in the card's words: what it does, its details (where), and until when it waits. The form has
+one field, `approve`, `yes` or `no`. Only an `accept` with `yes` approves and runs the plan, as the card's approval does,
+and the journal (`action-proposals.jsonl`) records the approval as `approved in the terminal by admin token <id>`; it is
+never written as the owner's. A decline, a cancel, an accept of `no`, a closed connection or no answer within four
+minutes leaves the plan waiting with its normal card, and the call answers as it would without the question.
+
+What this is not: a client's `accept` is the client's answer. A hook of the client (Claude Code's `Elicitation` hook can
+answer a form with no dialog) can give it with no person at the keyboard, so the admin token is a standing right to
+approve, held by whoever holds the token and its client. Keep it to the one terminal that should have it, and `arca token
+mint --replace` when it moves. Step-up authorization (a `403 insufficient_scope` that sends the person to the
+authorization server) would put the approval where the server can tell a person approved; it is not built here.
 
 ### Protocol versions
 

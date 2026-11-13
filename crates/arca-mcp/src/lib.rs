@@ -11,13 +11,15 @@
 //! single peer, and on a second unix socket for the node's own services.
 
 pub mod auth;
+pub mod elicit;
 mod fresh;
 pub mod http;
 pub mod jsonrpc;
 pub mod tools;
 pub mod version;
 
-pub use auth::{Caller, TokenStore, TokenStoreError, mint, mint_with_tools};
+pub use auth::{Caller, TokenStore, TokenStoreError, admin_token_ids, mint, mint_with_tools};
+pub use elicit::{PendingPlan, TerminalApprover};
 pub use http::{
     GetHandler, GetReply, Server, loopback_addr_ok, peer_allowed, proxy_addr_ok, serve_filtered,
     serve_loopback, serve_loopback_with, serve_proxy, serve_services, serve_tailnet, serve_unix,

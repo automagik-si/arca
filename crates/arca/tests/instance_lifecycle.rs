@@ -987,3 +987,87 @@ fn the_three_verbs_are_proposable_and_gated_as_the_table_says() {
         );
     }
 }
+
+/// The admin token's terminal approval, through the real kernel: the question states the plan, only the admin scope
+/// approves, a stop runs once, and the journal says it was approved in the terminal by that token, never by the owner.
+#[test]
+fn the_admin_tokens_terminal_approval_runs_a_stop_once_and_the_journal_names_it() {
+    use arca::handlers::TerminalApproval;
+    use arca_mcp::TerminalApprover;
+
+    let rig = Rig::new("life-terminal");
+    let proposal = rig
+        .call(
+            Scope::Viewer,
+            "action_propose",
+            json!({ "action": "instance_stop", "args": at(PROJECT, "api") }),
+        )
+        .expect("a proposal");
+    let approver = TerminalApproval {
+        kernel: Arc::clone(&rig.kernel),
+        clock: Arc::new(|| NOW),
+        actions: rig.executor.clone(),
+    };
+    // Only a waiting action proposal is asked about, and the question has the card's what, where and when.
+    assert!(approver.pending("arca_status", &proposal).is_none());
+    let plan = approver
+        .pending("action_propose", &proposal)
+        .expect("a waiting proposal");
+    assert_eq!(plan.id, proposal["id"].as_str().expect("an id"));
+    assert!(
+        plan.message.contains("Stop the instance api"),
+        "{}",
+        plan.message
+    );
+    assert!(
+        plan.message.contains(&format!("Project: {PROJECT}")),
+        "{}",
+        plan.message
+    );
+    assert!(
+        plan.message.contains("UTC"),
+        "the question says when: {}",
+        plan.message
+    );
+    assert!(
+        plan.message.contains("not by the owner"),
+        "{}",
+        plan.message
+    );
+
+    let caller = |scope, id: &str| Caller {
+        token_id: id.to_string(),
+        scope,
+        tools: None,
+    };
+    // A token below admin approves nothing here.
+    assert!(matches!(
+        approver.approve(&plan.id, &caller(Scope::Operator, "op-1")),
+        Err(CallError::Forbidden { .. })
+    ));
+    assert_eq!(rig.status(PROJECT, "api"), "Running");
+
+    let done = approver
+        .approve(&plan.id, &caller(Scope::Admin, "admin-1"))
+        .expect("the admin approves");
+    assert_eq!(done["action"], "instance_stop");
+    assert_eq!(rig.status(PROJECT, "api"), "Stopped", "the plan ran");
+    let journal = fs::read_to_string(
+        rig.scratch
+            .path(arca::action_proposal::ACTION_PROPOSALS_FILE),
+    )
+    .expect("the proposals journal");
+    assert!(
+        journal.contains("approved in the terminal by admin token admin-1"),
+        "{journal}"
+    );
+    assert!(!journal.contains("by the owner"), "{journal}");
+    // Once: the proposal is retired, so a second approval finds none and nothing runs again.
+    let writes = rig.state_writes();
+    assert!(
+        approver
+            .approve(&plan.id, &caller(Scope::Admin, "admin-1"))
+            .is_err()
+    );
+    assert_eq!(rig.state_writes(), writes);
+}

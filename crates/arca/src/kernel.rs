@@ -340,6 +340,28 @@ impl Kernel {
         approval: &str,
         now_ms: u64,
     ) -> Result<ApprovedAction, ActionApprovalError> {
+        self.approve_action_proved(id, Some(approval), None, now_ms)
+    }
+
+    /// Approves the action proposal `id` in the terminal of the admin token `token`, with no passkey proof: the same checks
+    /// as [`Kernel::approve_action`] but the owner verifier's, and the journal says who approved it and where. That is a
+    /// client's answer, never the owner's passkey, and the journal never says "by the owner".
+    pub fn approve_action_in_terminal(
+        &mut self,
+        id: &str,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<ApprovedAction, ActionApprovalError> {
+        self.approve_action_proved(id, None, Some(token), now_ms)
+    }
+
+    fn approve_action_proved(
+        &mut self,
+        id: &str,
+        approval: Option<&str>,
+        terminal_token: Option<&str>,
+        now_ms: u64,
+    ) -> Result<ApprovedAction, ActionApprovalError> {
         let proposal = self
             .action_proposals
             .get(id)
@@ -384,11 +406,15 @@ impl Kernel {
             })
         })?;
         let payload = json!({ "action": proposal.action.clone(), "args": proposal.args.clone() });
-        self.verifier
-            .check(statement_action, id, &payload, approval, now_ms)
-            .map_err(ActionApprovalError::Approval)?;
+        if let Some(approval) = approval {
+            self.verifier
+                .check(statement_action, id, &payload, approval, now_ms)
+                .map_err(ActionApprovalError::Approval)?;
+        }
+        let by =
+            terminal_token.map(|token| format!("approved in the terminal by admin token {token}"));
         self.action_proposals
-            .approve(id)
+            .approve_noting(id, by.as_deref())
             .map_err(|error| {
                 ActionApprovalError::Store(KernelError::Io {
                     path: ACTION_PROPOSALS_FILE.to_string(),

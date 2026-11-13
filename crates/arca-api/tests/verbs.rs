@@ -763,7 +763,8 @@ fn token_list_schemas_equal_its_table_row() {
                         "properties": {
                             "id": { "type": "string" },
                             "scope": { "type": "string", "enum": ["viewer", "doctor", "operator"] },
-                            "tools": { "type": "array", "items": { "type": "string" } }
+                            "tools": { "type": "array", "items": { "type": "string" } },
+                            "admin": { "type": "boolean" }
                         },
                         "required": ["id", "scope"]
                     }

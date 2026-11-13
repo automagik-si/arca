@@ -422,7 +422,7 @@ fn a_hash_file_with_a_bad_body_is_refused_as_malformed() {
         ("empty", String::new()),
         ("no sha256 line", "scope=viewer\n".to_string()),
         ("lines swapped", format!("{digest}\nscope=viewer\n")),
-        ("unknown scope", format!("scope=admin\n{digest}\n")),
+        ("unknown scope", format!("scope=root\n{digest}\n")),
         ("scope with a space", format!("scope= viewer\n{digest}\n")),
         ("short digest", "scope=viewer\nsha256=abcd\n".to_string()),
         ("uppercase digest", format!("scope=viewer\n{upper}\n")),

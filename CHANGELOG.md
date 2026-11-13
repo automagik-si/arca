@@ -7,6 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A new token scope, `admin`, sits above `operator`, and a node holds one admin token at a time: `arca token mint --scope
+admin` with another admin token on the node is refused naming it, and `--replace` retires the old one and has a running
+node read its tokens at once. The admin token can approve a waiting action proposal from the terminal of an MCP client
+that declared elicitation: the call stays open, the client is asked in the card's words, and an explicit accept with yes
+approves and runs the proposal once. The journals record it as approved in the terminal by that admin token (the run is
+made as `terminal-approval:<token id>`), never as the owner's. A decline, a cancel or a timeout leaves the proposal on
+its card, and every other token and client is answered as before. See "Approving a plan from the terminal" in
+OPERATING.md.
+
 ## 0.23.0 (2026-11-13)
 
 A node can now record a program that runs outside Incus, such as a macOS LaunchAgent next to the Incus VM, so it shows
