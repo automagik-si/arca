@@ -4533,12 +4533,13 @@ fn private_port_problem(
 }
 
 /// Why `serve` does not start over this desired state: a service's record names a host address for its private port that
-/// this config no longer names, or that no interface of this host holds (`is_local`). The proxy device of such a service
-/// would not bind, and Incus would not start it.
+/// this config no longer names. That is the owner's own change, and it is refused like a dropped destination. An
+/// address the config still names that no interface holds is never a reason: a link may have no carrier at boot, and
+/// one absent link must not stop every service of the node. Only that service's proxy fails to bind, in Incus, and
+/// `service_status` says why (`privatePort.ready` is false).
 pub fn private_port_refusal(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
-    is_local: &dyn Fn(std::net::Ipv4Addr) -> bool,
 ) -> Option<String> {
     let named = cfg.kernel.listen_addresses();
     entries
@@ -4548,13 +4549,8 @@ pub fn private_port_refusal(
             let recorded = entry.config.get("privatePort")?["address"].as_str()?;
             let name = entry.config["name"].as_str().unwrap_or(entry.id.0.as_str());
             let address: std::net::Ipv4Addr = recorded.parse().ok()?;
-            if !named.contains(&address) {
-                return Some(format!(
-                    "the service {name} listens on the host address {recorded} for its private port, as its owner approved, and this config's kernel.serviceListenAddresses does not name it: put the entry back, or remove the service before taking it out"
-                ));
-            }
-            (!is_local(address)).then(|| format!(
-                "the service {name} listens on the host address {recorded} for its private port, and that is not an address of any interface of this host: bring the private link up, or remove the service"
+            (!named.contains(&address)).then(|| format!(
+                "the service {name} listens on the host address {recorded} for its private port, as its owner approved, and this config's kernel.serviceListenAddresses does not name it: put the entry back, or remove the service before taking it out"
             ))
         })
 }

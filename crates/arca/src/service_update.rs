@@ -1150,7 +1150,11 @@ impl Run<'_> {
                     Reach::Running => "the instance did not stay running".to_string(),
                     _ => format!(
                         "port {} did not answer within {} second{}",
-                        self.port,
+                        match self.reach {
+                            Reach::Lan(port) | Reach::Private(_, port) | Reach::Direct(port) =>
+                                port,
+                            Reach::Running => self.port,
+                        },
                         self.seconds,
                         if self.seconds == 1 { "" } else { "s" }
                     ),

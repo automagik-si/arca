@@ -234,7 +234,7 @@ fn the_card_says_the_address_and_the_port_and_the_approval_binds_them() {
         words.contains(LINK) && words.contains(&format!("tcp port {PORT}")),
         "{words}"
     );
-    assert!(words.contains("on no other address"), "{words}");
+    assert!(words.contains(&format!("{LINK} only")), "{words}");
     assert!(
         proposal["summary"]
             .as_str()
@@ -557,27 +557,19 @@ fn a_status_names_what_does_not_stand() {
 }
 
 #[test]
-fn serve_does_not_start_over_a_service_whose_address_the_config_dropped_or_the_host_lost() {
+fn serve_does_not_start_over_an_address_the_config_dropped_and_never_over_one_the_host_lacks() {
     let rig = node(json!([LINK]));
     create_leaf(&rig);
     let entries = rig.entries();
-    let everywhere = |_: std::net::Ipv4Addr| true;
-    let nowhere = |_: std::net::Ipv4Addr| false;
+    // The config still names it, held or not: the start is never refused for the host's interfaces, so one link
+    // without carrier does not stop the node and every other service on it.
     assert_eq!(
-        arca::handlers::private_port_refusal(&rig.cfg, &entries, &everywhere),
+        arca::handlers::private_port_refusal(&rig.cfg, &entries),
         None
     );
-    let lost = arca::handlers::private_port_refusal(&rig.cfg, &entries, &nowhere)
-        .expect("the host lost the address");
-    assert!(
-        lost.contains("leaf")
-            && lost.contains(LINK)
-            && lost.contains("not an address of any interface"),
-        "{lost}"
-    );
-    // A config that no longer names it.
+    // A config that no longer names it is the owner's own change, and is refused.
     let other = node(json!([OTHER]));
-    let dropped = arca::handlers::private_port_refusal(&other.cfg, &entries, &everywhere)
+    let dropped = arca::handlers::private_port_refusal(&other.cfg, &entries)
         .expect("the config dropped the address");
     assert!(
         dropped.contains("leaf") && dropped.contains("does not name it"),
@@ -585,7 +577,81 @@ fn serve_does_not_start_over_a_service_whose_address_the_config_dropped_or_the_h
     );
     // A node with no such service starts as before.
     assert_eq!(
-        arca::handlers::private_port_refusal(&other.cfg, &other.entries(), &nowhere),
+        arca::handlers::private_port_refusal(&other.cfg, &other.entries()),
         None
+    );
+    // The host loses the address: the service says so, and the others of the node are untouched.
+    rig.fake().set_host_interfaces(vec![]);
+    let status = rig
+        .call("service_status", json!({ "name": "leaf" }))
+        .expect("status");
+    assert_eq!(status["privatePort"]["ready"], false);
+    assert!(
+        status["privatePort"]["problem"]
+            .as_str()
+            .expect("a problem")
+            .contains("not an address of any interface of this host now"),
+        "{status}"
+    );
+}
+
+#[test]
+fn a_proposal_made_before_the_template_changed_is_refused_at_the_create() {
+    let rig = node(json!([LINK]));
+    let proposal = propose(&rig, json!({ "name": "leaf", "template": "leaf" })).expect("proposal");
+    assert_eq!(proposal["args"]["privatePort"], stated());
+    // The template now offers another port: what the owner approved does not say that.
+    let mut changed = leaf_template();
+    changed["ports"] = json!([7423]);
+    changed["privatePort"] = json!({ "port": 7423 });
+    rig.template("leaf", changed);
+    let before = rig.fake().writes().len();
+    // The approved arguments state the old port, and the call may state only the template's own: refused, whichever of
+    // the two checks says it, before anything is written.
+    let result = approve(&rig, &proposal);
+    assert!(
+        matches!(&result, Err(CallError::Invalid(message))
+            if message == "privatePort: template leaf publishes port 7423, and the call may state only that"),
+        "{result:?}"
+    );
+    assert_eq!(rig.fake().writes().len(), before);
+    assert!(instance(&rig, "leaf").is_none());
+}
+
+#[test]
+fn a_failed_health_check_names_the_private_port_it_probed_and_not_the_first_port() {
+    // The template's ports are [7422] only, so give it a first port that is not the private one.
+    let rig = node(json!([LINK]));
+    let mut template = leaf_template();
+    template["ports"] = json!([4222, PORT]);
+    rig.template("leaf", template);
+    create_leaf(&rig);
+    let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe: Arc::new(|_, _, _| false),
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
+    let new = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let failed = handlers["service_update"]
+        .call(
+            json!({ "name": "leaf", "digest": new, "timeoutSeconds": 1 }),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+            },
+        )
+        .expect_err("the check fails");
+    let message = format!("{failed:?}");
+    assert!(
+        message.contains(&format!("port {PORT} did not answer")) && !message.contains("port 4222"),
+        "{message}"
     );
 }

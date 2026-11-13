@@ -1037,7 +1037,7 @@ pub fn kernel_access_words(port: u64) -> String {
 /// words.
 pub fn private_port_words(address: &str, port: u64) -> String {
     format!(
-        "Yes: tcp port {port} of this service answers on this node's address {address}, and on no other address of this node. Anything that can reach {address} can connect to it: a peer node over the private link, and nothing on the node's other networks. The service's own network rules do not stand between that address and the port."
+        "Yes: tcp port {port} of this service listens on this node's address {address} only, and not on every address of this node. Any machine that can send packets to {address} can connect to it, a peer node over the private link and also a neighbour on another network of this node that routes to that address through the node; this node's firewall decides beyond that. The service's own network rules do not stand between that address and the port."
     )
 }
 

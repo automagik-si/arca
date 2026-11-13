@@ -1114,17 +1114,18 @@ neighbouring address, is refused at once.
 ### A service port on one host address
 
 `lan` publishes a port on every host interface. A service that only a second node should reach, such as a NATS leafnode
-port, takes a private port instead: one port, on one host address that the node's config names, and on no other. Three
-parts, each needed:
+port, takes a private port instead: one port, listening on one host address that the node's config names and not on
+`0.0.0.0`. Three parts, each needed:
 
 1. **The config names the addresses.** `kernel.serviceListenAddresses` is a list of at most 8 IPv4 addresses of this
    host: the address of a private link to the other node (a private /24 on a dedicated interface, or a VPN address).
    The config is refused at load when an entry is not one plain IPv4 unicast address (`0.0.0.0`, a loopback, a
-   multicast address, the broadcast address, a range, a name and a repeated entry are refused). At start `serve` reads
-   the host's own interfaces: an address that no interface holds is said on standard error and does not stop the start
-   (a link may come up after the node), unless a service's record uses it, and then `serve` refuses to start and names
-   the service and the address, as it does for a bridge that is not there. A record whose address the config no longer
-   names stops the start the same way: put the entry back, or remove the service first.
+   multicast address, the broadcast address, a range, a name and a repeated entry are refused). At start `serve` asks
+   whether each address is on an interface of the host. One that is not is said on standard error and never stops the
+   start, even when a service uses it: a link without carrier, or a VPN that comes up late, must not take every service
+   of the node down. Only that service's proxy cannot bind, and `service_status` shows `privatePort.ready: false` with
+   the problem until the address is there. A record whose address the config no longer names is the owner's own change
+   and stops the start: put the entry back, or remove the service first.
 2. **The template says which port.** `"privatePort": { "port": 7422 }` must be one of the template's `ports`, and the
    template has either `lan` or `privatePort`, not both (both would bind the same port). The address is never the
    template's: a template is the same on every node, and an address is one node's own. A virtual machine template and a
@@ -1132,8 +1133,9 @@ parts, each needed:
 3. **The create names the address, and the owner approves it.** `service_create` takes `privatePort: { "address":
    "<one of the config's>" }`; a node whose config names exactly one address needs no argument. The create runs only
    from a proposal (`action_propose`): the proposal writes the address and the port into the arguments, so the
-   owner's card carries a `Private port` row ("tcp port 7422 of this service answers on this node's address
-   198.51.100.7, and on no other address of this node...") and the approval binds both. Called directly, the create is
+   owner's card carries a `Private port` row ("tcp port 7422 of this service listens on this node's address
+   198.51.100.7 only, and not on every address of this node. Any machine that can send packets to 198.51.100.7 can
+   connect to it...") and the approval binds both. Called directly, the create is
    refused with `NotApproved`. It is also refused, before anything is written, for an address the config does not
    name, for an address that no interface of the host holds now, in a tenant, and for a template with no
    `privatePort`.
@@ -1143,9 +1145,12 @@ The service gets one proxy device, `private`, which listens on `tcp:<address>:<p
 Nothing is bound on `0.0.0.0`. The network rules do not stand between that address and the port: the proxy is a
 forkproxy device that connects from the host into the container, so, like `lan`, its traffic skips the service's NIC
 ACL. The ACL is the one of an ordinary service, rule for rule: the proxy needs no rule, and the service's own egress is
-neither widened nor narrowed. What limits who can connect is the address itself: whoever can reach the node on
-that address, and nobody who can only reach another address of the node. The node's firewall, and the link, decide who
-that is; the owner names an address on a private link so that it is the other node alone.
+neither widened nor narrowed. The bind is to that one address and Arca adds no filtering of its own: Linux delivers a
+packet for any address of the host to the host whichever interface it arrives on, so any machine that can send packets
+to that address reaches the port, the peer on the private link and also a neighbour on another network of this node
+that routes to that address through the node. The node's firewall decides beyond that: to let only the link's
+interface through, the owner adds a rule of the host's own that accepts the port on that interface and drops it on the
+others. Arca writes no such rule.
 
 `service_status` and `service_list` show `privatePort: { "address", "port" }`; `service_status` adds `ready`, true when
 the instance carries the device as Arca made it and the host still holds the address, and otherwise false with a
@@ -1181,7 +1186,7 @@ Restart `serve`, propose the create (`action_propose` with `action: "service_cre
 - on this node, `ss -ltn` shows `198.51.100.7:7422` listening and nothing on `0.0.0.0:7422`;
 - from the other node, `nc -vz 198.51.100.7 7422` connects, and its leafnode configuration names
   `nats-leaf://198.51.100.7:7422`;
-- from a machine that reaches this node only by another address, `nc -vz <that address> 7422` is refused.
+- on this node's other addresses, `nc -vz <that address> 7422` is refused: the port is not bound there.
 
 To change the address, remove the service and create it again: the record keeps the address the owner approved.
 
