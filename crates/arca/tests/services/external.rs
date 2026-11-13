@@ -33,11 +33,10 @@ fn listening() -> (TcpListener, String) {
     (listener, format!("http://127.0.0.1:{port}/mcp"))
 }
 
-/// An address whose port had a listener a moment ago and has none now.
+/// An address nothing answers. Port 1 is below the ephemeral range, so no test's `bind("127.0.0.1:0")` is ever given
+/// it, and an unprivileged test cannot bind it: a parallel test can never take it and answer.
 fn closed() -> String {
-    let (listener, address) = listening();
-    drop(listener);
-    address
+    "http://127.0.0.1:1/mcp".to_string()
 }
 
 fn row(rig: &Rig, name: &str) -> Option<Value> {
@@ -123,7 +122,10 @@ fn status_makes_one_tcp_connect_and_says_up_or_down() {
     assert_eq!(up["state"], "up");
     assert_eq!(up["kind"], "host-program");
     assert_eq!(up["managed"], false);
+    // The program stops answering: the record now names an address nothing answers (a listener that was dropped
+    // could have its port taken by a parallel test, which would answer).
     drop(open);
+    add(&rig, "agent", &closed()).expect("the same name replaces the record");
     let down = rig
         .call("service_status", json!({"name":"agent"}))
         .expect("status");
