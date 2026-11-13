@@ -7,7 +7,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-A service template may set `noNewPrivileges: true`, so a setuid or setcap binary inside the container cannot raise privileges; off unless set, so every existing template and service is unchanged. See OPERATING.md.
+A service template may set `noNewPrivileges: true`, so a setuid or setcap binary inside the container cannot raise
+privileges. It is off unless set, so every existing template and service is unchanged. It needs
+`restricted.containers.lowlevel=allow` on the service project, a step on the node that Arca does not take; see
+OPERATING.md. `service_update` gives an existing service the key, or takes it away, to match its template, with a
+restart and no rebuild, so its data stays where it is.
 
 ## 0.25.0 (2026-11-13)
 
