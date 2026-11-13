@@ -3459,6 +3459,66 @@ fn automagik_server_runtime_shape_and_owned_volume_survive_retry_and_are_removed
     }
 }
 
+/// A database, a nats server and an Omni API made from the shipped templates keep their data on a volume of their own,
+/// at the path the program writes it, owned by the user the image runs as: `service_update` rebuilds the root disk from
+/// the new image and keeps only that volume, so data on the root would be gone after an update. Each states a size,
+/// which a tenant needs to count the disk against its cap.
+#[test]
+fn the_database_nats_and_omni_api_templates_keep_their_data_on_a_volume_of_their_own() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    for (template, path, owner, size) in [
+        ("postgres-autopg", "/var/lib/autopg/data", 1000, "20GiB"),
+        ("nats", "/data", 0, "10GiB"),
+        ("omni-api", "/app/data", 1000, "10GiB"),
+    ] {
+        let rig = Rig::with(
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                networks: vec![],
+                pools: vec![("pool1".into(), json!({}))],
+            },
+            vec![PROJECT.into()],
+            Some("192.0.2.0/24"),
+        );
+        assert!(arca::cmd_templates::install_into(&rig.dir.join("templates"), false).is_ok());
+        let shipped = service::load_template(&dir, template).unwrap();
+        let data = shipped.data.expect("the template names a data volume");
+        assert_eq!(data.path, path, "{template}");
+        assert_eq!(
+            (data.uid, data.gid, data.size.as_deref()),
+            (Some(owner), Some(owner), Some(size)),
+            "{template}"
+        );
+        rig.call("service_create", json!({"name":"svc1","template":template}))
+            .unwrap_or_else(|error| panic!("{template}: {error:?}"));
+        let instance = rig
+            .get(&format!("/1.0/instances/svc1?project={PROJECT}"))
+            .unwrap();
+        assert_eq!(
+            instance["devices"]["data"],
+            json!({"type":"disk", "path":path, "pool":"pool1", "source":"svc1-data"}),
+            "{template}"
+        );
+        let volume = rig
+            .get(&format!(
+                "/1.0/storage-pools/pool1/volumes/custom/svc1-data?project={PROJECT}"
+            ))
+            .unwrap();
+        assert_eq!(
+            volume["config"],
+            json!({
+                "initial.uid": owner.to_string(),
+                "initial.gid": owner.to_string(),
+                "size": size,
+                "user.arcakernel.entry": "service-svc1"
+            }),
+            "{template}"
+        );
+    }
+}
+
 #[test]
 fn apply_refuses_a_pre_existing_unmarked_data_volume_and_leaves_it() {
     let rig = Rig::with(
