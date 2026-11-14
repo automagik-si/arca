@@ -2384,10 +2384,17 @@ kept and named in `kept`. The moved copies on the target are not touched. A fini
 SHA-256. It is read line by line with no size cap; a torn last line is skipped, and the next append starts on a new line;
 a line over 8 MiB is skipped and said on the log.
 
-**What the tests do not prove.** The tests run two fake Incus daemons linked so that a push lands on the target. A real
-two-host run still has to show Incus's push between two daemons (certificates, the address reachable from the source, the
-refresh rounds' real deltas and rates), the progress metadata a real migration reports, a container's start and its
-network on the target, and the proxy port probe across the network.
+**What the tests prove, and a real run.** The tests run two fake Incus daemons linked so that a push lands on the target.
+`crates/arca/tests/instance_move_live.rs` (ignored by default) runs the same verbs, card and grant against two live Incus
+daemons. Run between two Incus 7.6 hosts on btrfs, it moved a running container with a 300 MB data file: three rounds,
+the progress read live from `fs_progress`, all six checks passed (the proxy port probed at the target's address), about
+16 s of measured downtime, and the source kept stopped with `boot.autostart` off. A copy forced to fail its network check
+was stopped and deleted on the target, and the source ran again with its uuid and address.
+
+**Known limit: refresh rounds are not deltas yet.** Without a snapshot the two hosts share, Incus's refresh of a btrfs
+container sends the whole volume again: in the run above each round sent the full 0.6 to 0.7 GB, so the last round, after
+the stop, takes as long as the first and the downtime is that of a full copy: the rounds do not shorten it yet. A move
+that takes a snapshot before each round, so Incus can send only the difference, is the next step.
 
 ## Snapshot storage and snapshots
 
