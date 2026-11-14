@@ -1184,3 +1184,661 @@ fn a_move_a_stopped_kernel_left_unfinished_is_rolled_back_on_the_next_start() {
         .unwrap();
     assert_eq!(rollback["interrupted"], true);
 }
+
+// ---- The review of ab7427f: each test below fails without the fix it names. ----
+
+fn writer(fake: &FakeIncus) -> arca_incus::MoveWriter {
+    arca_incus::MoveWriter::new(fake.socket().to_path_buf())
+}
+
+fn uuid_on(fake: &FakeIncus, name: &str) -> Option<String> {
+    writer(fake)
+        .get(&format!("/1.0/instances/{name}?project=shop"))
+        .ok()
+        .and_then(|doc| doc["config"]["volatile.uuid"].as_str().map(str::to_string))
+}
+
+/// Points the target's server document at `addresses`, with `certificate`.
+fn target_listens(rig: &Rig, addresses: &[&str], certificate: &str) {
+    rig.target.set_server(json!({
+        "api_version": "1.0",
+        "environment": {
+            "architectures": ["x86_64"], "driver": "lxc | qemu", "server_name": "fake",
+            "addresses": addresses, "certificate": certificate,
+        },
+    }));
+}
+
+/// Waits until the source holds a push the test planned to hold; answers it.
+fn held(rig: &Rig, count: usize) -> arca_incus::OpId {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let held = rig.source.held_pushes();
+        if held.len() >= count {
+            return held[count - 1].clone();
+        }
+        assert!(Instant::now() < until, "the held push never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn hold() -> PushPlan {
+    PushPlan::Hold {
+        processed: 1_000_000,
+        speed: 1_000_000,
+    }
+}
+
+fn result_line(rig: &Rig, name: &str) -> Value {
+    rig.journal()
+        .into_iter()
+        .rev()
+        .find(|l| l["event"] == "result" && l["name"] == name)
+        .unwrap_or_else(|| panic!("no result for {name}"))
+}
+
+fn rollback_line(rig: &Rig, name: &str) -> Value {
+    rig.journal()
+        .into_iter()
+        .rev()
+        .find(|l| l["event"] == "rollback" && l["name"] == name)
+        .unwrap_or_else(|| panic!("no rollback for {name}"))
+}
+
+/// H2: an ephemeral container is deleted by Incus when it stops, so the cutover would delete the source. M5: a spot-check
+/// that cannot be read on the source would pass by never comparing.
+#[test]
+fn a_plan_blocks_an_ephemeral_container_and_an_unreadable_spot_check() {
+    let mut ephemeral = web();
+    ephemeral["ephemeral"] = json!(true);
+    let rig = Rig::new(vec![ephemeral, api()], 100);
+    let plan = rig.plan(&["web"]);
+    assert_eq!(plan["go"], false, "{plan}");
+    assert!(
+        plan["blocked"][0]["reasons"]
+            .to_string()
+            .contains("ephemeral"),
+        "{plan}"
+    );
+    let plan = rig.plan_with(
+        &["api"],
+        json!({ "instances": [{ "project": "shop", "name": "api", "spotCheck": "/srv/missing" }] }),
+    );
+    assert_eq!(plan["go"], false, "{plan}");
+    assert!(
+        plan["blocked"][0]["reasons"]
+            .to_string()
+            .contains("spot-check file /srv/missing"),
+        "{plan}"
+    );
+}
+
+/// H2: the source is gone when the last round fails: the copy on the target is the only one, and the rollback keeps it.
+#[test]
+fn a_rollback_keeps_the_copy_when_the_source_is_not_read_back() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let last = held(&rig, 1);
+    // The source is stopped by the cutover; something deletes it while the last delta is in flight.
+    writer(&rig.source)
+        .delete_instance("shop", "web")
+        .expect("deleted");
+    rig.source.fail_operation(&last, "the link dropped");
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(status["phase"], "needs_owner");
+    assert!(
+        rig.target.holds("instance", "shop", "web"),
+        "the only copy is kept"
+    );
+    let rollback = rollback_line(&rig, "web");
+    assert_eq!(rollback["sourceIntact"], false);
+    assert_eq!(rollback["targetRemoved"], false);
+}
+
+/// H5: an instance on the target that this move did not record making is never deleted by its rollback.
+#[test]
+fn a_rollback_leaves_an_object_this_move_did_not_make() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let first = held(&rig, 1);
+    // Someone creates their own shop/web on the target before the first round lands; the round then fails.
+    rig.target
+        .add_instance(json!({ "name": "web", "project": "shop", "type": "container" }));
+    let theirs = uuid_on(&rig.target, "web").expect("their uuid");
+    rig.source.fail_operation(&first, "the link dropped");
+    let status = rig.wait(&id);
+    assert_eq!(
+        uuid_on(&rig.target, "web").as_deref(),
+        Some(theirs.as_str()),
+        "theirs is kept"
+    );
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Running"),
+        "the source was never stopped"
+    );
+    assert!(
+        rollback_line(&rig, "web")["detail"]
+            .to_string()
+            .contains("not a copy this move recorded making")
+    );
+}
+
+/// H4: the target cannot be read at the rollback, so a copy may run there: the source is not started next to it.
+#[test]
+fn a_rollback_does_not_start_the_source_while_the_target_cannot_be_read() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let last = held(&rig, 1);
+    rig.target.refuse_start("shop", "web");
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    rig.source.release_operation(&last);
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Stopped"),
+        "never started next to a copy that may run"
+    );
+    assert_eq!(rollback_line(&rig, "web")["sourceRunning"], false);
+}
+
+/// H4: whether the source runs is read at the cutover. api was stopped when the batch began and started during web's
+/// move; its cutover stops it, so it never runs next to its copy.
+#[test]
+fn a_source_started_during_the_batch_is_stopped_at_its_cutover() {
+    let rig = Rig::new(vec![web(), api()], 100);
+    writer(&rig.source)
+        .set_state("shop", "api", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web", "api"])["move"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first = held(&rig, 1);
+    writer(&rig.source)
+        .set_state("shop", "api", "start", false, Duration::from_secs(5))
+        .expect("started");
+    rig.source.release_operation(&first);
+    let status = rig.wait(&id);
+    assert_eq!(status["phase"], "moved", "{status}");
+    assert_eq!(
+        rig.target.instance_status("shop", "api").as_deref(),
+        Some("Running")
+    );
+    assert_eq!(
+        rig.source.instance_status("shop", "api").as_deref(),
+        Some("Stopped"),
+        "never both running"
+    );
+    let stopped = rig
+        .journal()
+        .into_iter()
+        .find(|l| l["event"] == "cutover" && l["name"] == "api" && l["step"] == "stopped")
+        .unwrap();
+    assert_eq!(stopped["wasRunning"], true);
+}
+
+/// H4: a second plan of an instance a move holds does not start, and a plan that ran is not proposed again.
+#[test]
+fn an_instance_another_move_holds_does_not_move_twice() {
+    let rig = Rig::new(vec![web()], 100);
+    let one = rig.plan_with(&["web"], json!({ "rounds": 1 }));
+    let two = rig.plan_with(&["web"], json!({ "rounds": 2 }));
+    assert_ne!(one["digest"], two["digest"]);
+    let first = rig.propose_move(&one).expect("proposed");
+    let second = rig.propose_move(&two).expect("proposed");
+    rig.source.plan_push(hold());
+    let id = rig.approve(&first).expect("started")["move"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pushed = held(&rig, 1);
+    assert_eq!(refusal_code(rig.approve(&second)), "InstanceMoving");
+    assert_eq!(refusal_code(rig.propose_move(&two)), "InstanceMoving");
+    rig.source.release_operation(&pushed);
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    assert_eq!(refusal_code(rig.propose_move(&one)), "AlreadyRun");
+    assert_eq!(
+        rig.source.pushes().len(),
+        2,
+        "one move ran: {:?}",
+        rig.source.pushes()
+    );
+}
+
+/// H3: the finish reads the copy back on the target as the one this move made before it deletes a source.
+#[test]
+fn a_finish_keeps_the_source_when_its_copy_is_not_the_one_this_move_made() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    // The copy is replaced on the target by another shop/web.
+    let target = writer(&rig.target);
+    target
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    target.delete_instance("shop", "web").expect("deleted");
+    rig.target
+        .add_instance(json!({ "name": "web", "project": "shop", "type": "container" }));
+    let proposal = rig.propose_finish(&id).expect("proposed");
+    let finished = rig.approve(&proposal).expect("finished");
+    assert_eq!(finished["deleted"], json!([]), "{finished}");
+    assert!(
+        finished["kept"][0]
+            .as_str()
+            .unwrap()
+            .contains("not read back"),
+        "{finished}"
+    );
+    assert!(
+        rig.source.holds("instance", "shop", "web"),
+        "the source is kept"
+    );
+}
+
+/// H3: a source that runs again, and a volume another instance uses, are kept by the finish.
+#[test]
+fn a_finish_keeps_a_running_source_and_a_volume_in_use() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    writer(&rig.source)
+        .set_state("shop", "web", "start", false, Duration::from_secs(5))
+        .expect("started");
+    let finished = rig
+        .approve(&rig.propose_finish(&id).expect("proposed"))
+        .expect("finished");
+    assert!(
+        finished["kept"][0].as_str().unwrap().contains("runs again"),
+        "{finished}"
+    );
+    assert!(rig.source.holds("instance", "shop", "web"));
+
+    let rig = Rig::new(vec![web_with_volume()], 100);
+    rig.source
+        .add_volume("default", "default", "web-data", json!({}));
+    rig.files("custom/default_web-data", 1);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    // Another instance on this host mounts the same volume.
+    rig.source.add_instance(json!({
+        "name": "batch", "project": "shop", "type": "container",
+        "devices": { "data": { "type": "disk", "pool": "default", "source": "web-data", "path": "/data" } },
+    }));
+    let finished = rig
+        .approve(&rig.propose_finish(&id).expect("proposed"))
+        .expect("finished");
+    assert_eq!(finished["deleted"], json!(["shop/web"]), "{finished}");
+    assert!(
+        finished["kept"][0]
+            .as_str()
+            .unwrap()
+            .contains("another instance uses it"),
+        "{finished}"
+    );
+    assert!(rig.source.holds("volume", "default", "web-data"));
+}
+
+/// M1: a copy whose checks passed is recorded as moved on the next start; nothing is deleted or started.
+#[test]
+fn a_verified_copy_a_stopped_kernel_left_is_recorded_as_moved() {
+    let rig = Rig::new(vec![web()], 100);
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Running");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+            json!({ "event": "cutover", "step": "started" }),
+            json!({ "event": "verify", "ok": true, "checks": [], "downtimeMs": 1234 }),
+        ],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["phase"], "moved", "{status}");
+    assert_eq!(status["instances"][0]["downtimeMs"], 1234);
+    assert_eq!(
+        uuid_on(&rig.target, "web").as_deref(),
+        Some(uuid.as_str()),
+        "the copy is kept"
+    );
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Stopped")
+    );
+    assert!(rig.journal().iter().all(|l| l["event"] != "rollback"));
+}
+
+/// M1: a copy that was started may have served writes: the next start keeps it, leaves the source stopped and names it
+/// for the owner.
+#[test]
+fn a_started_copy_a_stopped_kernel_left_is_kept_for_the_owner() {
+    let rig = Rig::new(vec![web()], 100);
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Running");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+        ],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["phase"], "needs_owner", "{status}");
+    assert_eq!(status["instances"][0]["result"], "failed");
+    assert!(
+        status["instances"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("may have served writes")
+    );
+    assert_eq!(
+        rig.target.instance_status("shop", "web").as_deref(),
+        Some("Running")
+    );
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Stopped")
+    );
+}
+
+/// M1: an instance whose result is journaled is settled as it is: a moved one is not rolled back.
+#[test]
+fn the_next_start_does_not_roll_back_an_instance_that_moved() {
+    let rig = Rig::new(vec![web()], 100);
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Running");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "result", "result": "moved", "downtimeMs": 900, "targetUuid": uuid }),
+        ],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["phase"], "moved", "{status}");
+    assert!(rig.target.holds("instance", "shop", "web"));
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Stopped")
+    );
+}
+
+/// M4: a proxy on every address that answered here must answer at the target's address; one that answers only on
+/// 127.0.0.1 there does not.
+#[test]
+fn the_ports_check_probes_the_target_address_for_proxies_that_answered_here() {
+    for (bind, moves) in [("127.0.0.1:0", false), ("0.0.0.0:0", true)] {
+        let listener = std::net::TcpListener::bind(bind).expect("listens");
+        let port = listener.local_addr().unwrap().port();
+        let mut served = web();
+        served["devices"]["site"] = json!({
+            "type": "proxy", "listen": format!("tcp:0.0.0.0:{port}"), "connect": "tcp:127.0.0.1:80",
+        });
+        let rig = Rig::new(vec![served], 100);
+        target_listens(&rig, &["127.0.0.2:8443"], CERT);
+        let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+        let status = rig.wait(&id);
+        let ports = rig
+            .journal()
+            .into_iter()
+            .find(|l| l["event"] == "verify")
+            .unwrap()["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == "ports")
+            .cloned()
+            .unwrap();
+        assert_eq!(ports["ok"], moves, "{bind}: {ports}");
+        assert_eq!(
+            status["instances"][0]["result"],
+            if moves { "moved" } else { "rolled_back" },
+            "{bind}: {status}"
+        );
+        drop(listener);
+    }
+}
+
+/// M5: a copy without the source's spot-check file fails its checks, and the rollback stops the running copy to delete it.
+#[test]
+fn a_copy_without_the_spot_check_file_is_stopped_and_removed() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.push_without_files();
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let status = rig.wait(&id);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{status}");
+    assert!(
+        one["reason"].as_str().unwrap().contains("spotCheck"),
+        "{one}"
+    );
+    assert!(
+        !rig.target.holds("instance", "shop", "web"),
+        "the running copy was stopped, then deleted"
+    );
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Running")
+    );
+}
+
+/// M4: a card that had an address on the source and has none on the copy fails the network check.
+#[test]
+fn a_copy_without_its_address_fails_the_network_check() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.set_live_network(
+        "shop",
+        "web",
+        &[("eth0", "00:16:3e:00:00:01", true, &["192.0.2.50"])],
+    );
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let last = held(&rig, 1);
+    rig.target
+        .set_live_network("shop", "web", &[("eth0", "00:16:3e:00:00:01", true, &[])]);
+    rig.source.release_operation(&last);
+    let status = rig.wait(&id);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{status}");
+    assert!(
+        one["reason"]
+            .as_str()
+            .unwrap()
+            .contains("network: no address on eth0"),
+        "{one}"
+    );
+}
+
+/// M6: a move whose plan and begin cannot be journaled does not begin.
+#[test]
+fn a_move_that_cannot_be_journaled_does_not_begin() {
+    let rig = Rig::new(vec![web()], 100);
+    let plan = rig.plan(&["web"]);
+    let proposal = rig.propose_move(&plan).expect("proposed");
+    fs::create_dir(rig.dir.join("state").join(arca::instance_move::MOVES_FILE))
+        .expect("a folder in its place");
+    assert_eq!(refusal_code(rig.approve(&proposal)), "JournalUnwritable");
+    assert!(rig.source.pushes().is_empty());
+    assert!(rig.source.writes().is_empty() && rig.target.writes().is_empty());
+}
+
+/// M7: a failed round's receiving operation still holds the copy for a while; the rollback waits for it to end before
+/// it deletes, so Incus never answers the delete as busy.
+#[test]
+fn a_rollback_waits_for_the_receiving_operation_before_it_deletes() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.target.receive_lingers(3);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source
+        .plan_push(PushPlan::Fail("the link dropped".to_string()));
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "rolled_back", "{status}");
+    assert!(!rig.target.holds("instance", "shop", "web"));
+    let deletes: Vec<u16> = rig
+        .target
+        .writes()
+        .iter()
+        .filter(|w| w.method == "DELETE")
+        .map(|w| w.status)
+        .collect();
+    assert_eq!(
+        deletes,
+        [202],
+        "one delete, after the operation ended, never answered busy: {deletes:?}"
+    );
+}
+
+/// M8: the target's addresses are tried in order with the same receiving operation; the one that answered goes first.
+#[test]
+fn each_target_address_is_tried_in_order() {
+    let rig = Rig::new(vec![web()], 100);
+    target_listens(&rig, &["192.0.2.99:8443", "203.0.113.20:8443"], CERT);
+    rig.target.unreachable_at("192.0.2.99:8443");
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    let pushes = rig.source.pushes();
+    assert!(pushes[0].contains("https://192.0.2.99:8443/"), "{pushes:?}");
+    assert!(
+        pushes[1].contains("https://203.0.113.20:8443/"),
+        "{pushes:?}"
+    );
+    assert_eq!(
+        pushes.len(),
+        4,
+        "the later rounds go to the address that answered: {pushes:?}"
+    );
+    assert!(
+        pushes[2..].iter().all(|p| p.contains("203.0.113.20")),
+        "{pushes:?}"
+    );
+}
+
+/// The node reads the instance again at the run: changed devices or a grown size refuse it, and nothing moves.
+#[test]
+fn changed_devices_or_a_grown_instance_refuse_the_approved_plan() {
+    for change in ["devices", "growth"] {
+        let rig = Rig::new(vec![web()], 100);
+        let plan = rig.plan(&["web"]);
+        let proposal = rig.propose_move(&plan).expect("proposed");
+        if change == "devices" {
+            rig.source.set_instance_device(
+                "shop",
+                "web",
+                "eth0",
+                json!({ "type": "nic", "network": "arcabr0", "ipv4.address": "192.0.2.60" }),
+            );
+        } else {
+            rig.files("containers/shop_web/rootfs/more", 1);
+        }
+        let refused = rig.approve(&proposal);
+        let Err(CallError::Refused { code, message }) = refused else {
+            panic!("{change}: {refused:?}");
+        };
+        assert_eq!(code, "PlanChanged", "{change}: {message}");
+        assert!(
+            message.contains(if change == "devices" {
+                "its devices"
+            } else {
+                "it grew"
+            }),
+            "{change}: {message}"
+        );
+        assert!(rig.source.pushes().is_empty());
+    }
+}
+
+/// The target's certificate is read again for each instance: a changed one rolls the next instance back.
+#[test]
+fn a_certificate_changed_during_a_batch_stops_the_next_instance() {
+    let rig = Rig::new(vec![web(), api()], 100);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web", "api"])["move"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first = held(&rig, 1);
+    target_listens(
+        &rig,
+        &["203.0.113.20:8443"],
+        "-----BEGIN CERTIFICATE-----\nb3RoZXI=\n-----END CERTIFICATE-----\n",
+    );
+    rig.source.release_operation(&first);
+    let status = rig.wait(&id);
+    assert_eq!(status["phase"], "partly_moved", "{status}");
+    assert_eq!(result_line(&rig, "web")["result"], "moved");
+    let api = result_line(&rig, "api");
+    assert_eq!(api["result"], "rolled_back");
+    assert!(
+        api["reason"].as_str().unwrap().contains("certificate"),
+        "{api}"
+    );
+    assert!(!rig.target.holds("instance", "shop", "api"));
+}
+
+/// A move to a target counts what the moves running to it may still land there.
+#[test]
+fn a_second_move_that_would_overfill_the_target_beside_a_running_one_is_refused() {
+    let rig = Rig::new(vec![web(), api()], 7);
+    rig.files("containers/shop_web/rootfs/more", 2);
+    rig.files("containers/shop_api/rootfs/more", 2);
+    let web_plan = rig.plan(&["web"]);
+    let api_plan = rig.plan(&["api"]);
+    assert_eq!(web_plan["go"], true, "{web_plan}");
+    assert_eq!(api_plan["go"], true, "{api_plan}");
+    let web_card = rig.propose_move(&web_plan).expect("proposed");
+    let api_card = rig.propose_move(&api_plan).expect("proposed");
+    rig.source.plan_push(hold());
+    let id = rig.approve(&web_card).expect("started")["move"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first = held(&rig, 1);
+    assert_eq!(refusal_code(rig.approve(&api_card)), "TargetFull");
+    rig.source.release_operation(&first);
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+}
+
+/// LOW: the kept source does not start by itself on a reboot of this host next to its copy.
+#[test]
+fn a_moved_source_is_kept_with_autostart_off() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    let doc = writer(&rig.source)
+        .get("/1.0/instances/web?project=shop")
+        .expect("the source");
+    assert_eq!(doc["config"]["boot.autostart"], "false");
+    assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+}

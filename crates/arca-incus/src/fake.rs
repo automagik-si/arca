@@ -887,6 +887,26 @@ impl FakeIncus {
         }
     }
 
+    /// Sets the device `device` of the instance `name` in `project` to `body`, as an edit of its devices does. Panics when no
+    /// such instance is held. It records no write.
+    pub fn set_instance_device(&self, project: &str, name: &str, device: &str, body: Value) {
+        let mut store = lock(&self.shared.store);
+        let index = store
+            .objects
+            .iter()
+            .position(|object| {
+                object.kind == "instance" && object.project == project && object.name == name
+            })
+            .unwrap_or_else(|| panic!("no instance {project}/{name} to set {device} of"));
+        store.objects[index].body["devices"][device] = body;
+        store.expand(index, false);
+    }
+
+    /// Replaces the server document `GET /1.0` answers, as a change of the daemon's addresses or certificate does.
+    pub fn set_server(&self, server: Value) {
+        lock(&self.shared.store).server = server;
+    }
+
     fn end_operation(&self, id: &OpId, failure: Option<&str>) {
         let mut guard = lock(&self.shared.store);
         let store: &mut Store = &mut guard;

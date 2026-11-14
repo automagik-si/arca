@@ -2713,7 +2713,9 @@ impl MoveRecord {
         let phase = if self.finished.is_some() {
             "finished"
         } else if self.ended_at.is_some() {
-            if results.iter().all(|result| *result == Some("moved")) {
+            if results.contains(&Some("failed")) {
+                "needs_owner"
+            } else if results.iter().all(|result| *result == Some("moved")) {
                 "moved"
             } else if results.contains(&Some("moved")) {
                 "partly_moved"
