@@ -1321,6 +1321,9 @@ fn reconfigure_count(changes: &Value) -> String {
     if changes.get("rawLxc").is_some() || changes.get("noNewPrivileges").is_some() {
         parts.push("its low-level container settings".to_string());
     }
+    if changes.get("entrypoint").is_some() {
+        parts.push("its entrypoint".to_string());
+    }
     if parts.is_empty() {
         "no change".to_string()
     } else {
@@ -1448,6 +1451,20 @@ fn reconfigure_rows(args: &Value) -> Vec<ActionDetail> {
                 "turned {}: a setuid or setcap binary inside it {} raise privileges",
                 if on { "on" } else { "off" },
                 if on { "can no longer" } else { "can again" }
+            ),
+        ));
+    }
+    if let Some(entrypoint) = changes.get("entrypoint") {
+        let scripts = match entrypoint.get("scripts") {
+            Some(names) => format!(", with the template's script {}", list_words(names)),
+            None => String::new(),
+        };
+        rows.push(row(
+            "Entrypoint".into(),
+            format!(
+                "{}{scripts} (was: {})",
+                shown(entrypoint["to"].as_str().unwrap_or_default(), 200),
+                shown(entrypoint["from"].as_str().unwrap_or_default(), 200)
             ),
         ));
     }

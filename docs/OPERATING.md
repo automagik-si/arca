@@ -1712,6 +1712,12 @@ difference from its record, which it writes into the proposal as `changes`:
 - `ports`, `rawLxc` and `noNewPrivileges`: `{from, to}` when the template says otherwise; `rawLxc` is the container's
   `raw.lxc` lines whole, `lxc.no_new_privs=1` among them when it is set. A tenant's service keeps its low-level
   container settings.
+- `entrypoint`: `{from, to}` when the template's entrypoint, with the scripts it reads from the templates directory as
+  they are now, is not the one the service runs. Each side is shown whole when short, or else by its size and the start
+  of its SHA-256 (a script goes as one long base64 word), and `scripts` names the template's scripts. It is applied as
+  the instance's `oci.entrypoint` and takes effect at the restart. This is how a service made before its template
+  changed its entrypoint (the edge's `arca-edge.sh`, for one) moves to the new one: install the templates, then
+  propose the reconfigure.
 
 The card shows the service, a row counting the changes (`environment values 43 added, 2 changed, 1 removed; 4
 secrets; its low-level container settings`), one row for each environment key and secret that changes, the ports and

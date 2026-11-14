@@ -2,7 +2,7 @@
 //!
 //! The service's record is rendered again from its CURRENT template: its environment (every value the template gives,
 //! then what each of its links provides, as `service_connect` gave it), the secrets the template declares, its ports,
-//! its `rawLxc` lines and its no-new-privileges. The difference from the record is the `changes` of the proposal: the
+//! its `rawLxc` lines, its no-new-privileges and its entrypoint. The difference from the record is the `changes` of the proposal: the
 //! node works it out when the proposal is made, the card shows it row by row, and the approval binds it. When the
 //! approved call runs it works the difference out again and refuses, changing nothing, unless it is the one the owner
 //! approved; so what is applied is exactly what the card showed.
@@ -324,6 +324,25 @@ pub(super) fn plan(
             json!({ "from": config.no_new_privileges, "to": no_new_privileges }),
         );
     }
+    // The entrypoint, with the scripts it reads from the template directory as they are now.
+    let entrypoint = crate::service::entrypoint(&template, &node.state_dir.join("templates"))
+        .map_err(service_template_error)?;
+    if entrypoint != config.entrypoint {
+        let mut change = json!({
+            "from": entrypoint_words(config.entrypoint.as_deref()),
+            "to": entrypoint_words(entrypoint.as_deref()),
+        });
+        let scripts: Vec<&str> = template
+            .entrypoint
+            .iter()
+            .flatten()
+            .filter_map(|part| part.get("file").and_then(Value::as_str))
+            .collect();
+        if !scripts.is_empty() {
+            change["scripts"] = json!(scripts);
+        }
+        changes.insert("entrypoint".into(), change);
+    }
     let writes = changes.keys().any(|section| section != "secrets")
         || secret_refs.len() != config.secret_refs.len()
         || !generate.is_empty();
@@ -343,6 +362,7 @@ pub(super) fn plan(
     next.links = links;
     next.raw_lxc = raw_lxc;
     next.no_new_privileges = no_new_privileges;
+    next.entrypoint = entrypoint;
     Ok(Plan {
         next,
         hidden,
@@ -351,6 +371,25 @@ pub(super) fn plan(
         writes,
     })
 }
+
+/// An entrypoint as the card shows it: whole when it is short, or else by its size and the start of its SHA-256 (a
+/// script goes as one long base64 word), so the card stays readable and still tells two entrypoints apart. `None` is the
+/// image's own.
+fn entrypoint_words(entrypoint: Option<&str>) -> String {
+    use sha2::{Digest as _, Sha256};
+    match entrypoint {
+        None => "the image's own".to_string(),
+        Some(text) if text.len() <= ENTRYPOINT_SHOWN => text.to_string(),
+        Some(text) => {
+            let digest = Sha256::digest(text.as_bytes());
+            let start: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+            format!("{} bytes, sha256 {start}", text.len())
+        }
+    }
+}
+
+/// The longest entrypoint a card shows whole.
+const ENTRYPOINT_SHOWN: usize = 160;
 
 /// The names in `changes`, for the journal: each key and secret with what happens to it, and never a value.
 fn names_of(changes: &Value) -> Value {
@@ -374,6 +413,7 @@ fn names_of(changes: &Value) -> Value {
         "ports": changes.get("ports").is_some(),
         "rawLxc": changes.get("rawLxc").is_some(),
         "noNewPrivileges": changes.get("noNewPrivileges").is_some(),
+        "entrypoint": changes.get("entrypoint").is_some(),
     })
 }
 
@@ -521,6 +561,7 @@ impl ServiceHandler {
             record.links = from.links.clone();
             record.raw_lxc = from.raw_lxc.clone();
             record.no_new_privileges = from.no_new_privileges;
+            record.entrypoint = from.entrypoint.clone();
         };
         // The node saves the record before it writes the instance, so a refused write leaves the new record saved:
         // it is put back, and the answer says whether that worked. The old record's environment applies whole.
@@ -540,6 +581,7 @@ impl ServiceHandler {
                 &record.ports,
                 &record.raw_lxc,
                 record.no_new_privileges,
+                &record.entrypoint,
             ))
             .ok()
         };
@@ -631,6 +673,11 @@ impl ServiceHandler {
                 if state.own_config.get("raw.lxc").cloned() != crate::service::raw_lxc_value(&next)
                 {
                     differs.push("raw.lxc".to_string());
+                }
+                if next.entrypoint.is_some()
+                    && state.own_config.get("oci.entrypoint") != next.entrypoint.as_ref()
+                {
+                    differs.push("oci.entrypoint".to_string());
                 }
                 (state.is_running(), differs)
             }

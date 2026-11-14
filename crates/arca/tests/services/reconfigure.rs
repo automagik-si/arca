@@ -554,3 +554,87 @@ fn a_raw_lxc_line_that_may_loosen_isolation_is_said_in_words_on_both_cards() {
     assert!(!service::raw_lxc_may_loosen("lxc.sched.core=0"));
     assert!(!service::raw_lxc_may_loosen("lxc.no_new_privs=1"));
 }
+
+#[test]
+fn a_reconfigure_moves_an_edge_to_the_entrypoint_its_template_says_now_and_shows_it_on_the_card() {
+    let key = common::SkKey::from_seed(47);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    // The edge as it was first shipped: Caddy run straight on the root's Caddyfile.
+    let old = [
+        "/usr/bin/caddy",
+        "run",
+        "--config",
+        "/etc/caddy/Caddyfile",
+        "--adapter",
+        "caddyfile",
+    ];
+    let mut edge = json!({"name":"edge","kind":"oci","image":"registry.example/edge","digest":DIGEST,
+        "ports":[443],"env":{},"lan":{"port":443},"edge":true,"data":{"path":"/data"},
+        "entrypoint": old});
+    rig.template("edge", edge.clone());
+    rig.call("service_create", json!({"name":"edge","template":"edge"}))
+        .expect("the edge");
+    let before = instance(&rig, "edge")["config"]["oci.entrypoint"]
+        .as_str()
+        .expect("an entrypoint")
+        .to_string();
+    assert_eq!(before, old.join(" "));
+
+    // The template now runs the shipped script, which puts the kept config back before Caddy starts.
+    let script = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/arca-edge.sh"),
+    )
+    .expect("the shipped script");
+    fs::write(rig.dir.join("templates/arca-edge.sh"), &script).expect("the script");
+    edge["entrypoint"] = json!(["/bin/sh", "-ec", { "file": "arca-edge.sh" }, "arca-edge"]);
+    rig.template("edge", edge);
+    let proposed = propose(&rig, json!({ "name": "edge" })).expect("proposed");
+    let change = &proposed["args"]["changes"]["entrypoint"];
+    assert_eq!(change["from"], before, "{proposed}");
+    assert_eq!(change["scripts"], json!(["arca-edge.sh"]));
+    let to = change["to"].as_str().expect("the new entrypoint");
+    assert!(to.contains(" bytes, sha256 "), "{to}");
+    assert_eq!(
+        proposed["args"]["changes"].as_object().map(|c| c.len()),
+        Some(1),
+        "{proposed}"
+    );
+    let shown = row(&proposed["details"], "Entrypoint").expect("an entrypoint row");
+    assert!(
+        shown.contains("with the template's script arca-edge.sh")
+            && shown.ends_with(&format!("(was: {before})")),
+        "{shown}"
+    );
+    assert_eq!(row(&proposed["details"], "Changes"), Some("its entrypoint"));
+
+    let done = approve_and_run(&rig, &key, &proposed).expect("runs");
+    assert_eq!(done["reconfigured"], true, "{done}");
+    assert_eq!(done["readBack"]["matches"], true, "{done}");
+    let now = instance(&rig, "edge")["config"]["oci.entrypoint"]
+        .as_str()
+        .expect("an entrypoint")
+        .to_string();
+    assert!(now.starts_with("/bin/sh -ec "), "{now}");
+    assert!(now.ends_with(" arca-edge"), "{now}");
+    assert_eq!(
+        rig.service_config("edge").entrypoint.as_deref(),
+        Some(now.as_str())
+    );
+    // Nothing is left to do, and the next reconcile writes nothing.
+    let again = propose(&rig, json!({ "name": "edge" })).expect("proposed");
+    assert_eq!(again["args"]["changes"], json!({}));
+    let writes = rig.fake.writes().len();
+    rig.apply(&rig.service_config("edge")).expect("reconcile");
+    assert_eq!(rig.fake.writes().len(), writes);
+}
