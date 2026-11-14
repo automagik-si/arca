@@ -234,6 +234,21 @@ impl ActionKind {
         self.undo_words()
     }
 
+    /// Whether the action deletes or erases something that cannot be brought back. Such a plan keeps the owner's passkey
+    /// card: the owner's signed-in session lists it but never approves it.
+    pub fn erases(self, args: &Value) -> bool {
+        match self {
+            Self::ServiceRemove
+            | Self::SnapshotDelete
+            | Self::TenantRemove
+            | Self::DeployRemove
+            | Self::FunctionRemove
+            | Self::StorageAdd => true,
+            Self::ServiceUpdate => args.get("eraseData").and_then(Value::as_bool) == Some(true),
+            _ => false,
+        }
+    }
+
     /// Whether the card says what the action takes of the node: a create from a template does.
     pub fn says_uses(self) -> bool {
         matches!(self, Self::ServiceCreate | Self::PostgresCreate)
@@ -1495,7 +1510,13 @@ pub struct ActionProposal {
 }
 
 impl ActionProposal {
-    /// Whether the proposal's fifteen minutes have run.
+    /// Whether the owner's signed-in session may approve it: an action that deletes or erases keeps the passkey card, so
+    /// it is neither asked there nor held open for it.
+    pub fn for_session(&self) -> bool {
+        ActionKind::from_name(&self.action).is_some_and(|kind| !kind.erases(&self.args))
+    }
+
+    /// Whether the proposal's fifteen minutes have run (moved forward while the owner's signed-in session is connected).
     pub fn expired(&self, now: u64) -> bool {
         now > self.expires_at
     }
@@ -1761,6 +1782,26 @@ impl ActionProposalStore {
         self.waiting.push(proposal.clone());
         self.compact_if_large();
         Ok(proposal)
+    }
+
+    /// Keeps every waiting proposal the owner's signed-in session may approve ([`ActionProposal::for_session`]) open for
+    /// another [`PLAN_TTL_MS`] from `now` once less than half of it is left: that session is connected and will be asked. The journal is rewritten only when one moved. Answers how
+    /// many moved.
+    pub fn hold(&mut self, now: u64) -> usize {
+        let mut moved = 0;
+        for proposal in &mut self.waiting {
+            if proposal.for_session()
+                && !proposal.expired(now)
+                && proposal.expires_at.saturating_sub(now) < PLAN_TTL_MS / 2
+            {
+                proposal.expires_at = now.saturating_add(PLAN_TTL_MS);
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.compact();
+        }
+        moved
     }
 
     /// Journals an approval and retires the proposal. The caller has already checked its proof.

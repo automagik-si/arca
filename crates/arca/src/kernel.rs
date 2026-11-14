@@ -63,6 +63,9 @@ pub struct Kernel {
     host: String,
     action_proposals: ActionProposalStore,
     action_grants: Vec<ActionGrant>,
+    /// Until when (unix ms) the owner's signed-in session, an app connected with the approvals scope, holds the waiting
+    /// proposals open. Zero when none is connected. The MCP authorization server keeps it current.
+    owner_session: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A one-shot permission to run an already approved action through its gated verb. The token is random, not the owner's
@@ -222,6 +225,7 @@ impl Kernel {
             host,
             action_proposals,
             action_grants: Vec::new(),
+            owner_session: Arc::default(),
         })
     }
 
@@ -294,6 +298,25 @@ impl Kernel {
         self.reconciler.pending_plans()
     }
 
+    /// Shares `until` with the MCP authorization server: while it is ahead of the clock, the owner's signed-in session is
+    /// connected, and the waiting proposals stay open ([`Kernel::hold_proposals`]).
+    pub fn set_owner_session(&mut self, until: Arc<std::sync::atomic::AtomicU64>) {
+        self.owner_session = until;
+    }
+
+    /// Whether the owner's signed-in session is connected at `now_ms`.
+    pub fn owner_session_live(&self, now_ms: u64) -> bool {
+        now_ms < self.owner_session.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// While the owner's signed-in session is connected, moves the expiry of every waiting proposal it may approve forward so it stays open
+    /// for that session to be asked. With none connected, nothing moves and a proposal lapses after its fifteen minutes.
+    pub fn hold_proposals(&mut self, now_ms: u64) {
+        if self.owner_session_live(now_ms) {
+            self.action_proposals.hold(now_ms);
+        }
+    }
+
     /// The action proposals still on disk. Callers leave out the lapsed ones.
     pub fn action_proposals(&self) -> &[ActionProposal] {
         self.action_proposals.waiting()
@@ -346,7 +369,8 @@ impl Kernel {
         self.approve_action_proved(id, Some(approval), None, now_ms)
     }
 
-    /// Approves the action proposal `id` in the terminal of the admin token `token`, with no passkey proof: the same checks
+    /// Approves the action proposal `id` in the terminal of the admin token `token`, or of the owner's signed-in session
+    /// (`token` begins `oauth:` and names the passkey that last confirmed it), with no passkey proof here: the same checks
     /// as [`Kernel::approve_action`] but the owner verifier's, and the journal says who approved it and where. That is a
     /// client's answer, never the owner's passkey, and the journal never says "by the owner".
     ///
@@ -370,6 +394,7 @@ impl Kernel {
         terminal: Option<(&str, u64)>,
         now_ms: u64,
     ) -> Result<ApprovedAction, ActionApprovalError> {
+        self.hold_proposals(now_ms);
         let proposal = self
             .action_proposals
             .get(id)
@@ -424,8 +449,13 @@ impl Kernel {
                 .check(statement_action, id, &payload, approval, now_ms)
                 .map_err(ActionApprovalError::Approval)?;
         }
-        let by =
-            terminal.map(|(token, _)| format!("approved in the terminal by admin token {token}"));
+        let by = terminal.map(|(token, _)| {
+            if token.starts_with(arca_mcp::ISSUED_PREFIX) {
+                format!("approved in the owner's signed-in session {token}")
+            } else {
+                format!("approved in the terminal by admin token {token}")
+            }
+        });
         self.action_proposals
             .approve_noting(id, by.as_deref())
             .map_err(|error| {

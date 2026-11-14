@@ -12,11 +12,12 @@
 use arca_api::verbs::{NOT_CONFIRMED, take_confirm};
 use std::sync::Arc;
 
-use arca_api::{Scope, Verb, conforms, may_call};
+use arca_api::{Verb, conforms, may_call};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use crate::auth::Caller;
+use crate::elicit::{Asking, Modes, PendingPlan};
 use crate::http::Server;
 use crate::tools::CallError;
 use crate::version::{self, Era, Mirrors, PROTOCOL_VERSION, SERVER_INFO_META, SUPPORTED_VERSIONS};
@@ -41,7 +42,7 @@ pub struct Answer {
     pub status: StatusCode,
     pub body: Value,
     /// When set, the answer is an SSE stream of these messages, the last of which is the call's own reply, and `body` is
-    /// not sent. Only a call by the admin token that the terminal is asked about streams ([`crate::elicit`]).
+    /// not sent. Only a call whose terminal is asked about a plan streams ([`crate::elicit`]).
     pub stream: Option<tokio::sync::mpsc::Receiver<Value>>,
 }
 
@@ -120,9 +121,9 @@ pub async fn dispatch(
         // Discovery is answered to anyone who asks, in the one shape it has: it is how a caller learns the versions.
         (_, "server/discover") => result_reply(id, discover_result()),
         (Era::Legacy, "initialize") => {
-            // The server keeps no session, so what an admin client can be asked is remembered by its token's id.
+            // The server keeps no session, so what a client that may be asked can be asked is remembered by its token's id.
             if let Some(terminal) = &server.terminal
-                && caller.scope == Scope::Admin
+                && terminal.approver.may_ask(caller) != Asking::No
             {
                 terminal.note_initialize(&caller.token_id, &params);
             }
@@ -289,9 +290,12 @@ async fn call_tool(
     };
     // Whether the terminal of this caller may be asked to approve the plan this call answers with, and, on a retry of
     // `2026-07-28` that carries a state of ours, what the client answered.
-    let terminal = terminal_for(server, caller, params, era);
+    let asked = terminal_for(server, caller, params, era);
+    let terminal = asked.as_ref().map(|(terminal, _, _)| *terminal);
     let call = crate::elicit::call_digest(name, &arguments);
     let mut asking = terminal.is_some();
+    // Whether this is the retry of a call that sent the owner to confirm with a passkey: it is never sent there twice.
+    let mut stepped = false;
     if let (Some(terminal), Era::Modern) = (terminal, era)
         && let Some(state) = params.get("requestState").and_then(Value::as_str)
     {
@@ -305,6 +309,38 @@ async fn call_tool(
                 )));
             }
             crate::elicit::State::Expired => asking = false,
+            crate::elicit::State::StepUp => stepped = true,
+            crate::elicit::State::Many { plans, listing } => {
+                let responses = params.get("inputResponses");
+                let yes: Vec<bool> = plans
+                    .iter()
+                    .map(|(plan, _)| {
+                        responses
+                            .and_then(|responses| responses.get(plan))
+                            .is_some_and(crate::elicit::is_yes)
+                    })
+                    .collect();
+                // A state is spent once, by the first answer that approves anything: a second use is as a forged one.
+                if yes.contains(&true) && !terminal.claim(state, now_seconds()) {
+                    return Ok(Some(error_reply(
+                        id,
+                        INVALID_PARAMS,
+                        "requestState is not valid for this call",
+                        None,
+                    )));
+                }
+                let mut decisions = Vec::new();
+                for ((plan, created_at), yes) in plans.iter().zip(yes) {
+                    decisions.push(decide(terminal, caller, plan, *created_at, yes).await);
+                }
+                let approving = Approving {
+                    verb: *verb,
+                    proposal: listing,
+                    only_looks: server.only_looks,
+                    log: Arc::clone(&server.log),
+                };
+                return Ok(Some(many_reply(id, approving, decisions)));
+            }
             crate::elicit::State::Plan { plan, proposal } => {
                 let answer = params
                     .get("inputResponses")
@@ -375,9 +411,19 @@ async fn call_tool(
                     tool_failure("internal", "the tool failed"),
                 )));
             }
-            let waiting = terminal
-                .filter(|_| asking)
-                .and_then(|t| t.approver.pending(name, &value).map(|plan| (t, plan)));
+            let asked = asked.filter(|_| asking);
+            let many = asked
+                .as_ref()
+                .map(|(terminal, _, _)| terminal.approver.waiting(name, &value, caller))
+                .unwrap_or_default();
+            let waiting = asked
+                .as_ref()
+                .filter(|(_, asking, modes)| *asking == Asking::Yes && modes.form)
+                .and_then(|(t, _, _)| {
+                    t.approver
+                        .pending(name, &value, caller)
+                        .map(|plan| (*t, plan))
+                });
             let approving = Approving {
                 verb: *verb,
                 proposal: value.clone(),
@@ -388,6 +434,50 @@ async fn call_tool(
                 id.clone(),
                 tool_result(verb, value, cut.as_deref(), server.only_looks),
             );
+            if let Some((terminal, asking, modes)) = asked.filter(|_| !many.is_empty()) {
+                let step_up = match asking {
+                    Asking::Yes if modes.form => None,
+                    Asking::StepUp { url } if modes.url && !stepped => Some(url),
+                    _ => return Ok(Some(reply)),
+                };
+                return Ok(Some(match (era, step_up) {
+                    (Era::Modern, Some(url)) => {
+                        let state = terminal.sign_step_up(&caller.token_id, &call, now_seconds());
+                        result_reply(id, step_up_required(&url, &state))
+                    }
+                    (Era::Modern, None) => {
+                        let state = terminal.sign_many(
+                            &caller.token_id,
+                            &many,
+                            &approving.proposal,
+                            &call,
+                            now_seconds(),
+                        );
+                        result_reply(id, many_required(&many, &state))
+                    }
+                    (Era::Legacy, step_up) => {
+                        let asking = ManyAsk {
+                            plans: many,
+                            step_up,
+                            form: modes.form,
+                        };
+                        match ask_many_on_stream(
+                            server,
+                            caller,
+                            id,
+                            asking,
+                            reply.clone(),
+                            approving,
+                        ) {
+                            Some(messages) => {
+                                *stream_out = Some(messages);
+                                Value::Null
+                            }
+                            None => reply,
+                        }
+                    }
+                }));
+            }
             let Some((terminal, plan)) = waiting else {
                 return Ok(Some(reply));
             };
@@ -450,27 +540,222 @@ fn now_seconds() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// The terminal of `caller`, when it may be asked: the server has a way to approve, the caller holds the admin scope, and
-/// its client declared elicitation (at `initialize` on `2025-11-25`, in this request's own `_meta` on `2026-07-28`).
+/// The terminal of `caller`, when it may be asked: the server has a way to approve, the node says this caller may be asked
+/// ([`crate::elicit::TerminalApprover::may_ask`]), and its client declared elicitation (at `initialize` on `2025-11-25`,
+/// in this request's own `_meta` on `2026-07-28`). With it, whether it may be asked now and the modes its client declared.
 fn terminal_for<'a>(
     server: &'a Server,
     caller: &Caller,
     params: &Value,
     era: Era,
-) -> Option<&'a crate::elicit::Terminal> {
+) -> Option<(&'a crate::elicit::Terminal, Asking, Modes)> {
     let terminal = server.terminal.as_ref()?;
-    if caller.scope != Scope::Admin {
+    let asking = terminal.approver.may_ask(caller);
+    if asking == Asking::No {
         return None;
     }
-    let declared = match era {
-        Era::Legacy => terminal.is_capable(&caller.token_id),
-        Era::Modern => crate::elicit::declares_elicitation(
-            params
+    let modes = match era {
+        Era::Legacy => terminal.modes(&caller.token_id),
+        Era::Modern => {
+            let declared = params
                 .get("_meta")
-                .and_then(|meta| meta.get(version::CAPABILITIES_META)),
-        ),
+                .and_then(|meta| meta.get(version::CAPABILITIES_META));
+            Modes {
+                form: crate::elicit::declares_elicitation(declared),
+                url: crate::elicit::declares_url(declared),
+            }
+        }
     };
-    declared.then_some(terminal)
+    (modes.form || modes.url).then_some((terminal, asking, modes))
+}
+
+/// The `2026-07-28` result that asks about several plans at once: one form request each, keyed by the plan's id.
+fn many_required(plans: &[PendingPlan], state: &str) -> Value {
+    let requests: serde_json::Map<String, Value> = plans
+        .iter()
+        .map(|plan| {
+            (
+                plan.id.clone(),
+                json!({
+                    "method": "elicitation/create",
+                    "params": crate::elicit::request_params(&plan.message)
+                }),
+            )
+        })
+        .collect();
+    json!({
+        "resultType": "input_required",
+        "inputRequests": Value::Object(requests),
+        "requestState": state
+    })
+}
+
+/// The `2026-07-28` result that sends the owner to confirm with a passkey at `url` (URL mode); the retry asks again.
+fn step_up_required(url: &str, state: &str) -> Value {
+    json!({
+        "resultType": "input_required",
+        "inputRequests": {
+            crate::elicit::STEP_UP_KEY: {
+                "method": "elicitation/create",
+                "params": crate::elicit::url_params(crate::elicit::STEP_UP_MESSAGE, url, crate::elicit::STEP_UP_KEY)
+            }
+        },
+        "requestState": state
+    })
+}
+
+/// What a `2025-11-25` stream asks about several plans: the plans, the page to confirm at first when the session must, and
+/// whether its client takes forms.
+struct ManyAsk {
+    plans: Vec<PendingPlan>,
+    step_up: Option<String>,
+    form: bool,
+}
+
+/// Opens the SSE stream of a `2025-11-25` listing call that asks about several plans. When the session must confirm with a
+/// passkey first, a URL-mode request sends the owner to the page, and the stream waits until the session may be asked,
+/// then says the confirmation is complete. Each plan is then asked in turn; a yes approves and runs it. The last message is
+/// the call's reply: the listing with what was decided. A decline, a timeout or a closed stream leaves the rest waiting.
+fn ask_many_on_stream(
+    server: &Arc<Server>,
+    caller: &Caller,
+    id: Value,
+    asking: ManyAsk,
+    normal: Value,
+    approving: Approving,
+) -> Option<tokio::sync::mpsc::Receiver<Value>> {
+    server.terminal.as_ref()?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Value>(4);
+    let server = Arc::clone(server);
+    let caller = caller.clone();
+    tokio::spawn(async move {
+        let Some(terminal) = server.terminal.as_ref() else {
+            return;
+        };
+        if let Some(url) = asking.step_up {
+            let Some((request_id, answer)) = terminal.expect(&caller.token_id) else {
+                let _ = tx.send(normal).await;
+                return;
+            };
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "elicitation/create",
+                "params": crate::elicit::url_params(crate::elicit::STEP_UP_MESSAGE, &url, &request_id)
+            });
+            if tx.send(request).await.is_err() {
+                terminal.forget(&request_id);
+                return;
+            }
+            let answered = tokio::select! {
+                answered = tokio::time::timeout(terminal.timeout, answer) => answered.ok().and_then(Result::ok),
+                () = tx.closed() => None,
+            };
+            terminal.forget(&request_id);
+            if answered.is_none_or(|response| response["result"]["action"] != "accept") {
+                let _ = tx.send(normal).await;
+                return;
+            }
+            let deadline = tokio::time::Instant::now() + terminal.timeout;
+            while terminal.approver.may_ask(&caller) != Asking::Yes {
+                if tokio::time::Instant::now() >= deadline {
+                    let _ = tx.send(normal).await;
+                    return;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                    () = tx.closed() => return,
+                }
+            }
+            let complete = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/elicitation/complete",
+                "params": { "elicitationId": request_id }
+            });
+            if tx.send(complete).await.is_err() {
+                return;
+            }
+            if !asking.form {
+                let _ = tx.send(normal).await;
+                return;
+            }
+        }
+        let mut decisions = Vec::new();
+        for plan in asking.plans {
+            let Some((request_id, answer)) = terminal.expect(&caller.token_id) else {
+                break;
+            };
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "elicitation/create",
+                "params": crate::elicit::request_params(&plan.message)
+            });
+            if tx.send(request).await.is_err() {
+                terminal.forget(&request_id);
+                return;
+            }
+            let answered = tokio::select! {
+                answered = tokio::time::timeout(terminal.timeout, answer) => answered.ok().and_then(Result::ok),
+                () = tx.closed() => {
+                    terminal.forget(&request_id);
+                    return;
+                }
+            };
+            terminal.forget(&request_id);
+            let yes = answered.is_some_and(|response| crate::elicit::is_yes(&response["result"]));
+            decisions.push(decide(terminal, &caller, &plan.id, plan.created_at, yes).await);
+        }
+        let _ = tx.send(many_reply(id, approving, decisions)).await;
+    });
+    Some(rx)
+}
+
+/// What became of one plan asked about: approved and run, refused when approved, or left waiting on its card.
+async fn decide(
+    terminal: &crate::elicit::Terminal,
+    caller: &Caller,
+    plan: &str,
+    created_at: u64,
+    yes: bool,
+) -> Value {
+    if !yes {
+        return json!({ "id": plan, "decision": "left" });
+    }
+    let approver = Arc::clone(&terminal.approver);
+    let (owned_caller, owned_plan) = (caller.clone(), plan.to_string());
+    let run = tokio::task::spawn_blocking(move || {
+        approver.approve(&owned_plan, created_at, &owned_caller)
+    })
+    .await;
+    match run {
+        Ok(Ok(output)) => json!({ "id": plan, "decision": "approved", "result": output }),
+        Ok(Err(refused)) => json!({
+            "id": plan,
+            "decision": "refused",
+            "message": refused.refusal().map_or("the plan was not run", |(_, message)| message),
+        }),
+        Err(_) => json!({ "id": plan, "decision": "refused", "message": "the plan was not run" }),
+    }
+}
+
+/// The reply of a listing whose plans were asked about: the listing as it was shown, with what was decided for each.
+fn many_reply(id: Value, approving: Approving, decisions: Vec<Value>) -> Value {
+    let Approving {
+        verb,
+        mut proposal,
+        only_looks,
+        log,
+    } = approving;
+    proposal["decisions"] = json!(decisions);
+    if let Err(why) = conforms(&(verb.result)(), &proposal) {
+        log(&internal_line(
+            verb.name,
+            &format!("its answer with decisions does not fit the verb's result schema ({why})"),
+        ));
+        return result_reply(id, tool_failure("internal", "the tool failed"));
+    }
+    result_reply(id, tool_result(&verb, proposal, None, only_looks))
 }
 
 /// The `2026-07-28` result that asks for input: one elicitation request and the state the client sends back with its answer.
@@ -578,8 +863,13 @@ async fn approved_reply(
             }
             let summary = (verb.summary_text)(&proposal);
             let mut result = tool_result(&verb, proposal, None, only_looks);
+            let by = if caller.is_issued() {
+                "the owner's signed-in session"
+            } else {
+                "admin token"
+            };
             result["content"][0]["text"] = json!(format!(
-                "approved in the terminal by admin token {} and run: {summary}",
+                "approved in the terminal by {by} {} and run: {summary}",
                 caller.token_id
             ));
             result_reply(id, result)

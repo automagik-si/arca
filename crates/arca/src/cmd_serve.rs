@@ -638,6 +638,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .approval_origin
         .as_ref()
         .map(|origin| format!("{origin}/approve"));
+    let approval_page = dashboard.clone();
     let approval_requests = Arc::new(
         crate::approval_requests::ApprovalRequests::open(&cfg.state_dir, dashboard, now_ms())
             .map_err(|e| {
@@ -681,14 +682,6 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
     let actions = ActionExecutor::new(action_handlers);
     let _ = action_slot.set(actions.clone());
-    // The node's one admin token may approve a waiting proposal from the terminal of a client that can ask.
-    if kernel_mode {
-        server = server.terminal_approval(Arc::new(crate::handlers::TerminalApproval {
-            kernel: Arc::clone(&kernel),
-            clock: clock.clone(),
-            actions: actions.clone(),
-        }));
-    }
     // MCP authorization: with an approval page, the page is the OAuth authorization server for `<origin>/mcp`, and the MCP
     // door also accepts the short-lived tokens it issues (see `crate::mcp_oauth`). The stored tokens work as before.
     let page_gate = door
@@ -715,11 +708,36 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         None => None,
     };
     if let Some(oauth) = &oauth {
+        // While the owner's signed-in session is connected, the kernel holds waiting proposals open for it.
+        if let Ok(mut kernel) = kernel.lock() {
+            kernel.set_owner_session(oauth.owner_session());
+        }
         server = server.oauth(
             Arc::clone(oauth) as Arc<dyn arca_mcp::IssuedTokens>,
             oauth.resource_metadata_url(),
         );
     }
+    // The node's one admin token, and the owner's signed-in session (an app connected with `approvals`), may approve a
+    // waiting proposal from the terminal of a client that can ask.
+    if kernel_mode {
+        server = server.terminal_approval(Arc::new(crate::handlers::TerminalApproval {
+            kernel: Arc::clone(&kernel),
+            clock: clock.clone(),
+            actions: actions.clone(),
+            oauth: oauth.clone(),
+        }));
+    }
+    // Everything that waits for the owner, and, in the owner's signed-in session, a question for each plan.
+    server = server.handle(
+        crate::handlers::OWNER_APPROVAL_PENDING,
+        Arc::new(crate::handlers::OwnerApprovalPending {
+            kernel: Arc::clone(&kernel),
+            clock: clock.clone(),
+            requests: Arc::clone(&approval_requests),
+            oauth: oauth.clone(),
+            page: approval_page.clone(),
+        }),
+    );
     let router = server.router();
     let linked_hosts = cfg
         .approval
@@ -818,7 +836,21 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
     let reload_path = cfg.state_dir.join(SERVE_RELOAD_FILE);
     let unix_path = cfg.listen.unix.clone();
+    // While the owner's signed-in session is connected, the waiting proposals are moved forward every minute, so none
+    // lapses while it can be asked; with none connected, nothing moves.
+    let hold_kernel = oauth.as_ref().map(|_| Arc::clone(&kernel));
     let outcome: io::Result<()> = runtime.block_on(async {
+        if let Some(kernel) = hold_kernel {
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+                    if let Ok(mut kernel) = kernel.lock() {
+                        kernel.hold_proposals(now_ms());
+                    }
+                }
+            });
+        }
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
         let reload_tokens = tokens.clone();

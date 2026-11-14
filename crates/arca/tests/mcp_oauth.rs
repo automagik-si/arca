@@ -166,6 +166,11 @@ impl Rig {
                 .expect("the store opens")
                 .with_log(Arc::new(|_| {})),
         );
+        // As `serve` does: the kernel holds waiting plans open while the owner's signed-in session is connected.
+        kernel
+            .lock()
+            .expect("kernel")
+            .set_owner_session(oauth.owner_session());
         // The unix socket's router exactly as `serve` merges it.
         let router = Server::new(arca_api::verbs(), tokens)
             .oauth(
@@ -501,7 +506,7 @@ fn an_mcp_client_given_only_the_url_is_told_where_to_ask_and_the_metadata_names_
         assert_eq!(body["authorization_servers"], json!([ORIGIN]));
         assert_eq!(
             body["scopes_supported"],
-            json!(["viewer", "doctor", "operator"])
+            json!(["viewer", "doctor", "operator", "approvals"])
         );
     }
     let server = rig.get("/.well-known/oauth-authorization-server").json();
@@ -1284,4 +1289,373 @@ fn grants_survive_a_restart_of_the_store() {
         elsewhere.lookup(&access).is_none(),
         "a token is for its resource only"
     );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The owner's signed-in session: an app connected with `approvals`.
+
+use arca::action_proposal::ActionKind;
+use arca::handlers::{OwnerApprovalPending, TerminalApproval};
+use arca::mcp_oauth::{STEP_UP_MS, Session};
+use arca_mcp::{Asking, CallError, Caller, TerminalApprover, ToolHandler};
+
+impl Rig {
+    fn clock_fn(&self) -> Clock {
+        let ticks = Arc::clone(&self.clock);
+        Arc::new(move || ticks.load(Ordering::SeqCst))
+    }
+
+    fn now(&self) -> u64 {
+        self.clock.load(Ordering::SeqCst)
+    }
+
+    /// The caller an access token is, as the MCP door sees it.
+    fn caller(&self, access: &str) -> Caller {
+        self.oauth.lookup(access).expect("a live access token")
+    }
+
+    /// Waits for the owner, as a worker's `action_propose` makes it: `action` with `args`, now.
+    fn propose(&self, action: ActionKind, args: Value) -> String {
+        let now = self.now();
+        self.kernel
+            .lock()
+            .expect("kernel")
+            .propose_action(action, args, now, None)
+            .expect("proposed")
+            .id
+    }
+
+    fn pending_handler(&self) -> OwnerApprovalPending {
+        OwnerApprovalPending {
+            kernel: Arc::clone(&self.kernel),
+            clock: self.clock_fn(),
+            requests: Arc::new(
+                arca::approval_requests::ApprovalRequests::open(&self.state_dir, None, self.now())
+                    .expect("the requests open"),
+            ),
+            oauth: Some(Arc::clone(&self.oauth)),
+            page: Some(format!("{ORIGIN}/approve")),
+        }
+    }
+
+    fn terminal(&self) -> TerminalApproval {
+        TerminalApproval {
+            kernel: Arc::clone(&self.kernel),
+            clock: self.clock_fn(),
+            actions: arca::handlers::ActionExecutor::new(Vec::new()),
+            oauth: Some(Arc::clone(&self.oauth)),
+        }
+    }
+
+    /// Confirms the session of `grant` again on the step-up page, with `key`.
+    fn step_up(&self, key: &SoftPasskey, grant: &str) -> Reply {
+        let begun = self.page_post("/oauth/step-up/begin", json!({ "id": grant }));
+        assert_eq!(begun.status, 200, "begin: {}", begun.text());
+        let statement = begun.json()["statement"]
+            .as_str()
+            .expect("a statement")
+            .to_string();
+        let proof = key.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+        self.page_post(
+            "/oauth/step-up/approve",
+            json!({ "id": grant, "statement": statement, "proof": proof }),
+        )
+    }
+}
+
+fn step_up_url(session: Session) -> String {
+    match session {
+        Session::StepUp { url } => url,
+        other => panic!("a step-up, not {other:?}"),
+    }
+}
+
+#[test]
+fn an_app_connected_with_approvals_is_the_owners_session_and_its_passkey_counts_for_12_hours() {
+    let (rig, key) = Rig::new("oauth-session");
+    let client = rig.client("Owner app");
+    let page = rig.authorize(&client, &[("scope", Some("viewer approvals"))]);
+    assert!(page.text().contains("id=\"approvals\""), "{}", page.text());
+    assert!(
+        page.text()
+            .contains("<strong id=\"scope\">viewer approvals</strong>")
+    );
+    let code = rig.code(&key, &client, "viewer approvals");
+    let tokens = rig.exchange(&client, &code).json();
+    assert_eq!(tokens["scope"], json!("viewer approvals"));
+    let session = rig.caller(tokens["access_token"].as_str().expect("access"));
+    assert!(
+        session.token_id.starts_with(&format!("oauth:{client}/g-")),
+        "{}",
+        session.token_id
+    );
+    assert_eq!(session.scope, Scope::Viewer);
+    assert!(matches!(rig.oauth.session(&session), Session::Ready { .. }));
+    // An app connected without approvals is never the owner's session, and cannot ask for it at a refresh.
+    let (plain_client, plain_access, plain_refresh) = rig.connected(&key, "Plain app", "doctor");
+    let plain = rig.caller(&plain_access);
+    assert_eq!(rig.oauth.session(&plain), Session::None);
+    let wider = rig.refresh(&plain_client, &plain_refresh, Some("doctor approvals"));
+    assert_eq!(error_of(&wider), "invalid_scope");
+    let list = rig.get("/approve/oauth/clients").json();
+    let owner_app = list["clients"]
+        .as_array()
+        .expect("clients")
+        .iter()
+        .find(|app| app["clientId"] == json!(client))
+        .expect("the owner's app")
+        .clone();
+    assert_eq!(owner_app["approvals"], json!(true));
+    // Twelve hours on, the consent's passkey no longer counts: the session is sent to the step-up page.
+    rig.advance(STEP_UP_MS + 1);
+    let url = step_up_url(rig.oauth.session(&session));
+    let grant = url.split("grant=").nth(1).expect("a grant").to_string();
+    assert!(session.token_id.ends_with(&grant), "{url}");
+    let path = url.strip_prefix(ORIGIN).expect("on the page origin");
+    let step_page = rig.get(path);
+    assert_eq!(step_page.status, 200);
+    assert!(
+        step_page
+            .text()
+            .contains("data-begin=\"/oauth/step-up/begin\"")
+    );
+    assert!(step_page.text().contains("Owner app"));
+    // A passkey over another statement does not confirm it.
+    rig.page_post("/oauth/step-up/begin", json!({ "id": grant }));
+    let proof = key.proof_value(&Assert::over(NAMESPACE, b"{\"another\":\"statement\"}"));
+    let stale = rig.page_post(
+        "/oauth/step-up/approve",
+        json!({ "id": grant, "statement": "{\"another\":\"statement\"}", "proof": proof }),
+    );
+    assert_eq!(stale.status, 409, "{}", stale.text());
+    assert!(matches!(
+        rig.oauth.session(&session),
+        Session::StepUp { .. }
+    ));
+    // One tap on the page confirms it for another twelve hours.
+    let confirmed = rig.step_up(&key, &grant);
+    assert_eq!(confirmed.status, 200, "{}", confirmed.text());
+    assert!(matches!(rig.oauth.session(&session), Session::Ready { .. }));
+    assert!(rig.journal().contains("\"event\":\"stepped_up\""));
+    rig.advance(STEP_UP_MS + 1);
+    assert!(matches!(
+        rig.oauth.session(&session),
+        Session::StepUp { .. }
+    ));
+    // A plain app's grant has no step-up page.
+    let plain_grant = plain.token_id;
+    let plain_grant = plain_grant.rsplit('/').next().expect("a grant");
+    assert_eq!(
+        rig.get(&format!("/oauth/step-up?grant={plain_grant}"))
+            .status,
+        404
+    );
+    // Revoked, the session is gone.
+    rig.oauth.revoke_client(&client, "test").expect("revoked");
+    assert_eq!(rig.oauth.session(&session), Session::None);
+}
+
+#[test]
+fn waiting_plans_stay_open_while_the_owners_session_is_connected_and_lapse_after() {
+    let (rig, key) = Rig::new("oauth-hold");
+    let minute = 60 * 1000;
+    // Without a session, a plan lapses after its fifteen minutes as ever.
+    let lapsing = rig.propose(
+        ActionKind::InstanceStop,
+        json!({ "project": "p1", "instance": "old" }),
+    );
+    rig.advance(16 * minute);
+    rig.kernel.lock().expect("kernel").hold_proposals(rig.now());
+    assert!(
+        rig.pending_handler()
+            .call(
+                json!({}),
+                &rig.caller(&rig.connected(&key, "Plain", "viewer").1)
+            )
+            .expect("listed")["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .all(|plan| plan["id"] != json!(lapsing))
+    );
+    // With the owner's session connected, a plan is held forward while time passes.
+    let (client, access, _) = rig.connected(&key, "Owner app", "viewer approvals");
+    let session = rig.caller(&access);
+    assert!(
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .owner_session_live(rig.now())
+    );
+    let held = rig.propose(
+        ActionKind::InstanceStop,
+        json!({ "project": "p1", "instance": "api" }),
+    );
+    // A plan that erases keeps its passkey card: the session is never asked about it, so nothing holds it.
+    let erasing = rig.propose(ActionKind::ServiceRemove, json!({ "name": "demo" }));
+    assert_eq!(
+        rig.pending_handler()
+            .call(json!({}), &session)
+            .expect("listed")["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .find(|plan| plan["id"] == json!(erasing))
+            .expect("waiting")["heldForSession"],
+        json!(false)
+    );
+    let made = rig.now();
+    for _ in 0..6 {
+        rig.advance(10 * minute);
+        rig.kernel.lock().expect("kernel").hold_proposals(rig.now());
+    }
+    let listing = rig
+        .pending_handler()
+        .call(json!({}), &session)
+        .expect("listed");
+    let plan = listing["plans"]
+        .as_array()
+        .expect("plans")
+        .iter()
+        .find(|plan| plan["id"] == json!(held))
+        .expect("still waiting an hour on")
+        .clone();
+    assert_eq!(plan["heldForSession"], json!(true));
+    assert!(plan["expiresAt"].as_u64().expect("an expiry") > made + 60 * minute);
+    assert!(
+        listing["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .all(|plan| plan["id"] != json!(erasing))
+    );
+    // The card says so: the plan listing marks it held.
+    let card = rig.get("/approve/plans");
+    assert_eq!(card.status, 200, "{}", card.text());
+    assert!(
+        card.text().contains("\"heldForSession\":true"),
+        "{}",
+        card.text()
+    );
+    // Once the session is gone, nothing holds it: it lapses after its last fifteen minutes.
+    rig.oauth.revoke_client(&client, "test").expect("revoked");
+    assert!(
+        !rig.kernel
+            .lock()
+            .expect("kernel")
+            .owner_session_live(rig.now())
+    );
+    rig.advance(16 * minute);
+    rig.kernel.lock().expect("kernel").hold_proposals(rig.now());
+    let after = rig
+        .pending_handler()
+        .call(
+            json!({}),
+            &rig.caller(&rig.connected(&key, "Plain 2", "viewer").1),
+        )
+        .expect("listed");
+    assert!(
+        after["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .all(|plan| plan["id"] != json!(held))
+    );
+}
+
+#[test]
+fn the_session_is_asked_only_about_plans_that_do_not_erase_and_others_list_only() {
+    let (rig, key) = Rig::new("oauth-pending");
+    let stop = rig.propose(
+        ActionKind::InstanceStop,
+        json!({ "project": "p1", "instance": "api" }),
+    );
+    let remove = rig.propose(ActionKind::ServiceRemove, json!({ "name": "demo" }));
+    let (_, access, _) = rig.connected(&key, "Owner app", "viewer approvals");
+    let session = rig.caller(&access);
+    let listing = rig
+        .pending_handler()
+        .call(json!({}), &session)
+        .expect("listed");
+    assert_eq!(listing["session"], json!("asks"));
+    assert_eq!(listing["page"], json!(format!("{ORIGIN}/approve")));
+    let row = |listing: &Value, id: &str| {
+        listing["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .find(|plan| plan["id"] == json!(id))
+            .expect("listed")
+            .clone()
+    };
+    assert_eq!(row(&listing, &stop)["askedHere"], json!(true));
+    assert_eq!(row(&listing, &remove)["askedHere"], json!(false));
+    assert!(
+        row(&listing, &remove)["why"]
+            .as_str()
+            .expect("why")
+            .contains("passkey")
+    );
+    arca_api::conforms(
+        &(arca_api::verb("owner_approval_pending")
+            .expect("the verb")
+            .result)(),
+        &listing,
+    )
+    .expect("the listing fits its schema");
+    // The door asks about the plan that does not erase, only.
+    let terminal = rig.terminal();
+    assert_eq!(terminal.may_ask(&session), Asking::Yes);
+    let asked: Vec<String> = terminal
+        .waiting("owner_approval_pending", &listing, &session)
+        .into_iter()
+        .map(|plan| plan.id)
+        .collect();
+    assert_eq!(asked, vec![stop.clone()]);
+    // A plan that erases is refused to the session even when reached directly, and nothing runs.
+    let created = row(&listing, &remove)["createdAt"].as_u64().expect("made");
+    match terminal.approve(&remove, created, &session) {
+        Err(CallError::Refused { code, .. }) => assert_eq!(code, "PasskeyOnly"),
+        other => panic!("refused, not {other:?}"),
+    }
+    assert!(
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .action_proposals()
+            .iter()
+            .any(|p| p.id == remove)
+    );
+    // Any other app lists only, and is never asked or let approve.
+    let (_, plain_access, _) = rig.connected(&key, "Plain app", "operator");
+    let plain = rig.caller(&plain_access);
+    let listed = rig
+        .pending_handler()
+        .call(json!({}), &plain)
+        .expect("listed");
+    assert_eq!(listed["session"], json!("none"));
+    assert_eq!(row(&listed, &stop)["askedHere"], json!(false));
+    assert_eq!(terminal.may_ask(&plain), Asking::No);
+    assert!(matches!(
+        terminal.approve(&stop, created, &plain),
+        Err(CallError::Forbidden { .. })
+    ));
+    // Twelve hours on, the session lists with the step-up page and is not let approve until it confirms.
+    rig.advance(STEP_UP_MS + 1);
+    let stale = rig
+        .pending_handler()
+        .call(json!({}), &session)
+        .expect("listed");
+    assert_eq!(stale["session"], json!("step-up"));
+    assert!(
+        stale["stepUp"]
+            .as_str()
+            .expect("a page")
+            .starts_with(&format!("{ORIGIN}/oauth/step-up?grant=g-"))
+    );
+    assert!(matches!(terminal.may_ask(&session), Asking::StepUp { .. }));
+    assert!(matches!(
+        terminal.approve(&stop, created, &session),
+        Err(CallError::Forbidden { .. })
+    ));
 }

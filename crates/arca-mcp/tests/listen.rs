@@ -266,6 +266,7 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "service_status",
             "service_logs",
             "owner_approval_list",
+            "owner_approval_pending",
             "storage_list",
             "snapshot_list",
             "tenant_list",

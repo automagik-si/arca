@@ -1,20 +1,25 @@
 //! Approving a plan from the terminal of the client that asked for it, with MCP elicitation.
 //!
-//! Only a call by the node's one `admin` token, from a client that declared the elicitation capability, can reach this.
-//! When such a call's answer is a plan that waits for the owner, the server asks the client, in words, whether to approve
-//! it: on `2025-11-25` as a `elicitation/create` request on the call's own SSE response stream (Streamable HTTP, "Sending
-//! Messages to the Server"; the client's answer comes back as a second `POST`, which the server answers `202`), and on
-//! `2026-07-28` as an `input_required` result the client answers by sending the call again with `inputResponses` (the
-//! multi round-trip pattern, which replaces server-to-client requests in that version). An explicit accept with `yes`
-//! approves the plan through [`TerminalApprover::approve`]; a decline, a cancel, a timeout or anything else leaves the plan
-//! waiting with its normal card, and the call answers as it would without elicitation.
+//! Only a caller the node says may be asked ([`TerminalApprover::may_ask`]: the node's one `admin` token, or the owner's
+//! own signed-in session, an issued token whose grant includes `approvals`), from a client that declared the elicitation
+//! capability, can reach this. When such a call's answer is a plan that waits for the owner, the server asks the client,
+//! in words, whether to approve it: on `2025-11-25` as a `elicitation/create` request on the call's own SSE response
+//! stream (Streamable HTTP, "Sending Messages to the Server"; the client's answer comes back as a second `POST`, which the
+//! server answers `202`), and on `2026-07-28` as an `input_required` result the client answers by sending the call again
+//! with `inputResponses` (the multi round-trip pattern, which replaces server-to-client requests in that version). An
+//! explicit accept with `yes` approves the plan through [`TerminalApprover::approve`]; a decline, a cancel, a timeout or
+//! anything else leaves the plan waiting with its normal card, and the call answers as it would without elicitation.
 //!
-//! The server keeps no session. Which clients can be asked is remembered per admin token id from its last `initialize`
+//! A listing verb can name several waiting plans ([`TerminalApprover::waiting`]): each is asked in turn on the stream, or
+//! all at once as one `inputRequests` entry each. A session whose passkey is too old to be asked is first sent a URL-mode
+//! elicitation to the page where one passkey tap confirms it ([`Asking::StepUp`]).
+//!
+//! The server keeps no session. Which clients can be asked is remembered per token id from its last `initialize`
 //! (`2025-11-25`) and read from each request's own capabilities (`2026-07-28`). A `2026-07-28` retry carries a
-//! `requestState` the server signed (HMAC-SHA256 under a key made at start): it names the token, the plan, the verb with
-//! the digest of its arguments and an expiry, so a state is never taken for another caller's or another call's.
+//! `requestState` the server signed (HMAC-SHA256 under a key made at start): it names the token, the plan or plans, the
+//! verb with the digest of its arguments and an expiry, so a state is never taken for another caller's or another call's.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,19 +38,49 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(240);
 /// The key of the one input request, in `inputRequests` and `inputResponses`.
 pub const APPROVE_KEY: &str = "approve";
 
-/// A plan that waits for the owner: its id, and the question that states it in the card's words.
+/// The key of the one URL-mode input request that sends the owner to confirm with a passkey.
+pub const STEP_UP_KEY: &str = "stepUp";
+
+/// A plan that waits for the owner: its id, the question that states it in the card's words, and when it was made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPlan {
     pub id: String,
     pub message: String,
+    pub created_at: u64,
+}
+
+/// Whether the terminal of a caller may be asked to approve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Asking {
+    /// It may be asked now.
+    Yes,
+    /// It may be asked once the owner confirms with a passkey at `url`, which a URL-mode elicitation opens.
+    StepUp { url: String },
+    /// It is never asked.
+    No,
 }
 
 /// What the server asks of the node to approve from the terminal. The node supplies it; this crate only asks.
 pub trait TerminalApprover: Send + Sync {
-    /// Whether `result`, the answer of `verb`, is a plan waiting for the owner, and the question that states it.
-    fn pending(&self, verb: &str, result: &Value) -> Option<PendingPlan>;
+    /// Whether `caller`'s terminal may be asked. By default only the admin token's.
+    fn may_ask(&self, caller: &Caller) -> Asking {
+        if caller.scope == arca_api::Scope::Admin {
+            Asking::Yes
+        } else {
+            Asking::No
+        }
+    }
 
-    /// Approves plan `plan` in the terminal for the admin token `caller` and runs it, as the web card's approval does,
+    /// Whether `result`, the answer of `verb` to `caller`, is a plan waiting for the owner, and the question that states it.
+    fn pending(&self, verb: &str, result: &Value, caller: &Caller) -> Option<PendingPlan>;
+
+    /// The waiting plans a listing `verb` answered with that `caller`'s terminal may be asked about, one question each.
+    /// None by default.
+    fn waiting(&self, _verb: &str, _result: &Value, _caller: &Caller) -> Vec<PendingPlan> {
+        Vec::new()
+    }
+
+    /// Approves plan `plan` in the terminal of `caller` and runs it, as the web card's approval does,
     /// recording that it was approved in the terminal by that token. Returns what the run answered.
     ///
     /// `created_at` is the creation time of the very proposal the question stated. It approves that record only: a plan
@@ -60,8 +95,8 @@ pub(crate) struct Terminal {
     pub(crate) timeout: Duration,
     /// The elicitation requests sent and not yet answered: request id to the token that was asked and where its answer goes.
     waiting: Mutex<HashMap<String, (String, oneshot::Sender<Value>)>>,
-    /// The ids of the admin tokens whose last `initialize` declared the elicitation capability.
-    capable: Mutex<HashSet<String>>,
+    /// The ids of the tokens whose last `initialize` declared the elicitation capability, with whether it named URL mode.
+    capable: Mutex<HashMap<String, Modes>>,
     /// The states already used to approve, each until it expires: a state approves once.
     spent: Mutex<HashMap<String, u64>>,
     key: [u8; 32],
@@ -75,7 +110,7 @@ impl Terminal {
             approver,
             timeout,
             waiting: Mutex::new(HashMap::new()),
-            capable: Mutex::new(HashSet::new()),
+            capable: Mutex::new(HashMap::new()),
             spent: Mutex::new(HashMap::new()),
             key,
         }
@@ -83,21 +118,26 @@ impl Terminal {
 
     /// Remembers whether the client of `token` declared elicitation at `initialize`.
     pub(crate) fn note_initialize(&self, token: &str, params: &Value) {
-        let declared = declares_elicitation(params.get("capabilities"));
+        let modes = Modes {
+            form: declares_elicitation(params.get("capabilities")),
+            url: declares_url(params.get("capabilities")),
+        };
         if let Ok(mut capable) = self.capable.lock() {
-            if declared {
-                capable.insert(token.to_string());
+            if modes.form || modes.url {
+                capable.insert(token.to_string(), modes);
             } else {
                 capable.remove(token);
             }
         }
     }
 
-    pub(crate) fn is_capable(&self, token: &str) -> bool {
+    /// What the client of `token` declared at its last `initialize`.
+    pub(crate) fn modes(&self, token: &str) -> Modes {
         self.capable
             .lock()
-            .map(|capable| capable.contains(token))
-            .unwrap_or(false)
+            .ok()
+            .and_then(|capable| capable.get(token).copied())
+            .unwrap_or_default()
     }
 
     /// Registers a request id for `token` and returns where its answer arrives.
@@ -156,11 +196,36 @@ impl Terminal {
         call: &str,
         now_s: u64,
     ) -> String {
-        let payload = json!({
+        self.seal(json!({
             "t": token, "p": plan, "v": proposal, "c": call, "x": now_s + self.timeout.as_secs()
-        })
-        .to_string();
-        let body = URL_SAFE_NO_PAD.encode(payload);
+        }))
+    }
+
+    /// The `requestState` for several plans asked at once: each plan's id and creation time, and the listing that was shown.
+    pub(crate) fn sign_many(
+        &self,
+        token: &str,
+        plans: &[PendingPlan],
+        listing: &Value,
+        call: &str,
+        now_s: u64,
+    ) -> String {
+        let plans: Vec<Value> = plans
+            .iter()
+            .map(|plan| json!([plan.id, plan.created_at]))
+            .collect();
+        self.seal(json!({
+            "t": token, "m": plans, "v": listing, "c": call, "x": now_s + self.timeout.as_secs()
+        }))
+    }
+
+    /// The `requestState` of a call that sent the owner to confirm with a passkey: its retry asks again, never twice.
+    pub(crate) fn sign_step_up(&self, token: &str, call: &str, now_s: u64) -> String {
+        self.seal(json!({ "t": token, "s": true, "c": call, "x": now_s + self.timeout.as_secs() }))
+    }
+
+    fn seal(&self, payload: Value) -> String {
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string());
         let mac = URL_SAFE_NO_PAD.encode(hmac_sha256(&self.key, body.as_bytes()));
         format!("{body}.{mac}")
     }
@@ -190,6 +255,24 @@ impl Terminal {
         if payload["x"].as_u64().is_none_or(|x| x < now_s) {
             return State::Expired;
         }
+        if payload["s"] == true {
+            return State::StepUp;
+        }
+        if let (Some(plans), Some(listing)) = (payload["m"].as_array(), payload.get("v"))
+            && listing.is_object()
+        {
+            let plans: Option<Vec<(String, u64)>> = plans
+                .iter()
+                .map(|plan| Some((plan[0].as_str()?.to_string(), plan[1].as_u64()?)))
+                .collect();
+            return match plans {
+                Some(plans) => State::Many {
+                    plans,
+                    listing: listing.clone(),
+                },
+                None => State::Invalid,
+            };
+        }
         match (payload["p"].as_str(), payload.get("v")) {
             (Some(plan), Some(proposal)) if proposal.is_object() => State::Plan {
                 plan: plan.to_string(),
@@ -200,10 +283,27 @@ impl Terminal {
     }
 }
 
+/// The elicitation modes a client declared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Modes {
+    pub(crate) form: bool,
+    pub(crate) url: bool,
+}
+
 /// A `requestState` as [`Terminal::verify`] reads it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum State {
-    Plan { plan: String, proposal: Value },
+    Plan {
+        plan: String,
+        proposal: Value,
+    },
+    /// Several plans asked at once: each one's id and creation time, and the listing the call answered.
+    Many {
+        plans: Vec<(String, u64)>,
+        listing: Value,
+    },
+    /// The owner was sent to confirm with a passkey.
+    StepUp,
     Expired,
     Invalid,
 }
@@ -216,6 +316,27 @@ pub(crate) fn declares_elicitation(capabilities: Option<&Value>) -> bool {
         .and_then(Value::as_object)
         .is_some_and(|modes| modes.is_empty() || modes.contains_key("form"))
 }
+
+/// Whether a `capabilities` object declares URL-mode elicitation.
+pub(crate) fn declares_url(capabilities: Option<&Value>) -> bool {
+    capabilities
+        .and_then(|c| c.get("elicitation"))
+        .and_then(Value::as_object)
+        .is_some_and(|modes| modes.contains_key("url"))
+}
+
+/// The `elicitation/create` params that send the owner to `url` to confirm with a passkey (URL mode).
+pub(crate) fn url_params(message: &str, url: &str, elicitation_id: &str) -> Value {
+    json!({
+        "mode": "url",
+        "message": message,
+        "url": url,
+        "elicitationId": elicitation_id
+    })
+}
+
+/// The words of the URL-mode request that sends the owner to confirm with a passkey.
+pub const STEP_UP_MESSAGE: &str = "Plans are waiting for your approval. Confirm it is you with your passkey on Arca's page first; this session can then ask you about each plan for the next 12 hours.";
 
 /// The `elicitation/create` params that ask the one question: approve, yes or no. A flat object of one enum, as form mode allows.
 pub(crate) fn request_params(message: &str) -> Value {
