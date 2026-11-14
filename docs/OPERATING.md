@@ -4787,13 +4787,17 @@ loopback and a private route could not tell the local network from the internet.
 - **`route_list`** `{}` (viewer): every route, and the edge with the address a person reaches it on.
 
 The answer of a write says `applied` (the edge took the new config: it was written into the edge, and reloaded when the
-edge runs) and `reloaded` (Caddy reloaded it). An edge that is stopped gets the file and reads it when it starts. A
+edge runs) and `reloaded` (Caddy reloaded it). An edge that is stopped gets the file and reads it when it starts, and
+an update of the stopped edge writes it again onto the rebuilt root, so the change is not lost (see below). A
 config Caddy refuses keeps the old one serving, and the old one is put back in its file, so a restart serves it too: the
 change stays recorded, the answer says why, and the same call again, or the next route change, writes it once more.
 
-Once Caddy takes a config, the edge keeps a copy on its data volume (`/data/Caddyfile`). An update of the edge rebuilds
-its root from the new image, and a re-created edge starts from the image too; either way the template's entrypoint puts
-the kept copy back before Caddy starts, so the routes come back with the edge.
+Once Caddy takes a config, the edge keeps a copy on its data volume (`/data/Caddyfile`), and the edge copies an Arca
+config on its root there each time it starts. An update of the edge rebuilds its root from the new image, and the update
+writes the config of the edge's routes onto the new root before it starts it (its journal shows the step `edge
+config`). A re-created edge starts from the image, and the template's entrypoint puts the kept copy back before Caddy
+starts. A route changed while the edge was stopped, and an instance deleted before the edge started again, is the one
+case that comes back without that change; the next route change, or the same call again, writes it.
 
 What the edge reaches:
 

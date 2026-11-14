@@ -1145,6 +1145,23 @@ impl Run<'_> {
         }
     }
 
+    /// An edge's rebuilt root holds the image's own Caddyfile: the render of its route record goes there before it
+    /// starts. A write Incus does not take is journalled and the update goes on: the entrypoint then puts the copy on
+    /// the data volume back, which holds the routes as they were at the edge's last start.
+    fn edge_root(&self) {
+        if self.config.edge.is_some() {
+            let written = self.handler.write_edge_root(self.entry, self.config);
+            self.journal.step(
+                "edge config",
+                written.is_ok(),
+                match written {
+                    Ok(()) => json!({}),
+                    Err(why) => json!({ "why": why }),
+                },
+            );
+        }
+    }
+
     fn started(&self, instance: &mut InstanceState) -> Result<(), Failure> {
         self.changer
             .change(instance, StateAction::Start)
@@ -1208,6 +1225,7 @@ impl Run<'_> {
             .map_err(|error| Failure::of("rebuild", &error))?;
         self.journal
             .step("rebuild", true, json!({ "digest": self.digest }));
+        self.edge_root();
         self.started(instance)?;
         self.journal.step("start", true, json!({}));
         self.healthy()?;
@@ -1350,7 +1368,10 @@ impl Run<'_> {
                     .step("restore", true, json!({ "snapshot": snapshot }));
             }
             Back::OldImage => match self.rebuild_from(instance, &self.config.source) {
-                Ok(()) => self.journal.step("rebuild back", true, json!({})),
+                Ok(()) => {
+                    self.journal.step("rebuild back", true, json!({}));
+                    self.edge_root();
+                }
                 Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
                     root_kept = true;
                     self.journal

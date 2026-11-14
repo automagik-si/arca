@@ -45,11 +45,16 @@ fn bare_rig(up: &Arc<AtomicBool>) -> Rig {
 
 /// A node with no service yet, whose update handler answers its health check as `up` says. `key` is the owner's.
 fn bare_node(up: &Arc<AtomicBool>, key: Option<&common::SkKey>) -> Rig {
+    node_with(up, key, vec![])
+}
+
+/// The same, with `instances` already in Incus.
+fn node_with(up: &Arc<AtomicBool>, key: Option<&common::SkKey>, instances: Vec<Value>) -> Rig {
     let mut rig = Rig::with_key(
         FakeState {
             server: json!({}),
             projects: vec![],
-            instances: vec![],
+            instances,
             networks: vec![],
             pools: vec![("pool1".into(), json!({}))],
         },
@@ -1480,4 +1485,71 @@ fn local_service_without_a_pin_is_refused_with_both_kinds_it_is_not() {
     );
     assert!(message.contains("Nothing was changed"), "{message}");
     assert!(rig.fake.rebuilds(PROJECT, "plain").is_empty());
+}
+
+#[test]
+fn an_update_of_an_edge_writes_the_routes_it_records_onto_the_new_root_before_it_starts() {
+    use arca_incus::exec::{EDGE_CONFIG, ExecCommand};
+    use arca_incus::fake::ExecScript;
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = node_with(
+        &up,
+        None,
+        vec![hand_instance(
+            "app",
+            "other",
+            json!({"eth0":{"type":"nic","name":"eth0","network":"br1","ipv4.address":"10.20.30.63"}}),
+        )],
+    );
+    rig.template(
+        "edge",
+        json!({"name":"edge","kind":"oci","image":"registry.example/edge","digest":DIGEST,
+            "ports":[443],"env":{},"lan":{"port":443},"edge":true}),
+    );
+    rig.call("service_create", json!({"name":"edge","template":"edge"}))
+        .expect("the edge");
+    rig.fake
+        .script_exec(ExecScript::new(ExecCommand::EdgeReload.argv(), 0, ""));
+    rig.call(
+        "route_add",
+        json!({"hostname":"app.example.com","instance":"app","project":"other","port":8080}),
+    )
+    .expect("a route while the edge runs");
+    // The edge stops, and a route is added: its file is on the root, for the next start.
+    rig.edit(
+        "PUT",
+        &format!("/1.0/instances/edge/state?project={PROJECT}"),
+        json!({ "action": "stop", "force": true }),
+    );
+    let stopped = rig
+        .call(
+            "route_add",
+            json!({"hostname":"second.example.com","instance":"app","project":"other","port":8081}),
+        )
+        .expect("a route while the edge is stopped");
+    assert_eq!(stopped["reloaded"], false);
+    // The rebuild gives the root the image's own Caddyfile.
+    let stock = ":80 {\n\troot * /usr/share/caddy\n\tfile_server\n}\n";
+    rig.fake
+        .set_service_file(PROJECT, "edge", EDGE_CONFIG, stock.as_bytes());
+
+    let done = update(&rig, json!({ "name": "edge", "digest": NEW })).expect("update");
+    assert_eq!(done["updated"], true);
+    let record = rig.service_config("edge").edge.expect("an edge record");
+    assert_eq!(record.routes.len(), 2);
+    let root = rig
+        .fake
+        .service_files()
+        .get(&format!("{PROJECT}/edge:{EDGE_CONFIG}"))
+        .map(|bytes| String::from_utf8(bytes.clone()).unwrap())
+        .expect("the edge's config");
+    assert_eq!(root, arca::route::caddyfile(&record));
+    assert!(root.contains("second.example.com"), "{root}");
+    let steps: Vec<(String, bool)> = journal(&rig);
+    let at = |name: &str| steps.iter().position(|(step, _)| step == name);
+    assert_eq!(
+        steps[at("edge config").expect("the step")],
+        ("edge config".to_string(), true)
+    );
+    assert!(at("rebuild") < at("edge config") && at("edge config") < at("start"));
 }
