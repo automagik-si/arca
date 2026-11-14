@@ -239,3 +239,29 @@ test('L2: when the budget stops the listing, the window is the days it got to, a
   assert.equal(data.window.days, 3);
   assert.match(markdown(analyze(data)), /the runs of 4 day\(s\).*the window is the 3 days whose runs were listed/);
 });
+
+/** A client signing in as the App whose first installation lookup answers `first`. */
+async function appClient(first, options = {}) {
+  const { generateKeyPairSync } = await import('node:crypto');
+  const pem = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs1', format: 'pem' });
+  return client(
+    (url, n) => {
+      if (url.endsWith('/installation')) return n === 1 ? first : response(200, { id: 9 });
+      if (url.endsWith('/access_tokens')) return response(201, { token: 'ghs_minted', expires_at: new Date(NOW + 3600e3).toISOString() });
+      return response(200, { ok: 1 });
+    },
+    { token: undefined, appId: '7', appKey: pem, ...options },
+  );
+}
+
+test('L-1: a sign-in retry-after past the wait budget is a rate limit, and the run stops on it', async () => {
+  const { gh, slept } = await appClient(response(429, {}, { 'retry-after': '7200' }), { maxWaitMs: 60 * 60 * 1000 });
+  await assert.rejects(gh.get('acme/app', '/repos/acme/app'), RateLimited);
+  assert.deepEqual(slept, []);
+});
+
+test('L-2: a retry-after in its HTTP-date form falls back to the 2 s backoff', async () => {
+  const { gh, slept } = await appClient(response(429, {}, { 'retry-after': 'Sat, 14 Nov 2026 13:00:00 GMT' }));
+  assert.deepEqual(await gh.get('acme/app', '/repos/acme/app'), { ok: 1 });
+  assert.deepEqual(slept, [2000]);
+});
