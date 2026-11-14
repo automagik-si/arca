@@ -667,6 +667,10 @@ fn held_copy(
                     && one.name == name
                     && (uuid.is_none() || one.uuid.is_none() || one.uuid.as_deref() == uuid)
             })?;
+            // A copy the rollback journaled removed holds nothing, and its target need not be read.
+            if one.target_removed {
+                return None;
+            }
             Some((record, one, one.target_uuid.as_deref()?))
         })
         .collect();
@@ -691,7 +695,7 @@ fn held_reason(project: &str, name: &str, held: &HeldCopy) -> String {
     } = held;
     let next = if *finishable {
         format!(
-            "finish move {id} first (it deletes the stopped source here), or stop or delete the copy on {target}"
+            "finish move {id} first (it deletes the stopped source here), or stop or delete the copy on {target} once you have kept what it holds: it is the instance that has served since the cutover"
         )
     } else {
         format!("stop or delete the copy on {target} first, once you have kept what it holds")
@@ -2697,6 +2701,8 @@ struct InstanceRecord {
     target_pool: String,
     volumes: Value,
     target_uuid: Option<String>,
+    /// The rollback journaled the copy on the target removed (deleted, or read back gone).
+    target_removed: bool,
     created_volumes: Vec<Value>,
     stopped_source: bool,
     copy_started: bool,
@@ -2798,6 +2804,7 @@ fn fold(lines: &[Value]) -> BTreeMap<String, MoveRecord> {
             }
             Some("rollback") => {
                 instance.phase = "rolling_back".to_string();
+                instance.target_removed |= line["targetRemoved"] == true;
                 record.interrupted |= line["interrupted"] == true;
             }
             Some("result") => {
@@ -3587,6 +3594,16 @@ mod tests {
         assert!(
             matches!(refusal(&kept, &runs), Some(CallError::Refused { code, .. }) if code == "CopyMayRun")
         );
+        // A copy its rollback journaled removed holds nothing, and is not read.
+        let mut removed = made("mv-dddddddddddd", 5, "node-b", "u-web", "rolled_back");
+        removed.insert(
+            2,
+            json!({ "event": "rollback", "move": "mv-dddddddddddd", "project": "shop", "name": "web",
+                "targetRemoved": true }),
+        );
+        assert!(refusal(&removed, &runs).is_none());
+        removed[2]["targetRemoved"] = json!(false);
+        assert!(refusal(&removed, &runs).is_some());
         // A move that recorded no copy holds nothing.
         let mut none_made = moved.clone();
         none_made.remove(1);
