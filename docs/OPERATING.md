@@ -2300,13 +2300,16 @@ estimated downtime: 30 s for the stop, start and checks, plus the whole measured
 resends the whole volume today (see the known limit below). It is an estimate; the move measures the real one. A plan
 expires an hour after it is first made: planning the same source again answers the same digest and the same expiry, never
 a renewed one. A changed uuid, device, config, profile or size gives another digest. Plan files are pruned a day after
-they expire. An instance is not a go while a copy of it that an earlier move recorded (its `targetUuid`, whatever that
-move's result: `moved`, or `failed` with the copy started or not deleted) may still run: a second move would leave two
-copies running. The plan reads each such copy on its move's target: read gone (or another instance of the name) or
-`Stopped`, it holds nothing; read running, or on a target that cannot be read, it holds the instance, and the reason
-names the move, the target and what was read. The reason says what to do: finish that move (`finish move mv-…`) while it
-may still be finished, or stop or delete the copy on that target. Another instance of the same name (another uuid) here
-is not held.
+they expire. An instance is not a go while a copy of it that an earlier move recorded (its `targetUuid`) may still run:
+a second move would leave two copies running. That is a copy left by a `moved` move, or by a `failed` one (the copy
+started, or not deleted); a copy whose rollback journaled it removed (`targetRemoved` in the `rollback` line, as every
+`rolled_back` result has) holds nothing and is not read. The plan reads each other copy on its move's target: read gone
+(or another instance of the name) or `Stopped`, it holds nothing; read running, or on a target that cannot be read, it
+holds the instance, and the reason names the move, the target and what was read. A target that is gone for good, or no
+longer linked, holds such an instance until it can be read again. The reason says what to do: finish that move
+(`finish move mv-…`) while it may still be finished, or stop or delete the copy on that target once you have kept what it
+holds (after a verified move, the copy is the instance that has served since the cutover). Another instance of the same
+name (another uuid) here is not held.
 
 ```
 arca call instance_move_plan '{"instances":[{"project":"shop","name":"web","spotCheck":"/srv/data/orders.db"}],"target":"node-b"}'
