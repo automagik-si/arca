@@ -273,6 +273,12 @@ impl Access for RegistrationAccess {
         self.connect().await
     }
 
+    fn forget_connection(&self, _binding: &str) {
+        if let Ok(mut cached) = self.cached.lock() {
+            *cached = None;
+        }
+    }
+
     async fn mint(&self, request: MintRequest) -> Result<Minted, AccessError> {
         let connection = self.connect().await?;
         let url = format!(

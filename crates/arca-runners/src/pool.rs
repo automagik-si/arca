@@ -34,6 +34,10 @@ pub const IDLE_MAX: Duration = Duration::from_secs(3600);
 pub const IDLE_GRACE: Duration = Duration::from_secs(300);
 /// How often the pool looks for machines of its own that it does not know.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(300);
+/// Failed reads in a row after which a runner without a job is given up. A runner with a job is never given up.
+pub const WATCH_FAILURES_MAX: u32 = 60;
+/// The pause after a failed read of a runner before the next.
+pub const WATCH_RETRY: Duration = Duration::from_secs(5);
 /// How long a runner that GitHub would not remove waits before the pool asks again.
 pub const RETIRE_RETRY: Duration = Duration::from_secs(30);
 /// The longest pause before a class tries again after failures.
@@ -48,6 +52,7 @@ pub struct Timing {
     pub idle_grace: Duration,
     pub sweep_every: Duration,
     pub retire_retry: Duration,
+    pub watch_retry: Duration,
     /// The first pause after a failure; it doubles up to `backoff_max`.
     pub backoff_base: Duration,
     pub backoff_max: Duration,
@@ -62,6 +67,7 @@ impl Default for Timing {
             idle_grace: IDLE_GRACE,
             sweep_every: SWEEP_EVERY,
             retire_retry: RETIRE_RETRY,
+            watch_retry: WATCH_RETRY,
             backoff_base: Duration::from_secs(5),
             backoff_max: BACKOFF_MAX,
         }
@@ -737,10 +743,11 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             .await
             .map_err(|error| {
                 if let Some(reason) = error.signin() {
-                    self.signin.failing(&self.config.name, reason);
+                    self.signin.failing_until_minted(&self.config.name, reason);
                 }
                 format!("no runner configuration: {error}")
             })?;
+        self.signin.minted(&self.config.name);
         {
             let mut state = self.lock();
             if let Some(machine) = state.machines.get_mut(name) {
@@ -771,6 +778,7 @@ impl<A: Access, L: Launcher> Pool<A, L> {
         let grace = ms(self.timing.completed_grace);
         let idle_max = ms(self.timing.idle_max);
         let mut retire_after_ms = 0;
+        let mut watch_failures: u32 = 0;
         loop {
             let now = now_ms();
             let (busy, idle_since, completed) =
@@ -800,15 +808,28 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             }
             let launcher = Arc::clone(&self.launcher);
             let watched = name.to_string();
-            if let Some(code) =
-                blocking(move || launcher.runner_exited(&watched, Duration::from_secs(5)))
-                    .await
-                    .map_err(|error| format!("the runner could not be watched: {error}"))?
-            {
-                if let Some(machine) = self.lock().machines.get_mut(name) {
-                    machine.phase = Phase::Ending;
+            match blocking(move || launcher.runner_exited(&watched, Duration::from_secs(5))).await {
+                Ok(Some(code)) => {
+                    if let Some(machine) = self.lock().machines.get_mut(name) {
+                        machine.phase = Phase::Ending;
+                    }
+                    return Ok(Some(code));
                 }
-                return Ok(Some(code));
+                Ok(None) => watch_failures = 0,
+                // A failed read is not an exit: Incus restarting or stalled says nothing about the runner. A runner
+                // with a job is watched until it exits; one without is given up only after many failures in a row.
+                Err(error) => {
+                    watch_failures = watch_failures.saturating_add(1);
+                    if watch_failures == 1 || watch_failures.is_multiple_of(12) {
+                        self.say(&format!(
+                            "machine {name}: its runner could not be watched ({watch_failures} in a row), still waiting: {error}"
+                        ));
+                    }
+                    if !busy && watch_failures >= WATCH_FAILURES_MAX {
+                        return Err(format!("the runner could not be watched: {error}"));
+                    }
+                    tokio::time::sleep(self.timing.watch_retry).await;
+                }
             }
         }
     }
@@ -851,13 +872,18 @@ impl<A: Access, L: Launcher> Pool<A, L> {
     }
 }
 
-/// The class's machines that count toward what it wants: all but those ending.
+/// The class's machines that count toward what it wants: all but those ending, and an ending one whose job GitHub has
+/// not reported finished yet, since GitHub's assigned count still holds that job.
 fn live_of(state: &State, class: usize) -> u32 {
     u32::try_from(
         state
             .machines
             .values()
-            .filter(|machine| machine.class == class && machine.phase != Phase::Ending)
+            .filter(|machine| {
+                machine.class == class
+                    && (machine.phase != Phase::Ending
+                        || (machine.started.is_some() && machine.completed.is_none()))
+            })
             .count(),
     )
     .unwrap_or(u32::MAX)

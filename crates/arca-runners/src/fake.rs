@@ -116,6 +116,7 @@ struct World {
     base: String,
     token: String,
     installed: bool,
+    refuse_mints: bool,
     registration_tokens: BTreeSet<String>,
     admin_tokens: BTreeSet<String>,
     scale_sets: BTreeMap<u64, FakeScaleSet>,
@@ -183,6 +184,17 @@ impl FakeGitHub {
         world.token = token.to_string();
         world.registration_tokens.clear();
         world.admin_tokens.clear();
+    }
+
+    /// Runner configurations are refused with 403 while the connection still polls, as when the App loses its
+    /// permission after the listener connected.
+    pub fn refuse_mints(&self, refuse: bool) {
+        self.lock().refuse_mints = refuse;
+    }
+
+    /// Every Actions service admin token given out stops working, as when one expires or is revoked.
+    pub fn expire_admin_tokens(&self) {
+        self.lock().admin_tokens.clear();
     }
 
     /// Queues a job. It is offered at once to the scale set with its labels, or when one is made.
@@ -269,6 +281,14 @@ impl FakeGitHub {
         let name = runner.name.clone();
         assign(&mut world);
         Some(name)
+    }
+
+    /// GitHub still lists a runner of that name.
+    pub fn runner_registered(&self, name: &str) -> bool {
+        self.lock()
+            .runners
+            .values()
+            .any(|runner| runner.name == name)
     }
 
     /// The job the runner of that name runs: its spec and how long it has run.
@@ -817,6 +837,9 @@ fn service(
             else {
                 return empty(StatusCode::NOT_FOUND);
             };
+            if world.refuse_mints {
+                return empty(StatusCode::FORBIDDEN);
+            }
             let name = body["name"].as_str().unwrap_or("").to_string();
             if name.is_empty() || world.runners.values().any(|runner| runner.name == name) {
                 return reply(
@@ -935,6 +958,8 @@ struct Machines {
     last_disk: BTreeSet<String>,
     fail_creates: u32,
     fail_destroys: u32,
+    fail_watches: u32,
+    destroyed_while_registered: Vec<String>,
 }
 
 /// The fake launcher. Its machines run the fake GitHub's jobs.
@@ -978,6 +1003,16 @@ impl FakeLauncher {
     /// The next `count` destroys of a machine that exists fail, as a destroy Incus refuses or times out.
     pub fn fail_destroys(&self, count: u32) {
         self.lock().fail_destroys = count;
+    }
+
+    /// The next `count` reads of a runner fail, as when Incus restarts or stalls.
+    pub fn fail_watches(&self, count: u32) {
+        self.lock().fail_watches = count;
+    }
+
+    /// The machines destroyed while GitHub still listed their runner.
+    pub fn destroyed_while_registered(&self) -> Vec<String> {
+        self.lock().destroyed_while_registered.clone()
     }
 
     /// A machine an earlier run left behind, or one the pool does not know.
@@ -1093,6 +1128,13 @@ impl Launcher for FakeLauncher {
 
     fn runner_exited(&self, name: &str, wait: Duration) -> Result<Option<i64>, LaunchError> {
         let until = Instant::now() + wait.min(Duration::from_millis(200));
+        {
+            let mut machines = self.lock();
+            if machines.fail_watches > 0 {
+                machines.fail_watches -= 1;
+                return Err(LaunchError("the fake read failed".to_string()));
+            }
+        }
         loop {
             if !self.lock().live.contains_key(name) {
                 return Err(LaunchError("no such machine".to_string()));
@@ -1117,7 +1159,16 @@ impl Launcher for FakeLauncher {
     }
 
     fn destroy(&self, name: &str) -> Result<(), LaunchError> {
+        let runner = self
+            .lock()
+            .live
+            .get(name)
+            .and_then(|machine| machine.runner.clone());
+        let registered = runner.is_some_and(|runner| self.github.runner_registered(&runner));
         let mut machines = self.lock();
+        if registered && machines.live.contains_key(name) && machines.fail_destroys == 0 {
+            machines.destroyed_while_registered.push(name.to_string());
+        }
         if machines.fail_destroys > 0 && machines.live.contains_key(name) {
             machines.fail_destroys -= 1;
             return Err(LaunchError("the fake destroy failed".to_string()));

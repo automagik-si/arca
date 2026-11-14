@@ -2,15 +2,16 @@
 //! the budget, warm runners, the state-leak test and the sign-in alert's state.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arca_runners::access::RegistrationAccess;
+use arca_runners::access::{AccessError, RegistrationAccess};
 use arca_runners::config::PoolConfig;
 use arca_runners::fake::{FakeGitHub, FakeLauncher, JobSpec};
 use arca_runners::record::Recorder;
 use arca_runners::scaleset::{Http, ScaleSetClient};
 use arca_runners::signin::SignInReason;
+use arca_runners::{Access, ActionsConnection, JobRef, MintRequest, Minted};
 use arca_runners::{Pool, Secret, SignInBoard, Timing};
 use serde_json::json;
 use tokio::sync::watch;
@@ -495,6 +496,12 @@ async fn an_old_idle_runner_is_replaced_and_a_busy_one_is_never_ended() {
         "{:?}",
         rig.github.removed_runners()
     );
+    // It was taken off GitHub before its machine went, never after.
+    assert!(
+        !rig.launcher.destroyed_while_registered().contains(&first),
+        "{:?}",
+        rig.launcher.destroyed_while_registered()
+    );
     // A job far longer than the idle age runs to its end on a warm runner.
     rig.github.queue_job(job("long", &[LABEL], 1.5));
     until("the long job", Duration::from_secs(15), || {
@@ -570,4 +577,128 @@ async fn a_machine_the_pool_does_not_know_is_swept_while_it_runs() {
             .contains(&"acme-0-0badf00d".to_string())
     );
     rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_read_of_a_busy_runner_does_not_end_its_job() {
+    let timing = Timing {
+        watch_retry: Duration::from_millis(50),
+        ..Timing::default()
+    };
+    let rig = rig_timed(config(0, 4, 32), timing, |_, _| {}).await;
+    until("the session", Duration::from_secs(10), || {
+        rig.github.session_open(LABEL)
+    })
+    .await;
+    rig.github.queue_job(job("long", &[LABEL], 2.0));
+    until("the job running", Duration::from_secs(10), || {
+        rig.pool.status().classes[0].busy == 1
+    })
+    .await;
+    // Incus restarts or stalls: the next reads of the runner fail. The job runs on to its end.
+    rig.launcher.fail_watches(3);
+    until("the long job", Duration::from_secs(15), || {
+        rig.github.finished().len() == 1
+    })
+    .await;
+    let finished = rig.github.finished();
+    assert_eq!(finished[0].result, "succeeded", "{finished:?}");
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mint_refusal_stays_on_the_board_while_the_listener_still_polls() {
+    let rig = rig(config(0, 4, 32), |_, _| {}).await;
+    until("the session", Duration::from_secs(10), || {
+        rig.github.session_open(LABEL)
+    })
+    .await;
+    // The App loses its permission after the listener connected: its polls still work, its mints do not.
+    rig.github.refuse_mints(true);
+    rig.github.queue_job(job("refused", &[LABEL], 0.1));
+    until("a sign-in failure", Duration::from_secs(10), || {
+        rig.signin
+            .read()
+            .get("acme")
+            .and_then(|state| state.failing)
+            == Some(SignInReason::Forbidden)
+    })
+    .await;
+    // The polls that work meanwhile do not clear it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.pool.signin().ok("acme");
+    assert_eq!(
+        rig.signin.read()["acme"].failing,
+        Some(SignInReason::Forbidden)
+    );
+    // A mint that works does.
+    rig.github.refuse_mints(false);
+    until("signed in again", Duration::from_secs(20), || {
+        rig.signin
+            .read()
+            .get("acme")
+            .is_some_and(|state| state.failing.is_none())
+    })
+    .await;
+    rig.finish().await;
+}
+
+/// [`RegistrationAccess`] that counts the connections the client drops.
+struct Counting {
+    inner: RegistrationAccess,
+    forgotten: AtomicU32,
+}
+
+impl Access for Counting {
+    async fn actions_connection(&self, binding: &str) -> Result<ActionsConnection, AccessError> {
+        self.inner.actions_connection(binding).await
+    }
+
+    async fn mint(&self, request: MintRequest) -> Result<Minted, AccessError> {
+        self.inner.mint(request).await
+    }
+
+    async fn attach_job(&self, mint_id: u64, job: JobRef) {
+        self.inner.attach_job(mint_id, job).await;
+    }
+
+    fn forget_connection(&self, binding: &str) {
+        self.forgotten.fetch_add(1, Ordering::Relaxed);
+        self.inner.forget_connection(binding);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_connection_is_dropped_by_its_holder_too() {
+    let github = FakeGitHub::start(TOKEN).await.expect("fake GitHub");
+    let http = Http::new().expect("http");
+    let access = Arc::new(Counting {
+        inner: RegistrationAccess::new(
+            http.clone(),
+            github.api_url(),
+            "https://github.com/acme",
+            Secret::new(TOKEN),
+        )
+        .expect("access"),
+        forgotten: AtomicU32::new(0),
+    });
+    let client = ScaleSetClient::new(http, Arc::clone(&access), "acme-org");
+    assert!(
+        client
+            .get_scale_set(3, "acme")
+            .await
+            .expect("a read")
+            .is_none()
+    );
+    assert_eq!(access.forgotten.load(Ordering::Relaxed), 0);
+    // The cached connection stops working: the client asks for a new one, and tells the holder to drop its own.
+    github.expire_admin_tokens();
+    assert!(
+        client
+            .get_scale_set(3, "acme")
+            .await
+            .expect("a read")
+            .is_none()
+    );
+    assert_eq!(access.forgotten.load(Ordering::Relaxed), 1);
 }

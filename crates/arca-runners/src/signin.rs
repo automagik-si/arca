@@ -34,6 +34,17 @@ pub struct SignIn {
     /// `None` when the last exchange that says anything about the credential worked.
     pub failing: Option<SignInReason>,
     pub at_ms: u64,
+    /// The failure came from a mint: only a mint that works clears it. The listener's polls run on a connection made
+    /// earlier and keep working for up to an hour after the credential stopped working, so a poll does not clear it.
+    pub until_minted: bool,
+}
+
+fn state(failing: Option<SignInReason>, until_minted: bool) -> SignIn {
+    SignIn {
+        failing,
+        at_ms: crate::time::now_ms(),
+        until_minted,
+    }
 }
 
 /// The board every pool writes its state on and the alerts read. Clones share it.
@@ -45,25 +56,35 @@ impl SignInBoard {
         Self::default()
     }
 
-    /// The pool's last exchange signed in.
+    /// The pool's last exchange signed in. A failure a mint found stays until a mint works.
     pub fn ok(&self, pool: &str) {
-        self.set(pool, None);
+        if let Ok(mut board) = self.0.lock() {
+            if board.get(pool).is_some_and(|state| state.until_minted) {
+                return;
+            }
+            board.insert(pool.to_string(), state(None, false));
+        }
     }
 
     /// The pool's last exchange failed for this reason.
     pub fn failing(&self, pool: &str, reason: SignInReason) {
-        self.set(pool, Some(reason));
+        if let Ok(mut board) = self.0.lock() {
+            let held = board.get(pool).is_some_and(|state| state.until_minted);
+            board.insert(pool.to_string(), state(Some(reason), held));
+        }
     }
 
-    fn set(&self, pool: &str, failing: Option<SignInReason>) {
+    /// A mint failed for this reason: the pool stays failing until a mint works.
+    pub fn failing_until_minted(&self, pool: &str, reason: SignInReason) {
         if let Ok(mut board) = self.0.lock() {
-            board.insert(
-                pool.to_string(),
-                SignIn {
-                    failing,
-                    at_ms: crate::time::now_ms(),
-                },
-            );
+            board.insert(pool.to_string(), state(Some(reason), true));
+        }
+    }
+
+    /// A mint worked: the credential signs in.
+    pub fn minted(&self, pool: &str) {
+        if let Ok(mut board) = self.0.lock() {
+            board.insert(pool.to_string(), state(None, false));
         }
     }
 

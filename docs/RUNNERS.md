@@ -100,8 +100,9 @@ repository, the workflow run id, the job id, the workflow reference, the labels 
 times. GitHub cannot narrow this permission to one runner group; the restraint is ours (the signer only acts in the
 binding's runner group with the labels the person chose), and the key never leaves the kernel.
 
-**The pool signs in through the signer.** A pool's `binding` is a connection the person made on the approval page
-(the one-link GitHub connect). The pool asks the kernel's signer for the Actions service connection and for every
+**The pool signs in through the signer.** A pool's `binding` is a GitHub App connection the person made on the
+approval page (the one-link GitHub connect). A device-flow or push connection cannot mint runners: the signer refuses
+it, the pool only logs the refusal and tries again, and no runner ever starts. The pool asks the kernel's signer for the Actions service connection and for every
 runner configuration; the signer refuses a scale set outside the connection's runner group and labels outside the
 connection's label sets, and writes every mint to its audit log. The pool holds no key and no token of its own, and
 there is no token file to place.
@@ -131,8 +132,12 @@ The node config's `runners` key (a kernel-mode node only):
 ```
 
 `binding` is the signer connection's id. The scale sets go into the runner group the connection made for the
-repositories the person picked; `runnerGroupId` names another group instead (the signer still mints only into its own).
-Each class's labels must be one of the connection's label sets. `image` is a local image alias or fingerprint, or
+repositories the person picked. Leave `runnerGroupId` unset: a pool that names any other group makes its scale sets
+there, and the signer then refuses every runner configuration, since it mints only into the connection's own group.
+Each class's labels must be one of the connection's label sets. A class whose labels are not boots a machine, is
+refused at the mint and waits; it tries again every five minutes at most, one machine boot each time, and never runs a
+job.
+`name` is at most 52 characters: a machine's name is the pool's name, `-<class>-` and 8 hex digits, and Incus allows 63. `image` is a local image alias or fingerprint, or
 `<instance>/<snapshot>` of a stopped template VM in the same project.
 Records and logs go to `<stateDir>/runners/<pool>/`.
 
@@ -156,7 +161,9 @@ Records and logs go to `<stateDir>/runners/<pool>/`.
 6. **Destroy.** Force stop, delete. Nothing is reused. A destroy that fails (Incus refused it or timed out) is tried
    again, waiting longer each time, and the machine keeps its share of the budget until it is gone.
 
-The pool never ends a runner that has a job: the job runs as long as it runs. A runner GitHub reports finished that has
+The pool never ends a runner that has a job: the job runs as long as it runs, and a failed read of the runner (Incus
+restarting or stalled) is not an exit, so the pool reads again five seconds later. A runner without a job whose reads
+fail sixty times in a row (five minutes or more) is ended. A runner GitHub reports finished that has
 not exited ten minutes later is stuck, and its machine is ended. An idle runner is replaced by a fresh machine after an
 hour without a job, and an idle runner above what the class wants goes after five minutes; either way its runner is
 removed from GitHub first (call 8), and the machine stays if GitHub refuses because it has just handed the runner a
@@ -212,7 +219,9 @@ A refusal of the request itself (a scale set outside the connection's runner gro
 the pool's settings, not its sign-in: the machine's record carries the signer's words, and the class waits before it
 tries again.
 
-Its label is `pool`. It clears after 120 seconds of successful calls. Network errors and GitHub's own 5xx are not
+Its label is `pool`. It clears after 120 seconds of successful calls. A failure found at a runner configuration (the
+App uninstalled or suspended after the pool connected) stays until a configuration is minted again, since the
+listener's polls run on the earlier connection and keep working for up to an hour. Network errors and GitHub's own 5xx are not
 sign-in failures: they keep the last state. `alerts_list` names the pool, never a token. The reason
 (`bad-credentials`, `app-not-installed`, `forbidden`, `no-credential`) is in the kernel's log line for the pool; the
 pool's status verb, a next slice, will show it.
