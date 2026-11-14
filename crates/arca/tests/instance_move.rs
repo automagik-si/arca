@@ -2148,3 +2148,159 @@ fn a_spot_check_that_differs_fails() {
     assert_eq!(one["result"], "rolled_back", "{status}");
     assert!(one["reason"].as_str().unwrap().contains("differs"), "{one}");
 }
+
+/// Plans `web` to node-c, as a Doctor retrying elsewhere would.
+fn plan_to_third(rig: &Rig) -> Value {
+    rig.source.link_migration(&rig.third);
+    rig.call_as(
+        Scope::Viewer,
+        "instance_move_plan",
+        json!({ "instances": [{ "project": "shop", "name": "web" }], "target": "node-c" }),
+    )
+    .expect("the plan answers")
+}
+
+/// R3-1: a move the kernel left with its copy started is `failed`, its copy running on node-b and its source stopped
+/// here. The instance is held while that copy runs: a move to node-c is not a go. Once the copy is stopped, it is.
+#[test]
+fn a_failed_move_whose_copy_runs_holds_the_instance() {
+    let rig = Rig::new(vec![web()], 100);
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Running");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+        ],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    let plan = plan_to_third(&rig);
+    assert_eq!(plan["go"], false, "{plan}");
+    let reasons = plan["blocked"][0]["reasons"].to_string();
+    assert!(
+        reasons.contains("mv-0123456789ab")
+            && reasons.contains("node-b")
+            && reasons.contains("Running"),
+        "{reasons}"
+    );
+    writer(&rig.target)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("the copy is stopped");
+    let plan = plan_to_third(&rig);
+    assert_eq!(
+        plan["go"], true,
+        "a stopped copy releases it: {}",
+        plan["blocked"]
+    );
+}
+
+/// R3-2: the way back (stop the copy, start the source), a finish that keeps the source, then the copy deleted on
+/// node-b: the instance may move again.
+#[test]
+fn after_going_back_and_finishing_the_instance_can_move_again() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    writer(&rig.target)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("copy stopped");
+    writer(&rig.source)
+        .set_state("shop", "web", "start", false, Duration::from_secs(5))
+        .expect("source started");
+    let finished = rig
+        .approve(&rig.propose_finish(&id).expect("proposed"))
+        .expect("finished");
+    assert!(
+        finished["kept"].to_string().contains("shop/web"),
+        "{finished}"
+    );
+    writer(&rig.target)
+        .delete_instance("shop", "web")
+        .expect("the copy is removed on the target");
+    let plan = rig.plan(&["web"]);
+    assert_eq!(plan["go"], true, "{}", plan["blocked"]);
+}
+
+/// R3-1: a target that cannot be read holds the instance: its copy there may run.
+#[test]
+fn a_copy_on_a_target_that_cannot_be_read_holds_the_instance() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    writer(&rig.target)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("copy stopped");
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    let plan = plan_to_third(&rig);
+    assert_eq!(plan["go"], false, "{plan}");
+    let reasons = plan["blocked"][0]["reasons"].to_string();
+    assert!(
+        reasons.contains(&id) && reasons.contains("could not be read"),
+        "{reasons}"
+    );
+}
+
+/// R3-1, at the start: a plan made while the copy was stopped does not start once the copy runs again.
+#[test]
+fn a_copy_started_again_after_the_plan_refuses_the_start() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    writer(&rig.target)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("copy stopped");
+    let plan = plan_to_third(&rig);
+    assert_eq!(plan["go"], true, "{}", plan["blocked"]);
+    let proposal = rig
+        .call_as(
+            Scope::Viewer,
+            "action_propose",
+            json!({ "action": "instance_move", "args": {
+                "plan": plan["digest"], "instances": [{ "project": "shop", "name": "web" }], "target": "node-c",
+            } }),
+        )
+        .expect("proposed");
+    writer(&rig.target)
+        .set_state("shop", "web", "start", false, Duration::from_secs(5))
+        .expect("copy started again");
+    let Err(CallError::Refused { code, message }) = rig.approve(&proposal) else {
+        panic!("the move started beside a running copy");
+    };
+    assert_eq!(code, "AlreadyMoved", "{message}");
+    assert!(message.contains(&id), "{message}");
+    assert!(!rig.third.holds("instance", "shop", "web"));
+}
+
+/// R3-3: the reason of a failed move with its copy started names what the owner can do, not a finish it is not offered.
+#[test]
+fn a_failed_move_with_its_copy_started_does_not_offer_a_finish() {
+    let rig = Rig::new(vec![web()], 100);
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Running");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+        ],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    let reason = status["instances"][0]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!reason.contains("finish the move"), "{reason}");
+    assert!(reason.contains("stop the copy"), "{reason}");
+}
