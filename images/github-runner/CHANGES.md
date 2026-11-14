@@ -13,6 +13,8 @@ changes (`patch-template.py`, `vm/`), and each build stops when one of them no l
 | The software report and the final tests run in the build user's SSH session | the same step first reads `/etc/environment` | over our SSH session GitHub's PATH additions were missing there (`ansible` in `/opt/pipx_bin` not found) |
 | Azure's agent makes 4096 MB of swap on the resource disk `/mnt` | `arca-swap.service` makes `/mnt/swapfile`, 4096 MB, at boot | the same swap without carrying the file in the image |
 | GitHub's provisioning adds the `runner` user and the runner program to each machine | in the image: `runner` (uid 1001, passwordless sudo, groups adm, users, systemd-journal, docker), `/home/runner/work`, the runner in `/home/runner/runners/<version>`, GitHub's `/opt/post-generation` scripts run once | a job machine starts ready |
+| A cloud-init setting mounts Azure's resource disk `ephemeral0` on `/mnt`; Ubuntu's LXD agent loader is installed | the setting is removed and `lxd-agent.service` is masked | neither exists outside Azure; both left a failed unit |
+| cloud-init's default user | none (`users: []`); the build's cloud-init seed is removed | GitHub's machines have only `runner` |
 | Homebrew belongs to the build user | `/home/linuxbrew` belongs to `runner` | the build user is removed |
 | The runner is registered by GitHub's own service | `arca-runner.service` runs one just-in-time runner per machine, its work folder set to `/home/runner/work`, then powers the machine off | one machine per job |
 

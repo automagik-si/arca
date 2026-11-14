@@ -66,6 +66,8 @@ command line.
 incus init arca/github-runner/ubuntu24/20261111.370 job-1 --project ci -c limits.cpu=2 -c limits.memory=8GiB
 incus config set job-1 user.arca-runner.jitconfig="$ENCODED_JIT_CONFIG" --project ci
 incus start job-1 --project ci          # runs one job, then powers off: delete it then
+# When the build kept the stopped machine instead of publishing it (too little room under /var/lib/incus):
+incus copy arca-runner-build-ubuntu24/image job-1 --project ci -c limits.cpu=2 -c limits.memory=8GiB
 ```
 
 ## The compatibility test

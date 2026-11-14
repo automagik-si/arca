@@ -76,8 +76,22 @@ install -m 0644 /tmp/arca-image/arca-runner.service /etc/systemd/system/arca-run
 install -m 0644 /tmp/arca-image/arca-swap.service /etc/systemd/system/arca-swap.service
 systemctl enable arca-runner.service arca-swap.service
 
+# Azure's edges that fail elsewhere: GitHub's cloud-init setting mounts Azure's resource disk (ephemeral0) on /mnt,
+# and Ubuntu's LXD agent loader (from ubuntu-server) starts when the machine is an Incus one, which has its own agent.
+# Either leaves a failed unit (systemctl is-system-running says degraded).
+rm -f /etc/cloud/cloud.cfg.d/99-azure-resource-disk-timeout.cfg
+sed -i '/^ephemeral0[[:space:]]/d' /etc/fstab
+systemctl disable lxd-agent.service 2>/dev/null || true
+systemctl mask lxd-agent.service
+
+# cloud-init makes its default user (ubuntu) on a machine's first boot; GitHub's machines have only runner.
+printf 'users: []\n' >/etc/cloud/cloud.cfg.d/90-arca-runner.cfg
+
 say "clean-up, as waagent -deprovision+user does"
 rm -rf /usr/local/lib/arca-image /tmp/arca-image
+# The build's cloud-init seed (its user and key) is a file in the machine: it goes, or every machine made from the
+# image would make that user again. Incus writes each machine's own seed when it starts.
+rm -rf /var/lib/cloud/seed/nocloud /var/lib/cloud/seed/nocloud-net
 if command -v cloud-init >/dev/null; then
   cloud-init clean --logs --machine-id || cloud-init clean --logs || warn "cloud-init clean failed"
 fi

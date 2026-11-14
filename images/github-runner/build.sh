@@ -257,6 +257,8 @@ in_vm --env RUNNER_VERSION="$RUNNER_VERSION" --env RUNNER_SHA256="$RUNNER_SHA256
   --env ARCA_DIFF_URL="$DIFF_URL_BASE/$slug/README.md" -- bash /tmp/arca-image/finalize.sh
 used=$(in_vm -- df -B1 --output=used / | tail -1 | tr -d ' ')
 incus stop "$vm" --project "$PROJECT"
+# The build user's cloud-init data must not go with the image: cloud-init would make that user again on every machine.
+incus config unset "$vm" cloud-init.user-data --project "$PROJECT"
 t_final=$(date +%s)
 
 # --- 7. the image -------------------------------------------------------------------------------------------------
@@ -271,7 +273,15 @@ if [ "$publish" = yes ] && [ "$(root_free)" -ge $(( used * 2 + 10 * 1073741824 )
   [ "$keep" = yes ] || incus delete "$vm" --project "$PROJECT"
 else
   [ "$publish" = yes ] && say "not publishing: /var/lib/incus has $(gib "$(root_free)") GiB free, needs $(gib $(( used * 2 + 10 * 1073741824 ))) GiB"
-  incus snapshot create "$vm" image --project "$PROJECT"
+  # A snapshot asked for right after a stop has hung on Incus 7.5 without ever becoming an operation: wait, bound it,
+  # and ask again.
+  snapshot=no
+  for try in 1 2 3; do
+    sleep 60
+    if timeout 300 incus snapshot create "$vm" image --project "$PROJECT"; then snapshot=yes; break; fi
+    say "the snapshot did not come (try $try of 3)"
+  done
+  [ "$snapshot" = yes ] || { say "no snapshot: the stopped machine $vm is the image; snapshot it by hand"; keep=yes; }
   kept="the stopped machine $vm, snapshot image, in project $PROJECT"
 fi
 t_end=$(date +%s)
