@@ -3,22 +3,35 @@
 # under $FAKE_DOCKER_DIR, writes every call's arguments to $FAKE_DOCKER_DIR/calls.log, and plays a runner: a container
 # started from the runner image reads its just-in-time configuration from the file mounted at /run/arca/jitconfig, asks
 # the fake GitHub for a job with it, runs the job once and exits. When GitHub tells it to update itself first it does
-# what a real runner does: it replaces its own files, which fails when its tools directory is a mount. Nothing here is
-# Docker.
+# what a real runner does: it replaces its own files, which fails when its tools directory is a mount. `docker build`
+# records the Dockerfile it reads and makes a local image of it; a runner is played in a container started from the
+# runner image, or from a local image built FROM it. In registration-token mode a container named <pool>-s<slot>-reg
+# plays config.sh: it registers a persistent runner with the token mounted at /run/arca/token and writes the runner's
+# registration into the folder mounted at /run/arca/registration; a runner started with such a registration takes job
+# after job and does not exit. Nothing here is Docker.
 set -u
 # The controller runs with only the programs its script declares on its PATH. This stand-in is not the controller: it
 # takes the machine's whole PATH back, and does not report its own programs as the controller's.
 PATH=${FAKE_PATH:-$PATH}
 unset -f command_not_found_handle 2>/dev/null
 root=$FAKE_DOCKER_DIR
-mkdir -p "$root/containers"
-printf '%s\n' "$*" >>"$root/calls.log"
+mkdir -p "$root/containers" "$root/images"
+# A played runner in a session of its own, when the test asks for one (FAKE_DETACH): a real container outlives the
+# controller that started it, and a played runner outlives the controller's process group then. It is no call.
+play_args=()
+if [ "${1-}" = __play ]; then
+  shift
+  play_detached=1
+  play_args=("$@")
+fi
+[ -n "${play_detached:-}" ] || printf '%s\n' "$*" >>"$root/calls.log"
 command=${1-}
 [ $# -gt 0 ] && shift
 
 # The name, the slice and the image of a `docker run` or `docker create`: the image is the first argument that is
 # neither an option nor an option's value.
-name='' cgroup_parent='' image='' jit_file='' tools_mounted='' home_mount='' command_line=''
+name='' cgroup_parent='' image='' jit_file='' tools_mounted='' home_mount='' command_line='' token_file='' reg_dir=''
+reg_dir_ro='' command_args=()
 parse_run() {
   while [ $# -gt 0 ]; do
     case $1 in
@@ -27,6 +40,9 @@ parse_run() {
       -v)
         case $2 in
           *:/run/arca/jitconfig:ro) jit_file=${2%:/run/arca/jitconfig:ro} ;;
+          *:/run/arca/token:ro) token_file=${2%:/run/arca/token:ro} ;;
+          *:/run/arca/registration) reg_dir=${2%:/run/arca/registration} ;;
+          *:/run/arca/registration:ro) reg_dir_ro=${2%:/run/arca/registration:ro} ;;
           *:/home/runner/externals | *:/home/runner/externals:*) tools_mounted=1 ;;
           *:/home/runner:ro) home_mount=${2%:/home/runner:ro} ;;
           *:/home/runner) home_mount=${2%:/home/runner} ;;
@@ -40,6 +56,7 @@ parse_run() {
         image=$1
         shift
         command_line=$*
+        command_args=("$@")
         return
         ;;
     esac
@@ -47,11 +64,35 @@ parse_run() {
 }
 
 play_runner() {
-  local dir=$1 jit=$2 tools_mounted=$3 answer job seconds result
-  echo "Connected to GitHub" >>"$dir/log"
-  echo "Listening for Jobs" >>"$dir/log"
+  local dir=$1 jit=$2 tools_mounted=$3 persistent=${4-} answer job seconds result listening=''
+  # A just-in-time runner says it listens at once. A persistent one says so once GitHub has taken its registration,
+  # as the real runner does after it has made its session; one GitHub no longer has says what the real one says.
+  # A test can make a persistent runner end at once, before it reaches GitHub, as one whose start fails does.
+  if [ -n "$persistent" ] && [ -n "${FAKE_PERSISTENT_DIES:-}" ]; then
+    echo "An error occurred: the runner could not start" >>"$dir/log"
+    end_play 1
+    return
+  fi
+  # Or GitHub refuses the first one as it makes its session, with what runner 2.338.2 says when the runner is not
+  # found; the ones after it reach GitHub.
+  if [ -n "$persistent" ] && [ -n "${FAKE_PERSISTENT_NOT_FOUND:-}" ] && [ ! -e "$root/not-found-said" ]; then
+    : >"$root/not-found-said"
+    echo "The runner no longer exists on the server. Please reconfigure the runner." >>"$dir/log"
+    end_play 1
+    return
+  fi
+  if [ -z "$persistent" ]; then
+    echo "Connected to GitHub" >>"$dir/log"
+    echo "Listening for Jobs" >>"$dir/log"
+  fi
   while [ -d "$dir" ]; do
     answer=$(printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/poll" 2>/dev/null) || answer=''
+    if [ -n "$persistent" ] && [ -z "$listening" ] && [ -n "$answer" ] &&
+      [ "$(printf '%s' "$answer" | jq -r '.gone // empty' 2>/dev/null)" != true ]; then
+      listening=1
+      echo "√ Connected to GitHub" >>"$dir/log"
+      echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: Listening for Jobs" >>"$dir/log"
+    fi
     if [ "$(printf '%s' "$answer" | jq -r '.update // empty' 2>/dev/null)" = true ]; then
       # GitHub wants a newer runner: the runner downloads it and replaces its own bin and externals directories.
       echo "Runner update in progress, do not shutdown runner." >>"$dir/log"
@@ -60,12 +101,12 @@ play_runner() {
       [ -d "$dir" ] || return
       if [ -n "$tools_mounted" ]; then
         echo "mv: cannot move '/home/runner/externals' to '/home/runner/externals.old': Device or resource busy" >>"$dir/log"
-        echo 1 >"$dir/exit"
+        end_play 1
         return
       fi
       if [ -n "${FAKE_UPDATE_FAILS:-}" ]; then
         echo "An error occurred: the update could not be downloaded" >>"$dir/log"
-        echo 1 >"$dir/exit"
+        end_play 1
         return
       fi
       echo "Runner will exit shortly for update, should be back online within 10 seconds." >>"$dir/log"
@@ -87,16 +128,58 @@ play_runner() {
       rm -f "$dir/worker"
       echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: Job $job completed with result: $result" >>"$dir/log"
       printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/done" >/dev/null 2>&1
-      echo 0 >"$dir/exit"
+      # A persistent runner goes back to listening for its next job, unless the test makes it stop after one.
+      if [ -n "$persistent" ] && [ -n "${FAKE_PERSISTENT_STOPS_AFTER_JOB:-}" ]; then
+        echo "An error occurred: the runner stopped" >>"$dir/log"
+        end_play 1
+        return
+      fi
+      if [ -n "$persistent" ]; then
+        echo "Listening for Jobs" >>"$dir/log"
+        continue
+      fi
+      end_play 0
       return
     fi
     if [ "$(printf '%s' "$answer" | jq -r '.gone // empty' 2>/dev/null)" = true ]; then
-      echo 1 >"$dir/exit"
+      # What runner 2.338.2 says: one removed while it listens cleans up and ends with 0; one refused as it makes its
+      # session ends with an error.
+      if [ -n "$persistent" ] && [ -n "$listening" ]; then
+        echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: The runner no longer exists on the server. Cleaning up local configuration." >>"$dir/log"
+        end_play 0
+        return
+      fi
+      if [ -n "$persistent" ]; then
+        echo "Failed to create a session. The runner registration has been deleted from the server, please re-configure. Runner registrations are automatically deleted for runners that have not connected to the service recently." >>"$dir/log"
+        echo "Runner listener exit with terminated error, stop the service, no retry needed." >>"$dir/log"
+      fi
+      end_play 1
       return
     fi
     sleep 0.05
   done
 }
+
+# A container's process ends: its exit code, and when, as Docker's State.FinishedAt says. A controller that adopts a
+# runner left by an earlier one times its job to this, not to when it next looked.
+end_play() {
+  echo "$1" >"$dir/exit"
+  date -u '+%Y-%m-%dT%H:%M:%S.%NZ' >"$dir/finished"
+}
+
+# The file that holds a local image's Dockerfile: its name with every / and : made a _.
+image_file() { printf '%s/images/%s' "$root" "$(printf '%s' "$1" | tr '/:' '__')"; }
+
+# Whether a container of `image` plays a runner: the runner image, or a local image built from it.
+runner_image() {
+  [ "$1" = "$FAKE_RUNNER_IMAGE" ] && return 0
+  [ -e "$(image_file "$1")" ] && [ "$(head -n1 "$(image_file "$1")")" = "FROM $FAKE_RUNNER_IMAGE" ]
+}
+
+if [ -n "${play_detached:-}" ]; then
+  play_runner "${play_args[@]}" </dev/null >/dev/null 2>&1
+  exit 0
+fi
 
 case $command in
   run | create)
@@ -116,14 +199,76 @@ case $command in
       echo "${FAKE_MEMORY_PEAK:-1610612736}" >"$cgroup/memory.peak"
       printf 'usage_usec %s\nuser_usec 1\nsystem_usec 1\n' "${FAKE_CPU_USEC:-73400000}" >"$cgroup/cpu.stat"
     fi
-    if [ "$command" = run ] && [ "$image" = "$FAKE_RUNNER_IMAGE" ] && [ "$name" != "${name%-run}" ]; then
+    if [ "$command" = run ] && runner_image "$image" && [ "$name" != "${name%-reg}" ]; then
+      # config.sh, in a container that ends when it is done (docker run --rm, not -d): its output is the command's.
+      rm -rf "$dir"
+      # shellcheck disable=SC2016
+      [ "${command_args[0]-}" = /bin/bash ] && [ "${command_args[1]-}" = -c ] &&
+        [ "${command_args[2]-}" = 'ACTIONS_RUNNER_INPUT_TOKEN=$(cat /run/arca/token) && export ACTIONS_RUNNER_INPUT_TOKEN && cd /home/runner && ./config.sh --unattended --replace "$@" && cp .runner .credentials .credentials_rsaparams /run/arca/registration/' ] ||
+        { echo "fake docker: the registration's command does not read its token" >&2; exit 125; }
+      [ -r "$token_file" ] && [ -d "$reg_dir" ] || { echo "fake docker: the registration was given no token or no folder" >&2; exit 125; }
+      set -- "${command_args[@]:4}"
+      url='' runner_name='' group='' labels='' ephemeral=false
+      while [ $# -gt 0 ]; do
+        case $1 in
+          --url) url=$2; shift 2 ;;
+          --name) runner_name=$2; shift 2 ;;
+          --runnergroup) group=$2; shift 2 ;;
+          --labels) labels=$2; shift 2 ;;
+          --ephemeral) ephemeral=true; shift ;;
+          --work) shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      echo "--------------------------------------------------------------------------------"
+      echo "|        ____ _ _   _   _       _          _        _   _                      |"
+      echo "# Authentication"
+      body=$(jq -nc --rawfile token "$token_file" --arg url "$url" --arg name "$runner_name" --arg group "$group" \
+        --arg labels "$labels" --argjson ephemeral "$ephemeral" \
+        '{token: $token, url: $url, name: $name, group: $group, labels: $labels, ephemeral: $ephemeral}')
+      answer=$(printf '%s' "$body" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/register" 2>/dev/null)
+      credential=$(printf '%s' "$answer" | jq -r '.credential // empty' 2>/dev/null)
+      if [ -z "$credential" ]; then
+        echo "Http response code: NotFound from 'POST https://api.github.com/actions/runner-registration'"
+        echo "Response status code does not indicate success: 404 (Not Found)."
+        exit 1
+      fi
+      echo "√ Connected to GitHub"
+      echo "√ Runner successfully added"
+      printf '{"agentName":"%s"}\n' "$runner_name" >"$reg_dir/.runner"
+      printf '%s' "$credential" >"$reg_dir/.credentials"
+      echo rsa >"$reg_dir/.credentials_rsaparams"
+      echo "√ Settings Saved."
+      exit 0
+    fi
+    if [ "$command" = run ] && runner_image "$image" && [ "$name" != "${name%-run}" ] && [ -n "$reg_dir_ro" ]; then
+      # A persistent runner reads the registration a registration container wrote.
+      case $command_line in
+        '/bin/bash -c cp /run/arca/registration/.runner /run/arca/registration/.credentials /run/arca/registration/.credentials_rsaparams /home/runner/ && exec /home/runner/run.sh') ;;
+        *) echo "fake docker: the persistent runner's command does not read its registration" >&2; exit 125 ;;
+      esac
+      [ -s "$reg_dir_ro/.runner" ] && [ -s "$reg_dir_ro/.credentials_rsaparams" ] && [ -r "$reg_dir_ro/.credentials" ] ||
+        { echo "fake docker: the runner was given no registration" >&2; exit 125; }
+      if [ -n "${FAKE_DETACH:-}" ]; then
+        setsid "$0" __play "$dir" "$(cat "$reg_dir_ro/.credentials")" "$tools_mounted" persistent </dev/null >/dev/null 2>&1 &
+      else
+        play_runner "$dir" "$(cat "$reg_dir_ro/.credentials")" "$tools_mounted" persistent </dev/null >/dev/null 2>&1 &
+      fi
+      echo "id-$name"
+      exit 0
+    fi
+    if [ "$command" = run ] && runner_image "$image" && [ "$name" != "${name%-run}" ]; then
       # The container's command reads the configuration from the mounted file, as the real one does.
       case $command_line in
         '/bin/bash -c ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat /run/arca/jitconfig) && export ACTIONS_RUNNER_INPUT_JITCONFIG && exec /home/runner/run.sh') ;;
         *) echo "fake docker: the runner's command does not read its configuration" >&2; exit 125 ;;
       esac
       [ -r "$jit_file" ] || { echo "fake docker: the runner was given no configuration file" >&2; exit 125; }
-      play_runner "$dir" "$(cat "$jit_file")" "$tools_mounted" </dev/null >/dev/null 2>&1 &
+      if [ -n "${FAKE_DETACH:-}" ]; then
+        setsid "$0" __play "$dir" "$(cat "$jit_file")" "$tools_mounted" </dev/null >/dev/null 2>&1 &
+      else
+        play_runner "$dir" "$(cat "$jit_file")" "$tools_mounted" </dev/null >/dev/null 2>&1 &
+      fi
     fi
     echo "id-$name"
     ;;
@@ -137,14 +282,24 @@ case $command in
     ;;
   ps)
     for dir in "$root"/containers/*/; do
-      [ -d "$dir" ] && echo "id-$(basename "$dir")"
+      [ -d "$dir" ] || continue
+      case " $* " in
+        *' {{.ID}} {{.Names}} '*) echo "id-$(basename "$dir") $(basename "$dir")" ;;
+        *) echo "id-$(basename "$dir")" ;;
+      esac
     done
     ;;
   inspect)
     for last; do :; done
     dir="$root/containers/$last"
     [ -d "$dir" ] || exit 1
-    if [ -e "$dir/exit" ]; then echo "false $(cat "$dir/exit")"; else echo "true 0"; fi
+    case " $* " in
+      *FinishedAt*)
+        # An ended container says when: a running one, or one whose end was never played, has no time to give.
+        if [ -e "$dir/finished" ]; then cat "$dir/finished"; else echo "0001-01-01T00:00:00Z"; fi
+        ;;
+      *) if [ -e "$dir/exit" ]; then echo "false $(cat "$dir/exit")"; else echo "true 0"; fi ;;
+    esac
     ;;
   top)
     dir="$root/containers/$1"
@@ -169,8 +324,43 @@ case $command in
   exec)
     [ -d "$root/containers/$1" ] || exit 1
     ;;
-  image | pull)
+  image)
+    # `image inspect`: an image named by digest is there unless the test says none is; a local name only once built.
+    for last; do :; done
+    case $last in
+      *@sha256:*) [ ! -e "$root/no-images" ] ;;
+      *) [ -e "$(image_file "$last")" ] ;;
+    esac
+    ;;
+  pull)
     [ ! -e "$root/no-images" ]
+    ;;
+  build)
+    # `docker build -t <name> -`: the Dockerfile comes on the standard input. A test makes it fail with the package
+    # manager's words in $root/fail-build. Without buildx, Docker's legacy builder keeps a failed step's container
+    # unless --force-rm is given: that container has no label of the pool, so it is modeled here as it is left.
+    tag='' force_rm=''
+    while [ $# -gt 0 ]; do
+      case $1 in
+        -t) tag=$2; shift 2 ;;
+        --force-rm) force_rm=1; shift ;;
+        *) shift ;;
+      esac
+    done
+    recipe=$(cat)
+    printf '%s\n' "$recipe" >>"$root/dockerfiles.log"
+    if [ -e "$root/fail-build" ]; then
+      if [ -z "$force_rm" ]; then
+        mkdir -p "$root/containers/build-failed-$$"
+      fi
+      echo "Step 3/4 : RUN apt-get update && apt-get install ..."
+      cat "$root/fail-build"
+      echo "The command '/bin/sh -c apt-get update' returned a non-zero code: 100" >&2
+      exit 1
+    fi
+    [ -n "$tag" ] || exit 1
+    printf '%s\n' "$recipe" >"$(image_file "$tag")"
+    echo "Successfully tagged $tag"
     ;;
   cp)
     for last; do :; done

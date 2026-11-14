@@ -1,0 +1,49 @@
+# Builds the CI analysis image (packages/arca-ci-analysis) and publishes it to GHCR. Its digest, printed in the job
+# summary, is what an Arca function_create names: a function is an image by digest, never a tag.
+name: ci-analysis image
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - packages/arca-ci-analysis/**
+      - .github/workflows/ci-analysis-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-analysis-image
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.11.0
+          package-manager-cache: false
+      - name: node --test
+        working-directory: packages/arca-ci-analysis
+        run: node --test
+      - name: Build and push
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/arca-ci-analysis
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker build --tag "$IMAGE:${GITHUB_SHA}" packages/arca-ci-analysis
+          docker push "$IMAGE:${GITHUB_SHA}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:${GITHUB_SHA}")
+          echo "image ${digest%@*}, digest ${digest#*@}" | tee -a "$GITHUB_STEP_SUMMARY"

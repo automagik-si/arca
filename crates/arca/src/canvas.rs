@@ -407,6 +407,7 @@ static CSP: LazyLock<String> = LazyLock::new(|| {
         (include_str!("approve_page.html"), "style"),
         (SIGN_IN_PAGE, "style"),
         (ERROR_PAGE, "style"),
+        (include_str!("github_page.html"), "style"),
     ] {
         if let Some(hash) = inline_hash(html, tag) {
             styles.push(hash);

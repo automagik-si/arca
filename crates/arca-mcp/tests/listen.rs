@@ -275,6 +275,9 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "function_runs",
             "registry_list",
             "instance_move_preflight",
+            "github_connect_status",
+            "github_bindings",
+            "github_audit",
             "os_update"
         ]
     );

@@ -38,6 +38,7 @@ pub(super) fn recorded_refusal(cfg: &NodeConfig, verb: &str, args: &Value) -> Op
             verb,
             "service_create"
                 | "service_update"
+                | "service_reconfigure"
                 | "service_remove"
                 | "service_import"
                 | "service_release"

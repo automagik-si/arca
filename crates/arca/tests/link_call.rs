@@ -64,6 +64,10 @@ impl Drop for Temp {
     }
 }
 
+/// How long a `link serve` process may take to say it runs. Only a bound: the test waits for the status itself, and a
+/// debug build of the node started twice on a loaded machine once took more than the 10 seconds this was.
+const STARTUP: Duration = Duration::from_secs(60);
+
 struct LinkProcess(std::process::Child);
 impl Drop for LinkProcess {
     fn drop(&mut self) {
@@ -86,7 +90,7 @@ async fn start_link_process(temp: &Temp, name: &str) -> LinkProcess {
             .spawn()
             .unwrap(),
     );
-    timeout(Duration::from_secs(10), async {
+    timeout(STARTUP, async {
         loop {
             assert!(child.0.try_wait().unwrap().is_none(), "link exited early");
             if temp.state().status().is_ok() {
@@ -102,7 +106,8 @@ async fn start_link_process(temp: &Temp, name: &str) -> LinkProcess {
 
 #[tokio::test]
 async fn peer_call_between_two_link_processes_returns_mcp_response() {
-    timeout(Duration::from_secs(30), async {
+    // Two startups, each within its own bound, and the call.
+    timeout(STARTUP * 3, async {
         let (host_dir, caller_dir) = (Temp::new(), Temp::new());
         host_dir.config();
         let token = caller_dir.config();

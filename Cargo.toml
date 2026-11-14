@@ -42,13 +42,20 @@ iroh = { version = "=1.4.1", features = ["unstable-custom-transports"] }
 iroh-tickets = "=1.0.0"
 qrcodegen = "=1.8.0"
 regex = "=1.13.1"
+# The GitHub signer's outbound HTTPS client (api.github.com and the Actions service). In the lock already through
+# iroh-relay with the same feature; the crypto provider is ring through `rustls` below, never aws-lc, and the roots are
+# webpki-roots, so a static binary needs no system certificate store.
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider"] }
+webpki-roots = "=1.0.11"
 # RS256 passkeys (some Windows Hello and TPM authenticators): RSASSA-PKCS1-v1_5 verification. In the lock already through
-# ssh-key. Only public-key operations are used, so no RSA private key is ever handled outside the tests.
+# ssh-key. One private-key operation exists: the GitHub signer signs its App's short-lived JWT with the App's key, which
+# it alone reads (crates/arca/src/github_api.rs).
 rsa = { version = "=0.9.10", default-features = false, features = ["std", "u64_digit"] }
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
 # SQLite is compiled from its bundled source, so the static musl build needs no system library.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
-# The browser passkey test's TLS front (dev only). Both are in the lock already through iroh; ring, never aws-lc.
+# The browser passkey test's TLS front, and the GitHub signer's client config. Both are in the lock already through iroh;
+# ring, never aws-lc.
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring"] }
 # Safe wrappers for the few file calls std lacks: an exclusive read-only open of a disk, and mkdirat/openat walks. And
