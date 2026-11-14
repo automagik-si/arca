@@ -7,6 +7,7 @@ changes (`patch-template.py`, `vm/`), and each build stops when one of them no l
 |---|---|---|
 | Packer `azure-arm` source: an Azure `Standard_D4s_v4`, 75 GB disk, Canonical's Ubuntu server image | Packer `null` source over SSH to an Incus virtual machine: 4 CPUs, 8 GiB, 80 GiB ext4 root, Ubuntu cloud image from images.linuxcontainers.org | no Azure |
 | Last step `waagent -force -deprovision+user` | `vm/finalize.sh`: removes the build user, cloud-init's state, the machine id, SSH host keys and the logs | no Azure agent |
+| Canonical's Ubuntu server image as the base | the images.linuxcontainers.org cloud image plus Ubuntu's `ubuntu-server` and `ubuntu-standard` package sets, installed before GitHub's scripts | GitHub's scripts expect what the server image carries (motd-news, snapd, needrestart, fwupd) |
 | `configure-environment.sh` edits `/etc/waagent.conf` | an empty `/etc/waagent.conf` before the build takes the edits | the script stops when the file is missing |
 | A failed image test stops the build | recorded and the build goes on (record mode, the default); the failures are listed here | one failure must not cost a whole build; `--tests strict` behaves as GitHub |
 | Azure's agent makes 4096 MB of swap on the resource disk `/mnt` | `arca-swap.service` makes `/mnt/swapfile`, 4096 MB, at boot | the same swap without carrying the file in the image |

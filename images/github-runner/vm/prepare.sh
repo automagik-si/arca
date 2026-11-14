@@ -10,6 +10,13 @@ if [ "$root_fs" != ext4 ]; then
   exit 1
 fi
 
+# GitHub starts from Canonical's Ubuntu server image; the cloud image here is smaller. Ubuntu's own server and standard
+# package sets bring what GitHub's scripts take for granted (motd-news, snapd, needrestart, fwupd and the rest).
+echo "prepare: installing ubuntu-server and ubuntu-standard, as on Canonical's server image"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q >/dev/null
+apt-get install -y -q ubuntu-server ubuntu-standard >/dev/null
+
 # configure-environment.sh edits the Azure agent's settings and stops when the file is missing. There is no agent:
 # an empty file takes the edits and does nothing.
 [ -e /etc/waagent.conf ] || : >/etc/waagent.conf
