@@ -105,6 +105,7 @@ struct Rig {
     dir: PathBuf,
     source: FakeIncus,
     target: FakeIncus,
+    third: FakeIncus,
     _kernel_fake: FakeIncus,
     _scratch: Scratch,
     kernel: Arc<Mutex<Kernel>>,
@@ -152,6 +153,7 @@ impl Rig {
         }
         let target = host(&dir.join("target"), Vec::new(), target_mib, true);
         source.link_migration(&target);
+        let third = host(&dir.join("third"), Vec::new(), target_mib, true);
         fs::create_dir_all(dir.join("kernel")).expect("kernel dir");
         let kernel_fake = FakeIncus::start(
             &dir.join("kernel"),
@@ -175,6 +177,11 @@ impl Rig {
                 "socket": dir.join("node-b-arca.sock"),
                 "tokenFile": dir.join("node-b.token"),
                 "incusSocket": target.socket(),
+            }, {
+                "name": "node-c",
+                "socket": dir.join("node-c-arca.sock"),
+                "tokenFile": dir.join("node-c.token"),
+                "incusSocket": third.socket(),
             }] },
         }))
         .expect("config");
@@ -241,6 +248,7 @@ impl Rig {
             dir,
             source,
             target,
+            third,
             _kernel_fake: kernel_fake,
             _scratch: scratch,
             kernel,
@@ -1875,4 +1883,185 @@ fn a_busy_delete_is_tried_again_until_the_operation_ends() {
         deletes >= 2,
         "it was answered busy and tried again: {deletes} delete(s)"
     );
+}
+
+// ---- The review of 5596780: each test below fails without the fix it names. ----
+
+/// N1: a moved source that is not finished waits here, stopped. Planning it to another host is refused: its copy on
+/// node-b runs, and a second copy started on node-c would run beside it with the same address.
+#[test]
+fn a_moved_source_that_is_not_finished_is_not_moved_again() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    rig.source.link_migration(&rig.third);
+    let plan = rig
+        .call_as(
+            Scope::Viewer,
+            "instance_move_plan",
+            json!({ "instances": [{ "project": "shop", "name": "web" }], "target": "node-c" }),
+        )
+        .expect("the plan answers");
+    assert_eq!(plan["go"], false, "{plan}");
+    let reasons = plan["blocked"][0]["reasons"].to_string();
+    assert!(reasons.contains(&format!("finish move {id}")), "{reasons}");
+    assert!(!rig.third.holds("instance", "shop", "web"));
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Stopped")
+    );
+}
+
+/// N1: a plan made before the first move ended is refused at its start too.
+#[test]
+fn a_plan_made_before_its_source_moved_does_not_start_after() {
+    let rig = Rig::new(vec![web()], 100);
+    let first = rig.plan_with(&["web"], json!({ "rounds": 1 }));
+    let second = rig.plan_with(&["web"], json!({ "rounds": 2 }));
+    let first_card = rig.propose_move(&first).expect("proposed");
+    let second_card = rig.propose_move(&second).expect("proposed");
+    let id = rig.approve(&first_card).expect("started")["move"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    let Err(CallError::Refused { code, message }) = rig.approve(&second_card) else {
+        panic!("the second plan started");
+    };
+    assert_eq!(code, "AlreadyMoved", "{message}");
+    assert!(message.contains(&format!("finish move {id}")), "{message}");
+    assert_eq!(rig.source.pushes().len(), 2, "{:?}", rig.source.pushes());
+}
+
+/// N2: a source Incus reports Frozen at the cutover (a snapshot freezes it on dir, lvm and ceph) is neither stopped nor
+/// left beside a started copy: the move fails safely, deletes only its own copy, and Incus thaws the source.
+#[test]
+fn a_source_frozen_at_the_cutover_fails_the_move_safely() {
+    let mut frozen = web();
+    frozen["status"] = json!("Frozen");
+    let rig = Rig::new(vec![frozen], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let status = rig.wait(&id);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{status}");
+    assert!(one["reason"].as_str().unwrap().contains("Frozen"), "{one}");
+    assert!(
+        !rig.target.holds("instance", "shop", "web"),
+        "its own copy is removed"
+    );
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Frozen")
+    );
+    assert!(
+        rig.journal()
+            .iter()
+            .all(|l| !(l["event"] == "cutover" && l["step"] == "starting")),
+        "the copy was never started"
+    );
+}
+
+/// N2: a source started again during the last round is read back before the copy starts, and the copy is not started.
+#[test]
+fn a_source_started_during_the_last_round_stops_the_copy_from_starting() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let last = held(&rig, 1);
+    writer(&rig.source)
+        .set_state("shop", "web", "start", false, Duration::from_secs(5))
+        .expect("started again");
+    rig.source.release_operation(&last);
+    let status = rig.wait(&id);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{status}");
+    assert!(one["reason"].as_str().unwrap().contains("Running"), "{one}");
+    assert!(!rig.target.holds("instance", "shop", "web"));
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Running")
+    );
+}
+
+/// N3: the card estimates the downtime from the whole size, since the last round resends the whole volume today.
+#[test]
+fn the_card_estimates_the_downtime_from_the_whole_size() {
+    let rig = Rig::new(vec![web()], 100);
+    let plan = rig.plan(&["web"]);
+    let one = &plan["plan"]["instances"][0];
+    let measured = one["bytes"]["measured"].as_u64().unwrap();
+    assert_eq!(
+        one["estimatedDowntimeSeconds"].as_u64().unwrap(),
+        30 + measured.div_ceil(50 * MIB)
+    );
+    assert!(
+        !one["rounds"]["order"]
+            .to_string()
+            .contains("only what changed"),
+        "{one}"
+    );
+    let card = rig.propose_move(&plan).expect("proposed")["details"].to_string();
+    assert!(card.contains("resends the whole"), "{card}");
+}
+
+/// N5: a kept source whose boot.autostart could not be turned off is named in the result for the owner.
+#[test]
+fn a_source_whose_autostart_stays_on_is_named_in_the_result() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.set_reject_patch("/1.0/instances/web");
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let status = rig.wait(&id);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "moved", "{status}");
+    assert!(
+        one["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("boot.autostart"),
+        "{one}"
+    );
+    assert_eq!(result_line(&rig, "web")["autostartOff"], false);
+}
+
+/// N7: when the source's spot-check file can be read neither before nor after the stop, the check fails.
+#[test]
+fn a_spot_check_with_no_reference_on_the_source_fails() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let first = held(&rig, 1);
+    // The file goes from the source once the plan was checked: no read of it works, before or after the stop.
+    rig.source.remove_guest_file("shop", "web", "/etc/hostname");
+    rig.source.release_operation(&first);
+    let status = rig.wait(&id);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{status}");
+    assert!(
+        one["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could not be read on the source"),
+        "{one}"
+    );
+}
+
+/// N7: a copy whose spot-check file differs from the source's fails the check.
+#[test]
+fn a_spot_check_that_differs_fails() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let last = held(&rig, 1);
+    // The last delta was taken; the source's file changes after it.
+    rig.source
+        .write_guest_file("shop", "web", "/etc/hostname", b"changed\n");
+    rig.source.release_operation(&last);
+    let status = rig.wait(&id);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{status}");
+    assert!(one["reason"].as_str().unwrap().contains("differs"), "{one}");
 }

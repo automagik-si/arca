@@ -4564,6 +4564,13 @@ impl FakeIncus {
             .insert(format!("{project}/{name}:{path}"), bytes.to_vec());
     }
 
+    /// Removes a file from an instance's guest, as the guest removed it: a read through the file API is then 404.
+    pub fn remove_guest_file(&self, project: &str, name: &str, path: &str) {
+        lock(&self.shared.service)
+            .files
+            .remove(&format!("{project}/{name}:{path}"));
+    }
+
     /// Whether an object of `kind` (`instance` or `volume`) is held under that name.
     pub fn holds(&self, kind: &str, project: &str, name: &str) -> bool {
         lock(&self.shared.store)
