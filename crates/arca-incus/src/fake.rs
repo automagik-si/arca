@@ -2834,11 +2834,42 @@ fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String
         );
     }
     let held = place_of_stored(&store.objects[index]);
-    if lock(&shared.migration)
-        .lingering
-        .values()
-        .any(|(_, _, place)| *place == held)
-    {
+    // A delete answered busy counts as time passing for the operation that holds the object: it ends after as many
+    // answers, reads and busy deletes together, as `receive_lingers` gave it.
+    let busy = {
+        let mut migration = lock(&shared.migration);
+        let holding = migration
+            .lingering
+            .iter()
+            .find(|(_, (_, _, place))| *place == held)
+            .map(|(id, _)| id.clone());
+        match holding {
+            Some(id) => {
+                if let Some((reads, _, _)) = migration.lingering.get_mut(&id) {
+                    *reads = reads.saturating_sub(1);
+                }
+                if migration
+                    .lingering
+                    .get(&id)
+                    .is_some_and(|(reads, _, _)| *reads == 0)
+                {
+                    let ended = migration
+                        .lingering
+                        .remove(&id)
+                        .map(|(_, message, _)| message);
+                    if let (Some(message), Some(operation)) = (ended, store.operations.get_mut(&id))
+                    {
+                        operation["status"] = json!("Failure");
+                        operation["status_code"] = json!(400);
+                        operation["err"] = json!(message);
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    };
+    if busy {
         return answered(
             shared,
             store,
@@ -4459,8 +4490,9 @@ impl FakeIncus {
         lock(&self.shared.migration).skip_files = true;
     }
 
-    /// A receiving operation whose push fails stays running for `reads` more reads of it, holding its object: a delete of
-    /// that instance meanwhile is refused as busy, as Incus refuses it while the create operation still runs.
+    /// A receiving operation whose push fails stays running for `reads` more reads of it or busy deletes of its object,
+    /// holding its object: a delete of that instance meanwhile is refused as busy, as Incus refuses it while the create
+    /// operation still runs.
     pub fn receive_lingers(&self, reads: u32) {
         lock(&self.shared.migration).linger = reads;
     }

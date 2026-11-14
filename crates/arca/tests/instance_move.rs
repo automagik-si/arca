@@ -119,6 +119,11 @@ struct Rig {
 impl Rig {
     /// This node holds `instances`; node-b, its linked host, a pool of `target_mib` MiB.
     fn new(instances: Vec<Value>, target_mib: u64) -> Rig {
+        Rig::waiting(instances, target_mib, Duration::from_millis(300))
+    }
+
+    /// The same, giving a copy `verify_wait` to come up and a failed copy's receiving operation as long to end.
+    fn waiting(instances: Vec<Value>, target_mib: u64, verify_wait: Duration) -> Rig {
         let dir = std::env::temp_dir().join(format!(
             "arca-instance-move-{}-{}",
             std::process::id(),
@@ -212,7 +217,7 @@ impl Rig {
         let moves = Arc::new(
             Moves::new(Arc::clone(&cfg), Arc::clone(&kernel), Arc::clone(&clock))
                 .with_storage_root(dir.join("source"))
-                .with_timing(Duration::from_millis(20), Duration::from_millis(300)),
+                .with_timing(Duration::from_millis(20), verify_wait),
         );
         let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = plan_handlers_served(
             Arc::clone(&kernel),
@@ -1844,4 +1849,30 @@ fn a_moved_source_is_kept_with_autostart_off() {
         .expect("the source");
     assert_eq!(doc["config"]["boot.autostart"], "false");
     assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+}
+
+/// M7: a receiving operation that outlasts the wait for it still holds the copy; the rollback's delete is tried again
+/// while Incus answers it as busy, and the copy is removed once the operation ends.
+#[test]
+fn a_busy_delete_is_tried_again_until_the_operation_ends() {
+    let rig = Rig::waiting(vec![web()], 100, Duration::from_millis(1));
+    rig.target.receive_lingers(4);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source
+        .plan_push(PushPlan::Fail("the link dropped".to_string()));
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "rolled_back", "{status}");
+    assert!(!rig.target.holds("instance", "shop", "web"));
+    // Incus answers a busy delete with an operation that fails; the last attempt is the one that removed it.
+    let deletes = rig
+        .target
+        .writes()
+        .iter()
+        .filter(|w| w.method == "DELETE" && w.path.starts_with("/1.0/instances/web"))
+        .count();
+    assert!(
+        deletes >= 2,
+        "it was answered busy and tried again: {deletes} delete(s)"
+    );
 }
