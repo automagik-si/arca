@@ -12,15 +12,16 @@
 //!   plan named by its digest: a SHA-256 over the canonical plan without its times. A source that changes (its uuid,
 //!   devices, config, profiles or measured size) gives another digest. A no-go blocks the plan with the preflight's own
 //!   reasons; a virtual machine is not movable yet, and an ephemeral container, which Incus deletes when it stops, is
-//!   not movable at all. Plans are kept one file each in `instance-move-plans/`, and pruned a day after they expire.
+//!   not movable at all. Nor is an instance whose latest move moved it and was not finished: its copy may run there. Plans are kept one file each in `instance-move-plans/`, and pruned a day after they expire.
 //! - The card is the action `instance_move` (`action_propose`), whose arguments carry the digest, the instances and the
 //!   target; the owner's passkey approves that digest, and the grant it arms is spent once.
 //! - `instance_move` (the approved run) refuses an expired, unknown, altered or already-run plan, an instance another
-//!   move holds, and a target without room for it beside the moves running to it. It journals the plan and `begin`,
+//!   move holds or a move not finished moved, and a target without room for it beside the moves running to it. It journals the plan and `begin`,
 //!   and runs in the background: per instance, Incus pushes the container and its custom volumes from this host to the
 //!   target (`push`; each of the target's addresses is tried in order; a relay through this kernel is the fallback the
-//!   plan names and is not built yet), in rounds while it runs (without freezing it), then the source is stopped, the
-//!   last delta sent and the copy started; then it is checked. The downtime is measured from the stop to the passed
+//!   plan names and is not built yet), in rounds while it runs (without freezing it), then the source is stopped (a
+//!   source neither running nor stopped, such as frozen, fails the instance), the last round sent (today Incus resends
+//!   the whole volume), the source read back stopped, and only then the copy started; then it is checked. The downtime is measured from the stop to the passed
 //!   checks. The kernel orchestrates; it copies no storage itself.
 //! - `instance_move_status` reads how a move stands; `instance_move_finish` (a card) deletes a verified move's sources.
 //!
@@ -83,7 +84,6 @@ const BUSY_RETRY: Duration = Duration::from_secs(30);
 /// The rate a card's downtime estimate assumes, in bytes a second, and the share of the data it assumes changes between
 /// the last round and the stop.
 const ASSUMED_RATE: u64 = 50 * 1024 * 1024;
-const ASSUMED_DELTA_PERCENT: u64 = 1;
 /// The seconds a card's estimate gives the stop, the start and the checks.
 const ASSUMED_STOP_START_SECONDS: u64 = 30;
 
@@ -114,8 +114,9 @@ fn digest_ok(digest: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// Whether an instance may run, as its document reads: anything but Stopped (Running, Frozen, a status in between).
 fn running(doc: &Value) -> bool {
-    doc.get("status") == Some(&json!("Running"))
+    doc.get("status") != Some(&json!("Stopped"))
 }
 
 /// The append-only move journal.
@@ -583,11 +584,11 @@ fn no_go_reasons(row: &Value, moved: &[String]) -> Vec<String> {
     reasons
 }
 
-/// The downtime a card estimates, in seconds: the stop, the start and the checks, and a last delta of 1% of the data at
-/// 50 MiB/s. The move measures the real one.
+/// The downtime a card estimates, in seconds: the stop, the start and the checks, and the last round at 50 MiB/s. Today
+/// that round resends the whole volume (the hosts share no snapshot for Incus to send a delta from), so the estimate
+/// counts all of `bytes`. The move measures the real one.
 fn estimated_downtime(bytes: u64) -> u64 {
-    let delta = bytes.saturating_mul(ASSUMED_DELTA_PERCENT) / 100;
-    ASSUMED_STOP_START_SECONDS + delta.div_ceil(ASSUMED_RATE)
+    ASSUMED_STOP_START_SECONDS + bytes.div_ceil(ASSUMED_RATE)
 }
 
 /// The TCP port of a proxy that listens on every address of its host (`0.0.0.0` or `::`).
@@ -611,9 +612,56 @@ fn answers(host: &str, port: u16) -> bool {
     })
 }
 
-/// Why a move of `refs` under the plan `digest` may not begin now, from the journal: the plan already ran, or another
-/// move that has not ended holds one of the instances. `None` when it may begin.
-fn start_refusal(lines: &[Value], digest: &str, refs: &[(String, String)]) -> Option<CallError> {
+/// The move whose copy of `project/name` (the instance of `uuid`, when both sides know it) may still run on its target:
+/// the latest move that held the instance moved it, and no finish deleted the source here or found the copy gone. While
+/// one is, a second move of the same instance could leave two copies running. Answers the move's id and target.
+fn moved_not_finished(
+    records: &BTreeMap<String, MoveRecord>,
+    project: &str,
+    name: &str,
+    uuid: Option<&str>,
+) -> Option<(String, String)> {
+    let label = format!("{project}/{name}");
+    let (record, one) = records
+        .values()
+        .filter_map(|record| {
+            record
+                .instances
+                .iter()
+                .find(|one| {
+                    one.project == project
+                        && one.name == name
+                        && (uuid.is_none() || one.uuid.is_none() || one.uuid.as_deref() == uuid)
+                })
+                .map(|one| (record, one))
+        })
+        .max_by_key(|(record, _)| record.started_at)?;
+    if one.result.as_deref() != Some("moved") {
+        return None;
+    }
+    let settled = record.finished.as_ref().is_some_and(|line| {
+        ["deleted", "copyGone"].iter().any(|key| {
+            line[*key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|done| done.as_str() == Some(label.as_str()))
+        })
+    });
+    (!settled).then(|| (record.id.clone(), record.target.clone()))
+}
+
+/// Why `project/name` may not be moved again: [`moved_not_finished`] in words.
+fn moved_reason(project: &str, name: &str, id: &str, target: &str) -> String {
+    format!(
+        "{project}/{name} moved to {target} in move {id}, which is not finished: its copy there may run, and a second move would leave two copies running; finish move {id} first (it deletes the stopped source here, or notes that the copy on {target} is gone)"
+    )
+}
+
+/// Why a move of `refs` (project, name, uuid) under the plan `digest` may not begin now, from the journal: the plan
+/// already ran, another move that has not ended holds one of the instances, or an earlier move moved one and was not
+/// finished. `None` when it may begin.
+fn start_refusal(lines: &[Value], digest: &str, refs: &[MoveRef]) -> Option<CallError> {
     if lines
         .iter()
         .any(|line| line["event"] == "begin" && line["plan"] == digest)
@@ -632,7 +680,7 @@ fn start_refusal(lines: &[Value], digest: &str, refs: &[(String, String)]) -> Op
     {
         if let Some(held) = record.instances.iter().find(|one| {
             refs.iter()
-                .any(|(p, n)| *p == one.project && *n == one.name)
+                .any(|(p, n, _)| *p == one.project && *n == one.name)
         }) {
             return Some(refused(
                 "InstanceMoving",
@@ -643,8 +691,15 @@ fn start_refusal(lines: &[Value], digest: &str, refs: &[(String, String)]) -> Op
             ));
         }
     }
-    None
+    let records = fold(lines);
+    refs.iter().find_map(|(project, name, uuid)| {
+        moved_not_finished(&records, project, name, uuid.as_deref())
+            .map(|(id, target)| refused("AlreadyMoved", moved_reason(project, name, &id, &target)))
+    })
 }
+
+/// An instance a plan names: its project, name and uuid.
+type MoveRef = (String, String, Option<String>);
 
 /// What one plan call answers: whether it is a go, the frozen plan, and what blocked it.
 pub struct Planned {
@@ -806,6 +861,7 @@ impl Moves {
             .unwrap_or((Vec::new(), None));
         let mut blocked = Vec::new();
         let mut instances = Vec::new();
+        let records = fold(&self.journal.lines());
         for (index, one) in wanted.iter().enumerate() {
             let row = &preflight["rows"][index];
             let doc = source.get(&instance_path(&one.project, &one.name)).ok();
@@ -834,6 +890,11 @@ impl Moves {
                     reasons.push(
                         "the container has no volatile.uuid, so the move could not tell it from another of its name".to_string(),
                     );
+                }
+                if let Some((id, target)) =
+                    moved_not_finished(&records, &one.project, &one.name, uuid_of(doc).as_deref())
+                {
+                    reasons.push(moved_reason(&one.project, &one.name, &id, &target));
                 }
                 for (device_name, device) in devices(doc) {
                     if text(&device, "type") == Some("disk")
@@ -942,11 +1003,11 @@ impl Moves {
                         .map(|round| if round == 1 {
                             "a full copy while it runs, not frozen, with its snapshots and custom volumes".to_string()
                         } else {
-                            format!("refresh {} while it runs, not frozen: only what changed", round - 1)
+                            format!("refresh {} while it runs, not frozen (today Incus resends the whole volume: the hosts share no snapshot)", round - 1)
                         })
                         .collect::<Vec<_>>(),
                 },
-                "cutover": ["stop the source", "send the last delta, consistent", "start the copy on the target"],
+                "cutover": ["stop the source", "send the last round, consistent: the whole volume today", "read the source back stopped", "start the copy on the target"],
                 "verify": [
                     "the copy runs, and still runs after the checks",
                     "each network card that had an address has one",
@@ -1044,7 +1105,7 @@ impl Moves {
                     instance["name"].as_str().unwrap_or("?")
                 ),
                 format!(
-                    "needs {} on {target}'s pool {}{}; {rounds} copy round(s) while it runs, not frozen, then the stop, the last delta and the start; downtime about {} s (an estimate: the move measures the real one)",
+                    "needs {} on {target}'s pool {}{}; {rounds} copy round(s) while it runs, not frozen, then the stop, the last round and the start; downtime about {} s: the last round, after the stop, resends the whole volume today, estimated at 50 MiB/s (the move measures the real one)",
                     human(needed),
                     instance["targetPool"].as_str().unwrap_or("?"),
                     if volumes == 0 {
@@ -1330,7 +1391,10 @@ impl Moves {
         for one in plan["instances"].as_array().into_iter().flatten() {
             results.push(self.move_one(id, plan, one));
         }
-        let moved = results.iter().filter(|result| **result == "moved").count();
+        let moved = results
+            .iter()
+            .filter(|result| result.starts_with("moved"))
+            .count();
         let total = results.len();
         self.note(
             json!({ "event": "end", "at": self.now(), "move": id, "moved": moved, "of": total }),
@@ -1345,8 +1409,11 @@ impl Moves {
         let Some(proposal) = proposal else {
             return;
         };
-        let moved = results.iter().filter(|result| **result == "moved").count();
-        let code = if results.contains(&"failed") {
+        let moved = results
+            .iter()
+            .filter(|result| result.starts_with("moved"))
+            .count();
+        let code = if results.contains(&"failed") || results.contains(&"moved_autostart_on") {
             "MoveNeedsOwner"
         } else if moved == results.len() {
             "MoveVerified"
@@ -1399,12 +1466,19 @@ impl Moves {
             Ok(downtime) => {
                 // A kept source must not come back by itself on a reboot of this host, next to its copy.
                 let autostart_off = source.disable_autostart(&project, &name).is_ok();
+                let reason = (!autostart_off).then_some(
+                    "moved, but boot.autostart could not be turned off on the kept source here: a reboot of this host would start it beside its copy; turn it off, or finish the move",
+                );
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
-                    "result": "moved", "downtimeMs": downtime, "reason": null,
+                    "result": "moved", "downtimeMs": downtime, "reason": reason,
                     "targetUuid": made.target_uuid, "autostartOff": autostart_off,
                 }));
-                "moved"
+                if autostart_off {
+                    "moved"
+                } else {
+                    "moved_autostart_on"
+                }
             }
             Err(reason) => {
                 self.set_live(id, &project, &name, |progress| {
@@ -1503,9 +1577,17 @@ impl Moves {
             .ok_or_else(|| "the source could not be read at the cutover".to_string())?;
         let before = self.before_stop(source, one);
         let began = Instant::now();
-        if status == "Running" {
-            stop(source, project, name)?;
-            made.stopped_source = true;
+        match status.as_str() {
+            "Running" => {
+                stop(source, project, name)?;
+                made.stopped_source = true;
+            }
+            "Stopped" => {}
+            other => {
+                return Err(format!(
+                    "the source is {other} at the cutover, neither running nor stopped (Incus freezes a container for a snapshot on some pools): the move stops here, starts nothing beside it and deletes only its own copy"
+                ));
+            }
         }
         if !self.note(json!({
             "event": "cutover", "at": self.now(), "move": id, "project": project, "name": name,
@@ -1529,6 +1611,17 @@ impl Moves {
             return Err(
                 "the copy on the target was never recorded, so it is not started".to_string(),
             );
+        }
+        // Nothing may have started the source since the stop: read it back Stopped, or the copy stays off.
+        let now = source
+            .get(&instance_path(project, name))
+            .ok()
+            .and_then(|doc| text(&doc, "status").map(str::to_string))
+            .unwrap_or_else(|| "unreadable".to_string());
+        if now != "Stopped" {
+            return Err(format!(
+                "the source reads {now} just before the copy would start, not Stopped: the copy was not started"
+            ));
         }
         if !self.note(json!({
             "event": "cutover", "at": self.now(), "move": id, "project": project, "name": name,
@@ -2230,7 +2323,10 @@ impl Moves {
             }));
             results.push(result);
         }
-        let moved = results.iter().filter(|result| **result == "moved").count();
+        let moved = results
+            .iter()
+            .filter(|result| result.starts_with("moved"))
+            .count();
         self.note(json!({
             "event": "end", "at": self.now(), "move": record.id, "moved": moved,
             "of": record.instances.len(), "interrupted": true,
@@ -2260,13 +2356,16 @@ impl Moves {
     }
 }
 
-fn refs_pairs(plan: &Value) -> Vec<(String, String)> {
-    Moves::refs_of(plan)
-        .iter()
+fn refs_pairs(plan: &Value) -> Vec<MoveRef> {
+    plan["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .map(|one| {
             (
                 one["project"].as_str().unwrap_or_default().to_string(),
                 one["name"].as_str().unwrap_or_default().to_string(),
+                one["uuid"].as_str().map(str::to_string),
             )
         })
         .collect()
@@ -3089,7 +3188,7 @@ impl ToolHandler for MoveFinishHandler {
         let dest = linked_target(&self.moves.cfg, &record.target)
             .ok()
             .map(|target| MoveWriter::new(target.socket));
-        let (mut deleted, mut kept) = (Vec::new(), Vec::new());
+        let (mut deleted, mut kept, mut gone) = (Vec::new(), Vec::new(), Vec::new());
         for one in record
             .instances
             .iter()
@@ -3100,6 +3199,11 @@ impl ToolHandler for MoveFinishHandler {
             // The other side first: the copy must be on the target, as the one this move made.
             let copy_there = match (dest.as_ref().map(|dest| dest.get(&path)), &one.target_uuid) {
                 (Some(Ok(doc)), Some(uuid)) => uuid_of(&doc).as_deref() == Some(uuid.as_str()),
+                (Some(Err(IncusError::Status { code: 404, .. })), _) => {
+                    // No copy runs there: the instance here may be moved again.
+                    gone.push(label.clone());
+                    false
+                }
                 _ => false,
             };
             if !copy_there {
@@ -3183,6 +3287,7 @@ impl ToolHandler for MoveFinishHandler {
         }
         self.moves.note(json!({
             "event": "finish", "at": self.moves.now(), "move": id, "deleted": deleted, "kept": kept,
+            "copyGone": gone,
         }));
         let message = if kept.is_empty() {
             format!("move {id} finished: {} deleted on this host", deleted.len())
@@ -3327,7 +3432,11 @@ mod tests {
     #[test]
     fn a_plan_that_ran_or_an_instance_another_move_holds_does_not_start() {
         let digest = "c".repeat(64);
-        let web = vec![("shop".to_string(), "web".to_string())];
+        let web = vec![(
+            "shop".to_string(),
+            "web".to_string(),
+            Some("u-web".to_string()),
+        )];
         let begin = |id: &str, plan: &str, name: &str| {
             json!({ "event": "begin", "move": id, "plan": plan, "target": "node-b",
                 "instances": [{ "project": "shop", "name": name }] })
@@ -3354,9 +3463,63 @@ mod tests {
     }
 
     #[test]
-    fn the_estimate_is_the_stop_and_start_and_a_one_percent_delta() {
+    fn an_instance_moved_and_not_finished_is_not_moved_again() {
+        let digest = "c".repeat(64);
+        let web = vec![(
+            "shop".to_string(),
+            "web".to_string(),
+            Some("u-web".to_string()),
+        )];
+        let moved = |uuid: &str| {
+            vec![
+                json!({ "event": "begin", "move": "mv-dddddddddddd", "plan": "d".repeat(64), "target": "node-b",
+                    "at": 5, "instances": [{ "project": "shop", "name": "web", "uuid": uuid }] }),
+                json!({ "event": "result", "move": "mv-dddddddddddd", "project": "shop", "name": "web",
+                    "result": "moved" }),
+                json!({ "event": "end", "move": "mv-dddddddddddd" }),
+            ]
+        };
+        let refusal = start_refusal(&moved("u-web"), &digest, &web);
+        assert!(
+            matches!(&refusal, Some(CallError::Refused { code, message })
+                if code == "AlreadyMoved" && message.contains("finish move mv-dddddddddddd")),
+            "{refusal:?}"
+        );
+        // Another instance of the name (a new uuid) is not the one that moved.
+        assert!(start_refusal(&moved("u-other"), &digest, &web).is_none());
+        // A finish that deleted the source, or found the copy gone, settles it; one that kept both does not.
+        for (key, settled) in [("deleted", true), ("copyGone", true), ("kept", false)] {
+            let mut lines = moved("u-web");
+            lines.push(json!({ "event": "finish", "move": "mv-dddddddddddd", key: ["shop/web"] }));
+            assert_eq!(
+                start_refusal(&lines, &digest, &web).is_none(),
+                settled,
+                "{key}"
+            );
+        }
+        // The latest move that held the instance is the word: a rolled-back one before the move does not settle it.
+        let rolled_back = |at: u64| {
+            vec![
+                json!({ "event": "begin", "move": "mv-eeeeeeeeeeee", "plan": "e".repeat(64), "target": "node-c",
+                    "at": at, "instances": [{ "project": "shop", "name": "web", "uuid": "u-web" }] }),
+                json!({ "event": "result", "move": "mv-eeeeeeeeeeee", "project": "shop", "name": "web",
+                    "result": "rolled_back" }),
+                json!({ "event": "end", "move": "mv-eeeeeeeeeeee" }),
+            ]
+        };
+        let mut before = rolled_back(1);
+        before.extend(moved("u-web"));
+        assert!(start_refusal(&before, &digest, &web).is_some());
+        let mut after = moved("u-web");
+        after.extend(rolled_back(9));
+        assert!(start_refusal(&after, &digest, &web).is_none());
+    }
+
+    #[test]
+    fn the_estimate_is_the_stop_and_start_and_the_whole_volume() {
         assert_eq!(estimated_downtime(0), 30);
-        assert_eq!(estimated_downtime(100 * ASSUMED_RATE), 31);
+        assert_eq!(estimated_downtime(100 * ASSUMED_RATE), 130);
+        assert_eq!(estimated_downtime(100 * ASSUMED_RATE + 1), 131);
     }
 
     #[test]
