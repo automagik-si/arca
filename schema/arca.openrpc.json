@@ -11701,15 +11701,19 @@
                           ]
                         },
                         "result": {
-                          "enum": [
-                            "moved",
-                            "rolled_back",
-                            "failed",
-                            "finished"
-                          ],
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "enum": [
+                                "moved",
+                                "rolled_back",
+                                "failed",
+                                "finished"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "roundsDone": {

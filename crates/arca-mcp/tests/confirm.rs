@@ -129,6 +129,26 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             json!({ "removed": true }),
             "confirm is false: nothing was removed and no approval was spent",
         ),
+        (
+            "instance_move",
+            json!({
+                "plan": "ab".repeat(32),
+                "instances": [{ "project": "shop", "name": "web" }],
+                "target": "node-b",
+                "approval": "0123456789abcdef",
+            }),
+            json!({
+                "move": "mv-abababababab", "plan": "ab".repeat(32), "target": "node-b", "phase": "copying",
+                "instances": [{ "project": "shop", "name": "web" }], "message": "started",
+            }),
+            "confirm is false: nothing was moved and no approval was spent",
+        ),
+        (
+            "instance_move_finish",
+            json!({ "move": "mv-abababababab", "approval": "0123456789abcdef" }),
+            json!({ "move": "mv-abababababab", "deleted": ["shop/web"], "kept": [], "message": "finished" }),
+            "confirm is false: nothing was deleted and no approval was spent",
+        ),
     ]
 }
 
