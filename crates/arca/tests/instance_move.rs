@@ -602,6 +602,9 @@ fn a_move_copies_in_rounds_cuts_over_checks_and_measures_its_downtime() {
         .write_guest_file("shop", "web", "/srv/data/check", b"orders 41\n");
     let plan = rig.plan_with(&["web"], json!({ "instances": [{ "project": "shop", "name": "web", "spotCheck": "/srv/data/check" }] }));
     assert_eq!(plan["go"], true, "{plan}");
+    // The copy's state is read only after the stop, and answers 200 ms late: the measured downtime holds that wait.
+    rig.target
+        .slow_reads("/1.0/instances/web/state", 1, Duration::from_millis(200));
     let proposal = rig.propose_move(&plan).expect("proposed");
     let started = rig.approve(&proposal).expect("started");
     assert_eq!(started["phase"], "copying");
@@ -617,8 +620,10 @@ fn a_move_copies_in_rounds_cuts_over_checks_and_measures_its_downtime() {
     assert_eq!(one["roundsDone"], 3);
     assert_eq!(one["roundsTotal"], 3);
     assert!(
-        one["downtimeMs"].is_u64(),
-        "the result carries the measured downtime: {one}"
+        one["downtimeMs"]
+            .as_u64()
+            .is_some_and(|ms| (200..30_000).contains(&ms)),
+        "the result carries the measured downtime, from the stop to the passed checks: {one}"
     );
     let checks: Vec<&str> = one["checks"]
         .as_array()
@@ -881,7 +886,8 @@ fn a_target_that_fills_during_the_move_rolls_it_back() {
 #[test]
 fn a_batch_with_one_failing_instance_rolls_that_one_back_and_moves_the_others() {
     let rig = Rig::new(vec![web(), api()], 100);
-    rig.target.refuse_start("shop", "api");
+    // The first instance of the batch fails; the one after it still moves.
+    rig.target.refuse_start("shop", "web");
     let plan = rig.plan(&["web", "api"]);
     assert_eq!(plan["go"], true, "{plan}");
     let proposal = rig.propose_move(&plan).expect("one card for the batch");
@@ -892,28 +898,60 @@ fn a_batch_with_one_failing_instance_rolls_that_one_back_and_moves_the_others() 
         .to_string();
     let status = rig.wait(&id);
     assert_eq!(status["phase"], "partly_moved", "{status}");
-    assert_eq!(status["instances"][0]["result"], "moved");
-    assert_eq!(status["instances"][1]["result"], "rolled_back");
+    assert_eq!(status["instances"][0]["result"], "rolled_back");
+    assert_eq!(status["instances"][1]["result"], "moved", "{status}");
     assert_eq!(
-        rig.target.instance_status("shop", "web").as_deref(),
+        rig.target.instance_status("shop", "api").as_deref(),
         Some("Running")
     );
-    assert!(!rig.target.holds("instance", "shop", "api"));
-    assert_eq!(
-        rig.source.instance_status("shop", "api").as_deref(),
-        Some("Running")
-    );
+    assert!(!rig.target.holds("instance", "shop", "web"));
     assert_eq!(
         rig.source.instance_status("shop", "web").as_deref(),
+        Some("Running")
+    );
+    assert_eq!(
+        rig.source.instance_status("shop", "api").as_deref(),
         Some("Stopped")
     );
     // The finish offers only the verified one.
     assert_eq!(status["finish"]["available"], true);
     let deletes = status["finish"]["deletes"].to_string();
     assert!(
-        deletes.contains("shop/web") && !deletes.contains("shop/api"),
+        deletes.contains("shop/api") && !deletes.contains("shop/web"),
         "{deletes}"
     );
+}
+
+#[test]
+fn a_finish_is_not_offered_while_the_move_runs_even_with_one_instance_verified() {
+    let rig = Rig::new(vec![web(), api()], 100);
+    // web's three pushes land; api's first push is held.
+    for _ in 0..3 {
+        rig.source.plan_push(PushPlan::Pass);
+    }
+    rig.source.plan_push(PushPlan::Hold {
+        processed: MIB,
+        speed: MIB,
+    });
+    let id = rig.start(&["web", "api"])["move"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let until = Instant::now() + Duration::from_secs(10);
+    while rig.source.held_pushes().is_empty() {
+        assert!(Instant::now() < until, "api's push never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = rig.status(&id);
+    assert_eq!(status["instances"][0]["result"], "moved", "{status}");
+    assert_eq!(status["finish"]["available"], false);
+    assert_eq!(refusal_code(rig.propose_finish(&id)), "NotVerified");
+    for held in rig.source.held_pushes() {
+        rig.source.release_operation(&held);
+    }
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    rig.propose_finish(&id)
+        .expect("offered once the move ended");
 }
 
 #[test]
