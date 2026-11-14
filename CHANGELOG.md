@@ -7,6 +7,14 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`service_reconfigure` makes a running container service what its current template says (environment values, the
+secrets it declares, ports, links' values, `rawLxc` and `noNewPrivileges`) behind one owner card that shows the exact
+difference key by key, secrets by name only; then it restarts the service once and reads its config back. Templates may
+declare `rawLxc` lines (`lxc.sched.core=0`, say) that Arca keeps in `raw.lxc` beside `lxc.no_new_privs=1` through every
+reconcile; a service without them is reconciled as before. The create and reconfigure cards show `raw.lxc` whole, and
+give every line but `lxc.sched.core` and `lxc.no_new_privs=1` a plain-words row saying it may loosen the container's
+isolation.
+
 `service_update` now moves a running container service made from a local image pinned by fingerprint, as it already
 moves one made from an image by digest on a registry: the call's `digest` is the new image's fingerprint, the image
 must already be in the service project's image store, the record takes the alias the installed template pins it under

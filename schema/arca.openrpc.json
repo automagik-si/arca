@@ -1740,6 +1740,7 @@
                           "service_create",
                           "service_remove",
                           "service_update",
+                          "service_reconfigure",
                           "service_import",
                           "service_release",
                           "service_publish",
@@ -1867,6 +1868,7 @@
               "service_create",
               "service_remove",
               "service_update",
+              "service_reconfigure",
               "service_import",
               "service_release",
               "service_publish",
@@ -1988,6 +1990,15 @@
                     },
                     "type": "object"
                   },
+                  "rawLxc": {
+                    "description": "Filled in by the node when a create is proposed from a container template that sets noNewPrivileges or rawLxc: the container's raw.lxc lines, whole and in order, so the owner's card shows them (and says in words when a line may loosen the container's isolation). A caller leaves it out; one that states it must state exactly the template's.",
+                    "items": {
+                      "maxLength": 256,
+                      "type": "string"
+                    },
+                    "maxItems": 17,
+                    "type": "array"
+                  },
                   "registry": {
                     "description": "Only for an image on a registry this node holds a credential for (registry_secret_set): that registry's address. A proposal made with action_propose fills it in, so the owner's card says that the image is fetched with the credential and that Incus then keeps it with the image; a caller has no need to state it. Such a create runs only from an approved proposal.",
                     "maxLength": 128,
@@ -2107,6 +2118,39 @@
                   "name"
                 ],
                 "title": "service_update",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_reconfigure: Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched. Example: {\"name\":\"web\"}",
+                "examples": [
+                  {
+                    "name": "web"
+                  }
+                ],
+                "properties": {
+                  "changes": {
+                    "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc and noNewPrivileges ({from, to} each). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                  },
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "service_reconfigure",
                 "type": "object"
               },
               {
@@ -3078,6 +3122,7 @@
                 "service_create",
                 "service_remove",
                 "service_update",
+                "service_reconfigure",
                 "service_import",
                 "service_release",
                 "service_publish",
@@ -3455,6 +3500,7 @@
                 "service_create",
                 "service_remove",
                 "service_update",
+                "service_reconfigure",
                 "service_import",
                 "service_release",
                 "service_publish",
@@ -4572,6 +4618,19 @@
               }
             },
             "type": "object"
+          }
+        },
+        {
+          "name": "rawLxc",
+          "required": false,
+          "schema": {
+            "description": "Filled in by the node when a create is proposed from a container template that sets noNewPrivileges or rawLxc: the container's raw.lxc lines, whole and in order, so the owner's card shows them (and says in words when a line may loosen the container's isolation). A caller leaves it out; one that states it must state exactly the template's.",
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "maxItems": 17,
+            "type": "array"
           }
         },
         {
@@ -5864,6 +5923,143 @@
         }
       },
       "summary": "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another digest or fingerprint in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new image (data volume, config, secrets and firewall rules are kept), started, and checked within timeoutSeconds (120 by default). On any failure the old version is put back. A local image must already be in the service project's image store. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "service_reconfigure",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "changes",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc and noNewPrivileges ({from, to} each). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
+            "properties": {
+              "environment": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "noNewPrivileges": {
+                "type": "object"
+              },
+              "ports": {
+                "type": "object"
+              },
+              "rawLxc": {
+                "type": "object"
+              },
+              "secrets": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "changes": {
+              "description": "The difference that was applied, as the owner's card showed it. No secret value is in it.",
+              "type": "object"
+            },
+            "message": {
+              "type": "string"
+            },
+            "readBack": {
+              "additionalProperties": false,
+              "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc) that differ. Never a value.",
+              "properties": {
+                "differs": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "matches": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "matches",
+                "differs"
+              ],
+              "type": "object"
+            },
+            "reconfigured": {
+              "description": "False when nothing was written: the service already was what its template says, or the only difference is a secret whose value is set separately.",
+              "type": "boolean"
+            },
+            "restarted": {
+              "description": "Whether the service was restarted (once) for the change: true when it was running.",
+              "type": "boolean"
+            },
+            "running": {
+              "description": "Whether the service runs after the change, as read back.",
+              "type": "boolean"
+            },
+            "service": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "reconfigured",
+            "service",
+            "changes",
+            "restarted",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

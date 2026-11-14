@@ -51,6 +51,7 @@ pub enum ActionKind {
     ServiceCreate,
     ServiceRemove,
     ServiceUpdate,
+    ServiceReconfigure,
     ServiceImport,
     ServiceRelease,
     ServicePublish,
@@ -131,10 +132,11 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 24] = [
+    pub const ALL: [ActionKind; 25] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
+        Self::ServiceReconfigure,
         Self::ServiceImport,
         Self::ServiceRelease,
         Self::ServicePublish,
@@ -171,6 +173,9 @@ impl ActionKind {
             Self::ServiceRemove => "It cannot be undone: the service is deleted with its data.",
             Self::ServiceUpdate => {
                 "If the new version's port does not answer, Arca puts the old version back by itself. To go back after a good update, ask your assistant to update to the old digest."
+            }
+            Self::ServiceReconfigure => {
+                "Change the template back and ask your assistant to reconfigure the service again: the card then shows the way back. If the node refuses the change or the restart fails, Arca puts the old settings back by itself."
             }
             Self::ServiceImport => {
                 "Ask your assistant to release it. The service itself is not changed either way."
@@ -234,6 +239,7 @@ impl ActionKind {
             Self::ServiceCreate => "service_create",
             Self::ServiceRemove => "service_remove",
             Self::ServiceUpdate => "service_update",
+            Self::ServiceReconfigure => "service_reconfigure",
             Self::ServiceImport => "service_import",
             Self::ServiceRelease => "service_release",
             Self::ServicePublish => "service_publish",
@@ -505,6 +511,12 @@ impl ActionKind {
                         &destinations_words(&args["destinations"]),
                     ));
                 }
+                // The container's `raw.lxc`, whole (filled in from the template when the proposal is made), and a
+                // plain-words row for each line that may loosen its isolation.
+                if let Some(lines) = args.get("rawLxc") {
+                    rows.push(row(RAW_LXC_LABEL, &list_words(lines)));
+                    rows.extend(loosening_rows(lines));
+                }
                 // The image is on a registry this node holds a credential for: the proposal names the registry (it
                 // is filled in when the proposal is made), and the card says where that credential then rests.
                 if let Some(server) = args.get("registry") {
@@ -567,6 +579,7 @@ impl ActionKind {
                 }
                 rows
             }
+            Self::ServiceReconfigure => reconfigure_rows(args),
             Self::ServiceImport => vec![
                 row("Name", text("name")),
                 row(
@@ -822,6 +835,11 @@ impl ActionKind {
                 )
             }
             Self::ServiceUpdate => format!("Update the service {} to a new image", text("name")),
+            Self::ServiceReconfigure => format!(
+                "Reconfigure the service {} as its template says now: {} (restarting it once if it runs)",
+                text("name"),
+                reconfigure_count(&args["changes"])
+            ),
             Self::ServiceImport => format!(
                 "Import the service {}, which another manager created, where it stands",
                 text("name")
@@ -1202,6 +1220,183 @@ const STOPPED_THEN: &str = "; it can be started later";
 
 /// How every [`stopped_words`] row begins.
 const STOPPED_BECAUSE: &str = "No: it is created stopped because ";
+
+/// The longest environment value a reconfigure card shows in one row. A longer one ends in an ellipsis; the approval
+/// binds the whole value all the same.
+pub const ENV_ROW_MAX: usize = 1024;
+
+/// How many changes a reconfigure's `changes` holds, in words: `3 environment values added, 1 changed, 1 removed; 2
+/// secrets; the ports; the low-level container settings`, or `no change`.
+fn reconfigure_count(changes: &Value) -> String {
+    let rows = |section: &str| changes[section].as_array().cloned().unwrap_or_default();
+    let count =
+        |rows: &[Value], change: &str| rows.iter().filter(|row| row["change"] == change).count();
+    let mut parts = Vec::new();
+    let environment = rows("environment");
+    if !environment.is_empty() {
+        let mut said = Vec::new();
+        for change in ["added", "changed", "removed"] {
+            let n = count(&environment, change);
+            if n > 0 {
+                said.push(format!("{n} {change}"));
+            }
+        }
+        parts.push(format!(
+            "environment value{} {}",
+            if environment.len() == 1 { "" } else { "s" },
+            said.join(", ")
+        ));
+    }
+    let secrets = rows("secrets");
+    if !secrets.is_empty() {
+        parts.push(format!(
+            "{} secret{}",
+            secrets.len(),
+            if secrets.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if changes.get("ports").is_some() {
+        parts.push("its ports".to_string());
+    }
+    if changes.get("rawLxc").is_some() || changes.get("noNewPrivileges").is_some() {
+        parts.push("its low-level container settings".to_string());
+    }
+    if parts.is_empty() {
+        "no change".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+/// The label of the card row that shows a container's `raw.lxc` lines.
+pub const RAW_LXC_LABEL: &str = "Low-level container settings (raw.lxc)";
+
+/// One `Isolation` row, in plain words and naming the line, for each `raw.lxc` line in `lines` that may loosen the
+/// container's isolation: every line but the few Arca knows are harmless.
+fn loosening_rows(lines: &Value) -> Vec<ActionDetail> {
+    lines
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|line| crate::service::raw_lxc_may_loosen(line))
+        .map(|line| ActionDetail {
+            label: "Isolation".to_string(),
+            value: format!("This line may loosen the container's isolation: {line}"),
+        })
+        .collect()
+}
+
+/// A list of names or numbers in words, or `none`.
+fn list_words(list: &Value) -> String {
+    let items: Vec<String> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| match item {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// The rows of a reconfigure's card: the service, how many changes, then one row for each environment key, each
+/// secret, the ports and the low-level container settings that change. A value that holds a secret, or that a link
+/// gives, is never shown: its row names the secrets or the link. A secret is named, never shown.
+fn reconfigure_rows(args: &Value) -> Vec<ActionDetail> {
+    let row = |label: String, value: String| ActionDetail { label, value };
+    let changes = &args["changes"];
+    let mut rows = vec![
+        row(
+            "Name".into(),
+            args["name"].as_str().unwrap_or_default().to_string(),
+        ),
+        row("Changes".into(), reconfigure_count(changes)),
+    ];
+    for item in changes["environment"].as_array().into_iter().flatten() {
+        let key = shown(item["key"].as_str().unwrap_or_default(), 64);
+        let change = item["change"].as_str().unwrap_or_default();
+        let words = if change == "removed" {
+            match item.get("needs") {
+                Some(names) => format!(
+                    "removed: it needs {}, not set yet; it comes back once the value is set",
+                    list_words(names)
+                ),
+                None => "removed".to_string(),
+            }
+        } else if let Some(value) = item["value"].as_str() {
+            match item["was"].as_str() {
+                Some(was) => format!(
+                    "{change}: {} (was: {})",
+                    shown(value, ENV_ROW_MAX),
+                    shown(was, ENV_ROW_MAX)
+                ),
+                None => format!("{change}: {}", shown(value, ENV_ROW_MAX)),
+            }
+        } else if let Some(names) = item.get("secrets") {
+            format!(
+                "{change}: holds the secret {} (value not shown)",
+                list_words(names)
+            )
+        } else {
+            format!(
+                "{change}: from the link to {} (value not shown)",
+                item["link"].as_str().unwrap_or_default()
+            )
+        };
+        rows.push(row(format!("Env {key}"), words));
+    }
+    for item in changes["secrets"].as_array().into_iter().flatten() {
+        let name = shown(item["name"].as_str().unwrap_or_default(), 64);
+        let words = match item["change"].as_str().unwrap_or_default() {
+            "generated" => "added: secret, Arca makes its value now (never shown)",
+            "removed" => "removed: the template no longer declares it",
+            _ => "added: secret, value set separately",
+        };
+        rows.push(row(format!("Secret {name}"), words.to_string()));
+    }
+    if let Some(ports) = changes.get("ports") {
+        rows.push(row(
+            "Ports".into(),
+            format!(
+                "{} (was: {})",
+                list_words(&ports["to"]),
+                list_words(&ports["from"])
+            ),
+        ));
+    }
+    if let Some(raw) = changes.get("rawLxc") {
+        rows.push(row(
+            RAW_LXC_LABEL.into(),
+            format!(
+                "{} (was: {})",
+                list_words(&raw["to"]),
+                list_words(&raw["from"])
+            ),
+        ));
+        rows.extend(loosening_rows(&raw["to"]));
+    }
+    if let Some(on) = changes["noNewPrivileges"]["to"].as_bool() {
+        rows.push(row(
+            "No-new-privileges".into(),
+            format!(
+                "turned {}: a setuid or setcap binary inside it {} raise privileges",
+                if on { "on" } else { "off" },
+                if on { "can no longer" } else { "can again" }
+            ),
+        ));
+    }
+    rows.push(row(
+        "Effect".into(),
+        "Arca writes these into the service and restarts it once if it runs, which interrupts it; a stopped service takes them at its next start. Then it reads the service's settings back. Its image and its data are not touched, and no secret value is shown here.".to_string(),
+    ));
+    rows
+}
 
 /// One argument the owner is shown, as a label and its exact value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

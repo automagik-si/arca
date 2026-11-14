@@ -83,7 +83,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 78] = [
+static VERBS: [Verb; 79] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -419,6 +419,20 @@ static VERBS: [Verb; 78] = [
         cut: no_cut,
         params: service_update_params,
         result: service_update_result,
+    },
+    Verb {
+        name: "service_reconfigure",
+        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_reconfigure,
+        cut: no_cut,
+        params: service_reconfigure_params,
+        result: service_reconfigure_result,
     },
     Verb {
         name: "service_import",
@@ -2571,6 +2585,7 @@ fn not_confirmed(name: &str) -> String {
         "service_import" => "nothing was imported",
         "service_release" => "nothing was released",
         "service_update" => "nothing was updated",
+        "service_reconfigure" => "nothing was reconfigured",
         "gpu_detach" => "nothing was detached",
         "storage_add" => "nothing was added",
         "action_approve" => "nothing was run",
@@ -3096,11 +3111,12 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty-four verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 24] = [
+/// The twenty-five verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 25] = [
     "service_create",
     "service_remove",
     "service_update",
+    "service_reconfigure",
     "service_import",
     "service_release",
     "service_publish",
@@ -3145,7 +3161,8 @@ fn action_propose_params() -> Value {
 /// removed or overwritten before the action's own check runs (the GPU verbs from the instance, storage_add from the
 /// disk survey, the snapshot verbs from the source or the snapshot). A branch takes any value for them, as the door did
 /// before it held `args` to a branch, and says so.
-pub const KERNEL_FILLED: [(&str, &[&str]); 5] = [
+pub const KERNEL_FILLED: [(&str, &[&str]); 6] = [
+    ("service_reconfigure", &["changes"]),
     ("gpu_attach", &["project", "kind", "uuid"]),
     ("gpu_detach", &["project", "kind", "uuid"]),
     (
@@ -3194,13 +3211,14 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 24] = [
+const ACTION_EXAMPLES: [(&str, &str); 25] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
         "service_update",
         r#"{"name":"nats","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#,
     ),
+    ("service_reconfigure", r#"{"name":"web"}"#),
     ("service_import", r#"{"name":"web"}"#),
     ("service_release", r#"{"name":"web"}"#),
     ("service_publish", r#"{"name":"dash","reach":"tailnet"}"#),
@@ -4171,6 +4189,12 @@ fn service_create_params_base() -> Value {
                 "pattern": "^[0-9a-f]{64}$",
                 "type": "string"
             },
+            "rawLxc": {
+                "description": "Filled in by the node when a create is proposed from a container template that sets noNewPrivileges or rawLxc: the container's raw.lxc lines, whole and in order, so the owner's card shows them (and says in words when a line may loosen the container's isolation). A caller leaves it out; one that states it must state exactly the template's.",
+                "items": { "maxLength": 256, "type": "string" },
+                "maxItems": 17,
+                "type": "array"
+            },
             "bridge": {
                 "description": "For a virtual-machine template: the existing host bridge its NIC joins, one of the node's allowed bridges. Left out, the virtual machine joins the managed service network when the node has one, and otherwise the node's only allowed bridge.",
                 "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$",
@@ -4508,6 +4532,81 @@ pub fn summary_service_update(v: &Value) -> String {
     } else {
         "Service updated.".to_string()
     }
+}
+
+pub fn summary_service_reconfigure(v: &Value) -> String {
+    if v["reconfigured"] == true {
+        "Service reconfigured from its template.".to_string()
+    } else {
+        "Service already is what its template says.".to_string()
+    }
+}
+
+fn service_reconfigure_params() -> Value {
+    with_tenant(with_confirm(json!({
+        "additionalProperties": false,
+        "properties": {
+            "approval": {
+                "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+            },
+            "changes": {
+                "additionalProperties": false,
+                "properties": {
+                    "environment": { "items": { "type": "object" }, "type": "array" },
+                    "noNewPrivileges": { "type": "object" },
+                    "ports": { "type": "object" },
+                    "rawLxc": { "type": "object" },
+                    "secrets": { "items": { "type": "object" }, "type": "array" }
+                },
+                "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc and noNewPrivileges ({from, to} each). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
+                "type": "object"
+            },
+            "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
+        },
+        "required": ["name", "approval"],
+        "type": "object"
+    })))
+}
+
+fn service_reconfigure_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "changes": {
+                "description": "The difference that was applied, as the owner's card showed it. No secret value is in it.",
+                "type": "object"
+            },
+            "message": { "type": "string" },
+            "readBack": {
+                "additionalProperties": false,
+                "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc) that differ. Never a value.",
+                "properties": {
+                    "differs": { "items": { "type": "string" }, "type": "array" },
+                    "matches": { "type": "boolean" }
+                },
+                "required": ["matches", "differs"],
+                "type": "object"
+            },
+            "reconfigured": {
+                "description": "False when nothing was written: the service already was what its template says, or the only difference is a secret whose value is set separately.",
+                "type": "boolean"
+            },
+            "restarted": {
+                "description": "Whether the service was restarted (once) for the change: true when it was running.",
+                "type": "boolean"
+            },
+            "running": {
+                "description": "Whether the service runs after the change, as read back.",
+                "type": "boolean"
+            },
+            "service": { "type": "string" }
+        },
+        "required": ["reconfigured", "service", "changes", "restarted", "message"],
+        "type": "object"
+    })
 }
 
 fn service_update_params() -> Value {
