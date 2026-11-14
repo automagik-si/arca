@@ -57,6 +57,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "service_logs",
             "service_remove",
             "service_update",
+            "service_reconfigure",
             "service_import",
             "service_release",
             "service_connect",
@@ -142,6 +143,13 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("service_logs", VerbClass::L, Scope::Viewer, false, false),
         ("service_remove", VerbClass::L, Scope::Doctor, true, true),
         ("service_update", VerbClass::L, Scope::Doctor, true, true),
+        (
+            "service_reconfigure",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            true,
+        ),
         ("service_import", VerbClass::L, Scope::Doctor, true, true),
         ("service_release", VerbClass::L, Scope::Doctor, true, true),
         ("gpu_attach", VerbClass::L, Scope::Doctor, true, false),
@@ -342,6 +350,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "service_create",
         "service_remove",
         "service_update",
+        "service_reconfigure",
         "service_import",
         "service_release",
         "service_publish",
@@ -1458,6 +1467,7 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "postgres_delete",
             "service_remove",
             "service_update",
+            "service_reconfigure",
             "service_import",
             "service_release",
             "gpu_detach",
@@ -1682,7 +1692,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 24);
+    assert_eq!(actions.len(), 25);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));

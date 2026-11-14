@@ -46,6 +46,11 @@
     },
     {
       "kind": "tool",
+      "id": "service_reconfigure",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
       "id": "service_remove",
       "status": "live"
     },

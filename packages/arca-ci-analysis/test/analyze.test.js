@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { analyze, percentile } from '../src/analyze.js';
 import { pickLogs } from '../src/collect.js';
+import { prText } from '../src/pr.js';
 import { markdown, resultLine } from '../src/report.js';
 
 const WORKFLOW = `name: ci
@@ -133,6 +134,88 @@ test('short jobs on a billed runner move to the free runner of a public reposito
   const pool = analyze(data, { moveTo: 'acme-4vcpu-ubuntu-2404' }).findings.find((f) => f.kind === 'paid-runner');
   assert.equal(pool.change.jobs[0].to, 'acme-4vcpu-ubuntu-2404');
   assert.match(pool.evidence[0], /^acme-4vcpu-ubuntu-2404 is the owner's own runner pool/);
+  assert.equal(pool.evidence.some((line) => /fork/.test(line)), false, 'a private repository has no pull requests from strangers');
+});
+
+function publicPoolData(on) {
+  const runs = [];
+  const jobs = [];
+  for (let k = 0; k < 3; k += 1) {
+    const r = run({ sha: `f${k}`, at: k * 100, until: k * 100 + 1 });
+    runs.push(r);
+    jobs.push({ ...job(r, { start: k * 100, end: k * 100 + 1 }), labels: ['blacksmith-4vcpu-ubuntu-2404'] });
+  }
+  const data = { ...dataset(runs, jobs), visibility: 'public' };
+  data.workflows['.github/workflows/ci.yml'] = WORKFLOW
+    .replace('runs-on: ubuntu-latest', 'runs-on: blacksmith-4vcpu-ubuntu-2404')
+    .replace('  push:\n  pull_request:\n', on.map((event) => `  ${event}:\n`).join(''));
+  return data;
+}
+const FORK_SAFE = "${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'acme-pool' }}";
+
+test('a move to the owner\'s pool in a public repository warns, whatever starts it, and steers ordinary fork pull requests', () => {
+  for (const event of ['pull_request', 'pull_request_target', 'pull_request_review', 'pull_request_review_comment']) {
+    const pool = analyze(publicPoolData(['push', event]), { moveTo: 'acme-pool' }).findings.find((f) => f.kind === 'paid-runner');
+    assert.deepEqual(pool.change, {
+      kind: 'set-runner', path: '.github/workflows/ci.yml', jobs: [{ id: 'build', from: 'blacksmith-4vcpu-ubuntu-2404', to: FORK_SAFE }],
+      pool: 'acme-pool', public: true, forks: 'ubuntu-latest',
+    }, event);
+    assert.ok(pool.evidence.some((line) => /it is not a wall: a fork pull request runs its own copy of the workflow and can name acme-pool itself/.test(line)), event);
+    assert.match(pool.suggestion, /a fork pull request can still name acme-pool itself/);
+  }
+  for (const on of [['push'], ['push', 'issue_comment'], ['workflow_run']]) {
+    const pool = analyze(publicPoolData(on), { moveTo: 'acme-pool' }).findings.find((f) => f.kind === 'paid-runner');
+    assert.equal(pool.change.jobs[0].to, 'acme-pool', `${on}: no pull request payload to steer by`);
+    assert.equal(pool.change.public, true, `${on}`);
+    assert.equal(pool.change.forks, undefined, `${on}`);
+    assert.ok(pool.evidence.some((line) => /only if the pool's runner group admits this public repository/.test(line)), `${on}`);
+    assert.ok(pool.evidence.some((line) => /any fork pull request can add a workflow of its own that names acme-pool/.test(line)), `${on}`);
+    assert.ok(pool.evidence.some((line) => /"Require approval for all external contributors" \(Settings, Actions, General\)/.test(line)), `${on}`);
+  }
+});
+
+test('the pull request text of a public move says the expression is not a wall, and what the owner can do', () => {
+  const data = publicPoolData(['push', 'pull_request']);
+  const report = analyze(data, { moveTo: 'acme-pool' });
+  const finding = report.findings.find((f) => f.kind === 'paid-runner');
+  const { body } = prText(report, finding);
+  assert.match(body, /\*\*This repository is public\. Read this before merging\.\*\*/);
+  assert.match(body, /reach acme-pool only if the pool's runner group admits this public repository/);
+  assert.match(body, /"Who can reach what"/);
+  assert.match(body, /It is not a wall: a fork pull request runs its own copy of the workflow and can name acme-pool itself\./);
+  assert.match(body, /"Require approval for all external contributors" \(Settings, Actions, General\)/);
+  const pushOnly = analyze(publicPoolData(['push']), { moveTo: 'acme-pool' });
+  const text = prText(pushOnly, pushOnly.findings.find((f) => f.kind === 'paid-runner')).body;
+  assert.match(text, /any fork pull request can add a workflow of its own that names acme-pool/);
+  assert.doesNotMatch(text, /runs-on expression/);
+});
+
+test('--move-to takes one plain label of the owner\'s own pool, and a job on that label is the owner\'s, at no charge', () => {
+  for (const bad of ['', 'a b', "x' || 'y", '${{ x }}', 'a\nb', ['a'], '-', '.inf', '1e3', '0x1F', '_pool']) {
+    assert.throws(() => analyze(dataset([], []), { moveTo: bad }), /--move-to takes one runner label/, JSON.stringify(bad));
+  }
+  for (const label of ['linux', 'linux-pool-4vcpu', 'ubuntu-latest', 'blacksmith-4vcpu-ubuntu-2404']) {
+    const r = run({ sha: `h-${label}`, until: 5 });
+    // The label alone, without `self-hosted`: only --move-to makes the job the owner's.
+    const data = dataset([r], [{ ...job(r, { end: 5 }), labels: [label] }]);
+    assert.ok(analyze(data).totals.listUsd > 0, `${label} without --move-to is priced as a hosted runner`);
+    const report = analyze(data, { moveTo: label });
+    assert.equal(report.totals.listUsd, 0, label);
+    assert.equal(report.jobs[0].runner, `self-hosted (${label})`, label);
+  }
+  const moves = publicPoolData(['push']);
+  moves.visibility = 'private';
+  const linux = analyze(moves, { moveTo: 'linux' }).findings.find((f) => f.kind === 'paid-runner');
+  assert.equal(linux.change.jobs[0].to, 'linux');
+  assert.ok(linux.evidence.some((line) => /^linux reads by its name like a runner GitHub hosts; .* understated$/.test(line)));
+  const acme = analyze(moves, { moveTo: 'acme-pool' }).findings.find((f) => f.kind === 'paid-runner');
+  assert.equal(acme.evidence.some((line) => /reads by its name/.test(line)), false);
+  const r = run({ sha: 'p0', until: 5 });
+  const data = dataset([r], [{ ...job(r, { end: 5 }), labels: ['acme-4vcpu-ubuntu-2404'] }]);
+  assert.equal(analyze(data).jobs[0].runner, 'acme-4vcpu-ubuntu-2404', 'without --move-to the label is not known');
+  const report = analyze(data, { moveTo: 'acme-4vcpu-ubuntu-2404' });
+  assert.equal(report.totals.listUsd, 0);
+  assert.equal(report.jobs[0].runner, 'self-hosted (acme-4vcpu-ubuntu-2404)');
 });
 
 test('the report renders, and the result line stays under 4096 bytes', () => {

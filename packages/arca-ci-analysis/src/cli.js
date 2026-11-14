@@ -16,7 +16,7 @@
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { analyze } from './analyze.js';
+import { analyze, checkLabel } from './analyze.js';
 import { collect } from './collect.js';
 import { GitHub } from './github.js';
 import { markdown, resultLine } from './report.js';
@@ -44,6 +44,7 @@ function parseArgs(argv) {
   if (args.repos.length === 0 && process.env.REPOS) args.repos = process.env.REPOS.split(',').map((r) => r.trim()).filter(Boolean);
   if (args.days == null && process.env.DAYS) args.days = Number(process.env.DAYS);
   if (!args.moveTo && process.env.MOVE_TO) args.moveTo = process.env.MOVE_TO;
+  checkLabel(args.moveTo ?? null); // before any collecting: a bad label fails the run, not each repository
   return args;
 }
 

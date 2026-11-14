@@ -1485,10 +1485,19 @@ service /24 through that last allow, so a function has none of that reach either
 service /24, is one of the node's own, or names port 0 opens nothing, whatever a record says. The linked service's
 side is the ordinary grant of a link, bound to the function's uuid and address.
 
-Source: `function_egress_rules` in `crates/arca-netproject/src/tenant.rs`, with its test
-`a_functions_rules_are_a_services_without_the_way_out_and_with_one_allow_for_each_link`; `egress` in
+A definition that says `internet: true` (the record's `internet`, shown on the owner's card) adds one rule at the end:
+an allow of every IPv4 address outside the service /24, less each private destination's own address. Every reject
+before it is the same as without it, and Incus weighs a reject above an allow, so the private ranges, CGNAT and the
+tailnet, link-local, loopback, the node's own addresses and all of IPv6 stay closed, and the service /24 stays closed
+but for the links. What it opens is the public internet. Without `internet`, or with `internet: false`, the array is
+exactly the one above.
+
+Source: `function_egress_rules` in `crates/arca-netproject/src/tenant.rs`, with its tests
+`a_functions_rules_are_a_services_without_the_way_out_and_with_one_allow_for_each_link` and
+`a_function_on_the_internet_reaches_what_a_service_does_less_its_subnet`; `egress` in
 `crates/arca/src/service.rs`; `create_function` in `crates/arca/src/function_handlers.rs`. Tests in
-`crates/arca/tests/functions.rs` (`a_private_destination_comes_from_the_nodes_config_and_is_on_the_card`).
+`crates/arca/tests/functions.rs` (`a_private_destination_comes_from_the_nodes_config_and_is_on_the_card`,
+`a_function_whose_definition_names_the_internet_is_let_out_to_public_addresses_only`).
 
 **Rule 73.** A run is not an effect. `arca_incus::function_run` is a path beside the effect journal, as the state
 writer of the instance verbs is: it reads one instance, refuses it unless it is a container that carries the function

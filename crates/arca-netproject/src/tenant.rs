@@ -704,6 +704,82 @@ mod tests {
         }
     }
 
+    /// A function whose definition names the internet, decided as Incus decides: a packet passes exactly when a
+    /// service's rules would pass it and it is not for the service /24, or when it is tcp to a link on its port. So
+    /// every private range, CGNAT and the tailnet, link-local (metadata among it), loopback and the node's own
+    /// addresses are as closed as for a service, whatever builds the rules; and without the internet nothing is
+    /// added to a function's rules but that one allow.
+    #[test]
+    fn a_function_on_the_internet_reaches_what_a_service_does_less_its_subnet() {
+        let hosts = json!(["10.20.30.1/24", "100.99.1.2/32", "172.20.7.5/24"]);
+        for gateway in [
+            [10, 90, 0, 1],
+            [192, 168, 44, 1],
+            [100, 70, 3, 1],
+            [198, 51, 100, 1],
+        ] {
+            let gateway = Ipv4Addr::from(gateway);
+            let own = u32::from(gateway) & 0xffff_ff00;
+            let links = [
+                Destination {
+                    address: Ipv4Addr::from(own | 10),
+                    port: 4222,
+                },
+                Destination {
+                    address: Ipv4Addr::from(own | 12),
+                    port: 5432,
+                },
+            ];
+            for destinations in [vec![], vec![to([10, 20, 30, 40], 443)]] {
+                let service = egress_rules(gateway, &hosts, None, &destinations);
+                let open = function_egress_rules(gateway, &hosts, &destinations, &links, true);
+                let closed = function_egress_rules(gateway, &hosts, &destinations, &links, false);
+                assert_eq!(closed, open[..open.len() - 1], "{gateway}: one rule more");
+                let more = [
+                    Ipv4Addr::new(169, 254, 169, 254),
+                    Ipv4Addr::new(100, 100, 100, 100),
+                    Ipv4Addr::new(10, 20, 30, 1),
+                    Ipv4Addr::new(100, 99, 1, 2),
+                    Ipv4Addr::new(172, 20, 7, 5),
+                    Ipv4Addr::new(140, 82, 112, 6),
+                    gateway,
+                    Ipv4Addr::from(own | 10),
+                    Ipv4Addr::from(own | 12),
+                    Ipv4Addr::from(own | 250),
+                ];
+                for ip in edges(&[&service, &open], &more) {
+                    let in_subnet = destination::holds(own, 24, u32::from(ip));
+                    for (protocol, ports) in [
+                        ("tcp", &[1u16, 22, 443, 4222, 5432, 65535][..]),
+                        ("udp", &[53, 443][..]),
+                        ("icmp4", &[0][..]),
+                        ("gre", &[0][..]),
+                    ] {
+                        for &port in ports {
+                            let link = protocol == "tcp"
+                                && links.iter().any(|l| l.address == ip && l.port == port);
+                            let wanted =
+                                (allowed(&service, ip, protocol, port) && !in_subnet) || link;
+                            assert_eq!(
+                                allowed(&open, ip, protocol, port),
+                                wanted,
+                                "{gateway} {destinations:?}: {protocol} {ip}:{port}"
+                            );
+                            assert_eq!(
+                                allowed(&closed, ip, protocol, port),
+                                link || (protocol == "tcp"
+                                    && destinations
+                                        .iter()
+                                        .any(|d| d.address == ip && d.port == port)),
+                                "{gateway} {destinations:?}: closed {protocol} {ip}:{port}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_service_with_no_destination_has_the_rules_it_always_had() {
         let hosts = json!([

@@ -138,7 +138,8 @@ pub fn classify_object(
         {
             // A function's instance carries one more: the mark the writer of a run looks for before it starts or
             // stops one. A function lives in the node's own service project and nowhere else, so the key is the
-            // entry's own there alone: on a tenant's instance it is another owner's key, as it always was.
+            // entry's own there alone: on a tenant's instance it is another owner's key, as it always was. So is
+            // the mark of the `raw.lxc` a template's `rawLxc` lines gave, which only a service there carries.
             if object.project == "arcak-svc" {
                 &[
                     "user.arca.template",
@@ -148,6 +149,7 @@ pub fn classify_object(
                     "user.arca.published",
                     "user.arca.envkeys",
                     "user.arca.function",
+                    "user.arca.rawlxc",
                 ]
             } else {
                 &[

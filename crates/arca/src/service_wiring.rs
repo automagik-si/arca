@@ -279,7 +279,7 @@ impl ServiceHandler {
         Ok(values)
     }
     /// Stores `value` as a file of the service whose entry is `owner`, and answers its reference.
-    fn store_value(&self, owner: &str, value: &str) -> Result<String, CallError> {
+    pub(super) fn store_value(&self, owner: &str, value: &str) -> Result<String, CallError> {
         let file = format!("v-{}", Digest::of(value.as_bytes()).to_hex());
         let path = self.cfg.state_dir.join("secrets").join(owner).join(&file);
         if !path.exists() {

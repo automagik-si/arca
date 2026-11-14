@@ -20,11 +20,15 @@ const BLACKSMITH = { 2: 0.004, 4: 0.008, 8: 0.016, 16: 0.032, 32: 0.064 };
 
 /**
  * The runner a job ran on, from its labels: `{ runner, kind, perMinute, freeForPublic }`. `kind` is `github`,
- * `blacksmith`, `self-hosted` or `unknown`.
+ * `blacksmith`, `self-hosted` or `unknown`. `ownPool` is the label of the owner's own runner pool (`--move-to`): a
+ * job carrying it ran there, whatever else its labels say, so it is self-hosted and priced at 0.
  */
-export function runnerOf(labels) {
+export function runnerOf(labels, ownPool = null) {
   const all = (labels ?? []).map((label) => String(label).toLowerCase());
   if (all.length === 0) return { runner: 'none (never ran)', kind: 'none', perMinute: 0, freeForPublic: true };
+  if (ownPool && all.includes(ownPool.toLowerCase())) {
+    return { runner: `self-hosted (${ownPool})`, kind: 'self-hosted', perMinute: 0, freeForPublic: false };
+  }
   if (all.includes('self-hosted')) {
     return { runner: `self-hosted (${all.filter((l) => l !== 'self-hosted').join(', ')})`, kind: 'self-hosted', perMinute: 0, freeForPublic: false };
   }
@@ -66,8 +70,8 @@ export function billedMinutes(job) {
  * What a job costs: `list` at list price whatever the repository, and `billed` with the free minutes of public
  * repositories taken off.
  */
-export function jobCost(job, visibility) {
-  const runner = runnerOf(job.labels);
+export function jobCost(job, visibility, ownPool = null) {
+  const runner = runnerOf(job.labels, ownPool);
   const minutes = billedMinutes(job);
   const list = runner.perMinute == null ? 0 : minutes * runner.perMinute;
   const billed = visibility === 'public' && runner.freeForPublic ? 0 : list;

@@ -581,10 +581,12 @@ pub fn limits_words(seconds: u64, memory: &str, cpu: u64) -> String {
     )
 }
 
-/// The `Internet` row of a function's card. It says the one way out that is not closed: names are resolved by this
-/// node's DNS, which asks the internet's, so a program can pass a little data out in the names it asks for.
-/// The card's `Internet` row for a definition that names the internet.
+/// The `Internet` row of the card of a definition that says `internet: true`: what it opens, and what it may carry
+/// out.
 pub const INTERNET_OPEN_WORDS: &str = "Yes: it can open connections to any public address on the internet, and send there whatever its program and its secrets hold. The private addresses outside the rows above and this node's other services stay closed to it";
+/// The `Internet` row of the card of a definition without `internet`. It says the one way out that is not closed:
+/// names are resolved by this node's DNS, which asks the internet's, so a program can pass a little data out in the
+/// names it asks for.
 pub const INTERNET_WORDS: &str = "No: it can open no connection to a public address. One way out stays: names are looked up through this node's DNS, which asks the internet's name servers, so a program can send a little data out in the names it asks for";
 
 /// The card rows of a `function_create`, as labels and values: what the function is, when it runs, what one run may
@@ -981,6 +983,21 @@ mod tests {
         );
         assert!(definition(&open).expect("a definition").function.internet);
         assert!(!definition(&args).expect("a definition").function.internet);
+        // An explicit false is the same definition, record and card as leaving it out.
+        let mut off = relay();
+        off["internet"] = json!(false);
+        let off = prepare(&off).expect("a definition");
+        assert_eq!(
+            definition(&off).expect("a definition").function,
+            definition(&args).expect("a definition").function
+        );
+        assert_eq!(
+            serde_json::to_value(definition(&off).expect("a definition").function)
+                .expect("a record")
+                .get("internet"),
+            None
+        );
+        assert_eq!(create_rows(&off), create_rows(&args));
         let mut wrong = relay();
         wrong["internet"] = json!("yes");
         assert!(

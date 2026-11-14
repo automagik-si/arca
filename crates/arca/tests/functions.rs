@@ -598,7 +598,7 @@ fn a_function_whose_definition_names_the_internet_is_let_out_to_public_addresses
             && rule["destination"]
                 .as_str()
                 .unwrap_or("")
-                .contains("192.168.0.0/16")),
+                .contains("100.64.0.0/10")),
         "{egress:?}"
     );
 

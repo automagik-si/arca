@@ -52,6 +52,25 @@ node src/pr-cli.js --report out/acme__app/report.json --workdir work/ --open   #
 repository under the signed-in account, pushes the branch there and opens a draft pull request. It never pushes to the
 repository itself and never merges.
 
+`pr-cli.js` assumes a public repository: it clones over anonymous https. For a private one, let git use your GitHub
+sign-in first (`gh auth setup-git`), and know that `--open` works only where the organisation allows forks of its
+private repositories.
+
+`--move-to` (or `MOVE_TO`) takes one runner label of your own pool: a letter, then letters, digits, `.`, `_` and `-`.
+Jobs that already carry it are counted as your own pool, at no charge; when the label reads by its name like a GitHub
+or Blacksmith runner (`linux`, `ubuntu-…`), each move adds one evidence line saying so.
+
+A public repository is a risk for your pool. Its jobs reach the pool only if the pool's runner group admits the
+repository, and Arca's pool warns when it does: a job on the pool can reach the pool's GitHub credential and the other
+slots (see "Who can reach what" in `docs/OPERATING.md`). Anyone can open a pull request from a fork, and a fork pull
+request runs its own copy of the workflow, so it can name your pool itself. Where pull requests start a workflow, the
+change writes
+`runs-on: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || '<label>' }}`.
+That sends ordinary pull requests from forks to GitHub's free runner, but it is not a wall. If you still want your pool
+for a public repository, choose "Require approval for all external contributors" (Settings, Actions, General), and read
+every workflow change before you approve a run. The evidence and the pull request text say all this for every move in a
+public repository.
+
 ## As an Arca function
 
 Without `--out` the CLI prints each repository's Markdown report, shortened to fit the 64 KiB of output Arca keeps,
