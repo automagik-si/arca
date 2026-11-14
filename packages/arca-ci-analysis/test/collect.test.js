@@ -195,6 +195,41 @@ test('L2: a day whose listing keeps failing is skipped and named; a run whose jo
   assert.equal(data.runs.length, 60 - 1, 'six days listed, one run without its jobs');
   assert.ok(data.logs && data.caches.activeCount === 0, 'the caches and logs are still read');
   assert.match(markdown(analyze(data)), /Not read: the runs of 1 day\(s\), the jobs of 1 run\(s\)/);
+  // L-A: the skipped day is out of the window, so a week is scaled from the six days read, not seven.
+  assert.equal(data.window.days, 6);
+  assert.match(markdown(analyze(data)), /the window is the 6 days whose runs were listed/);
+});
+
+test('L-B: a dead credential (a 401) stops collecting instead of spending the budget one request at a time', async () => {
+  const serve = repository(10, 3);
+  const { gh, calls } = client((url, n) => (n > 12 ? response(401, {}) : serve(url)), { budget: 600 });
+  const data = await collect(gh, 'acme/app', { days: 3, until: new Date(NOW).toISOString() });
+  assert.match(data.partial.reason, /GitHub answered 401/);
+  // The 401 stops new requests; at most the five others already in flight (six workers) still answer.
+  assert.ok(calls.length <= 13 + 5, `${calls.length} requests, not the rest of the budget`);
+  assert.ok(data.runs.length > 0, 'what was read before it is kept');
+
+  const { gh: app } = client(() => response(404, {}), { token: undefined, appId: '7', appKey: 'unused' });
+  app.authorization = async () => {
+    throw Object.assign(new Error('the App is not installed on acme/app: GitHub answered 404'), { code: 'auth' });
+  };
+  await assert.rejects(collect(app, 'acme/app', { days: 3, until: new Date(NOW).toISOString() }), /not installed/);
+  assert.equal(app.requests, 0);
+});
+
+test('I-A: a 429 while signing in waits for the retry-after GitHub names', async () => {
+  const { generateKeyPairSync } = await import('node:crypto');
+  const pem = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs1', format: 'pem' });
+  const { gh, slept } = client(
+    (url, n) => {
+      if (url.endsWith('/installation')) return n === 1 ? response(429, {}, { 'retry-after': '60' }) : response(200, { id: 9 });
+      if (url.endsWith('/access_tokens')) return response(201, { token: 'ghs_minted', expires_at: new Date(NOW + 3600e3).toISOString() });
+      return response(200, { ok: 1 });
+    },
+    { token: undefined, appId: '7', appKey: pem },
+  );
+  assert.deepEqual(await gh.get('acme/app', '/repos/acme/app'), { ok: 1 });
+  assert.deepEqual(slept, [60000]);
 });
 
 test('L2: when the budget stops the listing, the window is the days it got to, and the note says so', async () => {
@@ -202,5 +237,5 @@ test('L2: when the budget stops the listing, the window is the days it got to, a
   const data = await collect(gh, 'acme/app', { days: 7, until: new Date(NOW).toISOString() });
   assert.equal(data.partial.daysUnlisted, 4, 'the repository and three days listed, then the budget');
   assert.equal(data.window.days, 3);
-  assert.match(markdown(analyze(data)), /the runs of 4 day\(s\).*the window is the 3 days the listing got to/);
+  assert.match(markdown(analyze(data)), /the runs of 4 day\(s\).*the window is the 3 days whose runs were listed/);
 });

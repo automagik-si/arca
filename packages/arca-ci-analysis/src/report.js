@@ -32,7 +32,7 @@ export function markdown(report, { maxJobs = 25, maxFindings = 15 } = {}) {
       `**Partial:** not everything was read (${partial.reason}). Not read: ` +
         `${partial.daysUnlisted ? `the runs of ${partial.daysUnlisted} day(s), ` : ''}the jobs of ${partial.runsWithoutJobs} run(s), ` +
         `${partial.workflowsUnread} workflow file(s), ${partial.logsUnread} log(s). The figures cover what was read` +
-        `${partial.daysUnlisted ? `, and the window is the ${report.window.days} days the listing got to` : ''}.`,
+        `${partial.daysUnlisted ? `, and the window is the ${report.window.days} days whose runs were listed` : ''}.`,
     );
   }
   out.push('');

@@ -140,12 +140,16 @@ export class GitHub {
     if (held && held.expires - Date.now() > 5 * 60 * 1000) return `Bearer ${held.token}`;
     const jwt = this.appJwt();
     const headers = { authorization: `Bearer ${jwt}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' };
-    // A 5xx or 429 while signing in is tried again by get(), as any request is; any other answer is final.
-    const refused = (what, status) =>
-      Object.assign(new Error(`${what} ${repo}: GitHub answered ${status}`), { code: status >= 500 || status === 429 ? 'retry' : 'auth' });
+    // A 5xx or 429 while signing in is tried again by get(), as any request is, after the retry-after GitHub names;
+    // any other answer is final.
+    const refused = (what, answer) =>
+      Object.assign(new Error(`${what} ${repo}: GitHub answered ${answer.status}`), {
+        code: answer.status >= 500 || answer.status === 429 ? 'retry' : 'auth',
+        retryAfter: Number(answer.headers.get('retry-after') ?? 0) * 1000,
+      });
     this.spend();
     const found = await this.fetch(`${API}/repos/${repo}/installation`, { headers });
-    if (!found.ok) throw refused(found.status >= 500 || found.status === 429 ? 'could not look up the App on' : 'the App is not installed on', found.status);
+    if (!found.ok) throw refused(found.status >= 500 || found.status === 429 ? 'could not look up the App on' : 'the App is not installed on', found);
     const { id } = await found.json();
     // Creating an installation token is the one POST the analysis makes. The token is narrowed to this one
     // repository and to read permissions only.
@@ -158,7 +162,7 @@ export class GitHub {
         permissions: { actions: 'read', contents: 'read', metadata: 'read' },
       }),
     });
-    if (!minted.ok) throw refused('no installation token for', minted.status);
+    if (!minted.ok) throw refused('no installation token for', minted);
     const { token, expires_at: expiresAt } = await minted.json();
     this.installation.set(repo, { token, expires: Date.parse(expiresAt) });
     return `Bearer ${token}`;
@@ -190,8 +194,11 @@ export class GitHub {
       } catch (error) {
         // A spent budget or a refused sign-in is not tried again; a connection that broke is, as a server error is.
         if (error.code !== 'budget' && error.code !== 'auth' && attempt < 4) {
-          this.log(`GET ${path} failed (${error.message}); again in ${2 * 2 ** attempt} s`);
-          await this.sleep(2000 * 2 ** attempt);
+          const wait = Math.max(error.retryAfter ?? 0, 2000 * 2 ** attempt);
+          if (this.waited + wait > this.maxWaitMs) throw error;
+          if (error.retryAfter) this.waited += wait;
+          this.log(`GET ${path} failed (${error.message}); again in ${Math.round(wait / 1000)} s`);
+          await this.sleep(wait);
           continue;
         }
         throw error;
@@ -220,7 +227,9 @@ export class GitHub {
         continue;
       }
       if (response.status === 404 || response.status === 410) return null;
-      throw new Error(`GitHub answered ${response.status} for GET ${path}`);
+      // A 401 is a dead credential (an expired or revoked token): every later request would get the same answer.
+      const error = new Error(`GitHub answered ${response.status} for GET ${path}`);
+      throw response.status === 401 ? Object.assign(error, { code: 'auth' }) : error;
     }
   }
 
