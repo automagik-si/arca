@@ -77,8 +77,8 @@ impl Verb {
     /// Whether the MCP door advertises `readOnlyHint`. A verb that records a durable proposal is not read-only even
     /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
     /// `owner_approval_status` hands its requester an approval string, so it is not advertised read-only either (droidd's
-    /// `readOnly: false`), and its minimum scope keeps it off viewers. `instance_move_plan` records a frozen plan in the
-    /// move journal, as `action_propose` records a proposal.
+    /// `readOnly: false`), and its minimum scope keeps it off viewers. `instance_move_plan` keeps a frozen plan in a file of
+    /// its own, as `action_propose` records a proposal.
     pub fn read_only_hint(&self) -> bool {
         !self.writes
             && !matches!(
@@ -1062,7 +1062,7 @@ static VERBS: [Verb; 73] = [
     },
     Verb {
         name: "instance_move_plan",
-        summary: "Freeze the plan of a move of containers to a linked host, for the owner's one card. It runs instance_move_preflight again: any no-go blocks the plan with its reasons, and a virtual machine is not movable yet. When all pass it records the plan in the move journal and answers its digest: source, target and credential, each instance's uuid and measured bytes, the copy rounds and cutover, the checks, the transport (Incus pushes from this host) and the rollback promise. The plan expires in an hour; a changed source gives another digest. Nothing is stopped, copied or created.",
+        summary: "Freeze the plan of a move of containers to a linked host, for the owner's one card. It runs instance_move_preflight again: any no-go blocks the plan with its reasons, and a virtual machine is not movable yet. An ephemeral container or an unreadable spot-check file blocks it too. When all pass it keeps the plan and answers its digest: source, target and credential, each instance's uuid and measured bytes, the copy rounds and cutover, the checks, the transport (Incus pushes from this host) and the rollback promise. The plan expires an hour after it is first made, never renewed; a changed source gives another digest. Nothing is stopped, copied or created.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -1076,7 +1076,7 @@ static VERBS: [Verb; 73] = [
     },
     Verb {
         name: "instance_move",
-        summary: "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, is not the approved one, or whose instances changed. Per instance, Incus pushes the container and its volumes in rounds while it runs, stops it, sends the last delta, starts the copy and checks it. The downtime is measured from the stop to the passed checks. A failure before the checks pass rolls that instance back: the copy is removed and the source started again. The source is kept, stopped; instance_move_finish deletes it. Follow the run with instance_move_status.",
+        summary: "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, ran, is not the approved one, or whose instances changed or another move holds. Per instance, Incus pushes the container and its volumes in rounds while it runs, stops it, sends the last delta, starts the copy and checks it; the downtime is measured from the stop to the passed checks. A failure rolls that instance back without ever deleting the only copy or leaving both running: only the copy it recorded is removed, once the source is read back. The source is kept, stopped; instance_move_finish deletes it. Follow the run with instance_move_status.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -1104,7 +1104,7 @@ static VERBS: [Verb; 73] = [
     },
     Verb {
         name: "instance_move_finish",
-        summary: "Finish a verified move, once the owner has approved it as an action proposal: delete each moved source instance on this host and the custom volumes it took with it. It is offered only after the move's checks passed, never on a timer and never by itself; a source that runs again, or a volume another instance uses, is kept and named. instance_move_status shows what it would delete.",
+        summary: "Finish a verified move, once the owner has approved it as an action proposal: delete each moved source instance on this host and the custom volumes it took with it, each only once its copy is read back on the target. It is offered only after the move's checks passed, never on a timer and never by itself; a source that runs again, or a volume another instance uses, is kept and named. instance_move_status shows what it would delete.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,

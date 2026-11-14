@@ -2269,6 +2269,9 @@ A move takes containers from this node to a linked host with one owner card. The
 copy; the kernel orchestrates the rounds, journals them, measures the downtime, and rolls back what fails. The source is
 never deleted by the move: the owner finishes a verified move with a second card, whenever they choose.
 
+One rule holds on every path: no path deletes the only copy of an instance, and no path leaves the source and its copy
+both running. A rollback and a finish act only on objects whose uuid the move recorded, after reading the other side back.
+
 **What it needs.** The target is a linked host (`approval.linkedHosts`) with an `incusSocket`: the move writes to the
 target's Incus through that socket, so the owner decides by configuring it. The target's Incus listens on the network
 (`core.https_address`; its server document names the address and its certificate), and this host's Incus can reach that
@@ -2279,20 +2282,24 @@ plan names; it is not built yet, so a target that does not listen blocks the pla
 file, `/etc/hostname` when it does not), the `target`, and `rounds` (1 to 5 copy rounds while the container runs, 2 when
 absent). It runs the whole `instance_move_preflight` again. Any no-go blocks the whole plan, with the preflight's own
 reasons per instance in `blocked`: remove or fix those and plan again. Beyond the preflight, the plan blocks a virtual
-machine (`virtual machines are not movable yet`: this build moves containers only), a host folder (Incus does not copy
-it: move its data into a custom volume first), and a name the target already holds, instance or custom volume (a move
-never replaces one). A custom volume the target lacks is not a no-go here, unlike in the preflight: the move takes it
+machine (`virtual machines are not movable yet`: this build moves containers only), an ephemeral container (Incus deletes
+it when it stops, so the cutover would delete the source: make it non-ephemeral first), a host folder (Incus does not copy
+it: move its data into a custom volume first), a spot-check file that cannot be read in the container now (a check that
+could never compare would always pass), and a name the target already holds, instance or custom volume (a move never
+replaces one). A custom volume the target lacks is not a no-go here, unlike in the preflight: the move takes it
 along, in the same rounds.
 
-When every instance passes, the plan is frozen in the move journal and named by its `digest`, a SHA-256 over the
-canonical plan without its times. The plan names this node and the target, the credential (the target's `incusSocket`),
-the transport (`push`, the target's address and the SHA-256 of its certificate, `relay` as the unavailable fallback),
-and, per instance, its `volatile.uuid`, a digest of its devices, its measured bytes (root, snapshots, custom volumes,
+When every instance passes, the plan is frozen, one private file in `instance-move-plans/` in the state directory, and
+named by its `digest`, a SHA-256 over the canonical plan without its times. The plan names this node and the target, the
+credential (the target's `incusSocket`), the transport (`push`, every address the target listens on in its order, the
+SHA-256 of its certificate, `relay` as the unavailable fallback), and, per instance, its `volatile.uuid`, a digest of its
+devices and one of its own config without the volatile keys, its profiles, its measured bytes (root, snapshots, custom volumes,
 host folders) and the bytes it needs with 10% headroom, its target pool, its custom volumes, the rounds in order, the
 cutover (stop the source, send the last delta, start the copy), the checks, and an estimated downtime (30 s for the stop,
 start and checks, plus a last delta of 1% of the data at 50 MiB/s: an estimate; the move measures the real one). A plan
-expires an hour after it is made. Planning again with the same source gives the same digest; a changed uuid, device or
-size gives another.
+expires an hour after it is first made: planning the same source again answers the same digest and the same expiry, never
+a renewed one. A changed uuid, device, config, profile or size gives another digest. Plan files are pruned a day after
+they expire.
 
 ```
 arca call instance_move_plan '{"instances":[{"project":"shop","name":"web","spotCheck":"/srv/data/orders.db"}],"target":"node-b"}'
@@ -2306,52 +2313,76 @@ downtime, its custom volumes), the transport, the credential, the rollback promi
 is one card. The owner's passkey approves the card's arguments, digest included; the grant it arms is spent by one run.
 
 **3. The run.** The approved `instance_move` (doctor) checks the plan is still the approved one before it spends the
-grant, then reads everything again: a plan that is no longer a go, or whose instances changed since the card (uuid, type,
-devices, custom volumes, target pool, the target's address or certificate, or a size past the approved headroom) is
-refused with `PlanChanged` and nothing moves. With other moves running to the same target, their pending bytes are
-counted against its pool (`TargetFull`). The answer comes at once (`phase: copying`, the move id `mv-<12 hex>`); the run
+grant, and that no other move that has not ended holds one of its instances (`InstanceMoving`; a move a stopped kernel
+left holds them until the next start settles it), then reads everything again: a plan that is no longer a go, or whose
+instances changed since the card (uuid, type, devices, config, profiles, custom volumes, target pool, the target's
+addresses or certificate, or a size past the approved headroom) is refused with `PlanChanged` and nothing moves. With
+other moves running to the same target, their pending bytes are counted against its pool (`TargetFull`). The plan and the
+`begin` line are journaled before anything moves; a journal that cannot be written refuses the move
+(`JournalUnwritable`). The answer comes at once (`phase: copying`, the move id `mv-<12 hex>`); the run
 goes on in the background, one instance after the other:
 
 - the copy rounds while the container runs: each custom volume, then the container, are created on the target as a
   migration (`push` mode) and pushed by this host's Incus; the first round copies everything with its snapshots, each next
-  one refreshes only what changed. Before each round the target pool's free space is read again: a target that filled
-  up fails the round. Each round is journaled with its bytes, rate and time.
-- the cutover: the source is stopped (gracefully for a minute, then forced), the last delta is sent, and the copy is
-  started on the target.
+  one refreshes only what changed. These rounds ask Incus not to freeze the container (`allow_inconsistent`), so it keeps
+  serving: on dir, lvm and zfs block volumes their copy may be inconsistent, which the last round corrects. Each of the
+  target's addresses is tried in order with the same receiving operation, as Incus's own client does, and the one that
+  answered is used first for the rest. As each object lands in the first round, its uuid on the target is journaled
+  (`created`): that line is what a rollback may delete, and the run stops without it. Before each round the target pool's
+  free space is read again: a target that filled up fails the round. Each round is journaled with its bytes, rate and time.
+- the cutover: whether the source runs is read now, not at the begin. A running source is stopped (gracefully for a
+  minute, then forced), the last delta is sent consistently (frozen, with the source stopped), and the copy is started on
+  the target.
 - the checks: the copy runs, and still runs after the other checks; each network card that had a global address on the
-  source has one again (waiting up to a minute); each TCP proxy port answers on the target's address; a container has
-  no guest agent (not applicable); each custom volume is on the target and attached; the spot-check file reads the same
-  on both sides (when the source has no such file, the check says there was nothing to compare).
+  source has one again (waiting up to a minute); each TCP proxy that listens on every address (`0.0.0.0` or `::`) and
+  answered on this host just before the stop answers on the target's address (a proxy on one address is named as not
+  probed); a container has no guest agent (not applicable); each custom volume is on the target and attached; the
+  spot-check file reads the same on both sides: the source's as read after the stop, or, when that read fails (a stopped
+  container's custom volumes are not mounted), as read just before it. When neither read worked, the check fails.
 - the downtime is measured from the stop to the passed checks, and is in the `result` line and the status.
+- a verified source is kept, stopped, with `boot.autostart` off, so a reboot of this host does not start it next to its
+  copy (`autostartOff` in the result line).
 
-**Failure and rollback.** Any failure before the checks pass rolls that instance back: the copy on the target is
-stopped and deleted with the custom volumes the move created there (the plan made sure the target held none of those
-names), and the source is started again when it ran before the move. The source's own volumes are never touched. The
-instance's result is `rolled_back` with the reason; the next instance of a batch still moves. A verified instance's
-source stays on this host, stopped: to go back, stop the copy on the target and start the source, until the move is
-finished. The proposal's late result is `MoveVerified`, `MovePartlyRolledBack` or `MoveRolledBack`.
+**Failure and rollback.** Any failure before the checks pass rolls that instance back, under the rule above. A failed
+push first waits (up to a minute) for the target's receiving operation to end, and a delete Incus answers as busy is
+tried again for 30 s. Then the source is read back: only when it is here with the plan's `volatile.uuid` is the copy on
+the target deleted (stopped first when it runs), and only that copy: an instance or custom volume on the target whose
+uuid this move did not record is left alone and named. A custom volume's copy is deleted only while the source's volume
+is read back here. The source is started again only when this move stopped it and the copy is read back gone or stopped;
+a target that cannot be read leaves the source stopped. The source's own volumes are never touched. A clean rollback is
+`rolled_back` with the reason; anything else (the source not read back, a copy kept, a target not read) is `failed` with
+what was left and why, and the move's phase is `needs_owner`. The next instance of a batch still moves. A verified
+instance's source stays on this host, stopped: to go back, stop the copy on the target and start the source, until the
+move is finished. The proposal's late result is `MoveVerified`, `MovePartlyRolledBack`, `MoveRolledBack`, or
+`MoveNeedsOwner` when any instance is `failed`.
 
-**A stopped kernel.** A move the kernel left unfinished (a `begin` with no `end`) is not resumed: on the next start in
-kernel mode, each instance that has no result is rolled back as above, with the reason "the kernel stopped during the
-move", and the move ends `interrupted`.
+**A stopped kernel.** A move the kernel left unfinished (a `begin` with no `end`) is not resumed. On the next start in
+kernel mode each instance without a result is settled: one whose checks passed (a `verify` line with `ok`) is recorded as
+`moved` and nothing is deleted; one whose copy had been started is left as it stands, with the source stopped, and is
+`failed` for the owner (the copy may have served writes); any other is rolled back as above, with the reason "the kernel
+stopped during the move". The move ends `interrupted`, and the proposal gets its late result.
 
 **Progress.** `instance_move_status` (viewer, read-only) answers one move (`{"move": "mv-…"}`) or the latest 20: its
-phase (`running`, `moved`, `partly_moved`, `rolled_back`, `finished`, or `interrupted` when no run of this process holds
-it), and per instance the phase (`waiting`, `copying`, `cutover`, `verifying`, `rolling_back`, then the result), rounds
-done and total, bytes moved (Incus's own count, live during a round) and the measured total, the rate Incus reports, the
+phase (`running`, `moved`, `partly_moved`, `rolled_back`, `needs_owner`, `finished`, or `interrupted` when no run of this
+process holds it), and per instance the phase (`waiting`, `copying`, `cutover`, `verifying`, `rolling_back`, then the
+result), rounds done and total, bytes moved (during a round, the figure Incus writes in the operation's `fs_progress`,
+such as `web: 1.20GB (3.00MB/s)`: decimal units, rounded to two decimals, counted per stream, so an estimate) and the
+measured total, the rate Incus reports, the
 elapsed time, the time left (only during the first round, from the rate; `null` when it cannot be said), the downtime
 once moved, the reason and the checks. `finish` says whether a finish is offered and what it would delete.
 
 **4. Finishing.** `instance_move_finish` is a card of its own (`action_propose` with `{move}`), offered only after the
 move ended with at least one verified instance, never on a timer and never by itself. Its card lists each source
-instance and custom volume it deletes. Approved, it deletes each verified source instance on this host, and its custom
-volumes when no other instance uses them; a source that runs again, or a volume in use, is kept and named in `kept`. The
-moved copies on the target are not touched. A finish runs once.
+instance and custom volume it deletes. Approved, it first reads each copy back on the target: a source is deleted only
+when its copy is there with the uuid this move recorded, the source here is the moved instance (its uuid) and it is not
+running; a custom volume only when its copy is read back on the target and no instance here uses it. Anything else is
+kept and named in `kept`. The moved copies on the target are not touched. A finish runs once.
 
-**The journal.** `instance-moves.jsonl` in the state directory (0600), append-only JSON lines: `plan`, `begin`,
-`round`, `created`, `cutover`, `verify`, `result`, `rollback`, `end` and `finish`. It holds no secret: no websocket
-secret and no certificate, only the certificate's SHA-256. A torn last line is skipped, and the next append starts on a
-new line.
+**The journal.** `instance-moves.jsonl` in the state directory (0600), append-only JSON lines: `plan` (written with the
+`begin` of the move that runs it, not when planning), `begin`, `round`, `created`, `cutover`, `verify`, `result`,
+`rollback`, `end` and `finish`. It holds no secret: no websocket secret and no certificate, only the certificate's
+SHA-256. It is read line by line with no size cap; a torn last line is skipped, and the next append starts on a new line;
+a line over 8 MiB is skipped and said on the log.
 
 **What the tests do not prove.** The tests run two fake Incus daemons linked so that a push lands on the target. A real
 two-host run still has to show Incus's push between two daemons (certificates, the address reachable from the source, the

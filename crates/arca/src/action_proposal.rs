@@ -736,7 +736,7 @@ impl ActionKind {
                     "Sets IP forwarding as the host's declared file says, adds the firewall rules that let the declared bridges' containers reach out, and sets the FORWARD policy the file records. No container and nothing in Arca's own state changes.",
                 ),
             ],
-            // What the frozen plan holds, read from the move journal when the proposal was made: a row per instance,
+            // What the frozen plan holds, read from its plan file when the proposal was made: a row per instance,
             // the transport, the credential and the rollback.
             Self::InstanceMove => {
                 let mut rows = vec![row("Plan", text("plan")), row("Target", text("target"))];
