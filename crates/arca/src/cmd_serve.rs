@@ -295,11 +295,17 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     };
     let (sampler, metrics_source) = new_sampler(&cfg);
     let sampler = sampler.with_probes(probe_targets(&alerts_file.probes));
-    let ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
+    let mut ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
         .with_checks(targets)
         .with_watch(Arc::clone(&watch))
         .with_host_network(cfg.host_network.status.clone())
         .with_os_update(os_update.clone());
+    // The runner pools run only on a kernel-mode node: they create and delete their job machines.
+    if kernel_mode
+        && let Some(board) = crate::runners::spawn(&cfg, &node).map_err(Failure::Runtime)?
+    {
+        ticker = ticker.with_runners(board);
+    }
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let reader = Arc::new(Mutex::new(reader));

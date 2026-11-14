@@ -364,6 +364,7 @@ pub struct Ticker<S: TickStore> {
     watch: Option<Arc<WatchHandler>>,
     host_network: Option<std::path::PathBuf>,
     os_update: Option<OsUpdatePublished>,
+    runners: Option<arca_runners::SignInBoard>,
 }
 
 impl<S: TickStore> Ticker<S> {
@@ -382,12 +383,19 @@ impl<S: TickStore> Ticker<S> {
             watch: None,
             host_network: None,
             os_update: None,
+            runners: None,
         }
     }
 
     /// The same ticker, which publishes the sampler's newest update state to `cell` on each tick, for `os_update`.
     pub fn with_os_update(mut self, cell: OsUpdatePublished) -> Self {
         self.os_update = Some(cell);
+        self
+    }
+
+    /// The same ticker, which reads the runner pools' sign-in board on each tick for the `runner-signin` rule.
+    pub fn with_runners(mut self, board: arca_runners::SignInBoard) -> Self {
+        self.runners = Some(board);
         self
     }
 
@@ -436,6 +444,8 @@ impl<S: TickStore> Ticker<S> {
         if let Some(path) = &self.host_network {
             inputs.host_network = crate::host_network::alert_input(path);
         }
+        // A node without pools has a known, empty list: the rule is never unknown there.
+        inputs.runner_signin = Some(crate::runners::alert_input(self.runners.as_ref(), now_ms));
         let points = export::points(&self.sampler, &inputs);
         let mut snapshot = self.engine.tick(&inputs, points, now_ms);
         snapshot.sample_at = self.sampler.latest().map(|sample| sample.at);

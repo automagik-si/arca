@@ -74,6 +74,23 @@ pub struct NodeConfig {
     /// places the install writes.
     #[serde(default)]
     pub host_network: HostNetworkConfig,
+    /// The GitHub Actions runner pools this node runs: one fresh virtual machine per job (`docs/RUNNERS.md`). Absent,
+    /// none. Served only by a kernel-mode node.
+    #[serde(default)]
+    pub runners: Option<RunnersConfig>,
+}
+
+/// The `runners` key.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunnersConfig {
+    pub pools: Vec<arca_runners::PoolConfig>,
+    /// The folder of the pools' GitHub credentials until the signer holds them: a file named after each pool's binding,
+    /// holding a token with the organisation permission "Self-hosted runners: read and write", readable by the node's
+    /// user only. It is read at each sign-in, so a new token is used without a restart. Absent,
+    /// `<stateDir>/runner-credentials`.
+    #[serde(default)]
+    pub credentials_dir: Option<PathBuf>,
 }
 
 /// The `hostNetwork` key: the socket and the status file of the root part (`arca host-network run`).
@@ -503,6 +520,8 @@ pub enum ConfigError {
     FollowInterval,
     /// `hostNetwork.socket` or `hostNetwork.status` is not an absolute path.
     HostNetworkPath,
+    /// A runner pool breaks a rule; the rule is named.
+    Runners(String),
     /// The approval origin is not an https origin with a host name and at most a non-443 port, nor the localhost origin.
     /// The value is left out.
     ApprovalOrigin,
@@ -593,6 +612,7 @@ impl fmt::Display for ConfigError {
                 f,
                 "follow.intervalSeconds is refused: it must be a whole number of seconds from 60 to 86400"
             ),
+            Self::Runners(rule) => write!(f, "runners is refused: {rule}"),
             Self::HostNetworkPath => write!(
                 f,
                 "hostNetwork.socket and hostNetwork.status are refused: each must be an absolute path"
@@ -716,6 +736,24 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     }
     if !config.host_network.socket.is_absolute() || !config.host_network.status.is_absolute() {
         return Err(ConfigError::HostNetworkPath);
+    }
+    if let Some(runners) = &config.runners {
+        let mut names = std::collections::BTreeSet::new();
+        for pool in &runners.pools {
+            pool.check().map_err(ConfigError::Runners)?;
+            if !names.insert(pool.name.as_str()) {
+                return Err(ConfigError::Runners("two pools share a name".to_string()));
+            }
+        }
+        if runners
+            .credentials_dir
+            .as_ref()
+            .is_some_and(|dir| !dir.is_absolute())
+        {
+            return Err(ConfigError::Runners(
+                "credentialsDir is an absolute path".to_string(),
+            ));
+        }
     }
     if let Some(host) = &config.approval_host
         && !host_name_ok(host)

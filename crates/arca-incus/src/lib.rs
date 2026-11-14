@@ -28,6 +28,9 @@ pub mod import;
 #[cfg(feature = "write")]
 pub mod lifecycle;
 pub mod read;
+/// The per-job runner machines of a CI runner pool: created, written into, run and deleted, only with the pool's mark.
+#[cfg(feature = "write")]
+pub mod runner_vm;
 pub mod shim;
 #[cfg(feature = "write")]
 pub mod snapshot;

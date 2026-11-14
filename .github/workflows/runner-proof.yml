@@ -1,0 +1,83 @@
+# The proof of a runner pool (docs/RUNNERS.md): run by hand, never by a push or a pull request, so no outside code
+# reaches the pool through it.
+#
+# - fingerprint: prints what the machine is, on GitHub's own runner and on the pool's, as artifacts to diff.
+# - leak-writer, then leak-reader: job N leaves marker files and a Docker image; job N+1 on the same label must find
+#   none of them.
+name: runner-proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "The pool's runs-on label"
+        required: true
+        default: automagik-4vcpu-ubuntu-2404
+
+permissions:
+  contents: read
+
+jobs:
+  fingerprint:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, pool]
+    runs-on: ${{ matrix.runner == 'pool' && inputs.label || matrix.runner }}
+    steps:
+      - name: Fingerprint
+        run: |
+          set +e
+          out="$RUNNER_TEMP/fingerprint-${{ matrix.runner }}.txt"
+          {
+            echo "## id";        id
+            echo "## pwd";       pwd
+            echo "## workspace"; echo "$GITHUB_WORKSPACE"
+            echo "## nproc";     nproc
+            echo "## memory";    free -m
+            echo "## cpu";       grep -m1 'model name' /proc/cpuinfo
+            echo "## kernel";    uname -r
+            echo "## os";        cat /etc/os-release
+            echo "## ulimit";    ulimit -a
+            echo "## sysctl";    sysctl vm.max_map_count fs.inotify.max_user_watches fs.inotify.max_user_instances vm.mmap_rnd_bits
+            echo "## disk";      df -h / /mnt /tmp 2>/dev/null
+            echo "## swap";      swapon --show
+            echo "## env";       env | sort | grep -v -E 'TOKEN|SECRET|KEY|PASSWORD|JITCONFIG'
+            echo "## sudo";      sudo -n true && echo yes
+            echo "## docker";    docker info --format '{{.ServerVersion}} {{.Driver}} {{.CgroupVersion}}'
+            echo "## services";  systemctl list-units --type=service --state=running --no-legend | awk '{print $1}'
+            echo "## tools"
+            for tool in git curl jq zstd gcc make node npm python3 go docker gh skopeo wget zip rsync xz; do
+              printf '%s: %s\n' "$tool" "$(command -v "$tool" >/dev/null && "$tool" --version 2>&1 | head -1)"
+            done
+            echo "## toolcache"; ls /opt/hostedtoolcache 2>&1
+          } >"$out" 2>&1
+          cat "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fingerprint-${{ matrix.runner }}
+          path: ${{ runner.temp }}/fingerprint-${{ matrix.runner }}.txt
+
+  leak-writer:
+    runs-on: ${{ inputs.label }}
+    steps:
+      - name: Leave markers and an image
+        run: |
+          touch "$HOME/arca-leak" /tmp/arca-leak "$GITHUB_WORKSPACE/arca-leak"
+          sudo touch /opt/arca-leak /var/lib/arca-leak
+          printf 'FROM scratch\nLABEL arca_leak=${{ github.run_id }}\n' | docker build -t arca-leak:test -
+          docker image ls arca-leak
+
+  leak-reader:
+    needs: leak-writer
+    runs-on: ${{ inputs.label }}
+    steps:
+      - name: Find nothing job N left
+        run: |
+          found=0
+          for path in "$HOME/arca-leak" /tmp/arca-leak "$GITHUB_WORKSPACE/arca-leak" /opt/arca-leak /var/lib/arca-leak; do
+            if [ -e "$path" ]; then echo "LEAK: $path"; found=1; fi
+          done
+          if docker image inspect arca-leak:test >/dev/null 2>&1; then echo "LEAK: docker image arca-leak:test"; found=1; fi
+          [ "$found" = 0 ] && echo "no state from job N"
+          exit "$found"

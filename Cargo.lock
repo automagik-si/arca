@@ -108,6 +108,7 @@ dependencies = [
  "arca-postgres",
  "arca-providers",
  "arca-reconcile",
+ "arca-runners",
  "arca-store",
  "arca-watch",
  "axum",
@@ -290,6 +291,22 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+]
+
+[[package]]
+name = "arca-runners"
+version = "0.29.0"
+dependencies = [
+ "arca-incus",
+ "arca-metrics",
+ "axum",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
