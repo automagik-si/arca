@@ -141,12 +141,14 @@ export class GitHub {
     const jwt = this.appJwt();
     const headers = { authorization: `Bearer ${jwt}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' };
     // A 5xx or 429 while signing in is tried again by get(), as any request is, after the retry-after GitHub names;
-    // any other answer is final.
-    const refused = (what, answer) =>
-      Object.assign(new Error(`${what} ${repo}: GitHub answered ${answer.status}`), {
+    // any other answer is final. A retry-after in seconds is kept; its HTTP-date form is not, and the backoff applies.
+    const refused = (what, answer) => {
+      const seconds = Number(answer.headers.get('retry-after'));
+      return Object.assign(new Error(`${what} ${repo}: GitHub answered ${answer.status}`), {
         code: answer.status >= 500 || answer.status === 429 ? 'retry' : 'auth',
-        retryAfter: Number(answer.headers.get('retry-after') ?? 0) * 1000,
+        retryAfter: Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0,
       });
+    };
     this.spend();
     const found = await this.fetch(`${API}/repos/${repo}/installation`, { headers });
     if (!found.ok) throw refused(found.status >= 500 || found.status === 429 ? 'could not look up the App on' : 'the App is not installed on', found);
@@ -195,7 +197,8 @@ export class GitHub {
         // A spent budget or a refused sign-in is not tried again; a connection that broke is, as a server error is.
         if (error.code !== 'budget' && error.code !== 'auth' && attempt < 4) {
           const wait = Math.max(error.retryAfter ?? 0, 2000 * 2 ** attempt);
-          if (this.waited + wait > this.maxWaitMs) throw error;
+          // A retry-after past the wait budget is a rate limit that will not lift in time: the run stops on it.
+          if (this.waited + wait > this.maxWaitMs) throw error.retryAfter ? new RateLimited(this.now() + wait) : error;
           if (error.retryAfter) this.waited += wait;
           this.log(`GET ${path} failed (${error.message}); again in ${Math.round(wait / 1000)} s`);
           await this.sleep(wait);
