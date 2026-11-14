@@ -3,10 +3,13 @@
 //! Per size class it keeps `min(max, warm + assigned)` runners alive, where `assigned` is GitHub's count of the class's
 //! jobs that are assigned and not finished, and as long as the pool's budget has room. Each runner is one machine:
 //! made, handed one just-in-time configuration, watched until its runner exits, its logs read, destroyed. A machine is
-//! never reused. A machine that never took a job is destroyed too, and its runner removed from GitHub.
+//! never reused. A machine that never took a job is destroyed too, its runner removed from GitHub first, so GitHub
+//! never hands a job to a runner whose machine is going. A runner with a job is never ended by the pool. A machine
+//! whose destroy fails keeps its share of the budget and is destroyed again later; a machine of the pool that the pool
+//! does not know (one an earlier run left) is destroyed by a sweep every few minutes.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,12 +25,60 @@ use crate::time::{now_ms, parse_rfc3339};
 
 /// How long a machine may take from its create until its agent answers.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(300);
-/// How long a machine's runner may live: GitHub's own longest job is 6 hours; a runner past this is ended.
-pub const RUNNER_TIMEOUT: Duration = Duration::from_secs(7 * 3600);
+/// How long a runner may go on after GitHub said its job finished before its machine is ended: a runner exits on its
+/// own once its one job is done, so one still running is stuck. A runner whose job is still running is never ended.
+pub const COMPLETED_GRACE: Duration = Duration::from_secs(600);
+/// How long an idle runner waits for a job before its machine is replaced by a fresh one.
+pub const IDLE_MAX: Duration = Duration::from_secs(3600);
 /// How long an idle runner above the wanted count is kept before its machine goes.
 pub const IDLE_GRACE: Duration = Duration::from_secs(300);
+/// How often the pool looks for machines of its own that it does not know.
+pub const SWEEP_EVERY: Duration = Duration::from_secs(300);
+/// How long a runner that GitHub would not remove waits before the pool asks again.
+pub const RETIRE_RETRY: Duration = Duration::from_secs(30);
 /// The longest pause before a class tries again after failures.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// The pool's clocks. The defaults are the constants above; tests shorten them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    pub ready: Duration,
+    pub completed_grace: Duration,
+    pub idle_max: Duration,
+    pub idle_grace: Duration,
+    pub sweep_every: Duration,
+    pub retire_retry: Duration,
+    /// The first pause after a failure; it doubles up to `backoff_max`.
+    pub backoff_base: Duration,
+    pub backoff_max: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            ready: READY_TIMEOUT,
+            completed_grace: COMPLETED_GRACE,
+            idle_max: IDLE_MAX,
+            idle_grace: IDLE_GRACE,
+            sweep_every: SWEEP_EVERY,
+            retire_retry: RETIRE_RETRY,
+            backoff_base: Duration::from_secs(5),
+            backoff_max: BACKOFF_MAX,
+        }
+    }
+}
+
+impl Timing {
+    /// The pause after `failures` failures: the base doubled per failure, at most the max.
+    fn backoff(&self, failures: u32) -> Duration {
+        self.backoff_max
+            .min(self.backoff_base.saturating_mul(1 << failures.min(10)))
+    }
+}
+
+fn ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Where a machine is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +102,7 @@ struct Machine {
     idle_since_ms: u64,
     started: Option<JobMessage>,
     completed: Option<JobMessage>,
+    completed_ms: Option<u64>,
     mint_id: Option<u64>,
     runner_id: Option<u64>,
     cancel: Arc<AtomicBool>,
@@ -101,6 +153,7 @@ pub struct Pool<A: Access, L: Launcher> {
     signin: SignInBoard,
     recorder: Recorder,
     owner: String,
+    timing: Timing,
     state: Mutex<State>,
 }
 
@@ -114,6 +167,27 @@ impl<A: Access, L: Launcher> Pool<A, L> {
         recorder: Recorder,
         owner: &str,
     ) -> Arc<Self> {
+        Self::with_timing(
+            config,
+            client,
+            launcher,
+            signin,
+            recorder,
+            owner,
+            Timing::default(),
+        )
+    }
+
+    /// The same, with its own clocks.
+    pub fn with_timing(
+        config: PoolConfig,
+        client: Arc<ScaleSetClient<A>>,
+        launcher: Arc<L>,
+        signin: SignInBoard,
+        recorder: Recorder,
+        owner: &str,
+        timing: Timing,
+    ) -> Arc<Self> {
         let classes = vec![ClassState::default(); config.classes.len()];
         Arc::new(Self {
             config,
@@ -122,6 +196,7 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             signin,
             recorder,
             owner: owner.to_string(),
+            timing,
             state: Mutex::new(State {
                 classes,
                 ..State::default()
@@ -155,10 +230,11 @@ impl<A: Access, L: Launcher> Pool<A, L> {
         eprintln!("arca: runners: pool {}: {text}", self.config.name);
     }
 
-    /// Runs the pool until `stop` turns true: removes what an earlier run left, starts one listener per class, and
-    /// sweeps old logs every hour. On stop, the listeners close their sessions and the machines without a job go.
+    /// Runs the pool until `stop` turns true: removes what an earlier run left, starts one listener per class, sweeps
+    /// for unknown machines every few minutes and old logs every hour. On stop, the listeners close their sessions and
+    /// the machines without a job go.
     pub async fn run(self: Arc<Self>, stop: watch::Receiver<bool>) {
-        self.clean_leftovers().await;
+        self.sweep_unknown(true).await;
         self.recorder.sweep();
         let mut listeners = Vec::new();
         for class in 0..self.config.classes.len() {
@@ -169,11 +245,17 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             )));
         }
         let mut stop_wait = stop.clone();
-        let mut sweep = tokio::time::interval(Duration::from_secs(3600));
+        let mut logs = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let every = self.timing.sweep_every;
+        let mut unknown = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         loop {
             tokio::select! {
                 () = crate::listener::stopped(&mut stop_wait) => break,
-                _ = sweep.tick() => { self.recorder.sweep(); }
+                _ = logs.tick() => { self.recorder.sweep(); }
+                _ = unknown.tick() => { self.sweep_unknown(false).await; }
             }
         }
         for listener in listeners {
@@ -182,21 +264,32 @@ impl<A: Access, L: Launcher> Pool<A, L> {
         self.stop_machines().await;
     }
 
-    /// Destroys every machine of the pool that exists before the pool starts: a kernel that stopped leaves none behind
-    /// for long. Its runner, if GitHub still lists it, is removed too.
-    async fn clean_leftovers(&self) {
+    /// Destroys every machine of the pool that the pool does not know: at start, all of them (a kernel that stopped
+    /// leaves none behind for long); later, one an earlier run left that could not be listed or destroyed then. Its
+    /// runner, if GitHub still lists it, is removed too. A machine is known from before its create until after its
+    /// destroy, so a machine being made or ended is never taken for an unknown one.
+    async fn sweep_unknown(&self, at_start: bool) {
         let launcher = Arc::clone(&self.launcher);
         let names = match blocking(move || launcher.existing()).await {
             Ok(names) => names,
             Err(error) => {
                 self.say(&format!(
-                    "the machines left by an earlier run could not be listed: {error}"
+                    "the pool's machines could not be listed, the sweep tries again in {} s: {error}",
+                    self.timing.sweep_every.as_secs()
                 ));
                 return;
             }
         };
         for name in names {
-            self.say(&format!("removing machine {name}, left by an earlier run"));
+            if self.lock().machines.contains_key(&name) {
+                continue;
+            }
+            let why = if at_start {
+                "left by an earlier run"
+            } else {
+                "not known to the pool"
+            };
+            self.say(&format!("removing machine {name}, {why}"));
             let launcher = Arc::clone(&self.launcher);
             let gone = name.clone();
             if let Err(error) = blocking(move || launcher.destroy(&gone)).await {
@@ -300,7 +393,9 @@ impl<A: Access, L: Launcher> Pool<A, L> {
         {
             let mut state = self.lock();
             for job in &message.started {
-                if let Some(machine) = state.machines.get_mut(&job.runner_name) {
+                if let Some(machine) = state.machines.get_mut(&job.runner_name)
+                    && machine.phase != Phase::Ending
+                {
                     machine.phase = Phase::Busy;
                     machine.started = Some(job.clone());
                     if let Some(mint) = machine.mint_id {
@@ -311,6 +406,7 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             for job in &message.completed {
                 if let Some(machine) = state.machines.get_mut(&job.runner_name) {
                     machine.completed = Some(job.clone());
+                    machine.completed_ms = Some(now_ms());
                 }
             }
         }
@@ -360,7 +456,12 @@ impl<A: Access, L: Launcher> Pool<A, L> {
                 && state.cpu_used + config.cpu <= self.config.budget.cpu
                 && state.memory_used + config.memory <= self.config.budget.memory
             {
-                let name = machine_name(&self.config.name, class);
+                let name = loop {
+                    let name = machine_name(&self.config.name, class);
+                    if !state.machines.contains_key(&name) {
+                        break name;
+                    }
+                };
                 let cancel = Arc::new(AtomicBool::new(false));
                 state.cpu_used += config.cpu;
                 state.memory_used += config.memory;
@@ -374,6 +475,7 @@ impl<A: Access, L: Launcher> Pool<A, L> {
                         idle_since_ms: now,
                         started: None,
                         completed: None,
+                        completed_ms: None,
                         mint_id: None,
                         runner_id: None,
                         cancel: Arc::clone(&cancel),
@@ -383,7 +485,7 @@ impl<A: Access, L: Launcher> Pool<A, L> {
                 live += 1;
             }
             if live > wanted {
-                let grace = u64::try_from(IDLE_GRACE.as_millis()).unwrap_or(u64::MAX);
+                let grace = ms(self.timing.idle_grace);
                 if let Some(extra) = state.machines.values().find(|machine| {
                     machine.class == class
                         && machine.phase == Phase::Idle
@@ -401,6 +503,9 @@ impl<A: Access, L: Launcher> Pool<A, L> {
     /// One machine's whole life, and what follows it: the record, the class's backoff, a reconcile.
     async fn machine(self: Arc<Self>, class: usize, name: String, cancel: Arc<AtomicBool>) {
         let outcome = self.machine_life(class, &name, &cancel).await;
+        if let Some(machine) = self.lock().machines.get_mut(&name) {
+            machine.phase = Phase::Ending;
+        }
         let exit = match &outcome {
             Ok(Some(code)) => Some(*code),
             _ => None,
@@ -419,11 +524,7 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             },
             Ok(None) | Err(_) => None,
         };
-        let launcher = Arc::clone(&self.launcher);
-        let doomed = name.clone();
-        if let Err(error) = blocking(move || launcher.destroy(&doomed)).await {
-            self.say(&format!("machine {name} could not be destroyed: {error}"));
-        }
+        let mut destroyed = self.destroy(&name).await;
         // GitHub's JobCompleted can trail the runner's exit by a poll: wait a little for it, so the record has the result.
         for _ in 0..150 {
             let waiting =
@@ -455,17 +556,22 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             return;
         };
         if !ran && let Some(runner) = runner_id {
-            // A runner that never took a job stays registered on GitHub until removed.
+            // A runner that never took a job stays registered on GitHub until removed. An idle runner the pool ended
+            // was removed before its machine went; this one exited or failed on its own.
             if let Err(error) = self.client.remove_runner(runner).await {
                 self.say(&format!(
                     "runner {name} could not be removed from GitHub: {error}"
                 ));
             }
         }
-        let note = match &outcome {
+        let mut note = match &outcome {
             Ok(_) => None,
             Err(why) => Some(why.clone()),
         };
+        if let Err(error) = &destroyed {
+            let failed = format!("the machine could not be destroyed, trying again: {error}");
+            note = Some(note.map_or_else(|| failed.clone(), |why| format!("{why}; {failed}")));
+        }
         if let Some(why) = &note {
             self.say(&format!("machine {name}: {why}"));
         }
@@ -497,6 +603,13 @@ impl<A: Access, L: Launcher> Pool<A, L> {
         if let Err(error) = self.recorder.job(&record) {
             self.say(&format!("the job record could not be written: {error}"));
         }
+        // A machine that is not destroyed keeps its share of the budget, ending, until a destroy succeeds.
+        let mut tries: u32 = 0;
+        while destroyed.is_err() {
+            tries = tries.saturating_add(1);
+            tokio::time::sleep(self.timing.backoff(tries)).await;
+            destroyed = self.destroy(&name).await;
+        }
         {
             let mut state = self.lock();
             let config = &self.config.classes[class];
@@ -508,16 +621,51 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             // next try, longer each time, so a broken image or credential does not spin.
             if note.is_some() && runner_start_ms.is_none() && !cancel.load(Ordering::SeqCst) {
                 class_state.failures = class_state.failures.saturating_add(1);
-                let pause = BACKOFF_MAX.min(Duration::from_secs(
-                    5u64.saturating_mul(1 << class_state.failures.min(6)),
-                ));
-                class_state.retry_at_ms = now_ms() + u64::try_from(pause.as_millis()).unwrap_or(0);
+                class_state.retry_at_ms = now_ms() + ms(self.timing.backoff(class_state.failures));
             } else if runner_start_ms.is_some() {
                 class_state.failures = 0;
                 class_state.retry_at_ms = 0;
             }
         }
         self.reconcile(class);
+    }
+
+    /// One destroy of a machine; a machine that is gone already is destroyed.
+    async fn destroy(&self, name: &str) -> Result<(), LaunchError> {
+        let launcher = Arc::clone(&self.launcher);
+        let doomed = name.to_string();
+        let result = blocking(move || launcher.destroy(&doomed)).await;
+        if let Err(error) = &result {
+            self.say(&format!("machine {name} could not be destroyed: {error}"));
+        }
+        result
+    }
+
+    /// Takes an idle runner off GitHub before its machine goes, so no job is handed to it on the way. `false` when
+    /// GitHub kept it (it has just been given a job, or the call failed): the machine stays.
+    async fn retire(&self, name: &str) -> bool {
+        let runner = self
+            .lock()
+            .machines
+            .get(name)
+            .and_then(|machine| machine.runner_id);
+        let Some(runner) = runner else {
+            return true;
+        };
+        match self.client.remove_runner(runner).await {
+            Ok(()) => {
+                if let Some(machine) = self.lock().machines.get_mut(name) {
+                    machine.runner_id = None;
+                }
+                true
+            }
+            Err(error) => {
+                self.say(&format!(
+                    "runner {name} is kept: GitHub did not remove it ({error})"
+                ));
+                false
+            }
+        }
     }
 
     /// Makes the machine, hands it its runner, and waits for the runner to exit. `Ok(Some(code))` when it exited,
@@ -552,7 +700,7 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             {
                 break;
             }
-            if started.elapsed() > READY_TIMEOUT {
+            if started.elapsed() > self.timing.ready {
                 return Err("the machine did not boot in time".to_string());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -589,6 +737,7 @@ impl<A: Access, L: Launcher> Pool<A, L> {
         let target = name.to_string();
         let start = RunnerStart {
             runner_dir: self.config.runner_dir.clone(),
+            work_folder: self.config.work_folder.clone(),
         };
         let jit = minted.encoded_jit_config;
         blocking(move || launcher.start_runner(&target, &jit, &start))
@@ -604,18 +753,35 @@ impl<A: Access, L: Launcher> Pool<A, L> {
                 }
             }
         }
-        let started = std::time::Instant::now();
+        let grace = ms(self.timing.completed_grace);
+        let idle_max = ms(self.timing.idle_max);
+        let mut retire_after_ms = 0;
         loop {
-            let busy = self
-                .lock()
-                .machines
-                .get(name)
-                .is_some_and(|machine| machine.phase == Phase::Busy);
-            if !busy && cancel.load(Ordering::SeqCst) {
-                return Ok(None);
-            }
-            if started.elapsed() > RUNNER_TIMEOUT {
-                return Err("the runner ran past its time limit".to_string());
+            let now = now_ms();
+            let (busy, idle_since, completed) =
+                self.lock()
+                    .machines
+                    .get(name)
+                    .map_or((false, now, None), |machine| {
+                        (
+                            machine.phase == Phase::Busy,
+                            machine.idle_since_ms,
+                            machine.completed_ms,
+                        )
+                    });
+            if busy {
+                // A runner with a job runs as long as the job does; only one GitHub says is over and that has not
+                // exited is ended.
+                if completed.is_some_and(|at| now.saturating_sub(at) > grace) {
+                    return Err("the runner did not exit after its job finished".to_string());
+                }
+            } else if (cancel.load(Ordering::SeqCst) || now.saturating_sub(idle_since) > idle_max)
+                && now >= retire_after_ms
+            {
+                if self.retire(name).await {
+                    return Ok(None);
+                }
+                retire_after_ms = now.saturating_add(ms(self.timing.retire_retry));
             }
             let launcher = Arc::clone(&self.launcher);
             let watched = name.to_string();
@@ -682,10 +848,16 @@ fn live_of(state: &State, class: usize) -> u32 {
     .unwrap_or(u32::MAX)
 }
 
-/// A machine's name, which is its runner's name on GitHub too: the pool, the class's index, and 8 random hex digits.
+/// A machine's name, which is its runner's name on GitHub too: the pool, the class's index, and 8 random hex digits
+/// (from the clock and a counter if the system's randomness fails).
 fn machine_name(pool: &str, class: usize) -> String {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
     let mut bytes = [0u8; 4];
-    let _ = getrandom::fill(&mut bytes);
+    if getrandom::fill(&mut bytes).is_err() {
+        let mixed = u32::try_from(now_ms() % (1 << 24)).unwrap_or(0) << 8
+            ^ COUNT.fetch_add(1, Ordering::Relaxed);
+        bytes = mixed.to_be_bytes();
+    }
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("{pool}-{class}-{hex}")
 }

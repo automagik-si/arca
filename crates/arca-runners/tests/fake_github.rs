@@ -10,7 +10,7 @@ use arca_runners::fake::{FakeGitHub, FakeLauncher, JobSpec};
 use arca_runners::record::Recorder;
 use arca_runners::scaleset::{Http, ScaleSetClient};
 use arca_runners::signin::SignInReason;
-use arca_runners::{Pool, Secret, SignInBoard};
+use arca_runners::{Pool, Secret, SignInBoard, Timing};
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -47,6 +47,14 @@ fn config(warm: u32, max: u32, budget_cpu: u32) -> PoolConfig {
 }
 
 async fn rig(config: PoolConfig, setup: impl FnOnce(&FakeGitHub, &FakeLauncher)) -> Rig {
+    rig_timed(config, Timing::default(), setup).await
+}
+
+async fn rig_timed(
+    config: PoolConfig,
+    timing: Timing,
+    setup: impl FnOnce(&FakeGitHub, &FakeLauncher),
+) -> Rig {
     let github = FakeGitHub::start(TOKEN).await.expect("fake GitHub");
     let launcher = Arc::new(FakeLauncher::new(github.clone()));
     setup(&github, &launcher);
@@ -68,13 +76,14 @@ async fn rig(config: PoolConfig, setup: impl FnOnce(&FakeGitHub, &FakeLauncher))
         arca_runners::time::now_ms()
     ));
     let recorder = Recorder::open(dir.clone(), 7).expect("recorder");
-    let pool = Pool::new(
+    let pool = Pool::with_timing(
         config,
         client,
         Arc::clone(&launcher),
         signin.clone(),
         recorder,
         "node-a",
+        timing,
     );
     let (stop, receiver) = watch::channel(false);
     let task = tokio::spawn(Arc::clone(&pool).run(receiver));
@@ -451,4 +460,106 @@ async fn stopping_closes_the_sessions_and_removes_idle_machines() {
     // The idle runner never took a job, so it is removed from GitHub.
     assert_eq!(github.removed_runners().len(), 1);
     let _ = std::fs::remove_dir_all(&rig.dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_old_idle_runner_is_replaced_and_a_busy_one_is_never_ended() {
+    let timing = Timing {
+        idle_max: Duration::from_millis(400),
+        retire_retry: Duration::from_millis(100),
+        ..Timing::default()
+    };
+    let rig = rig_timed(config(1, 4, 32), timing, |_, _| {}).await;
+    until("a warm runner", Duration::from_secs(10), || {
+        rig.pool.status().classes[0].idle == 1
+    })
+    .await;
+    let first = rig.launcher.created()[0].name.clone();
+    // Past its idle age the warm runner is taken off GitHub, its machine goes, and a fresh one waits instead.
+    until(
+        "the old warm runner replaced",
+        Duration::from_secs(10),
+        || rig.launcher.destroyed().contains(&first) && rig.pool.status().classes[0].idle == 1,
+    )
+    .await;
+    assert!(
+        rig.github.removed_runners().contains(&first),
+        "{:?}",
+        rig.github.removed_runners()
+    );
+    // A job far longer than the idle age runs to its end on a warm runner.
+    rig.github.queue_job(job("long", &[LABEL], 1.5));
+    until("the long job", Duration::from_secs(15), || {
+        rig.github.finished().len() == 1
+    })
+    .await;
+    let finished = rig.github.finished();
+    assert_eq!(finished[0].result, "succeeded", "{finished:?}");
+    // GitHub refuses to remove a runner with a job, and the pool never tried to end it: the runner was not removed.
+    assert!(!rig.github.removed_runners().contains(&finished[0].runner));
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_destroy_keeps_the_budget_and_is_tried_again() {
+    let timing = Timing {
+        backoff_base: Duration::from_millis(100),
+        ..Timing::default()
+    };
+    // A budget of 4 CPUs holds one machine; its first two destroys fail.
+    let rig = rig_timed(config(0, 4, 4), timing, |_, launcher| {
+        launcher.fail_destroys(2)
+    })
+    .await;
+    until("the session", Duration::from_secs(10), || {
+        rig.github.session_open(LABEL)
+    })
+    .await;
+    rig.github.queue_job(job("first", &[LABEL], 0.1));
+    rig.github.queue_job(job("second", &[LABEL], 0.1));
+    until("both jobs", Duration::from_secs(20), || {
+        rig.github.finished().len() == 2
+    })
+    .await;
+    until("every machine gone", Duration::from_secs(10), || {
+        rig.launcher.live().is_empty()
+    })
+    .await;
+    // The machine that would not go kept its share: no second machine existed beside it.
+    assert_eq!(rig.launcher.peak(), 1);
+    assert_eq!(rig.launcher.destroyed().len(), 2);
+    until("two job lines", Duration::from_secs(5), || {
+        rig.jobs_file().len() == 2
+    })
+    .await;
+    assert!(rig.jobs_file().iter().any(|line| {
+        line["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("could not be destroyed"))
+    }));
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_the_pool_does_not_know_is_swept_while_it_runs() {
+    let timing = Timing {
+        sweep_every: Duration::from_millis(200),
+        ..Timing::default()
+    };
+    let rig = rig_timed(config(0, 4, 32), timing, |_, _| {}).await;
+    until("the session", Duration::from_secs(10), || {
+        rig.github.session_open(LABEL)
+    })
+    .await;
+    rig.launcher.leave_machine("acme-0-0badf00d");
+    until("the unknown machine gone", Duration::from_secs(5), || {
+        rig.launcher.live().is_empty()
+    })
+    .await;
+    assert!(
+        rig.launcher
+            .destroyed()
+            .contains(&"acme-0-0badf00d".to_string())
+    );
+    rig.finish().await;
 }

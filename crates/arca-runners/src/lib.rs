@@ -32,6 +32,6 @@ pub mod time;
 pub use access::{Access, AccessError, ActionsConnection, JobRef, MintRequest, Minted};
 pub use config::{ClassConfig, PoolConfig};
 pub use launcher::{LaunchError, Launcher, MachineSpec};
-pub use pool::Pool;
+pub use pool::{Pool, Timing};
 pub use secret::Secret;
 pub use signin::{SignInBoard, SignInReason};

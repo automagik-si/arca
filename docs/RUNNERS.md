@@ -67,6 +67,19 @@ Scale sets are GitHub's mechanism for runners that come and go with demand.
   only the jobs whose `runs-on` matches its labels, so the label a job asks for decides the size of its machine.
 - The runner group is GitHub's list of repositories that may send jobs here. It is the access control; a label is not.
 
+**Public repositories and fork pull requests.** A runner group serves a public repository only when its "Allow public
+repositories" setting is on. Then a pull request from a fork can carry its own workflow file naming the pool's label, and
+GitHub runs the pull request's copy of the workflow for `pull_request` events: anyone's code, with passwordless sudo, on
+a machine of the pool. No credential reaches the machine and the machine is destroyed after the job, but until
+per-person network isolation lands it sits on the host's network beside other jobs' machines. So, in GitHub's settings:
+
+- leave the runner group's "Allow public repositories" off for a pool that serves private repositories only;
+- before a pool serves a public repository, set that repository's (or the organisation's) Actions setting "Approval for
+  running fork pull request workflows from contributors" to "Require approval for all external contributors", so a
+  maintainer reads every outside pull request before it runs on the pool;
+- the proof workflow below runs only by hand (`workflow_dispatch`), so it adds no trigger a fork can use; serving it
+  from a public repository still needs the group's public setting on, with the approval setting above.
+
 The calls the listener and the signer make (ported from `actions/scaleset`; Actions service paths take
 `api-version=6.0-preview`):
 
@@ -130,20 +143,30 @@ Records and logs go to `<stateDir>/runners/<pool>/`.
    second, and it costs only the blocks the job writes.
 2. **Boot and wait for the Incus agent.** The launcher never uses a network path into the VM.
 3. **Hand over.** The controller asks the signer for one JIT configuration (`workFolder` `/home/runner/work`) and the
-   launcher writes it into the VM through the agent's file API, on `/run` (memory), mode 0600, owned by `runner`. It is
-   never in the instance's config, on a command line or in a log.
+   launcher writes it into the VM through the agent's file API, on `/run` (memory), mode 0600, owned by root (`arca-job`
+   reads it as root). It is never in the instance's config, on a command line or in a log.
 4. **Run.** The launcher starts `arca-job` (a short script this repository ships and the launcher writes into the VM)
    through the agent. It reads the JIT file, deletes it, starts the runner as `runner` in a login session (so
    `/etc/environment` and limits apply, as on GitHub), and writes the runner's output to `/var/log/arca-job/`. The
    runner takes exactly one job and exits.
 5. **Collect.** When the runner exits, `arca-job` packs its output and `_diag` into one archive. The launcher reads it
-   through the agent and stores it on the host under `<state>/runner-logs/<pool>/<runner>/`, directory 0700 and files
-   0600, owned by root. Logs older than seven days are deleted.
-6. **Destroy.** Force stop, delete. Nothing is reused.
+   through the agent and stores it on the host as `<state>/runners/<pool>/logs/<runner>/logs.tar.gz`, directory 0700
+   and file 0600, owned by root. Logs older than seven days are deleted.
+6. **Destroy.** Force stop, delete. Nothing is reused. A destroy that fails (Incus refused it or timed out) is tried
+   again, waiting longer each time, and the machine keeps its share of the budget until it is gone.
 
-A machine whose runner never took a job (the pool shrank, the kernel restarted) is destroyed too, and its runner is
-removed from GitHub (call 8). At start the controller deletes every instance in its project that carries its mark: a
-kernel that stopped mid-job leaves nothing behind for long.
+The pool never ends a runner that has a job: the job runs as long as it runs. A runner GitHub reports finished that has
+not exited ten minutes later is stuck, and its machine is ended. An idle runner is replaced by a fresh machine after an
+hour without a job, and an idle runner above what the class wants goes after five minutes; either way its runner is
+removed from GitHub first (call 8), and the machine stays if GitHub refuses because it has just handed the runner a
+job. A runner that exited without a job is removed from GitHub after its machine is destroyed.
+
+The controller deletes every instance in its project that carries its mark and that it does not know: all of them at
+start, and any it finds every five minutes after (a machine an earlier destroy or listing could not reach).
+
+**A kernel restart ends the pool's running jobs.** Machines are not adopted across a restart: the kernel that starts
+again destroys every machine of the pool, busy or not, and the jobs on them fail on GitHub and write no record here.
+Until adoption lands, deploy a node with a pool when its queue is quiet.
 
 **Why a VM and not a container.** Docker inside an LXC container depends on the host's LXC and runc settings, and a
 runc security fix in November 2025 broke it on Incus and other LXC hosts until their configuration changed. A CI
@@ -166,7 +189,7 @@ service cannot have that class of outage. A VM also runs systemd services, sets 
   the count falls by itself.
 - **Capacity.** The controller tells GitHub how many runners each class can still have (`X-ScaleSetMaxCapacity`), from
   the budget that is free, so GitHub does not hand a scale set more jobs than the pool can start.
-- **Warm runners.** `warm` (default 1 for the dogfood class, 0 otherwise) keeps that many booted machines with a
+- **Warm runners.** `warm` (default 0) keeps that many booted machines with a
   registered, idle runner. A job then starts in the time GitHub takes to hand it over, instead of a clone and a boot.
   Targets: queued to started, median 10 s or less, 95th percentile 30 s or less (a cold clone and boot when the warm
   machines are taken). Measured per job: queue time is `runnerAssignTime − queueTime` from the job messages.
@@ -184,14 +207,17 @@ when a pool's last GitHub exchange failed for a credential reason and has done s
 - the credential missing from the kernel.
 
 Its label is `pool`. It clears after 120 seconds of successful calls. Network errors and GitHub's own 5xx are not
-sign-in failures: they keep the last state. `alerts_list` names the pool and the reason (`bad-credentials`,
-`app-not-installed`, `forbidden`, `no-credential`), never a token.
+sign-in failures: they keep the last state. `alerts_list` names the pool, never a token. The reason
+(`bad-credentials`, `app-not-installed`, `forbidden`, `no-credential`) is in the kernel's log line for the pool; the
+pool's status verb, a next slice, will show it.
 
 ## What is recorded per job
 
-One line per job in `<state>/runner-logs/<pool>/jobs.jsonl`: runner name, class, repository, workflow reference, run id,
-job id, job name, event, result, queue time, assign time, start, finish, machine create and boot seconds, and where its
-logs are. From these: jobs per day, pass rate, queue time (median, p95), boot time.
+One line per machine in `<state>/runners/<pool>/jobs.jsonl`: runner name, class, repository, workflow reference, run
+id, job id, job name, event, result, queue time, assign time, start, finish, machine create and boot seconds, where its
+logs are, and a note when something failed. A machine that never ran a job (a warm runner that was replaced, a failed
+boot) writes a line too, with the job fields empty. From these: jobs per day, pass rate, queue time (median, p95), boot
+time.
 
 ## How it is proven
 
@@ -199,7 +225,9 @@ logs are. From these: jobs per day, pass rate, queue time (median, p95), boot ti
   plays GitHub's part: offers jobs, assigns them once acquired, starts them on a runner that registered with a JIT
   config it minted, completes them. It can answer 401, 404 and 403 to drive the alert.
 - **Fake launcher** (tests): an in-memory machine per runner that "runs" a job when told.
-- **Incus launcher** (tests): the request bodies and the order of calls against the repository's fake Incus.
+- **Incus launcher** (tests): against the repository's fake Incus, a machine is a marked virtual machine of its
+  class's size, and only the pool's marked machines are listed and destroyed. The runner hand-over (file pushes and
+  the exec) is a next test.
 - **Dogfood** (our own organisation, one pool): a test workflow and one real CI job. Counted: jobs, pass rate, queue
   time, boot time. And the **state-leak test**: job N writes a marker file in `$HOME`, `/tmp`, `/opt` and the workspace,
   and builds a Docker image; job N+1 on the same class must find none of them.
@@ -212,7 +240,7 @@ logs are. From these: jobs per day, pass rate, queue time (median, p95), boot ti
    sign-in alert, all against the fake GitHub.
 2. The kernel task: pools from the node's config, the signer's connection, logs and job records.
 3. Dogfood on one class with the image from the image build: the first real job, the state-leak test, the fingerprint.
-4. Next slices: one-click onboarding (the App's installation creates the runner group and scale sets), per-customer
+4. Next slices: one-click onboarding (the App's installation creates the runner group and scale sets), per-person
    project and network isolation, a Docker Hub pull-through mirror, the Cloud Hypervisor launcher with snapshot-restore,
    placement across hosts.
 

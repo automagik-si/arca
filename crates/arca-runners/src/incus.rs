@@ -129,7 +129,10 @@ impl Launcher for IncusLauncher {
             .exec(
                 name,
                 &[GUEST_SCRIPT_PATH],
-                &[("ARCA_RUNNER_DIR", start.runner_dir.as_str())],
+                &[
+                    ("ARCA_RUNNER_DIR", start.runner_dir.as_str()),
+                    ("ARCA_WORK_FOLDER", start.work_folder.as_str()),
+                ],
             )
             .map_err(incus)?;
         if let Ok(mut runs) = self.runs.lock() {

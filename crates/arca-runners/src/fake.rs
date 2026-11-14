@@ -824,7 +824,7 @@ fn service(
                     json!({ "message": "a runner of that name exists" }),
                 );
             }
-            if body["workFolder"].as_str() != Some(crate::config::WORK_FOLDER) {
+            if body["workFolder"].as_str() != Some(crate::config::work_folder()) {
                 return reply(
                     StatusCode::BAD_REQUEST,
                     json!({ "message": "the work folder is not GitHub's" }),
@@ -863,11 +863,19 @@ fn service(
             )
         }
         ("DELETE", ["distributedtask", "pools", "0", "agents", id]) => {
-            if let Some(runner) = id
-                .parse::<u64>()
-                .ok()
-                .and_then(|id| world.runners.remove(&id))
+            let id = id.parse::<u64>().unwrap_or(0);
+            // GitHub refuses to remove a runner that holds a job.
+            if world
+                .runners
+                .get(&id)
+                .is_some_and(|runner| runner.job.is_some())
             {
+                return reply(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "message": "the runner has a job still running", "typeName": "JobStillRunningException" }),
+                );
+            }
+            if let Some(runner) = world.runners.remove(&id) {
                 world.removed_runners.push(runner.name);
             }
             empty(StatusCode::NO_CONTENT)
@@ -926,6 +934,7 @@ struct Machines {
     reuse: bool,
     last_disk: BTreeSet<String>,
     fail_creates: u32,
+    fail_destroys: u32,
 }
 
 /// The fake launcher. Its machines run the fake GitHub's jobs.
@@ -966,7 +975,12 @@ impl FakeLauncher {
         self.lock().fail_creates = count;
     }
 
-    /// A machine an earlier run left behind.
+    /// The next `count` destroys of a machine that exists fail, as a destroy Incus refuses or times out.
+    pub fn fail_destroys(&self, count: u32) {
+        self.lock().fail_destroys = count;
+    }
+
+    /// A machine an earlier run left behind, or one the pool does not know.
     pub fn leave_machine(&self, name: &str) {
         self.lock()
             .live
@@ -1104,6 +1118,10 @@ impl Launcher for FakeLauncher {
 
     fn destroy(&self, name: &str) -> Result<(), LaunchError> {
         let mut machines = self.lock();
+        if machines.fail_destroys > 0 && machines.live.contains_key(name) {
+            machines.fail_destroys -= 1;
+            return Err(LaunchError("the fake destroy failed".to_string()));
+        }
         if let Some(machine) = machines.live.remove(name) {
             machines.last_disk = machine.disk;
             machines.destroyed.push(name.to_string());

@@ -53,10 +53,12 @@ jobs:
             echo "## toolcache"; ls /opt/hostedtoolcache 2>&1
           } >"$out" 2>&1
           cat "$out"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fingerprint-${{ matrix.runner }}
           path: ${{ runner.temp }}/fingerprint-${{ matrix.runner }}.txt
+          # The artifact describes a host; on a public repository it is public, so it is kept one day.
+          retention-days: 1
 
   leak-writer:
     runs-on: ${{ inputs.label }}

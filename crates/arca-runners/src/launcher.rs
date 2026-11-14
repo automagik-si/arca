@@ -23,6 +23,8 @@ pub struct MachineSpec {
 pub struct RunnerStart {
     /// The runner's own folder in the image.
     pub runner_dir: String,
+    /// The work folder the runner's configuration names; the guest makes it the runner user's.
+    pub work_folder: String,
 }
 
 /// Why a launcher call failed.

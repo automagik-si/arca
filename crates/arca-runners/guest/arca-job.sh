@@ -10,10 +10,12 @@
 #    /var/log/arca-job/logs.tar.gz and writes the exit code to /var/log/arca-job/exit, which Arca reads back before it
 #    destroys the machine.
 #
-# ARCA_RUNNER_DIR names the runner's folder (default /home/runner/actions-runner), ARCA_RUNNER_USER its user.
+# ARCA_RUNNER_DIR names the runner's folder, ARCA_WORK_FOLDER the work folder its configuration names, and
+# ARCA_RUNNER_USER its user. Arca sets the first two from the pool's settings; the defaults are GitHub's.
 set -u
 
 RUNNER_DIR=${ARCA_RUNNER_DIR:-/home/runner/actions-runner}
+WORK_FOLDER=${ARCA_WORK_FOLDER:-/home/runner/work}
 RUNNER_USER=${ARCA_RUNNER_USER:-runner}
 JIT_FILE=/run/arca-job-jit
 OUT=/var/log/arca-job
@@ -44,13 +46,14 @@ if [ ! -x "$RUNNER_DIR/run.sh" ]; then
   finish 91
 fi
 
-# The work folder the configuration names (/home/runner/work) belongs to the runner user, as on GitHub.
-install -d -o "$RUNNER_USER" -g "$(id -gn "$RUNNER_USER")" -m 0755 /home/runner/work
+# The work folder the configuration names belongs to the runner user, as on GitHub.
+install -d -o "$RUNNER_USER" -g "$(id -gn "$RUNNER_USER")" -m 0755 "$WORK_FOLDER"
 
 printf 'arca-job: runner starting at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$OUT/runner.log"
-ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" runuser -l "$RUNNER_USER" \
-  -w ACTIONS_RUNNER_INPUT_JITCONFIG \
-  -c "cd '$RUNNER_DIR' && exec ./run.sh" >>"$OUT/runner.log" 2>&1
+# The folder reaches the login shell as a variable, never spliced into the command, so any path works.
+ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" ARCA_RUNNER_DIR="$RUNNER_DIR" runuser -l "$RUNNER_USER" \
+  -w ACTIONS_RUNNER_INPUT_JITCONFIG,ARCA_RUNNER_DIR \
+  -c 'cd "$ARCA_RUNNER_DIR" && exec ./run.sh' >>"$OUT/runner.log" 2>&1
 code=$?
 unset jit
 printf 'arca-job: runner exited %s at %s\n' "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$OUT/runner.log"

@@ -3,8 +3,25 @@
 
 use serde::Deserialize;
 
-/// The default work folder: the workspace is `/home/runner/work/<repo>/<repo>`, as on GitHub's own runners.
-pub const WORK_FOLDER: &str = "/home/runner/work";
+/// The guest's default folders, one per line: the work folder, then the runner's own folder. They live in a text file
+/// beside the guest script so that each one is, whole, a line of the product's sources, which is what the portable
+/// build's check for build-machine paths accepts (two Rust literals would sit side by side in the binary as one string).
+const GUEST_DEFAULTS: &str = include_str!("../guest/defaults");
+
+fn guest_default(line: usize) -> &'static str {
+    GUEST_DEFAULTS.lines().nth(line).unwrap_or_default()
+}
+
+/// The default work folder, `/home/runner/work`: the workspace is `<work folder>/<repo>/<repo>`, as on GitHub's own
+/// runners.
+pub fn work_folder() -> &'static str {
+    guest_default(0)
+}
+
+/// The default runner folder in the image, `/home/runner/actions-runner`.
+pub fn runner_folder() -> &'static str {
+    guest_default(1)
+}
 
 /// One pool.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -127,11 +144,11 @@ impl PoolConfig {
 }
 
 fn default_runner_dir() -> String {
-    "/home/runner/actions-runner".to_string()
+    runner_folder().to_string()
 }
 
 fn default_work_folder() -> String {
-    WORK_FOLDER.to_string()
+    work_folder().to_string()
 }
 
 fn default_log_days() -> u32 {
