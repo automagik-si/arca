@@ -25,6 +25,7 @@ export function readWorkflow(path, text) {
       concurrency: job.concurrency ?? null,
       uses: typeof job.uses === 'string' ? job.uses : null,
       runsOn: job['runs-on'] ?? null,
+      needs: [].concat(job.needs ?? []).filter((id) => typeof id === 'string'),
       steps: steps.map((step, index) => ({
         index,
         line: job.steps[LINES]?.[job.steps.indexOf(step)] ?? null,
