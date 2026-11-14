@@ -195,8 +195,15 @@ if [ "$cloud_init" -ne 0 ] && [ "$cloud_init" -ne 2 ]; then
   in_vm -- cloud-init status --long || true
   exit 1
 fi
-ip=$(incus query "/1.0/instances/$vm/state?project=$PROJECT" | jq -r '[.network | to_entries[] | select(.key | test("^(en|eth)"))
-  | .value.addresses[] | select(.family == "inet" and .scope == "global") | .address][0] // empty')
+# The agent reports the machine's network a little after it answers commands: ask until an address is there.
+ip=''
+for _ in $(seq 60); do
+  ip=$(incus query "/1.0/instances/$vm/state?project=$PROJECT" | jq -r '[(.network // {}) | to_entries[]
+    | select(.key | test("^(en|eth)")) | .value.addresses[] | select(.family == "inet" and .scope == "global")
+    | .address][0] // empty') || ip=''
+  [ -n "$ip" ] && break
+  sleep 5
+done
 [ -n "$ip" ] || { say "$vm has no address"; exit 1; }
 push_files() {
   local f
