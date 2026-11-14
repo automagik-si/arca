@@ -1,6 +1,6 @@
-// The GitHub REST client the analysis reads with: read-only, GET only. It signs in either with a token it is given
-// (GITHUB_TOKEN) or as a GitHub App installed on the repository (GITHUB_APP_ID and the App's private key), and it
-// never prints either. Every request is a GET; the one redirect it follows (a job's log) is fetched without the token.
+// The GitHub REST client the analysis reads with: read-only, GET only. It signs in with a token it is given (an App
+// installation token; a person's token only when asked, see access()) or as a GitHub App installed on the repository
+// (GITHUB_APP_ID and the App's private key), and it never prints either. Every request is a GET; the one redirect it follows (a job's log) is fetched without the token.
 
 import { createSign } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -26,20 +26,26 @@ export function tokenKind(token) {
  * spent. Returns `{ token?, appId?, appKey?, how }`; `how` names the way in words and never holds a secret.
  */
 export async function access(args, env = process.env, read = (path) => readFile(path, 'utf8')) {
-  const fromFile = args.tokenFile ? (await read(args.tokenFile)).trim() : null;
-  const installation = fromFile || env.GITHUB_INSTALLATION_TOKEN || null;
-  if (installation) return { token: installation, how: 'an App installation token' };
+  // Whatever names a token, a person's token is checked the same way: GITHUB_INSTALLATION_TOKEN=$(gh auth token) is
+  // still a person's token.
+  const checked = (token, where) => {
+    if (tokenKind(token) === 'installation') return { token, how: 'an App installation token' };
+    if (!args.allowUserToken) {
+      throw new Error(
+        `${where} holds a person's token, not an App installation token, and its rate limit is shared with everything that person runs; give an App installation token (--installation-token-file or GITHUB_INSTALLATION_TOKEN) or the App's id and key, or pass --allow-user-token`,
+      );
+    }
+    return { token, how: "a person's token (--allow-user-token)" };
+  };
+  if (args.tokenFile) {
+    const fromFile = (await read(args.tokenFile)).trim();
+    if (fromFile) return checked(fromFile, '--installation-token-file');
+  }
+  if (env.GITHUB_INSTALLATION_TOKEN) return checked(env.GITHUB_INSTALLATION_TOKEN, 'GITHUB_INSTALLATION_TOKEN');
   const appKey = env.GITHUB_APP_KEY_B64 ? Buffer.from(env.GITHUB_APP_KEY_B64, 'base64').toString('utf8') : env.GITHUB_APP_KEY;
   if (env.GITHUB_APP_ID && appKey) return { appId: env.GITHUB_APP_ID, appKey, how: `the GitHub App ${env.GITHUB_APP_ID}` };
-  const token = env.GITHUB_TOKEN || null;
-  if (!token) return { how: 'no token (public repositories only, 60 requests an hour)' };
-  if (tokenKind(token) === 'installation') return { token, how: 'an App installation token' };
-  if (!args.allowUserToken) {
-    throw new Error(
-      "GITHUB_TOKEN is a person's token, not an App installation token, and its rate limit is shared with everything that person runs; give an App installation token (--installation-token-file or GITHUB_INSTALLATION_TOKEN) or the App's id and key, or pass --allow-user-token",
-    );
-  }
-  return { token, how: "a person's token (--allow-user-token)" };
+  if (!env.GITHUB_TOKEN) return { how: 'no token (public repositories only, 60 requests an hour)' };
+  return checked(env.GITHUB_TOKEN, 'GITHUB_TOKEN');
 }
 
 /** The request budget of a run is spent: the collector keeps what it has read so far. */
@@ -134,9 +140,12 @@ export class GitHub {
     if (held && held.expires - Date.now() > 5 * 60 * 1000) return `Bearer ${held.token}`;
     const jwt = this.appJwt();
     const headers = { authorization: `Bearer ${jwt}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' };
+    // A 5xx or 429 while signing in is tried again by get(), as any request is; any other answer is final.
+    const refused = (what, status) =>
+      Object.assign(new Error(`${what} ${repo}: GitHub answered ${status}`), { code: status >= 500 || status === 429 ? 'retry' : 'auth' });
     this.spend();
     const found = await this.fetch(`${API}/repos/${repo}/installation`, { headers });
-    if (!found.ok) throw Object.assign(new Error(`the App is not installed on ${repo}: GitHub answered ${found.status}`), { code: 'auth' });
+    if (!found.ok) throw refused(found.status >= 500 || found.status === 429 ? 'could not look up the App on' : 'the App is not installed on', found.status);
     const { id } = await found.json();
     // Creating an installation token is the one POST the analysis makes. The token is narrowed to this one
     // repository and to read permissions only.
@@ -149,7 +158,7 @@ export class GitHub {
         permissions: { actions: 'read', contents: 'read', metadata: 'read' },
       }),
     });
-    if (!minted.ok) throw Object.assign(new Error(`no installation token for ${repo}: GitHub answered ${minted.status}`), { code: 'auth' });
+    if (!minted.ok) throw refused('no installation token for', minted.status);
     const { token, expires_at: expiresAt } = await minted.json();
     this.installation.set(repo, { token, expires: Date.parse(expiresAt) });
     return `Bearer ${token}`;

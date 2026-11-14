@@ -29,7 +29,7 @@ function client(answers, options = {}) {
   return { gh, calls, slept };
 }
 
-test('B1: a rate limit waits for its reset, however far, and costs no attempt; past maxWaitMs it stops', async () => {
+test('B1: a rate limit waits for its reset, however far, and costs no attempt; past maxWaitMs it stops', { timeout: 5000 }, async () => {
   const reset = String((NOW + 30 * 60 * 1000) / 1000);
   const limited = response(403, {}, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset });
   // Six rate limits in a row, more than the four attempts a server error gets.
@@ -69,7 +69,13 @@ test('B4: a person\'s token is not used unless asked; an installation token or t
   assert.equal(tokenKind('ghs_abc'), 'installation');
   assert.equal(tokenKind('0123456789abcdef0123456789abcdef01234567'), 'unknown');
 
-  await assert.rejects(access({}, { GITHUB_TOKEN: 'gho_from_gh_auth_token' }), /GITHUB_TOKEN is a person's token.*--allow-user-token/);
+  await assert.rejects(access({}, { GITHUB_TOKEN: 'gho_from_gh_auth_token' }), /GITHUB_TOKEN holds a person's token.*--allow-user-token/);
+  // The same check, whichever input names the token: GITHUB_INSTALLATION_TOKEN=$(gh auth token) is a person's token.
+  const file = async () => 'gho_in_a_file\n';
+  await assert.rejects(access({ tokenFile: 't.txt' }, {}, file), /--installation-token-file holds a person's token/);
+  await assert.rejects(access({}, { GITHUB_INSTALLATION_TOKEN: 'ghp_in_the_env' }), /GITHUB_INSTALLATION_TOKEN holds a person's token/);
+  assert.deepEqual(await access({ tokenFile: 't.txt', allowUserToken: true }, {}, file), { token: 'gho_in_a_file', how: "a person's token (--allow-user-token)" });
+  assert.deepEqual(await access({ allowUserToken: true }, { GITHUB_INSTALLATION_TOKEN: 'ghp_in_the_env' }), { token: 'ghp_in_the_env', how: "a person's token (--allow-user-token)" });
   await assert.rejects(access({}, { GITHUB_TOKEN: '0123456789abcdef0123456789abcdef01234567' }), /a person's token/);
   assert.equal((await access({ allowUserToken: true }, { GITHUB_TOKEN: 'gho_x' })).token, 'gho_x');
   assert.equal((await access({}, { GITHUB_TOKEN: 'ghs_x' })).token, 'ghs_x');
@@ -145,5 +151,56 @@ test('B3: when the budget runs out part-way, the dataset keeps what was read and
   assert.equal(data.runs.length + data.partial.runsWithoutJobs, 30);
   assert.equal(new Set(data.jobs.map((job) => job.runId)).size, data.runs.length, 'no run without its jobs');
   const report = analyze(data);
-  assert.match(markdown(report), /\*\*Partial:\*\* collecting stopped \(the request budget of 20 is spent\)/);
+  assert.match(markdown(report), /\*\*Partial:\*\* not everything was read \(the request budget of 20 is spent\)/);
+});
+
+test('L3: signing in as the App is tried again on a 5xx or a 429, within the budget; a 404 is final', async () => {
+  const { generateKeyPairSync } = await import('node:crypto');
+  const pem = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs1', format: 'pem' });
+  const signIn = (lookup) =>
+    client(
+      (url, n) => {
+        if (url.endsWith('/installation')) return lookup(n);
+        if (url.endsWith('/access_tokens')) return response(201, { token: 'ghs_minted', expires_at: new Date(NOW + 3600e3).toISOString() });
+        return response(200, { ok: 1 });
+      },
+      { token: undefined, appId: '7', appKey: pem },
+    );
+  const flaky = signIn((n) => (n === 1 ? response(502, {}) : response(200, { id: 9 })));
+  assert.deepEqual(await flaky.gh.get('acme/app', '/repos/acme/app'), { ok: 1 });
+  assert.deepEqual(flaky.slept, [2000]);
+  assert.equal(flaky.gh.requests, 4, 'the failed lookup counts against the budget');
+
+  const busy = signIn(() => response(429, {}));
+  await assert.rejects(busy.gh.get('acme/app', '/repos/acme/app'), (error) => /could not look up the App on acme\/app: GitHub answered 429/.test(error.message));
+  assert.equal(busy.slept.length, 4);
+
+  const absent = signIn(() => response(404, {}));
+  await assert.rejects(absent.gh.get('acme/app', '/repos/acme/app'), /the App is not installed on acme\/app: GitHub answered 404/);
+  assert.deepEqual(absent.slept, [], 'not installed is not tried again');
+});
+
+test('L2: a day whose listing keeps failing is skipped and named; a run whose jobs keep failing is skipped, not the rest', async () => {
+  const serve = repository(10, 7);
+  const thirdDay = new Date(NOW - 2 * 86400e3).toISOString().slice(0, 13);
+  const { gh } = client((url) => {
+    if (url.includes('created=') && decodeURIComponent(url).includes(thirdDay)) return response(502, {});
+    if (url.includes('/runs/5/jobs')) return response(502, {});
+    return serve(url);
+  });
+  const data = await collect(gh, 'acme/app', { days: 7, until: new Date(NOW).toISOString() });
+  assert.equal(data.partial.daysUnlisted, 1);
+  assert.equal(data.partial.runsWithoutJobs, 1);
+  assert.match(data.partial.reason, /GitHub kept failing on 2 request\(s\)/);
+  assert.equal(data.runs.length, 60 - 1, 'six days listed, one run without its jobs');
+  assert.ok(data.logs && data.caches.activeCount === 0, 'the caches and logs are still read');
+  assert.match(markdown(analyze(data)), /Not read: the runs of 1 day\(s\), the jobs of 1 run\(s\)/);
+});
+
+test('L2: when the budget stops the listing, the window is the days it got to, and the note says so', async () => {
+  const { gh } = client(repository(5, 7), { budget: 4 });
+  const data = await collect(gh, 'acme/app', { days: 7, until: new Date(NOW).toISOString() });
+  assert.equal(data.partial.daysUnlisted, 4, 'the repository and three days listed, then the budget');
+  assert.equal(data.window.days, 3);
+  assert.match(markdown(analyze(data)), /the runs of 4 day\(s\).*the window is the 3 days the listing got to/);
 });

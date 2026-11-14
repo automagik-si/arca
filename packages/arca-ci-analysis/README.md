@@ -40,7 +40,7 @@ estimates weigh 0.6).
 
 | Finding | Change it proposes | PR step writes it |
 |---|---|---|
-| `paid-runner` | short jobs of a public repository moved off a billed runner to `ubuntu-latest`; with `--move-to`, any job on a billed Linux x64 runner moved to your own pool, whatever its length | yes |
+| `paid-runner` | short jobs of a public repository moved off a billed runner to `ubuntu-latest`; with `--move-to`, any job on a provider's or GitHub's larger billed Linux x64 runner moved to your own pool, whatever its length (not yet a job on GitHub's standard runners, such as `ubuntu-latest`, even in a private repository where they are billed) | yes |
 | `cancel-superseded` | a concurrency group with `cancel-in-progress` | yes, when the workflow has none |
 | `duplicate-trigger` | `push` limited to named branches when a branch's push and pull request run the same commit | yes |
 | `missing-timeout` | `timeout-minutes` of 3 × p95 (at least 10) | yes |

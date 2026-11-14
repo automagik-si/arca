@@ -11,12 +11,13 @@
 //                                                                  `gh auth token`, ghp_, github_pat_) only with
 //                                                                  --allow-user-token, since its rate limit is shared
 //                                                                  with everything that person runs
-// Requests: before the first one the run prints its plan (the most requests it can make) to stderr. --budget N (600 by
-// default, BUDGET) is the most GitHub REST requests the run makes in all; the runs and logs read shrink to fit it, and
+// Requests: before the first one the run prints its plan (an estimate of the requests it makes) to stderr. --budget N
+// (600 by default, BUDGET) is the limit: the most GitHub REST requests the run makes in all; the runs and logs read shrink to fit it, and
 // past it the collector stops and keeps what it read. --max-runs N (300, MAX_RUNS): per repository, only the newest N
 // completed runs of the window are read.
 // REPOS (comma-separated), DAYS and MOVE_TO stand for --repo, --days and --move-to, as an Arca function's plain
-// settings. --move-to LABEL names the owner's own runner pool: jobs on billed Linux runners are proposed to move there.
+// settings. --move-to LABEL names the owner's own runner pool: jobs on a provider's or GitHub's larger billed Linux
+// runners are proposed to move there (not yet those on GitHub's standard runners, even in a private repository).
 //
 // With --out, each repository gets DIR/<owner>__<name>/{dataset.json,report.json,report.md}. Without it (an Arca
 // function run), the Markdown report of each repository is printed, then one JSON result line, the run's result.
@@ -102,11 +103,12 @@ async function main() {
       maxRuns: args.maxRuns ?? undefined,
       app: Boolean(how.appId),
     });
-    const most = requestPlan(options) * args.repos.length;
+    // An estimate (retries, jobs lists over 100 entries and runs still in progress cost more); the budget is the limit.
+    const about = requestPlan(options) * args.repos.length;
     process.stderr.write(
       `plan: ${args.repos.length} repositories, ${options.days} days, the newest ${options.maxRuns} runs and ` +
-        `${options.flakeLogs + options.failureLogs + options.sampleLogs} logs each: at most ${most} GitHub requests ` +
-        `(budget ${args.budget}), signed in with ${how.how}\n`,
+        `${options.flakeLogs + options.failureLogs + options.sampleLogs} logs each: about ${about} GitHub requests, ` +
+        `never more than the budget of ${args.budget}; signed in with ${how.how}\n`,
     );
     // The repositories are read side by side, through one client that keeps a few requests in flight in all and
     // stops at the budget: a function run has 15 minutes for every one of them.

@@ -24,7 +24,8 @@ export const DEFAULTS = {
 };
 
 /**
- * The most REST requests one repository's collection makes with these options: the repository, the runs list (one
+ * About how many REST requests one repository's collection makes with these options (retries, jobs lists over 100
+ * entries and runs still in progress add to it; the client's budget is the limit): the repository, the runs list (one
  * page a day, plus one a hundred runs), one jobs list a run, the workflow files, the two cache lists, the logs, and
  * the two requests that mint an App installation token when the client signs in as an App.
  */
@@ -68,8 +69,18 @@ export async function collect(gh, repo, options = {}) {
   const until = options.until ? new Date(options.until) : new Date();
   const since = new Date(until.getTime() - o.days * DAY);
   const log = options.log ?? (() => {});
+  // A spent budget or a rate limit that will not reset in time stops the collection: nothing more can be read. Any
+  // other failure (GitHub still failing after its retries) skips that one request and goes on.
   let stopped = null;
+  let failed = 0;
+  let firstFailure = null;
   const stop = (error) => {
+    if (error.code !== 'budget' && error.code !== 'rate-limit') {
+      failed += 1;
+      firstFailure ??= error.message;
+      log(`${repo}: skipped one request (${error.message})`);
+      return;
+    }
     if (!stopped) {
       stopped = error.message;
       log(`${repo}: stopped (${error.message}); keeping what was read`);
@@ -84,8 +95,14 @@ export async function collect(gh, repo, options = {}) {
   let runs = [];
   let listed = 0;
   let full = true;
-  for (let end = until.getTime(); end > since.getTime() && !stopped; end -= DAY) {
+  let daysUnlisted = 0;
+  let reached = until.getTime(); // the start of the oldest day the listing got to
+  for (let end = until.getTime(); end > since.getTime(); end -= DAY) {
     const start = Math.max(end - DAY, since.getTime());
+    if (stopped) {
+      daysUnlisted += 1;
+      continue;
+    }
     const range = `${iso(start)}..${iso(end - 1000)}`;
     try {
       const page = await gh.all(repo, `/repos/${repo}/actions/runs?created=${encodeURIComponent(range)}`, 'workflow_runs', {
@@ -93,8 +110,10 @@ export async function collect(gh, repo, options = {}) {
       });
       listed += page.length;
       for (const run of page) if (run.status === 'completed') runs.push(slimRun(run));
+      reached = start;
     } catch (error) {
       stop(error);
+      daysUnlisted += 1;
     }
     if (runs.length >= o.maxRuns) {
       full = end - DAY <= since.getTime();
@@ -104,8 +123,10 @@ export async function collect(gh, repo, options = {}) {
   runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const sampled = runs.length > o.maxRuns || !full;
   runs = runs.slice(0, o.maxRuns);
-  // A sample covers from its oldest run on, and the analysis scales to a week by that span, not by the days asked.
-  const from = sampled && runs.length ? Date.parse(runs.at(-1).createdAt) : since.getTime();
+  // A sample covers from its oldest run on, and the analysis scales to a week by that span, not by the days asked; a
+  // listing that stopped covers the days it got to.
+  const from = sampled && runs.length ? Date.parse(runs.at(-1).createdAt) : stopped ? reached : since.getTime();
+  const cut = sampled || from > since.getTime();
   log(`${repo}: ${runs.length} completed runs since ${iso(from)}${sampled ? ` (the newest ${o.maxRuns})` : ''}`);
 
   const jobs = [];
@@ -176,12 +197,19 @@ export async function collect(gh, repo, options = {}) {
     window: {
       since: iso(from),
       until: iso(until.getTime()),
-      days: sampled ? Math.max(0.01, Math.round(((until.getTime() - from) / DAY) * 100) / 100) : o.days,
+      days: cut ? Math.max(0.01, Math.round(((until.getTime() - from) / DAY) * 100) / 100) : o.days,
       ...(sampled ? { sampled: { runs: runs.length + runsWithoutJobs, listed, maxRuns: o.maxRuns, daysAsked: o.days } } : {}),
     },
-    partial: stopped
-      ? { reason: stopped, runsWithoutJobs, workflowsUnread: paths.length - Object.keys(workflows).length, logsUnread: wanted.length - Object.keys(logs).length }
-      : null,
+    partial:
+      stopped || failed
+        ? {
+            reason: stopped ?? `GitHub kept failing on ${failed} request(s), the first: ${firstFailure}`,
+            daysUnlisted,
+            runsWithoutJobs,
+            workflowsUnread: paths.length - Object.keys(workflows).length,
+            logsUnread: wanted.length - Object.keys(logs).length,
+          }
+        : null,
     runs,
     jobs,
     workflows,
