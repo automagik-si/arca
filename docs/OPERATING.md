@@ -5100,7 +5100,10 @@ since it is where the pool's credential will be used.
 | `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
 | `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
 | `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. Never below the number of classes: a create with less is refused ("A place for every class" below). |
-| `allowDefaultRunnerGroup` | no | `true` lets the pool start on the organisation's default runner group. Leave it out. |
+| `aptPackages` | yes | The Ubuntu packages added to the runner image, which the machine builds once ("The runner image's packages" below). The default is `["libatomic1", "build-essential", "zstd", "wget", "skopeo", "xz-utils", "zip", "rsync", "gh"]`. Given at create, it replaces the whole list, so name the defaults too when you add one; `[]` runs the runner image as it is. |
+| `registration` | yes | `jit` (the default): a just-in-time runner per job, registered with the pool's App or token. `registration-token`: no GitHub credential at all; each slot is registered once with a registration token and keeps its runner between jobs ("Without a GitHub credential" below). |
+| `runnerGroup` | yes | With `registration-token`, the runner group's name as GitHub shows it (config.sh names a group by name). Required for an organisation. |
+| `allowDefaultRunnerGroup` | no | `true` lets a `jit` pool start on the organisation's default runner group (the registration-token mode does not read it; it takes the default group with a warning). Leave it out. |
 | `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |
 | `dockerCache`, `dependencyCache` | no | The disk the Docker layer caches and the dependency caches may use, over all slots. |
 | `runnerImage`, `dockerImage` | no | The runner's and the Docker daemon's public images, pinned by digest. |
@@ -5198,6 +5201,62 @@ boot failed has no pool; remove it with `service_remove` and create it again onc
 that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]`, or
 `[self-hosted, linux, x64, arca-large]` for a large slot.
 
+### Without a GitHub credential: a registration token
+
+Some organisations do not allow an App or a token that can register runners anywhere in the organisation. For them the
+pool has a second mode, `registration` set to `registration-token`, in which it holds no GitHub credential at all:
+
+1. Create the pool with `"registration": "registration-token"` and `"runnerGroup": "<the group's name>"` (for
+   example `{"registration": "registration-token", "runnerGroup": "arca-pool"}` beside `url` and `classes`).
+   `runnerGroupId` is not used in this mode.
+2. An organisation owner opens "Settings", "Actions", "Runners", "New self-hosted runner" and copies the token in
+   the `./config.sh --token` line. It lasts one hour and can only register runners.
+3. `service_secret_set` with `{"name": "ci-pool", "key": "GITHUB_REGISTRATION_TOKEN", "value": "<the token>"}`, then
+   `instance_start`. On a pool that runs, the same token written as `/etc/arca-secrets/GITHUB_REGISTRATION_TOKEN`
+   inside the machine (root's, mode 0600) is picked up within seconds, with no restart.
+
+What the pool does with it:
+
+- Each slot without a registration runs the runner's own `config.sh --unattended --replace` once, with the group,
+  the class's labels (GitHub adds `self-hosted`, `linux` and `x64` itself) and the name
+  `<pool>-<the pool's id>-<slot>`, and not `--ephemeral`. The pool's id keeps two pools of one name in one
+  organisation from taking each other's runners (`--replace` replaces a runner of the same name). The token reaches config.sh as a file on `/run` that its container reads into
+  `ACTIONS_RUNNER_INPUT_TOKEN`: it is on no command line, in no log and in no record of Docker's.
+- The runner's registration (`.runner`, `.credentials`, `.credentials_rsaparams`) is kept per slot in
+  `/var/lib/arca-runner-pool/registered/<slot>`, a folder only root enters (0700; the files 0600). Each runner has its
+  own credential, which can do nothing but connect that one runner.
+- The token is deleted once every slot is registered, or an hour after the pool first saw it, when GitHub no longer
+  takes it. Arca keeps the secret's value and writes it into the machine again at every start: the same token written
+  again is as old as it was and is deleted without being tried, so the stored value need not be cleared. A slot that
+  has its registration starts without one, also after a restart of the controller or of the machine. A refused token
+  is said in `service_logs` with config.sh's own last lines (`config.sh did not register the runner ...`), and the
+  slot tries again with backoff until the token is deleted; its whole output is in
+  `/var/log/arca-runner-pool/register-<slot>.log` inside the machine.
+- The pool asks GitHub's API nothing in this mode: it does not read the runner group, does not take stale runners
+  off, and does not retire an idle runner to give its place to another class. So give every slot a place
+  (`maxSlots` at least the number of slots): a persistent runner keeps its place.
+- When GitHub no longer has a slot's registration (the runner was removed on GitHub, the pool was off for more than
+  14 days, after which GitHub drops a persistent runner, or another runner took its name), its runner says so as it
+  starts. The slot then clears its registration and says in `service_logs`: `GitHub no longer has the registration of
+  its runner ...`. To bring it back, drop a new token: `service_secret_set` of `GITHUB_REGISTRATION_TOKEN`, then
+  `instance_start`. Nothing is done inside the machine. Slots that still have their registration keep running.
+- `runnerGroup` can be the organisation's default group (`Default`), for an organisation that has no other: the pool
+  then says a `WARNING` at its start and in every status block, because every repository that group admits can send
+  jobs to these persistent runners. A group limited to selected repositories is safer. (The `jit` mode refuses the
+  default group unless the template sets `allowDefaultRunnerGroup`.)
+- A token put in at the same moment as a start, before the pool has found that GitHub dropped a slot's registration,
+  can be deleted as unneeded while every slot still looks registered. If a slot then waits for a token, run
+  `instance_start` again within the token's hour: Arca writes the stored token again and the slot registers with it.
+
+**This mode keeps per-slot state between jobs.** The slot's runner is persistent: it takes job after job in the same
+container, beside the same Docker daemon, with the same work directory (`_work`), the same Docker layer cache, the
+same tool cache and the same files any job left in the runner's home. The slot is not cleaned per job; only the two
+cache budgets are checked after each job, as in the other mode. A job can therefore see what an earlier job on that
+slot left, and can leave something for a later one: use it only for repositories that trust each other. Each job is
+still recorded in `jobs.tsv` with its name, result and seconds, but its memory peak is the slot's since its runner
+started (a slice's peak cannot be set back while it runs), and its CPU time is the slot's since the job began. This
+mode is a bridge until each job runs in a fresh machine of its own; the `jit` mode stays as it was.
+
 ### Who can reach what
 
 - **A job can reach the pool's credential.** Jobs get Docker, and the Docker daemon of a slot runs privileged inside
@@ -5207,7 +5266,8 @@ that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]
 - **So the runner group is the wall.** Everyone who can get a workflow run in a repository the runner group admits
   (by pushing a branch there, or through an approved pull request) can, in effect, hold the credential, and what the
   credential can do is in the table of step 2. Admit only repositories where you would trust every person with write
-  access that far. That is why the pool refuses the default runner group and why public repositories stay off.
+  access that far. That is why the `jit` mode refuses the default runner group (the registration-token mode takes it with a
+  warning) and why public repositories stay off.
 - **Nothing beyond the virtual machine.** A job that takes over the virtual machine has the virtual machine: its own
   disk, and the network it is on. It does not have the machine Arca runs on, Arca's other services or Arca's secrets.
 
@@ -5283,8 +5343,30 @@ neither has been measured on the pool itself.
 ### What to know
 
 - **One job per runner.** A runner is registered for one job (GitHub calls it just-in-time and ephemeral), runs in a
-  container made from the runner's public image, and is removed with everything in it. The next job gets a new
+  container made from the pool's runner image (the runner's public image with `aptPackages` added), and is removed
+  with everything in it. The next job gets a new
   registration and a new container, so no job finds another's files, processes or installed packages.
+- **The runner image's packages.** The runner's public image is Ubuntu 24.04 with git, curl, jq, unzip, python3,
+  Docker's client and a passwordless `sudo`, and less than GitHub's own `ubuntu-latest`: no C compiler, no `make`, no
+  `libatomic1` (pnpm and other Node.js-based tools stop with `libatomic.so.1` missing), no `zstd` (`actions/cache`
+  then falls back to gzip, which is another cache version, so no cache saved with zstd restores), no `wget`, no
+  `skopeo`, no `xz-utils` (`tar -xJf` fails), no `zip`, no `rsync` and no `gh`. So before it begins any slot the controller builds one image on the machine: `FROM` the pinned runner
+  image, then `apt-get install --no-install-recommends` of `aptPackages` (by default `libatomic1`, `build-essential`,
+  which is `make`, `gcc` and `g++`, `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, all from Ubuntu's
+  own archive, `skopeo` and `gh` from its universe component; Ubuntu's `gh` is older than GitHub's own apt repository,
+  which a list of package names cannot add). It is named `arca-runner-pool-<the pool's id>:<a digest of what it is built from>`, kept on the
+  machine's disk, and every runner starts from it; a controller that finds it built builds nothing. Node.js is not in
+  the list: a workflow sets up the version it wants with `actions/setup-node`, and the runner carries its own for
+  JavaScript actions only, off the `PATH`, so a workflow that runs `node` or `npm ci` without `actions/setup-node`
+  stops with "command not found" here, where `ubuntu-latest` has both (Ubuntu 24.04's own `nodejs` is 18, past its
+  end of life). Playwright's system libraries are not in it either: `npx playwright install --with-deps` installs
+  them in the job (the image's `sudo` needs no password), at the cost of a download per job. A build that fails (a mirror that cannot be reached, a name that is not a package) is said in
+  `service_logs`, with the image, the step and the package manager's last lines; no runner starts until a build
+  succeeds; while it keeps failing it is tried again after a minute, then two, four and so on, up to five minutes,
+  and each failed attempt's stopped container is removed. Docker's whole output is in
+  `/var/log/arca-runner-pool/runner-image-build.log` inside the machine. The packages come from Ubuntu's archive on
+  the day of the build, so two machines built on different days can differ in their versions; the runner image
+  underneath is the pinned one.
 - **Admission by memory.** A slot starts only while there is memory for its whole size: memory that no other slot has
   reserved, and memory the machine has free at that moment. A slot's memory is a hard limit with no swap, so a job that
   passes it is stopped by the kernel and no other slot pays for it. CPU is different: each slot has a ceiling of its
@@ -5308,8 +5390,14 @@ neither has been measured on the pool itself.
   the new value into the virtual machine, and the controller uses it for the next token. To retire a credential a job
   may have taken, delete the App's key (or the token) on GitHub: that, not Arca, makes it worthless.
 - **Stopping and restarting.** `instance_stop` and `instance_restart` need your approval. Runners that are idle are
-  taken off GitHub first; a job that is running is lost and GitHub reports it as failed. After the machine Arca runs
-  on restarts, the pool starts by itself.
+  taken off GitHub first; a job that is running is lost and GitHub reports it as failed, because the machine's
+  Docker stops with it. After the machine Arca runs on restarts, the pool starts by itself. An orderly stop or
+  restart of the controller service alone, inside a running machine, leaves a runner at its job to finish it: the
+  controller leaves it running, the controller that starts next watches it to its end and records its job, and only
+  then is its slot given a new runner, from the runner image of that controller. That is for an orderly stop only.
+  A crash, an out-of-memory kill or a stop of the machine can lose a running job: a controller that dies before it
+  writes the note leaves the next one nothing to adopt, and a stopped machine takes its Docker with it, so GitHub
+  reports the job as failed.
 - **Pins, and what you are trusting.** The runner is `ghcr.io/actions/actions-runner` 2.338.2 and the slot's daemon is
   `docker` 29.9.3-dind, both by digest: the bytes are fixed. The virtual machine is `images:debian/13/cloud`, the
   public Debian 13 image with cloud-init (which runs the first boot and grows the disk), named by its alias and not by

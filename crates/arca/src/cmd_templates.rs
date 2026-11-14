@@ -113,6 +113,15 @@ pub const EARLIER: &[(&str, &str)] = &[
         "gitlab-runner-pool.sh",
         "9792af0cb048e8efcce28859eb4e4063ba479d52675d6cd074bef7954ac5204f",
     ),
+    // 0.14.0 to 0.29.0: before the runner image was built with aptPackages added.
+    (
+        "github-runner-pool.json",
+        "abf7616b2aa1c1c6f6a0f4a293136c24679b4803c5cf2e5c07ec94e2221546d5",
+    ),
+    (
+        "github-runner-pool.sh",
+        "640b97d0bb914daf9ef2c8ea58276de6bd6bd71035d1f63a7057ba8843e1d7b0",
+    ),
     // 0.13.0: its controller took the stop signal in the process that ran the pool, where bash 5.2 can lose it.
     (
         "gitlab-runner-pool.sh",
