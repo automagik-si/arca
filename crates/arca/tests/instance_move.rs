@@ -2023,6 +2023,85 @@ fn a_source_whose_autostart_stays_on_is_named_in_the_result() {
         "{one}"
     );
     assert_eq!(result_line(&rig, "web")["autostartOff"], false);
+    // The proposal's late result asks for the owner.
+    let late = (0..400).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(25));
+        let path = find_file(&rig.dir, "action-proposals.jsonl")?;
+        let text = fs::read_to_string(path).ok()?;
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|line| {
+                line["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("Move"))
+            })
+    });
+    assert_eq!(late.expect("a late result")["code"], "MoveNeedsOwner");
+}
+
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return Some(path);
+        }
+        if path.is_dir()
+            && let Some(found) = find_file(&path, name)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// N1: a finish that reads the copy on the target back gone says so (copyGone), and the source may be moved again.
+#[test]
+fn a_finish_that_finds_the_copy_gone_lets_the_source_move_again() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    writer(&rig.target)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    writer(&rig.target)
+        .delete_instance("shop", "web")
+        .expect("the copy is removed on the target");
+    let finished = rig
+        .approve(&rig.propose_finish(&id).expect("proposed"))
+        .expect("finished");
+    assert_eq!(finished["deleted"], json!([]), "{finished}");
+    assert!(rig.source.holds("instance", "shop", "web"));
+    let line = rig
+        .journal()
+        .into_iter()
+        .find(|l| l["event"] == "finish")
+        .expect("a finish line");
+    assert_eq!(line["copyGone"], json!(["shop/web"]), "{line}");
+    let plan = rig
+        .call_as(
+            Scope::Viewer,
+            "instance_move_plan",
+            json!({ "instances": [{ "project": "shop", "name": "web" }], "target": "node-b" }),
+        )
+        .expect("the plan answers");
+    assert_eq!(plan["go"], true, "{plan}");
+}
+
+/// N2: a finish keeps a moved source that reads Frozen, not Stopped: it may run again.
+#[test]
+fn a_finish_keeps_a_source_that_is_frozen() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    rig.source.set_instance_status("shop", "web", "Frozen");
+    let finished = rig
+        .approve(&rig.propose_finish(&id).expect("proposed"))
+        .expect("finished");
+    assert!(
+        finished["kept"].to_string().contains("shop/web"),
+        "{finished}"
+    );
+    assert!(rig.source.holds("instance", "shop", "web"));
 }
 
 /// N7: when the source's spot-check file can be read neither before nor after the stop, the check fails.

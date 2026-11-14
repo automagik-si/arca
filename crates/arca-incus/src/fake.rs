@@ -902,6 +902,20 @@ impl FakeIncus {
         store.expand(index, false);
     }
 
+    /// Sets the status of the instance `name` in `project`, as Incus itself changes it (a freeze for a snapshot): no request
+    /// is answered and no write is recorded. Panics when no such instance is held.
+    pub fn set_instance_status(&self, project: &str, name: &str, status: &str) {
+        let mut store = lock(&self.shared.store);
+        let object = store
+            .objects
+            .iter_mut()
+            .find(|object| {
+                object.kind == "instance" && object.project == project && object.name == name
+            })
+            .unwrap_or_else(|| panic!("no instance {project}/{name} to set the status of"));
+        object.body["status"] = json!(status);
+    }
+
     /// Replaces the server document `GET /1.0` answers, as a change of the daemon's addresses or certificate does.
     pub fn set_server(&self, server: Value) {
         lock(&self.shared.store).server = server;
