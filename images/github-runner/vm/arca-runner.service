@@ -1,0 +1,13 @@
+[Unit]
+Description=Arca: run this machine's one GitHub Actions job, then power off
+Wants=network-online.target docker.service
+After=network-online.target docker.service arca-swap.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/arca-runner-start
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

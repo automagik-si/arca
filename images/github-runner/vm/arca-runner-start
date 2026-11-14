@@ -1,0 +1,61 @@
+#!/bin/bash
+# arca-runner-start (arca-runner.service): one machine, one job. At boot it waits for this machine's just-in-time
+# runner configuration (GitHub's encoded_jit_config), runs the runner once as `runner` with the environment a job gets
+# on GitHub's machines, then powers the machine off so whoever started it knows the job is over.
+#
+# Where the configuration comes from, first found wins:
+# - the file /run/arca-runner/jitconfig (put there with `incus file push`, for example);
+# - the instance setting user.arca-runner.jitconfig, read through Incus's guest API (/dev/incus/sock).
+#
+# The work folder is set to /home/runner/work, as on GitHub, whatever the configuration says (GitHub's default is
+# _work inside the runner's folder). The configuration never goes on a command line: the runner reads it from its
+# ACTIONS_RUNNER_INPUT_JITCONFIG variable, and the file is removed once the runner has started.
+#
+# A file /etc/arca-runner/keep-on keeps the machine running after the job (for looking at it).
+set -u
+dir=/run/arca-runner
+file=$dir/jitconfig
+install -d -m 0700 -o runner -g runner "$dir"
+
+guest_api() {
+  [ -S /dev/incus/sock ] || return 1
+  curl -fsS --unix-socket /dev/incus/sock "http://incus/1.0/config/user.arca-runner.jitconfig" 2>/dev/null
+}
+
+echo "arca-runner: waiting for this machine's runner configuration"
+until [ -s "$file" ]; do
+  if config=$(guest_api) && [ -n "$config" ]; then
+    (umask 077 && printf '%s' "$config" >"$file")
+    break
+  fi
+  sleep 1
+done
+chown runner:runner "$file"
+chmod 0400 "$file"
+
+# The configuration is base64 of a JSON object whose values are the runner's files, each base64 too. Point the
+# runner's work folder at /home/runner/work in its .runner file; leave the configuration as it was if it is not that.
+if fixed=$(base64 -d "$file" 2>/dev/null | jq -ce '
+    .[".runner"] |= (@base64d | fromjson | .workFolder = "/home/runner/work" | tojson | @base64)' 2>/dev/null) &&
+  [ -n "$fixed" ]; then
+  (umask 077 && printf '%s' "$fixed" | base64 -w0 >"$file.new") && mv "$file.new" "$file"
+  chown runner:runner "$file"
+  chmod 0400 "$file"
+fi
+
+runner_dir=$(readlink -f /home/runner/actions-runner)
+echo "arca-runner: starting the runner"
+runuser -u runner -- env -i bash -c '
+  set -a; . /etc/environment; set +a
+  export HOME=/home/runner USER=runner LOGNAME=runner SHELL=/bin/bash LANG="${LANG:-C.UTF-8}"
+  ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat "$2")
+  export ACTIONS_RUNNER_INPUT_JITCONFIG
+  rm -f "$2"
+  cd "$1" && exec ./run.sh' _ "$runner_dir" "$file"
+status=$?
+rm -f "$file"
+echo "arca-runner: the runner ended with status $status"
+if [ ! -e /etc/arca-runner/keep-on ]; then
+  systemctl poweroff
+fi
+exit "$status"
