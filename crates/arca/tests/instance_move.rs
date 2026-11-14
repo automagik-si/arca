@@ -2300,3 +2300,88 @@ fn a_failed_move_with_its_copy_started_does_not_offer_a_finish() {
     assert!(!reason.contains("finish the move"), "{reason}");
     assert!(reason.contains("stop the copy"), "{reason}");
 }
+
+/// R4-1: a move whose rollback removed its copy, and journaled it, holds nothing, even once its target cannot be read.
+#[test]
+fn a_cleanly_rolled_back_move_to_an_unreadable_target_does_not_hold() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source
+        .plan_push(PushPlan::Fail("the link dropped".to_string()));
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "rolled_back", "{status}");
+    assert!(!rig.target.holds("instance", "shop", "web"));
+    let lines = rig.journal();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["event"] == "created" && l["targetUuid"].is_string())
+    );
+    let rollback = lines.iter().find(|l| l["event"] == "rollback").unwrap();
+    assert_eq!(rollback["targetRemoved"], true, "{rollback}");
+    let plan = plan_to_third(&rig);
+    assert_eq!(plan["go"], true, "node-b readable: {}", plan["blocked"]);
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    let plan = plan_to_third(&rig);
+    assert_eq!(
+        plan["go"], true,
+        "node-b unreadable, the copy journaled deleted: {}",
+        plan["blocked"]
+    );
+}
+
+/// R4-4: another instance of the name on the target, not the copy the move recorded, holds nothing.
+#[test]
+fn another_instance_of_the_name_on_the_target_does_not_hold() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    writer(&rig.target)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("copy stopped");
+    writer(&rig.target)
+        .delete_instance("shop", "web")
+        .expect("the copy is removed on the target");
+    copy_on_target(&rig, "web", "Running");
+    let plan = plan_to_third(&rig);
+    assert_eq!(plan["go"], true, "{}", plan["blocked"]);
+}
+
+/// R4-4: a card for a plan that was a go is refused when the instance is held by the time the card is proposed.
+#[test]
+fn a_card_for_an_instance_held_now_is_refused() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    writer(&rig.target)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("copy stopped");
+    let plan = plan_to_third(&rig);
+    assert_eq!(plan["go"], true, "{}", plan["blocked"]);
+    writer(&rig.target)
+        .set_state("shop", "web", "start", false, Duration::from_secs(5))
+        .expect("copy started again");
+    let card = rig.call_as(
+        Scope::Viewer,
+        "action_propose",
+        json!({ "action": "instance_move", "args": {
+            "plan": plan["digest"], "instances": [{ "project": "shop", "name": "web" }], "target": "node-c",
+        } }),
+    );
+    assert_eq!(refusal_code(card), "AlreadyMoved");
+}
+
+/// R4-2: the AlreadyMoved reason warns that the copy on the target is the one that served since the cutover.
+#[test]
+fn the_already_moved_reason_says_to_keep_what_the_copy_holds() {
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    let reasons = plan_to_third(&rig)["blocked"][0]["reasons"].to_string();
+    assert!(reasons.contains(&format!("finish move {id}")), "{reasons}");
+    assert!(
+        reasons.contains("once you have kept what it holds"),
+        "{reasons}"
+    );
+}
