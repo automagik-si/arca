@@ -258,7 +258,7 @@ fn a_remove_the_edge_did_not_take_says_the_route_is_gone_and_is_retried_by_remov
 
 /// The template's entrypoint script, run by the host's `sh` with its paths moved into a scratch directory and a
 /// stand-in for Caddy that writes down its arguments.
-fn edge_script(live: Option<&str>, kept: Option<&str>) -> (String, String) {
+fn edge_script(live: Option<&str>, kept: Option<&str>) -> (String, String, String) {
     use std::os::unix::fs::PermissionsExt;
     let script = fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/arca-edge.sh"),
@@ -304,13 +304,14 @@ fn edge_script(live: Option<&str>, kept: Option<&str>) -> (String, String) {
     let ran = (
         fs::read_to_string(&live_path).unwrap_or_default(),
         fs::read_to_string(&args).unwrap_or_default(),
+        fs::read_to_string(&kept_path).unwrap_or_default(),
     );
     fs::remove_dir_all(&work).unwrap();
     ran
 }
 
 #[test]
-fn the_edge_entrypoint_puts_the_kept_config_back_after_a_rebuild_and_never_over_a_newer_one() {
+fn the_edge_entrypoint_puts_the_kept_config_back_after_a_rebuild_and_keeps_a_newer_one_of_arcas() {
     let mut routed = EdgeRecord::default();
     routed.put(Route {
         hostname: "app.example.com".into(),
@@ -324,16 +325,22 @@ fn the_edge_entrypoint_puts_the_kept_config_back_after_a_rebuild_and_never_over_
     let newer = route::caddyfile(&EdgeRecord::default());
     let stock = ":80 {\n\troot * /usr/share/caddy\n\tfile_server\n}\n";
     // A rebuilt root holds the image's own file: the kept copy goes back, and Caddy runs it.
-    let (live, args) = edge_script(Some(stock), Some(&kept));
+    let (live, args, _) = edge_script(Some(stock), Some(&kept));
     assert_eq!(live, kept);
     assert!(args.starts_with("run\n--config\n"), "{args}");
     assert!(args.ends_with("--adapter\ncaddyfile\n"), "{args}");
-    // A root file of Arca's is the newer (a route changed while the edge was stopped): it stays.
-    let (live, _) = edge_script(Some(&newer), Some(&kept));
+    // A root file of Arca's is the newer (a route changed while the edge was stopped): it stays, and the volume keeps
+    // it from now on, so a rebuild after that change brings the change back.
+    let (live, _, on_volume) = edge_script(Some(&newer), Some(&kept));
     assert_eq!(live, newer);
-    // Nothing kept yet: the image's file runs as it is.
-    let (live, _) = edge_script(Some(stock), None);
+    assert_eq!(on_volume, newer);
+    let (live, _, on_volume) = edge_script(Some(&newer), None);
+    assert_eq!(live, newer);
+    assert_eq!(on_volume, newer);
+    // Nothing kept yet and nothing of Arca's: the image's file runs as it is, and nothing is kept.
+    let (live, _, on_volume) = edge_script(Some(stock), None);
     assert_eq!(live, stock);
+    assert_eq!(on_volume, "");
 }
 
 #[test]

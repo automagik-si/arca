@@ -1246,7 +1246,11 @@ fn summary_route_remove(v: &Value) -> String {
             v["port"]
         )
     } else {
-        format!("{url} had no route; the edge's config was written again: {state}")
+        if v["applied"] == true {
+            format!("{url} had no route; the edge's config was written again: {state}")
+        } else {
+            format!("{url} had no route; {state}")
+        }
     }
 }
 fn summary_route_list(v: &Value) -> String {
