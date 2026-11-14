@@ -214,11 +214,16 @@ pub fn egress_rules(
 /// `links` are those addresses and ports. One that is outside the service /24, that is one of the node's own
 /// addresses, or whose port is 0 is never opened, whatever a record says. `destinations` are the private addresses the
 /// node's config names for the function, opened exactly as a service's are.
+///
+/// `internet` is the definition's own word that the function may reach the internet. With it the rules end with one
+/// allow of every address outside the service /24: the rejects before it still close every private range and the
+/// node's own addresses, so what it opens is the public internet.
 pub fn function_egress_rules(
     gateway: Ipv4Addr,
     hosts: &Value,
     destinations: &[Destination],
     links: &[Destination],
+    internet: bool,
 ) -> Vec<Value> {
     let mut rules = egress_rules_for(gateway, hosts, None, destinations, false);
     let own = u32::from(gateway) & 0xffffff00;
@@ -245,6 +250,22 @@ pub fn function_egress_rules(
             "protocol":"tcp", "destination_port":named,
             "description":format!("the linked service at {address}, tcp port {named}")}),
         ));
+    }
+    if internet {
+        // A definition that names the internet lets out what a service's last rule lets out, less the service subnet:
+        // a service's allow is also its way to its neighbours there, and a function's neighbours stay closed but for
+        // its links. Every address the rejects above name (the private ranges, the node's own) stays rejected, since
+        // a reject outweighs an allow, and a private destination keeps only its own rules, as a service's does.
+        let mut closed = destination::node_own(hosts);
+        closed.insert(gateway);
+        let opened = destination::by_address(destinations, gateway, &closed);
+        let internet = destination::cut(destination::without(0, own, 24), opened.keys().copied())
+            .into_iter()
+            .map(|(ip, length)| format!("{}/{length}", Ipv4Addr::from(ip)))
+            .collect::<Vec<_>>()
+            .join(",");
+        rules.push(rule(json!({"action":"allow", "destination":internet,
+            "description":"internet: every public address, named in the function's definition"})));
     }
     rules
 }
@@ -680,6 +701,82 @@ mod tests {
         Destination {
             address: Ipv4Addr::from(address),
             port,
+        }
+    }
+
+    /// A function whose definition names the internet, decided as Incus decides: a packet passes exactly when a
+    /// service's rules would pass it and it is not for the service /24, or when it is tcp to a link on its port. So
+    /// every private range, CGNAT and the tailnet, link-local (metadata among it), loopback and the node's own
+    /// addresses are as closed as for a service, whatever builds the rules; and without the internet nothing is
+    /// added to a function's rules but that one allow.
+    #[test]
+    fn a_function_on_the_internet_reaches_what_a_service_does_less_its_subnet() {
+        let hosts = json!(["10.20.30.1/24", "100.99.1.2/32", "172.20.7.5/24"]);
+        for gateway in [
+            [10, 90, 0, 1],
+            [192, 168, 44, 1],
+            [100, 70, 3, 1],
+            [198, 51, 100, 1],
+        ] {
+            let gateway = Ipv4Addr::from(gateway);
+            let own = u32::from(gateway) & 0xffff_ff00;
+            let links = [
+                Destination {
+                    address: Ipv4Addr::from(own | 10),
+                    port: 4222,
+                },
+                Destination {
+                    address: Ipv4Addr::from(own | 12),
+                    port: 5432,
+                },
+            ];
+            for destinations in [vec![], vec![to([10, 20, 30, 40], 443)]] {
+                let service = egress_rules(gateway, &hosts, None, &destinations);
+                let open = function_egress_rules(gateway, &hosts, &destinations, &links, true);
+                let closed = function_egress_rules(gateway, &hosts, &destinations, &links, false);
+                assert_eq!(closed, open[..open.len() - 1], "{gateway}: one rule more");
+                let more = [
+                    Ipv4Addr::new(169, 254, 169, 254),
+                    Ipv4Addr::new(100, 100, 100, 100),
+                    Ipv4Addr::new(10, 20, 30, 1),
+                    Ipv4Addr::new(100, 99, 1, 2),
+                    Ipv4Addr::new(172, 20, 7, 5),
+                    Ipv4Addr::new(140, 82, 112, 6),
+                    gateway,
+                    Ipv4Addr::from(own | 10),
+                    Ipv4Addr::from(own | 12),
+                    Ipv4Addr::from(own | 250),
+                ];
+                for ip in edges(&[&service, &open], &more) {
+                    let in_subnet = destination::holds(own, 24, u32::from(ip));
+                    for (protocol, ports) in [
+                        ("tcp", &[1u16, 22, 443, 4222, 5432, 65535][..]),
+                        ("udp", &[53, 443][..]),
+                        ("icmp4", &[0][..]),
+                        ("gre", &[0][..]),
+                    ] {
+                        for &port in ports {
+                            let link = protocol == "tcp"
+                                && links.iter().any(|l| l.address == ip && l.port == port);
+                            let wanted =
+                                (allowed(&service, ip, protocol, port) && !in_subnet) || link;
+                            assert_eq!(
+                                allowed(&open, ip, protocol, port),
+                                wanted,
+                                "{gateway} {destinations:?}: {protocol} {ip}:{port}"
+                            );
+                            assert_eq!(
+                                allowed(&closed, ip, protocol, port),
+                                link || (protocol == "tcp"
+                                    && destinations
+                                        .iter()
+                                        .any(|d| d.address == ip && d.port == port)),
+                                "{gateway} {destinations:?}: closed {protocol} {ip}:{port}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1236,7 +1333,7 @@ mod tests {
         };
         // With no link and no destination nothing is allowed at all: every packet meets the NIC's default, reject.
         let service = egress_rules(gateway, &hosts, None, &[]);
-        let bare = function_egress_rules(gateway, &hosts, &[], &[]);
+        let bare = function_egress_rules(gateway, &hosts, &[], &[], false);
         assert_eq!(service.last().expect("a rule")["description"], "internet");
         assert_eq!(
             bare,
@@ -1254,6 +1351,7 @@ mod tests {
                 link([10, 90, 0, 10], 4222),
                 link([10, 90, 0, 10], 8222),
             ],
+            false,
         );
         assert_eq!(
             allows(&linked),
@@ -1283,6 +1381,7 @@ mod tests {
                 link([203, 0, 113, 9], 443),
                 link([10, 90, 0, 10], 0),
             ],
+            false,
         );
         assert_eq!(odd, bare);
         // A private destination is opened as a service's is, and still no rule lets everything else out.
@@ -1292,6 +1391,7 @@ mod tests {
             &hosts,
             &destination,
             &[link([10, 90, 0, 10], 4222)],
+            false,
         );
         assert_eq!(
             allows(&with),
@@ -1308,6 +1408,35 @@ mod tests {
                 ),
             ]
         );
+        // A definition that names the internet ends with one allow: every address outside the service /24, and
+        // outside a private destination's own address. The rejects before it are a service's, unchanged.
+        let open = function_egress_rules(
+            gateway,
+            &hosts,
+            &destination,
+            &[link([10, 90, 0, 10], 4222)],
+            true,
+        );
+        assert_eq!(&open[..open.len() - 1], &with[..]);
+        let last = open.last().expect("a rule");
+        assert_eq!(last["action"], "allow");
+        assert_eq!(last["protocol"], "", "every protocol: {last}");
+        let ranges: Vec<&str> = last["destination"]
+            .as_str()
+            .expect("a destination")
+            .split(',')
+            .collect();
+        let inside = |ip: [u8; 4]| {
+            let ip = u32::from(Ipv4Addr::from(ip));
+            ranges.iter().any(|range| {
+                let (base, length) = range.split_once('/').expect("a range");
+                let base = u32::from(base.parse::<Ipv4Addr>().expect("an address"));
+                let length: u32 = length.parse().expect("a length");
+                destination::holds(base, length, ip)
+            })
+        };
+        assert!(inside([203, 0, 113, 9]) && inside([140, 82, 112, 6]));
+        assert!(!inside([10, 90, 0, 10]) && !inside([10, 90, 0, 200]) && !inside([10, 4, 0, 9]));
         assert!(with.iter().all(|rule| rule["description"] != "internet"));
         let service = egress_rules(gateway, &hosts, None, &destination);
         assert_eq!(with[..with.len() - 1], service[..service.len() - 1]);

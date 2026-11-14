@@ -83,7 +83,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 69] = [
+static VERBS: [Verb; 79] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -419,6 +419,20 @@ static VERBS: [Verb; 69] = [
         cut: no_cut,
         params: service_update_params,
         result: service_update_result,
+    },
+    Verb {
+        name: "service_reconfigure",
+        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_reconfigure,
+        cut: no_cut,
+        params: service_reconfigure_params,
+        result: service_reconfigure_result,
     },
     Verb {
         name: "service_import",
@@ -903,7 +917,7 @@ static VERBS: [Verb; 69] = [
     },
     Verb {
         name: "function_create",
-        summary: "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container, on its image's own root, with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
+        summary: "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container, on its image's own root, with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and the internet only when the definition says internet: true. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -1055,7 +1069,439 @@ static VERBS: [Verb; 69] = [
         params: instance_move_preflight_params,
         result: instance_move_preflight_result,
     },
+    Verb {
+        name: "github_oauth_app_set",
+        summary: "Set this node's GitHub OAuth App, which `github_connect` signs people in with: its client ID and client secret. Write-only: no verb, page, log or record shows the secret again. The App asks for the `admin:org` scope; Arca uses each grant once and then asks GitHub to delete it.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_github_oauth_app_set,
+        cut: no_cut,
+        params: github_oauth_app_set_params,
+        result: github_oauth_app_set_result,
+    },
+    Verb {
+        name: "github_connect",
+        summary: "Connect a GitHub organisation's runners through GitHub's device flow. The answer carries a code and an address (github.com/login/device) for the person, who types the code there and authorises Arca once (scope admin:org). Arca then gets a registration token, puts the runner group in place (the named one, made when missing, or the default), registers the asked runners with the person's labels, each with its own key, and then asks GitHub to delete the grant; a deletion GitHub does not confirm is said plainly. Steps: `github_connect_status`; log: `github_audit`. The runners' credentials stay in Arca's private store.",
+        class: VerbClass::L,
+        min_scope: Scope::Operator,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_github_connect,
+        cut: no_cut,
+        params: github_connect_params,
+        result: github_flow_result,
+    },
+    Verb {
+        name: "github_connect_status",
+        summary: "Where a `github_connect` stands: waiting for the person, registering, done or failed, with every step in words as the person should read them. GitHub's own words in a step are data.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_github_connect,
+        cut: no_cut,
+        params: github_connect_status_params,
+        result: github_flow_result,
+    },
+    Verb {
+        name: "github_bindings",
+        summary: "The GitHub organisations connected to this node: each one's id, mode (oauth, app or push), organisation, status, runner group, label sets and registered runners, and the device flows of the last day. Never a key, a grant, a token or a runner's credential.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_github_bindings,
+        cut: no_cut,
+        params: github_bindings_params,
+        result: github_bindings_result,
+    },
+    Verb {
+        name: "github_audit",
+        summary: "The GitHub signer's log, oldest first: every connection, registration, mint and grant deletion, with who asked, when, the organisation, runner group, labels, runner and outcome. Optionally of one connection, and at most `limit` lines (default 100, at most 1000).",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_github_audit,
+        cut: no_cut,
+        params: github_audit_params,
+        result: github_audit_result,
+    },
+    Verb {
+        name: "github_runner_mint",
+        summary: "One just-in-time runner configuration from a GitHub connection, for a runner launcher outside the kernel: the connection, a runner name and its labels (exactly one of the connection's label sets), and for a scale set its id. An App connection asks GitHub with the App's key, which never leaves Arca; a push connection hands out the oldest configuration the person's service sent with those labels. The answer's encodedJitConfig registers one runner for one job: give it only to the machine that runs it. Every call, refused ones too, is a line of `github_audit`.",
+        class: VerbClass::L,
+        min_scope: Scope::Operator,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_github_mint,
+        cut: no_cut,
+        params: github_runner_mint_params,
+        result: github_runner_mint_result,
+    },
+    Verb {
+        name: "github_mint_job",
+        summary: "Record which job a minted runner took (repository, run, job, workflow), as a line of `github_audit` beside its mint. A runner's job is not known when it is minted.",
+        class: VerbClass::L,
+        min_scope: Scope::Operator,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_github_mint_job,
+        cut: no_cut,
+        params: github_mint_job_params,
+        result: github_mint_job_result,
+    },
+    Verb {
+        name: "github_disconnect",
+        summary: "Disconnect a GitHub connection from Arca's side: an App is uninstalled from the organisation where GitHub lets it and its key is deleted; a push connection's token and waiting configurations are deleted; a signed-in connection's runner credentials are deleted (its runners stay listed on GitHub, offline, until removed there). Nothing is minted from it again. The answer says what was done and what is left for the person on GitHub.",
+        class: VerbClass::L,
+        min_scope: Scope::Operator,
+        writes: true,
+        destructive: true,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_github_disconnect,
+        cut: no_cut,
+        params: github_disconnect_params,
+        result: github_binding_record,
+    },
+    Verb {
+        name: "os_update",
+        summary: "The node's OS update state: the version, channel, check frequency, automatic updates, the last check and update, and the OS's own error kind and update-key trust. Read every 5 minutes; known is false on a node that is not Arca OS.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_os_update,
+        cut: no_cut,
+        params: os_update_params,
+        result: os_update_result,
+    },
 ];
+
+fn summary_github_mint(v: &Value) -> String {
+    format!(
+        "runner {} minted (mint {})",
+        v["runnerName"].as_str().unwrap_or("?"),
+        v["mintId"]
+    )
+}
+
+fn summary_github_mint_job(_: &Value) -> String {
+    "job recorded".to_string()
+}
+
+fn summary_github_disconnect(v: &Value) -> String {
+    format!(
+        "GitHub connection {} for {}: {}",
+        v["id"].as_str().unwrap_or("?"),
+        v["account"].as_str().unwrap_or("?"),
+        v["status"].as_str().unwrap_or("?")
+    )
+}
+
+fn github_job_schema() -> Value {
+    params(vec![
+        (
+            "repo",
+            true,
+            json!({ "description": "owner/name", "maxLength": 200, "minLength": 3, "type": "string" }),
+        ),
+        ("runId", false, at_least(0)),
+        ("jobId", false, at_least(0)),
+        ("jobName", false, string_max(300)),
+        ("workflowRef", false, string_max(500)),
+    ])
+}
+
+fn github_runner_mint_params() -> Value {
+    params(vec![
+        ("binding", true, github_binding_schema()),
+        (
+            "runnerName",
+            true,
+            json!({ "description": "The runner's name on GitHub.", "maxLength": 64, "minLength": 1, "pattern": "^[A-Za-z0-9._-]+$", "type": "string" }),
+        ),
+        ("labels", true, github_labels_schema()),
+        (
+            "workFolder",
+            false,
+            json!({ "description": "The runner's work folder; _work when absent.", "maxLength": 200, "minLength": 1, "type": "string" }),
+        ),
+        ("scaleSetId", false, at_least(1)),
+        ("job", false, github_job_schema()),
+    ])
+}
+
+fn github_runner_mint_result() -> Value {
+    result(vec![
+        ("mintId", true, at_least(1)),
+        ("runnerId", true, at_least(0)),
+        ("runnerName", true, string()),
+        ("runnerGroupId", true, nullable(int())),
+        ("labels", true, array(string())),
+        ("encodedJitConfig", true, string()),
+    ])
+}
+
+fn github_mint_job_params() -> Value {
+    params(vec![
+        ("mintId", true, at_least(1)),
+        ("job", true, github_job_schema()),
+    ])
+}
+
+fn github_mint_job_result() -> Value {
+    result(vec![("ok", true, boolean())])
+}
+
+fn github_disconnect_params() -> Value {
+    with_confirm(params(vec![("binding", true, github_binding_schema())]))
+}
+
+fn summary_github_oauth_app_set(v: &Value) -> String {
+    format!(
+        "GitHub OAuth App {} set",
+        v["clientId"].as_str().unwrap_or("?")
+    )
+}
+
+fn summary_github_connect(v: &Value) -> String {
+    format!(
+        "GitHub connection {} for {}: {} ({} step(s))",
+        v["id"].as_str().unwrap_or("?"),
+        v["account"].as_str().unwrap_or("?"),
+        v["state"].as_str().unwrap_or("?"),
+        v["steps"].as_array().map_or(0, Vec::len)
+    )
+}
+
+fn summary_github_bindings(v: &Value) -> String {
+    format!(
+        "{} GitHub connection(s), {} recent device flow(s)",
+        v["bindings"].as_array().map_or(0, Vec::len),
+        v["flows"].as_array().map_or(0, Vec::len)
+    )
+}
+
+fn summary_github_audit(v: &Value) -> String {
+    format!(
+        "{} audit line(s)",
+        v["lines"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A GitHub organisation login.
+fn github_org_schema() -> Value {
+    json!({
+        "description": "The GitHub organisation's login, as in https://github.com/<org>.",
+        "maxLength": 39,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$",
+        "type": "string"
+    })
+}
+
+/// A GitHub connection's id.
+fn github_binding_schema() -> Value {
+    json!({ "description": "A GitHub connection's id, as `github_bindings` lists it.", "maxLength": 64, "minLength": 1, "type": "string" })
+}
+
+fn github_labels_schema() -> Value {
+    json!({
+        "description": "The runners' labels, exactly as the person chose them: one to twenty, each 1 to 100 characters with no space or comma. None is added.",
+        "items": { "maxLength": 100, "minLength": 1, "type": "string" },
+        "maxItems": 20,
+        "type": "array"
+    })
+}
+
+fn github_oauth_app_set_params() -> Value {
+    params(vec![
+        (
+            "clientId",
+            true,
+            json!({ "description": "The OAuth App's client ID.", "maxLength": 64, "minLength": 1, "pattern": "^[A-Za-z0-9._]+$", "type": "string" }),
+        ),
+        (
+            "clientSecret",
+            true,
+            json!({ "description": "The OAuth App's client secret. Never shown again.", "maxLength": 256, "minLength": 1, "type": "string" }),
+        ),
+    ])
+}
+
+fn github_oauth_app_set_result() -> Value {
+    result(vec![("ok", true, boolean()), ("clientId", true, string())])
+}
+
+fn github_connect_params() -> Value {
+    params(vec![
+        ("org", true, github_org_schema()),
+        (
+            "group",
+            false,
+            json!({ "description": "The runner group, by name. Made when the organisation has none of that name (open to its private repositories, public ones off). Absent: the organisation's default group.", "maxLength": 100, "minLength": 1, "type": "string" }),
+        ),
+        ("labels", true, github_labels_schema()),
+        (
+            "runners",
+            true,
+            json!({ "description": "How many runners to register, 1 to 50.", "maximum": 50, "minimum": 1, "type": "integer" }),
+        ),
+        (
+            "namePrefix",
+            false,
+            json!({ "description": "The start of each runner's name; -1, -2 and so on follow. Absent: arca-<a short id>.", "maxLength": 50, "minLength": 1, "pattern": "^[A-Za-z0-9._-]+$", "type": "string" }),
+        ),
+    ])
+}
+
+fn github_connect_status_params() -> Value {
+    params(vec![(
+        "id",
+        true,
+        json!({ "description": "The id `github_connect` answered.", "maxLength": 64, "minLength": 1, "type": "string" }),
+    )])
+}
+
+fn github_step_schema() -> Value {
+    result(vec![
+        ("at", true, at_least(0)),
+        ("atText", true, string()),
+        ("ok", true, boolean()),
+        ("text", true, string()),
+    ])
+}
+
+fn github_flow_result() -> Value {
+    result(vec![
+        ("id", true, string()),
+        ("account", true, string()),
+        ("group", true, nullable(string())),
+        ("labels", true, array(string())),
+        ("runners", true, at_least(1)),
+        ("userCode", true, string()),
+        ("verificationUri", true, string()),
+        ("expiresAt", true, at_least(0)),
+        (
+            "state",
+            true,
+            one_of(&["waitingForPerson", "registering", "done", "failed"]),
+        ),
+        ("steps", true, array(github_step_schema())),
+        ("binding", true, nullable(string())),
+        ("createdBy", true, string()),
+        ("createdAt", true, at_least(0)),
+    ])
+}
+
+fn github_bindings_params() -> Value {
+    params(vec![])
+}
+
+fn github_binding_record() -> Value {
+    result(vec![
+        ("id", true, string()),
+        ("mode", true, one_of(&["oauth", "app", "push"])),
+        ("account", true, string()),
+        (
+            "status",
+            true,
+            one_of(&["awaitingInstall", "active", "suspended", "revoked"]),
+        ),
+        ("why", false, string()),
+        ("labelSets", true, array(array(string()))),
+        (
+            "runnerGroup",
+            false,
+            result(vec![
+                ("id", true, at_least(0)),
+                ("name", true, string()),
+                ("createdByArca", true, boolean()),
+                ("warning", false, string()),
+            ]),
+        ),
+        (
+            "runners",
+            false,
+            array(result(vec![
+                ("name", true, string()),
+                ("id", true, at_least(0)),
+                ("labels", true, array(string())),
+            ])),
+        ),
+        (
+            "app",
+            false,
+            result(vec![
+                ("id", true, at_least(0)),
+                ("slug", true, string()),
+                ("clientId", true, string()),
+                ("htmlUrl", true, string()),
+                ("ownerId", true, at_least(0)),
+            ]),
+        ),
+        (
+            "installation",
+            false,
+            result(vec![
+                ("id", true, at_least(0)),
+                ("repositorySelection", true, string()),
+                ("repositories", true, array(string())),
+            ]),
+        ),
+        ("createdBy", true, string()),
+        ("createdAt", true, at_least(0)),
+        ("updatedAt", true, at_least(0)),
+    ])
+}
+
+fn github_bindings_result() -> Value {
+    result(vec![
+        ("bindings", true, array(github_binding_record())),
+        ("flows", true, array(github_flow_result())),
+    ])
+}
+
+fn github_audit_params() -> Value {
+    params(vec![
+        ("binding", false, github_binding_schema()),
+        (
+            "limit",
+            false,
+            json!({ "description": "At most this many lines, the newest. Default 100.", "maximum": 1000, "minimum": 1, "type": "integer" }),
+        ),
+    ])
+}
+
+fn github_audit_result() -> Value {
+    result(vec![(
+        "lines",
+        true,
+        array(
+            json!({ "type": "object", "properties": { "at": { "type": "integer" }, "atText": { "type": "string" }, "kind": { "type": "string" } }, "required": ["at", "atText", "kind"] }),
+        ),
+    )])
+}
 
 /// The checks of every `instance_move_preflight` row, in the order each row lists them.
 pub const MOVE_PREFLIGHT_CHECKS: [&str; 8] = [
@@ -1421,6 +1867,10 @@ fn function_create_params_base() -> Value {
                 "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$", "type": "string" },
                 "type": "object"
             },
+            "internet": {
+                "description": "Whether the function may reach the internet: true lets its runs open connections to every public address, as a service can, and the owner's card says so. Left out or false, it opens no connection to a public address. The node's services stay closed to it but for its links either way.",
+                "type": "boolean"
+            },
             "image": {
                 "description": "The image, as <registry>/<repository> in lower case, such as registry.example/acme/relay. Arca pulls it without a credential.",
                 "maxLength": 255,
@@ -1475,6 +1925,7 @@ fn function_result() -> Value {
             ])),
         ),
         ("destinations", false, json!({ "type": "array" })),
+        ("internet", true, boolean()),
         ("triggers", true, json!({ "type": "array" })),
         ("limits", true, json!({ "type": "object" })),
         ("concurrency", true, bounded_int(1, 1)),
@@ -1908,6 +2359,18 @@ pub fn summary_status(v: &Value) -> String {
     )
 }
 
+/// A short line for a successful `os_update`: the version and channel, or that the node reports no update state.
+pub fn summary_os_update(v: &Value) -> String {
+    if v["known"].as_bool() != Some(true) {
+        return "this node does not report update state".to_string();
+    }
+    format!(
+        "OS {} on channel {}",
+        v["version"].as_str().unwrap_or("unknown"),
+        v["channel"].as_str().unwrap_or("unknown")
+    )
+}
+
 /// A short line for a successful `node_metrics`.
 pub fn summary_metrics(v: &Value) -> String {
     format!("host metrics for {} minute(s)", v["minutes"])
@@ -2122,6 +2585,7 @@ fn not_confirmed(name: &str) -> String {
         "service_import" => "nothing was imported",
         "service_release" => "nothing was released",
         "service_update" => "nothing was updated",
+        "service_reconfigure" => "nothing was reconfigured",
         "gpu_detach" => "nothing was detached",
         "storage_add" => "nothing was added",
         "action_approve" => "nothing was run",
@@ -2131,9 +2595,13 @@ fn not_confirmed(name: &str) -> String {
         "deploy_rollback" => "nothing was rolled back",
         "deploy_remove" => "nothing was removed",
         "function_remove" => "nothing was removed",
+        "github_disconnect" => "nothing was disconnected",
         _ => "nothing was deleted",
     };
-    let spent = if name == "postgres_delete" || name == "deploy_rollback" {
+    let spent = if matches!(
+        name,
+        "postgres_delete" | "deploy_rollback" | "github_disconnect"
+    ) {
         ""
     } else {
         " and no approval was spent"
@@ -2315,6 +2783,48 @@ fn node_metrics_result() -> Value {
         ("minutes", true, int()),
         ("latest", true, nullable(host_sample())),
         ("mean", true, nullable(host_sample())),
+    ])
+}
+
+fn os_update_params() -> Value {
+    params(vec![])
+}
+
+fn os_update_result() -> Value {
+    let text = || nullable(string());
+    let ms = || nullable(int());
+    result(vec![
+        ("known", true, boolean()),
+        ("asOf", true, int()),
+        ("version", true, text()),
+        ("channel", true, text()),
+        ("checkFrequency", true, text()),
+        ("automatic", true, nullable(boolean())),
+        ("lastCheckAt", true, ms()),
+        ("lastSuccessAt", true, ms()),
+        ("lastUpdatedVersion", true, text()),
+        ("lastUpdatedAt", true, ms()),
+        ("needsReboot", true, nullable(boolean())),
+        ("pendingVersion", true, text()),
+        ("previousVersion", true, text()),
+        ("goodVersion", true, text()),
+        ("lastResult", true, text()),
+        ("lastReason", true, text()),
+        (
+            "lastErrorKind",
+            true,
+            nullable_enum(&["network", "parse", "signature", "trust", "other"]),
+        ),
+        (
+            "trust",
+            true,
+            nullable(result(vec![
+                ("embeddedCaFingerprint", true, text()),
+                ("presentedCaFingerprint", true, text()),
+                ("failures", true, nullable(at_least(0))),
+                ("escalated", true, nullable(boolean())),
+            ])),
+        ),
     ])
 }
 
@@ -2601,11 +3111,12 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty-four verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 24] = [
+/// The twenty-five verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 25] = [
     "service_create",
     "service_remove",
     "service_update",
+    "service_reconfigure",
     "service_import",
     "service_release",
     "service_publish",
@@ -2650,7 +3161,8 @@ fn action_propose_params() -> Value {
 /// removed or overwritten before the action's own check runs (the GPU verbs from the instance, storage_add from the
 /// disk survey, the snapshot verbs from the source or the snapshot). A branch takes any value for them, as the door did
 /// before it held `args` to a branch, and says so.
-pub const KERNEL_FILLED: [(&str, &[&str]); 5] = [
+pub const KERNEL_FILLED: [(&str, &[&str]); 6] = [
+    ("service_reconfigure", &["changes"]),
     ("gpu_attach", &["project", "kind", "uuid"]),
     ("gpu_detach", &["project", "kind", "uuid"]),
     (
@@ -2699,13 +3211,14 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 24] = [
+const ACTION_EXAMPLES: [(&str, &str); 25] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
         "service_update",
         r#"{"name":"nats","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#,
     ),
+    ("service_reconfigure", r#"{"name":"web"}"#),
     ("service_import", r#"{"name":"web"}"#),
     ("service_release", r#"{"name":"web"}"#),
     ("service_publish", r#"{"name":"dash","reach":"tailnet"}"#),
@@ -3676,6 +4189,12 @@ fn service_create_params_base() -> Value {
                 "pattern": "^[0-9a-f]{64}$",
                 "type": "string"
             },
+            "rawLxc": {
+                "description": "Filled in by the node when a create is proposed from a container template that sets noNewPrivileges or rawLxc: the container's raw.lxc lines, whole and in order, so the owner's card shows them (and says in words when a line may loosen the container's isolation). A caller leaves it out; one that states it must state exactly the template's.",
+                "items": { "maxLength": 256, "type": "string" },
+                "maxItems": 17,
+                "type": "array"
+            },
             "bridge": {
                 "description": "For a virtual-machine template: the existing host bridge its NIC joins, one of the node's allowed bridges. Left out, the virtual machine joins the managed service network when the node has one, and otherwise the node's only allowed bridge.",
                 "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$",
@@ -4013,6 +4532,81 @@ pub fn summary_service_update(v: &Value) -> String {
     } else {
         "Service updated.".to_string()
     }
+}
+
+pub fn summary_service_reconfigure(v: &Value) -> String {
+    if v["reconfigured"] == true {
+        "Service reconfigured from its template.".to_string()
+    } else {
+        "Service already is what its template says.".to_string()
+    }
+}
+
+fn service_reconfigure_params() -> Value {
+    with_tenant(with_confirm(json!({
+        "additionalProperties": false,
+        "properties": {
+            "approval": {
+                "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+            },
+            "changes": {
+                "additionalProperties": false,
+                "properties": {
+                    "environment": { "items": { "type": "object" }, "type": "array" },
+                    "noNewPrivileges": { "type": "object" },
+                    "ports": { "type": "object" },
+                    "rawLxc": { "type": "object" },
+                    "secrets": { "items": { "type": "object" }, "type": "array" }
+                },
+                "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc and noNewPrivileges ({from, to} each). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
+                "type": "object"
+            },
+            "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
+        },
+        "required": ["name", "approval"],
+        "type": "object"
+    })))
+}
+
+fn service_reconfigure_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "changes": {
+                "description": "The difference that was applied, as the owner's card showed it. No secret value is in it.",
+                "type": "object"
+            },
+            "message": { "type": "string" },
+            "readBack": {
+                "additionalProperties": false,
+                "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc) that differ. Never a value.",
+                "properties": {
+                    "differs": { "items": { "type": "string" }, "type": "array" },
+                    "matches": { "type": "boolean" }
+                },
+                "required": ["matches", "differs"],
+                "type": "object"
+            },
+            "reconfigured": {
+                "description": "False when nothing was written: the service already was what its template says, or the only difference is a secret whose value is set separately.",
+                "type": "boolean"
+            },
+            "restarted": {
+                "description": "Whether the service was restarted (once) for the change: true when it was running.",
+                "type": "boolean"
+            },
+            "running": {
+                "description": "Whether the service runs after the change, as read back.",
+                "type": "boolean"
+            },
+            "service": { "type": "string" }
+        },
+        "required": ["reconfigured", "service", "changes", "restarted", "message"],
+        "type": "object"
+    })
 }
 
 fn service_update_params() -> Value {

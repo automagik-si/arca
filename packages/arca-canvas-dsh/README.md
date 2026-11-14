@@ -174,13 +174,17 @@ host entry has `name`, `address` (the configured LAN address or empty), `at`,
 (resolved by the host), `machine`, `instances`, `instancesKnown` (false when
 `watch_report` failed), `projects` (the Incus project ids from `watch_report`),
 `databases`, `services`, `servicesKnown` (false when `service_list` failed),
-`metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
+`metrics`, `osUpdate`, `osUpdateRead`, `alerts`, `plans`, `journal`, `journalKnown` (false when
 `journal_list` failed), `journalPending` (true while a deep journal read finishes
 in the background), `devices`, `devicesAt` (ISO time of the last good device
 list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable`,
 `unreachable`, or `stale`.
 
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
+- `osUpdate` holds the `os_update` result (the node's OS version, update channel, check frequency, automatic updates,
+  last check and update, the OS's error kind and update-key trust), or null. `osUpdateRead` is `ok`, `missing` (the
+  kernel has no `os_update`: an older kernel), `failed` (the read did not complete this poll) or `pending`. It never
+  adds to `error`.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
 - `databases` and `plans` contain the arrays from `postgres_list` and `plan_list`.
 - `services` holds the `service_list.services` rows (name, template, state, ipv4, ports,
@@ -245,6 +249,16 @@ The host logs one safe line per device state change, naming `devicesUrl` or
 `devicesTokenPath` for a rejected setting. Setting values, device credentials and
 upstream error details never enter logs, the snapshot or the browser bundle. Arca
 reads keep their existing error behavior.
+
+The top bar's **Fleet** link, beside the project picker, opens the Fleet updates view (`#fleet`; Back returns to the
+project shown before). It is read only: one row per configured host, in config order, with the OS version, channel and
+check frequency (`stable · every 6h`), automatic updates On/Off, the last successful check as an age, the last update
+(`version · age`, or `none seen yet`) and the last error kind in words. A row carries at most one warning, in this order:
+the update key is not trusted (with both CA fingerprints and the count of failed checks in a row), the node does not report
+update state (not Arca OS, or an older kernel), an update waiting for a restart or a version behind the newest one on the
+fleet's same channel (the update server's own newest version is not reported yet), automatic updates off, and no
+successful check for twice the check frequency (at least an hour). A row whose read failed says "Could not read the update
+state just now." The line above the table gives the newest read time and how many nodes report update state.
 
 The page has four regions. The top bar holds the project picker, the
 `Arca self-hosted | Arca Cloud` segmented control (Cloud is disabled and marked

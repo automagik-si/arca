@@ -26,7 +26,7 @@ use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::EffectRefusal;
 use arca_mcp::{CallError, Caller, GetHandler, GetReply, TokenStore, ToolHandler};
 use arca_metrics::{
-    DEFAULT_MINUTES, HostModeChoice, HostSample, MODE_PROBE_TIMEOUT, ModeRetry, Sampler,
+    DEFAULT_MINUTES, HostModeChoice, HostSample, MODE_PROBE_TIMEOUT, ModeRetry, OsUpdate, Sampler,
     SamplerConfig, choose_host_mode, mean,
 };
 use arca_providers::ReadOnlyIncusProvider;
@@ -318,6 +318,25 @@ impl Published {
     }
 }
 
+/// The update state the sampler's newest incus-osd read gave, swapped in by each tick as [`Published`] swaps its samples, so
+/// `os_update` answers from the ~5 min reading and never sends a GET of its own. `None` before the first read.
+#[derive(Clone, Default)]
+pub struct OsUpdatePublished(Arc<RwLock<Option<Arc<OsUpdate>>>>);
+
+impl OsUpdatePublished {
+    pub fn publish(&self, state: OsUpdate) {
+        let next = Some(Arc::new(state));
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = next;
+    }
+
+    pub fn current(&self) -> Option<Arc<OsUpdate>> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// The alert snapshot the sampler's tick last published, swapped in as [`Published`] swaps its samples. Before the first
 /// tick it is empty.
 #[derive(Clone, Default)]
@@ -344,6 +363,7 @@ pub struct Ticker<S: TickStore> {
     checks: Option<CheckTargets>,
     watch: Option<Arc<WatchHandler>>,
     host_network: Option<std::path::PathBuf>,
+    os_update: Option<OsUpdatePublished>,
 }
 
 impl<S: TickStore> Ticker<S> {
@@ -361,7 +381,14 @@ impl<S: TickStore> Ticker<S> {
             checks: None,
             watch: None,
             host_network: None,
+            os_update: None,
         }
+    }
+
+    /// The same ticker, which publishes the sampler's newest update state to `cell` on each tick, for `os_update`.
+    pub fn with_os_update(mut self, cell: OsUpdatePublished) -> Self {
+        self.os_update = Some(cell);
+        self
     }
 
     /// The same ticker, which reads the root part's status file at `path` on each tick and fills `Inputs.host_network` with
@@ -391,6 +418,9 @@ impl<S: TickStore> Ticker<S> {
         self.sampler.sample(now_ms);
         self.published
             .publish(self.sampler.history(HISTORY_MINUTES));
+        if let (Some(cell), Some(state)) = (&self.os_update, self.sampler.os_update()) {
+            cell.publish(state.clone());
+        }
         let mut inputs = inputs::from_sampler(&self.sampler);
         let swept = self.watch.as_ref().and_then(|handler| handler.newest());
         if let Some(targets) = &self.checks {
@@ -838,6 +868,24 @@ impl ToolHandler for MetricsHandler {
             minutes,
             now_ms(),
         ))
+    }
+}
+
+/// `os_update`: the node's OS update state, from the sampler's newest incus-osd read (every ~5 min). `node_metrics` is the host
+/// metrics domain, and its incus-osd reading is not part of the serialized sample; the update state changes on a slower cadence
+/// and has its own contract here. A node that is not Arca OS, a failed read, and the time before the first read are all
+/// `known: false`, never an error: the verb refuses nothing.
+pub struct OsUpdateHandler {
+    pub published: OsUpdatePublished,
+}
+
+impl ToolHandler for OsUpdateHandler {
+    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let state = match self.published.current() {
+            Some(state) => serde_json::to_value(&*state),
+            None => serde_json::to_value(OsUpdate::unknown(now_ms())),
+        };
+        state.map_err(|_| CallError::Internal("the update state could not be written".to_string()))
     }
 }
 
@@ -1721,6 +1769,22 @@ impl ToolHandler for ActionPropose {
             // never asked to approve it.
             let entries = lock(&self.kernel)?.entries().to_vec();
             service_update::check_proposal(node, &entries, &payload)?
+        } else if action == ActionKind::ServiceReconfigure {
+            // The difference the run would apply is worked out now and recorded, so the card shows it and the
+            // approval binds it. What a caller sent there is never kept.
+            match &self.node {
+                Some(node) => {
+                    let entries = lock(&self.kernel)?.entries().to_vec();
+                    service_reconfigure::check_proposal(node, &entries, &payload)?
+                }
+                None => {
+                    let mut payload = payload;
+                    if let Some(object) = payload.as_object_mut() {
+                        object.remove("changes");
+                    }
+                    payload
+                }
+            }
         } else if let (ActionKind::FunctionCreate, Some(node)) = (action, &self.node) {
             // The proposal names every default and every private destination, so the card shows them and the
             // approval binds them. A create the node would refuse is refused now.
@@ -2440,6 +2504,7 @@ impl ActionExecutor {
             "service_create"
                 | "service_remove"
                 | "service_update"
+                | "service_reconfigure"
                 | "service_publish"
                 | "service_import"
                 | "service_release"
@@ -2941,6 +3006,50 @@ mod tests {
                 metrics_row(snapshot.last(), &window_of(&snapshot, minutes), minutes, 9);
             assert_eq!(from_snapshot, node_metrics(&sampler, Some(minutes), 9));
         }
+    }
+
+    #[test]
+    fn os_update_answers_known_false_before_a_read_and_the_published_state_after() {
+        let caller = Caller {
+            token_id: "viewer".to_string(),
+            scope: Scope::Viewer,
+            tools: None,
+        };
+        let verb = arca_api::verb("os_update").expect("the verb is in the table");
+        assert_eq!(verb.min_scope, Scope::Viewer);
+        assert!(!verb.writes);
+        let schema = (verb.result)();
+        let published = OsUpdatePublished::default();
+        let handler = OsUpdateHandler {
+            published: published.clone(),
+        };
+        let before = handler.call(json!({}), &caller).expect("never a refusal");
+        assert_eq!(before["known"], json!(false));
+        assert_eq!(before["version"], Value::Null);
+        arca_api::conforms(&schema, &before).expect("the answer conforms");
+
+        let mut state = OsUpdate::unknown(42);
+        state.known = true;
+        state.version = Some("202611010000".to_string());
+        state.channel = Some("stable".to_string());
+        state.check_frequency = Some("6h".to_string());
+        state.automatic = Some(true);
+        state.last_error_kind = Some("trust".to_string());
+        state.trust = Some(arca_metrics::UpdateTrust {
+            embedded_ca_fingerprint: Some("AA:BB".to_string()),
+            presented_ca_fingerprint: Some("CC:DD".to_string()),
+            failures: Some(2),
+            escalated: Some(false),
+        });
+        published.publish(state);
+        let after = handler.call(json!({}), &caller).expect("never a refusal");
+        assert_eq!(after["known"], json!(true));
+        assert_eq!(after["asOf"], json!(42));
+        assert_eq!(after["version"], json!("202611010000"));
+        assert_eq!(after["lastErrorKind"], json!("trust"));
+        assert_eq!(after["trust"]["presentedCaFingerprint"], json!("CC:DD"));
+        assert_eq!(after["trust"]["failures"], json!(2));
+        arca_api::conforms(&schema, &after).expect("the answer conforms");
     }
 }
 
@@ -3878,16 +3987,17 @@ fn enrich_service_create(
         if tenant.is_some() && (template.lan.is_some() || template.publishable) {
             return Err(service_refused(tenant_host_port(&template.name)));
         }
-        // A tenant's project refuses `raw.lxc`, the only way Incus 7.5 sets no-new-privileges: refused before any write.
-        if tenant.is_some() && template.no_new_privileges {
-            return Err(service_refused(tenant_no_new_privileges(&template.name)));
+        // A tenant's project refuses `raw.lxc`, the only way Incus 7.5 sets no-new-privileges or a template's
+        // `rawLxc` lines: refused before any write.
+        if tenant.is_some() && needs_low_level(&template) {
+            return Err(service_refused(tenant_low_level(&template)));
         }
         // The owner is never shown a card for a create the node would refuse: the service project must allow
         // low-level container config for this template.
         if tenant.is_none()
-            && template.no_new_privileges
+            && needs_low_level(&template)
             && let Some(why) =
-                no_new_privileges_refusal(&UnixIncus::new(cfg.incus.socket.clone()), &template.name)
+                low_level_refusal(&UnixIncus::new(cfg.incus.socket.clone()), &template)
         {
             return Err(service_refused(why));
         }
@@ -3913,6 +4023,14 @@ fn enrich_service_create(
         if let (Some(private), Some(object)) = (&private, payload.as_object_mut()) {
             object.insert("privatePort".to_string(), private_port_arg(private));
         }
+        // The `raw.lxc` the container gets, whole, so the owner's card shows it and the approval binds it.
+        let raw = crate::service::template_raw_lxc(&template);
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("rawLxc");
+            if !raw.is_empty() {
+                object.insert("rawLxc".to_string(), json!(raw));
+            }
+        }
         return Ok(payload);
     }
     // The settings a create gives are checked now, so the owner's card never shows a value the create would refuse.
@@ -3925,6 +4043,10 @@ fn enrich_service_create(
         return Err(service_refused(why));
     }
     let mut payload = payload.clone();
+    // A virtual machine has no raw.lxc, so a stated one is never shown on its card.
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("rawLxc");
+    }
     // A tenant's machine joins the managed service network and nothing else.
     if tenant.is_some() && payload.get("bridge").is_some() {
         return Err(service_refused(TENANT_BRIDGE));
@@ -4100,6 +4222,36 @@ pub(crate) fn no_new_privileges_refusal(read: &UnixIncus, template: &str) -> Opt
     Some(format!(
         "template {template}: noNewPrivileges needs the LXC config raw.lxc, and the Incus project {project} {why} (restricted.containers.lowlevel is not allow). Nothing was created"
     ))
+}
+
+/// Whether a container template needs low-level container config: it sets `noNewPrivileges` or declares `rawLxc`.
+fn needs_low_level(template: &crate::service::Template) -> bool {
+    template.no_new_privileges || !template.raw_lxc.is_empty()
+}
+
+/// What a template that needs low-level container config is said to need it for, in its own keys.
+fn low_level_subject(template: &crate::service::Template) -> &'static str {
+    match (template.no_new_privileges, template.raw_lxc.is_empty()) {
+        (true, true) => "noNewPrivileges needs",
+        (false, _) => "rawLxc needs",
+        (true, false) => "noNewPrivileges and rawLxc need",
+    }
+}
+
+/// [`no_new_privileges_refusal`], said of what `template` sets.
+fn low_level_refusal(read: &UnixIncus, template: &crate::service::Template) -> Option<String> {
+    no_new_privileges_refusal(read, &template.name)
+        .map(|why| why.replacen("noNewPrivileges needs", low_level_subject(template), 1))
+}
+
+/// [`tenant_no_new_privileges`], said of what `template` sets.
+fn tenant_low_level(template: &crate::service::Template) -> String {
+    let words = tenant_no_new_privileges(&template.name);
+    match low_level_subject(template) {
+        "noNewPrivileges needs" => words,
+        "rawLxc needs" => words.replacen("noNewPrivileges is", "rawLxc is", 1),
+        _ => words.replacen("noNewPrivileges is", "noNewPrivileges and rawLxc are", 1),
+    }
 }
 
 /// Why a tenant's service is not made from a template that sets `noNewPrivileges`.
@@ -5385,6 +5537,8 @@ mod service_follow;
 #[path = "service_omni.rs"]
 mod service_omni;
 pub use service_follow::{Attestation, FollowEdges, Followed, Follower, spawn_follower};
+#[path = "service_reconfigure.rs"]
+mod service_reconfigure;
 #[path = "service_update.rs"]
 mod service_update;
 #[path = "service_wiring.rs"]
@@ -5460,6 +5614,7 @@ pub fn service_handlers_updating(
         "service_logs",
         "service_remove",
         "service_update",
+        "service_reconfigure",
         "service_import",
         "service_release",
     ]
@@ -6272,6 +6427,7 @@ pub(crate) fn adopted_config(
         follow: None,
         follow_version: None,
         no_new_privileges: false,
+        raw_lxc: Vec::new(),
     })
 }
 
@@ -6482,6 +6638,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         follow: None,
         follow_version: None,
         no_new_privileges: parts.template.no_new_privileges,
+        raw_lxc: parts.template.raw_lxc.clone(),
     })
 }
 
@@ -6567,6 +6724,7 @@ fn vm_service_config(
         follow: None,
         follow_version: None,
         no_new_privileges: false,
+        raw_lxc: Vec::new(),
     })
 }
 
@@ -6868,6 +7026,8 @@ impl ServiceHandler {
                 // reads, and refused when they differ: they can only refuse, never widen.
                 "image",
                 "templateDigest",
+                // What a proposal is given when it is made: the `raw.lxc` lines the template gives, for the card.
+                "rawLxc",
             ],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
@@ -6879,6 +7039,13 @@ impl ServiceHandler {
                 "eraseData",
                 // What an update of the service's no-new-privileges sets, so its card says it.
                 "noNewPrivileges",
+                // Only an approved proposal carries it: the one-shot grant of its approval.
+                "approval",
+            ],
+            "service_reconfigure" => &[
+                "name",
+                // What a proposal is given when it is made: the difference from the template, which the card shows.
+                "changes",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
             ],
@@ -6897,6 +7064,7 @@ impl ServiceHandler {
                 "secrets",
                 "links",
                 "destinations",
+                "internet",
                 "triggers",
                 "limits",
                 "concurrency",
@@ -6930,7 +7098,11 @@ impl ServiceHandler {
         }
         if matches!(
             self.verb,
-            "service_create" | "service_update" | "service_import" | "service_release"
+            "service_create"
+                | "service_update"
+                | "service_reconfigure"
+                | "service_import"
+                | "service_release"
         ) && caller.scope < Scope::Doctor
         {
             return Err(CallError::Forbidden {
@@ -6970,6 +7142,7 @@ impl ServiceHandler {
             "service_create"
                 | "service_remove"
                 | "service_update"
+                | "service_reconfigure"
                 | "service_publish"
                 | "service_import"
                 | "service_release"
@@ -7397,6 +7570,7 @@ impl ServiceHandler {
                 Ok(answer)
             }
             "service_update" => self.call_update(&args, &entries, preapproved),
+            "service_reconfigure" => self.call_reconfigure(&args, &entries, preapproved),
             "service_remove" => {
                 let name = service_name(&args)?;
                 let approval = args["approval"]
@@ -7611,6 +7785,16 @@ impl ServiceHandler {
                 let content = crate::service::load_template_content(&templates_dir, template_name)
                     .map_err(service_template_error)?;
                 let template = content.template.clone();
+                // A call that states the `raw.lxc` lines (a proposal fills them in for the card) states exactly the
+                // template's: it can only refuse, never widen.
+                if let Some(stated) = args.get("rawLxc")
+                    && *stated != json!(crate::service::template_raw_lxc(&template))
+                {
+                    return Err(CallError::Invalid(format!(
+                        "rawLxc: template {} gives its container other raw.lxc lines than the call states: the template changed after it was proposed. Propose the create again, so the owner's card says them",
+                        template.name
+                    )));
+                }
                 // Read before the create makes any secret: why this template is created stopped whatever `start` says.
                 let forced = crate::service::template_stopped_reason(
                     &template,
@@ -7890,8 +8074,8 @@ impl ServiceHandler {
                     if template.lan.is_some() || template.publishable {
                         return Err(service_refused(tenant_host_port(template_name)));
                     }
-                    if template.no_new_privileges {
-                        return Err(service_refused(tenant_no_new_privileges(template_name)));
+                    if needs_low_level(&template) {
+                        return Err(service_refused(tenant_low_level(&template)));
                     }
                     if let Some(refusal) =
                         create_room_refusal(&self.cfg, &all_entries, Some(scope), &name, &template)
@@ -7899,9 +8083,9 @@ impl ServiceHandler {
                         return Err(refusal);
                     }
                 }
-                if template.no_new_privileges
+                if needs_low_level(&template)
                     && tenant.is_none()
-                    && let Some(why) = no_new_privileges_refusal(&read, template_name)
+                    && let Some(why) = low_level_refusal(&read, &template)
                 {
                     return Err(service_refused(why));
                 }

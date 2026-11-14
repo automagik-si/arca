@@ -273,6 +273,74 @@ pub fn kernel_link_of(row: &Value) -> Option<KernelLink> {
 /// container's init, so every process inside inherits it. Incus 7.5 has no config key of its own for this.
 pub const NO_NEW_PRIVS_RAW_LXC: &str = "lxc.no_new_privs=1";
 
+/// The `raw.lxc` value Arca last wrote for a container whose template declares `rawLxc` lines. Only such a container
+/// carries the key, so every other instance is as it always was. A later reconcile removes `raw.lxc` once the template
+/// declares no line any more only when `raw.lxc` still is this value: anything else there was put by someone else.
+pub const RAW_LXC_KEY: &str = "user.arca.rawlxc";
+/// The most `rawLxc` lines a template may declare.
+pub const RAW_LXC_MAX_LINES: usize = 16;
+/// The longest `rawLxc` line, in bytes.
+pub const RAW_LXC_LINE_MAX: usize = 256;
+
+/// The `raw.lxc` a record gives its container: `lxc.no_new_privs=1` when it says `noNewPrivileges`, then each line its
+/// template declares in `rawLxc`, in order, one per line. `None` when there is neither.
+pub fn raw_lxc_value(cfg: &ServiceConfig) -> Option<String> {
+    let mut lines: Vec<&str> = Vec::new();
+    if cfg.no_new_privileges {
+        lines.push(NO_NEW_PRIVS_RAW_LXC);
+    }
+    for line in &cfg.raw_lxc {
+        if !lines.contains(&line.as_str()) {
+            lines.push(line);
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The `raw.lxc` lines a container made from `template` gets, in order: what a create's card shows.
+pub fn template_raw_lxc(template: &Template) -> Vec<String> {
+    let mut lines = Vec::new();
+    if template.no_new_privileges {
+        lines.push(NO_NEW_PRIVS_RAW_LXC.to_string());
+    }
+    for line in &template.raw_lxc {
+        if !lines.contains(line) {
+            lines.push(line.clone());
+        }
+    }
+    lines
+}
+
+/// Whether a `raw.lxc` line may loosen the container's isolation, so a card says it in plain words. Every line may,
+/// except the few Arca knows are harmless (`lxc.sched.core`, `lxc.no_new_privs=1`): `raw.lxc` is applied last, so a
+/// line can replace what Incus set (the root, the AppArmor profile, the namespaces, the network, a limit). Nothing is
+/// refused for it; the owner decides on the card.
+pub fn raw_lxc_may_loosen(line: &str) -> bool {
+    let (key, value) = line.split_once('=').unwrap_or((line, ""));
+    let harmless = match key.trim() {
+        "lxc.sched.core" => true,
+        "lxc.no_new_privs" => value.trim() == "1",
+        _ => false,
+    };
+    !harmless
+}
+
+/// Whether `line` may be one of a template's `rawLxc` lines: `lxc.<key>=<value>` on one line, the key of lower-case
+/// letters, digits, dots and underscores, at most [`RAW_LXC_LINE_MAX`] bytes, and no control character.
+pub fn raw_lxc_line_ok(line: &str) -> bool {
+    let Some((key, _)) = line.split_once('=') else {
+        return false;
+    };
+    let key = key.trim_end();
+    line.len() <= RAW_LXC_LINE_MAX
+        && !line.chars().any(char::is_control)
+        && key.len() > "lxc.".len()
+        && key.starts_with("lxc.")
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
+}
+
 /// Where a virtual machine's guest finds its template's `settings`, as one JSON object.
 pub const GUEST_SETTINGS_PATH: &str = "/etc/arca/settings.json";
 /// The largest first-boot script a template may carry, in bytes.
@@ -364,6 +432,11 @@ pub struct ServiceConfig {
     /// template without the key is created as it always was. Only a container of the node's own project carries it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_new_privileges: bool,
+    /// Set from the template's `rawLxc`: the LXC lines the container's `raw.lxc` carries beside `lxc.no_new_privs=1`
+    /// ([`raw_lxc_value`]). Empty in a record that never says it, so every older record is created and reconciled as
+    /// it always was. Only a container of the node's own project carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_lxc: Vec<String>,
 }
 
 /// An image digest and the version Automagik published it as.
@@ -792,13 +865,15 @@ pub fn egress(cfg: &ServiceConfig, hosts: &Value) -> Vec<Value> {
         Some(Ok(block)) => Some(block),
         _ => None,
     };
-    // A function reaches only what its definition names: its linked services and its destinations, and no more.
+    // A function reaches only what its definition names: its linked services, its destinations, and the internet
+    // when the definition names it.
     if let Some(function) = &cfg.function {
         return arca_netproject::tenant::function_egress_rules(
             gateway,
             hosts,
             &cfg.destinations,
             &function.reach,
+            function.internet,
         );
     }
     arca_netproject::tenant::egress_rules(gateway, hosts, block, &cfg.destinations)
@@ -862,8 +937,11 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     if cfg.autostart {
         config.insert("boot.autostart".into(), json!("true"));
     }
-    if cfg.no_new_privileges {
-        config.insert("raw.lxc".into(), json!(NO_NEW_PRIVS_RAW_LXC));
+    if let Some(raw) = raw_lxc_value(cfg) {
+        if !cfg.raw_lxc.is_empty() {
+            config.insert(RAW_LXC_KEY.into(), json!(raw));
+        }
+        config.insert("raw.lxc".into(), json!(raw));
     }
     if cfg.function.is_some() {
         // The mark the writer of a run looks for, and a memory limit that swap does not stretch.
@@ -1219,18 +1297,34 @@ impl Plugin for Service {
                     changes.insert(format!("environment.{key}"), None);
                 }
             }
-            // `raw.lxc` follows the record's `noNewPrivileges`. While the record says true, `raw.lxc` is Arca's: it is
-            // written as `lxc.no_new_privs=1`, replacing any other value. When the record says false, it is removed
-            // only if it is exactly that value; any other `raw.lxc` is not Arca's and is left as it is.
+            // `raw.lxc` follows the record's `noNewPrivileges` and `rawLxc`. While the record names either, `raw.lxc` is
+            // Arca's: it is written as `lxc.no_new_privs=1` then each declared line ([`raw_lxc_value`]), replacing any
+            // other value, so a declared line survives every reconcile and an undeclared one does not. A record with
+            // declared lines also marks the value it wrote ([`RAW_LXC_KEY`]). When the record names neither,
+            // `raw.lxc` is removed only if it is exactly `lxc.no_new_privs=1` or exactly the value the mark says Arca
+            // wrote; any other `raw.lxc` is not Arca's and is left as it is.
             let raw = current.get("raw.lxc").and_then(Value::as_str);
-            if cfg.no_new_privileges {
-                if raw != Some(NO_NEW_PRIVS_RAW_LXC) {
-                    changes.insert("raw.lxc".into(), Some(NO_NEW_PRIVS_RAW_LXC.into()));
+            let mark = current.get(RAW_LXC_KEY).and_then(Value::as_str);
+            match raw_lxc_value(cfg) {
+                Some(wanted) => {
+                    if raw != Some(wanted.as_str()) {
+                        changes.insert("raw.lxc".into(), Some(wanted.clone()));
+                    }
+                    let marked = (!cfg.raw_lxc.is_empty()).then_some(wanted);
+                    if mark != marked.as_deref() {
+                        changes.insert(RAW_LXC_KEY.into(), marked);
+                    }
                 }
-            } else if raw == Some(NO_NEW_PRIVS_RAW_LXC) {
-                changes.insert("raw.lxc".into(), None);
+                None => {
+                    if raw == Some(NO_NEW_PRIVS_RAW_LXC) || (raw.is_some() && raw == mark) {
+                        changes.insert("raw.lxc".into(), None);
+                    }
+                    if mark.is_some() {
+                        changes.insert(RAW_LXC_KEY.into(), None);
+                    }
+                }
             }
-            for key in [ENVKEYS_KEY, LINKS_KEY, PUBLISHED_KEY] {
+            for key in [ENVKEYS_KEY, LINKS_KEY, PUBLISHED_KEY, PORTS_KEY] {
                 let value = desired["config"]
                     .get(key)
                     .and_then(Value::as_str)
@@ -1349,6 +1443,12 @@ pub struct Template {
     /// project is created from such a template, never one in a tenant, whose project refuses `raw.lxc`.
     #[serde(default)]
     pub no_new_privileges: bool,
+    /// A container template's extra LXC lines, such as `lxc.sched.core=0`: each is kept in the instance's `raw.lxc`
+    /// beside `lxc.no_new_privs=1` ([`raw_lxc_value`]), through every reconcile. At most [`RAW_LXC_MAX_LINES`], each
+    /// `lxc.<key>=<value>` on one line ([`raw_lxc_line_ok`]). Like `noNewPrivileges`, only a service of the node's own
+    /// project is created from such a template, and the project must allow low-level container config.
+    #[serde(default)]
+    pub raw_lxc: Vec<String>,
     /// A virtual-machine template whose service runs a version the template names: `{ "pin": "<a key of settings>" }`.
     /// No other kind sets it.
     #[serde(default)]
@@ -1755,6 +1855,13 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             "template {name}: an OCI image needs a digest"
         )));
     }
+    if template.raw_lxc.len() > RAW_LXC_MAX_LINES
+        || !template.raw_lxc.iter().all(|line| raw_lxc_line_ok(line))
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: rawLxc is at most {RAW_LXC_MAX_LINES} lines, each lxc.<key>=<value> on one line of at most {RAW_LXC_LINE_MAX} bytes, the key of lower-case letters, digits, dots and underscores"
+        )));
+    }
     if template.ports.len() > 16 {
         return Err(TemplateError::refused(format!(
             "template {name}: at most 16 ports"
@@ -1926,9 +2033,9 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
             "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan, privatePort or kernelAccess: they need a container's environment, image or devices",
         );
     }
-    if template.no_new_privileges {
+    if template.no_new_privileges || !template.raw_lxc.is_empty() {
         return refused(
-            "a virtual machine has no noNewPrivileges: it is the LXC config of a container",
+            "a virtual machine has no noNewPrivileges or rawLxc: they are the LXC config of a container",
         );
     }
     if template.secrets.len() > 16 {
@@ -2753,6 +2860,20 @@ pub fn secret_file(secrets_dir: &Path, owner: &str, key: &str) -> Option<PathBuf
         return None;
     }
     Some(secrets_dir.join(owner).join(secret_name(key)))
+}
+
+/// Makes the secret `key` of the service whose entry is `owner` as its template's `generate` says, with `prefix`, and
+/// writes it to its file, as a create does. Answers its reference. Nothing is shown.
+pub fn generate_secret(
+    secrets_dir: &Path,
+    owner: &str,
+    key: &str,
+    prefix: &str,
+) -> Result<String, TemplateError> {
+    let file = secret_file(secrets_dir, owner, key)
+        .ok_or_else(|| TemplateError::refused("invalid secret name"))?;
+    write_secret(&file, &generated_secret(prefix)?)?;
+    Ok(secret_reference(owner, key))
 }
 
 fn generated_secret(prefix: &str) -> Result<String, TemplateError> {

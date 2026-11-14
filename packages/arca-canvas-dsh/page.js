@@ -10,48 +10,220 @@
     }
   }
 
+  // src/fleet.js
+  var HOUR = 36e5;
+  var MINUTE = 6e4;
+  var DAY = 864e5;
+  var ERROR_KIND_TEXT = {
+    network: "could not reach the update server",
+    parse: "the update data was damaged",
+    signature: "the server's signature was invalid",
+    trust: "the server's key is not trusted",
+    other: "the last check failed"
+  };
+  var FLEET_TEXT = {
+    trust: "Its update key is not trusted, so it will not update until this is fixed.",
+    unknown: "This node does not report update state.",
+    failed: "Could not read the update state just now.",
+    restart: "An update is ready and waiting for a restart.",
+    automaticOff: "Automatic updates are off on this node.",
+    // The update server's newest version for a channel is not in the update document yet (a later OS field such as
+    // `available_version`), so a node is compared with the newest version its own fleet reports on the same channel.
+    behindDetail: "Compared with the newest version on your fleet."
+  };
+  var text = (value) => typeof value === "string" && value.trim() ? value.trim() : null;
+  var finite = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+  function frequencyMs(value) {
+    const raw = text(value);
+    if (!raw || raw === "never" || !/^(\d+(\.\d+)?(h|m|s|ms))+$/.test(raw)) return null;
+    let total = 0;
+    for (const [, amount, , unit] of raw.matchAll(/(\d+(\.\d+)?)(ms|h|m|s)/g)) {
+      total += Number(amount) * { h: HOUR, m: MINUTE, s: 1e3, ms: 1 }[unit];
+    }
+    return total > 0 ? total : null;
+  }
+  function plainAge(at, now) {
+    if (finite(at) === null) return "";
+    const elapsed = Math.max(0, now - at);
+    if (elapsed < MINUTE) return "just now";
+    const unit = (amount, name) => `${amount} ${name}${amount === 1 ? "" : "s"} ago`;
+    if (elapsed < HOUR) return `${Math.floor(elapsed / MINUTE)} min ago`;
+    if (elapsed < DAY) return unit(Math.floor(elapsed / HOUR), "hour");
+    return unit(Math.floor(elapsed / DAY), "day");
+  }
+  function defaultDate(at) {
+    try {
+      return new Intl.DateTimeFormat(void 0, {
+        day: "numeric",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23"
+      }).format(new Date(at));
+    } catch {
+      return new Date(at).toISOString().slice(0, 16).replace("T", " ");
+    }
+  }
+  function compareVersions(a, b) {
+    return String(a).localeCompare(String(b), "en", { numeric: true, sensitivity: "base" });
+  }
+  function updateRead(host = {}) {
+    if (host.osUpdate && typeof host.osUpdate === "object") return "ok";
+    if (host.osUpdateRead === "failed") return "failed";
+    return "missing";
+  }
+  function newestByChannel(hosts) {
+    const newest = /* @__PURE__ */ new Map();
+    for (const host of hosts) {
+      if (updateRead(host) !== "ok" || host.osUpdate.known !== true) continue;
+      const channel = text(host.osUpdate.channel);
+      const version = text(host.osUpdate.version);
+      if (!channel || !version) continue;
+      const current = newest.get(channel);
+      if (!current || compareVersions(version, current) > 0) newest.set(channel, version);
+    }
+    return newest;
+  }
+  function trustDetail(trust) {
+    if (!trust || typeof trust !== "object") return "";
+    const parts = [];
+    const embedded = text(trust.embeddedCaFingerprint);
+    const presented = text(trust.presentedCaFingerprint);
+    if (embedded) parts.push(`Expected key ${embedded}.`);
+    if (presented) parts.push(`The server presented ${presented}.`);
+    const failures = finite(trust.failures);
+    if (failures !== null && failures > 1) parts.push(`${failures} checks in a row.`);
+    return parts.join(" ");
+  }
+  function blankRow(name, read, message) {
+    return {
+      name,
+      read,
+      known: false,
+      version: "\u2014",
+      channel: "\u2014",
+      automatic: "\u2014",
+      lastCheck: "\u2014",
+      lastCheckStale: false,
+      lastUpdate: "\u2014",
+      lastError: "\u2014",
+      warning: { kind: read === "failed" ? "failed" : "unknown", tone: "neutral", text: message, detail: "" },
+      asOf: null
+    };
+  }
+  function buildRow(host, newest, now, formatDate) {
+    const name = text(host.name) ?? "Machine";
+    const read = updateRead(host);
+    if (read === "failed") return blankRow(name, read, FLEET_TEXT.failed);
+    if (read === "missing") return blankRow(name, read, FLEET_TEXT.unknown);
+    const state = host.osUpdate;
+    const asOf = finite(state.asOf);
+    if (state.known !== true) {
+      return { ...blankRow(name, read, FLEET_TEXT.unknown), version: "not an Arca OS node", asOf };
+    }
+    const version = text(state.version);
+    const channel = text(state.channel);
+    const frequency = text(state.checkFrequency);
+    const automatic = typeof state.automatic === "boolean" ? state.automatic : null;
+    const lastSuccessAt = finite(state.lastSuccessAt);
+    const every = frequencyMs(frequency);
+    const staleAfter = every === null ? null : Math.max(2 * every, HOUR);
+    const stale = staleAfter !== null && lastSuccessAt !== null && now - lastSuccessAt > staleAfter;
+    const updatedVersion = text(state.lastUpdatedVersion);
+    const updatedAt = finite(state.lastUpdatedAt);
+    const errorKind = text(state.lastErrorKind);
+    const trust = state.trust && typeof state.trust === "object" ? state.trust : null;
+    const row = {
+      name,
+      read,
+      known: true,
+      version: version ?? "\u2014",
+      channel: [channel ?? "\u2014", frequency ? frequency === "never" ? "never" : `every ${frequency}` : null].filter(Boolean).join(" \xB7 "),
+      automatic: automatic === null ? "\u2014" : automatic ? "On" : "Off",
+      lastCheck: lastSuccessAt !== null ? plainAge(lastSuccessAt, now) : "never",
+      lastCheckStale: stale,
+      lastUpdate: updatedVersion ? [updatedVersion, updatedAt !== null ? plainAge(updatedAt, now) : null].filter(Boolean).join(" \xB7 ") : "none seen yet",
+      lastError: errorKind && ERROR_KIND_TEXT[errorKind] ? ERROR_KIND_TEXT[errorKind] : "\u2014",
+      warning: null,
+      asOf
+    };
+    const head = channel ? newest.get(channel) : null;
+    if (errorKind === "trust" || (finite(trust?.failures) ?? 0) > 0) {
+      row.warning = { kind: "trust", tone: "bad", text: FLEET_TEXT.trust, detail: trustDetail(trust) };
+    } else if (state.needsReboot === true || text(state.pendingVersion)) {
+      const pending = text(state.pendingVersion);
+      row.warning = { kind: "restart", tone: "warn", text: FLEET_TEXT.restart, detail: pending ? `Version ${pending} is waiting.` : "" };
+    } else if (version && head && compareVersions(version, head) < 0) {
+      row.warning = {
+        kind: "behind",
+        tone: "warn",
+        text: `Behind the fleet's newest version (${head}) on ${channel}.`,
+        detail: FLEET_TEXT.behindDetail
+      };
+    } else if (automatic === false) {
+      row.warning = { kind: "automatic-off", tone: "warn", text: FLEET_TEXT.automaticOff, detail: "" };
+    } else if (stale) {
+      row.warning = { kind: "stale", tone: "warn", text: `Has not checked since ${formatDate(lastSuccessAt)}.`, detail: "" };
+    }
+    return row;
+  }
+  function buildFleet(hosts = [], { now = Date.now(), formatDate = defaultDate } = {}) {
+    const list3 = Array.isArray(hosts) ? hosts : [];
+    const newest = newestByChannel(list3);
+    const rows = list3.map((host) => buildRow(host ?? {}, newest, now, formatDate));
+    const reported = rows.filter((row) => row.known).length;
+    const times = rows.map((row) => row.asOf).filter((at) => at !== null);
+    return {
+      rows,
+      reported,
+      total: rows.length,
+      asOf: times.length ? Math.max(...times) : null,
+      count: `${reported} of ${rows.length} node${rows.length === 1 ? "" : "s"} report update state`
+    };
+  }
+
   // src/open-intelligence.js
   var OPEN_INTELLIGENCE_TAG = ["svg", { "viewBox": "0 0 340 64", "width": "170", "height": "32", "role": "img", "aria-label": "Open Intelligence badge" }, [["rect", { "x": "1.5", "y": "1.5", "width": "337", "height": "61", "rx": "30.5", "fill": "#0e1017", "stroke": "#ebe6da", "stroke-width": "2" }, []], ["g", { "transform": "translate(34 32) scale(0.27) translate(-100 -100)" }, [["path", { "d": "M78.04 110.98 A3.66 3.66 0 0 1 80.19 111.68", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M79.44 111.26 A3.66 3.66 0 0 1 81.16 112.73", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M80.63 112.05 A3.66 3.66 0 0 1 81.66 114.07", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M81.42 113.24 A3.66 3.66 0 0 1 81.60 115.49", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M81.70 114.64 A3.66 3.66 0 0 1 81.00 116.79", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M81.42 116.04 A3.66 3.66 0 0 1 79.95 117.76", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M80.63 117.23 A3.66 3.66 0 0 1 78.61 118.25", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M79.44 118.02 A3.66 3.66 0 0 1 77.19 118.20", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M78.04 118.30 A3.66 3.66 0 0 1 75.89 117.60", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M76.64 118.02 A3.66 3.66 0 0 1 74.92 116.55", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M75.45 117.23 A3.66 3.66 0 0 1 74.43 115.21", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M74.66 116.04 A3.66 3.66 0 0 1 74.48 113.78", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M74.38 114.64 A3.66 3.66 0 0 1 75.08 112.49", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M74.66 113.24 A3.66 3.66 0 0 1 76.13 111.52", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M75.45 112.05 A3.66 3.66 0 0 1 77.47 111.02", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M76.64 111.26 A3.66 3.66 0 0 1 78.90 111.08", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M81.70 114.64 A3.66 3.66 0 0 1 81.00 116.79", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M81.42 116.04 A3.66 3.66 0 0 1 79.95 117.76", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M80.63 117.23 A3.66 3.66 0 0 1 78.61 118.25", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M79.44 118.02 A3.66 3.66 0 0 1 77.19 118.20", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M78.04 118.30 A3.66 3.66 0 0 1 75.89 117.60", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M76.64 118.02 A3.66 3.66 0 0 1 74.92 116.55", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M75.45 117.23 A3.66 3.66 0 0 1 74.43 115.21", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M74.66 116.04 A3.66 3.66 0 0 1 74.48 113.78", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M74.38 114.64 A3.66 3.66 0 0 1 75.08 112.49", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M74.66 113.24 A3.66 3.66 0 0 1 76.13 111.52", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M75.45 112.05 A3.66 3.66 0 0 1 77.47 111.02", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M76.64 111.26 A3.66 3.66 0 0 1 78.90 111.08", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M78.04 110.98 A3.66 3.66 0 0 1 80.19 111.68", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M79.44 111.26 A3.66 3.66 0 0 1 81.16 112.73", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M80.63 112.05 A3.66 3.66 0 0 1 81.66 114.07", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M81.42 113.24 A3.66 3.66 0 0 1 81.60 115.49", "fill": "none", "stroke": "#ebe6da", "stroke-width": "0.86" }, []], ["path", { "d": "M78.04 118.30 A7.32 7.32 0 0 1 73.74 116.90", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M75.24 117.74 A7.32 7.32 0 0 1 71.80 114.80", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M72.87 116.16 A7.32 7.32 0 0 1 70.81 112.12", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M71.28 113.78 A7.32 7.32 0 0 1 70.92 109.27", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M70.72 110.98 A7.32 7.32 0 0 1 72.12 106.68", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M71.28 108.18 A7.32 7.32 0 0 1 74.22 104.74", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M72.87 105.80 A7.32 7.32 0 0 1 76.90 103.75", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M75.24 104.22 A7.32 7.32 0 0 1 79.75 103.86", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M78.04 103.66 A7.32 7.32 0 0 1 82.34 105.06", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M80.84 104.22 A7.32 7.32 0 0 1 84.28 107.15", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M83.22 105.80 A7.32 7.32 0 0 1 85.27 109.83", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M84.80 108.18 A7.32 7.32 0 0 1 85.16 112.69", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M85.36 110.98 A7.32 7.32 0 0 1 83.96 115.28", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M84.80 113.78 A7.32 7.32 0 0 1 81.87 117.22", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M83.22 116.16 A7.32 7.32 0 0 1 79.19 118.21", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M80.84 117.74 A7.32 7.32 0 0 1 76.33 118.10", "fill": "none", "stroke": "#ebe6da", "stroke-width": "1.73" }, []], ["path", { "d": "M70.72 110.98 A10.98 10.98 0 0 1 72.82 104.53", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M71.56 106.78 A10.98 10.98 0 0 1 75.96 101.62", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M73.94 103.22 A10.98 10.98 0 0 1 79.98 100.14", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M77.50 100.84 A10.98 10.98 0 0 1 84.26 100.30", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M81.70 100.00 A10.98 10.98 0 0 1 88.15 102.10", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M85.90 100.84 A10.98 10.98 0 0 1 91.06 105.24", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M89.46 103.22 A10.98 10.98 0 0 1 92.55 109.26", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M91.84 106.78 A10.98 10.98 0 0 1 92.38 113.54", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M92.68 110.98 A10.98 10.98 0 0 1 90.58 117.43", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M91.84 115.18 A10.98 10.98 0 0 1 87.44 120.34", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M89.46 118.74 A10.98 10.98 0 0 1 83.42 121.82", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M85.90 121.12 A10.98 10.98 0 0 1 79.14 121.66", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M81.70 121.96 A10.98 10.98 0 0 1 75.25 119.86", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M77.50 121.12 A10.98 10.98 0 0 1 72.34 116.72", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M73.94 118.74 A10.98 10.98 0 0 1 70.86 112.70", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M71.56 115.18 A10.98 10.98 0 0 1 71.02 108.42", "fill": "none", "stroke": "#ebe6da", "stroke-width": "2.59" }, []], ["path", { "d": "M81.70 100.00 A18.30 18.30 0 0 1 92.46 103.49", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M88.70 101.39 A18.30 18.30 0 0 1 97.30 108.74", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M94.64 105.36 A18.30 18.30 0 0 1 99.77 115.44", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M98.61 111.30 A18.30 18.30 0 0 1 99.49 122.57", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M100.00 118.30 A18.30 18.30 0 0 1 96.51 129.06", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M98.61 125.30 A18.30 18.30 0 0 1 91.26 133.90", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M94.64 131.24 A18.30 18.30 0 0 1 84.56 136.37", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M88.70 135.21 A18.30 18.30 0 0 1 77.43 136.09", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M81.70 136.60 A18.30 18.30 0 0 1 70.94 133.10", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M74.70 135.21 A18.30 18.30 0 0 1 66.10 127.86", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M68.76 131.24 A18.30 18.30 0 0 1 63.63 121.16", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M64.79 125.30 A18.30 18.30 0 0 1 63.91 114.03", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M63.40 118.30 A18.30 18.30 0 0 1 66.90 107.54", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M64.79 111.30 A18.30 18.30 0 0 1 72.14 102.70", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M68.76 105.36 A18.30 18.30 0 0 1 78.84 100.23", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M74.70 101.39 A18.30 18.30 0 0 1 85.97 100.51", "fill": "none", "stroke": "#ebe6da", "stroke-width": "4.32" }, []], ["path", { "d": "M100.00 118.30 A29.28 29.28 0 0 1 95.03 134.62", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M98.02 128.88 A29.28 29.28 0 0 1 87.49 142.30", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M92.36 138.02 A29.28 29.28 0 0 1 77.69 146.74", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M83.77 144.51 A29.28 29.28 0 0 1 66.94 147.33", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M73.42 147.45 A29.28 29.28 0 0 1 56.71 144.01", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M62.71 146.46 A29.28 29.28 0 0 1 48.37 137.21", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M53.08 141.66 A29.28 29.28 0 0 1 43.05 127.86", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M45.83 133.71 A29.28 29.28 0 0 1 41.46 117.22", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M41.94 123.68 A29.28 29.28 0 0 1 43.83 106.72", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M41.94 112.92 A29.28 29.28 0 0 1 49.83 97.79", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M45.83 102.89 A29.28 29.28 0 0 1 58.65 91.63", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M53.08 94.93 A29.28 29.28 0 0 1 69.10 89.07", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M62.71 90.14 A29.28 29.28 0 0 1 79.77 90.45", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M73.42 89.15 A29.28 29.28 0 0 1 89.22 95.60", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M83.77 92.09 A29.28 29.28 0 0 1 96.17 103.82", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M92.36 98.57 A29.28 29.28 0 0 1 99.68 113.99", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M98.02 107.72 A29.28 29.28 0 0 1 99.28 124.74", "fill": "none", "stroke": "#ebe6da", "stroke-width": "6.91" }, []], ["path", { "d": "M70.72 147.58 A47.58 47.58 0 0 1 48.80 142.23", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M56.70 145.46 A47.58 47.58 0 0 1 37.33 133.89", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M43.92 139.31 A47.58 47.58 0 0 1 28.82 122.55", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M33.52 129.66 A47.58 47.58 0 0 1 24.04 109.19", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M26.43 117.38 A47.58 47.58 0 0 1 23.40 95.03", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M23.28 103.56 A47.58 47.58 0 0 1 26.97 81.30", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M24.34 89.41 A47.58 47.58 0 0 1 34.43 69.24", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M29.52 76.21 A47.58 47.58 0 0 1 45.11 59.91", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M38.36 65.12 A47.58 47.58 0 0 1 58.06 54.14", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M50.08 57.13 A47.58 47.58 0 0 1 72.14 52.44", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M63.63 52.95 A47.58 47.58 0 0 1 86.10 54.98", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M77.81 52.95 A47.58 47.58 0 0 1 98.69 61.51", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M91.36 57.13 A47.58 47.58 0 0 1 108.79 71.46", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M103.08 65.12 A47.58 47.58 0 0 1 115.51 83.95", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M111.92 76.21 A47.58 47.58 0 0 1 118.25 97.87", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M117.11 89.41 A47.58 47.58 0 0 1 116.77 111.97", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M118.17 103.56 A47.58 47.58 0 0 1 111.19 125.01", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M115.01 117.38 A47.58 47.58 0 0 1 102.02 135.83", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M107.92 129.66 A47.58 47.58 0 0 1 90.07 143.46", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M97.52 139.31 A47.58 47.58 0 0 1 76.40 147.24", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M84.75 145.46 A47.58 47.58 0 0 1 62.23 146.81", "fill": "none", "stroke": "#ebe6da", "stroke-width": "11.23" }, []], ["path", { "d": "M23.14 100.00 A76.86 76.86 0 0 1 28.41 72.04", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M25.22 82.28 A76.86 76.86 0 0 1 36.79 56.28", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M31.32 65.51 A76.86 76.86 0 0 1 48.57 42.88", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M41.12 50.60 A76.86 76.86 0 0 1 63.13 32.56", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M54.10 38.35 A76.86 76.86 0 0 1 79.68 25.88", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M69.56 29.43 A76.86 76.86 0 0 1 97.32 23.19", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M86.65 24.31 A76.86 76.86 0 0 1 115.10 24.64", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M104.47 23.27 A76.86 76.86 0 0 1 132.08 30.16", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M122.04 26.37 A76.86 76.86 0 0 1 147.32 39.44", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M138.43 33.44 A76.86 76.86 0 0 1 160.01 51.98", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M152.74 44.10 A76.86 76.86 0 0 1 169.47 67.11", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M164.21 57.77 A76.86 76.86 0 0 1 175.18 84.02", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M172.22 73.71 A76.86 76.86 0 0 1 176.84 101.79", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M176.34 91.08 A76.86 76.86 0 0 1 174.35 119.46", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M176.34 108.92 A76.86 76.86 0 0 1 167.86 136.08", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M172.22 126.29 A76.86 76.86 0 0 1 157.71 150.76", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M164.21 142.23 A76.86 76.86 0 0 1 144.45 162.70", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M152.74 155.90 A76.86 76.86 0 0 1 128.79 171.26", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M138.43 166.56 A76.86 76.86 0 0 1 111.58 175.98", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M122.04 173.63 A76.86 76.86 0 0 1 93.75 176.60", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M104.47 176.73 A76.86 76.86 0 0 1 76.25 173.09", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M86.65 175.69 A76.86 76.86 0 0 1 60.03 165.65", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M69.56 170.57 A76.86 76.86 0 0 1 45.97 154.66", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M54.10 161.65 A76.86 76.86 0 0 1 34.82 140.73", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M41.12 149.40 A76.86 76.86 0 0 1 27.19 124.60", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M31.32 134.49 A76.86 76.86 0 0 1 23.48 107.14", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []], ["path", { "d": "M25.22 117.72 A76.86 76.86 0 0 1 23.89 89.30", "fill": "none", "stroke": "#ebe6da", "stroke-width": "18.14" }, []]]], ["text", { "x": "68", "y": "39", "font-family": "IBM Plex Mono, monospace", "font-size": "18", "font-weight": "600", "letter-spacing": "3.2", "fill": "#ebe6da" }, ["OPEN INTELLIGENCE"]]]];
 
   // src/model.js
   var list = (value) => Array.isArray(value) ? value : [];
-  var text = (value, fallback = "") => value == null ? fallback : String(value);
+  var text2 = (value, fallback = "") => value == null ? fallback : String(value);
   var count = (value, singular, plural = `${singular}s`) => `${value} ${value === 1 ? singular : plural}`;
   var byName = (a, b) => a.localeCompare(b, void 0, { numeric: true, sensitivity: "base" });
   var INTERNAL_PROJECT = "arcak-svc";
   function proposalId(value) {
-    const id = value && typeof value === "object" ? text(value.id) : "";
+    const id = value && typeof value === "object" ? text2(value.id) : "";
     return /^act-[0-9a-f]{12}$/.test(id) ? id : "";
   }
   function humanize(value) {
-    const raw = text(value, "Unnamed");
+    const raw = text2(value, "Unnamed");
     return raw.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   }
   function projectLabel(value) {
-    const id = text(value, "Unnamed project");
+    const id = text2(value, "Unnamed project");
     if (id === "default") return "Default";
     if (id === "bench") return "Bench";
     if (id.startsWith("arcak-adopt-")) return `Adopted ${humanize(id.slice("arcak-adopt-".length))}`;
     return humanize(id);
   }
   function instanceKindLabel(kind) {
-    const value = text(kind).toLowerCase();
+    const value = text2(kind).toLowerCase();
     if (value === "virtual-machine" || value === "vm") return "VM";
     if (value === "container") return "Container";
     return humanize(value || "Instance");
   }
   function statusTone(status) {
-    const value = text(status).trim().toLowerCase();
+    const value = text2(status).trim().toLowerCase();
     if (["running", "ready", "active", "started", "ok", "up", "reachable", "applied", "committed", "confirmed"].includes(value)) return "ok";
     if (["stopped", "exited", "off", "disabled", "retained", "reverted"].includes(value)) return "neutral";
     if (["error", "failed", "unreachable", "unavailable", "down", "missing", "rejected"].includes(value)) return "bad";
     return value ? "warn" : "unknown";
   }
   function ownerLabel(owner) {
-    const value = text(owner?.class ?? owner, "unknown");
+    const value = text2(owner?.class ?? owner, "unknown");
     return ["kernel", "retained"].includes(value) ? "Managed by Arca" : "External";
   }
-  function finite(value) {
+  function finite2(value) {
     if (value === null || value === void 0 || value === "") return null;
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
@@ -76,15 +248,15 @@
   }
   var WATCH_ONLY_SERVICES = "Arca watches this machine; it doesn't run services here yet";
   function formatWatts(value) {
-    const number = finite(value);
+    const number = finite2(value);
     return number === null || number < 0 ? "" : `${formatNumber(number, 1)} W`;
   }
   function formatCelsius(value) {
-    const number = finite(value);
+    const number = finite2(value);
     return number === null ? "" : `${formatNumber(number, 1)} \xB0C`;
   }
   function formatMhz(value) {
-    const number = finite(value);
+    const number = finite2(value);
     return number === null || number < 0 ? "" : `${Math.round(number)} MHz`;
   }
   function gpuPowerCapped(value) {
@@ -105,7 +277,7 @@
     return (mask & 4n) === 4n;
   }
   function gpuProductName(product) {
-    let value = text(product).trim();
+    let value = text2(product).trim();
     const bracket = value.match(/\[([^\]]+)\]/);
     if (bracket) value = bracket[1];
     value = value.replace(/\b(?:NVIDIA|AMD|ATI|Intel|Corporation)\b/gi, " ").replace(/\b(?:GeForce|Radeon|Graphics)\b/gi, " ").replace(/\b(?:RTX|GTX|RX|Arc)\b/gi, " ").replace(/\b\d+\s*GB\b/gi, " ").replace(/\s+/g, " ").trim();
@@ -113,10 +285,10 @@
     return value;
   }
   function gpuCardReason(card, gpu) {
-    return text(card?.reason).trim() || text(gpu?.reason).trim();
+    return text2(card?.reason).trim() || text2(gpu?.reason).trim();
   }
   function containerLabel(value) {
-    const id = text(value).trim();
+    const id = text2(value).trim();
     if (!id) return "";
     return /^[0-9a-f]{64}$/i.test(id) ? id.slice(0, 12) : id;
   }
@@ -125,10 +297,10 @@
     for (const process of list(processes)) {
       if (!process || typeof process !== "object") continue;
       const owner = process.owner && typeof process.owner === "object" ? process.owner : {};
-      const project = text(owner.project).trim();
-      const name = text(owner.name).trim();
-      const container = text(owner.container).trim();
-      const kind = text(owner.kind).trim().toLowerCase();
+      const project = text2(owner.project).trim();
+      const name = text2(owner.name).trim();
+      const container = text2(owner.container).trim();
+      const kind = text2(owner.kind).trim().toLowerCase();
       let row;
       if (project || name) {
         const where = [project ? projectLabel(project) : "", name].filter(Boolean).join(" / ");
@@ -159,7 +331,7 @@
         groups.set(key, group);
       }
       group.processes += 1;
-      const bytes = finite(process.vramBytes);
+      const bytes = finite2(process.vramBytes);
       if (bytes !== null && bytes >= 0) group.vramBytes = (group.vramBytes ?? 0) + bytes;
     }
     return [...groups.values()].sort((a, b) => {
@@ -170,17 +342,17 @@
     }).map((owner) => ({ ...owner, vramText: owner.vramBytes === null ? "" : `${formatGb(owner.vramBytes)} GB` }));
   }
   function gpuCards(gpu) {
-    const cards = list(gpu?.cards).filter((card) => card && typeof card === "object" && text(card.pci).trim()).slice().sort((a, b) => text(a.pci).trim().localeCompare(text(b.pci).trim(), "en"));
+    const cards = list(gpu?.cards).filter((card) => card && typeof card === "object" && text2(card.pci).trim()).slice().sort((a, b) => text2(a.pci).trim().localeCompare(text2(b.pci).trim(), "en"));
     return cards.map((card, index) => {
-      const pci = text(card.pci).trim();
-      const product = text(card.product).trim();
+      const pci = text2(card.pci).trim();
+      const product = text2(card.product).trim();
       const shortName = gpuProductName(product);
       const slot = index + 1;
       const label = `GPU ${slot}${shortName ? ` \xB7 ${shortName}` : ""}`;
       const telemetry = card.telemetry && typeof card.telemetry === "object" ? card.telemetry : null;
-      const utilizationPct = finite(telemetry?.utilizationPct);
-      const usedBytes = finite(telemetry?.memoryUsedBytes);
-      const totalBytes = finite(telemetry?.memoryTotalBytes) ?? finite(card.vramTotalBytes);
+      const utilizationPct = finite2(telemetry?.utilizationPct);
+      const usedBytes = finite2(telemetry?.memoryUsedBytes);
+      const totalBytes = finite2(telemetry?.memoryTotalBytes) ?? finite2(card.vramTotalBytes);
       const vramPercent = usedBytes !== null && totalBytes !== null && totalBytes > 0 ? Math.max(0, Math.min(100, usedBytes / totalBytes * 100)) : null;
       let vramText = "";
       if (usedBytes !== null && totalBytes !== null) vramText = `${formatGb(usedBytes)} / ${formatGb(totalBytes)} GB`;
@@ -195,12 +367,12 @@
         shortName,
         label,
         product,
-        vendor: text(card.vendor).trim(),
-        uuid: text(card.uuid).trim(),
-        driver: text(card.driver).trim(),
-        driverVersion: text(card.driverVersion).trim(),
-        use: text(card.use).trim(),
-        numaNode: finite(card.numaNode),
+        vendor: text2(card.vendor).trim(),
+        uuid: text2(card.uuid).trim(),
+        driver: text2(card.driver).trim(),
+        driverVersion: text2(card.driverVersion).trim(),
+        use: text2(card.use).trim(),
+        numaNode: finite2(card.numaNode),
         telemetry,
         hasReading,
         utilizationPct: utilizationPct === null ? null : Math.max(0, Math.min(100, utilizationPct)),
@@ -212,13 +384,13 @@
         reason,
         // With no usable telemetry the plain kernel reason is the whole reading, never a zero.
         statusText: hasReading ? "" : reason || "No reading yet",
-        powerDrawW: finite(telemetry?.powerDrawW),
-        powerLimitW: finite(telemetry?.powerLimitW),
-        temperatureC: finite(telemetry?.temperatureC),
-        smClockMhz: finite(telemetry?.smClockMhz),
+        powerDrawW: finite2(telemetry?.powerDrawW),
+        powerLimitW: finite2(telemetry?.powerLimitW),
+        temperatureC: finite2(telemetry?.temperatureC),
+        smClockMhz: finite2(telemetry?.smClockMhz),
         eventReasons: telemetry?.eventReasons ?? null,
         powerCapped: gpuPowerCapped(telemetry?.eventReasons),
-        processReason: text(card.processReason).trim(),
+        processReason: text2(card.processReason).trim(),
         owners: gpuOwnerRows(card.processes),
         title: product ? `${product} \xB7 ${pci}` : pci
       };
@@ -228,17 +400,17 @@
     return Boolean(host.machine) && host.machine.incusReachable !== false;
   }
   function cpuCoresKnown(cpu) {
-    const cores = finite(cpu?.cores);
+    const cores = finite2(cpu?.cores);
     return cores !== null && cores > 0 && (typeof cpu?.coresKnown === "boolean" ? cpu.coresKnown : true);
   }
   function cpuCoreCount(cpu) {
-    return cpuCoresKnown(cpu) ? finite(cpu.cores) : 0;
+    return cpuCoresKnown(cpu) ? finite2(cpu.cores) : 0;
   }
   function hostCpu(host = {}) {
     const cpu = host.metrics?.latest?.cpu;
-    const cores = finite(cpu?.cores);
+    const cores = finite2(cpu?.cores);
     const coresKnown = cpuCoresKnown(cpu);
-    const usedPct = finite(cpu?.usedPct);
+    const usedPct = finite2(cpu?.usedPct);
     const reason = typeof cpu?.reason === "string" ? cpu.reason.trim() : "";
     if (cores === null && usedPct === null && !reason) return null;
     const percent = coresKnown && usedPct !== null ? clampPercent(usedPct) : null;
@@ -252,9 +424,9 @@
   }
   function hostMemory(host = {}) {
     const memory = host.metrics?.latest?.memory;
-    const totalBytes = finite(memory?.totalBytes);
-    const availableBytes = finite(memory?.availableBytes);
-    const reportedUsed = finite(memory?.usedBytes);
+    const totalBytes = finite2(memory?.totalBytes);
+    const availableBytes = finite2(memory?.availableBytes);
+    const reportedUsed = finite2(memory?.usedBytes);
     const reason = typeof memory?.reason === "string" ? memory.reason.trim() : "";
     if (totalBytes === null && availableBytes === null && reportedUsed === null && !reason) return null;
     const derivedUsed = totalBytes !== null && availableBytes !== null ? Math.max(0, totalBytes - availableBytes) : null;
@@ -271,9 +443,9 @@
     if (!cpu) return "";
     const cores = cpuCoreCount(cpu);
     if (!cores) return "cores n/a";
-    const usedPct = finite(cpu.usedPct);
+    const usedPct = finite2(cpu.usedPct);
     if (usedPct === null) return `n/a / ${count(cores, "core")}`;
-    const usedCores = finite(cpu.usedCores);
+    const usedCores = finite2(cpu.usedCores);
     if (usedCores !== null) return `${formatNumber(usedCores)} / ${count(cores, "core")}`;
     return `${formatNumber(usedPct)}% used`;
   }
@@ -294,10 +466,10 @@
   }
   function normalizeHosts(envelope) {
     if (Array.isArray(envelope.hosts)) return envelope.hosts;
-    return [{ ...envelope, name: text(envelope.nodeName, "Machine") }];
+    return [{ ...envelope, name: text2(envelope.nodeName, "Machine") }];
   }
   function instanceKey(hostName, project, instance) {
-    return `${text(hostName)}|${text(project, "default")}|${text(instance)}`;
+    return `${text2(hostName)}|${text2(project, "default")}|${text2(instance)}`;
   }
   function instanceUrl(instance) {
     const candidates = [
@@ -317,17 +489,17 @@
     return "";
   }
   function aclLabel(value) {
-    return text(value).replace(/\barcak-svc-svc-([a-z0-9-]+)\b/gi, (_, name) => `${humanize(name)} firewall`).replace(/arcak-svc/gi, "Arca service");
+    return text2(value).replace(/\barcak-svc-svc-([a-z0-9-]+)\b/gi, (_, name) => `${humanize(name)} firewall`).replace(/arcak-svc/gi, "Arca service");
   }
   function targetLabel(target) {
     if (typeof target === "string") return aclLabel(target);
     if (!target || typeof target !== "object") return "";
-    const kind = text(target.kind);
+    const kind = text2(target.kind);
     const name = aclLabel(target.name);
     if (kind && name) return `${kind} ${name}`;
     if (name) return name;
     if (kind && target.project) {
-      const project = text(target.project);
+      const project = text2(target.project);
       return `${kind} in ${project === INTERNAL_PROJECT ? "Arca service" : projectLabel(project)}`;
     }
     return kind;
@@ -351,7 +523,7 @@
     return { tone, text: parts.join(" \xB7 ") || "Live" };
   }
   function readErrorTools(error) {
-    const value = text(error).trim();
+    const value = text2(error).trim();
     if (!value) return [];
     const pattern = /(?:^|\s)(arca_status|watch_report|postgres_list|node_metrics|alerts_list|plan_list|service_list|journal_list):\s/g;
     const tools = [];
@@ -363,13 +535,13 @@
     const cpu = hostCpu(host);
     const memory = hostMemory(host);
     const online = isHostOnline(host);
-    const mode = text(host.machine?.mode).trim();
+    const mode = text2(host.machine?.mode).trim();
     const gpu = host.metrics?.latest?.gpu;
     const errorTools = readErrorTools(host.error);
     return {
-      name: text(host.name, text(host.nodeName, "Machine")),
-      label: text(host.name, text(host.nodeName, "Machine")),
-      address: text(host.address).trim(),
+      name: text2(host.name, text2(host.nodeName, "Machine")),
+      label: text2(host.name, text2(host.nodeName, "Machine")),
+      address: text2(host.address).trim(),
       online,
       status: online ? "Online" : "Offline",
       tone: online ? "ok" : "bad",
@@ -385,16 +557,16 @@
       memoryLabel: memoryLabel(memory),
       memoryReason: memory?.reason ?? "",
       gpus: gpuCards(gpu),
-      gpuReason: text(gpu?.reason).trim(),
-      gpuSkipped: text(gpu?.skipped).trim(),
+      gpuReason: text2(gpu?.reason).trim(),
+      gpuSkipped: text2(gpu?.skipped).trim(),
       services: list(host.services).map((service) => ({
-        name: text(service?.name).trim(),
-        state: text(service?.state).trim(),
-        lanPort: finite(service?.lanPort),
+        name: text2(service?.name).trim(),
+        state: text2(service?.state).trim(),
+        lanPort: finite2(service?.lanPort),
         versionDiffers: versionDiffers(service),
         // A program the node only records (external_add) says its kind and that Arca does not manage it. Every
         // other row carries neither, so it is the row it always was.
-        kind: service?.recorded === true ? text(service.kind).trim() : "",
+        kind: service?.recorded === true ? text2(service.kind).trim() : "",
         recorded: service?.recorded === true
       })).filter((service) => service.name),
       // Older snapshots have no flag: treat their empty list as known-empty, as before.
@@ -411,9 +583,9 @@
     return service?.update?.state === "differs";
   }
   function serviceUrl(address, lanPort, state) {
-    const host = text(address).trim();
-    const port = finite(lanPort);
-    if (text(state).toLowerCase() !== "running") return "";
+    const host = text2(address).trim();
+    const port = finite2(lanPort);
+    if (text2(state).toLowerCase() !== "running") return "";
     if (!host || port === null || port < 1 || port > 65535) return "";
     return `http://${host.includes(":") ? `[${host}]` : host}:${Math.trunc(port)}`;
   }
@@ -421,14 +593,14 @@
     const targets = /* @__PURE__ */ new Map();
     for (const host of hosts) {
       for (const service of list(host.services)) {
-        const name = text(service?.name).trim();
+        const name = text2(service?.name).trim();
         if (!name) continue;
         targets.set(instanceKey(host.name, INTERNAL_PROJECT, name), {
           name,
-          state: text(service.state),
-          ipv4: text(service.ipv4),
-          ports: list(service.ports).map(finite).filter((port) => port !== null),
-          lanPort: finite(service.lanPort),
+          state: text2(service.state),
+          ipv4: text2(service.ipv4),
+          ports: list(service.ports).map(finite2).filter((port) => port !== null),
+          lanPort: finite2(service.lanPort),
           published: service.published ?? null,
           versionDiffers: versionDiffers(service),
           url: serviceUrl(host.address, service.lanPort, service.state)
@@ -438,14 +610,14 @@
     return targets;
   }
   function instanceCard(hostName, instance, services) {
-    const status = text(instance.status, "Unknown");
+    const status = text2(instance.status, "Unknown");
     const service = services?.get(instanceKey(hostName, instance.project, instance.name)) ?? null;
     return {
       kind: "instance",
       key: instanceKey(hostName, instance.project, instance.name),
       host: hostName,
-      incusProject: text(instance.project, "default"),
-      name: text(instance.name, "Unnamed instance"),
+      incusProject: text2(instance.project, "default"),
+      name: text2(instance.name, "Unnamed instance"),
       status,
       tone: statusTone(status),
       type: instanceKindLabel(instance.kind),
@@ -456,19 +628,19 @@
     };
   }
   function databaseCard(hostName, instance, database) {
-    const status = text(database.status, "Unknown");
+    const status = text2(database.status, "Unknown");
     return {
       kind: "database",
-      key: `${instanceKey(hostName, instance.project, instance.name)}|db:${text(database.name ?? database.entry, "db")}`,
+      key: `${instanceKey(hostName, instance.project, instance.name)}|db:${text2(database.name ?? database.entry, "db")}`,
       host: hostName,
-      incusProject: text(instance.project, "default"),
-      instance: text(instance.name),
-      name: text(database.name ?? database.entry, "Database"),
+      incusProject: text2(instance.project, "default"),
+      instance: text2(instance.name),
+      name: text2(database.name ?? database.entry, "Database"),
       status,
       tone: statusTone(status),
       type: "PostgreSQL",
-      address: text(database.address ?? database.host),
-      port: finite(database.port),
+      address: text2(database.address ?? database.host),
+      port: finite2(database.port),
       links: list(database.links),
       url: instanceUrl(database)
     };
@@ -478,10 +650,10 @@
     for (const host of hosts) {
       const instances = list(host.instances);
       for (const database of list(host.databases)) {
-        const explicit = text(database.instance ?? database.container ?? database.droid);
-        let matches = explicit ? instances.filter((instance) => text(instance.name) === explicit) : [];
+        const explicit = text2(database.instance ?? database.container ?? database.droid);
+        let matches = explicit ? instances.filter((instance) => text2(instance.name) === explicit) : [];
         if (!matches.length) {
-          matches = instances.filter((instance) => text(instance.name) === text(database.name) || text(instance.name) === text(database.entry));
+          matches = instances.filter((instance) => text2(instance.name) === text2(database.name) || text2(instance.name) === text2(database.entry));
         }
         if (matches.length !== 1) continue;
         targets.set(instanceKey(host.name, matches[0].project, matches[0].name), { host, instance: matches[0], database });
@@ -508,14 +680,14 @@
     const databaseCards = databaseTargets(hosts);
     const serviceCards = serviceTargets(hosts);
     for (const config of list(envelope.projects)) {
-      const name = text(config.name).trim();
+      const name = text2(config.name).trim();
       if (!name || usedNames.has(name)) continue;
       const cards = [];
       let missing = 0;
       let unknown = 0;
       for (const member of list(config.members)) {
         const host = hosts.find((candidate) => candidate.name === member.host);
-        const instance = list(host?.instances).find((candidate) => text(candidate.project, "default") === text(member.incusProject) && text(candidate.name) === text(member.instance));
+        const instance = list(host?.instances).find((candidate) => text2(candidate.project, "default") === text2(member.incusProject) && text2(candidate.name) === text2(member.instance));
         if (!instance) {
           if (host && host.instancesKnown === false) unknown++;
           else missing++;
@@ -538,7 +710,7 @@
         label: name,
         rawName: "",
         host: null,
-        domain: text(config.domain).trim(),
+        domain: text2(config.domain).trim(),
         cards,
         hosts: [...new Set(cards.map((card) => card.host))],
         status: roll.text,
@@ -548,24 +720,24 @@
       });
     }
     for (const host of hosts) {
-      const unlisted = list(host.instances).filter((instance) => text(instance.project, "default") === INTERNAL_PROJECT && !claimed.has(instanceKey(host.name, instance.project, instance.name))).sort((a, b) => byName(humanize(text(a.name)), humanize(text(b.name))));
+      const unlisted = list(host.instances).filter((instance) => text2(instance.project, "default") === INTERNAL_PROJECT && !claimed.has(instanceKey(host.name, instance.project, instance.name))).sort((a, b) => byName(humanize(text2(a.name)), humanize(text2(b.name))));
       for (const instance of unlisted) {
         const cards = [instanceCard(host.name, instance, serviceCards)];
         const target = databaseCards.get(cards[0].key);
         if (target) cards.push(databaseCard(target.host.name, target.instance, target.database));
-        const name = uniqueName(humanize(text(instance.name)), usedNames, host.name);
+        const name = uniqueName(humanize(text2(instance.name)), usedNames, host.name);
         usedNames.add(name);
         const roll = rollup(cards);
         serviceProjects.push({
-          id: `service:${text(host.name)}/${text(instance.name)}`,
+          id: `service:${text2(host.name)}/${text2(instance.name)}`,
           kind: "service",
           name,
           label: name,
           rawName: "",
-          host: text(host.name),
+          host: text2(host.name),
           domain: "",
           cards,
-          hosts: [text(host.name)],
+          hosts: [text2(host.name)],
           status: roll.text,
           tone: roll.tone,
           missing: 0,
@@ -574,13 +746,13 @@
       }
     }
     for (const host of hosts) {
-      const projectIds = new Set(list(host.projects).map((value) => text(value)).filter(Boolean));
-      for (const instance of list(host.instances)) projectIds.add(text(instance.project, "default"));
+      const projectIds = new Set(list(host.projects).map((value) => text2(value)).filter(Boolean));
+      for (const instance of list(host.instances)) projectIds.add(text2(instance.project, "default"));
       for (const project of [...projectIds].sort(byName)) {
         if (project === INTERNAL_PROJECT) continue;
-        const unlisted = list(host.instances).filter((instance) => text(instance.project, "default") === project && !claimed.has(instanceKey(host.name, instance.project, instance.name)));
+        const unlisted = list(host.instances).filter((instance) => text2(instance.project, "default") === project && !claimed.has(instanceKey(host.name, instance.project, instance.name)));
         if (!unlisted.length) continue;
-        const cards = unlisted.sort((a, b) => byName(text(a.name), text(b.name))).map((instance) => instanceCard(host.name, instance, serviceCards));
+        const cards = unlisted.sort((a, b) => byName(text2(a.name), text2(b.name))).map((instance) => instanceCard(host.name, instance, serviceCards));
         for (const card of [...cards]) {
           const target = databaseCards.get(card.key);
           if (target) cards.push(databaseCard(target.host.name, target.instance, target.database));
@@ -590,15 +762,15 @@
         usedNames.add(name);
         const roll = rollup(cards);
         fallbackProjects.push({
-          id: `incus:${text(host.name)}/${project}`,
+          id: `incus:${text2(host.name)}/${project}`,
           kind: "incus",
           name,
           label: name,
           rawName: project,
-          host: text(host.name),
+          host: text2(host.name),
           domain: "",
           cards,
-          hosts: [text(host.name)],
+          hosts: [text2(host.name)],
           status: roll.text,
           tone: roll.tone,
           missing: 0,
@@ -607,7 +779,7 @@
       }
     }
     const projects = [...ownerProjects, ...serviceProjects, ...fallbackProjects];
-    const configuredDefault = text(envelope.defaultProject).trim();
+    const configuredDefault = text2(envelope.defaultProject).trim();
     const defaultProject = projects.find((project) => project.name === configuredDefault) ?? projects.find((project) => project.kind === "owner") ?? projects.find((project) => project.kind === "service") ?? projects.find((project) => project.kind === "incus") ?? null;
     return {
       hosts: machines,
@@ -624,14 +796,14 @@
       for (const [index, record] of list(host.journal).entries()) {
         if (!record || typeof record !== "object") continue;
         records.push({
-          key: `${text(host.name)}:${record.id ?? index}`,
-          host: text(host.name, "Machine"),
-          entry: text(record.entry, "activity"),
-          state: text(record.state, "Unknown"),
+          key: `${text2(host.name)}:${record.id ?? index}`,
+          host: text2(host.name, "Machine"),
+          entry: text2(record.entry, "activity"),
+          state: text2(record.state, "Unknown"),
           tone: statusTone(record.state),
           target: targetLabel(record.target),
-          plugin: text(record.plugin),
-          at: finite(record.at_ms)
+          plugin: text2(record.plugin),
+          at: finite2(record.at_ms)
         });
       }
     }
@@ -642,7 +814,7 @@
     return project ? `#project/${encodeURIComponent(project.name)}` : "";
   }
   function parseProjectHash(hash) {
-    const match = /^#project\/(.+)$/.exec(text(hash));
+    const match = /^#project\/(.+)$/.exec(text2(hash));
     if (!match) return null;
     try {
       return decodeURIComponent(match[1]);
@@ -761,13 +933,13 @@
     Unresolved: "Arca could not match this approval to a waiting proposal.",
     NoSuchPlan: NO_SUCH_PLAN
   });
-  var text2 = (value, fallback = "") => value == null ? fallback : String(value);
+  var text3 = (value, fallback = "") => value == null ? fallback : String(value);
   var list2 = (value) => Array.isArray(value) ? value : [];
   var count2 = (value, singular, plural = `${singular}s`) => `${value} ${value === 1 ? singular : plural}`;
   function b64(bytes) {
-    let text3 = "";
-    for (const byte of bytes) text3 += String.fromCharCode(byte);
-    return btoa(text3);
+    let text4 = "";
+    for (const byte of bytes) text4 += String.fromCharCode(byte);
+    return btoa(text4);
   }
   function b64url(bytes) {
     return b64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -776,8 +948,8 @@
     return signature.byteLength > 72 ? "RS256" : "ES256";
   }
   function fromB64url(value) {
-    const text3 = String(value).replace(/-/g, "+").replace(/_/g, "/");
-    const padded = text3 + "=".repeat((4 - text3.length % 4) % 4);
+    const text4 = String(value).replace(/-/g, "+").replace(/_/g, "/");
+    const padded = text4 + "=".repeat((4 - text4.length % 4) % 4);
     const raw = atob(padded);
     return Uint8Array.from(raw, (character) => character.charCodeAt(0));
   }
@@ -1052,6 +1224,66 @@
     row.append(head, el(doc, "span", "arca-gpu-reason", reason));
     return row;
   }
+  var FLEET_HASH = "#fleet";
+  var FLEET_COLUMNS = ["Node", "OS version", "Channel", "Automatic updates", "Last successful check", "Last update", "Last error"];
+  function fleetTime(at) {
+    if (!Number.isFinite(at)) return "";
+    try {
+      return new Intl.DateTimeFormat(void 0, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(at));
+    } catch {
+      return "";
+    }
+  }
+  function fleetTable(doc, fleet) {
+    const card = el(doc, "div", "arca-fleet-card");
+    const table = el(doc, "table", "arca-fleet-table");
+    const head = el(doc, "thead");
+    const headRow = el(doc, "tr");
+    for (const name of FLEET_COLUMNS) {
+      const cell = el(doc, "th", "arca-cap", name);
+      cell.scope = "col";
+      headRow.append(cell);
+    }
+    head.append(headRow);
+    const body = el(doc, "tbody");
+    for (const row of fleet.rows) {
+      const line = el(doc, "tr", "arca-fleet-row");
+      line.dataset.node = row.name;
+      line.dataset.read = row.read;
+      line.dataset.warning = row.warning?.kind ?? "";
+      const name = el(doc, "th", "arca-fleet-node", row.name);
+      name.scope = "row";
+      const lastCheck = el(doc, "td", "arca-fleet-check", row.lastCheck);
+      if (row.lastCheckStale) lastCheck.dataset.stale = "true";
+      line.append(
+        name,
+        el(doc, "td", "arca-fleet-version mono", row.version),
+        el(doc, "td", "arca-fleet-channel", row.channel),
+        el(doc, "td", "arca-fleet-automatic", row.automatic),
+        lastCheck,
+        el(doc, "td", "arca-fleet-update", row.lastUpdate),
+        el(doc, "td", "arca-fleet-error", row.lastError)
+      );
+      body.append(line);
+      if (row.warning) {
+        const note = el(doc, "tr", "arca-fleet-note");
+        note.dataset.tone = row.warning.tone;
+        note.dataset.kind = row.warning.kind;
+        const cell = el(doc, "td");
+        cell.colSpan = FLEET_COLUMNS.length;
+        if (row.warning.detail) cell.title = row.warning.detail;
+        const text4 = el(doc, "span", "arca-fleet-warning");
+        text4.append(dot(doc, row.warning.tone), el(doc, "span", "", row.warning.text));
+        cell.append(text4);
+        if (row.warning.detail) cell.append(el(doc, "span", "arca-fleet-detail mono", row.warning.detail));
+        note.append(cell);
+        body.append(note);
+      }
+    }
+    table.append(head, body);
+    card.append(table);
+    return card;
+  }
   function machineCard(doc, machine) {
     const card = el(doc, "article", "arca-machine");
     card.dataset.host = machine.name;
@@ -1325,7 +1557,7 @@
     }
   }
   function chatLabel(value) {
-    return text2(value).replace(/\barcak-svc-svc-([a-z0-9-]+)\b/gi, (_, name) => `${humanize(name)} firewall`).replace(/arcak-svc/gi, "Arca service");
+    return text3(value).replace(/\barcak-svc-svc-([a-z0-9-]+)\b/gi, (_, name) => `${humanize(name)} firewall`).replace(/arcak-svc/gi, "Arca service");
   }
   function chatStatusText(status) {
     if (status === 401) return "Sign in to Arca to chat with the Doctor.";
@@ -1375,6 +1607,10 @@
     chevron.setAttribute("aria-hidden", "true");
     pickerWrap.append(chevron);
     brand.append(pickerWrap);
+    const fleetLink = el(doc, "a", "arca-fleet-link", "Fleet");
+    fleetLink.href = FLEET_HASH;
+    fleetLink.title = "Every machine's OS version and last update";
+    brand.append(fleetLink);
     const modes = el(doc, "div", "arca-modes");
     modes.setAttribute("role", "group");
     modes.setAttribute("aria-label", "Where it runs");
@@ -1412,7 +1648,9 @@
     const scroller = el(doc, "div", "arca-scroller");
     const worldHost = el(doc, "div", "arca-world-host");
     scroller.append(worldHost);
-    stage.append(canvasHead, scroller);
+    const fleetHost = el(doc, "div", "arca-fleet");
+    fleetHost.hidden = true;
+    stage.append(canvasHead, scroller, fleetHost);
     left.append(machines, stage);
     const panel = el(doc, "aside", "arca-panel");
     panel.setAttribute("aria-label", "Doctor");
@@ -1511,11 +1749,12 @@
       envelope: {},
       dashboard: null,
       project: null,
+      view: "project",
       tab: "chat",
       plans: 0,
       approvalUrl: "",
       detailHost: "",
-      signatures: { machines: "", canvas: "", panel: "", picker: "" }
+      signatures: { machines: "", canvas: "", panel: "", picker: "", fleet: "" }
     };
     const chat = {
       messages: [],
@@ -1568,6 +1807,11 @@
     };
     chatTab.addEventListener("click", () => setTab("chat"));
     stepsTab.addEventListener("click", () => setTab("steps"));
+    const fleetOption = doc.createElement("option");
+    fleetOption.value = "";
+    fleetOption.textContent = "Fleet";
+    fleetOption.disabled = true;
+    fleetOption.hidden = true;
     const updatePicker = () => {
       const projects = state.dashboard?.projects ?? [];
       const signature = projects.map((project) => `${project.name}\0${project.kind}`).join("");
@@ -1589,7 +1833,13 @@
         }
         picker.replaceChildren(fragment);
       }
-      picker.value = state.project?.name ?? "";
+      if (state.view === "fleet") {
+        if (fleetOption.parentNode !== picker) picker.prepend(fleetOption);
+        picker.value = "";
+      } else {
+        fleetOption.remove();
+        picker.value = state.project?.name ?? "";
+      }
     };
     const updateSummary = () => {
       summary.textContent = state.dashboard?.summary ?? "";
@@ -1752,7 +2002,34 @@
       machinesRow.replaceChildren(...nodes);
       if (state.detailHost && !detailBackdrop.hidden) renderMachineDetail();
     };
+    const updateFleet = () => {
+      const fleet = buildFleet(state.envelope.hosts ?? [], { now: Date.now() });
+      canvasTitle.textContent = "Fleet updates";
+      const chips = [];
+      const at = fleetTime(fleet.asOf);
+      if (at) chips.push(`as of ${at}`);
+      chips.push(fleet.count);
+      canvasChips.replaceChildren(...chips.map((value) => el(doc, "span", "arca-chip", value)));
+      const signature = JSON.stringify(fleet);
+      if (signature === state.signatures.fleet) return;
+      state.signatures.fleet = signature;
+      const scrollTop = fleetHost.scrollTop;
+      fleetHost.replaceChildren(fleetTable(doc, fleet));
+      fleetHost.scrollTop = scrollTop;
+    };
     const updateCanvas = () => {
+      const fleet = state.view === "fleet";
+      stage.dataset.view = state.view;
+      scroller.hidden = fleet;
+      fleetHost.hidden = !fleet;
+      if (fleet) fleetLink.setAttribute("aria-current", "page");
+      else fleetLink.removeAttribute("aria-current");
+      if (fleet) {
+        state.signatures.canvas = "";
+        updateFleet();
+        return;
+      }
+      state.signatures.fleet = "";
       const project = state.project;
       if (!project) {
         canvasTitle.textContent = "No projects";
@@ -1846,7 +2123,7 @@
     const approvalConfigured = () => Boolean(approvalUrl(state.envelope.approvalUrl));
     function toolCardKey(tool) {
       const id = proposalId(tool?.proposal);
-      const pageHost = text2(state.envelope.pageHost).trim();
+      const pageHost = text3(state.envelope.pageHost).trim();
       if (!id || !pageHost || typeof tool?.host !== "string") return "";
       if (tool.host === pageHost) return id;
       return approvals.linkedHosts.has(tool.host) ? approvalKey(tool.host, id) : "";
@@ -2043,7 +2320,7 @@
     }
     function planGpuSlot(plan) {
       if (!GPU_ACTIONS.has(plan.action) || !plan.pci) return null;
-      const owner = plan.linkedHost || text2(state.envelope.pageHost).trim();
+      const owner = plan.linkedHost || text3(state.envelope.pageHost).trim();
       if (!owner) return null;
       const host = (state.dashboard?.hosts ?? []).find((candidate) => candidate.name.toLowerCase() === owner.toLowerCase());
       if (!host) return null;
@@ -2363,7 +2640,7 @@ ${statement}`)
         if (card) Object.assign(card, data);
         else message.tools.push({ ...data });
         const proposedId = proposalId(data?.proposal);
-        const pageHost = text2(state.envelope.pageHost).trim();
+        const pageHost = text3(state.envelope.pageHost).trim();
         if (proposedId && pageHost && typeof data?.host === "string" && data.host) {
           void confirmProposal(data.host === pageHost ? proposedId : approvalKey(data.host, proposedId));
         }
@@ -2418,11 +2695,11 @@ ${statement}`)
       input.focus();
     };
     const sendChat = async () => {
-      const text3 = input.value.trim();
-      if (!text3 || chat.streaming) return;
+      const text4 = input.value.trim();
+      if (!text4 || chat.streaming) return;
       input.value = "";
       updateSend();
-      chat.messages.push({ role: "user", text: text3, tools: [], notes: [] });
+      chat.messages.push({ role: "user", text: text4, tools: [], notes: [] });
       chat.messages.push({ role: "assistant", text: "", tools: [], notes: [] });
       chat.streaming = true;
       chat.done = false;
@@ -2436,7 +2713,7 @@ ${statement}`)
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-          body: JSON.stringify({ message: text3 }),
+          body: JSON.stringify({ message: text4 }),
           signal: controller.signal
         });
         if (!response.ok) {
@@ -2582,6 +2859,7 @@ ${statement}`)
     };
     const selectProject = (project, { updateHash = true } = {}) => {
       state.project = project;
+      state.view = "project";
       if (updateHash) {
         const hash = projectHash(project);
         if (location.hash !== hash) location.hash = hash;
@@ -2597,6 +2875,12 @@ ${statement}`)
     const selectDashboardProject = (name) => (state.dashboard?.projects ?? []).find((project) => project.name === name) ?? null;
     const onHash = () => {
       if (!state.dashboard) return;
+      if (location.hash === FLEET_HASH) {
+        state.view = "fleet";
+        updatePicker();
+        updateCanvas();
+        return;
+      }
       const name = parseProjectHash(location.hash);
       const project = name ? selectDashboardProject(name) : null;
       if (project) selectProject(project, { updateHash: false });
@@ -2604,6 +2888,7 @@ ${statement}`)
         const fallback = state.dashboard.defaultProject ?? state.dashboard.projects[0];
         if (fallback) {
           state.project = fallback;
+          state.view = "project";
           history.replaceState(null, "", projectHash(fallback));
           updatePicker();
           updateCanvas();
@@ -2621,7 +2906,8 @@ ${statement}`)
       const shown = hashedName && !hashed ? null : previous;
       const project = hashed ?? shown ?? state.dashboard.defaultProject ?? state.dashboard.projects[0] ?? null;
       state.project = project;
-      if (project) {
+      state.view = location.hash === FLEET_HASH ? "fleet" : "project";
+      if (project && state.view === "project") {
         const hash = projectHash(project);
         if (location.hash !== hash) history.replaceState(null, "", hash);
       }

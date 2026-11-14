@@ -533,6 +533,81 @@ fn a_function_is_created_only_from_an_approved_proposal_whose_card_names_what_it
     assert_eq!(names, ["nats"]);
 }
 
+/// A definition that says `internet: true` is a card that says so, a record that keeps it, and one more egress rule:
+/// an allow of every address outside the service subnet. Its link is still the one way to a service of the node.
+#[test]
+fn a_function_whose_definition_names_the_internet_is_let_out_to_public_addresses_only() {
+    let rig = Rig::new();
+    let nats = rig.nats();
+    let mut args = relay_args();
+    args["internet"] = json!(true);
+    let proposal = rig
+        .propose("function_create", args.clone())
+        .expect("proposed");
+    let internet = proposal["details"]
+        .as_array()
+        .expect("details")
+        .iter()
+        .find(|row| row["label"] == "Internet")
+        .expect("the Internet row")["value"]
+        .as_str()
+        .expect("text")
+        .to_string();
+    assert!(
+        internet.starts_with("Yes: it can open connections to any public address"),
+        "{internet}"
+    );
+    rig.approved("function_create", args).expect("created");
+
+    let egress = rules(&rig.acl("relay"), "egress");
+    let allows: Vec<&Value> = egress
+        .iter()
+        .filter(|rule| rule["action"] == "allow")
+        .collect();
+    assert_eq!(allows.len(), 2, "{egress:?}");
+    let nats_ip = nats["ipv4"].as_str().unwrap();
+    assert_eq!(allows[0]["destination"], format!("{nats_ip}/32"));
+    assert_eq!(allows[0]["destination_port"], "4222");
+    // The last allow is every protocol to every address but the service /24: the private ranges before it are
+    // rejected, and a reject outweighs an allow.
+    let open = allows[1];
+    assert_eq!(open["protocol"], "");
+    let ranges = open["destination"].as_str().unwrap();
+    let holds = |ip: &str| {
+        let ip = u32::from(ip.parse::<std::net::Ipv4Addr>().unwrap());
+        ranges.split(',').any(|range| {
+            let (base, length) = range.split_once('/').unwrap();
+            let base = u32::from(base.parse::<std::net::Ipv4Addr>().unwrap());
+            let length: u32 = length.parse().unwrap();
+            let mask = if length == 0 {
+                0
+            } else {
+                u32::MAX << (32 - length)
+            };
+            ip & mask == base & mask
+        })
+    };
+    let subnet = nats_ip.rsplit_once('.').unwrap().0;
+    assert!(
+        !holds(nats_ip) && !holds(&format!("{subnet}.250")),
+        "{ranges}"
+    );
+    assert!(holds("140.82.112.6") && holds("203.0.113.9"), "{ranges}");
+    assert!(
+        egress.iter().any(|rule| rule["action"] == "reject"
+            && rule["destination"]
+                .as_str()
+                .unwrap_or("")
+                .contains("100.64.0.0/10")),
+        "{egress:?}"
+    );
+
+    let listed = rig
+        .call_as(Scope::Viewer, "function_list", json!({}))
+        .expect("list");
+    assert_eq!(listed["functions"][0]["internet"], true);
+}
+
 /// A function whose command is a shell and its script (`/bin/sh -c <script>`) gets the script as a service template's
 /// script goes: one word with no whitespace, which the shell decodes and runs. Incus quotes a word with a space for
 /// LXC, and liblxc 5.0 and older split on spaces and keep the quotes, so the script as it is starts on no such node.
@@ -623,7 +698,7 @@ fn a_proposal_the_node_would_refuse_is_refused_before_the_owner_sees_it() {
         with(&|args| args["triggers"] = json!([{ "timer": { "everySeconds": 5 } }]))
             .starts_with("args")
     );
-    assert!(with(&|args| args["internet"] = json!(true)).starts_with("args"));
+    assert!(with(&|args| args["internet"] = json!("yes")).starts_with("args/internet"));
     // A caller cannot state a private destination: only the node's config names one.
     assert!(
         with(&|args| args["destinations"] = json!([{ "address": "10.4.0.9", "port": 443 }]))

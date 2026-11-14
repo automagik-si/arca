@@ -99,10 +99,10 @@ fn updating() -> &'static Mutex<BTreeSet<String>> {
     SET.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
-struct Claim(String);
+pub(super) struct Claim(String);
 
 impl Claim {
-    fn take(id: &str) -> Option<Claim> {
+    pub(super) fn take(id: &str) -> Option<Claim> {
         let mut set = updating().lock().unwrap_or_else(PoisonError::into_inner);
         set.insert(id.to_string()).then(|| Claim(id.to_string()))
     }
@@ -251,7 +251,7 @@ pub(super) struct Journal {
 }
 
 impl Journal {
-    fn line(&self, step: &str, ok: bool, detail: Value) -> std::io::Result<()> {
+    pub(super) fn line(&self, step: &str, ok: bool, detail: Value) -> std::io::Result<()> {
         let row = json!({
             "update": self.id,
             "at": (self.clock)(),
@@ -296,7 +296,10 @@ impl Journal {
 }
 
 /// The writer of the power state and of the root of the instance `config` names.
-fn state_changer_for(cfg: &NodeConfig, config: &ServiceConfig) -> Result<StateChanger, CallError> {
+pub(super) fn state_changer_for(
+    cfg: &NodeConfig,
+    config: &ServiceConfig,
+) -> Result<StateChanger, CallError> {
     let family = arca_incus::ProjectFamily::new(
         [arca_netproject::PROJECT],
         cfg.kernel.droidd_projects.iter().map(String::as_str),

@@ -289,6 +289,7 @@ fn function_view(config: &ServiceConfig, runner: &crate::function_run::FunctionR
             "set": function::secret_set(config, secret),
         })).collect::<Vec<_>>(),
         "links": config.links.iter().map(|link| json!({ "to": link.to, "port": link.port })).collect::<Vec<_>>(),
+        "internet": function.internet,
         "triggers": [{ "timer": { "everySeconds": function.every_seconds } }],
         "limits": {
             "seconds": function.seconds,
@@ -654,6 +655,7 @@ impl ServiceHandler {
             follow: None,
             follow_version: None,
             no_new_privileges: false,
+            raw_lxc: Vec::new(),
         };
         let template = function::template(&config).ok_or_else(internal)?;
         config.source = crate::service::source(&template).map_err(service_template_error)?;

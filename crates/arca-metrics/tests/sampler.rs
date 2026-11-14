@@ -1363,7 +1363,8 @@ mod instance_readings {
 }
 
 mod latency_probe {
-    use std::net::{SocketAddr, TcpListener};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+    use std::os::fd::OwnedFd;
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1392,12 +1393,22 @@ mod latency_probe {
         (addr, rx)
     }
 
-    /// A loopback port with nothing listening on it: the listener is bound, its address kept, and the listener closed.
-    fn closed_port() -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
-        let addr = listener.local_addr().expect("the listener has an address");
-        drop(listener);
-        addr
+    /// A loopback port with nothing listening on it, for as long as the returned socket lives. The socket is bound and
+    /// never listens, so a connect to it is refused, and no listener of another test run beside this one can take the
+    /// port, as one did when this closed a listener and kept only its address. It is closed on exec, so no child a test
+    /// starts keeps the port bound after the test.
+    fn closed_port() -> (OwnedFd, SocketAddr) {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, bind, getsockname, socket_with};
+        let held = socket_with(
+            AddressFamily::INET,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a TCP socket");
+        bind(&held, &SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind a loopback port");
+        let addr = getsockname(&held).expect("the socket has an address");
+        (held, SocketAddr::try_from(addr).expect("an IP address"))
     }
 
     /// A sampler over a host with no files and an Incus with no socket, so only the probes have readings, with the given targets.
@@ -1429,8 +1440,9 @@ mod latency_probe {
 
     #[test]
     fn a_closed_port_gives_none_within_one_point_one_seconds() {
+        let (_held, closed) = closed_port();
         let started = Instant::now();
-        assert_eq!(tcp_connect_seconds(closed_port(), ONE_SECOND), None);
+        assert_eq!(tcp_connect_seconds(closed, ONE_SECOND), None);
         assert!(
             started.elapsed() < Duration::from_millis(1_100),
             "the refused connect returns within the timeout's margin: {:?}",
@@ -1478,12 +1490,10 @@ mod latency_probe {
     fn an_unnamed_target_has_no_entry_and_a_failed_one_reads_none() {
         let scratch = Scratch::new("latency-entries");
         let (addr, _accepted) = listener();
+        let (_held, closed) = closed_port();
         let mut sampler = probing(
             &scratch,
-            vec![
-                (ProbeTarget::Gateway, addr),
-                (ProbeTarget::Relay, closed_port()),
-            ],
+            vec![(ProbeTarget::Gateway, addr), (ProbeTarget::Relay, closed)],
         );
         sampler.sample(0);
         let round = sampler.readings().latency.clone().expect("a round ran");
@@ -1617,6 +1627,46 @@ mod osd_readings {
     /// The reading the sampler holds at its latest sample.
     fn reading(sampler: &Sampler<Docs>) -> Option<OsdReading> {
         sampler.readings().osd.clone()
+    }
+
+    #[test]
+    fn the_update_state_is_taken_with_the_osd_read_and_carried_between_reads() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        assert!(
+            sampler.os_update().is_none(),
+            "no state before the first read"
+        );
+        docs.serve(
+            security(),
+            json!({
+                "config": { "channel": "stable", "check_frequency": "6h" },
+                "state": {
+                    "status": "OS update check completed",
+                    "last_check": "2026-11-01T10:00:00Z",
+                    "needs_reboot": false,
+                    "health": { "current_version": "202611010000" },
+                },
+            }),
+        );
+        sampler.sample(CHECKED);
+        let state = sampler.os_update().expect("the first read").clone();
+        assert!(state.known);
+        assert_eq!(state.as_of, CHECKED);
+        assert_eq!(state.version.as_deref(), Some("202611010000"));
+        assert_eq!(state.channel.as_deref(), Some("stable"));
+        assert_eq!(state.last_success_at, Some(CHECKED));
+        docs.down();
+        sampler.sample(CHECKED + 5_000);
+        assert_eq!(
+            sampler.os_update(),
+            Some(&state),
+            "between reads the state is carried, not read again"
+        );
+        sampler.sample(CHECKED + 300_000);
+        let state = sampler.os_update().expect("the next read");
+        assert!(!state.known, "a failed read is not known, never an error");
+        assert_eq!(state.as_of, CHECKED + 300_000);
     }
 
     #[test]
