@@ -294,7 +294,7 @@ function checkText(change) {
     case 'set-runner':
       if (change.public) {
         return [
-          `The moved jobs run on ${change.pool} and pass as before; their time stays within the p95 above, since each is short. Nothing else changes runner.`,
+          `The moved jobs run on ${change.pool} and pass as before; on pool machines as large as the runner they leave, their time stays near the p95 above. Nothing else changes runner.`,
           '',
           `**This repository is public. Read this before merging.** The jobs reach ${change.pool} only if the pool's runner group admits this public repository, and Arca's pool warns when it does: a job on the pool can reach the pool's GitHub credential and the other slots ("Who can reach what" in Arca's docs/OPERATING.md).`,
           change.forks
@@ -302,6 +302,9 @@ function checkText(change) {
             : `Nothing in this workflow steers pull requests from forks, and any fork pull request can add a workflow of its own that names ${change.pool}.`,
           'If you still want this, choose "Require approval for all external contributors" (Settings, Actions, General), and read every workflow change before you approve a run.',
         ].join('\n');
+      }
+      if (change.pool) {
+        return `The moved jobs run on ${change.pool} and pass as before; on pool machines as large as the runner they leave, their time stays near the p95 above. Nothing else changes runner.`;
       }
       return `The moved jobs run on ${[...new Set(change.jobs.map((job) => job.to))].join(', ')} and pass as before; their time stays within the p95 above, since each is short. Nothing else changes runner.`;
     default:

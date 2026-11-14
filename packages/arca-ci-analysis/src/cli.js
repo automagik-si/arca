@@ -1,15 +1,22 @@
 #!/usr/bin/env node
 // arca-ci-analyze: the nightly CI analysis of one or more GitHub repositories.
 //
-//   arca-ci-analyze --repo acme/app [--repo acme/lib] [--days 7] [--out DIR]
+//   arca-ci-analyze --repo acme/app [--repo acme/lib] [--days 7] [--max-runs 300] [--budget 600] [--out DIR]
 //   arca-ci-analyze --dataset DIR/acme__app/dataset.json [--out DIR]     (analyse a saved dataset again, offline)
 //
-// Access, read-only, from the environment (never printed):
-//   GITHUB_TOKEN                               a token that can read the repositories, or
-//   GITHUB_APP_ID and GITHUB_APP_KEY_B64       a GitHub App installed on them (the PEM key, base64 on one line), or
-//   GITHUB_APP_ID and GITHUB_APP_KEY           the same with the PEM key itself
+// Access, read-only, never printed, in this order:
+//   --installation-token-file FILE, or GITHUB_INSTALLATION_TOKEN   a GitHub App installation token (ghs_...)
+//   GITHUB_APP_ID and GITHUB_APP_KEY_B64 (or GITHUB_APP_KEY)       the App itself: it mints one per repository
+//   GITHUB_TOKEN                                                   an installation token; a person's token (gho_ from
+//                                                                  `gh auth token`, ghp_, github_pat_) only with
+//                                                                  --allow-user-token, since its rate limit is shared
+//                                                                  with everything that person runs
+// Requests: before the first one the run prints its plan (the most requests it can make) to stderr. --budget N (600 by
+// default, BUDGET) is the most GitHub REST requests the run makes in all; the runs and logs read shrink to fit it, and
+// past it the collector stops and keeps what it read. --max-runs N (300, MAX_RUNS): per repository, only the newest N
+// completed runs of the window are read.
 // REPOS (comma-separated), DAYS and MOVE_TO stand for --repo, --days and --move-to, as an Arca function's plain
-// settings. --move-to LABEL names the owner's own runner pool: short jobs on billed runners are proposed to move there.
+// settings. --move-to LABEL names the owner's own runner pool: jobs on billed Linux runners are proposed to move there.
 //
 // With --out, each repository gets DIR/<owner>__<name>/{dataset.json,report.json,report.md}. Without it (an Arca
 // function run), the Markdown report of each repository is printed, then one JSON result line, the run's result.
@@ -17,8 +24,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { analyze, checkLabel } from './analyze.js';
-import { collect } from './collect.js';
-import { GitHub } from './github.js';
+import { collect, fitBudget, requestPlan } from './collect.js';
+import { access, GitHub } from './github.js';
 import { markdown, resultLine } from './report.js';
 
 /** What a function run may print: Arca keeps the last 64 KiB of a run's output. */
@@ -38,32 +45,33 @@ function parseArgs(argv) {
     else if (flag === '--move-to') args.moveTo = value();
     else if (flag === '--out') args.out = value();
     else if (flag === '--dataset') args.datasets.push(value());
+    else if (flag === '--budget') args.budget = Number(value());
+    else if (flag === '--max-runs') args.maxRuns = Number(value());
+    else if (flag === '--installation-token-file') args.tokenFile = value();
+    else if (flag === '--allow-user-token') args.allowUserToken = true;
     else if (flag === '--help' || flag === '-h') args.help = true;
     else throw new Error(`unknown argument ${flag}`);
   }
   if (args.repos.length === 0 && process.env.REPOS) args.repos = process.env.REPOS.split(',').map((r) => r.trim()).filter(Boolean);
   if (args.days == null && process.env.DAYS) args.days = Number(process.env.DAYS);
   if (!args.moveTo && process.env.MOVE_TO) args.moveTo = process.env.MOVE_TO;
+  if (args.budget == null) args.budget = process.env.BUDGET ? Number(process.env.BUDGET) : DEFAULT_BUDGET;
+  if (args.maxRuns == null && process.env.MAX_RUNS) args.maxRuns = Number(process.env.MAX_RUNS);
+  if (!args.allowUserToken && process.env.ALLOW_USER_TOKEN === '1') args.allowUserToken = true;
+  for (const [flag, number] of [['--budget', args.budget], ['--max-runs', args.maxRuns ?? 1], ['--days', args.days ?? 1]]) {
+    if (!Number.isFinite(number) || number <= 0) throw new Error(`${flag} takes a positive number`);
+  }
   checkLabel(args.moveTo ?? null); // before any collecting: a bad label fails the run, not each repository
   return args;
 }
 
-function client() {
-  const appKey = process.env.GITHUB_APP_KEY_B64
-    ? Buffer.from(process.env.GITHUB_APP_KEY_B64, 'base64').toString('utf8')
-    : process.env.GITHUB_APP_KEY;
-  return new GitHub({
-    token: process.env.GITHUB_TOKEN || undefined,
-    appId: process.env.GITHUB_APP_ID || undefined,
-    appKey: appKey || undefined,
-    log: (line) => process.stderr.write(`${line}\n`),
-  });
-}
+/** The most GitHub REST requests a run makes when --budget does not say: about a tenth of a token's hourly limit. */
+const DEFAULT_BUDGET = 600;
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || (args.repos.length === 0 && args.datasets.length === 0)) {
-    process.stdout.write('usage: arca-ci-analyze --repo owner/name [--repo ...] [--days 7] [--out DIR] | --dataset FILE\n');
+    process.stdout.write('usage: arca-ci-analyze --repo owner/name [--repo ...] [--days 7] [--max-runs 300] [--budget 600] [--installation-token-file FILE] [--allow-user-token] [--move-to LABEL] [--out DIR] | --dataset FILE\n');
     process.stdout.write(`${JSON.stringify({ ok: false, errors: ['no repository named'] })}\n`);
     return;
   }
@@ -87,14 +95,33 @@ async function main() {
     reports.push(await save(args.out, data, analyze(data, { moveTo: args.moveTo })));
   }
   if (args.repos.length) {
-    // The repositories are read side by side, through one client that keeps a few requests in flight in all: a
-    // function run has 15 minutes for every one of them.
-    const gh = client();
+    // Before any request: who signs in, and the most requests the run can make, fitted to the budget.
+    const how = await access(args);
+    const options = fitBudget(args.repos.length, args.budget, {
+      days: args.days ?? undefined,
+      maxRuns: args.maxRuns ?? undefined,
+      app: Boolean(how.appId),
+    });
+    const most = requestPlan(options) * args.repos.length;
+    process.stderr.write(
+      `plan: ${args.repos.length} repositories, ${options.days} days, the newest ${options.maxRuns} runs and ` +
+        `${options.flakeLogs + options.failureLogs + options.sampleLogs} logs each: at most ${most} GitHub requests ` +
+        `(budget ${args.budget}), signed in with ${how.how}\n`,
+    );
+    // The repositories are read side by side, through one client that keeps a few requests in flight in all and
+    // stops at the budget: a function run has 15 minutes for every one of them.
+    const gh = new GitHub({
+      token: how.token,
+      appId: how.appId,
+      appKey: how.appKey,
+      budget: args.budget,
+      log: (line) => process.stderr.write(`${line}\n`),
+    });
     const done = await Promise.all(
       args.repos.map(async (repo) => {
         try {
           const data = await collect(gh, repo, {
-            days: args.days ?? undefined,
+            ...options,
             log: (line) => process.stderr.write(`${line}\n`),
           });
           return await save(args.out, data, analyze(data, { moveTo: args.moveTo }));
