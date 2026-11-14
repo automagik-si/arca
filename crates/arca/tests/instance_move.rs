@@ -1708,7 +1708,9 @@ fn a_move_that_cannot_be_journaled_does_not_begin() {
 /// it deletes, so Incus never answers the delete as busy.
 #[test]
 fn a_rollback_waits_for_the_receiving_operation_before_it_deletes() {
-    let rig = Rig::new(vec![web()], 100);
+    // The wait for the operation is bounded by verify_wait: a loaded machine needs more than the rig's 300 ms for the
+    // three reads, and the wait ends as soon as the operation does.
+    let rig = Rig::waiting(vec![web()], 100, Duration::from_secs(10));
     rig.target.receive_lingers(3);
     rig.source.plan_push(PushPlan::Pass);
     rig.source
