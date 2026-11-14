@@ -1743,10 +1743,10 @@ fn each_target_address_is_tried_in_order() {
     );
 }
 
-/// The node reads the instance again at the run: changed devices or a grown size refuse it, and nothing moves.
+/// The node reads the instance again at the run: changed devices or config, or a grown size, refuse it, and nothing moves.
 #[test]
-fn changed_devices_or_a_grown_instance_refuse_the_approved_plan() {
-    for change in ["devices", "growth"] {
+fn changed_devices_or_config_or_a_grown_instance_refuse_the_approved_plan() {
+    for change in ["devices", "config", "growth"] {
         let rig = Rig::new(vec![web()], 100);
         let plan = rig.plan(&["web"]);
         let proposal = rig.propose_move(&plan).expect("proposed");
@@ -1757,6 +1757,9 @@ fn changed_devices_or_a_grown_instance_refuse_the_approved_plan() {
                 "eth0",
                 json!({ "type": "nic", "network": "arcabr0", "ipv4.address": "192.0.2.60" }),
             );
+        } else if change == "config" {
+            rig.source
+                .set_instance_config("shop", "web", "limits.cpu", "2");
         } else {
             rig.files("containers/shop_web/rootfs/more", 1);
         }
@@ -1766,10 +1769,10 @@ fn changed_devices_or_a_grown_instance_refuse_the_approved_plan() {
         };
         assert_eq!(code, "PlanChanged", "{change}: {message}");
         assert!(
-            message.contains(if change == "devices" {
-                "its devices"
-            } else {
-                "it grew"
+            message.contains(match change {
+                "devices" => "its devices",
+                "config" => "its config",
+                _ => "it grew",
             }),
             "{change}: {message}"
         );
