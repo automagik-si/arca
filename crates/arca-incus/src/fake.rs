@@ -1669,7 +1669,9 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                     }
                 }
                 let mut body = store.objects[index].body.clone();
-                // A custom volume names the instances that mount it, as Incus's `used_by` does.
+                // A custom volume that an instance mounts names it, as Incus's `used_by` does. The list is not part of
+                // the ETag, which covers the object's own fields.
+                let etag = etag_of(&body);
                 if address.kind == "volume" {
                     let (pool, name) = (&store.objects[index].parent, &store.objects[index].name);
                     let users: Vec<Value> = store
@@ -1694,9 +1696,11 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                             ))
                         })
                         .collect();
-                    body["used_by"] = Value::Array(users);
+                    if !users.is_empty() {
+                        body["used_by"] = Value::Array(users);
+                    }
                 }
-                let extra = format!("ETag: {}\r\n", etag_of(&body));
+                let extra = format!("ETag: {etag}\r\n");
                 (200, extra, sync_envelope(body))
             }
             None => (404, String::new(), error_envelope(404, "not found")),
