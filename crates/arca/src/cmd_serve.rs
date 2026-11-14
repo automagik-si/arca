@@ -43,9 +43,9 @@ use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
     ActionExecutor, ActionSlot, AlertsExport, AlertsHandler, AlertsPublished, ApprovalStatus,
-    Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, Published,
-    SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
-    plan_handlers_served, spawn_watcher,
+    Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, OsUpdateHandler,
+    OsUpdatePublished, Published, SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler,
+    WatchHandler, new_sampler, now_ms, plan_handlers_served, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -286,6 +286,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let published = Published::default();
+    let os_update = OsUpdatePublished::default();
     let alerts = AlertsPublished::default();
     let targets = CheckTargets {
         incus: cfg.incus.socket.clone(),
@@ -297,7 +298,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
         .with_checks(targets)
         .with_watch(Arc::clone(&watch))
-        .with_host_network(cfg.host_network.status.clone());
+        .with_host_network(cfg.host_network.status.clone())
+        .with_os_update(os_update.clone());
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let reader = Arc::new(Mutex::new(reader));
@@ -356,6 +358,12 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             "node_metrics",
             Arc::new(MetricsHandler {
                 published: published.clone(),
+            }),
+        )
+        .handle(
+            "os_update",
+            Arc::new(OsUpdateHandler {
+                published: os_update,
             }),
         )
         .handle("watch_report", watch)
@@ -636,6 +644,26 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 Failure::Runtime(format!("the approval requests cannot be opened: {e}"))
             })?,
     );
+    // The GitHub signer: its store is `<stateDir>/github`, and a node that only looks has none of its verbs.
+    let github_signer = if kernel_mode {
+        let signer = crate::github_signer::Signer::open(
+            &cfg.state_dir,
+            crate::github_api::Endpoints::github(),
+            clock.clone(),
+        )
+        .map_err(|e| {
+            Failure::Runtime(format!(
+                "the GitHub signer cannot be opened: {}",
+                e.message()
+            ))
+        })?;
+        for (verb, handler) in crate::github_handlers::handlers(&signer) {
+            server = server.handle(verb, handler);
+        }
+        Some(signer)
+    } else {
+        None
+    };
     for (verb, handler) in crate::approval_requests::handlers(
         Arc::clone(&kernel),
         clock.clone(),
@@ -701,6 +729,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Some(syncer) => page.with_peer_sync(syncer.clone()),
             None => page,
         };
+        let page = match &github_signer {
+            Some(signer) => page.with_github(signer.clone()),
+            None => page,
+        };
         // The exact line, with the config's whole path, is for the page of this machine alone, which only this
         // machine's accounts can load. A page under any other origin may be public: it keeps the line with a
         // placeholder, and shows nobody the node user's name or where its files are.
@@ -718,9 +750,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The services socket serves the MCP routes alone: a service with kernel access connects to it, and it never
     // carries the approval page, whose routes need no token. It is taken here, before the page is merged anywhere.
     let services_router = router.clone();
-    let with_page = |trust_forwarded_for: bool| match &page {
-        Some(page) => router.clone().merge(page.router(trust_forwarded_for)),
-        None => router.clone(),
+    // The push intake goes wherever the page goes: a person's service reaches it at the page's own origin.
+    let with_page = |trust_forwarded_for: bool| match (&page, &github_signer) {
+        (Some(page), Some(signer)) => router
+            .clone()
+            .merge(page.router(trust_forwarded_for))
+            .merge(crate::github_page::intake_router(signer.clone())),
+        (Some(page), None) => router.clone().merge(page.router(trust_forwarded_for)),
+        (None, _) => router.clone(),
     };
     // Where the page is served depends on its origin. An https page is reached through the tailnet listener or a
     // reverse proxy, and never on the loopback listener, where a browser could not use it and every process of the

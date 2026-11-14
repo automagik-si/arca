@@ -1,0 +1,22 @@
+{
+  "name": "arca-ci-analysis",
+  "description": "Nightly GitHub Actions analysis for one repository, and the agent step that turns its top finding into one small pull request",
+  "type": "module",
+  "license": "Apache-2.0",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/automagik-si/arca.git",
+    "directory": "packages/arca-ci-analysis"
+  },
+  "bin": {
+    "arca-ci-analyze": "./src/cli.js",
+    "arca-ci-pr": "./src/pr-cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

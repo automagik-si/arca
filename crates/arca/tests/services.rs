@@ -744,6 +744,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         setting_rules: Vec::new(),
         kernel_access: None,
         no_new_privileges: false,
+        raw_lxc: Vec::new(),
         edge: false,
         update: None,
     }
@@ -3324,6 +3325,8 @@ mod nats_replica;
 mod omni;
 #[path = "services/private_port.rs"]
 mod private_port;
+#[path = "services/reconfigure.rs"]
+mod reconfigure;
 #[path = "services/routes.rs"]
 mod routes;
 #[path = "services/tunnel.rs"]

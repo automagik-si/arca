@@ -140,6 +140,8 @@ struct PageState {
     gate: Option<PageGate>,
     /// The line that prints the setup code on a terminal of this machine, for a machine with no screen.
     setup_command: String,
+    /// The GitHub signer, when the page serves `/approve/github` (see `crate::github_page`).
+    github: Option<crate::github_signer::Signer>,
 }
 
 /// What the page shows for the terminal's command when `serve` gave it none: the command, with the config to fill in.
@@ -325,6 +327,7 @@ impl Page {
                 requests: None,
                 gate: None,
                 setup_command: SETUP_COMMAND.to_string(),
+                github: None,
             },
         }
     }
@@ -342,6 +345,12 @@ impl Page {
     /// the machine has no screen, and the answer of a setup-code request that found no screen carries it.
     pub fn with_setup_command(mut self, command: String) -> Self {
         self.state.setup_command = command;
+        self
+    }
+
+    /// Serves the owner's GitHub page (`/approve/github`) for `signer`, behind the canvas passkey session.
+    pub fn with_github(mut self, signer: crate::github_signer::Signer) -> Self {
+        self.state.github = Some(signer);
         self
     }
 
@@ -453,6 +462,20 @@ impl Page {
         ] {
             router = both(router, path, route);
         }
+        if state.github.is_some() {
+            use crate::github_page as gh;
+            for (path, route) in [
+                (gh::PAGE_PATH, get(github_view).post(canvas_sign_in)),
+                (gh::DEVICE_PATH, post(github_device)),
+                (gh::APP_PATH, post(github_app)),
+                (gh::PUSH_PATH, post(github_push)),
+                (gh::DISCONNECT_PATH, post(github_disconnect)),
+                (gh::CREATED_PATH, get(github_created)),
+                (gh::INSTALLED_PATH, get(github_installed)),
+            ] {
+                router = both(router, path, route);
+            }
+        }
         router
             .route("/approve/{*rest}", any(not_found))
             .layer(DefaultBodyLimit::max(PAGE_BODY_BYTES))
@@ -546,10 +569,13 @@ async fn origin_rule(
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static(canvas::csp()),
-    );
+    // A response that set its own policy keeps it: the GitHub page's one form that goes to GitHub does.
+    if !headers.contains_key("content-security-policy") {
+        headers.insert(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(canvas::csp()),
+        );
+    }
     headers.insert(
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
@@ -582,6 +608,152 @@ async fn page(State(state): State<Arc<PageState>>) -> Response {
 
 async fn not_found() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+/// Who acts on the GitHub page, for the signer's audit log: the passkey the session was signed in with.
+fn github_caller(credential: &str) -> String {
+    format!("page:{}", credential.chars().take(24).collect::<String>())
+}
+
+fn github_ctx<'a>(
+    state: &'a PageState,
+    signer: &'a crate::github_signer::Signer,
+    caller: &'a str,
+) -> crate::github_page::Ctx<'a> {
+    crate::github_page::Ctx {
+        signer,
+        origin: &state.origin,
+        caller,
+    }
+}
+
+async fn github_view(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let now = (state.clock)();
+    let Some(credential) = state.canvas.session(&headers, now) else {
+        let ids = trusted_credential_ids(&state);
+        return canvas_html(
+            render_credentials(canvas::SIGN_IN_PAGE, &ids)
+                .replace("<title>Automagik Arca canvas</title>", "<title>Arca: GitHub runners</title>")
+                .replace("<h1>Arca canvas</h1>", "<h1>GitHub runners</h1>")
+                .replace(
+                    "<p>Sign in with the passkey you use for Arca. It views the canvas; it approves nothing.</p>",
+                    "<p>Sign in with the passkey you use for Arca to connect GitHub runners and see their connections.</p>",
+                ),
+        );
+    };
+    let caller = github_caller(&credential);
+    let query = crate::github_page::parse_form(uri.query().unwrap_or(""));
+    crate::github_page::view(&github_ctx(&state, signer, &caller), &query)
+}
+
+/// The signed-in caller and the form of a GitHub page POST; `None` when no passkey session came with it.
+fn github_form(
+    state: &PageState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<(String, HashMap<String, String>)> {
+    let credential = state.canvas.session(headers, (state.clock)())?;
+    let text = String::from_utf8_lossy(body);
+    Some((
+        github_caller(&credential),
+        crate::github_page::parse_form(&text),
+    ))
+}
+
+/// The answer to a GitHub page POST that came without a passkey session.
+fn github_signed_out() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "Sign in on the GitHub page with your passkey first.",
+    )
+        .into_response()
+}
+
+async fn github_device(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match github_form(&state, &headers, &body) {
+        Some((caller, form)) => {
+            crate::github_page::device(&github_ctx(&state, signer, &caller), &form).await
+        }
+        None => github_signed_out(),
+    }
+}
+
+async fn github_app(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match github_form(&state, &headers, &body) {
+        Some((caller, form)) => {
+            crate::github_page::app_start(&github_ctx(&state, signer, &caller), &form)
+        }
+        None => github_signed_out(),
+    }
+}
+
+async fn github_push(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match github_form(&state, &headers, &body) {
+        Some((caller, form)) => {
+            crate::github_page::push(&github_ctx(&state, signer, &caller), &form)
+        }
+        None => github_signed_out(),
+    }
+}
+
+async fn github_disconnect(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match github_form(&state, &headers, &body) {
+        Some((caller, form)) => {
+            crate::github_page::disconnect(&github_ctx(&state, signer, &caller), &form).await
+        }
+        None => github_signed_out(),
+    }
+}
+
+async fn github_created(State(state): State<Arc<PageState>>, uri: axum::http::Uri) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let query = crate::github_page::parse_form(uri.query().unwrap_or(""));
+    crate::github_page::created(&github_ctx(&state, signer, "github"), &query).await
+}
+
+async fn github_installed(State(state): State<Arc<PageState>>, uri: axum::http::Uri) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let query = crate::github_page::parse_form(uri.query().unwrap_or(""));
+    crate::github_page::installed(&github_ctx(&state, signer, "github"), &query).await
 }
 
 async fn canvas_page(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {

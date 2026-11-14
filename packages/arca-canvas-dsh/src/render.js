@@ -1,4 +1,5 @@
 import { approvalUrl } from './approval.js';
+import { buildFleet } from './fleet.js';
 import { OPEN_INTELLIGENCE_TAG } from './open-intelligence.js';
 import {
   buildDashboard, formatCelsius, formatGb, formatMhz, formatWatts, humanize, parseProjectHash,
@@ -389,6 +390,68 @@ function gpuFailureLine(doc, reason) {
   return row;
 }
 
+const FLEET_HASH = '#fleet';
+const FLEET_COLUMNS = ['Node', 'OS version', 'Channel', 'Automatic updates', 'Last successful check', 'Last update', 'Last error'];
+
+function fleetTime(at) {
+  if (!Number.isFinite(at)) return '';
+  try {
+    return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(at));
+  } catch { return ''; }
+}
+
+// The Fleet updates table: one row per host and, under it, the row's one warning. Read only: nothing here changes a node.
+function fleetTable(doc, fleet) {
+  const card = el(doc, 'div', 'arca-fleet-card');
+  const table = el(doc, 'table', 'arca-fleet-table');
+  const head = el(doc, 'thead');
+  const headRow = el(doc, 'tr');
+  for (const name of FLEET_COLUMNS) {
+    const cell = el(doc, 'th', 'arca-cap', name);
+    cell.scope = 'col';
+    headRow.append(cell);
+  }
+  head.append(headRow);
+  const body = el(doc, 'tbody');
+  for (const row of fleet.rows) {
+    const line = el(doc, 'tr', 'arca-fleet-row');
+    line.dataset.node = row.name;
+    line.dataset.read = row.read;
+    line.dataset.warning = row.warning?.kind ?? '';
+    const name = el(doc, 'th', 'arca-fleet-node', row.name);
+    name.scope = 'row';
+    const lastCheck = el(doc, 'td', 'arca-fleet-check', row.lastCheck);
+    if (row.lastCheckStale) lastCheck.dataset.stale = 'true';
+    line.append(
+      name,
+      el(doc, 'td', 'arca-fleet-version mono', row.version),
+      el(doc, 'td', 'arca-fleet-channel', row.channel),
+      el(doc, 'td', 'arca-fleet-automatic', row.automatic),
+      lastCheck,
+      el(doc, 'td', 'arca-fleet-update', row.lastUpdate),
+      el(doc, 'td', 'arca-fleet-error', row.lastError),
+    );
+    body.append(line);
+    if (row.warning) {
+      const note = el(doc, 'tr', 'arca-fleet-note');
+      note.dataset.tone = row.warning.tone;
+      note.dataset.kind = row.warning.kind;
+      const cell = el(doc, 'td');
+      cell.colSpan = FLEET_COLUMNS.length;
+      if (row.warning.detail) cell.title = row.warning.detail;
+      const text = el(doc, 'span', 'arca-fleet-warning');
+      text.append(dot(doc, row.warning.tone), el(doc, 'span', '', row.warning.text));
+      cell.append(text);
+      if (row.warning.detail) cell.append(el(doc, 'span', 'arca-fleet-detail mono', row.warning.detail));
+      note.append(cell);
+      body.append(note);
+    }
+  }
+  table.append(head, body);
+  card.append(table);
+  return card;
+}
+
 function machineCard(doc, machine) {
   const card = el(doc, 'article', 'arca-machine');
   card.dataset.host = machine.name;
@@ -765,6 +828,12 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   chevron.setAttribute('aria-hidden', 'true');
   pickerWrap.append(chevron);
   brand.append(pickerWrap);
+  // The Fleet view: every machine's OS version and last update in one place. A plain link, so the browser keeps the
+  // history and Back returns to the project shown before.
+  const fleetLink = el(doc, 'a', 'arca-fleet-link', 'Fleet');
+  fleetLink.href = FLEET_HASH;
+  fleetLink.title = 'Every machine\'s OS version and last update';
+  brand.append(fleetLink);
 
   const modes = el(doc, 'div', 'arca-modes');
   modes.setAttribute('role', 'group');
@@ -806,7 +875,9 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   const scroller = el(doc, 'div', 'arca-scroller');
   const worldHost = el(doc, 'div', 'arca-world-host');
   scroller.append(worldHost);
-  stage.append(canvasHead, scroller);
+  const fleetHost = el(doc, 'div', 'arca-fleet');
+  fleetHost.hidden = true;
+  stage.append(canvasHead, scroller, fleetHost);
   left.append(machines, stage);
 
   const panel = el(doc, 'aside', 'arca-panel');
@@ -909,8 +980,8 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   root.replaceChildren(shell);
 
   const state = {
-    envelope: {}, dashboard: null, project: null, tab: 'chat', plans: 0, approvalUrl: '', detailHost: '',
-    signatures: { machines: '', canvas: '', panel: '', picker: '' },
+    envelope: {}, dashboard: null, project: null, view: 'project', tab: 'chat', plans: 0, approvalUrl: '', detailHost: '',
+    signatures: { machines: '', canvas: '', panel: '', picker: '', fleet: '' },
   };
   const chat = {
     messages: [], streaming: false, error: '', loaded: false, controller: null, sessionId: null,
@@ -953,6 +1024,11 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   chatTab.addEventListener('click', () => setTab('chat'));
   stepsTab.addEventListener('click', () => setTab('steps'));
 
+  const fleetOption = doc.createElement('option');
+  fleetOption.value = '';
+  fleetOption.textContent = 'Fleet';
+  fleetOption.disabled = true;
+  fleetOption.hidden = true;
   const updatePicker = () => {
     const projects = state.dashboard?.projects ?? [];
     const signature = projects.map((project) => `${project.name}\u0000${project.kind}`).join('\u0001');
@@ -974,7 +1050,15 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       }
       picker.replaceChildren(fragment);
     }
-    picker.value = state.project?.name ?? '';
+    // In the Fleet view the picker shows "Fleet", not a project, so choosing any project (the one shown before
+    // included) is a change that leaves the view. The placeholder is hidden from the list and cannot be chosen.
+    if (state.view === 'fleet') {
+      if (fleetOption.parentNode !== picker) picker.prepend(fleetOption);
+      picker.value = '';
+    } else {
+      fleetOption.remove();
+      picker.value = state.project?.name ?? '';
+    }
   };
 
   const updateSummary = () => {
@@ -1150,7 +1234,36 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     if (state.detailHost && !detailBackdrop.hidden) renderMachineDetail();
   };
 
+  const updateFleet = () => {
+    const fleet = buildFleet(state.envelope.hosts ?? [], { now: Date.now() });
+    canvasTitle.textContent = 'Fleet updates';
+    const chips = [];
+    const at = fleetTime(fleet.asOf);
+    if (at) chips.push(`as of ${at}`);
+    chips.push(fleet.count);
+    canvasChips.replaceChildren(...chips.map((value) => el(doc, 'span', 'arca-chip', value)));
+    const signature = JSON.stringify(fleet);
+    if (signature === state.signatures.fleet) return;
+    state.signatures.fleet = signature;
+    const scrollTop = fleetHost.scrollTop;
+    fleetHost.replaceChildren(fleetTable(doc, fleet));
+    fleetHost.scrollTop = scrollTop;
+  };
+
   const updateCanvas = () => {
+    const fleet = state.view === 'fleet';
+    stage.dataset.view = state.view;
+    scroller.hidden = fleet;
+    fleetHost.hidden = !fleet;
+    if (fleet) fleetLink.setAttribute('aria-current', 'page');
+    else fleetLink.removeAttribute('aria-current');
+    if (fleet) {
+      // The project canvas is rebuilt in full when the view returns to it.
+      state.signatures.canvas = '';
+      updateFleet();
+      return;
+    }
+    state.signatures.fleet = '';
     const project = state.project;
     if (!project) {
       canvasTitle.textContent = 'No projects';
@@ -2016,6 +2129,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
 
   const selectProject = (project, { updateHash = true } = {}) => {
     state.project = project;
+    state.view = 'project';
     if (updateHash) {
       const hash = projectHash(project);
       if (location.hash !== hash) location.hash = hash;
@@ -2034,6 +2148,12 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
 
   const onHash = () => {
     if (!state.dashboard) return;
+    if (location.hash === FLEET_HASH) {
+      state.view = 'fleet';
+      updatePicker();
+      updateCanvas();
+      return;
+    }
     const name = parseProjectHash(location.hash);
     const project = name ? selectDashboardProject(name) : null;
     if (project) selectProject(project, { updateHash: false });
@@ -2041,6 +2161,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       const fallback = state.dashboard.defaultProject ?? state.dashboard.projects[0];
       if (fallback) {
         state.project = fallback;
+        state.view = 'project';
         history.replaceState(null, '', projectHash(fallback));
         updatePicker();
         updateCanvas();
@@ -2062,7 +2183,9 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     const shown = hashedName && !hashed ? null : previous;
     const project = hashed ?? shown ?? state.dashboard.defaultProject ?? state.dashboard.projects[0] ?? null;
     state.project = project;
-    if (project) {
+    // #fleet keeps the Fleet view across snapshots; the project behind it is still chosen, for Back and the picker.
+    state.view = location.hash === FLEET_HASH ? 'fleet' : 'project';
+    if (project && state.view === 'project') {
       const hash = projectHash(project);
       if (location.hash !== hash) history.replaceState(null, '', hash);
     }

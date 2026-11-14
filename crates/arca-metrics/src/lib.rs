@@ -28,7 +28,7 @@ pub use mode::{
     HostMode, HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode,
     choose_host_mode_within,
 };
-pub use osd::OsdReading;
+pub use osd::{OsUpdate, OsdReading, UpdateTrust};
 pub use probe::ProbeTarget;
 pub use sample::{
     Cpu, DEFAULT_MINUTES, HostSample, LatencyReading, Load, MODE_PROBE_EVERY_MS, Memory,

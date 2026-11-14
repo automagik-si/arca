@@ -99,11 +99,11 @@ test('token is read again between initialize and tools/call, and on later calls'
   assert.equal(calls.length, 4);
 });
 
-test('all eight fixtures become one snapshot with project-qualified instances', async (t) => {
+test('all nine fixtures become one snapshot with project-qualified instances', async (t) => {
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'services', 'servicesKnown', 'metrics', 'alerts', 'plans', 'journal', 'journalKnown', 'journalPending', 'devices', 'devicesAt', 'phones', 'desktops']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'services', 'servicesKnown', 'metrics', 'osUpdate', 'osUpdateRead', 'alerts', 'plans', 'journal', 'journalKnown', 'journalPending', 'devices', 'devicesAt', 'phones', 'desktops']);
   assert.equal(snapshot.instancesKnown, true);
   assert.deepEqual(snapshot.projects, fixtures.watch_report.projects.map(({ project }) => project));
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
@@ -115,11 +115,13 @@ test('all eight fixtures become one snapshot with project-qualified instances', 
   assert.deepEqual(snapshot.services, fixtures.service_list.services);
   assert.equal(snapshot.servicesKnown, true);
   assert.deepEqual(snapshot.metrics, fixtures.node_metrics);
+  assert.deepEqual(snapshot.osUpdate, fixtures.os_update);
+  assert.equal(snapshot.osUpdateRead, 'ok');
   assert.deepEqual(snapshot.alerts, fixtures.alerts_list);
   assert.deepEqual(snapshot.plans, fixtures.plan_list.plans);
   assert.deepEqual(snapshot.journal, fixtures.journal_list.records);
   assert.equal(snapshot.journalKnown, true);
-  assert.equal(calls.length, 16);
+  assert.equal(calls.length, 18);
   assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
 });
 

@@ -18,7 +18,7 @@ use crate::gpu::{
 };
 use crate::incus::{self, InstanceReading};
 use crate::mode::{HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode_within};
-use crate::osd::{self, OsdReading, UpdateMemory};
+use crate::osd::{self, OsUpdate, OsdReading, UpdateMemory};
 use crate::probe::{self, ProbeTarget};
 use crate::procfs::{self, CpuTotals, NicTotals};
 use crate::smart::{self, DrivesReading};
@@ -309,6 +309,8 @@ pub struct Sampler<R: IncusRead> {
     /// The update result and last success time carried between incus-osd reads, so an in-progress or skipped status keeps the
     /// previous result. A failed read leaves it as it was.
     osd_memory: UpdateMemory,
+    /// The update state the newest incus-osd read gave, for the `os_update` verb. `None` before the first read.
+    os_update: Option<OsUpdate>,
     /// When the incus-osd storage document was last read for SMART, in epoch milliseconds. `None` until the first read.
     smart_read_at: Option<u64>,
     /// How to retry a provisional mode. Cleared once a server-name answer decides it.
@@ -364,6 +366,7 @@ impl<R: IncusRead> Sampler<R> {
             probed_at: None,
             osd_read_at: None,
             osd_memory: UpdateMemory::default(),
+            os_update: None,
             smart_read_at: None,
             mode_retry,
             provisional_since: None,
@@ -529,7 +532,9 @@ impl<R: IncusRead> Sampler<R> {
                 .incus_local
                 .then(|| procfs::read_uptime_ms(&self.cfg.proc_root))
                 .flatten();
-            osd::read(&self.incus, now_ms, &mut self.osd_memory, uptime_ms)
+            let (reading, state) = osd::read(&self.incus, now_ms, &mut self.osd_memory, uptime_ms);
+            self.os_update = Some(state);
+            reading
         } else {
             self.readings.osd.clone()
         };
@@ -884,6 +889,11 @@ impl<R: IncusRead> Sampler<R> {
     /// What Incus and the NICs answered at the latest sample. Before the first sample every field is `None`.
     pub fn readings(&self) -> &Readings {
         &self.readings
+    }
+
+    /// The update state of the newest incus-osd read, taken with the alert reading every 5 min. `None` before the first read.
+    pub fn os_update(&self) -> Option<&OsUpdate> {
+        self.os_update.as_ref()
     }
 
     /// The samples from the last `minutes` before the latest sample, oldest first. The window is measured from the latest

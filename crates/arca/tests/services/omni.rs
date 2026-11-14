@@ -259,6 +259,28 @@ struct OmniRig {
     said: Mutex<Vec<String>>,
 }
 
+/// A loopback port nothing listens on, for as long as the returned socket lives. The socket is bound and never listens,
+/// so a connect to it is refused, and no listener of another test run beside this one can take the port, as one did
+/// when the port was a listener's, closed a moment before. It is closed on exec, so no child a test starts keeps the
+/// port bound after the test.
+fn closed_port() -> (std::os::fd::OwnedFd, SocketAddr) {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, bind, getsockname, socket_with};
+    let held = socket_with(
+        AddressFamily::INET,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .expect("a TCP socket");
+    bind(
+        &held,
+        &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+    )
+    .expect("bind a loopback port");
+    let addr = getsockname(&held).expect("the socket has an address");
+    (held, SocketAddr::try_from(addr).expect("an IP address"))
+}
+
 #[derive(Default)]
 struct Opts {
     base: Option<SocketAddr>,
@@ -862,11 +884,8 @@ fn g6_failures_read_plainly() {
     );
     r.omni.state().next = Some((200, json!("not an object"), vec![]));
     r.refused("omni_status", json!({"name":"omni"}), "refused", "");
-    // A port nothing listens on: one a listener held a moment ago.
-    let closed = {
-        let held = TcpListener::bind("127.0.0.1:0").unwrap();
-        held.local_addr().unwrap()
-    };
+    // A port nothing listens on, held so that no test run beside this one listens there either.
+    let (_held, closed) = closed_port();
     let down = omni_rig(Opts {
         base: Some(closed),
         ..Opts::default()
@@ -1063,10 +1082,7 @@ fn g6_pair_cooldown_starts_with_every_attempt_that_reaches_omni() {
         "once it has passed, a code"
     );
     // One that reaches nothing holds nothing off: each try against a closed port reaches the network again.
-    let closed = {
-        let held = TcpListener::bind("127.0.0.1:0").unwrap();
-        held.local_addr().unwrap()
-    };
+    let (_held, closed) = closed_port();
     let down = omni_rig(Opts {
         base: Some(closed),
         ..Opts::default()

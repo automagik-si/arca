@@ -845,6 +845,33 @@ fn wait_for_runner(pool: &Pool, containers: &[&str]) {
     });
 }
 
+/// A loopback port nothing listens on, for as long as the returned socket lives. The socket is bound and never listens,
+/// so a connect to it is refused, and no listener of another test run beside this one can take the port, as one did
+/// when the port was a listener's, closed a moment before. It is closed on exec, so no child a test starts keeps the
+/// port bound after the test.
+fn closed_port() -> (std::os::fd::OwnedFd, u16) {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, bind, getsockname, socket_with};
+    let held = socket_with(
+        AddressFamily::INET,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .expect("a TCP socket");
+    bind(
+        &held,
+        &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+    )
+    .expect("bind a loopback port");
+    let addr = getsockname(&held).expect("the socket has an address");
+    (
+        held,
+        std::net::SocketAddr::try_from(addr)
+            .expect("an IP address")
+            .port(),
+    )
+}
+
 fn wait_for_words(pool: &Pool, words: &str) {
     wait_for(pool, words, || pool.output().contains(words));
 }
@@ -1160,10 +1187,7 @@ fn a_gitlab_that_cannot_be_reached_is_said_in_one_sentence_for_each_thing_in_bet
 
     // The failures the real curl makes against this test's own GitLab, and the token GitLab does not take.
     let gitlab = Gitlab::start(std::slice::from_ref(&good));
-    let closed = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
-        listener.local_addr().expect("the address").port()
-    };
+    let (_held, closed) = closed_port();
     let mut pool = Pool::new(&settings(one_runner(), 4), REPORTED_32GIB);
     pool.env.push(("POOL_HTTP_WAIT", "1".into()));
     pool.secret("GITLAB_RUNNER_TOKEN_1", &good);

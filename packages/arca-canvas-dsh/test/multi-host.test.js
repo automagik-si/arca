@@ -230,7 +230,7 @@ test('two Unix hosts keep projects, machines, journal and failures isolated', as
     .some((node) => node.textContent === 'beta'));
 
   assert.ok(methods.every((method) => method === 'GET'), 'all canvas requests stay GET');
-  const reads = ['arca_status', 'watch_report', 'postgres_list', 'service_list', 'node_metrics', 'alerts_list', 'plan_list', 'journal_list',
+  const reads = ['arca_status', 'watch_report', 'postgres_list', 'service_list', 'node_metrics', 'os_update', 'alerts_list', 'plan_list', 'journal_list',
     'droid_list', 'desktop_list', 'droidd_status', 'phone_status'];
   for (const entries of Object.values(calls)) {
     assert.ok(entries.every((body) => body.method === 'initialize' || (body.method === 'tools/call' && reads.includes(body.params.name))));

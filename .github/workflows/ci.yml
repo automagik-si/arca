@@ -118,6 +118,10 @@ jobs:
           package-manager-cache: false
       - name: brand-sync --check
         run: node scripts/brand-sync.mjs --check
+      # The CI analysis has no dependency and its tests take about a second: they ride on this job's Node.
+      - name: arca-ci-analysis node --test
+        working-directory: packages/arca-ci-analysis
+        run: node --test
 
   clippy:
     name: cargo clippy

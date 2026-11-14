@@ -11,7 +11,8 @@
 //!   template file. [`template`] gives the template those arguments stand for, so the code that sets a secret reads a
 //!   function as it reads a service.
 //! - It reaches only what its definition names: its NIC rules have no rule that lets everything else out
-//!   (`arca_netproject::tenant::function_egress_rules`).
+//!   (`arca_netproject::tenant::function_egress_rules`), unless the definition names the internet (`internet: true`),
+//!   which the owner's card says in its own row. Even then the node's services stay closed but for its links.
 //! - A link gives it a way to a service and nothing else: no connection value is put in its environment. What it
 //!   connects with is a secret its definition names.
 //!
@@ -64,6 +65,10 @@ pub struct Function {
     /// The names of its secrets. A run receives these and no other; `function_secret_set` sets each value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// Whether the definition names the internet: its NIC then lets it out to every public address, as a service's
+    /// does. Without it a function opens no connection to a public address.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internet: bool,
     /// The timer: a run starts every this many seconds, unless one is still running.
     pub every_seconds: u64,
     /// The longest one run may take, in seconds. The kernel stops a run that passes it.
@@ -268,6 +273,16 @@ pub fn definition(args: &Value) -> Result<Definition, String> {
     if links.len() > LINKS_MAX {
         return Err(field("links", &format!("at most {LINKS_MAX} links")));
     }
+    let internet = match &args["internet"] {
+        Value::Null => false,
+        Value::Bool(internet) => *internet,
+        _ => {
+            return Err(field(
+                "internet",
+                "true when the function may reach the internet, false (the default) when it may not",
+            ));
+        }
+    };
     let triggers = args["triggers"]
         .as_array()
         .map(Vec::as_slice)
@@ -324,6 +339,7 @@ pub fn definition(args: &Value) -> Result<Definition, String> {
             command,
             env,
             secrets,
+            internet,
             every_seconds,
             seconds,
             reach: Vec::new(),
@@ -565,8 +581,12 @@ pub fn limits_words(seconds: u64, memory: &str, cpu: u64) -> String {
     )
 }
 
-/// The `Internet` row of a function's card. It says the one way out that is not closed: names are resolved by this
-/// node's DNS, which asks the internet's, so a program can pass a little data out in the names it asks for.
+/// The `Internet` row of the card of a definition that says `internet: true`: what it opens, and what it may carry
+/// out.
+pub const INTERNET_OPEN_WORDS: &str = "Yes: it can open connections to any public address on the internet, and send there whatever its program and its secrets hold. The private addresses outside the rows above and this node's other services stay closed to it";
+/// The `Internet` row of the card of a definition without `internet`. It says the one way out that is not closed:
+/// names are resolved by this node's DNS, which asks the internet's, so a program can pass a little data out in the
+/// names it asks for.
 pub const INTERNET_WORDS: &str = "No: it can open no connection to a public address. One way out stays: names are looked up through this node's DNS, which asks the internet's name servers, so a program can send a little data out in the names it asks for";
 
 /// The card rows of a `function_create`, as labels and values: what the function is, when it runs, what one run may
@@ -677,7 +697,14 @@ pub fn create_rows(args: &Value) -> Vec<(String, String)> {
             "No: every private address outside this node's services is closed to it".to_string(),
         ));
     }
-    rows.push(("Internet".to_string(), INTERNET_WORDS.to_string()));
+    rows.push((
+        "Internet".to_string(),
+        if args["internet"].as_bool() == Some(true) {
+            INTERNET_OPEN_WORDS.to_string()
+        } else {
+            INTERNET_WORDS.to_string()
+        },
+    ));
     if let Some(server) = args.get("registry") {
         rows.push((
             "Registry".to_string(),
@@ -939,6 +966,44 @@ mod tests {
                 && row("Internet").contains("names are looked up through this node's DNS"),
             "{}",
             row("Internet")
+        );
+        // A definition that names the internet says so, and keeps it in its record.
+        let mut open = relay();
+        open["internet"] = json!(true);
+        let open = prepare(&open).expect("a definition");
+        let rows_open = create_rows(&open);
+        let internet = &rows_open
+            .iter()
+            .find(|(label, _)| label == "Internet")
+            .expect("the row")
+            .1;
+        assert!(
+            internet.starts_with("Yes: it can open connections to any public address"),
+            "{internet}"
+        );
+        assert!(definition(&open).expect("a definition").function.internet);
+        assert!(!definition(&args).expect("a definition").function.internet);
+        // An explicit false is the same definition, record and card as leaving it out.
+        let mut off = relay();
+        off["internet"] = json!(false);
+        let off = prepare(&off).expect("a definition");
+        assert_eq!(
+            definition(&off).expect("a definition").function,
+            definition(&args).expect("a definition").function
+        );
+        assert_eq!(
+            serde_json::to_value(definition(&off).expect("a definition").function)
+                .expect("a record")
+                .get("internet"),
+            None
+        );
+        assert_eq!(create_rows(&off), create_rows(&args));
+        let mut wrong = relay();
+        wrong["internet"] = json!("yes");
+        assert!(
+            prepare(&wrong)
+                .expect_err("not a bool")
+                .starts_with("args/internet")
         );
         // A private destination, filled in from the node's config when the proposal is made, is said in words.
         args["destinations"] = json!([{ "address": "10.4.0.9", "port": 443 }]);

@@ -29,6 +29,7 @@
     "page.css",
     "src/chat.js",
     "src/model.js",
+    "src/fleet.js",
     "src/render.js",
     "src/page.js",
     "src/client.js",
