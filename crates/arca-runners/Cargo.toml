@@ -7,7 +7,10 @@ repository.workspace = true
 description = "Automagik Arca's CI runners: GitHub's runner scale set protocol, a controller that starts one fresh machine per job, the machine launchers and a fake GitHub"
 
 [dependencies]
-arca-incus = { workspace = true, features = ["write"] }
+arca-incus.workspace = true
+# The one crate that enables arca-incus's writer (docs/OWNERSHIP.md, Rules 28 and 77): the runner machines' writer,
+# `arca_incus::runner_vm`, is compiled with it, as the adoption writer is for the kernel.
+arca-providers.workspace = true
 arca-metrics.workspace = true
 axum.workspace = true
 base64.workspace = true

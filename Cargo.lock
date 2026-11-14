@@ -299,6 +299,7 @@ version = "0.29.0"
 dependencies = [
  "arca-incus",
  "arca-metrics",
+ "arca-providers",
  "axum",
  "base64 0.23.1",
  "getrandom 0.4.3",
@@ -307,6 +308,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "webpki-roots",
 ]
 
 [[package]]

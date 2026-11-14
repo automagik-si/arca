@@ -84,13 +84,8 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunnersConfig {
+    /// The pools. Each signs in with the GitHub signer's connection its `binding` names.
     pub pools: Vec<arca_runners::PoolConfig>,
-    /// The folder of the pools' GitHub credentials until the signer holds them: a file named after each pool's binding,
-    /// holding a token with the organisation permission "Self-hosted runners: read and write", readable by the node's
-    /// user only. It is read at each sign-in, so a new token is used without a restart. Absent,
-    /// `<stateDir>/runner-credentials`.
-    #[serde(default)]
-    pub credentials_dir: Option<PathBuf>,
 }
 
 /// The `hostNetwork` key: the socket and the status file of the root part (`arca host-network run`).
@@ -744,15 +739,6 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
             if !names.insert(pool.name.as_str()) {
                 return Err(ConfigError::Runners("two pools share a name".to_string()));
             }
-        }
-        if runners
-            .credentials_dir
-            .as_ref()
-            .is_some_and(|dir| !dir.is_absolute())
-        {
-            return Err(ConfigError::Runners(
-                "credentialsDir is an absolute path".to_string(),
-            ));
         }
     }
     if let Some(host) = &config.approval_host

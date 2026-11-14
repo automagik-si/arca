@@ -2,6 +2,7 @@
 //! the budget, warm runners, the state-leak test and the sign-in alert's state.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arca_runners::access::RegistrationAccess;
@@ -13,6 +14,9 @@ use arca_runners::signin::SignInReason;
 use arca_runners::{Pool, Secret, SignInBoard, Timing};
 use serde_json::json;
 use tokio::sync::watch;
+
+/// Tests of one process start in the same millisecond: each scratch folder also takes the next number.
+static SCRATCH: AtomicU64 = AtomicU64::new(0);
 
 const TOKEN: &str = "fake-installation-token";
 const LABEL: &str = "acme-4vcpu-ubuntu-2404";
@@ -63,7 +67,10 @@ async fn rig_timed(
         RegistrationAccess::new(
             http.clone(),
             github.api_url(),
-            &config.url,
+            config
+                .url
+                .as_deref()
+                .expect("a pool with a token has its url"),
             Secret::new(TOKEN),
         )
         .expect("access"),
@@ -71,9 +78,10 @@ async fn rig_timed(
     let client = Arc::new(ScaleSetClient::new(http, access, &config.binding));
     let signin = SignInBoard::new();
     let dir = std::env::temp_dir().join(format!(
-        "arca-runners-test-{}-{}",
+        "arca-runners-test-{}-{}-{}",
         std::process::id(),
-        arca_runners::time::now_ms()
+        arca_runners::time::now_ms(),
+        SCRATCH.fetch_add(1, Ordering::Relaxed)
     ));
     let recorder = Recorder::open(dir.clone(), 7).expect("recorder");
     let pool = Pool::with_timing(

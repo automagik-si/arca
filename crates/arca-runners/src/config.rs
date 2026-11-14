@@ -31,10 +31,14 @@ pub struct PoolConfig {
     pub name: String,
     /// The signer's binding: the GitHub organisation (or installation) whose credential the pool uses.
     pub binding: String,
-    /// The organisation's address, such as `https://github.com/acme`.
-    pub url: String,
-    /// The runner group the scale sets live in. It decides which repositories may send jobs here.
-    pub runner_group_id: u64,
+    /// The organisation's address, such as `https://github.com/acme`. Only a pool that signs in with a token of its
+    /// own needs it; the signer knows its binding's organisation.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The runner group the scale sets live in. It decides which repositories may send jobs here. Absent, the group
+    /// the signer made for the binding's repositories.
+    #[serde(default)]
+    pub runner_group_id: Option<u64>,
     /// What the pool may hold at once, across all its classes.
     pub budget: Budget,
     /// The size classes. Each is one scale set on GitHub.
@@ -103,7 +107,11 @@ impl PoolConfig {
         if !plain(&self.name) || !plain(&self.project) {
             return Err("a pool's name and project are plain names".to_string());
         }
-        if !self.url.starts_with("https://") {
+        if self
+            .url
+            .as_ref()
+            .is_some_and(|url| !url.starts_with("https://"))
+        {
             return Err("a pool's url is an https address".to_string());
         }
         if self.classes.is_empty() {

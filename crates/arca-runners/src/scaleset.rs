@@ -383,6 +383,7 @@ impl<A: Access> ScaleSetClient<A> {
 
     async fn forget_connection(&self) {
         *self.connection.lock().await = None;
+        self.access.forget_connection(&self.binding);
     }
 
     /// One Actions service call with the admin token, made once more with a fresh connection after a 401.

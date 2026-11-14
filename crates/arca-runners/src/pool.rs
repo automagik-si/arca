@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::access::{Access, JobRef, MintRequest};
+use crate::access::{Access, AccessError, JobRef, MintRequest};
 use crate::config::PoolConfig;
 use crate::launcher::{LaunchError, Launcher, MachineSpec, RunnerStart};
 use crate::record::{JobRecord, Recorder};
@@ -330,7 +330,20 @@ impl<A: Access, L: Launcher> Pool<A, L> {
     /// labels when GitHub's differ.
     pub(crate) async fn scale_set(&self, class: usize) -> Result<u64, ApiError> {
         let config = &self.config.classes[class];
-        let group = self.config.runner_group_id;
+        let group = match self.config.runner_group_id {
+            Some(group) => group,
+            None => self
+                .client
+                .access()
+                .runner_group(&self.config.binding)
+                .await
+                .map_err(ApiError::Access)?
+                .ok_or_else(|| {
+                    ApiError::Access(AccessError::Refused(
+                        "the GitHub connection has no runner group yet".to_string(),
+                    ))
+                })?,
+        };
         let name = config.scale_set_name();
         let id = match self.client.get_scale_set(group, name).await? {
             Some(found) => {
@@ -429,6 +442,8 @@ impl<A: Access, L: Launcher> Pool<A, L> {
                             run_id: u64::try_from(job.workflow_run_id).ok(),
                             job_id: Some(job.job_id.clone()),
                             job_name: Some(job.job_display_name.clone()),
+                            workflow_ref: Some(job.job_workflow_ref.clone())
+                                .filter(|text| !text.is_empty()),
                         },
                     )
                     .await;

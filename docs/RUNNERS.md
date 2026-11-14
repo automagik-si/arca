@@ -100,11 +100,11 @@ repository, the workflow run id, the job id, the workflow reference, the labels 
 times. GitHub cannot narrow this permission to one runner group; the restraint is ours (the signer only acts in the
 binding's runner group with the labels the person chose), and the key never leaves the kernel.
 
-**Until the signer holds the App.** A pool can take its credential from a file instead: the node config's
-`runners.credentialsDir` (default `<stateDir>/runner-credentials`) holds one file per binding, named after it, with a
-token that has the same organisation permission (a fine-grained personal access token whose resource owner is the
-organisation, "Self-hosted runners: Read and write"). It is read at each sign-in, so a new token takes effect without
-a restart. The file is readable by the node's user only.
+**The pool signs in through the signer.** A pool's `binding` is a connection the person made on the approval page
+(the one-link GitHub connect). The pool asks the kernel's signer for the Actions service connection and for every
+runner configuration; the signer refuses a scale set outside the connection's runner group and labels outside the
+connection's label sets, and writes every mint to its audit log. The pool holds no key and no token of its own, and
+there is no token file to place.
 
 ## Configuring a pool
 
@@ -116,9 +116,7 @@ The node config's `runners` key (a kernel-mode node only):
     "pools": [
       {
         "name": "acme",
-        "binding": "acme-org",
-        "url": "https://github.com/acme",
-        "runnerGroupId": 3,
+        "binding": "gh-acme",
         "budget": { "cpu": 16, "memory": "64GiB" },
         "project": "arcak-runners",
         "image": "runner-ubuntu-2404",
@@ -132,14 +130,17 @@ The node config's `runners` key (a kernel-mode node only):
 }
 ```
 
-`image` is a local image alias or fingerprint, or `<instance>/<snapshot>` of a stopped template VM in the same project.
+`binding` is the signer connection's id. The scale sets go into the runner group the connection made for the
+repositories the person picked; `runnerGroupId` names another group instead (the signer still mints only into its own).
+Each class's labels must be one of the connection's label sets. `image` is a local image alias or fingerprint, or
+`<instance>/<snapshot>` of a stopped template VM in the same project.
 Records and logs go to `<stateDir>/runners/<pool>/`.
 
 ## The job machine
 
 1. **Clone.** `POST /1.0/instances` with `type: virtual-machine`, the runner image as source, the class's
    `limits.cpu`, `limits.memory` and root disk size, in the pool's own Incus project and network, marked
-   `user.arca.runner=<pool>`. On ZFS and Ceph RBD the root disk is a copy-on-write clone of the image's volume: about a
+   `user.arcakernel.runner=<pool>`. On ZFS and Ceph RBD the root disk is a copy-on-write clone of the image's volume: about a
    second, and it costs only the blocks the job writes.
 2. **Boot and wait for the Incus agent.** The launcher never uses a network path into the VM.
 3. **Hand over.** The controller asks the signer for one JIT configuration (`workFolder` `/home/runner/work`) and the
@@ -201,10 +202,15 @@ service cannot have that class of outage. A VM also runs systemd services, sets 
 Each pool reports its sign-in state to Arca's alerts on every listener pass. The rule `runner-signin` fires (critical)
 when a pool's last GitHub exchange failed for a credential reason and has done so for 60 seconds:
 
-- `401` from the token, registration or Actions service calls (bad key, revoked token);
-- `404` from the installation lookup (the App was uninstalled or never installed on the organisation);
-- `403` for a missing permission;
-- the credential missing from the kernel.
+- `401` from the token, registration or Actions service calls (bad key, revoked token): `bad-credentials`;
+- the App not installed yet, uninstalled or deleted on GitHub, which the signer records as a revoked connection:
+  `app-not-installed`;
+- `403` for a missing permission, or an installation GitHub suspended: `forbidden`;
+- the pool's `binding` naming no connection of the signer: `no-credential`.
+
+A refusal of the request itself (a scale set outside the connection's runner group, labels outside its label sets) is
+the pool's settings, not its sign-in: the machine's record carries the signer's words, and the class waits before it
+tries again.
 
 Its label is `pool`. It clears after 120 seconds of successful calls. Network errors and GitHub's own 5xx are not
 sign-in failures: they keep the last state. `alerts_list` names the pool, never a token. The reason
@@ -238,7 +244,8 @@ time.
 
 1. This note; the scale set client and listener, the controller, the launcher trait with the Incus VM launcher, the
    sign-in alert, all against the fake GitHub.
-2. The kernel task: pools from the node's config, the signer's connection, logs and job records.
+2. The kernel task: pools from the node's config, signing in through the signer's connection (no token of their own),
+   logs and job records.
 3. Dogfood on one class with the image from the image build: the first real job, the state-leak test, the fingerprint.
 4. Next slices: one-click onboarding (the App's installation creates the runner group and scale sets), per-person
    project and network isolation, a Docker Hub pull-through mirror, the Cloud Hypervisor launcher with snapshot-restore,

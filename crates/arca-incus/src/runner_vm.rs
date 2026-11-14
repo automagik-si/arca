@@ -19,7 +19,7 @@ use crate::lifecycle::{checked_envelope, plain_name, refused};
 use crate::read::{IncusError, exchange_capped};
 
 /// The key, in a job machine's own config, that marks it as a runner pool's: its value is the pool's name.
-pub const RUNNER_KEY: &str = "user.arca.runner";
+pub const RUNNER_KEY: &str = "user.arcakernel.runner";
 /// The largest file read back from a guest, in bytes: a job's packed logs.
 pub const PULL_MAX: usize = 64 * 1024 * 1024;
 /// The largest file written into a guest, in bytes.

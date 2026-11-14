@@ -71,7 +71,7 @@ fn a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go() {
     let made = instance(&fake, &spec.name).expect("the machine exists");
     let made = made.get("metadata").unwrap_or(&made).clone();
     assert_eq!(made["type"], "virtual-machine");
-    assert_eq!(made["config"]["user.arca.runner"], "acme");
+    assert_eq!(made["config"]["user.arcakernel.runner"], "acme");
     assert_eq!(made["config"]["limits.cpu"], "4");
     assert_eq!(made["config"]["limits.memory"], "16384MiB");
     // A second machine of that name is refused.
@@ -98,7 +98,11 @@ fn a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go() {
     // A machine that is gone is not an error.
     launcher.destroy(&spec.name).expect("destroy again");
     let writes = fake.writes();
-    assert!(writes.iter().any(|write| write.method == "POST"
-        && write.config_keys.contains(&"user.arca.runner".to_string())));
+    assert!(writes.iter().any(|write| {
+        write.method == "POST"
+            && write
+                .config_keys
+                .contains(&"user.arcakernel.runner".to_string())
+    }));
     let _ = fs::remove_dir_all(dir);
 }

@@ -61,6 +61,14 @@ impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoCredential => f.write_str("the pool's binding has no GitHub credential"),
+            // Status 0: the signer refused from its own record, with no GitHub answer behind it.
+            Self::SignIn { reason, status: 0 } => {
+                write!(
+                    f,
+                    "the GitHub connection cannot sign in ({})",
+                    reason.as_str()
+                )
+            }
             Self::SignIn { reason, status } => {
                 write!(
                     f,
@@ -105,6 +113,7 @@ pub struct JobRef {
     pub run_id: Option<u64>,
     pub job_id: Option<String>,
     pub job_name: Option<String>,
+    pub workflow_ref: Option<String>,
 }
 
 /// Whoever holds the GitHub credential of a pool's binding.
@@ -123,6 +132,17 @@ pub trait Access: Send + Sync + 'static {
 
     /// Records the job a minted runner took.
     fn attach_job(&self, mint_id: u64, job: JobRef) -> impl Future<Output = ()> + Send;
+
+    /// The runner group the binding's runners belong in, when the credential's holder made one.
+    fn runner_group(
+        &self,
+        _binding: &str,
+    ) -> impl Future<Output = Result<Option<u64>, AccessError>> + Send {
+        async { Ok(None) }
+    }
+
+    /// Drops a cached Actions service connection that GitHub refused, so the next call makes a new one.
+    fn forget_connection(&self, _binding: &str) {}
 }
 
 /// [`Access`] over an installation token handed to it: it makes the registration token and the Actions service
