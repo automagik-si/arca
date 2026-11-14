@@ -1944,7 +1944,11 @@ fn a_source_frozen_at_the_cutover_fails_the_move_safely() {
     let status = rig.wait(&id);
     let one = &status["instances"][0];
     assert_eq!(one["result"], "rolled_back", "{status}");
-    assert!(one["reason"].as_str().unwrap().contains("Frozen"), "{one}");
+    let reason = one["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("Frozen at the cutover"),
+        "refused before the stop and the last round: {one}"
+    );
     assert!(
         !rig.target.holds("instance", "shop", "web"),
         "its own copy is removed"
