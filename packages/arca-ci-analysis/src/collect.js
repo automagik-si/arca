@@ -69,13 +69,14 @@ export async function collect(gh, repo, options = {}) {
   const until = options.until ? new Date(options.until) : new Date();
   const since = new Date(until.getTime() - o.days * DAY);
   const log = options.log ?? (() => {});
-  // A spent budget or a rate limit that will not reset in time stops the collection: nothing more can be read. Any
-  // other failure (GitHub still failing after its retries) skips that one request and goes on.
+  // A spent budget, a rate limit that will not reset in time or a dead credential (a 401, a refused App sign-in) stops
+  // the collection: nothing more can be read. Any other failure (GitHub still failing after its retries, a 403 on one
+  // endpoint the access does not cover) skips that one request and goes on.
   let stopped = null;
   let failed = 0;
   let firstFailure = null;
   const stop = (error) => {
-    if (error.code !== 'budget' && error.code !== 'rate-limit') {
+    if (error.code !== 'budget' && error.code !== 'rate-limit' && error.code !== 'auth') {
       failed += 1;
       firstFailure ??= error.message;
       log(`${repo}: skipped one request (${error.message})`);
@@ -96,6 +97,7 @@ export async function collect(gh, repo, options = {}) {
   let listed = 0;
   let full = true;
   let daysUnlisted = 0;
+  const skipped = []; // [start, end) of the days skipped while the listing went on
   let reached = until.getTime(); // the start of the oldest day the listing got to
   for (let end = until.getTime(); end > since.getTime(); end -= DAY) {
     const start = Math.max(end - DAY, since.getTime());
@@ -114,6 +116,7 @@ export async function collect(gh, repo, options = {}) {
     } catch (error) {
       stop(error);
       daysUnlisted += 1;
+      if (!stopped) skipped.push([start, end]);
     }
     if (runs.length >= o.maxRuns) {
       full = end - DAY <= since.getTime();
@@ -124,9 +127,11 @@ export async function collect(gh, repo, options = {}) {
   const sampled = runs.length > o.maxRuns || !full;
   runs = runs.slice(0, o.maxRuns);
   // A sample covers from its oldest run on, and the analysis scales to a week by that span, not by the days asked; a
-  // listing that stopped covers the days it got to.
+  // listing that stopped covers the days it got to, and a day skipped on the way is not in the window at all.
   const from = sampled && runs.length ? Date.parse(runs.at(-1).createdAt) : stopped ? reached : since.getTime();
-  const cut = sampled || from > since.getTime();
+  const gap = skipped.reduce((total, [start, end]) => total + Math.max(0, end - Math.max(start, from)), 0);
+  const cut = sampled || from > since.getTime() || gap > 0;
+  const windowDays = Math.max(0.01, Math.round(((until.getTime() - from - gap) / DAY) * 100) / 100);
   log(`${repo}: ${runs.length} completed runs since ${iso(from)}${sampled ? ` (the newest ${o.maxRuns})` : ''}`);
 
   const jobs = [];
@@ -197,7 +202,7 @@ export async function collect(gh, repo, options = {}) {
     window: {
       since: iso(from),
       until: iso(until.getTime()),
-      days: cut ? Math.max(0.01, Math.round(((until.getTime() - from) / DAY) * 100) / 100) : o.days,
+      days: cut ? windowDays : o.days,
       ...(sampled ? { sampled: { runs: runs.length + runsWithoutJobs, listed, maxRuns: o.maxRuns, daysAsked: o.days } } : {}),
     },
     partial:
