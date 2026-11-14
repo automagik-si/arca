@@ -12,11 +12,11 @@
 //!   plan named by its digest: a SHA-256 over the canonical plan without its times. A source that changes (its uuid,
 //!   devices, config, profiles or measured size) gives another digest. A no-go blocks the plan with the preflight's own
 //!   reasons; a virtual machine is not movable yet, and an ephemeral container, which Incus deletes when it stops, is
-//!   not movable at all. Nor is an instance whose latest move moved it and was not finished: its copy may run there. Plans are kept one file each in `instance-move-plans/`, and pruned a day after they expire.
+//!   not movable at all. Nor is an instance while a copy an earlier move recorded may still run, read on its target. Plans are kept one file each in `instance-move-plans/`, and pruned a day after they expire.
 //! - The card is the action `instance_move` (`action_propose`), whose arguments carry the digest, the instances and the
 //!   target; the owner's passkey approves that digest, and the grant it arms is spent once.
 //! - `instance_move` (the approved run) refuses an expired, unknown, altered or already-run plan, an instance another
-//!   move holds or a move not finished moved, and a target without room for it beside the moves running to it. It journals the plan and `begin`,
+//!   move holds or with a copy an earlier move made that may still run, and a target without room for it beside the moves running to it. It journals the plan and `begin`,
 //!   and runs in the background: per instance, Incus pushes the container and its custom volumes from this host to the
 //!   target (`push`; each of the target's addresses is tried in order; a relay through this kernel is the fallback the
 //!   plan names and is not built yet), in rounds while it runs (without freezing it), then the source is stopped (a
@@ -612,56 +612,116 @@ fn answers(host: &str, port: u16) -> bool {
     })
 }
 
-/// The move whose copy of `project/name` (the instance of `uuid`, when both sides know it) may still run on its target:
-/// the latest move that held the instance moved it, and no finish deleted the source here or found the copy gone. While
-/// one is, a second move of the same instance could leave two copies running. Answers the move's id and target.
-fn moved_not_finished(
+/// Reads a copy an earlier move recorded (`uuid` on `target`): `None` when it cannot run there (gone, another instance
+/// of the name, or Stopped), or why it may (it runs, or the target cannot be read).
+type CopyProbe<'a> = &'a dyn Fn(&str, &str, &str, &str) -> Option<String>;
+
+/// [`CopyProbe`] against the linked hosts of `cfg`, read live through each one's Incus socket.
+fn probe_copy(
+    cfg: &NodeConfig,
+    target: &str,
+    project: &str,
+    name: &str,
+    uuid: &str,
+) -> Option<String> {
+    let writer = match linked_target(cfg, target) {
+        Ok(linked) => MoveWriter::new(linked.socket),
+        Err(error) => return Some(format!("{target} could not be read: {error}")),
+    };
+    match writer.get(&instance_path(project, name)) {
+        Err(IncusError::Status { code: 404, .. }) => None,
+        Err(error) => Some(format!("{target} could not be read: {error}")),
+        Ok(doc) if uuid_of(&doc).as_deref() != Some(uuid) => None,
+        Ok(doc) if !running(&doc) => None,
+        Ok(doc) => Some(format!(
+            "it reads {} on {target}",
+            text(&doc, "status").unwrap_or("no status")
+        )),
+    }
+}
+
+/// A copy an earlier move made of an instance that may still run: the move, its target, whether that move may still be
+/// finished, and why the copy may run.
+struct HeldCopy {
+    id: String,
+    target: String,
+    finishable: bool,
+    why: String,
+}
+
+/// The newest earlier move whose recorded copy of `project/name` (the instance of `uuid`, when both sides know it) may
+/// still run on its target, whatever that move's result: a second move of the instance could then leave two copies
+/// running. Each recorded copy is read on its target through `probe`; a copy read gone or stopped releases it.
+fn held_copy(
     records: &BTreeMap<String, MoveRecord>,
     project: &str,
     name: &str,
     uuid: Option<&str>,
-) -> Option<(String, String)> {
-    let label = format!("{project}/{name}");
-    let (record, one) = records
+    probe: CopyProbe,
+) -> Option<HeldCopy> {
+    let mut made: Vec<(&MoveRecord, &InstanceRecord, &str)> = records
         .values()
         .filter_map(|record| {
-            record
-                .instances
-                .iter()
-                .find(|one| {
-                    one.project == project
-                        && one.name == name
-                        && (uuid.is_none() || one.uuid.is_none() || one.uuid.as_deref() == uuid)
-                })
-                .map(|one| (record, one))
+            let one = record.instances.iter().find(|one| {
+                one.project == project
+                    && one.name == name
+                    && (uuid.is_none() || one.uuid.is_none() || one.uuid.as_deref() == uuid)
+            })?;
+            Some((record, one, one.target_uuid.as_deref()?))
         })
-        .max_by_key(|(record, _)| record.started_at)?;
-    if one.result.as_deref() != Some("moved") {
-        return None;
-    }
-    let settled = record.finished.as_ref().is_some_and(|line| {
-        ["deleted", "copyGone"].iter().any(|key| {
-            line[*key]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|done| done.as_str() == Some(label.as_str()))
+        .collect();
+    made.sort_by_key(|(record, _, _)| std::cmp::Reverse(record.started_at));
+    made.into_iter().find_map(|(record, one, copy)| {
+        probe(&record.target, project, name, copy).map(|why| HeldCopy {
+            id: record.id.clone(),
+            target: record.target.clone(),
+            finishable: one.result.as_deref() == Some("moved") && record.finished.is_none(),
+            why,
         })
-    });
-    (!settled).then(|| (record.id.clone(), record.target.clone()))
+    })
 }
 
-/// Why `project/name` may not be moved again: [`moved_not_finished`] in words.
-fn moved_reason(project: &str, name: &str, id: &str, target: &str) -> String {
+/// Why `project/name` may not be moved now: [`held_copy`] in words, with what the owner can do.
+fn held_reason(project: &str, name: &str, held: &HeldCopy) -> String {
+    let HeldCopy {
+        id,
+        target,
+        finishable,
+        why,
+    } = held;
+    let next = if *finishable {
+        format!(
+            "finish move {id} first (it deletes the stopped source here), or stop or delete the copy on {target}"
+        )
+    } else {
+        format!("stop or delete the copy on {target} first, once you have kept what it holds")
+    };
     format!(
-        "{project}/{name} moved to {target} in move {id}, which is not finished: its copy there may run, and a second move would leave two copies running; finish move {id} first (it deletes the stopped source here, or notes that the copy on {target} is gone)"
+        "{project}/{name} has a copy on {target} from move {id} that may still run ({why}): a second move would leave two copies running; {next}"
     )
 }
 
-/// Why a move of `refs` (project, name, uuid) under the plan `digest` may not begin now, from the journal: the plan
-/// already ran, another move that has not ended holds one of the instances, or an earlier move moved one and was not
-/// finished. `None` when it may begin.
-fn start_refusal(lines: &[Value], digest: &str, refs: &[MoveRef]) -> Option<CallError> {
+/// [`held_copy`] as a refusal: `AlreadyMoved` while that move may still be finished, `CopyMayRun` otherwise.
+fn held_refusal(project: &str, name: &str, held: &HeldCopy) -> CallError {
+    refused(
+        if held.finishable {
+            "AlreadyMoved"
+        } else {
+            "CopyMayRun"
+        },
+        held_reason(project, name, held),
+    )
+}
+
+/// Why a move of `refs` (project, name, uuid) under the plan `digest` may not begin now: the plan already ran, another
+/// move that has not ended holds one of the instances (from the journal), or a copy an earlier move made of one may still
+/// run (read on its target through `probe`). `None` when it may begin.
+fn start_refusal(
+    lines: &[Value],
+    digest: &str,
+    refs: &[MoveRef],
+    probe: CopyProbe,
+) -> Option<CallError> {
     if lines
         .iter()
         .any(|line| line["event"] == "begin" && line["plan"] == digest)
@@ -693,8 +753,8 @@ fn start_refusal(lines: &[Value], digest: &str, refs: &[MoveRef]) -> Option<Call
     }
     let records = fold(lines);
     refs.iter().find_map(|(project, name, uuid)| {
-        moved_not_finished(&records, project, name, uuid.as_deref())
-            .map(|(id, target)| refused("AlreadyMoved", moved_reason(project, name, &id, &target)))
+        held_copy(&records, project, name, uuid.as_deref(), probe)
+            .map(|held| held_refusal(project, name, &held))
     })
 }
 
@@ -891,10 +951,17 @@ impl Moves {
                         "the container has no volatile.uuid, so the move could not tell it from another of its name".to_string(),
                     );
                 }
-                if let Some((id, target)) =
-                    moved_not_finished(&records, &one.project, &one.name, uuid_of(doc).as_deref())
-                {
-                    reasons.push(moved_reason(&one.project, &one.name, &id, &target));
+                let probe = |target: &str, project: &str, name: &str, uuid: &str| {
+                    probe_copy(&self.cfg, target, project, name, uuid)
+                };
+                if let Some(held) = held_copy(
+                    &records,
+                    &one.project,
+                    &one.name,
+                    uuid_of(doc).as_deref(),
+                    &probe,
+                ) {
+                    reasons.push(held_reason(&one.project, &one.name, &held));
                 }
                 for (device_name, device) in devices(doc) {
                     if text(&device, "type") == Some("disk")
@@ -1240,7 +1307,10 @@ impl Moves {
         // From here to the `begin` line no other start passes these checks.
         let _starting = self.starting.lock().map_err(|_| internal())?;
         let lines = self.journal.lines();
-        if let Some(refusal) = start_refusal(&lines, &digest, &refs) {
+        let probe = |target: &str, project: &str, name: &str, uuid: &str| {
+            probe_copy(&self.cfg, target, project, name, uuid)
+        };
+        if let Some(refusal) = start_refusal(&lines, &digest, &refs, &probe) {
             return Err(refusal);
         }
         let target_name = plan["target"]["name"]
@@ -2261,8 +2331,8 @@ impl Moves {
             // to it. The owner decides.
             if instance.copy_started {
                 let reason = format!(
-                    "{stopped} after the copy was started on {} and before its checks were journaled: the copy may have served writes, so it was left as it is and the source stays stopped. Check the copy, then finish the move or move it back",
-                    record.target
+                    "{stopped} after the copy was started on {target} and before its checks were journaled: the copy may have served writes, so it was left as it is and the source stays stopped. Keep one of them: to come back, stop the copy on {target} and start the source here; to keep the copy, leave the source stopped. Until the copy on {target} is stopped or gone, no other move takes this instance",
+                    target = record.target
                 );
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
@@ -2998,10 +3068,14 @@ pub fn check_proposal(
     let rows = match action {
         ActionKind::InstanceMove => {
             let plan = approved_plan(&Plans::at(&cfg.state_dir), args, now)?;
+            let probe = |target: &str, project: &str, name: &str, uuid: &str| {
+                probe_copy(cfg, target, project, name, uuid)
+            };
             if let Some(refusal) = start_refusal(
                 &journal.lines(),
                 plan["digest"].as_str().unwrap_or_default(),
                 &refs_pairs(&plan),
+                &probe,
             ) {
                 return Err(refusal);
             }
@@ -3098,11 +3172,15 @@ impl ToolHandler for MoveHandler {
             .prepare(&bare, None)
             .map_err(CallError::Invalid)?;
         let plan = approved_plan(&self.moves.plans, &args, self.moves.now())?;
-        // A plan that ran, or an instance another move holds, keeps the grant unspent.
+        // A plan that ran, an instance another move holds, or one with a copy that may run keeps the grant unspent.
+        let probe = |target: &str, project: &str, name: &str, uuid: &str| {
+            probe_copy(&self.moves.cfg, target, project, name, uuid)
+        };
         if let Some(refusal) = start_refusal(
             &self.moves.journal.lines(),
             plan["digest"].as_str().unwrap_or_default(),
             &refs_pairs(&plan),
+            &probe,
         ) {
             return Err(refusal);
         }
@@ -3188,7 +3266,7 @@ impl ToolHandler for MoveFinishHandler {
         let dest = linked_target(&self.moves.cfg, &record.target)
             .ok()
             .map(|target| MoveWriter::new(target.socket));
-        let (mut deleted, mut kept, mut gone) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut deleted, mut kept) = (Vec::new(), Vec::new());
         for one in record
             .instances
             .iter()
@@ -3199,11 +3277,6 @@ impl ToolHandler for MoveFinishHandler {
             // The other side first: the copy must be on the target, as the one this move made.
             let copy_there = match (dest.as_ref().map(|dest| dest.get(&path)), &one.target_uuid) {
                 (Some(Ok(doc)), Some(uuid)) => uuid_of(&doc).as_deref() == Some(uuid.as_str()),
-                (Some(Err(IncusError::Status { code: 404, .. })), _) => {
-                    // No copy runs there: the instance here may be moved again.
-                    gone.push(label.clone());
-                    false
-                }
                 _ => false,
             };
             if !copy_there {
@@ -3287,7 +3360,6 @@ impl ToolHandler for MoveFinishHandler {
         }
         self.moves.note(json!({
             "event": "finish", "at": self.moves.now(), "move": id, "deleted": deleted, "kept": kept,
-            "copyGone": gone,
         }));
         let message = if kept.is_empty() {
             format!("move {id} finished: {} deleted on this host", deleted.len())
@@ -3441,78 +3513,98 @@ mod tests {
             json!({ "event": "begin", "move": id, "plan": plan, "target": "node-b",
                 "instances": [{ "project": "shop", "name": name }] })
         };
-        assert!(start_refusal(&[], &digest, &web).is_none());
+        let none = |_: &str, _: &str, _: &str, _: &str| None;
+        assert!(start_refusal(&[], &digest, &web, &none).is_none());
         let ran = vec![
             begin("mv-cccccccccccc", &digest, "web"),
             json!({ "event": "end", "move": "mv-cccccccccccc" }),
         ];
         assert!(matches!(
-            start_refusal(&ran, &digest, &web),
+            start_refusal(&ran, &digest, &web, &none),
             Some(CallError::Refused { code, .. }) if code == "AlreadyRun"
         ));
         let other = vec![begin("mv-dddddddddddd", &"d".repeat(64), "web")];
         assert!(matches!(
-            start_refusal(&other, &digest, &web),
+            start_refusal(&other, &digest, &web, &none),
             Some(CallError::Refused { code, .. }) if code == "InstanceMoving"
         ));
         let mut ended = other.clone();
         ended.push(json!({ "event": "end", "move": "mv-dddddddddddd" }));
-        assert!(start_refusal(&ended, &digest, &web).is_none());
+        assert!(start_refusal(&ended, &digest, &web, &none).is_none());
         let api = vec![begin("mv-eeeeeeeeeeee", &"e".repeat(64), "api")];
-        assert!(start_refusal(&api, &digest, &web).is_none());
+        assert!(start_refusal(&api, &digest, &web, &none).is_none());
     }
 
     #[test]
-    fn an_instance_moved_and_not_finished_is_not_moved_again() {
+    fn an_instance_with_a_copy_that_may_run_is_not_moved_again() {
         let digest = "c".repeat(64);
         let web = vec![(
             "shop".to_string(),
             "web".to_string(),
             Some("u-web".to_string()),
         )];
-        let moved = |uuid: &str| {
+        let runs = |target: &str, _: &str, _: &str, copy: &str| {
+            Some(format!("{copy} reads Running on {target}"))
+        };
+        let gone = |_: &str, _: &str, _: &str, _: &str| None;
+        let made = |id: &str, at: u64, target: &str, uuid: &str, result: &str| {
             vec![
-                json!({ "event": "begin", "move": "mv-dddddddddddd", "plan": "d".repeat(64), "target": "node-b",
-                    "at": 5, "instances": [{ "project": "shop", "name": "web", "uuid": uuid }] }),
-                json!({ "event": "result", "move": "mv-dddddddddddd", "project": "shop", "name": "web",
-                    "result": "moved" }),
-                json!({ "event": "end", "move": "mv-dddddddddddd" }),
+                json!({ "event": "begin", "move": id, "plan": "d".repeat(64), "target": target,
+                    "at": at, "instances": [{ "project": "shop", "name": "web", "uuid": uuid }] }),
+                json!({ "event": "created", "move": id, "project": "shop", "name": "web",
+                    "targetUuid": format!("copy-{id}") }),
+                json!({ "event": "result", "move": id, "project": "shop", "name": "web", "result": result }),
+                json!({ "event": "end", "move": id }),
             ]
         };
-        let refusal = start_refusal(&moved("u-web"), &digest, &web);
+        let refusal =
+            |lines: &[Value], probe: CopyProbe| start_refusal(lines, &digest, &web, probe);
+        // A moved copy that runs: the move may still be finished.
+        let moved = made("mv-dddddddddddd", 5, "node-b", "u-web", "moved");
         assert!(
-            matches!(&refusal, Some(CallError::Refused { code, message })
-                if code == "AlreadyMoved" && message.contains("finish move mv-dddddddddddd")),
-            "{refusal:?}"
+            matches!(refusal(&moved, &runs), Some(CallError::Refused { code, message })
+                if code == "AlreadyMoved" && message.contains("finish move mv-dddddddddddd")
+                    && message.contains("copy-mv-dddddddddddd reads Running on node-b")),
         );
+        // Read gone or stopped on its target, it holds nothing.
+        assert!(refusal(&moved, &gone).is_none());
         // Another instance of the name (a new uuid) is not the one that moved.
-        assert!(start_refusal(&moved("u-other"), &digest, &web).is_none());
-        // A finish that deleted the source, or found the copy gone, settles it; one that kept both does not.
-        for (key, settled) in [("deleted", true), ("copyGone", true), ("kept", false)] {
-            let mut lines = moved("u-web");
-            lines.push(json!({ "event": "finish", "move": "mv-dddddddddddd", key: ["shop/web"] }));
-            assert_eq!(
-                start_refusal(&lines, &digest, &web).is_none(),
-                settled,
-                "{key}"
-            );
-        }
-        // The latest move that held the instance is the word: a rolled-back one before the move does not settle it.
-        let rolled_back = |at: u64| {
-            vec![
-                json!({ "event": "begin", "move": "mv-eeeeeeeeeeee", "plan": "e".repeat(64), "target": "node-c",
-                    "at": at, "instances": [{ "project": "shop", "name": "web", "uuid": "u-web" }] }),
-                json!({ "event": "result", "move": "mv-eeeeeeeeeeee", "project": "shop", "name": "web",
-                    "result": "rolled_back" }),
-                json!({ "event": "end", "move": "mv-eeeeeeeeeeee" }),
-            ]
+        assert!(
+            refusal(
+                &made("mv-dddddddddddd", 5, "node-b", "u-other", "moved"),
+                &runs
+            )
+            .is_none()
+        );
+        // A failed move's copy holds it too, with no finish offered; so does a moved one whose finish kept the source.
+        let failed = made("mv-dddddddddddd", 5, "node-b", "u-web", "failed");
+        assert!(
+            matches!(refusal(&failed, &runs), Some(CallError::Refused { code, message })
+                if code == "CopyMayRun" && !message.contains("finish move")),
+        );
+        let mut kept = moved.clone();
+        kept.push(json!({ "event": "finish", "move": "mv-dddddddddddd", "kept": ["shop/web"] }));
+        assert!(
+            matches!(refusal(&kept, &runs), Some(CallError::Refused { code, .. }) if code == "CopyMayRun")
+        );
+        // A move that recorded no copy holds nothing.
+        let mut none_made = moved.clone();
+        none_made.remove(1);
+        assert!(refusal(&none_made, &runs).is_none());
+        // Any earlier copy that may run holds it, not only the latest move's; the newest is named.
+        let mut both = made("mv-dddddddddddd", 5, "node-b", "u-web", "moved");
+        both.extend(made("mv-eeeeeeeeeeee", 9, "node-c", "u-web", "failed"));
+        let only_b = |target: &str, _: &str, _: &str, _: &str| {
+            (target == "node-b").then(|| "it reads Running on node-b".to_string())
         };
-        let mut before = rolled_back(1);
-        before.extend(moved("u-web"));
-        assert!(start_refusal(&before, &digest, &web).is_some());
-        let mut after = moved("u-web");
-        after.extend(rolled_back(9));
-        assert!(start_refusal(&after, &digest, &web).is_none());
+        assert!(
+            matches!(refusal(&both, &only_b), Some(CallError::Refused { message, .. })
+                if message.contains("mv-dddddddddddd")),
+        );
+        assert!(
+            matches!(refusal(&both, &runs), Some(CallError::Refused { message, .. })
+                if message.contains("mv-eeeeeeeeeeee")),
+        );
     }
 
     #[test]

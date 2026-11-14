@@ -2058,7 +2058,7 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// N1: a finish that reads the copy on the target back gone says so (copyGone), and the source may be moved again.
+/// N1: once the copy on the target is gone, a finish keeps the source, and the source may be moved again.
 #[test]
 fn a_finish_that_finds_the_copy_gone_lets_the_source_move_again() {
     let rig = Rig::new(vec![web()], 100);
@@ -2075,12 +2075,6 @@ fn a_finish_that_finds_the_copy_gone_lets_the_source_move_again() {
         .expect("finished");
     assert_eq!(finished["deleted"], json!([]), "{finished}");
     assert!(rig.source.holds("instance", "shop", "web"));
-    let line = rig
-        .journal()
-        .into_iter()
-        .find(|l| l["event"] == "finish")
-        .expect("a finish line");
-    assert_eq!(line["copyGone"], json!(["shop/web"]), "{line}");
     let plan = rig
         .call_as(
             Scope::Viewer,
