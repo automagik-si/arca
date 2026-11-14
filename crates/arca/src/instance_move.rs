@@ -1,43 +1,54 @@
-//! Moving containers to a linked host: a frozen plan, one owner card, pre-copy rounds, a short cutover, checks, a
-//! measured downtime and a rollback that works while the source exists. The source is never deleted by the move; the
-//! owner finishes a verified move with a card of its own.
+//! Moving containers to a linked host: a frozen plan, one owner card, copy rounds while the container runs, a short
+//! cutover, checks, a measured downtime, and a rollback. The source is never deleted by the move; the owner finishes a
+//! verified move with a card of its own.
 //!
-//! - `instance_move_plan` runs the whole `instance_move_preflight` again and freezes, for containers that all pass, a plan
-//!   record in the move journal, named by its digest: a SHA-256 over the canonical plan without its times. A source that
-//!   changes (its uuid, its devices, its measured size) gives another digest. A no-go blocks the plan with the
-//!   preflight's own reasons, and a virtual machine is answered plainly: it is not movable yet.
+//! The rule above all: no path deletes the only copy of an instance, and no path leaves the source and its copy both
+//! running. A rollback and a finish act only on objects whose uuid this move recorded, after reading the other side
+//! back: a rollback deletes the target copy only when the source is read back with the plan's uuid, and starts the
+//! source again only when the copy is read back gone or stopped; a finish deletes the source only when the copy is read
+//! back on the target with the uuid this move recorded when it made it.
+//!
+//! - `instance_move_plan` runs the whole `instance_move_preflight` again and freezes, for containers that all pass, a
+//!   plan named by its digest: a SHA-256 over the canonical plan without its times. A source that changes (its uuid,
+//!   devices, config, profiles or measured size) gives another digest. A no-go blocks the plan with the preflight's own
+//!   reasons; a virtual machine is not movable yet, and an ephemeral container, which Incus deletes when it stops, is
+//!   not movable at all. Plans are kept one file each in `instance-move-plans/`, and pruned a day after they expire.
 //! - The card is the action `instance_move` (`action_propose`), whose arguments carry the digest, the instances and the
 //!   target; the owner's passkey approves that digest, and the grant it arms is spent once.
-//! - `instance_move` (the approved run) refuses an expired, unknown or altered plan, re-checks the target's room against
-//!   the moves that are running, journals `begin`, and runs the move in the background: per instance, Incus pushes the
-//!   container and its custom volumes from this host to the target (`push`: the target listens; a relay through this
-//!   kernel is the fallback the plan names and is not built yet), in rounds while it runs, then stops it, sends the last
-//!   delta and starts the copy; then checks it. The downtime is measured from the stop to the passed checks. Any failure
-//!   before the checks pass rolls that instance back: the target copy is stopped and deleted, the source is started again
-//!   when it ran, and the source's volumes are never touched. The kernel orchestrates; it copies no storage itself.
+//! - `instance_move` (the approved run) refuses an expired, unknown, altered or already-run plan, an instance another
+//!   move holds, and a target without room for it beside the moves running to it. It journals the plan and `begin`,
+//!   and runs in the background: per instance, Incus pushes the container and its custom volumes from this host to the
+//!   target (`push`; each of the target's addresses is tried in order; a relay through this kernel is the fallback the
+//!   plan names and is not built yet), in rounds while it runs (without freezing it), then the source is stopped, the
+//!   last delta sent and the copy started; then it is checked. The downtime is measured from the stop to the passed
+//!   checks. The kernel orchestrates; it copies no storage itself.
 //! - `instance_move_status` reads how a move stands; `instance_move_finish` (a card) deletes a verified move's sources.
 //!
 //! The journal, `instance-moves.jsonl` in the state directory, is append-only JSON lines (mode 0600) with the events
-//! `plan`, `begin`, `round`, `cutover`, `verify`, `result`, `rollback`, `end` and `finish`. It holds no secret: no
-//! websocket secret and no certificate, only the target certificate's fingerprint. A torn last line is skipped, and the
-//! next append starts on a new line. A move a stopped kernel left unfinished is not resumed: the next start rolls back
-//! each instance it had not finished, as a failure before the checks would, and journals why.
+//! `plan`, `begin`, `round`, `created`, `cutover`, `verify`, `result`, `rollback`, `end` and `finish`. It holds no
+//! secret: no websocket secret and no certificate, only the target certificate's fingerprint. A torn last line is
+//! skipped, and the next append starts on a new line. A move cannot begin unless its `plan` and `begin` lines are
+//! written, and an instance cannot go past its first round unless the `created` line (the uuid of the copy) is.
+//!
+//! A move a stopped kernel left unfinished is not resumed. On the next start each instance without a result is settled:
+//! one whose checks passed is recorded as moved; one whose copy had been started is left as it stands (the copy may have
+//! served writes) with the source stopped, and named for the owner; any other is rolled back under the rule above.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arca_api::Scope;
 use arca_incus::migrate::{OpState, progress_of};
-use arca_incus::{IncusError, MoveWriter, PushTarget};
+use arca_incus::{IncusError, MoveWriter, PushTarget, Receive};
 use arca_kernel::canon::{Digest, canonical_json};
 use arca_mcp::{CallError, Caller, ToolHandler};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::action_proposal::ActionKind;
 use crate::config::{NodeConfig, host_name_ok};
@@ -47,22 +58,28 @@ use crate::move_preflight::{MovePreflightHandler, human, instance_ok, project_ok
 
 /// The move journal's file name in the state directory.
 pub const MOVES_FILE: &str = "instance-moves.jsonl";
+/// The folder of frozen plans in the state directory, one `<digest>.json` each.
+pub const PLANS_DIR: &str = "instance-move-plans";
 /// How long a frozen plan may be approved and run.
 pub const PLAN_TTL_MS: u64 = 60 * 60 * 1000;
+/// How long an expired plan's file is kept before a later plan prunes it.
+const PLAN_KEEP_MS: u64 = 24 * 60 * 60 * 1000;
 /// The copy rounds while the instance runs, unless the plan names another count.
 pub const DEFAULT_ROUNDS: u64 = 2;
 /// The file the checks compare when the plan names none.
 pub const DEFAULT_SPOT_CHECK: &str = "/etc/hostname";
 /// What every card and plan promises about a failure.
-pub const ROLLBACK_PROMISE: &str = "If anything fails before the moved copy passes its checks, Arca removes the copy on the target and starts the source again; the source keeps running while it is copied, its volumes are never touched, and it is never deleted unless you finish the move.";
-/// The largest journal this build reads.
-const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+pub const ROLLBACK_PROMISE: &str = "If anything fails before the moved copy passes its checks, Arca removes the copy it made on the target and starts the source again, but only after reading the source back as the same instance, and only once the copy is gone or stopped: it never deletes the only copy and never leaves both running. The source keeps running while it is copied, its volumes are never touched, and it is never deleted unless you finish the move.";
+/// The longest journal line this build reads; a longer one is skipped.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// How long a graceful stop of the source may take before it is forced.
 const STOP_GRACE: Duration = Duration::from_secs(60);
 /// How long a start may take.
 const START_DEADLINE: Duration = Duration::from_secs(120);
 /// How long one copy of one object may run before it counts as failed.
 const ROUND_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a delete Incus answers as busy (an operation still holds the object) is tried again.
+const BUSY_RETRY: Duration = Duration::from_secs(30);
 /// The rate a card's downtime estimate assumes, in bytes a second, and the share of the data it assumes changes between
 /// the last round and the stop.
 const ASSUMED_RATE: u64 = 50 * 1024 * 1024;
@@ -88,6 +105,17 @@ fn internal() -> CallError {
 fn digest_of(value: &Value) -> String {
     let text = canonical_json(value).unwrap_or_default();
     Digest::of(text.as_bytes()).to_hex()
+}
+
+fn digest_ok(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn running(doc: &Value) -> bool {
+    doc.get("status") == Some(&json!("Running"))
 }
 
 /// The append-only move journal.
@@ -143,40 +171,126 @@ impl Journal {
         file.sync_all()
     }
 
-    /// Every line that reads as JSON. A torn last line (no newline after it) is skipped; any other line that does not
-    /// read is skipped and said on the log.
+    /// Every line that reads as a JSON object, however long the journal grows. A torn last line (no newline after it)
+    /// is skipped; any other line that does not read, or is longer than 8 MiB, is skipped and said on the log.
     pub fn lines(&self) -> Vec<Value> {
         let _held = self.lock.lock();
         let Ok(meta) = fs::symlink_metadata(&self.path) else {
             return Vec::new();
         };
-        if !meta.is_file() || meta.len() > MAX_JOURNAL_BYTES {
-            eprintln!("arca: the move journal is not a regular file under 64 MiB; it is not read");
+        if !meta.is_file() {
+            eprintln!("arca: the move journal is not a regular file; it is not read");
             return Vec::new();
         }
-        let Ok(text) = fs::read_to_string(&self.path) else {
+        let Ok(file) = fs::File::open(&self.path) else {
             return Vec::new();
         };
-        let complete = text.ends_with('\n');
-        let rows: Vec<&str> = text.lines().collect();
+        let mut reader = BufReader::new(file);
         let mut out = Vec::new();
-        for (index, row) in rows.iter().enumerate() {
-            match serde_json::from_str::<Value>(row) {
+        let mut row = Vec::new();
+        loop {
+            row.clear();
+            let read = (&mut reader)
+                .take(MAX_LINE_BYTES as u64 + 1)
+                .read_until(b'\n', &mut row);
+            match read {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let complete = row.last() == Some(&b'\n');
+            if !complete && row.len() > MAX_LINE_BYTES {
+                eprintln!("arca: a line of the move journal is longer than 8 MiB and is skipped");
+                let mut rest = Vec::new();
+                let _ = reader.read_until(b'\n', &mut rest);
+                continue;
+            }
+            match serde_json::from_slice::<Value>(&row) {
                 Ok(value) if value.is_object() => out.push(value),
-                _ if index + 1 == rows.len() && !complete => {}
+                _ if !complete => {}
                 _ => eprintln!("arca: a line of the move journal does not read and is skipped"),
             }
         }
         out
     }
+}
 
-    /// The frozen plan with `digest`, as its `plan` line holds it.
-    pub fn plan(&self, digest: &str) -> Option<Value> {
-        self.lines()
-            .into_iter()
-            .rev()
-            .find(|line| line["event"] == "plan" && line["plan"]["digest"] == digest)
-            .map(|line| line["plan"].clone())
+/// The frozen plans: one private file each, named by the digest.
+pub struct Plans {
+    dir: PathBuf,
+}
+
+impl Plans {
+    pub fn at(state_dir: &Path) -> Self {
+        Self {
+            dir: state_dir.join(PLANS_DIR),
+        }
+    }
+
+    /// The plan with `digest`, as it was frozen.
+    pub fn get(&self, digest: &str) -> Option<Value> {
+        if !digest_ok(digest) {
+            return None;
+        }
+        let path = self.dir.join(format!("{digest}.json"));
+        let meta = fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > MAX_LINE_BYTES as u64 {
+            return None;
+        }
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    /// Freezes `plan`. A plan with the same digest that has not expired is kept as it is, its expiry included: planning
+    /// the same state again never renews an approved plan. Plans that expired a day ago or more are pruned. Answers the
+    /// plan as kept.
+    pub fn save(&self, plan: Value, now: u64) -> std::io::Result<Value> {
+        let digest = plan["digest"].as_str().unwrap_or_default().to_string();
+        if !digest_ok(&digest) {
+            return Err(std::io::Error::other("the plan has no digest"));
+        }
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.dir)?;
+        self.prune(now);
+        if let Some(kept) = self.get(&digest)
+            && kept["expiresAt"].as_u64().unwrap_or(0) >= now
+        {
+            return Ok(kept);
+        }
+        let path = self.dir.join(format!("{digest}.json"));
+        let staging = self.dir.join(format!(".{digest}.json.tmp"));
+        let _ = fs::remove_file(&staging);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&staging)?;
+        file.write_all(&serde_json::to_vec(&plan).map_err(std::io::Error::other)?)?;
+        file.sync_all()?;
+        fs::rename(&staging, &path)?;
+        Ok(plan)
+    }
+
+    fn prune(&self, now: u64) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(digest) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let gone = self.get(digest).is_some_and(|plan| {
+                plan["expiresAt"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(PLAN_KEEP_MS)
+                    < now
+            });
+            if gone {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -301,6 +415,29 @@ fn is_root(device: &Value) -> bool {
     text(device, "type") == Some("disk") && text(device, "path") == Some("/")
 }
 
+fn uuid_of(doc: &Value) -> Option<String> {
+    doc.pointer("/config/volatile.uuid")
+        .and_then(Value::as_str)
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_string)
+}
+
+/// The instance's own config without its volatile keys: what the plan's digest covers of it.
+fn config_digest(doc: &Value) -> String {
+    let kept: Map<String, Value> = doc
+        .get("config")
+        .and_then(Value::as_object)
+        .map(|config| {
+            config
+                .iter()
+                .filter(|(key, _)| !key.starts_with("volatile."))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    digest_of(&Value::Object(kept))
+}
+
 /// A target's Incus, as this node reaches it: the socket the linked host's config names.
 struct Target {
     socket: PathBuf,
@@ -320,27 +457,33 @@ fn linked_target(cfg: &NodeConfig, name: &str) -> Result<Target, String> {
     Ok(Target { socket })
 }
 
-/// The transport facts of a target read from its server document: the first address it listens on, and its
+/// The transport facts of a target read from its server document: every address it listens on, in its order, and its
 /// certificate's PEM.
-fn transport_facts(server: &Value) -> (Option<String>, Option<String>) {
-    let address = server
+fn transport_facts(server: &Value) -> (Vec<String>, Option<String>) {
+    let addresses = server
         .pointer("/environment/addresses")
         .and_then(Value::as_array)
-        .and_then(|list| list.iter().filter_map(Value::as_str).next())
-        .map(str::to_string);
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .filter(|address| !address.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let certificate = server
         .pointer("/environment/certificate")
         .and_then(Value::as_str)
         .filter(|pem| !pem.is_empty())
         .map(str::to_string);
-    (address, certificate)
+    (addresses, certificate)
 }
 
-/// The custom volumes an instance takes with it, each `{device, pool, name, project, path}`: the project is the one Incus
-/// keeps the volume in (the instance's, when that project sets `features.storage.volumes`, else `default`).
-fn volumes_of(source: &MoveWriter, project: &str, instance: &Value) -> Vec<Value> {
-    let volume_project = if project != "default"
-        && source
+/// The project a custom volume of `project` is kept in on a host: the project itself when it sets
+/// `features.storage.volumes`, else `default`.
+fn volume_project(writer: &MoveWriter, project: &str) -> String {
+    let own = project != "default"
+        && writer
             .get(&format!("/1.0/projects/{}", seg(project)))
             .ok()
             .and_then(|doc| {
@@ -348,27 +491,54 @@ fn volumes_of(source: &MoveWriter, project: &str, instance: &Value) -> Vec<Value
                     .and_then(Value::as_str)
                     .map(|value| value == "true")
             })
-            .unwrap_or(false)
-    {
-        project
-    } else {
-        "default"
-    };
-    devices(instance)
+            .unwrap_or(false);
+    if own { project } else { "default" }.to_string()
+}
+
+/// The custom volumes an instance takes with it, each `{device, pool, name, project, targetProject, path}`: the project
+/// Incus keeps it in here, and the one it lands in on the target, each by that host's own project setting.
+fn volumes_of(
+    source: &MoveWriter,
+    target: Option<&MoveWriter>,
+    project: &str,
+    instance: &Value,
+) -> Vec<Value> {
+    let found: Vec<(String, Value)> = devices(instance)
         .into_iter()
         .filter(|(_, device)| text(device, "type") == Some("disk") && !is_root(device))
-        .filter_map(|(device_name, device)| {
-            let pool = text(&device, "pool")?;
-            let name = text(&device, "source")?;
-            Some(json!({
+        .filter(|(_, device)| text(device, "pool").is_some() && text(device, "source").is_some())
+        .collect();
+    if found.is_empty() {
+        return Vec::new();
+    }
+    let here = volume_project(source, project);
+    let there = target.map_or_else(|| here.clone(), |target| volume_project(target, project));
+    found
+        .into_iter()
+        .map(|(device_name, device)| {
+            json!({
                 "device": device_name,
-                "pool": pool,
-                "name": name,
-                "project": volume_project,
+                "pool": text(&device, "pool"),
+                "name": text(&device, "source"),
+                "project": here,
+                "targetProject": there,
                 "path": text(&device, "path"),
-            }))
+            })
         })
         .collect()
+}
+
+fn volume_path(pool: &str, name: &str, project: &str) -> String {
+    format!(
+        "/1.0/storage-pools/{}/volumes/custom/{}?project={}",
+        seg(pool),
+        seg(name),
+        seg(project)
+    )
+}
+
+fn instance_path(project: &str, name: &str) -> String {
+    format!("/1.0/instances/{}?project={}", seg(name), seg(project))
 }
 
 /// The words of a row's failing checks, for a blocked plan: `size: <detail>`. A `devices` finding about a custom volume
@@ -420,6 +590,62 @@ fn estimated_downtime(bytes: u64) -> u64 {
     ASSUMED_STOP_START_SECONDS + delta.div_ceil(ASSUMED_RATE)
 }
 
+/// The TCP port of a proxy that listens on every address of its host (`0.0.0.0` or `::`).
+fn wildcard(listen: &str) -> Option<u16> {
+    let rest = listen.strip_prefix("tcp:")?;
+    let (host, port) = rest.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if matches!(host, "0.0.0.0" | "::" | "") {
+        port.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Whether something answers on `host:port`.
+fn answers(host: &str, port: u16) -> bool {
+    (host, port).to_socket_addrs().is_ok_and(|mut found| {
+        found.any(|address: SocketAddr| {
+            TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok()
+        })
+    })
+}
+
+/// Why a move of `refs` under the plan `digest` may not begin now, from the journal: the plan already ran, or another
+/// move that has not ended holds one of the instances. `None` when it may begin.
+fn start_refusal(lines: &[Value], digest: &str, refs: &[(String, String)]) -> Option<CallError> {
+    if lines
+        .iter()
+        .any(|line| line["event"] == "begin" && line["plan"] == digest)
+    {
+        return Some(refused(
+            "AlreadyRun",
+            format!(
+                "this plan already ran as move {}; plan the move again for a new card",
+                Moves::move_id(digest)
+            ),
+        ));
+    }
+    for record in fold(lines)
+        .values()
+        .filter(|record| record.ended_at.is_none())
+    {
+        if let Some(held) = record.instances.iter().find(|one| {
+            refs.iter()
+                .any(|(p, n)| *p == one.project && *n == one.name)
+        }) {
+            return Some(refused(
+                "InstanceMoving",
+                format!(
+                    "{}/{} is in move {}, which has not ended; wait for it, or for the next start to settle it",
+                    held.project, held.name, record.id
+                ),
+            ));
+        }
+    }
+    None
+}
+
 /// What one plan call answers: whether it is a go, the frozen plan, and what blocked it.
 pub struct Planned {
     pub go: bool,
@@ -436,10 +662,13 @@ pub struct Moves {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
     journal: Journal,
+    plans: Plans,
     /// The progress of each running copy, by move, project and name.
     live: Mutex<BTreeMap<(String, String, String), Progress>>,
     /// The moves running in this process.
     running: Mutex<Vec<String>>,
+    /// Held from the checks that refuse a start to its `begin` line, so two starts never both pass them.
+    starting: Mutex<()>,
     poll: Duration,
     verify_wait: Duration,
 }
@@ -451,22 +680,43 @@ struct Progress {
     phase: String,
     /// Bytes of the objects this round already finished.
     done: u64,
-    /// The bytes Incus says it moved of the object it copies now, and its rate.
+    /// The bytes Incus says it moved of the stream it sends now, and its rate.
     processed: Option<u64>,
     speed: Option<u64>,
+}
+
+/// What one instance's run made and did, for its rollback: the uuid of the copy it made on the target, the custom
+/// volumes it made there, whether it stopped the source, and whether it started the copy.
+#[derive(Debug, Clone, Default)]
+struct Made {
+    target_uuid: Option<String>,
+    volumes: Vec<Value>,
+    stopped_source: bool,
+}
+
+/// What the source looked like just before the stop: its file for the spot-check, and the TCP ports of its wildcard
+/// proxies that answered here.
+#[derive(Debug, Clone, Default)]
+struct Before {
+    spot: Option<Vec<u8>>,
+    ports: Vec<u16>,
+    unprobed: Vec<String>,
 }
 
 impl Moves {
     pub fn new(cfg: Arc<NodeConfig>, kernel: Arc<Mutex<Kernel>>, clock: Clock) -> Self {
         let journal = Journal::at(&cfg.state_dir);
+        let plans = Plans::at(&cfg.state_dir);
         Self {
             cfg,
             storage_root: None,
             kernel,
             clock,
             journal,
+            plans,
             live: Mutex::new(BTreeMap::new()),
             running: Mutex::new(Vec::new()),
+            starting: Mutex::new(()),
             poll: Duration::from_secs(2),
             verify_wait: Duration::from_secs(60),
         }
@@ -478,7 +728,8 @@ impl Moves {
         self
     }
 
-    /// The same, polling a running copy every `poll`, and giving the moved copy `verify_wait` to come up.
+    /// The same, polling a running copy every `poll`, and giving the moved copy `verify_wait` to come up (and a failed
+    /// copy's receiving operation as long to end).
     pub fn with_timing(mut self, poll: Duration, verify_wait: Duration) -> Self {
         self.poll = poll;
         self.verify_wait = verify_wait;
@@ -493,9 +744,14 @@ impl Moves {
         (self.clock)()
     }
 
-    fn note(&self, line: Value) {
-        if let Err(error) = self.journal.append(&line) {
-            eprintln!("arca: the move journal could not be written: {error}");
+    /// Appends a journal line; answers whether it was written. The callers that cannot go on without the line stop.
+    fn note(&self, line: Value) -> bool {
+        match self.journal.append(&line) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("arca: the move journal could not be written: {error}");
+                false
+            }
         }
     }
 
@@ -512,6 +768,10 @@ impl Moves {
             .approval_host
             .clone()
             .unwrap_or_else(|| "this node".to_string())
+    }
+
+    fn source(&self) -> MoveWriter {
+        MoveWriter::new(self.cfg.incus.socket.clone())
     }
 
     /// Plans a move: the whole preflight again, then a frozen record for containers that all pass.
@@ -533,40 +793,46 @@ impl Moves {
                 tools: None,
             },
         )?;
-        let source = MoveWriter::new(self.cfg.incus.socket.clone());
+        let source = self.source();
         let target = linked_target(&self.cfg, target_name);
         let target_writer = target
             .as_ref()
             .ok()
             .map(|t| MoveWriter::new(t.socket.clone()));
         let server = target_writer.as_ref().and_then(|w| w.get("/1.0").ok());
-        let (address, certificate) = server.as_ref().map(transport_facts).unwrap_or((None, None));
+        let (addresses, certificate) = server
+            .as_ref()
+            .map(transport_facts)
+            .unwrap_or((Vec::new(), None));
         let mut blocked = Vec::new();
         let mut instances = Vec::new();
         for (index, one) in wanted.iter().enumerate() {
             let row = &preflight["rows"][index];
-            let doc = source
-                .get(&format!(
-                    "/1.0/instances/{}?project={}",
-                    seg(&one.name),
-                    seg(&one.project)
-                ))
-                .ok();
-            let moved: Vec<String> = doc
+            let doc = source.get(&instance_path(&one.project, &one.name)).ok();
+            let volumes = doc
                 .as_ref()
-                .map(|doc| {
-                    volumes_of(&source, &one.project, doc)
-                        .iter()
-                        .filter_map(|volume| volume["device"].as_str().map(str::to_string))
-                        .collect()
-                })
+                .map(|doc| volumes_of(&source, target_writer.as_ref(), &one.project, doc))
                 .unwrap_or_default();
+            let moved: Vec<String> = volumes
+                .iter()
+                .filter_map(|volume| volume["device"].as_str().map(str::to_string))
+                .collect();
             let mut reasons = no_go_reasons(row, &moved);
             if let Some(doc) = &doc {
                 if text(doc, "type") == Some("virtual-machine") {
                     reasons.insert(
                         0,
                         "virtual machines are not movable yet: this build moves containers only; a virtual machine's move (not live first) comes later".to_string(),
+                    );
+                }
+                if doc.get("ephemeral") == Some(&json!(true)) {
+                    reasons.push(
+                        "the container is ephemeral: Incus deletes it when it stops, so the cutover would delete the source; make it non-ephemeral first".to_string(),
+                    );
+                }
+                if uuid_of(doc).is_none() {
+                    reasons.push(
+                        "the container has no volatile.uuid, so the move could not tell it from another of its name".to_string(),
                     );
                 }
                 for (device_name, device) in devices(doc) {
@@ -580,24 +846,25 @@ impl Moves {
                         ));
                     }
                 }
-                if let Some(writer) = &target_writer {
-                    let there = writer.get(&format!(
-                        "/1.0/instances/{}?project={}",
-                        seg(&one.name),
-                        seg(&one.project)
+                // The spot-check file must be there now: a check that could never compare would always pass.
+                if let Err(error) = source.read_file(&one.project, &one.name, &one.spot_check) {
+                    reasons.push(format!(
+                        "the spot-check file {} cannot be read in {}/{} ({error}); name a file the container holds",
+                        one.spot_check, one.project, one.name
                     ));
-                    if there.is_ok() {
+                }
+                if let Some(writer) = &target_writer {
+                    if writer.get(&instance_path(&one.project, &one.name)).is_ok() {
                         reasons.push(format!(
                             "{target_name} already has an instance {}/{}; a move never replaces one",
                             one.project, one.name
                         ));
                     }
-                    for volume in volumes_of(&source, &one.project, doc) {
-                        let found = writer.get(&format!(
-                            "/1.0/storage-pools/{}/volumes/custom/{}?project={}",
-                            seg(volume["pool"].as_str().unwrap_or_default()),
-                            seg(volume["name"].as_str().unwrap_or_default()),
-                            seg(volume["project"].as_str().unwrap_or_default())
+                    for volume in &volumes {
+                        let found = writer.get(&volume_path(
+                            volume["pool"].as_str().unwrap_or_default(),
+                            volume["name"].as_str().unwrap_or_default(),
+                            volume["targetProject"].as_str().unwrap_or_default(),
                         ));
                         if found.is_ok() {
                             reasons.push(format!(
@@ -641,13 +908,20 @@ impl Moves {
                 .cloned()
                 .or_else(|| doc.get("devices").cloned())
                 .unwrap_or(json!({}));
+            let on_volume = volumes.iter().any(|volume| {
+                volume["path"].as_str().is_some_and(|mount| {
+                    one.spot_check
+                        .starts_with(&format!("{}/", mount.trim_end_matches('/')))
+                })
+            });
             instances.push(json!({
                 "project": one.project,
                 "name": one.name,
-                "uuid": doc.pointer("/config/volatile.uuid").and_then(Value::as_str),
+                "uuid": uuid_of(&doc),
                 "type": text(&doc, "type").unwrap_or("container"),
                 "status": text(&doc, "status"),
                 "devicesDigest": digest_of(&expanded),
+                "configDigest": config_digest(&doc),
                 "profiles": doc.get("profiles").cloned().unwrap_or(json!([])),
                 "sourcePool": size["sourcePool"],
                 "targetPool": size["targetPool"],
@@ -661,33 +935,35 @@ impl Moves {
                     "measured": measured,
                     "needed": size["neededBytes"],
                 },
-                "volumes": volumes_of(&source, &one.project, &doc),
+                "volumes": volumes,
                 "rounds": {
                     "preCopy": rounds,
                     "order": (1..=rounds)
                         .map(|round| if round == 1 {
-                            "a full copy while it runs, with its snapshots and custom volumes".to_string()
+                            "a full copy while it runs, not frozen, with its snapshots and custom volumes".to_string()
                         } else {
-                            format!("refresh {} while it runs: only what changed", round - 1)
+                            format!("refresh {} while it runs, not frozen: only what changed", round - 1)
                         })
                         .collect::<Vec<_>>(),
                 },
-                "cutover": ["stop the source", "send the last delta", "start the copy on the target"],
+                "cutover": ["stop the source", "send the last delta, consistent", "start the copy on the target"],
                 "verify": [
-                    "the copy runs",
+                    "the copy runs, and still runs after the checks",
                     "each network card that had an address has one",
-                    "a proxy's port answers",
+                    "each TCP proxy on every address that answered here answers on the target",
                     "each custom volume is attached",
                     format!("the file {} is the same on both", one.spot_check),
                 ],
                 "spotCheck": one.spot_check,
+                "spotCheckOnVolume": on_volume,
                 "estimatedDowntimeSeconds": estimated_downtime(measured),
             }));
         }
-        let transport = match (&address, &certificate) {
+        let transport = match (addresses.first(), &certificate) {
             (Some(address), Some(certificate)) => json!({
                 "mode": "push",
                 "address": address,
+                "addresses": addresses,
                 "certificateFingerprint": Digest::of(certificate.as_bytes()).to_hex(),
                 "fallback": "relay",
                 "fallbackAvailable": false,
@@ -695,6 +971,7 @@ impl Moves {
             _ => json!({
                 "mode": "relay",
                 "address": null,
+                "addresses": [],
                 "certificateFingerprint": null,
                 "fallback": "relay",
                 "fallbackAvailable": false,
@@ -729,7 +1006,7 @@ impl Moves {
             .map(|t| t.socket.display().to_string())
             .unwrap_or_default();
         let mut plan = json!({
-            "version": 1,
+            "version": 2,
             "source": { "node": self.source_name(), "incusSocket": self.cfg.incus.socket.display().to_string() },
             "target": { "name": target_name, "incusSocket": socket },
             "credential": format!("Arca writes to {target_name}'s Incus through the linked host's incusSocket {socket}, which the owner configured"),
@@ -767,7 +1044,7 @@ impl Moves {
                     instance["name"].as_str().unwrap_or("?")
                 ),
                 format!(
-                    "needs {} on {target}'s pool {}{}; {rounds} copy round(s) while it runs, then the stop, the last delta and the start; downtime about {} s (an estimate: the move measures the real one)",
+                    "needs {} on {target}'s pool {}{}; {rounds} copy round(s) while it runs, not frozen, then the stop, the last delta and the start; downtime about {} s (an estimate: the move measures the real one)",
                     human(needed),
                     instance["targetPool"].as_str().unwrap_or("?"),
                     if volumes == 0 {
@@ -784,7 +1061,14 @@ impl Moves {
             match plan["transport"]["mode"].as_str() {
                 Some("push") => format!(
                     "Incus on this host pushes to {target}'s Incus at {}",
-                    plan["transport"]["address"].as_str().unwrap_or("?")
+                    plan["transport"]["addresses"]
+                        .as_array()
+                        .map(|list| list
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", then "))
+                        .unwrap_or_default()
                 ),
                 _ => "a relay through this kernel (not available yet)".to_string(),
             },
@@ -796,7 +1080,7 @@ impl Moves {
         rows.push(("Rollback".to_string(), ROLLBACK_PROMISE.to_string()));
         rows.push((
             "Source".to_string(),
-            "kept, stopped, on this host after a verified move: it is deleted only when you finish the move".to_string(),
+            "kept, stopped, with boot.autostart off, on this host after a verified move: it is deleted only when you finish the move".to_string(),
         ));
         rows
     }
@@ -811,7 +1095,7 @@ impl Moves {
     }
 
     fn move_id(digest: &str) -> String {
-        format!("mv-{}", &digest[..12])
+        format!("mv-{}", &digest[..12.min(digest.len())])
     }
 
     /// What has changed between the approved plan and the one the node makes now: each difference in words.
@@ -819,9 +1103,9 @@ impl Moves {
         let mut out = Vec::new();
         if approved["transport"]["certificateFingerprint"]
             != fresh["transport"]["certificateFingerprint"]
-            || approved["transport"]["address"] != fresh["transport"]["address"]
+            || approved["transport"]["addresses"] != fresh["transport"]["addresses"]
         {
-            out.push("the target's Incus address or certificate".to_string());
+            out.push("the target's Incus addresses or certificate".to_string());
         }
         if approved["target"]["incusSocket"] != fresh["target"]["incusSocket"] {
             out.push("the target's incusSocket".to_string());
@@ -839,8 +1123,11 @@ impl Moves {
                 ("uuid", "its uuid (it is not the same instance)"),
                 ("type", "its type"),
                 ("devicesDigest", "its devices"),
+                ("configDigest", "its config"),
+                ("profiles", "its profiles"),
                 ("volumes", "its custom volumes"),
                 ("targetPool", "the target pool"),
+                ("spotCheckOnVolume", "where its spot-check file lives"),
             ] {
                 if a[key] != b[key] {
                     out.push(format!("{label}: {words}"));
@@ -859,14 +1146,14 @@ impl Moves {
         out
     }
 
-    /// The moves running in this process to `target`, and the bytes each instance of them may still land on each pool.
-    fn pending_on(&self, target: &str) -> BTreeMap<String, u64> {
+    /// The bytes the moves running in this process to `target` may still land, per pool.
+    fn pending_on(&self, lines: &[Value], target: &str) -> BTreeMap<String, u64> {
         let running = self.running.lock().map(|r| r.clone()).unwrap_or_default();
         let mut out = BTreeMap::new();
         if running.is_empty() {
             return out;
         }
-        let records = fold(&self.journal.lines());
+        let records = fold(lines);
         for id in running {
             let Some(record) = records.get(&id) else {
                 continue;
@@ -888,15 +1175,12 @@ impl Moves {
     fn start(self: &Arc<Self>, plan: Value, proposal: Option<String>) -> Result<Value, CallError> {
         let digest = plan["digest"].as_str().unwrap_or_default().to_string();
         let id = Self::move_id(&digest);
+        let refs = refs_pairs(&plan);
+        // From here to the `begin` line no other start passes these checks.
+        let _starting = self.starting.lock().map_err(|_| internal())?;
         let lines = self.journal.lines();
-        if lines
-            .iter()
-            .any(|line| line["event"] == "begin" && line["plan"] == digest.as_str())
-        {
-            return Err(refused(
-                "AlreadyRun",
-                format!("this plan already ran as move {id}; plan the move again for a new card"),
-            ));
+        if let Some(refusal) = start_refusal(&lines, &digest, &refs) {
+            return Err(refusal);
         }
         let target_name = plan["target"]["name"]
             .as_str()
@@ -957,7 +1241,7 @@ impl Moves {
             ));
         }
         // The target's room, less what the moves running now may still land there.
-        let pending = self.pending_on(&target_name);
+        let pending = self.pending_on(&lines, &target_name);
         if !pending.is_empty() {
             let mut need: BTreeMap<String, u64> = BTreeMap::new();
             for one in fresh_plan["instances"].as_array().into_iter().flatten() {
@@ -985,24 +1269,14 @@ impl Moves {
             }
         }
         let now = self.now();
-        let source = MoveWriter::new(self.cfg.incus.socket.clone());
         let instances: Vec<Value> = plan["instances"]
             .as_array()
             .into_iter()
             .flatten()
             .map(|one| {
-                let running = source
-                    .get(&format!(
-                        "/1.0/instances/{}?project={}",
-                        seg(one["name"].as_str().unwrap_or_default()),
-                        seg(one["project"].as_str().unwrap_or_default())
-                    ))
-                    .ok()
-                    .and_then(|doc| doc.get("status").cloned())
-                    == Some(json!("Running"));
                 json!({
-                    "project": one["project"], "name": one["name"],
-                    "wasRunning": running,
+                    "project": one["project"], "name": one["name"], "uuid": one["uuid"],
+                    "status": one["status"],
                     "roundsTotal": one["rounds"]["preCopy"].as_u64().unwrap_or(0) + 1,
                     "bytesTotal": one["bytes"]["measured"],
                     "needed": one["bytes"]["needed"],
@@ -1011,10 +1285,18 @@ impl Moves {
                 })
             })
             .collect();
-        self.note(json!({
-            "event": "begin", "at": now, "move": id, "plan": digest, "target": target_name,
-            "proposal": proposal, "instances": instances,
-        }));
+        // Without its plan and begin lines in the journal a move cannot be settled after a stop: it does not begin.
+        let written = self.note(json!({ "event": "plan", "at": now, "move": id, "plan": plan }))
+            && self.note(json!({
+                "event": "begin", "at": now, "move": id, "plan": digest, "target": target_name,
+                "proposal": proposal, "instances": instances,
+            }));
+        if !written {
+            return Err(refused(
+                "JournalUnwritable",
+                "the move journal could not be written, so the move did not begin and nothing moved",
+            ));
+        }
         if let Ok(mut running) = self.running.lock() {
             running.push(id.clone());
         }
@@ -1022,9 +1304,12 @@ impl Moves {
         let (thread_id, thread_plan) = (id.clone(), plan.clone());
         let spawned = std::thread::Builder::new()
             .name(format!("arca-{id}"))
-            .spawn(move || moves.run(&thread_id, &thread_plan, &instances, proposal));
+            .spawn(move || moves.run(&thread_id, &thread_plan, proposal));
         if spawned.is_err() {
             self.note(json!({ "event": "end", "at": self.now(), "move": id, "reason": "the move's thread could not start" }));
+            if let Ok(mut running) = self.running.lock() {
+                running.retain(|running| *running != id);
+            }
             return Err(internal());
         }
         Ok(json!({
@@ -1040,37 +1325,38 @@ impl Moves {
     }
 
     /// The whole run, one instance after the other. A failed instance is rolled back and the next one still moves.
-    fn run(&self, id: &str, plan: &Value, begun: &[Value], proposal: Option<String>) {
-        let mut moved = 0usize;
-        for (index, one) in plan["instances"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            let was_running = begun
-                .get(index)
-                .is_some_and(|row| row["wasRunning"] == true);
-            if self.move_one(id, plan, one, was_running) {
-                moved += 1;
-            }
+    fn run(&self, id: &str, plan: &Value, proposal: Option<String>) {
+        let mut results = Vec::new();
+        for one in plan["instances"].as_array().into_iter().flatten() {
+            results.push(self.move_one(id, plan, one));
         }
-        let total = plan["instances"].as_array().map_or(0, Vec::len);
+        let moved = results.iter().filter(|result| **result == "moved").count();
+        let total = results.len();
         self.note(
             json!({ "event": "end", "at": self.now(), "move": id, "moved": moved, "of": total }),
         );
         if let Ok(mut running) = self.running.lock() {
             running.retain(|running| running != id);
         }
-        if let (Some(proposal), Ok(mut kernel)) = (proposal, self.kernel.lock()) {
-            let code = if moved == total {
-                "MoveVerified"
-            } else if moved == 0 {
-                "MoveRolledBack"
-            } else {
-                "MovePartlyRolledBack"
-            };
-            kernel.journal_late_result(&proposal, moved == total, code);
+        self.late_result(proposal.as_deref(), &results);
+    }
+
+    fn late_result(&self, proposal: Option<&str>, results: &[&str]) {
+        let Some(proposal) = proposal else {
+            return;
+        };
+        let moved = results.iter().filter(|result| **result == "moved").count();
+        let code = if results.contains(&"failed") {
+            "MoveNeedsOwner"
+        } else if moved == results.len() {
+            "MoveVerified"
+        } else if moved == 0 {
+            "MoveRolledBack"
+        } else {
+            "MovePartlyRolledBack"
+        };
+        if let Ok(mut kernel) = self.kernel.lock() {
+            kernel.journal_late_result(proposal, moved == results.len(), code);
         }
     }
 
@@ -1089,8 +1375,8 @@ impl Moves {
         }
     }
 
-    /// Moves one instance; answers whether it moved and passed its checks.
-    fn move_one(&self, id: &str, plan: &Value, one: &Value, was_running: bool) -> bool {
+    /// Moves one instance; answers its result: `moved`, `rolled_back` or `failed`.
+    fn move_one(&self, id: &str, plan: &Value, one: &Value) -> &'static str {
         let project = one["project"].as_str().unwrap_or_default().to_string();
         let name = one["name"].as_str().unwrap_or_default().to_string();
         let target_name = plan["target"]["name"].as_str().unwrap_or_default();
@@ -1101,44 +1387,59 @@ impl Moves {
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
                     "result": "failed", "downtimeMs": null, "reason": why,
                 }));
-                return false;
+                return "failed";
             }
         };
-        let source = MoveWriter::new(self.cfg.incus.socket.clone());
+        let source = self.source();
         let dest = MoveWriter::new(target.socket.clone());
-        let mut stopped = false;
-        let outcome = self.attempt(id, plan, one, &source, &dest, was_running, &mut stopped);
+        let mut made = Made::default();
+        let outcome = self.attempt(id, plan, one, &source, &dest, &mut made);
         self.clear_live(id, &project, &name);
         match outcome {
             Ok(downtime) => {
+                // A kept source must not come back by itself on a reboot of this host, next to its copy.
+                let autostart_off = source.disable_autostart(&project, &name).is_ok();
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
                     "result": "moved", "downtimeMs": downtime, "reason": null,
+                    "targetUuid": made.target_uuid, "autostartOff": autostart_off,
                 }));
-                true
+                "moved"
             }
             Err(reason) => {
                 self.set_live(id, &project, &name, |progress| {
                     progress.phase = "rolling_back".to_string();
                 });
-                let rollback = rollback(&source, &dest, one, was_running);
+                let rolled = rollback(&source, &dest, one, &made, target_name);
                 self.clear_live(id, &project, &name);
                 self.note(json!({
                     "event": "rollback", "at": self.now(), "move": id, "project": project, "name": name,
-                    "reason": reason, "targetRemoved": rollback.target_removed,
-                    "sourceRunning": rollback.source_running, "detail": rollback.detail,
+                    "reason": reason, "sourceIntact": rolled.source_intact,
+                    "targetRemoved": rolled.target_removed, "sourceRunning": rolled.source_running,
+                    "detail": rolled.detail,
                 }));
+                let (result, reason) = if rolled.clean {
+                    ("rolled_back", reason)
+                } else {
+                    (
+                        "failed",
+                        format!(
+                            "{reason}; the rollback did not finish, so the owner decides: {}",
+                            rolled.detail.join("; ")
+                        ),
+                    )
+                };
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
-                    "result": "rolled_back", "downtimeMs": null, "reason": reason,
+                    "result": result, "downtimeMs": null, "reason": reason,
                 }));
-                false
+                result
             }
         }
     }
 
-    /// The rounds, the cutover and the checks. Answers the measured downtime in milliseconds, or why it failed.
-    #[allow(clippy::too_many_arguments)]
+    /// The rounds, the cutover and the checks. Answers the measured downtime in milliseconds, or why it failed. `made`
+    /// collects what the run made and did, for the rollback.
     fn attempt(
         &self,
         id: &str,
@@ -1146,8 +1447,7 @@ impl Moves {
         one: &Value,
         source: &MoveWriter,
         dest: &MoveWriter,
-        was_running: bool,
-        stopped: &mut bool,
+        made: &mut Made,
     ) -> Result<u64, String> {
         let project = one["project"].as_str().unwrap_or_default();
         let name = one["name"].as_str().unwrap_or_default();
@@ -1158,8 +1458,8 @@ impl Moves {
         let server = dest
             .get("/1.0")
             .map_err(|error| format!("{target_name}'s Incus could not be read: {error}"))?;
-        let (address, certificate) = transport_facts(&server);
-        let (Some(address), Some(certificate)) = (address, certificate) else {
+        let (addresses, certificate) = transport_facts(&server);
+        let Some(certificate) = certificate.filter(|_| !addresses.is_empty()) else {
             return Err(format!(
                 "{target_name}'s Incus no longer listens on the network, so this host cannot push to it"
             ));
@@ -1171,106 +1471,206 @@ impl Moves {
                 "{target_name}'s Incus certificate is not the one the plan named"
             ));
         }
+        let mut addresses = addresses;
         let needed = one["bytes"]["needed"].as_u64().unwrap_or(0);
         let headroom = needed.saturating_sub(one["bytes"]["measured"].as_u64().unwrap_or(0));
-        let instance_path = format!("/1.0/instances/{}?project={}", seg(name), seg(project));
         let addressed = nics_with_addresses(source, project, name);
-        for round in 1..=total_rounds {
-            let last = round == total_rounds;
-            if last {
-                // The cutover: the source stops here, and the downtime runs from now.
-                let began = Instant::now();
-                self.set_live(id, project, name, |progress| {
-                    progress.phase = "cutover".to_string();
-                    progress.round = round;
-                });
-                if was_running {
-                    stop(source, project, name)?;
-                }
-                *stopped = true;
-                self.note(json!({
-                    "event": "cutover", "at": self.now(), "move": id, "project": project, "name": name,
-                    "step": "stopped", "wasRunning": was_running,
-                }));
-                self.check_room(
-                    dest,
-                    pool,
-                    if round == 1 { needed } else { headroom },
-                    target_name,
-                )?;
-                self.copy_round(
-                    id,
-                    one,
-                    source,
-                    dest,
-                    &address,
-                    &certificate,
-                    round,
-                    total_rounds,
-                )?;
-                dest.set_state(project, name, "start", false, START_DEADLINE)
-                    .map_err(|error| format!("the copy on {target_name} did not start: {error}"))?;
-                self.note(json!({
-                    "event": "cutover", "at": self.now(), "move": id, "project": project, "name": name,
-                    "step": "started", "elapsedMs": began.elapsed().as_millis() as u64,
-                }));
-                self.set_live(id, project, name, |progress| {
-                    progress.phase = "verifying".to_string()
-                });
-                let checks = self.verify(source, dest, one, &address, &addressed);
-                let ok = checks.iter().all(|check| check["ok"] == true);
-                let downtime = began.elapsed().as_millis() as u64;
-                self.note(json!({
-                    "event": "verify", "at": self.now(), "move": id, "project": project, "name": name,
-                    "ok": ok, "checks": checks, "downtimeMs": if ok { json!(downtime) } else { Value::Null },
-                }));
-                if !ok {
-                    let failing: Vec<String> = checks
-                        .iter()
-                        .filter(|check| check["ok"] == false)
-                        .map(|check| {
-                            format!(
-                                "{}: {}",
-                                check["check"].as_str().unwrap_or("?"),
-                                check["detail"].as_str().unwrap_or("not ok")
-                            )
-                        })
-                        .collect();
-                    return Err(format!(
-                        "the copy on {target_name} did not pass its checks: {}",
-                        failing.join("; ")
-                    ));
-                }
-                return Ok(downtime);
-            }
-            self.check_room(
-                dest,
-                pool,
-                if round == 1 { needed } else { headroom },
-                target_name,
-            )?;
+        let round_room = |round: u64| if round == 1 { needed } else { headroom };
+        // The rounds while it runs, not frozen.
+        for round in 1..=pre {
+            self.check_room(dest, pool, round_room(round), target_name)?;
             self.copy_round(
                 id,
                 one,
-                source,
-                dest,
-                &address,
+                (source, dest),
+                &mut addresses,
                 &certificate,
-                round,
-                total_rounds,
+                (round, total_rounds),
+                made,
             )?;
-            if round == 1 {
-                let uuid = dest
-                    .get(&instance_path)
-                    .ok()
-                    .and_then(|doc| doc.pointer("/config/volatile.uuid").cloned());
-                self.note(json!({
+        }
+        // The cutover. Whether the source runs is read now, not at the begin: it may have been started or stopped
+        // during the rounds.
+        let round = total_rounds;
+        self.set_live(id, project, name, |progress| {
+            progress.phase = "cutover".to_string();
+            progress.round = round;
+        });
+        let status = source
+            .get(&instance_path(project, name))
+            .ok()
+            .and_then(|doc| text(&doc, "status").map(str::to_string))
+            .ok_or_else(|| "the source could not be read at the cutover".to_string())?;
+        let before = self.before_stop(source, one);
+        let began = Instant::now();
+        if status == "Running" {
+            stop(source, project, name)?;
+            made.stopped_source = true;
+        }
+        if !self.note(json!({
+            "event": "cutover", "at": self.now(), "move": id, "project": project, "name": name,
+            "step": "stopped", "wasRunning": made.stopped_source,
+        })) {
+            return Err(
+                "the move journal could not record the stop, so the move stops here".to_string(),
+            );
+        }
+        self.check_room(dest, pool, round_room(round), target_name)?;
+        self.copy_round(
+            id,
+            one,
+            (source, dest),
+            &mut addresses,
+            &certificate,
+            (round, total_rounds),
+            made,
+        )?;
+        if made.target_uuid.is_none() {
+            return Err(
+                "the copy on the target was never recorded, so it is not started".to_string(),
+            );
+        }
+        if !self.note(json!({
+            "event": "cutover", "at": self.now(), "move": id, "project": project, "name": name,
+            "step": "starting",
+        })) {
+            return Err(
+                "the move journal could not record the start of the copy, so the copy was not started".to_string(),
+            );
+        }
+        dest.set_state(project, name, "start", false, START_DEADLINE)
+            .map_err(|error| format!("the copy on {target_name} did not start: {error}"))?;
+        self.note(json!({
+            "event": "cutover", "at": self.now(), "move": id, "project": project, "name": name,
+            "step": "started", "elapsedMs": began.elapsed().as_millis() as u64,
+        }));
+        self.set_live(id, project, name, |progress| {
+            progress.phase = "verifying".to_string()
+        });
+        let target_host = addresses
+            .first()
+            .and_then(|address| address.rsplit_once(':'))
+            .map(|(host, _)| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let checks = self.verify(source, dest, one, &target_host, &addressed, &before);
+        let ok = checks.iter().all(|check| check["ok"] == true);
+        let downtime = began.elapsed().as_millis() as u64;
+        let verified = self.note(json!({
+            "event": "verify", "at": self.now(), "move": id, "project": project, "name": name,
+            "ok": ok, "checks": checks, "downtimeMs": if ok { json!(downtime) } else { Value::Null },
+            "targetUuid": made.target_uuid,
+        }));
+        if !ok {
+            let failing: Vec<String> = checks
+                .iter()
+                .filter(|check| check["ok"] == false)
+                .map(|check| {
+                    format!(
+                        "{}: {}",
+                        check["check"].as_str().unwrap_or("?"),
+                        check["detail"].as_str().unwrap_or("not ok")
+                    )
+                })
+                .collect();
+            return Err(format!(
+                "the copy on {target_name} did not pass its checks: {}",
+                failing.join("; ")
+            ));
+        }
+        if !verified {
+            return Err("the move journal could not record the passed checks".to_string());
+        }
+        Ok(downtime)
+    }
+
+    /// Records an object the first round made on the target, as soon as it landed: the copy's uuid, or a custom
+    /// volume's. The run does not go on without this line: a rollback, now or after a stop of the kernel, deletes on the
+    /// target only what these lines name.
+    fn record(
+        &self,
+        id: &str,
+        one: &Value,
+        dest: &MoveWriter,
+        made: &mut Made,
+        volume: Option<&Value>,
+    ) -> Result<(), String> {
+        let project = one["project"].as_str().unwrap_or_default();
+        let name = one["name"].as_str().unwrap_or_default();
+        let line = match volume {
+            Some(volume) => {
+                let doc = dest
+                    .get(&volume_path(
+                        volume["pool"].as_str().unwrap_or_default(),
+                        volume["name"].as_str().unwrap_or_default(),
+                        volume["targetProject"].as_str().unwrap_or("default"),
+                    ))
+                    .ok();
+                let made_volume = json!({
+                    "pool": volume["pool"], "name": volume["name"], "project": volume["targetProject"],
+                    "uuid": doc.as_ref().and_then(uuid_of),
+                });
+                made.volumes.push(made_volume.clone());
+                json!({
                     "event": "created", "at": self.now(), "move": id, "project": project, "name": name,
-                    "targetUuid": uuid,
-                }));
+                    "volume": made_volume,
+                })
+            }
+            None => {
+                made.target_uuid = dest
+                    .get(&instance_path(project, name))
+                    .ok()
+                    .as_ref()
+                    .and_then(uuid_of);
+                if made.target_uuid.is_none() {
+                    return Err("the copy on the target has no uuid to record".to_string());
+                }
+                json!({
+                    "event": "created", "at": self.now(), "move": id, "project": project, "name": name,
+                    "targetUuid": made.target_uuid,
+                })
+            }
+        };
+        if self.note(line) {
+            Ok(())
+        } else {
+            Err(
+                "the move journal could not record the copy it made, so the move stops here"
+                    .to_string(),
+            )
+        }
+    }
+
+    /// What the source looks like just before its stop: its spot-check file (a file on a custom volume can be read only
+    /// while it runs) and the TCP ports of its proxies on every address that answer on this host.
+    fn before_stop(&self, source: &MoveWriter, one: &Value) -> Before {
+        let project = one["project"].as_str().unwrap_or_default();
+        let name = one["name"].as_str().unwrap_or_default();
+        let path = one["spotCheck"].as_str().unwrap_or(DEFAULT_SPOT_CHECK);
+        let mut before = Before {
+            spot: source.read_file(project, name, path).ok(),
+            ..Before::default()
+        };
+        let doc = source.get(&instance_path(project, name)).ok();
+        for (device_name, device) in doc.as_ref().map(devices).unwrap_or_default() {
+            if text(&device, "type") != Some("proxy") {
+                continue;
+            }
+            let listen = text(&device, "listen").unwrap_or("?");
+            match wildcard(listen) {
+                Some(port) if answers("127.0.0.1", port) => before.ports.push(port),
+                Some(port) => before.unprobed.push(format!(
+                    "{device_name} ({port} did not answer here before the stop)"
+                )),
+                None => before.unprobed.push(format!(
+                    "{device_name} (listens on {listen}, not on every address)"
+                )),
             }
         }
-        Err("the move ended without a cutover".to_string())
+        before
     }
 
     /// Refuses a round when the target pool has less room than it may take.
@@ -1293,23 +1693,24 @@ impl Moves {
         Ok(())
     }
 
-    /// One round: each custom volume, then the instance, pushed by the source's Incus to the target's. Journals the
-    /// round with what it moved, its rate, how long it took and the time left.
+    /// One round: each custom volume, then the instance, pushed by the source's Incus to the target's. The rounds while
+    /// it runs do not freeze it; the last one, after the stop, is consistent. Journals the round with what it moved, its
+    /// rate, how long it took and the time left.
     #[allow(clippy::too_many_arguments)]
     fn copy_round(
         &self,
         id: &str,
         one: &Value,
-        source: &MoveWriter,
-        dest: &MoveWriter,
-        address: &str,
+        (source, dest): (&MoveWriter, &MoveWriter),
+        addresses: &mut Vec<String>,
         certificate: &str,
-        round: u64,
-        of: u64,
+        (round, of): (u64, u64),
+        made: &mut Made,
     ) -> Result<(), String> {
         let project = one["project"].as_str().unwrap_or_default();
         let name = one["name"].as_str().unwrap_or_default();
         let refresh = round > 1;
+        let last = round == of;
         let started = Instant::now();
         self.set_live(id, project, name, |progress| {
             progress.round = round;
@@ -1324,37 +1725,32 @@ impl Moves {
         for volume in one["volumes"].as_array().into_iter().flatten() {
             let pool = volume["pool"].as_str().unwrap_or_default();
             let volume_name = volume["name"].as_str().unwrap_or_default();
-            let volume_project = volume["project"].as_str().unwrap_or("default");
+            let here = volume["project"].as_str().unwrap_or("default");
+            let there = volume["targetProject"].as_str().unwrap_or(here);
             let what = format!("the custom volume {pool}/{volume_name}");
             let doc = source
-                .get(&format!(
-                    "/1.0/storage-pools/{}/volumes/custom/{}?project={}",
-                    seg(pool),
-                    seg(volume_name),
-                    seg(volume_project)
-                ))
+                .get(&volume_path(pool, volume_name, here))
                 .map_err(|error| format!("{what} could not be read here: {error}"))?;
             let receive = dest
-                .receive_volume(volume_project, pool, volume_name, &doc, refresh)
+                .receive_volume(there, pool, volume_name, &doc, refresh)
                 .map_err(|error| format!("the target did not take {what}: {error}"))?;
-            let to = PushTarget {
-                address,
-                certificate,
-                receive: &receive,
-            };
-            let push = source
-                .push_volume(volume_project, pool, volume_name, &to)
-                .map_err(|error| format!("this host did not push {what}: {error}"))?;
-            moved += self.follow(
-                id,
-                project,
-                name,
+            let push = |to: &PushTarget| source.push_volume(here, pool, volume_name, to);
+            let landed =
+                |dest: &MoveWriter| dest.get(&volume_path(pool, volume_name, there)).is_ok();
+            moved += self.push_to(
+                (id, project, name),
                 source,
                 dest,
-                &push,
-                &receive.operation,
+                addresses,
+                certificate,
+                &receive,
                 &what,
+                push,
+                landed,
             )?;
+            if !refresh {
+                self.record(id, one, dest, made, Some(volume))?;
+            }
             self.set_live(id, project, name, |progress| {
                 progress.done = moved;
                 progress.processed = None;
@@ -1362,56 +1758,117 @@ impl Moves {
         }
         let what = format!("the container {project}/{name}");
         let doc = source
-            .get(&format!(
-                "/1.0/instances/{}?project={}",
-                seg(name),
-                seg(project)
-            ))
+            .get(&instance_path(project, name))
             .map_err(|error| format!("{what} could not be read here: {error}"))?;
         let receive = dest
             .receive_instance(project, name, &doc, refresh)
             .map_err(|error| format!("the target did not take {what}: {error}"))?;
-        let to = PushTarget {
-            address,
-            certificate,
-            receive: &receive,
-        };
-        let push = source
-            .push_instance(project, name, &to)
-            .map_err(|error| format!("this host did not push {what}: {error}"))?;
-        moved += self.follow(
-            id,
-            project,
-            name,
+        let push = |to: &PushTarget| source.push_instance(project, name, to, last);
+        let landed = |dest: &MoveWriter| dest.get(&instance_path(project, name)).is_ok();
+        moved += self.push_to(
+            (id, project, name),
             source,
             dest,
-            &push,
-            &receive.operation,
+            addresses,
+            certificate,
+            &receive,
             &what,
+            push,
+            landed,
         )?;
+        if !refresh {
+            self.record(id, one, dest, made, None)?;
+        }
         let elapsed = started.elapsed().as_millis() as u64;
         let rate = (elapsed > 0).then(|| moved.saturating_mul(1000) / elapsed.max(1));
         self.note(json!({
             "event": "round", "at": self.now(), "move": id, "project": project, "name": name,
-            "round": round, "of": of, "refresh": refresh, "final": round == of,
+            "round": round, "of": of, "refresh": refresh, "final": last,
             "bytes": moved, "elapsedMs": elapsed, "rateBytesPerSecond": rate,
-            "timeLeftMs": if round == of { json!(0) } else { Value::Null },
+            "timeLeftMs": if last { json!(0) } else { Value::Null },
         }));
         Ok(())
     }
 
-    /// Follows one push to its end, keeping its progress readable, and then the target's receiving side. Answers the
-    /// bytes Incus says it moved (0 when it did not say).
+    /// Pushes one object to its receiving operation, trying each of the target's addresses in order, as Incus's own
+    /// client does: an address that does not connect leaves the receiving operation waiting, and the next one is tried.
+    /// The address that worked goes first for the next objects. Answers the bytes Incus said it moved. On a failure it
+    /// waits for the receiving operation to end before answering, so a rollback never deletes what an operation still
+    /// holds.
     #[allow(clippy::too_many_arguments)]
-    fn follow(
+    fn push_to(
         &self,
-        id: &str,
-        project: &str,
-        name: &str,
+        who: (&str, &str, &str),
         source: &MoveWriter,
         dest: &MoveWriter,
+        addresses: &mut Vec<String>,
+        certificate: &str,
+        receive: &Receive,
+        what: &str,
+        push: impl Fn(&PushTarget) -> Result<String, IncusError>,
+        landed: impl Fn(&MoveWriter) -> bool,
+    ) -> Result<u64, String> {
+        let mut failures = Vec::new();
+        for (index, address) in addresses.clone().iter().enumerate() {
+            let to = PushTarget {
+                address,
+                certificate,
+                receive,
+            };
+            let outcome = match push(&to) {
+                Ok(operation) => self.follow_push(who, source, &operation, what),
+                Err(error) => Err(format!("this host did not push {what}: {error}")),
+            };
+            match outcome {
+                Ok(bytes) => {
+                    self.follow_receive(dest, &receive.operation, what, &landed)?;
+                    if index > 0 {
+                        let worked = addresses.remove(index);
+                        addresses.insert(0, worked);
+                    }
+                    return Ok(bytes);
+                }
+                Err(error) => {
+                    failures.push(format!("{address}: {error}"));
+                    // The receiving side still waits: the push never reached it, so the next address may.
+                    if matches!(
+                        dest.wait(&receive.operation, Duration::from_millis(1)),
+                        Ok(OpState::Running(_))
+                    ) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        self.settle(dest, &receive.operation);
+        Err(format!(
+            "the push of {what} failed: {}",
+            failures.join("; ")
+        ))
+    }
+
+    /// Waits, at most the verify wait, for a receiving operation to end.
+    fn settle(&self, dest: &MoveWriter, operation: &str) {
+        let until = Instant::now() + self.verify_wait;
+        while Instant::now() < until {
+            match dest.wait(operation, self.poll) {
+                Ok(OpState::Running(_)) => {
+                    std::thread::sleep(self.poll.min(Duration::from_millis(200)))
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Follows the source's push to its end, keeping its progress readable. Answers the bytes Incus said it moved (0
+    /// when it did not say). An operation Incus no longer knows is not taken as a success here: the receiving side
+    /// decides.
+    fn follow_push(
+        &self,
+        (id, project, name): (&str, &str, &str),
+        source: &MoveWriter,
         push: &str,
-        receiving: &str,
         what: &str,
     ) -> Result<u64, String> {
         let until = Instant::now() + ROUND_DEADLINE;
@@ -1432,9 +1889,9 @@ impl Moves {
                     if let (Some(processed), _) = progress_of(&operation) {
                         bytes = processed;
                     }
-                    break;
+                    return Ok(bytes);
                 }
-                Ok(OpState::Gone) => break,
+                Ok(OpState::Gone) => return Ok(bytes),
                 Ok(OpState::Failed(message)) => {
                     return Err(format!("the push of {what} failed: {message}"));
                 }
@@ -1447,9 +1904,27 @@ impl Moves {
             }
             std::thread::sleep(self.poll.min(Duration::from_millis(500)));
         }
+    }
+
+    /// Follows the target's receiving operation to its end. An operation Incus no longer knows counts only when the
+    /// object is read back on the target.
+    fn follow_receive(
+        &self,
+        dest: &MoveWriter,
+        receiving: &str,
+        what: &str,
+        landed: &impl Fn(&MoveWriter) -> bool,
+    ) -> Result<(), String> {
+        let until = Instant::now() + ROUND_DEADLINE;
         loop {
             match dest.wait(receiving, self.poll) {
-                Ok(OpState::Done(_) | OpState::Gone) => return Ok(bytes),
+                Ok(OpState::Done(_)) => return Ok(()),
+                Ok(OpState::Gone) if landed(dest) => return Ok(()),
+                Ok(OpState::Gone) => {
+                    return Err(format!(
+                        "the target no longer knows the operation that took {what}, and it is not there"
+                    ));
+                }
                 Ok(OpState::Running(_)) if Instant::now() < until => {}
                 Ok(OpState::Running(_)) => {
                     return Err(format!("the target did not finish taking {what}"));
@@ -1472,8 +1947,9 @@ impl Moves {
         source: &MoveWriter,
         dest: &MoveWriter,
         one: &Value,
-        address: &str,
+        target_host: &str,
         addressed: &[String],
+        before: &Before,
     ) -> Vec<Value> {
         let project = one["project"].as_str().unwrap_or_default();
         let name = one["name"].as_str().unwrap_or_default();
@@ -1484,14 +1960,13 @@ impl Moves {
             seg(name),
             seg(project)
         );
-        let instance_path = format!("/1.0/instances/{}?project={}", seg(name), seg(project));
-        // Running now; the check is written last, when the copy is read again after the others.
-        let state = dest.get(&state_path).ok();
-        let first = state
-            .as_ref()
-            .and_then(|state| text(state, "status"))
-            .unwrap_or("not readable")
-            .to_string();
+        let path_of = instance_path(project, name);
+        // Running now; the check is written first, once the copy is read again after the others.
+        let first = dest
+            .get(&state_path)
+            .ok()
+            .and_then(|state| text(&state, "status").map(str::to_string))
+            .unwrap_or_else(|| "not readable".to_string());
         // Each card that had an address has one again.
         let mut missing: Vec<String> = addressed.to_vec();
         loop {
@@ -1513,36 +1988,13 @@ impl Moves {
                 format!("no address on {} after {} s", missing.join(", "), self.verify_wait.as_secs())
             },
         }));
-        // Ports: each TCP proxy of the copy answers on the target host.
-        let doc = dest.get(&instance_path).ok();
-        let host = address
-            .rsplit_once(':')
-            .map(|(host, _)| {
-                host.trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_string()
-            })
-            .unwrap_or_default();
-        let ports: Vec<u16> = doc
-            .as_ref()
-            .map(devices)
-            .unwrap_or_default()
-            .iter()
-            .filter(|(_, device)| text(device, "type") == Some("proxy"))
-            .filter_map(|(_, device)| {
-                let listen = text(device, "listen")?;
-                let rest = listen.strip_prefix("tcp:")?;
-                rest.rsplit_once(':')?.1.parse().ok()
-            })
-            .collect();
+        // Ports: each TCP proxy on every address that answered on this host before the stop answers on the target.
         let mut closed = Vec::new();
-        for port in &ports {
+        for port in &before.ports {
             let mut open = false;
             loop {
-                if let Ok(mut found) = (host.as_str(), *port).to_socket_addrs() {
-                    open = found.any(|address: SocketAddr| {
-                        TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok()
-                    });
+                if answers(target_host, *port) {
+                    open = true;
                 }
                 if open || Instant::now() >= until {
                     break;
@@ -1553,14 +2005,20 @@ impl Moves {
                 closed.push(port.to_string());
             }
         }
+        let unprobed = if before.unprobed.is_empty() {
+            String::new()
+        } else {
+            format!("; not probed: {}", before.unprobed.join(", "))
+        };
+        let ports: Vec<String> = before.ports.iter().map(u16::to_string).collect();
         checks.push(json!({
             "check": "ports", "ok": closed.is_empty(),
-            "detail": if ports.is_empty() {
-                "the copy has no TCP proxy to probe".to_string()
+            "detail": if before.ports.is_empty() {
+                format!("no TCP proxy on every address answered here before the stop, so none is required{unprobed}")
             } else if closed.is_empty() {
-                format!("port(s) {} answer on {host}", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", "))
+                format!("port(s) {} answer on {target_host}{unprobed}", ports.join(", "))
             } else {
-                format!("port(s) {} do not answer on {host}", closed.join(", "))
+                format!("port(s) {} answered here before the stop and do not answer on {target_host}{unprobed}", closed.join(", "))
             },
         }));
         // A container has no guest agent.
@@ -1569,16 +2027,16 @@ impl Moves {
             "detail": "a container has no guest agent: not applicable",
         }));
         // The custom volumes are there and attached.
+        let doc = dest.get(&path_of).ok();
         let mut detached = Vec::new();
         for volume in one["volumes"].as_array().into_iter().flatten() {
             let pool = volume["pool"].as_str().unwrap_or_default();
             let volume_name = volume["name"].as_str().unwrap_or_default();
             let there = dest
-                .get(&format!(
-                    "/1.0/storage-pools/{}/volumes/custom/{}?project={}",
-                    seg(pool),
-                    seg(volume_name),
-                    seg(volume["project"].as_str().unwrap_or("default"))
+                .get(&volume_path(
+                    pool,
+                    volume_name,
+                    volume["targetProject"].as_str().unwrap_or("default"),
                 ))
                 .is_ok();
             let attached = doc.as_ref().is_some_and(|doc| {
@@ -1603,24 +2061,31 @@ impl Moves {
                 format!("not there or not attached: {}", detached.join(", "))
             },
         }));
-        // The spot-check file is the same on both sides.
+        // The spot-check file is the same on both sides: the source's as read after the stop, or, for a file on a
+        // custom volume (a stopped container's volumes are not mounted), as read just before it.
         let path = one["spotCheck"].as_str().unwrap_or(DEFAULT_SPOT_CHECK);
-        let (ok, detail) = match source.read_file(project, name, path) {
-            Err(error) => (
-                true,
-                format!("{path} could not be read on the source ({error}); nothing to compare"),
+        let (reference, when) = match source.read_file(project, name, path) {
+            Ok(after) => (Some(after), "after the stop"),
+            Err(_) => (before.spot.clone(), "just before the stop"),
+        };
+        let (ok, detail) = match reference {
+            None => (
+                false,
+                format!(
+                    "{path} could not be read on the source, before or after the stop, so the check cannot pass"
+                ),
             ),
-            Ok(here) => match dest.read_file(project, name, path) {
+            Some(here) => match dest.read_file(project, name, path) {
                 Ok(there) if there == here => (
                     true,
                     format!(
-                        "{path} is the same on both ({})",
+                        "{path} is the same on both ({}; the source's read {when})",
                         &Digest::of(&here).to_hex()[..12]
                     ),
                 ),
                 Ok(_) => (
                     false,
-                    format!("{path} differs between the source and the copy"),
+                    format!("{path} differs between the source ({when}) and the copy"),
                 ),
                 Err(error) => (
                     false,
@@ -1631,16 +2096,16 @@ impl Moves {
         checks.push(json!({ "check": "spotCheck", "ok": ok, "detail": detail }));
         // Still running after the checks: a program that exits right after its start fails here.
         let last = dest
-            .get(&instance_path)
+            .get(&path_of)
             .ok()
             .and_then(|doc| text(&doc, "status").map(str::to_string))
             .unwrap_or_else(|| "not readable".to_string());
-        let running = first == "Running" && last == "Running";
+        let ok = first == "Running" && last == "Running";
         checks.insert(
             0,
             json!({
-                "check": "running", "ok": running,
-                "detail": if running {
+                "check": "running", "ok": ok,
+                "detail": if ok {
                     "the copy runs, and still runs after its checks".to_string()
                 } else if first != "Running" {
                     format!("the copy is {first}")
@@ -1652,12 +2117,11 @@ impl Moves {
         checks
     }
 
-    /// Rolls back the moves a stopped kernel left unfinished: each instance without a result, as a failure before its
-    /// checks would be. Runs in the background, once, when the node starts.
+    /// Settles the moves a stopped kernel left unfinished, in the background, once, when the node starts. A move that
+    /// the next start has not settled yet holds its instances: a new move of one is refused until it has.
     pub fn recover(self: &Arc<Self>) {
         let lines = self.journal.lines();
-        let records = fold(&lines);
-        let unfinished: Vec<MoveRecord> = records
+        let unfinished: Vec<MoveRecord> = fold(&lines)
             .into_values()
             .filter(|record| record.ended_at.is_none())
             .collect();
@@ -1675,51 +2139,103 @@ impl Moves {
     }
 
     fn recover_one(&self, record: &MoveRecord) {
-        let reason =
-            "the kernel stopped during the move; the next start rolled it back".to_string();
+        let stopped = "the kernel stopped during the move";
         let target = linked_target(&self.cfg, &record.target);
-        let source = MoveWriter::new(self.cfg.incus.socket.clone());
-        for instance in record.instances.iter().filter(|one| one.result.is_none()) {
+        let source = self.source();
+        let mut results: Vec<&str> = Vec::new();
+        for instance in &record.instances {
+            if let Some(result) = instance.result.as_deref() {
+                results.push(match result {
+                    "moved" => "moved",
+                    "rolled_back" => "rolled_back",
+                    _ => "failed",
+                });
+                continue;
+            }
+            // The checks passed and were journaled: the copy is the moved instance. Nothing is deleted or started.
+            if instance.verified {
+                self.note(json!({
+                    "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
+                    "name": instance.name, "result": "moved", "downtimeMs": instance.verify_downtime,
+                    "reason": format!("{stopped} after the copy passed its checks; the next start recorded it as moved"),
+                    "targetUuid": instance.target_uuid, "recovered": true,
+                }));
+                let _ = source.disable_autostart(&instance.project, &instance.name);
+                results.push("moved");
+                continue;
+            }
+            // The copy was started, and may have served writes: nothing is deleted, and the source is not started next
+            // to it. The owner decides.
+            if instance.copy_started {
+                let reason = format!(
+                    "{stopped} after the copy was started on {} and before its checks were journaled: the copy may have served writes, so it was left as it is and the source stays stopped. Check the copy, then finish the move or move it back",
+                    record.target
+                );
+                self.note(json!({
+                    "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
+                    "name": instance.name, "result": "failed", "downtimeMs": null, "reason": reason,
+                    "targetUuid": instance.target_uuid, "recovered": true,
+                }));
+                results.push("failed");
+                continue;
+            }
             let one = json!({
-                "project": instance.project, "name": instance.name, "volumes": instance.volumes,
+                "project": instance.project, "name": instance.name, "uuid": instance.uuid,
+                "volumes": instance.volumes,
             });
-            let outcome = match &target {
+            let made = Made {
+                target_uuid: instance.target_uuid.clone(),
+                volumes: instance.created_volumes.clone(),
+                stopped_source: instance.stopped_source,
+            };
+            let rolled = match &target {
                 Ok(target) => rollback(
                     &source,
                     &MoveWriter::new(target.socket.clone()),
                     &one,
-                    instance.was_running,
+                    &made,
+                    &record.target,
                 ),
                 Err(why) => RolledBack {
+                    source_intact: false,
                     target_removed: false,
-                    source_running: start_if(
-                        &source,
-                        &instance.project,
-                        &instance.name,
-                        instance.was_running,
-                    ),
-                    detail: vec![format!("the target was not reached: {why}")],
+                    source_running: false,
+                    clean: false,
+                    detail: vec![format!(
+                        "the target was not reached ({why}), so nothing was deleted or started"
+                    )],
                 },
             };
+            let reason = format!("{stopped}; the next start rolled it back");
             self.note(json!({
                 "event": "rollback", "at": self.now(), "move": record.id, "project": instance.project,
-                "name": instance.name, "reason": reason, "targetRemoved": outcome.target_removed,
-                "sourceRunning": outcome.source_running, "detail": outcome.detail, "interrupted": true,
+                "name": instance.name, "reason": reason, "sourceIntact": rolled.source_intact,
+                "targetRemoved": rolled.target_removed, "sourceRunning": rolled.source_running,
+                "detail": rolled.detail, "interrupted": true,
             }));
+            let (result, reason) = if rolled.clean {
+                ("rolled_back", reason)
+            } else {
+                (
+                    "failed",
+                    format!(
+                        "{reason}, but it did not finish, so the owner decides: {}",
+                        rolled.detail.join("; ")
+                    ),
+                )
+            };
             self.note(json!({
                 "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
-                "name": instance.name, "result": "rolled_back", "downtimeMs": null, "reason": reason,
+                "name": instance.name, "result": result, "downtimeMs": null, "reason": reason,
             }));
+            results.push(result);
         }
-        let moved = record
-            .instances
-            .iter()
-            .filter(|one| one.result.as_deref() == Some("moved"))
-            .count();
+        let moved = results.iter().filter(|result| **result == "moved").count();
         self.note(json!({
             "event": "end", "at": self.now(), "move": record.id, "moved": moved,
             "of": record.instances.len(), "interrupted": true,
         }));
+        self.late_result(record.proposal.as_deref(), &results);
     }
 
     /// The status of one move, or of the recent ones.
@@ -1742,6 +2258,18 @@ impl Moves {
             .map(|record| record.json(now, running.contains(&record.id), &live))
             .collect()
     }
+}
+
+fn refs_pairs(plan: &Value) -> Vec<(String, String)> {
+    Moves::refs_of(plan)
+        .iter()
+        .map(|one| {
+            (
+                one["project"].as_str().unwrap_or_default().to_string(),
+                one["name"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
 }
 
 /// The free bytes of a pool, as its resources say.
@@ -1802,100 +2330,172 @@ fn stop(source: &MoveWriter, project: &str, name: &str) -> Result<(), String> {
         .map_err(|error| format!("the source did not stop: {error}"))
 }
 
-/// Starts the source again when it ran before the move, and answers whether it runs.
-fn start_if(source: &MoveWriter, project: &str, name: &str, was_running: bool) -> bool {
-    let path = format!("/1.0/instances/{}?project={}", seg(name), seg(project));
-    let status = |source: &MoveWriter| {
-        source.get(&path).ok().and_then(|doc| {
-            doc.get("status")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-    };
-    if status(source).as_deref() == Some("Running") {
-        return true;
+/// Deletes with `delete`, trying again while Incus answers that an operation still holds the object.
+fn delete_patiently(delete: impl Fn() -> Result<(), IncusError>) -> Result<(), IncusError> {
+    let until = Instant::now() + BUSY_RETRY;
+    loop {
+        match delete() {
+            Err(IncusError::Status { message, .. })
+                if message.to_lowercase().contains("busy") && Instant::now() < until =>
+            {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            other => return other,
+        }
     }
-    if !was_running {
-        return false;
-    }
-    let _ = source.set_state(project, name, "start", false, START_DEADLINE);
-    status(source).as_deref() == Some("Running")
 }
 
-/// What a rollback did.
+/// What a rollback did, and whether it left the source as it was before the move with no copy of this move running.
 struct RolledBack {
+    source_intact: bool,
     target_removed: bool,
     source_running: bool,
+    clean: bool,
     detail: Vec<String>,
 }
 
-/// Rolls one instance back: the copy on the target is stopped and deleted with the custom volumes the move made there,
-/// and the source is started again when it ran. The source's own volumes are never touched. The plan made sure the
-/// target held none of these names before the move, so what is there now is the move's own.
-fn rollback(source: &MoveWriter, dest: &MoveWriter, one: &Value, was_running: bool) -> RolledBack {
+/// Rolls one instance back, under the rule: no copy is deleted unless the source is read back as the plan's instance,
+/// nothing on the target is deleted unless this move recorded making it (its uuid), and the source is started again
+/// only when this move stopped it and the copy is read back gone or stopped. The source's own volumes are never touched.
+fn rollback(
+    source: &MoveWriter,
+    dest: &MoveWriter,
+    one: &Value,
+    made: &Made,
+    target_name: &str,
+) -> RolledBack {
     let project = one["project"].as_str().unwrap_or_default();
     let name = one["name"].as_str().unwrap_or_default();
     let mut detail = Vec::new();
-    let path = format!("/1.0/instances/{}?project={}", seg(name), seg(project));
-    let target_removed = match dest.get(&path) {
+    let path = instance_path(project, name);
+    // The source, read back: is it still the instance the plan named?
+    let source_doc = source.get(&path).ok();
+    let source_intact = source_doc
+        .as_ref()
+        .and_then(uuid_of)
+        .is_some_and(|uuid| Some(uuid.as_str()) == one["uuid"].as_str());
+    if !source_intact {
+        detail.push(format!(
+            "the source {project}/{name} was not read back here as the plan's instance, so any copy on {target_name} was kept: it may be the only one"
+        ));
+    }
+    // The copy on the target: only the one this move made, and only while the source is intact.
+    let (target_removed, copy_quiet) = match dest.get(&path) {
         Err(IncusError::Status { code: 404, .. }) => {
             detail.push("no copy was left on the target".to_string());
-            true
+            (true, true)
         }
         Err(error) => {
-            detail.push(format!("the target could not be read: {error}"));
-            false
+            detail.push(format!(
+                "the target could not be read ({error}), so the source was not started next to a copy that may run"
+            ));
+            (false, false)
         }
+        Ok(doc) if made.target_uuid.is_none() || uuid_of(&doc) != made.target_uuid => {
+            detail.push(format!(
+                "{target_name}'s {project}/{name} is not a copy this move recorded making, so it was left alone"
+            ));
+            // Not a copy this move made. The source may run beside it only when the move made no copy at all (a
+            // copy whose uuid was never recorded may be this one).
+            (
+                made.target_uuid.is_some(),
+                made.target_uuid.is_some() && !running(&doc),
+            )
+        }
+        Ok(doc) if !source_intact => (false, !running(&doc)),
         Ok(doc) => {
-            if doc.get("status") == Some(&json!("Running")) {
+            if running(&doc) {
                 let _ = dest.set_state(project, name, "stop", true, STOP_GRACE);
             }
-            match dest.delete_instance(project, name) {
+            match delete_patiently(|| dest.delete_instance(project, name)) {
                 Ok(()) => {
                     detail.push("the copy on the target was deleted".to_string());
-                    true
+                    (true, true)
                 }
                 Err(error) => {
                     detail.push(format!(
                         "the copy on the target could not be deleted: {error}"
                     ));
-                    false
+                    let quiet = dest.get(&path).ok().is_some_and(|doc| !running(&doc));
+                    (false, quiet)
                 }
             }
         }
     };
-    for volume in one["volumes"].as_array().into_iter().flatten() {
+    // The volumes this move made on the target, each while the source's own is read back.
+    let mut volumes_clean = true;
+    for volume in &made.volumes {
         let pool = volume["pool"].as_str().unwrap_or_default();
         let volume_name = volume["name"].as_str().unwrap_or_default();
-        let volume_project = volume["project"].as_str().unwrap_or("default");
-        let found = dest.get(&format!(
-            "/1.0/storage-pools/{}/volumes/custom/{}?project={}",
-            seg(pool),
-            seg(volume_name),
-            seg(volume_project)
-        ));
-        if found.is_ok() {
-            match dest.delete_volume(volume_project, pool, volume_name) {
-                Ok(()) => detail.push(format!(
-                    "the copy of the volume {pool}/{volume_name} was deleted"
-                )),
-                Err(error) => detail.push(format!(
+        let there = volume["project"].as_str().unwrap_or("default");
+        let here = one["volumes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|planned| planned["pool"] == pool && planned["name"] == volume_name)
+            .and_then(|planned| planned["project"].as_str())
+            .unwrap_or("default");
+        let Ok(doc) = dest.get(&volume_path(pool, volume_name, there)) else {
+            continue;
+        };
+        if volume["uuid"].is_string() && uuid_of(&doc).as_deref() != volume["uuid"].as_str() {
+            detail.push(format!(
+                "{target_name}'s volume {pool}/{volume_name} is not the copy this move made, so it was left alone"
+            ));
+            continue;
+        }
+        if !source_intact || source.get(&volume_path(pool, volume_name, here)).is_err() {
+            detail.push(format!(
+                "the source's volume {pool}/{volume_name} was not read back here, so its copy on {target_name} was kept"
+            ));
+            volumes_clean = false;
+            continue;
+        }
+        match delete_patiently(|| dest.delete_volume(there, pool, volume_name)) {
+            Ok(()) => detail.push(format!(
+                "the copy of the volume {pool}/{volume_name} was deleted"
+            )),
+            Err(error) => {
+                volumes_clean = false;
+                detail.push(format!(
                     "the copy of the volume {pool}/{volume_name} could not be deleted: {error}"
-                )),
+                ));
             }
         }
     }
-    let source_running = start_if(source, project, name, was_running);
-    detail.push(if source_running {
-        "the source runs".to_string()
-    } else if was_running {
-        "the source did not start again".to_string()
-    } else {
-        "the source was stopped before the move and stays stopped".to_string()
-    });
+    // The source again: only when this move stopped it, it is the plan's instance, and no copy of it may run.
+    let mut source_running = source_doc.as_ref().is_some_and(running);
+    if made.stopped_source && source_intact && !source_running {
+        if copy_quiet {
+            let _ = source.set_state(project, name, "start", false, START_DEADLINE);
+            source_running = source.get(&path).ok().is_some_and(|doc| running(&doc));
+            detail.push(if source_running {
+                "the source runs again".to_string()
+            } else {
+                "the source did not start again".to_string()
+            });
+        } else {
+            detail.push(
+                "the source was not started: a copy of it may still run on the target".to_string(),
+            );
+        }
+    } else if !made.stopped_source && source_intact {
+        detail.push(if source_running {
+            "the source was not stopped by the move and runs".to_string()
+        } else {
+            "the source was not running when the move would have stopped it, and stays stopped"
+                .to_string()
+        });
+    }
+    let clean = source_intact
+        && target_removed
+        && volumes_clean
+        && (source_running || !made.stopped_source);
     RolledBack {
+        source_intact,
         target_removed,
         source_running,
+        clean,
         detail,
     }
 }
@@ -1906,6 +2506,7 @@ struct MoveRecord {
     id: String,
     plan: String,
     target: String,
+    proposal: Option<String>,
     started_at: u64,
     ended_at: Option<u64>,
     interrupted: bool,
@@ -1917,7 +2518,7 @@ struct MoveRecord {
 struct InstanceRecord {
     project: String,
     name: String,
-    was_running: bool,
+    uuid: Option<String>,
     rounds_total: u64,
     rounds_done: u64,
     bytes_total: Option<u64>,
@@ -1926,6 +2527,12 @@ struct InstanceRecord {
     needed: u64,
     target_pool: String,
     volumes: Value,
+    target_uuid: Option<String>,
+    created_volumes: Vec<Value>,
+    stopped_source: bool,
+    copy_started: bool,
+    verified: bool,
+    verify_downtime: Option<u64>,
     phase: String,
     result: Option<String>,
     downtime: Option<u64>,
@@ -1950,7 +2557,7 @@ fn fold(lines: &[Value]) -> BTreeMap<String, MoveRecord> {
                 .map(|one| InstanceRecord {
                     project: one["project"].as_str().unwrap_or_default().to_string(),
                     name: one["name"].as_str().unwrap_or_default().to_string(),
-                    was_running: one["wasRunning"] == true,
+                    uuid: one["uuid"].as_str().map(str::to_string),
                     rounds_total: one["roundsTotal"].as_u64().unwrap_or(0),
                     bytes_total: one["bytesTotal"].as_u64(),
                     needed: one["needed"].as_u64().unwrap_or(0),
@@ -1966,6 +2573,7 @@ fn fold(lines: &[Value]) -> BTreeMap<String, MoveRecord> {
                     id: id.to_string(),
                     plan: line["plan"].as_str().unwrap_or_default().to_string(),
                     target: line["target"].as_str().unwrap_or_default().to_string(),
+                    proposal: line["proposal"].as_str().map(str::to_string),
                     started_at: at,
                     instances,
                     ..MoveRecord::default()
@@ -1997,10 +2605,27 @@ fn fold(lines: &[Value]) -> BTreeMap<String, MoveRecord> {
                 instance.last_rate = line["rateBytesPerSecond"].as_u64().or(instance.last_rate);
                 instance.phase = "copying".to_string();
             }
-            Some("cutover") => instance.phase = "cutover".to_string(),
+            Some("created") => {
+                if let Some(uuid) = line["targetUuid"].as_str() {
+                    instance.target_uuid = Some(uuid.to_string());
+                }
+                if line["volume"].is_object() {
+                    instance.created_volumes.push(line["volume"].clone());
+                }
+            }
+            Some("cutover") => {
+                instance.phase = "cutover".to_string();
+                match line["step"].as_str() {
+                    Some("stopped") => instance.stopped_source = line["wasRunning"] == true,
+                    Some("starting" | "started") => instance.copy_started = true,
+                    _ => {}
+                }
+            }
             Some("verify") => {
                 instance.checks = line["checks"].as_array().cloned().unwrap_or_default();
                 instance.phase = "verifying".to_string();
+                instance.verified = line["ok"] == true;
+                instance.verify_downtime = line["downtimeMs"].as_u64();
             }
             Some("rollback") => {
                 instance.phase = "rolling_back".to_string();
@@ -2012,6 +2637,9 @@ fn fold(lines: &[Value]) -> BTreeMap<String, MoveRecord> {
                 instance.downtime = line["downtimeMs"].as_u64();
                 instance.reason = line["reason"].as_str().map(str::to_string);
                 instance.ended_at = Some(at);
+                if let Some(uuid) = line["targetUuid"].as_str() {
+                    instance.target_uuid = Some(uuid.to_string());
+                }
             }
             _ => {}
         }
@@ -2025,11 +2653,6 @@ impl MoveRecord {
         if self.finished.is_some() {
             return (false, "the move was finished".to_string(), Vec::new());
         }
-        let moved: Vec<&InstanceRecord> = self
-            .instances
-            .iter()
-            .filter(|one| one.result.as_deref() == Some("moved"))
-            .collect();
         if self.ended_at.is_none() {
             return (
                 false,
@@ -2037,6 +2660,11 @@ impl MoveRecord {
                 Vec::new(),
             );
         }
+        let moved: Vec<&InstanceRecord> = self
+            .instances
+            .iter()
+            .filter(|one| one.result.as_deref() == Some("moved"))
+            .collect();
         if moved.is_empty() {
             return (
                 false,
@@ -2062,8 +2690,10 @@ impl MoveRecord {
         }
         (
             true,
-            "the moved copies passed their checks: the owner may finish the move with a card"
-                .to_string(),
+            format!(
+                "the moved copies passed their checks: the owner may finish the move with a card; each source is deleted only once its copy is read back on {}",
+                self.target
+            ),
             deletes,
         )
     }
@@ -2075,20 +2705,17 @@ impl MoveRecord {
         live: &BTreeMap<(String, String, String), Progress>,
     ) -> Value {
         let (available, why, deletes) = self.finish_view();
+        let results: Vec<Option<&str>> = self
+            .instances
+            .iter()
+            .map(|one| one.result.as_deref())
+            .collect();
         let phase = if self.finished.is_some() {
             "finished"
         } else if self.ended_at.is_some() {
-            if self
-                .instances
-                .iter()
-                .all(|one| one.result.as_deref() == Some("moved"))
-            {
+            if results.iter().all(|result| *result == Some("moved")) {
                 "moved"
-            } else if self
-                .instances
-                .iter()
-                .any(|one| one.result.as_deref() == Some("moved"))
-            {
+            } else if results.contains(&Some("moved")) {
                 "partly_moved"
             } else {
                 "rolled_back"
@@ -2103,7 +2730,8 @@ impl MoveRecord {
             .iter()
             .map(|one| {
                 let progress = live.get(&(self.id.clone(), one.project.clone(), one.name.clone()));
-                let current = progress.map(|progress| progress.done + progress.processed.unwrap_or(0));
+                let current =
+                    progress.map(|progress| progress.done + progress.processed.unwrap_or(0));
                 let bytes_moved = match (progress, one.rounds_done) {
                     (Some(p), 0) if p.processed.is_none() && p.done == 0 => None,
                     _ => Some(one.bytes_moved + current.unwrap_or(0)),
@@ -2113,9 +2741,12 @@ impl MoveRecord {
                     Some(0)
                 } else {
                     match (progress, rate, one.bytes_total) {
-                        (Some(p), Some(rate), Some(total)) if p.round == 1 && rate > 0 => {
-                            Some(total.saturating_sub(current.unwrap_or(0)).saturating_mul(1000) / rate)
-                        }
+                        (Some(p), Some(rate), Some(total)) if p.round == 1 && rate > 0 => Some(
+                            total
+                                .saturating_sub(current.unwrap_or(0))
+                                .saturating_mul(1000)
+                                / rate,
+                        ),
                         _ => None,
                     }
                 };
@@ -2124,9 +2755,14 @@ impl MoveRecord {
                     .filter(|phase| !phase.is_empty())
                     .unwrap_or_else(|| one.phase.clone());
                 let finished = self.finished.as_ref().is_some_and(|line| {
-                    line["deleted"].as_array().into_iter().flatten().any(|deleted| {
-                        deleted.as_str() == Some(format!("{}/{}", one.project, one.name).as_str())
-                    })
+                    line["deleted"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|deleted| {
+                            deleted.as_str()
+                                == Some(format!("{}/{}", one.project, one.name).as_str())
+                        })
                 });
                 json!({
                     "project": one.project,
@@ -2184,17 +2820,22 @@ impl ToolHandler for MovePlanHandler {
                 .ok_or_else(|| invalid("rounds: expected 1 to 5"))?,
         };
         let planned = self.moves.compute(&wanted, &target, rounds)?;
-        let (digest, expires) = match &planned.plan {
-            Some(plan) => {
-                self.moves
-                    .note(json!({ "event": "plan", "at": self.moves.now(), "plan": plan }));
-                (plan["digest"].clone(), plan["expiresAt"].clone())
-            }
-            None => (Value::Null, Value::Null),
-        };
+        let plan =
+            match planned.plan {
+                Some(plan) => Some(self.moves.plans.save(plan, self.moves.now()).map_err(
+                    |error| {
+                        eprintln!("arca: a move plan could not be kept: {error}");
+                        internal()
+                    },
+                )?),
+                None => None,
+            };
+        let (digest, expires) = plan.as_ref().map_or((Value::Null, Value::Null), |plan| {
+            (plan["digest"].clone(), plan["expiresAt"].clone())
+        });
         let message = if planned.go {
             format!(
-                "planned {} container(s) to {target}: propose it with action_propose instance_move and the digest; the plan expires in an hour",
+                "planned {} container(s) to {target}: propose it with action_propose instance_move and the digest; the plan expires an hour after it was first made",
                 wanted.len()
             )
         } else {
@@ -2209,7 +2850,7 @@ impl ToolHandler for MovePlanHandler {
             "digest": digest,
             "expiresAt": expires,
             "target": planned.target,
-            "plan": planned.plan,
+            "plan": plan,
             "blocked": planned.blocked,
             "preflight": planned.preflight,
             "message": message,
@@ -2219,9 +2860,9 @@ impl ToolHandler for MovePlanHandler {
 
 /// The approved plan the arguments of an `instance_move` name, checked against them: it is there, it has not expired,
 /// and its instances and target are the arguments'. Answers the plan.
-fn approved_plan(journal: &Journal, args: &Value, now: u64) -> Result<Value, CallError> {
+fn approved_plan(plans: &Plans, args: &Value, now: u64) -> Result<Value, CallError> {
     let digest = args["plan"].as_str().unwrap_or_default();
-    let plan = journal.plan(digest).ok_or_else(|| {
+    let plan = plans.get(digest).ok_or_else(|| {
         refused(
             "NoSuchPlan",
             "no move plan has this digest on this node: plan the move with instance_move_plan first",
@@ -2255,16 +2896,13 @@ pub fn check_proposal(
     let journal = Journal::at(&cfg.state_dir);
     let rows = match action {
         ActionKind::InstanceMove => {
-            let plan = approved_plan(&journal, args, now)?;
-            if journal
-                .lines()
-                .iter()
-                .any(|line| line["event"] == "begin" && line["plan"] == plan["digest"])
-            {
-                return Err(refused(
-                    "AlreadyRun",
-                    "this plan already ran: plan the move again for a new card",
-                ));
+            let plan = approved_plan(&Plans::at(&cfg.state_dir), args, now)?;
+            if let Some(refusal) = start_refusal(
+                &journal.lines(),
+                plan["digest"].as_str().unwrap_or_default(),
+                &refs_pairs(&plan),
+            ) {
+                return Err(refusal);
             }
             Moves::card_rows(&plan)
         }
@@ -2287,7 +2925,10 @@ pub fn check_proposal(
                 .collect();
             rows.push((
                 "Moved to".to_string(),
-                format!("{}, where each copy passed its checks", record.target),
+                format!(
+                    "{}, where each copy passed its checks; a source is deleted only when its copy is read back there, and kept while it runs or another instance uses its volume",
+                    record.target
+                ),
             ));
             rows
         }
@@ -2355,7 +2996,15 @@ impl ToolHandler for MoveHandler {
         let args = ActionKind::InstanceMove
             .prepare(&bare, None)
             .map_err(CallError::Invalid)?;
-        let plan = approved_plan(&self.moves.journal, &args, self.moves.now())?;
+        let plan = approved_plan(&self.moves.plans, &args, self.moves.now())?;
+        // A plan that ran, or an instance another move holds, keeps the grant unspent.
+        if let Some(refusal) = start_refusal(
+            &self.moves.journal.lines(),
+            plan["digest"].as_str().unwrap_or_default(),
+            &refs_pairs(&plan),
+        ) {
+            return Err(refusal);
+        }
         let proposal = spend(&self.moves.kernel, verb, &args, &grant)?;
         self.moves.start(plan, proposal)
     }
@@ -2402,7 +3051,8 @@ fn move_id_ok(id: &str) -> bool {
     })
 }
 
-/// `instance_move_finish`: deletes a verified move's sources, only from an approved card, once.
+/// `instance_move_finish`: deletes a verified move's sources, only from an approved card, once, and each source only
+/// when its copy is read back on the target as the one this move made.
 pub struct MoveFinishHandler {
     pub moves: Arc<Moves>,
 }
@@ -2433,7 +3083,10 @@ impl ToolHandler for MoveFinishHandler {
             ));
         }
         spend(&self.moves.kernel, verb, &args, &grant)?;
-        let source = MoveWriter::new(self.moves.cfg.incus.socket.clone());
+        let source = self.moves.source();
+        let dest = linked_target(&self.moves.cfg, &record.target)
+            .ok()
+            .map(|target| MoveWriter::new(target.socket));
         let (mut deleted, mut kept) = (Vec::new(), Vec::new());
         for one in record
             .instances
@@ -2441,13 +3094,27 @@ impl ToolHandler for MoveFinishHandler {
             .filter(|one| one.result.as_deref() == Some("moved"))
         {
             let label = format!("{}/{}", one.project, one.name);
-            let path = format!(
-                "/1.0/instances/{}?project={}",
-                seg(&one.name),
-                seg(&one.project)
-            );
+            let path = instance_path(&one.project, &one.name);
+            // The other side first: the copy must be on the target, as the one this move made.
+            let copy_there = match (dest.as_ref().map(|dest| dest.get(&path)), &one.target_uuid) {
+                (Some(Ok(doc)), Some(uuid)) => uuid_of(&doc).as_deref() == Some(uuid.as_str()),
+                _ => false,
+            };
+            if !copy_there {
+                kept.push(format!(
+                    "{label}: its copy was not read back on {} as the one this move made, so the source was kept",
+                    record.target
+                ));
+                continue;
+            }
             match source.get(&path) {
-                Ok(doc) if doc.get("status") == Some(&json!("Running")) => {
+                Ok(doc) if uuid_of(&doc) != one.uuid => {
+                    kept.push(format!(
+                        "{label}: the instance here is not the one that was moved, so it was kept"
+                    ));
+                    continue;
+                }
+                Ok(doc) if running(&doc) => {
                     kept.push(format!(
                         "{label}: it runs again on this host, so it was kept"
                     ));
@@ -2469,25 +3136,40 @@ impl ToolHandler for MoveFinishHandler {
             for volume in one.volumes.as_array().into_iter().flatten() {
                 let pool = volume["pool"].as_str().unwrap_or_default();
                 let name = volume["name"].as_str().unwrap_or_default();
-                let project = volume["project"].as_str().unwrap_or("default");
+                let here = volume["project"].as_str().unwrap_or("default");
+                let there = volume["targetProject"].as_str().unwrap_or(here);
                 let volume_label = format!("volume {pool}/{name}");
-                let used = source
-                    .get(&format!(
-                        "/1.0/storage-pools/{}/volumes/custom/{}?project={}",
-                        seg(pool),
-                        seg(name),
-                        seg(project)
-                    ))
-                    .ok()
-                    .and_then(|doc| doc.get("used_by").and_then(Value::as_array).map(Vec::len))
-                    .unwrap_or(0);
+                let copied = dest
+                    .as_ref()
+                    .is_some_and(|dest| dest.get(&volume_path(pool, name, there)).is_ok());
+                if !copied {
+                    kept.push(format!(
+                        "{volume_label}: its copy was not read back on {}, so it was kept",
+                        record.target
+                    ));
+                    continue;
+                }
+                let used = match source.get(&volume_path(pool, name, here)) {
+                    Ok(doc) => doc
+                        .get("used_by")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len),
+                    Err(IncusError::Status { code: 404, .. }) => {
+                        deleted.push(volume_label);
+                        continue;
+                    }
+                    Err(error) => {
+                        kept.push(format!("{volume_label}: it could not be read: {error}"));
+                        continue;
+                    }
+                };
                 if used > 0 {
                     kept.push(format!(
                         "{volume_label}: another instance uses it, so it was kept"
                     ));
                     continue;
                 }
-                match source.delete_volume(project, pool, name) {
+                match source.delete_volume(here, pool, name) {
                     Ok(()) | Err(IncusError::Status { code: 404, .. }) => {
                         deleted.push(volume_label)
                     }
@@ -2545,16 +3227,20 @@ pub fn handlers(moves: Arc<Moves>) -> Vec<(&'static str, Arc<dyn ToolHandler>)> 
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_torn_last_line_is_skipped_and_the_next_append_starts_on_its_own_line() {
-        let dir = std::env::temp_dir().join(format!("arca-move-journal-{}", std::process::id()));
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("arca-move-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn a_torn_last_line_is_skipped_and_the_next_append_starts_on_its_own_line() {
+        let dir = scratch("torn");
         let journal = Journal::at(&dir);
         journal
             .append(&json!({ "event": "begin", "move": "mv-000000000001" }))
             .expect("append");
-        // A crash leaves half a line with no newline.
         let mut file = OpenOptions::new()
             .append(true)
             .open(dir.join(MOVES_FILE))
@@ -2577,6 +3263,95 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_past_64_mib_is_still_read_and_an_overlong_line_is_skipped() {
+        let dir = scratch("long");
+        let journal = Journal::at(&dir);
+        journal
+            .append(&json!({ "event": "begin", "move": "mv-000000000001" }))
+            .expect("append");
+        let filler = "x".repeat(1024 * 1024 - 64);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(dir.join(MOVES_FILE))
+            .expect("open");
+        for _ in 0..65 {
+            writeln!(file, "{}", json!({ "event": "note", "pad": filler })).expect("pad");
+        }
+        writeln!(
+            file,
+            "{}",
+            json!({ "event": "note", "pad": "y".repeat(9 * 1024 * 1024) })
+        )
+        .expect("long");
+        drop(file);
+        journal
+            .append(&json!({ "event": "end", "move": "mv-000000000001" }))
+            .expect("append");
+        let lines = journal.lines();
+        assert_eq!(lines.len(), 67, "every line but the overlong one");
+        assert_eq!(lines.last().expect("last")["event"], "end");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plan_is_not_renewed_by_planning_again_and_expired_plans_are_pruned() {
+        let dir = scratch("plans");
+        let plans = Plans::at(&dir);
+        let plan = |digest: &str, at: u64| json!({ "digest": digest, "createdAt": at, "expiresAt": at + PLAN_TTL_MS });
+        let first = "a".repeat(64);
+        let kept = plans.save(plan(&first, 1_000), 1_000).expect("saved");
+        assert_eq!(kept["expiresAt"], 1_000 + PLAN_TTL_MS);
+        let half = 1_000 + PLAN_TTL_MS / 2;
+        let again = plans.save(plan(&first, half), half).expect("saved");
+        assert_eq!(again["expiresAt"], 1_000 + PLAN_TTL_MS, "not renewed");
+        assert_eq!(
+            plans.get(&first).expect("kept")["expiresAt"],
+            1_000 + PLAN_TTL_MS
+        );
+        let later = 1_000 + 2 * PLAN_KEEP_MS;
+        plans
+            .save(plan(&"b".repeat(64), later), later)
+            .expect("saved");
+        assert!(plans.get(&first).is_none(), "the expired plan was pruned");
+        let mode = fs::metadata(dir.join(PLANS_DIR).join(format!("{}.json", "b".repeat(64))))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(plans.get("../x").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plan_that_ran_or_an_instance_another_move_holds_does_not_start() {
+        let digest = "c".repeat(64);
+        let web = vec![("shop".to_string(), "web".to_string())];
+        let begin = |id: &str, plan: &str, name: &str| {
+            json!({ "event": "begin", "move": id, "plan": plan, "target": "node-b",
+                "instances": [{ "project": "shop", "name": name }] })
+        };
+        assert!(start_refusal(&[], &digest, &web).is_none());
+        let ran = vec![
+            begin("mv-cccccccccccc", &digest, "web"),
+            json!({ "event": "end", "move": "mv-cccccccccccc" }),
+        ];
+        assert!(matches!(
+            start_refusal(&ran, &digest, &web),
+            Some(CallError::Refused { code, .. }) if code == "AlreadyRun"
+        ));
+        let other = vec![begin("mv-dddddddddddd", &"d".repeat(64), "web")];
+        assert!(matches!(
+            start_refusal(&other, &digest, &web),
+            Some(CallError::Refused { code, .. }) if code == "InstanceMoving"
+        ));
+        let mut ended = other.clone();
+        ended.push(json!({ "event": "end", "move": "mv-dddddddddddd" }));
+        assert!(start_refusal(&ended, &digest, &web).is_none());
+        let api = vec![begin("mv-eeeeeeeeeeee", &"e".repeat(64), "api")];
+        assert!(start_refusal(&api, &digest, &web).is_none());
+    }
+
+    #[test]
     fn the_estimate_is_the_stop_and_start_and_a_one_percent_delta() {
         assert_eq!(estimated_downtime(0), 30);
         assert_eq!(estimated_downtime(100 * ASSUMED_RATE), 31);
@@ -2587,5 +3362,14 @@ mod tests {
         assert!(move_id_ok("mv-0123456789ab"));
         assert!(!move_id_ok("mv-0123456789AB"));
         assert!(!move_id_ok("mv-0123"));
+    }
+
+    #[test]
+    fn only_a_proxy_on_every_address_is_probed() {
+        assert_eq!(wildcard("tcp:0.0.0.0:8080"), Some(8080));
+        assert_eq!(wildcard("tcp:[::]:443"), Some(443));
+        assert_eq!(wildcard("tcp:127.0.0.1:8080"), None);
+        assert_eq!(wildcard("tcp:192.0.2.5:80"), None);
+        assert_eq!(wildcard("udp:0.0.0.0:53"), None);
     }
 }

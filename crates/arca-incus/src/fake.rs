@@ -1600,6 +1600,31 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
             }
             sync(Value::Object(groups))
         }
+        ("GET", Route::Operation(id) | Route::OperationWait(id))
+            if lock(&shared.migration).lingering.contains_key(&id) =>
+        {
+            let mut migration = lock(&shared.migration);
+            let ended = match migration.lingering.get_mut(&id) {
+                Some((reads, _, _)) if *reads > 1 => {
+                    *reads -= 1;
+                    None
+                }
+                _ => migration
+                    .lingering
+                    .remove(&id)
+                    .map(|(_, message, _)| message),
+            };
+            drop(migration);
+            if let (Some(message), Some(operation)) = (ended, store.operations.get_mut(&id)) {
+                operation["status"] = json!("Failure");
+                operation["status_code"] = json!(400);
+                operation["err"] = json!(message);
+            }
+            match store.operations.get(&id) {
+                Some(operation) => sync(operation.clone()),
+                None => (404, String::new(), error_envelope(404, "not found")),
+            }
+        }
         ("GET", Route::Operation(id) | Route::OperationWait(id)) => match store.operations.get(&id)
         {
             Some(operation) => sync(operation.clone()),
@@ -1623,7 +1648,34 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                         *reads -= 1;
                     }
                 }
-                let body = store.objects[index].body.clone();
+                let mut body = store.objects[index].body.clone();
+                // A custom volume names the instances that mount it, as Incus's `used_by` does.
+                if address.kind == "volume" {
+                    let (pool, name) = (&store.objects[index].parent, &store.objects[index].name);
+                    let users: Vec<Value> = store
+                        .objects
+                        .iter()
+                        .filter(|object| object.kind == "instance")
+                        .filter(|object| {
+                            ["devices", "expanded_devices"].iter().any(|key| {
+                                object.body[*key].as_object().is_some_and(|devices| {
+                                    devices.values().any(|device| {
+                                        device["type"] == "disk"
+                                            && device["pool"].as_str() == Some(pool)
+                                            && device["source"].as_str() == Some(name)
+                                    })
+                                })
+                            })
+                        })
+                        .map(|object| {
+                            json!(format!(
+                                "/1.0/instances/{}?project={}",
+                                object.name, object.project
+                            ))
+                        })
+                        .collect();
+                    body["used_by"] = Value::Array(users);
+                }
                 let extra = format!("ETag: {}\r\n", etag_of(&body));
                 (200, extra, sync_envelope(body))
             }
@@ -2759,6 +2811,23 @@ fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String
             400,
             String::new(),
             error_envelope(400, "the project is not empty"),
+        );
+    }
+    let held = place_of_stored(&store.objects[index]);
+    if lock(&shared.migration)
+        .lingering
+        .values()
+        .any(|(_, _, place)| *place == held)
+    {
+        return answered(
+            shared,
+            store,
+            &kind,
+            "DELETE",
+            Err((
+                400,
+                "Instance is busy running a create operation".to_string(),
+            )),
         );
     }
     if kind == "instance" && store.objects[index].body.get("status") == Some(&json!("Running")) {
@@ -4305,6 +4374,14 @@ struct MigrationFake {
     held_pushes: Vec<String>,
     /// The instances whose start is refused, by project and name.
     refuse_start: std::collections::BTreeSet<(String, String)>,
+    /// The `host:port` addresses this fake, as a target, does not answer a push on.
+    unreachable: std::collections::BTreeSet<String>,
+    /// Whether this fake's pushes leave the guest files behind (a copy whose files differ from the source's).
+    skip_files: bool,
+    /// How many reads a receiving operation whose push failed stays running, holding its instance, before it fails.
+    linger: u32,
+    /// The receiving operations that failed and still run: their reads left, their error, and the object they hold.
+    lingering: BTreeMap<String, (u32, String, Place)>,
 }
 
 /// A receiving operation: the object it lands, and its two secrets.
@@ -4347,6 +4424,47 @@ impl FakeIncus {
             .cloned()
             .map(OpId)
             .collect()
+    }
+
+    /// Does not answer a push sent to `address` (`host:port`): the push fails to connect, and the receiving operation
+    /// keeps waiting for one on another address.
+    pub fn unreachable_at(&self, address: &str) {
+        lock(&self.shared.migration)
+            .unreachable
+            .insert(address.to_string());
+    }
+
+    /// Pushes from now on land without the instance's guest files: the copy's files are not the source's.
+    pub fn push_without_files(&self) {
+        lock(&self.shared.migration).skip_files = true;
+    }
+
+    /// A receiving operation whose push fails stays running for `reads` more reads of it, holding its object: a delete of
+    /// that instance meanwhile is refused as busy, as Incus refuses it while the create operation still runs.
+    pub fn receive_lingers(&self, reads: u32) {
+        lock(&self.shared.migration).linger = reads;
+    }
+
+    /// Adds an instance as one created on this host by someone else: `body` names it, its project and its config; it
+    /// is given a uuid of its own.
+    pub fn add_instance(&self, body: Value) {
+        let mut body = body;
+        let uuid = self.shared.next_id();
+        if let Some(object) = body.as_object_mut() {
+            object.entry("config").or_insert_with(|| json!({}));
+            object.entry("status").or_insert_with(|| json!("Stopped"));
+            object.entry("devices").or_insert_with(|| json!({}));
+        }
+        body["config"]["volatile.uuid"] = json!(uuid);
+        let project = body["project"].as_str().unwrap_or("default").to_string();
+        let name = body["name"].as_str().unwrap_or_default().to_string();
+        lock(&self.shared.store).objects.push(Stored {
+            kind: "instance".to_string(),
+            project,
+            name,
+            parent: String::new(),
+            body,
+        });
     }
 
     /// Refuses every start of the instance, as Incus refuses one that cannot start here.
@@ -4507,7 +4625,7 @@ fn push(
     }
     let receiving = url.rsplit('/').next().unwrap_or("").to_string();
     let secrets = target
-        .get("websockets")
+        .get("secrets")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
@@ -4525,11 +4643,18 @@ fn push(
     let instance = object.kind == "instance";
     let (bytes, plan) = {
         let mut migration = lock(&shared.migration);
-        migration.pushes.push(format!("{key} -> {url}"));
+        let inconsistent = if sent.get("allow_inconsistent") == Some(&json!(true)) {
+            " (inconsistent)"
+        } else {
+            ""
+        };
+        migration
+            .pushes
+            .push(format!("{key} -> {url}{inconsistent}"));
         let bytes = migration.sizes.get(&key).copied().unwrap_or(1024 * 1024);
         (bytes, migration.plans.pop_front().unwrap_or(PushPlan::Pass))
     };
-    let files: Vec<(String, Vec<u8>)> = if instance {
+    let files: Vec<(String, Vec<u8>)> = if instance && !lock(&shared.migration).skip_files {
         lock(&shared.service)
             .files
             .iter()
@@ -4540,10 +4665,31 @@ fn push(
         Vec::new()
     };
     let peer = lock(&shared.peer).clone();
+    // An address the target does not answer on: the push fails to connect, and the receiving operation keeps waiting
+    // for a push on another address, as Incus's does.
+    let host = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    let unreachable = peer
+        .as_ref()
+        .is_some_and(|peer| lock(&peer.migration).unreachable.contains(&host));
+    let plan = if unreachable {
+        lock(&shared.migration).plans.push_front(plan);
+        None
+    } else {
+        Some(plan)
+    };
     let id = shared.next_id();
     let mut operation = running_operation(&id, &place);
     operation["description"] = json!("Migrating");
-    let progress = |processed: u64, speed: u64| json!({ "progress": { "stage": "fs_progress", "processed": processed.to_string(), "speed": speed.to_string() } });
+    // Incus 7.6 writes the progress of a stream as one text, `fs_progress`: "<volume>: 1.20GB (3.00MB/s)".
+    let stream = object.name.clone();
+    let progress = move |processed: u64, speed: u64| -> Value {
+        json!({ "fs_progress": format!("{stream}: {} ({}/s)", incus_bytes(processed), incus_bytes(speed)) })
+    };
+    let held_progress = progress.clone();
     let finish = move |operation: &mut Value, outcome: Result<(), String>| match outcome {
         Ok(()) => {
             operation["status"] = json!("Success");
@@ -4563,16 +4709,19 @@ fn push(
         land(&peer, &receiving, &secrets, files, ok, message)
     };
     match plan {
-        PushPlan::Pass => {
+        None => {
+            finish(&mut operation, Err(format!("Unable to connect to: {host}")));
+        }
+        Some(PushPlan::Pass) => {
             let outcome = land_on(peer, true, "");
             finish(&mut operation, outcome);
         }
-        PushPlan::Fail(message) => {
+        Some(PushPlan::Fail(message)) => {
             let _ = land_on(peer, false, &message);
             finish(&mut operation, Err(message));
         }
-        PushPlan::Hold { processed, speed } => {
-            operation["metadata"] = progress(processed, speed);
+        Some(PushPlan::Hold { processed, speed }) => {
+            operation["metadata"] = held_progress(processed, speed);
             store.held.insert(
                 id.clone(),
                 Held {
@@ -4590,6 +4739,21 @@ fn push(
     }
     store.operations.insert(id.clone(), operation.clone());
     (202, String::new(), async_envelope(&id, operation))
+}
+
+/// Bytes as Incus prints them (`units.GetByteSizeString(n, 2)`): "512B", "1.20GB", in decimal units.
+fn incus_bytes(bytes: u64) -> String {
+    if bytes < 1000 {
+        return format!("{bytes}B");
+    }
+    let mut value = bytes as f64;
+    for unit in ["kB", "MB", "GB", "TB", "PB", "EB"] {
+        value /= 1000.0;
+        if value < 1000.0 {
+            return format!("{value:.2}{unit}");
+        }
+    }
+    format!("{value:.2}EB")
 }
 
 /// Ends the peer's receiving operation `id`: with `ok` the object lands (a refresh of one it holds keeps its uuid and
@@ -4618,6 +4782,17 @@ fn land(
         Ok(())
     };
     store.held.remove(id);
+    if let Err(message) = &outcome {
+        let mut migration = lock(&peer.migration);
+        if migration.linger > 0 {
+            let reads = migration.linger;
+            migration.lingering.insert(
+                id.to_string(),
+                (reads, message.clone(), receiving.place.clone()),
+            );
+            return outcome;
+        }
+    }
     if let Some(operation) = store.operations.get_mut(id) {
         match &outcome {
             Ok(()) => {

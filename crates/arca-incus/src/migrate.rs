@@ -6,8 +6,9 @@
 //! volume to that operation, over the network, with the target's certificate. The kernel moves no byte itself: it starts
 //! the two operations, follows their progress, and reads what landed.
 //!
-//! Besides the copy the writer starts and stops an instance, reads a file inside one (the spot-check), and deletes an
-//! instance or a custom volume: a target copy when a move is rolled back, and a source when the owner finishes a move.
+//! Besides the copy the writer starts and stops an instance, reads a file inside one (the spot-check), turns a kept
+//! source's `boot.autostart` off, and deletes an instance or a custom volume: a target copy when a move is rolled back,
+//! and a source when the owner finishes a move.
 //! Every write is one of the closed shapes [`write_allowed`] lists, with plain names and a `project` query, and every
 //! body is built here: no caller sends a body of its own. The websocket secrets are never logged or returned in a
 //! `Debug` form.
@@ -59,7 +60,8 @@ impl PushTarget<'_> {
         json!({
             "certificate": self.certificate,
             "operation": format!("https://{}/1.0/operations/{}", self.address, self.receive.operation),
-            "websockets": self.receive.secrets,
+            // Incus 7.6 reads the secrets under `secrets` (InstancePostTarget and StorageVolumePostTarget).
+            "secrets": self.receive.secrets,
         })
     }
 }
@@ -117,6 +119,7 @@ pub fn write_allowed(method: &str, target: &str) -> bool {
         ("POST", ["instances"])
             | ("POST", ["instances", _])
             | ("PUT", ["instances", _, "state"])
+            | ("PATCH", ["instances", _])
             | ("DELETE", ["instances", _])
             | ("POST", ["storage-pools", _, "volumes", "custom"])
             | ("POST", ["storage-pools", _, "volumes", "custom", _])
@@ -302,12 +305,15 @@ impl MoveWriter {
     }
 
     /// Asks the sending side to push the instance `name` of `project`, with its snapshots, to `to`. Answers the sending
-    /// operation's id.
+    /// operation's id. A round while the instance runs is sent `consistent: false`: Incus then copies without freezing
+    /// the instance, on the drivers (dir, lvm, block-mode zfs) that would freeze it for a consistent copy; the last
+    /// round, after the stop, is consistent.
     pub fn push_instance(
         &self,
         project: &str,
         name: &str,
         to: &PushTarget,
+        consistent: bool,
     ) -> Result<String, IncusError> {
         names_ok(&[project, name])?;
         let body = json!({
@@ -315,7 +321,7 @@ impl MoveWriter {
             "migration": true,
             "live": false,
             "instance_only": false,
-            "allow_inconsistent": false,
+            "allow_inconsistent": !consistent,
             "target": to.body(),
         });
         let envelope = self.send(
@@ -388,6 +394,19 @@ impl MoveWriter {
             Some(&body),
         )?;
         self.finish(&envelope, deadline)
+    }
+
+    /// Turns `boot.autostart` off on the instance `name` of `project`: a kept source must not start by itself on a host
+    /// reboot next to its moved copy. The body is this one key and nothing else.
+    pub fn disable_autostart(&self, project: &str, name: &str) -> Result<(), IncusError> {
+        names_ok(&[project, name])?;
+        let body = json!({ "config": { "boot.autostart": "false" } });
+        let envelope = self.send(
+            "PATCH",
+            &format!("/1.0/instances/{name}?project={project}"),
+            Some(&body),
+        )?;
+        self.finish(&envelope, Duration::from_secs(60))
     }
 
     /// Deletes the instance `name` of `project`, which must be stopped.
@@ -474,20 +493,50 @@ pub fn state_of(operation: Value) -> OpState {
     }
 }
 
-/// The bytes an operation has moved and its rate in bytes a second, from the progress Incus writes into its metadata
-/// (`progress.processed` and `progress.speed`). `None` for a figure it does not give.
+/// The bytes an operation has moved of the stream it sends now, and its rate in bytes a second, as Incus 7.6 writes
+/// them into its metadata: `fs_progress` (or `block_progress`) is the text "<volume>: 1.20GB (3.00MB/s)", in decimal
+/// units (`units.GetByteSizeString`, two decimals). The figures restart with each stream (each snapshot, then the
+/// volume). `None` for a figure that is not there or does not read.
 pub fn progress_of(operation: &Value) -> (Option<u64>, Option<u64>) {
-    let progress = operation.pointer("/metadata/progress");
-    let number = |key: &str| {
-        progress
-            .and_then(|progress| progress.get(key))
-            .and_then(|value| {
-                value
-                    .as_u64()
-                    .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-            })
+    let text = ["fs_progress", "block_progress"].iter().find_map(|key| {
+        operation
+            .pointer(&format!("/metadata/{key}"))
+            .and_then(Value::as_str)
+    });
+    let Some(text) = text else {
+        return (None, None);
     };
-    (number("processed"), number("speed"))
+    // The volume's name comes first, before ": "; the figures are after the last one.
+    let figures = text.rsplit_once(": ").map_or(text, |(_, figures)| figures);
+    let (bytes, rate) = match figures.split_once(" (") {
+        Some((bytes, rate)) => (
+            bytes,
+            Some(rate.trim_end_matches(')').trim_end_matches("/s")),
+        ),
+        None => (figures, None),
+    };
+    (
+        decimal_bytes(bytes.trim()),
+        rate.and_then(|rate| decimal_bytes(rate.trim())),
+    )
+}
+
+/// "1.20GB" or "512B" as bytes, in the decimal units Incus prints.
+fn decimal_bytes(text: &str) -> Option<u64> {
+    let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+    let (number, unit) = text.split_at(split);
+    let factor: u64 = match unit {
+        "B" => 1,
+        "kB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "PB" => 1_000_000_000_000_000,
+        "EB" => 1_000_000_000_000_000_000,
+        _ => return None,
+    };
+    let value: f64 = number.parse().ok()?;
+    (value.is_finite() && value >= 0.0).then(|| (value * factor as f64).round() as u64)
 }
 
 fn operation_id(envelope: &Value) -> Result<String, IncusError> {
@@ -510,6 +559,7 @@ mod tests {
             ("POST", "/1.0/instances?project=shop"),
             ("POST", "/1.0/instances/web?project=shop"),
             ("PUT", "/1.0/instances/web/state?project=shop"),
+            ("PATCH", "/1.0/instances/web?project=shop"),
             ("DELETE", "/1.0/instances/web?project=shop"),
             (
                 "POST",
@@ -528,7 +578,6 @@ mod tests {
         }
         for (method, target) in [
             ("POST", "/1.0/instances"),
-            ("PATCH", "/1.0/instances/web?project=shop"),
             ("PUT", "/1.0/instances/web?project=shop"),
             ("DELETE", "/1.0/projects/shop?project=shop"),
             ("POST", "/1.0/instances/web/exec?project=shop"),
@@ -552,10 +601,45 @@ mod tests {
     }
 
     #[test]
-    fn progress_is_read_from_numbers_or_the_text_incus_writes() {
-        let op = json!({ "metadata": { "progress": { "stage": "fs_progress", "processed": "1048576", "speed": "2048" } } });
-        assert_eq!(progress_of(&op), (Some(1_048_576), Some(2048)));
+    fn progress_is_read_from_the_text_incus_writes() {
+        let op = json!({ "metadata": { "fs_progress": "web: 1.20GB (3.00MB/s)" } });
+        assert_eq!(progress_of(&op), (Some(1_200_000_000), Some(3_000_000)));
+        let op = json!({ "metadata": { "block_progress": "data: 512B (0B/s)" } });
+        assert_eq!(progress_of(&op), (Some(512), Some(0)));
+        // A name with ": " in it, and a figure Incus never prints.
+        let op = json!({ "metadata": { "fs_progress": "a: b: 2.50kB (1.00kB/s)" } });
+        assert_eq!(progress_of(&op), (Some(2500), Some(1000)));
+        assert_eq!(
+            progress_of(&json!({ "metadata": { "fs_progress": "x: 3QB (1QB/s)" } })),
+            (None, None)
+        );
+        // The field the first build read is not one Incus writes.
+        let op = json!({ "metadata": { "progress": { "processed": "1048576", "speed": "2048" } } });
+        assert_eq!(progress_of(&op), (None, None));
         assert_eq!(progress_of(&json!({ "metadata": null })), (None, None));
+    }
+
+    #[test]
+    fn a_push_names_the_secrets_as_incus_reads_them() {
+        let receive = Receive {
+            operation: "op1".into(),
+            secrets: BTreeMap::from([
+                ("control".to_string(), "c".to_string()),
+                ("fs".to_string(), "f".to_string()),
+            ]),
+        };
+        let body = PushTarget {
+            address: "203.0.113.20:8443",
+            certificate: "PEM",
+            receive: &receive,
+        }
+        .body();
+        assert_eq!(body["secrets"], json!({ "control": "c", "fs": "f" }));
+        assert!(body.get("websockets").is_none());
+        assert_eq!(
+            body["operation"],
+            "https://203.0.113.20:8443/1.0/operations/op1"
+        );
     }
 
     #[test]

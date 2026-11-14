@@ -126,7 +126,25 @@ impl Rig {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("state")).expect("state");
+        let names: Vec<(String, String)> = instances
+            .iter()
+            .map(|one| {
+                (
+                    one["project"].as_str().unwrap_or("shop").to_string(),
+                    one["name"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
         let source = host(&dir.join("source"), instances, 100, false);
+        // Each container holds the default spot-check file, as a real one does.
+        for (project, name) in &names {
+            source.write_guest_file(
+                project,
+                name,
+                "/etc/hostname",
+                format!("{name}\n").as_bytes(),
+            );
+        }
         let target = host(&dir.join("target"), Vec::new(), target_mib, true);
         source.link_migration(&target);
         fs::create_dir_all(dir.join("kernel")).expect("kernel dir");
@@ -428,12 +446,22 @@ fn a_passing_plan_is_frozen_with_its_digest_and_a_changed_source_gives_another()
     assert_eq!(one["volumes"][0]["name"], "web-data");
     assert_eq!(one["cutover"][0], "stop the source");
     assert!(one["verify"].as_array().unwrap().len() >= 4);
-    // The plan is in the move journal; nothing was written on either host.
-    assert!(
-        rig.journal()
-            .iter()
-            .any(|line| line["event"] == "plan" && line["plan"]["digest"] == digest)
-    );
+    // The plan is kept in its own private file, not in the move journal; nothing was written on either host.
+    let kept = rig
+        .dir
+        .join("state")
+        .join(arca::instance_move::PLANS_DIR)
+        .join(format!("{}.json", digest));
+    let frozen: Value = serde_json::from_slice(&fs::read(&kept).expect("the plan file")).unwrap();
+    assert_eq!(frozen["digest"], digest);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert!(rig.journal().is_empty(), "planning writes no journal line");
     assert!(rig.source.writes().is_empty() && rig.target.writes().is_empty());
 
     // The same source plans to the same digest; a changed uuid, a grown size or a new device give another.
@@ -597,7 +625,10 @@ fn a_move_copies_in_rounds_cuts_over_checks_and_measures_its_downtime() {
     rig.source
         .add_volume("default", "default", "web-data", json!({}));
     rig.files("custom/default_web-data", 1);
-    rig.source.set_push_bytes("instance:shop/web", 40 * MIB);
+    // Incus reports its progress in decimal units, as text: "web: 40.00MB (...)".
+    rig.source.set_push_bytes("instance:shop/web", 40_000_000);
+    rig.source
+        .set_push_bytes("volume:default/default/web-data", 1_000_000);
     rig.source
         .write_guest_file("shop", "web", "/srv/data/check", b"orders 41\n");
     let plan = rig.plan_with(&["web"], json!({ "instances": [{ "project": "shop", "name": "web", "spotCheck": "/srv/data/check" }] }));
@@ -663,6 +694,11 @@ fn a_move_copies_in_rounds_cuts_over_checks_and_measures_its_downtime() {
         "volume:default/default/web-data -> https://203.0.113.20:8443/1.0/operations/"
     ));
     assert!(pushes[1].starts_with("instance:shop/web -> "));
+    // The rounds while it runs do not freeze it; the last one, after the stop, is consistent.
+    assert!(pushes[1].ends_with(" (inconsistent)"), "{pushes:?}");
+    assert!(pushes[3].ends_with(" (inconsistent)"), "{pushes:?}");
+    assert!(pushes[5].starts_with("instance:shop/web -> "));
+    assert!(!pushes[5].ends_with(" (inconsistent)"), "{pushes:?}");
     let rounds: Vec<Value> = rig
         .journal()
         .into_iter()
@@ -672,7 +708,7 @@ fn a_move_copies_in_rounds_cuts_over_checks_and_measures_its_downtime() {
     assert_eq!(rounds[0]["refresh"], false);
     assert_eq!(rounds[1]["refresh"], true);
     assert_eq!(rounds[2]["final"], true);
-    assert_eq!(rounds[0]["bytes"], json!(41 * MIB));
+    assert_eq!(rounds[0]["bytes"], json!(41_000_000));
     // The copy runs on the target with its volume; the source is kept, stopped, with its volume.
     assert_eq!(
         rig.target.instance_status("shop", "web").as_deref(),
@@ -693,7 +729,8 @@ fn a_move_copies_in_rounds_cuts_over_checks_and_measures_its_downtime() {
     assert_eq!(result["downtimeMs"], one["downtimeMs"]);
     // The status is as the journal tells it; the result was journaled on the proposal too.
     let events = rig.events(&id);
-    assert_eq!(events.first().map(String::as_str), Some("begin"));
+    // The plan is journaled, whole, with the begin of the move that runs it.
+    assert_eq!(&events[..2], ["plan", "begin"]);
     assert_eq!(events.last().map(String::as_str), Some("end"));
     for event in ["round", "cutover", "verify", "result"] {
         assert!(events.iter().any(|e| e == event), "{event}: {events:?}");
@@ -703,10 +740,10 @@ fn a_move_copies_in_rounds_cuts_over_checks_and_measures_its_downtime() {
 #[test]
 fn progress_is_readable_during_a_slow_round_and_reading_it_writes_nothing() {
     let rig = Rig::new(vec![web()], 100);
-    rig.source.set_push_bytes("instance:shop/web", 40 * MIB);
+    rig.source.set_push_bytes("instance:shop/web", 40_000_000);
     rig.source.plan_push(PushPlan::Hold {
-        processed: 10 * MIB,
-        speed: 5 * MIB,
+        processed: 10_000_000,
+        speed: 5_000_000,
     });
     let started = rig.start(&["web"]);
     let id = started["move"].as_str().unwrap().to_string();
@@ -718,7 +755,8 @@ fn progress_is_readable_during_a_slow_round_and_reading_it_writes_nothing() {
     // Incus's progress reaches the status while the round runs.
     let status = loop {
         let status = rig.status(&id);
-        if status["instances"][0]["bytesMoved"] == json!(10 * MIB) {
+        // Read from the text Incus writes in the operation's fs_progress: "web: 10.00MB (5.00MB/s)".
+        if status["instances"][0]["bytesMoved"] == json!(10_000_000) {
             break status;
         }
         assert!(Instant::now() < until, "no progress: {status}");
@@ -729,7 +767,7 @@ fn progress_is_readable_during_a_slow_round_and_reading_it_writes_nothing() {
     assert_eq!(status["phase"], "running");
     assert_eq!(one["phase"], "copying");
     assert_eq!(one["roundsDone"], 0);
-    assert_eq!(one["rateBytesPerSecond"], json!(5 * MIB));
+    assert_eq!(one["rateBytesPerSecond"], json!(5_000_000));
     assert!(one["bytesTotal"].as_u64().unwrap() >= 2 * MIB);
     assert_eq!(one["downtimeMs"], Value::Null);
     assert_eq!(status["finish"]["available"], false);
@@ -1057,32 +1095,69 @@ fn the_journal_holds_each_step_without_secrets_and_tolerates_a_torn_tail() {
     file.write_all(br#"{"event":"round","move":"#).unwrap();
     drop(file);
     assert_eq!(rig.status(&id)["phase"], "moved");
+    let before = rig.journal().len();
     let again = rig.plan(&["api"]);
     assert_eq!(again["go"], true, "{again}");
-    let lines = rig.journal();
-    assert_eq!(lines.last().unwrap()["event"], "plan");
+    assert_eq!(rig.journal().len(), before, "a plan adds no journal line");
+    // The next line starts on its own after the torn tail.
+    let id = rig.start(&["api"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+}
+
+/// The uuid `container` gives the source's `web`.
+const WEB_UUID: &str = "00000000-0000-4000-8000-000000000001";
+
+/// Puts a copy of `name` on the target as a move's first round would leave it; answers its uuid.
+fn copy_on_target(rig: &Rig, name: &str, status: &str) -> String {
+    rig.target.add_instance(json!({
+        "name": name, "project": "shop", "type": "container", "status": status,
+        "devices": { "root": { "type": "disk", "path": "/", "pool": "default" } },
+    }));
+    arca_incus::MoveWriter::new(rig.target.socket().to_path_buf())
+        .get(&format!("/1.0/instances/{name}?project=shop"))
+        .expect("the copy")["config"]["volatile.uuid"]
+        .as_str()
+        .expect("a uuid")
+        .to_string()
+}
+
+/// Journals a move of `web` that a stopped kernel left after the lines `steps` (each without move, project and name).
+fn interrupted(rig: &Rig, id: &str, steps: Vec<Value>) {
+    let journal = rig.moves.journal();
+    journal
+        .append(&json!({
+            "event": "begin", "at": NOW, "move": id, "plan": "ab".repeat(32), "target": "node-b",
+            "proposal": null, "instances": [{
+                "project": "shop", "name": "web", "uuid": WEB_UUID, "roundsTotal": 3,
+                "bytesTotal": 2 * MIB, "needed": 3 * MIB, "targetPool": "default", "volumes": [],
+            }],
+        }))
+        .unwrap();
+    for mut step in steps {
+        step["at"] = json!(NOW);
+        step["move"] = json!(id);
+        step["project"] = json!("shop");
+        step["name"] = json!("web");
+        journal.append(&step).unwrap();
+    }
 }
 
 #[test]
 fn a_move_a_stopped_kernel_left_unfinished_is_rolled_back_on_the_next_start() {
     let rig = Rig::new(vec![web()], 100);
-    // The kernel stopped in the cutover: the source stopped, a copy on the target.
+    // The kernel stopped in the cutover: the source stopped, the copy it recorded on the target, stopped.
     arca_incus::MoveWriter::new(rig.source.socket().to_path_buf())
         .set_state("shop", "web", "stop", true, Duration::from_secs(5))
         .expect("stopped");
-    let journal = rig.moves.journal();
-    journal
-        .append(&json!({
-            "event": "begin", "at": NOW, "move": "mv-0123456789ab", "plan": "ab".repeat(32), "target": "node-b",
-            "proposal": null, "instances": [{
-                "project": "shop", "name": "web", "wasRunning": true, "roundsTotal": 3,
-                "bytesTotal": 2 * MIB, "needed": 3 * MIB, "targetPool": "default", "volumes": [],
-            }],
-        }))
-        .unwrap();
-    journal
-        .append(&json!({ "event": "cutover", "at": NOW, "move": "mv-0123456789ab", "project": "shop", "name": "web", "step": "stopped" }))
-        .unwrap();
+    let uuid = copy_on_target(&rig, "web", "Stopped");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+        ],
+    );
     assert_eq!(rig.status("mv-0123456789ab")["interrupted"], true);
     rig.moves.recover();
     let status = rig.wait("mv-0123456789ab");
@@ -1093,6 +1168,10 @@ fn a_move_a_stopped_kernel_left_unfinished_is_rolled_back_on_the_next_start() {
             .as_str()
             .unwrap()
             .contains("the kernel stopped during the move")
+    );
+    assert!(
+        !rig.target.holds("instance", "shop", "web"),
+        "the recorded copy is removed"
     );
     assert_eq!(
         rig.source.instance_status("shop", "web").as_deref(),
