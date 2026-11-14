@@ -14,6 +14,8 @@ wrongly). The same list is in the published difference (README.md, "What we chan
 3. Only in record mode (the default): GitHub's image tests still run, at every place their scripts run them, but a
    failed test is written to a list and the build goes on, so one failure does not cost a whole build. The list is
    published with the image. In strict mode a failed test stops the build, as on GitHub.
+4. The step that makes the software report and runs every test first reads /etc/environment, the environment a job
+   gets. Over Packer's SSH session it ran without GitHub's PATH additions (`ansible` in /opt/pipx_bin was not found).
 """
 import re
 import sys
@@ -74,6 +76,11 @@ def main():
     # 2. The Azure agent's deprovision.
     start, end = only_one("waagent", [b for b in blocks(text) if "waagent -force -deprovision+user" in text[b[0]:b[1]]])
     text = text[:start] + text[end:]
+
+    # 4. The report and the tests read the job's environment.
+    old = 'inline           = ["pwsh -File ${var.image_folder}/SoftwareReport/Generate-SoftwareReport.ps1'
+    only_one("report environment", [m.start() for m in re.finditer(re.escape(old), text)])
+    text = text.replace(old, old.replace('["', '["set -a", ". /etc/environment", "set +a", "', 1))
 
     if mode == "record":
         # 3a. invoke_tests (which every install script calls) records instead of stopping. configure-environment.sh
