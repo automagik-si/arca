@@ -167,7 +167,7 @@ cat >"$src/user-data" <<EOF
 #cloud-config
 users:
   - name: packer
-    uid: "1000"
+    uid: 1000
     shell: /bin/bash
     lock_passwd: true
     sudo: "ALL=(ALL) NOPASSWD:ALL"
@@ -182,9 +182,14 @@ incus init "$BASE_IMAGE" "$vm" --vm --project "$PROJECT" \
   -d root,size="$DISK" -d root,limits.read="$DISK_READ" -d root,limits.write="$DISK_WRITE"
 incus start "$vm" --project "$PROJECT"
 for _ in $(seq 120); do in_vm -- true 2>/dev/null && break; sleep 5; done
-# cloud-init says 2 for "done, with warnings".
-cloud_init=0
-in_vm -- cloud-init status --wait >/dev/null || cloud_init=$?
+# cloud-init says 2 for "done, with warnings". The Incus agent can go away while the machine boots (cloud-init
+# restarts services): a lost connection is waited out, cloud-init's own answer is not.
+cloud_init=255
+for _ in $(seq 60); do
+  answer=$(in_vm -- cloud-init status --wait 2>&1) && cloud_init=0 || cloud_init=$?
+  case $answer in *"connect to the agent"*|*"agent isn't currently running"*) cloud_init=255; sleep 5; continue ;; esac
+  break
+done
 if [ "$cloud_init" -ne 0 ] && [ "$cloud_init" -ne 2 ]; then
   say "cloud-init failed in $vm"
   in_vm -- cloud-init status --long || true
