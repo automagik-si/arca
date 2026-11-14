@@ -14,6 +14,10 @@ fi
 # an empty file takes the edits and does nothing.
 [ -e /etc/waagent.conf ] || : >/etc/waagent.conf
 
+# cloud-init leaves the build user's password locked ("!"), and Ubuntu's sshd then refuses its key too. "*" means no
+# password at all, which sshd accepts for a key.
+usermod -p '*' packer
+
 install -d -m 0755 /usr/local/lib/arca-image
 install -m 0755 /tmp/arca-image/invoke-tests-record.sh /usr/local/lib/arca-image/invoke-tests-record.sh
 : >/usr/local/lib/arca-image/test-failures.log
