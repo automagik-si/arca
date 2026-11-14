@@ -222,17 +222,23 @@ in_vm -- mkdir -p /tmp/arca-diff
 incus file push "$src/github-report.json" "$vm/tmp/arca-diff/github.json" --project "$PROJECT"
 incus file push "$out/software-report.json" "$vm/tmp/arca-diff/ours.json" --project "$PROJECT"
 comparer=/imagegeneration/SoftwareReport/software-report-base/Calculate-ImagesDifference.ps1
-in_vm -- pwsh -NoProfile -File "$comparer" -PreviousJsonReportPath /tmp/arca-diff/github.json \
-  -CurrentJsonReportPath /tmp/arca-diff/ours.json -OutputFile /tmp/arca-diff/github.md
-incus file pull "$vm/tmp/arca-diff/github.md" "$out/against-github.md" --project "$PROJECT"
+# From here on a failed comparison is said in the difference, not a reason to throw the built machine away.
+if ! { in_vm -- pwsh -NoProfile -File "$comparer" -PreviousJsonReportPath /tmp/arca-diff/github.json \
+  -CurrentJsonReportPath /tmp/arca-diff/ours.json -OutputFile /tmp/arca-diff/github.md &&
+  incus file pull "$vm/tmp/arca-diff/github.md" "$out/against-github.md" --project "$PROJECT"; }; then
+  say "GitHub's comparer failed against GitHub's report"
+  echo "GitHub's comparer failed on this build; see the build log." >"$out/against-github.md"
+fi
 previous=$(find "$repo/docs/runner-image" -mindepth 1 -maxdepth 1 -type d -name "$IMAGE_OS-*" ! -name "$slug" | sort | tail -1)
 if [ -n "$previous" ] && [ -f "$previous/software-report.json" ]; then
   incus file push "$previous/software-report.json" "$vm/tmp/arca-diff/previous.json" --project "$PROJECT"
   in_vm -- pwsh -NoProfile -File "$comparer" -PreviousJsonReportPath /tmp/arca-diff/previous.json \
-    -CurrentJsonReportPath /tmp/arca-diff/ours.json -OutputFile /tmp/arca-diff/previous.md
-  incus file pull "$vm/tmp/arca-diff/previous.md" "$out/against-previous.md" --project "$PROJECT"
+    -CurrentJsonReportPath /tmp/arca-diff/ours.json -OutputFile /tmp/arca-diff/previous.md &&
+    incus file pull "$vm/tmp/arca-diff/previous.md" "$out/against-previous.md" --project "$PROJECT" ||
+    say "GitHub's comparer failed against our previous report"
 fi
-incus file pull "$vm/usr/local/lib/arca-image/test-failures.log" "$out/test-failures.txt" --project "$PROJECT"
+incus file pull "$vm/usr/local/lib/arca-image/test-failures.log" "$out/test-failures.txt" --project "$PROJECT" ||
+  echo "(the list of failed tests could not be read)" >"$out/test-failures.txt"
 in_vm -- rm -rf /tmp/arca-diff
 
 # --- 6. runner, clean-up --------------------------------------------------------------------------------------------

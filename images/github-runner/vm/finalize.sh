@@ -14,6 +14,7 @@
 set -euo pipefail
 : "${RUNNER_VERSION:?}" "${RUNNER_SHA256:?}" "${IMAGE_OS:?}" "${IMAGE_VERSION:?}" "${RUNNER_IMAGES_TAG:?}" "${ARCA_DIFF_URL:?}"
 say() { printf 'finalize: %s\n' "$*"; }
+warn() { printf 'finalize: warning: %s\n' "$*"; }
 
 # The build user (cloud-init made it, with its sudo rule) goes first, so `runner` is the last line of /etc/passwd:
 # GitHub's post-generation scripts take the last user as the machine's user.
@@ -48,7 +49,7 @@ install -d "$runner_dir"
 tar -xzf "$tarball" -C "$runner_dir"
 rm -f "$tarball"
 # The runner's own dependency check; on this image everything it names is already there.
-"$runner_dir/bin/installdependencies.sh" >/dev/null
+"$runner_dir/bin/installdependencies.sh" >/dev/null || warn "the runner's installdependencies.sh failed"
 
 # The "Runner Image" group GitHub shows at the top of every job, plus one line saying whose build this is.
 jq --arg diff "$ARCA_DIFF_URL" --arg tag "$RUNNER_IMAGES_TAG" \
@@ -61,13 +62,13 @@ say "post-generation scripts"
 for script in /opt/post-generation/*.sh; do
   [ -e "$script" ] || continue
   say "  $(basename "$script")"
-  bash "$script"
+  bash "$script" || warn "$(basename "$script") failed"
 done
 
 # The runner's .env and .path, written by its own env.sh in the environment a job gets (after post-generation, which
 # puts the user's home into /etc/environment).
 runuser -u runner -- env -i bash -c 'set -a; . /etc/environment; set +a; export HOME=/home/runner USER=runner;
-  cd "$1" && ./env.sh >/dev/null' _ "$runner_dir"
+  cd "$1" && ./env.sh >/dev/null' _ "$runner_dir" || warn "the runner's env.sh failed"
 
 say "arca-runner service and swap"
 install -m 0755 /tmp/arca-image/arca-runner-start /usr/local/sbin/arca-runner-start
@@ -78,7 +79,7 @@ systemctl enable arca-runner.service arca-swap.service
 say "clean-up, as waagent -deprovision+user does"
 rm -rf /usr/local/lib/arca-image /tmp/arca-image
 if command -v cloud-init >/dev/null; then
-  cloud-init clean --logs --machine-id
+  cloud-init clean --logs --machine-id || cloud-init clean --logs || warn "cloud-init clean failed"
 fi
 truncate -s 0 /etc/machine-id
 rm -f /var/lib/dbus/machine-id /etc/ssh/ssh_host_*
