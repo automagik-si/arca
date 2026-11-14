@@ -1760,7 +1760,9 @@
                           "deploy_remove",
                           "function_create",
                           "function_remove",
-                          "host_network_restore"
+                          "host_network_restore",
+                          "instance_move",
+                          "instance_move_finish"
                         ],
                         "type": "string"
                       },
@@ -1887,7 +1889,9 @@
               "deploy_remove",
               "function_create",
               "function_remove",
-              "host_network_restore"
+              "host_network_restore",
+              "instance_move",
+              "instance_move_finish"
             ],
             "type": "string"
           }
@@ -3057,6 +3061,105 @@
                 "required": [],
                 "title": "host_network_restore",
                 "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of instance_move: Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, is not the approved one, or whose instances changed. Per instance, Incus pushes the container and its volumes in rounds while it runs, stops it, sends the last delta, starts the copy and checks it. The downtime is measured from the stop to the passed checks. A failure before the checks pass rolls that instance back: the copy is removed and the source started again. The source is kept, stopped; instance_move_finish deletes it. Follow the run with instance_move_status. Example: {\"instances\":[{\"name\":\"web\",\"project\":\"shop\"}],\"plan\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"target\":\"node-b\"}",
+                "examples": [
+                  {
+                    "instances": [
+                      {
+                        "name": "web",
+                        "project": "shop"
+                      }
+                    ],
+                    "plan": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "target": "node-b"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "instances": {
+                    "description": "The instances, in the plan's order: 1 to 50 {project, name} references; an empty list is refused.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "name": {
+                          "description": "The Incus instance name.",
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                          "type": "string"
+                        },
+                        "project": {
+                          "description": "The Incus project the instance is in, on this node.",
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "project",
+                        "name"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 50,
+                    "type": "array"
+                  },
+                  "plan": {
+                    "description": "The digest instance_move_plan answered: 64 lowercase hex digits.",
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "target": {
+                    "description": "The target node: the name of one of this kernel's linked hosts (approval.linkedHosts). The move writes to its Incus through that host's incusSocket.",
+                    "maxLength": 253,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "plan",
+                  "instances",
+                  "target"
+                ],
+                "title": "instance_move",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of instance_move_finish: Finish a verified move, once the owner has approved it as an action proposal: delete each moved source instance on this host and the custom volumes it took with it. It is offered only after the move's checks passed, never on a timer and never by itself; a source that runs again, or a volume another instance uses, is kept and named. instance_move_status shows what it would delete. Example: {\"move\":\"mv-000000000000\"}",
+                "examples": [
+                  {
+                    "move": "mv-000000000000"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "move": {
+                    "description": "The move's id, as instance_move answered it: mv- and twelve hex digits.",
+                    "maxLength": 15,
+                    "minLength": 15,
+                    "pattern": "^mv-[0-9a-f]{12}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "move"
+                ],
+                "title": "instance_move_finish",
+                "type": "object"
               }
             ],
             "description": "The action's own arguments: those of the anyOf branch whose title is the action.",
@@ -3094,7 +3197,9 @@
                 "deploy_remove",
                 "function_create",
                 "function_remove",
-                "host_network_restore"
+                "host_network_restore",
+                "instance_move",
+                "instance_move_finish"
               ],
               "type": "string"
             },
@@ -3471,7 +3576,9 @@
                 "deploy_remove",
                 "function_create",
                 "function_remove",
-                "host_network_restore"
+                "host_network_restore",
+                "instance_move",
+                "instance_move_finish"
               ],
               "type": "string"
             },
@@ -11212,6 +11319,553 @@
       "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
+    },
+    {
+      "name": "instance_move_plan",
+      "params": [
+        {
+          "name": "instances",
+          "required": true,
+          "schema": {
+            "description": "The containers to move, in the order they move: 1 to 50 references. A batch is one plan and one card.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "description": "The Incus instance name.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                  "type": "string"
+                },
+                "project": {
+                  "description": "The Incus project the instance is in, on this node.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                  "type": "string"
+                },
+                "spotCheck": {
+                  "description": "A file inside the instance, best one on its data volume, read on both sides after the move and compared. Absent: /etc/hostname.",
+                  "maxLength": 1024,
+                  "minLength": 2,
+                  "pattern": "^/[A-Za-z0-9._/-]+$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "project",
+                "name"
+              ],
+              "type": "object"
+            },
+            "maxItems": 50,
+            "type": "array"
+          }
+        },
+        {
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "The target node: the name of one of this kernel's linked hosts (approval.linkedHosts). The move writes to its Incus through that host's incusSocket.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "rounds",
+          "required": false,
+          "schema": {
+            "description": "The copy rounds while the instance runs, before the stop: the first is a full copy, each later one a refresh. Absent: 2.",
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "blocked": {
+              "items": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  },
+                  "reasons": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "project",
+                  "name",
+                  "reasons"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "digest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expiresAt": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "go": {
+              "type": "boolean"
+            },
+            "message": {
+              "type": "string"
+            },
+            "plan": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "preflight": {
+              "type": "object"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "go",
+            "digest",
+            "expiresAt",
+            "target",
+            "plan",
+            "blocked",
+            "preflight",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Freeze the plan of a move of containers to a linked host, for the owner's one card. It runs instance_move_preflight again: any no-go blocks the plan with its reasons, and a virtual machine is not movable yet. When all pass it records the plan in the move journal and answers its digest: source, target and credential, each instance's uuid and measured bytes, the copy rounds and cutover, the checks, the transport (Incus pushes from this host) and the rollback promise. The plan expires in an hour; a changed source gives another digest. Nothing is stopped, copied or created.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "instance_move",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "instances",
+          "required": true,
+          "schema": {
+            "description": "The instances, in the plan's order: 1 to 50 {project, name} references; an empty list is refused.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "description": "The Incus instance name.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                  "type": "string"
+                },
+                "project": {
+                  "description": "The Incus project the instance is in, on this node.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "project",
+                "name"
+              ],
+              "type": "object"
+            },
+            "maxItems": 50,
+            "type": "array"
+          }
+        },
+        {
+          "name": "plan",
+          "required": true,
+          "schema": {
+            "description": "The digest instance_move_plan answered: 64 lowercase hex digits.",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "The target node: the name of one of this kernel's linked hosts (approval.linkedHosts). The move writes to its Incus through that host's incusSocket.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "instances": {
+              "items": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project",
+                  "name"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "message": {
+              "type": "string"
+            },
+            "move": {
+              "type": "string"
+            },
+            "phase": {
+              "type": "string"
+            },
+            "plan": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "move",
+            "plan",
+            "target",
+            "phase",
+            "instances",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, is not the approved one, or whose instances changed. Per instance, Incus pushes the container and its volumes in rounds while it runs, stops it, sends the last delta, starts the copy and checks it. The downtime is measured from the stop to the passed checks. A failure before the checks pass rolls that instance back: the copy is removed and the source started again. The source is kept, stopped; instance_move_finish deletes it. Follow the run with instance_move_status.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "instance_move_status",
+      "params": [
+        {
+          "name": "move",
+          "required": false,
+          "schema": {
+            "description": "The move's id, as instance_move answered it: mv- and twelve hex digits.",
+            "maxLength": 15,
+            "minLength": 15,
+            "pattern": "^mv-[0-9a-f]{12}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "moves": {
+              "items": {
+                "properties": {
+                  "endedAt": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "finish": {
+                    "properties": {
+                      "available": {
+                        "type": "boolean"
+                      },
+                      "deletes": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "reason": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "available",
+                      "reason",
+                      "deletes"
+                    ],
+                    "type": "object"
+                  },
+                  "instances": {
+                    "items": {
+                      "properties": {
+                        "bytesMoved": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "bytesTotal": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "checks": {
+                          "items": {
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "downtimeMs": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "elapsedMs": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "phase": {
+                          "type": "string"
+                        },
+                        "project": {
+                          "type": "string"
+                        },
+                        "rateBytesPerSecond": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "result": {
+                          "enum": [
+                            "moved",
+                            "rolled_back",
+                            "failed",
+                            "finished"
+                          ],
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "roundsDone": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "roundsTotal": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "timeLeftMs": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "project",
+                        "name",
+                        "phase",
+                        "result",
+                        "roundsDone",
+                        "roundsTotal",
+                        "bytesMoved",
+                        "bytesTotal",
+                        "rateBytesPerSecond",
+                        "elapsedMs",
+                        "timeLeftMs",
+                        "downtimeMs",
+                        "reason",
+                        "checks"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "interrupted": {
+                    "type": "boolean"
+                  },
+                  "move": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "type": "string"
+                  },
+                  "plan": {
+                    "type": "string"
+                  },
+                  "startedAt": {
+                    "type": "integer"
+                  },
+                  "target": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "move",
+                  "plan",
+                  "target",
+                  "phase",
+                  "startedAt",
+                  "endedAt",
+                  "interrupted",
+                  "instances",
+                  "finish"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "moves"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "How a move stands, read-only: its phase, and per instance the rounds done of the total, the bytes moved of the measured bytes, the rate, the time it has taken and the time left, the measured downtime and the checks once it ends, and whether it can be finished. A figure Incus has not given yet is null. Without a move id, the recent moves.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "instance_move_finish",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "move",
+          "required": true,
+          "schema": {
+            "description": "The move's id, as instance_move answered it: mv- and twelve hex digits.",
+            "maxLength": 15,
+            "minLength": 15,
+            "pattern": "^mv-[0-9a-f]{12}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "deleted": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kept": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "message": {
+              "type": "string"
+            },
+            "move": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "move",
+            "deleted",
+            "kept",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Finish a verified move, once the owner has approved it as an action proposal: delete each moved source instance on this host and the custom volumes it took with it. It is offered only after the move's checks passed, never on a timer and never by itself; a source that runs again, or a volume another instance uses, is kept and named. instance_move_status shows what it would delete.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
     }
   ],
   "openrpc": "1.3.2",

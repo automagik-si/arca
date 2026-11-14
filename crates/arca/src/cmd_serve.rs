@@ -599,6 +599,16 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // A database made from the node's template is created by the service handler itself.
     let service_create = crate::handlers::service_create_handler(&service_handlers)
         .ok_or_else(|| Failure::Runtime("the service handlers hold no service_create".into()))?;
+    // The moves to linked hosts: their plans, their runs and their journal. A move a stopped kernel left unfinished is
+    // rolled back now, in the background, before any new move can start.
+    let moves = Arc::new(crate::instance_move::Moves::new(
+        Arc::new(cfg.clone()),
+        Arc::clone(&kernel),
+        clock.clone(),
+    ));
+    if kernel_mode {
+        moves.recover();
+    }
     let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> =
         plan_handlers_served(
             Arc::clone(&kernel),
@@ -624,6 +634,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             clock.clone(),
             Arc::new(cfg.clone()),
         ))
+        .chain(crate::instance_move::handlers(moves))
         .collect();
     // The owner approval requests: the three verbs and the approval page share one store in the state directory.
     let dashboard = cfg

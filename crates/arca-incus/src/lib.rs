@@ -27,6 +27,9 @@ pub mod function_run;
 pub mod import;
 #[cfg(feature = "write")]
 pub mod lifecycle;
+/// The move writer: the migration push between two Incus daemons, the start, stop and delete a move needs, and nothing else.
+#[cfg(feature = "write")]
+pub mod migrate;
 pub mod read;
 pub mod shim;
 #[cfg(feature = "write")]
@@ -42,7 +45,7 @@ pub use adopt::{
 };
 #[cfg(feature = "write")]
 pub use assign::{DeviceAssigner, GpuChange, InstanceDevices, device_name, normalize_pci};
-pub use fake::{Appears, OpId};
+pub use fake::{Appears, OpId, PushPlan};
 pub use fake::{
     FakeIncus, FakeState, LxcSplit, RecordedRequest, WriteRecord, lxc_execute_argv,
     oci_entrypoint_args,
@@ -53,6 +56,8 @@ pub use import::{ImportRead, ImportTarget, ImportWriter, import_allowance};
 pub use lifecycle::{
     CALL_BUDGET, FetchedImage, GRACE_SECONDS, InstanceState, StateAction, StateChanger,
 };
+#[cfg(feature = "write")]
+pub use migrate::{MoveWriter, OpState, PushTarget, Receive};
 pub use read::{IncusError, IncusRead, Target, Unconfirmed, UnixIncus};
 pub use read::{
     OPERATIONS_PATH, RunningOp, SESSION_DESCRIPTIONS, TOKEN_CLASS, operation_names, running_on,

@@ -186,7 +186,7 @@ refused without the value being echoed back.
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
 | `approval.trustOwnerKeysFrom` | no | Absolute paths of other kernels' owner passkeys files on this machine, which this kernel also trusts, read-only, for action approvals only (never to change its own passkeys). See "Approving on another kernel of this machine". |
 | `approval.origins` | with `trustOwnerKeysFrom` | The page origins (`approvalOrigin` form) a passkey from those files may answer from. A line for any other origin is not trusted. |
-| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>", "incusSocket": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. The optional `incusSocket` is that host's Incus socket on this machine (local, or forwarded to a path here); `instance_move_preflight` reads the host through it, with GETs only. |
+| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>", "incusSocket": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. The optional `incusSocket` is that host's Incus socket on this machine (local, or forwarded to a path here); `instance_move_preflight` reads the host through it, with GETs only, and an approved `instance_move` writes through it (the copy it receives, its start, and its removal on a rollback). |
 
 The config is refused, with exit 2, when:
 
@@ -1797,7 +1797,8 @@ unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
 `action_propose`, `plan_decline`, `approval_submit`, `action_approve`, `peer_keys_sync`, the Postgres and ontology verbs, `service_create`, `service_list` and
 `service_status`, `gpu_attach` and `gpu_detach`, `storage_list`, `storage_add`, `snapshot_create`, `snapshot_list` and
-`snapshot_delete`, `instance_start`, `instance_stop` and `instance_restart`, and `instance_move_preflight`.
+`snapshot_delete`, `instance_start`, `instance_stop` and `instance_restart`, `instance_move_preflight`, and the move verbs
+`instance_move_plan`, `instance_move`, `instance_move_status` and `instance_move_finish`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
@@ -2236,6 +2237,101 @@ arca call instance_move_preflight '{"instances":[{"project":"shop","name":"web"}
 The operator re-points the proxy, then asks again; `go` turns true. Several instances in one call are sized one after
 another against the same pool: an earlier one that fits counts as pending for the later ones, and its name is in their
 `detail` and in `measure.pendingFor`.
+
+## Moving containers to a linked host: `instance_move`
+
+A move takes containers from this node to a linked host with one owner card. The owner approves once; Incus does the
+copy; the kernel orchestrates the rounds, journals them, measures the downtime, and rolls back what fails. The source is
+never deleted by the move: the owner finishes a verified move with a second card, whenever they choose.
+
+**What it needs.** The target is a linked host (`approval.linkedHosts`) with an `incusSocket`: the move writes to the
+target's Incus through that socket, so the owner decides by configuring it. The target's Incus listens on the network
+(`core.https_address`; its server document names the address and its certificate), and this host's Incus can reach that
+address: Incus on this host pushes each container and custom volume to it. A relay through the kernel is the fallback the
+plan names; it is not built yet, so a target that does not listen blocks the plan and says so.
+
+**1. The plan.** `instance_move_plan` (viewer) takes 1 to 50 `{project, name}` references (each may name a `spotCheck`
+file, `/etc/hostname` when it does not), the `target`, and `rounds` (1 to 5 copy rounds while the container runs, 2 when
+absent). It runs the whole `instance_move_preflight` again. Any no-go blocks the whole plan, with the preflight's own
+reasons per instance in `blocked`: remove or fix those and plan again. Beyond the preflight, the plan blocks a virtual
+machine (`virtual machines are not movable yet`: this build moves containers only), a host folder (Incus does not copy
+it: move its data into a custom volume first), and a name the target already holds, instance or custom volume (a move
+never replaces one). A custom volume the target lacks is not a no-go here, unlike in the preflight: the move takes it
+along, in the same rounds.
+
+When every instance passes, the plan is frozen in the move journal and named by its `digest`, a SHA-256 over the
+canonical plan without its times. The plan names this node and the target, the credential (the target's `incusSocket`),
+the transport (`push`, the target's address and the SHA-256 of its certificate, `relay` as the unavailable fallback),
+and, per instance, its `volatile.uuid`, a digest of its devices, its measured bytes (root, snapshots, custom volumes,
+host folders) and the bytes it needs with 10% headroom, its target pool, its custom volumes, the rounds in order, the
+cutover (stop the source, send the last delta, start the copy), the checks, and an estimated downtime (30 s for the stop,
+start and checks, plus a last delta of 1% of the data at 50 MiB/s: an estimate; the move measures the real one). A plan
+expires an hour after it is made. Planning again with the same source gives the same digest; a changed uuid, device or
+size gives another.
+
+```
+arca call instance_move_plan '{"instances":[{"project":"shop","name":"web","spotCheck":"/srv/data/orders.db"}],"target":"node-b"}'
+```
+
+**2. The card.** `action_propose` with the action `instance_move` and the arguments `{plan: <digest>, instances, target}`,
+the instances in the plan's own order. The node refuses a card for a digest it never planned (`NoSuchPlan`), an expired
+plan (`PlanExpired`), other instances or another target (`PlanMismatch`), and a plan that already ran (`AlreadyRun`). The
+card shows the digest and the target, then a row per instance (what it needs on which pool, the rounds, the estimated
+downtime, its custom volumes), the transport, the credential, the rollback promise, and that the source is kept. A batch
+is one card. The owner's passkey approves the card's arguments, digest included; the grant it arms is spent by one run.
+
+**3. The run.** The approved `instance_move` (doctor) checks the plan is still the approved one before it spends the
+grant, then reads everything again: a plan that is no longer a go, or whose instances changed since the card (uuid, type,
+devices, custom volumes, target pool, the target's address or certificate, or a size past the approved headroom) is
+refused with `PlanChanged` and nothing moves. With other moves running to the same target, their pending bytes are
+counted against its pool (`TargetFull`). The answer comes at once (`phase: copying`, the move id `mv-<12 hex>`); the run
+goes on in the background, one instance after the other:
+
+- the copy rounds while the container runs: each custom volume, then the container, are created on the target as a
+  migration (`push` mode) and pushed by this host's Incus; the first round copies everything with its snapshots, each next
+  one refreshes only what changed. Before each round the target pool's free space is read again: a target that filled
+  up fails the round. Each round is journaled with its bytes, rate and time.
+- the cutover: the source is stopped (gracefully for a minute, then forced), the last delta is sent, and the copy is
+  started on the target.
+- the checks: the copy runs, and still runs after the other checks; each network card that had a global address on the
+  source has one again (waiting up to a minute); each TCP proxy port answers on the target's address; a container has
+  no guest agent (not applicable); each custom volume is on the target and attached; the spot-check file reads the same
+  on both sides (when the source has no such file, the check says there was nothing to compare).
+- the downtime is measured from the stop to the passed checks, and is in the `result` line and the status.
+
+**Failure and rollback.** Any failure before the checks pass rolls that instance back: the copy on the target is
+stopped and deleted with the custom volumes the move created there (the plan made sure the target held none of those
+names), and the source is started again when it ran before the move. The source's own volumes are never touched. The
+instance's result is `rolled_back` with the reason; the next instance of a batch still moves. A verified instance's
+source stays on this host, stopped: to go back, stop the copy on the target and start the source, until the move is
+finished. The proposal's late result is `MoveVerified`, `MovePartlyRolledBack` or `MoveRolledBack`.
+
+**A stopped kernel.** A move the kernel left unfinished (a `begin` with no `end`) is not resumed: on the next start in
+kernel mode, each instance that has no result is rolled back as above, with the reason "the kernel stopped during the
+move", and the move ends `interrupted`.
+
+**Progress.** `instance_move_status` (viewer, read-only) answers one move (`{"move": "mv-…"}`) or the latest 20: its
+phase (`running`, `moved`, `partly_moved`, `rolled_back`, `finished`, or `interrupted` when no run of this process holds
+it), and per instance the phase (`waiting`, `copying`, `cutover`, `verifying`, `rolling_back`, then the result), rounds
+done and total, bytes moved (Incus's own count, live during a round) and the measured total, the rate Incus reports, the
+elapsed time, the time left (only during the first round, from the rate; `null` when it cannot be said), the downtime
+once moved, the reason and the checks. `finish` says whether a finish is offered and what it would delete.
+
+**4. Finishing.** `instance_move_finish` is a card of its own (`action_propose` with `{move}`), offered only after the
+move ended with at least one verified instance, never on a timer and never by itself. Its card lists each source
+instance and custom volume it deletes. Approved, it deletes each verified source instance on this host, and its custom
+volumes when no other instance uses them; a source that runs again, or a volume in use, is kept and named in `kept`. The
+moved copies on the target are not touched. A finish runs once.
+
+**The journal.** `instance-moves.jsonl` in the state directory (0600), append-only JSON lines: `plan`, `begin`,
+`round`, `created`, `cutover`, `verify`, `result`, `rollback`, `end` and `finish`. It holds no secret: no websocket
+secret and no certificate, only the certificate's SHA-256. A torn last line is skipped, and the next append starts on a
+new line.
+
+**What the tests do not prove.** The tests run two fake Incus daemons linked so that a push lands on the target. A real
+two-host run still has to show Incus's push between two daemons (certificates, the address reachable from the source, the
+refresh rounds' real deltas and rates), the progress metadata a real migration reports, a container's start and its
+network on the target, and the proxy port probe across the network.
 
 ## Snapshot storage and snapshots
 

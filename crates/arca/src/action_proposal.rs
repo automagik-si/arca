@@ -72,6 +72,8 @@ pub enum ActionKind {
     FunctionCreate,
     FunctionRemove,
     HostNetworkRestore,
+    InstanceMove,
+    InstanceMoveFinish,
 }
 
 /// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
@@ -131,7 +133,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 24] = [
+    pub const ALL: [ActionKind; 26] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
@@ -156,6 +158,8 @@ impl ActionKind {
         Self::FunctionCreate,
         Self::FunctionRemove,
         Self::HostNetworkRestore,
+        Self::InstanceMove,
+        Self::InstanceMoveFinish,
     ];
 
     /// How the owner undoes this action once it has run, in the owner's words: the card says it beside what the action
@@ -206,6 +210,12 @@ impl ActionKind {
             Self::HostNetworkRestore => {
                 "There is nothing to undo: it only puts the host back to what its declared file says, and the file is not changed."
             }
+            Self::InstanceMove => {
+                "A failure before the moved copy passes its checks is rolled back by itself. After a verified move the source stays on this host, stopped: to go back, stop the copy on the target and start the source again, until you finish the move."
+            }
+            Self::InstanceMoveFinish => {
+                "It cannot be undone: the source instances and their custom volumes are deleted from this host; the moved copies on the target stay."
+            }
         }
     }
 
@@ -255,6 +265,8 @@ impl ActionKind {
             Self::FunctionCreate => "function_create",
             Self::FunctionRemove => "function_remove",
             Self::HostNetworkRestore => "host_network_restore",
+            Self::InstanceMove => "instance_move",
+            Self::InstanceMoveFinish => "instance_move_finish",
         }
     }
 
@@ -724,6 +736,38 @@ impl ActionKind {
                     "Sets IP forwarding as the host's declared file says, adds the firewall rules that let the declared bridges' containers reach out, and sets the FORWARD policy the file records. No container and nothing in Arca's own state changes.",
                 ),
             ],
+            // What the frozen plan holds, read from the move journal when the proposal was made: a row per instance,
+            // the transport, the credential and the rollback.
+            Self::InstanceMove => {
+                let mut rows = vec![row("Plan", text("plan")), row("Target", text("target"))];
+                match crate::instance_move::fact_rows(gpu_product) {
+                    Some(fact) => rows.extend(fact.iter().map(|(label, value)| row(label, value))),
+                    None => {
+                        for one in args["instances"].as_array().into_iter().flatten() {
+                            rows.push(row(
+                                &format!(
+                                    "Move {}/{}",
+                                    one["project"].as_str().unwrap_or_default(),
+                                    one["name"].as_str().unwrap_or_default()
+                                ),
+                                "as the plan says",
+                            ));
+                        }
+                    }
+                }
+                rows
+            }
+            Self::InstanceMoveFinish => {
+                let mut rows = vec![row("Move", text("move"))];
+                match crate::instance_move::fact_rows(gpu_product) {
+                    Some(fact) => rows.extend(fact.iter().map(|(label, value)| row(label, value))),
+                    None => rows.push(row(
+                        "Delete",
+                        "the move's verified source instances and their custom volumes on this host",
+                    )),
+                }
+                rows
+            }
             Self::DeployRemove => vec![
                 row("Deploy", text("deploy")),
                 // What the deploy holds as the proposal is made: the owner sees each part he approves the removal of.
@@ -898,6 +942,23 @@ impl ActionKind {
                 "Put this host's forwarding and firewall rules back as its declared file says"
                     .to_string()
             }
+            Self::InstanceMove => {
+                let count = args["instances"].as_array().map_or(0, Vec::len);
+                if count == 1 {
+                    format!(
+                        "Move the container {}/{} to {}",
+                        args["instances"][0]["project"].as_str().unwrap_or_default(),
+                        args["instances"][0]["name"].as_str().unwrap_or_default(),
+                        text("target")
+                    )
+                } else {
+                    format!("Move {count} containers to {}", text("target"))
+                }
+            }
+            Self::InstanceMoveFinish => format!(
+                "Finish the move {}: delete its sources on this host",
+                text("move")
+            ),
         };
         // A service that can call the kernel is named as one.
         let sentence = if self == Self::ServiceCreate && args.get("kernelAccess").is_some() {
@@ -1260,6 +1321,28 @@ fn loaded_words(
 ) -> (String, Vec<ActionDetail>) {
     // The parts of a deploy's removal were read from the desired state when it was proposed, and are not in its
     // arguments either: the journal's own rows are kept when they are the rows this action writes for these arguments.
+    // A move's rows were read from its frozen plan, and a finish's from the move journal: the journal's rows are kept
+    // when they open with the rows this action writes for these arguments.
+    if matches!(
+        action,
+        ActionKind::InstanceMove | ActionKind::InstanceMoveFinish
+    ) {
+        let rebuilt = action.details(args);
+        let head = if action == ActionKind::InstanceMove {
+            2
+        } else {
+            1
+        };
+        let fits = stored_details.len() > head && stored_details[..head] == rebuilt[..head];
+        return (
+            action.summary(args),
+            if fits {
+                stored_details.to_vec()
+            } else {
+                rebuilt
+            },
+        );
+    }
     if action == ActionKind::DeployRemove {
         let rebuilt = action.details(args);
         let fits = stored_details.len() == rebuilt.len()

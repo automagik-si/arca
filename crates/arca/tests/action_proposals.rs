@@ -349,6 +349,12 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             }),
             ActionKind::FunctionRemove => json!({ "name": "relay" }),
             ActionKind::HostNetworkRestore => json!({}),
+            ActionKind::InstanceMove => json!({
+                "plan": "ab".repeat(32),
+                "instances": [{ "project": "shop", "name": "web" }],
+                "target": "node-b",
+            }),
+            ActionKind::InstanceMoveFinish => json!({ "move": "mv-0123456789ab" }),
         }
     }
 
@@ -563,6 +569,32 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     ("Disk", "100GiB"),
                 ]
             );
+            continue;
+        }
+        // With no plan read from the move journal, a move's card names the plan, the target and each instance.
+        if action == ActionKind::InstanceMove {
+            let shown: Vec<(&str, &str)> = details
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(
+                shown,
+                [
+                    ("Plan", "ab".repeat(32).as_str()),
+                    ("Target", "node-b"),
+                    ("Move shop/web", "as the plan says"),
+                ]
+            );
+            assert_eq!(
+                action.summary(&prepared),
+                "Move the container shop/web to node-b"
+            );
+            continue;
+        }
+        if action == ActionKind::InstanceMoveFinish {
+            assert_eq!(details[0].label, "Move");
+            assert_eq!(details[0].value, "mv-0123456789ab");
+            assert!(action.undo_words().contains("cannot be undone"));
             continue;
         }
         if action == ActionKind::HostNetworkRestore {

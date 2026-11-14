@@ -1792,6 +1792,17 @@ impl ToolHandler for ActionPropose {
             ActionKind::HostNetworkRestore => Some(crate::host_network::proposal_fact(
                 &self.host_network_socket(),
             )?),
+            // The card of a move shows its frozen plan, and a finish's what it deletes, read from the move journal now;
+            // a plan that is not there, has expired or does not fit, and a move not verified, propose nothing.
+            ActionKind::InstanceMove | ActionKind::InstanceMoveFinish => {
+                let node = self.node.as_deref().ok_or_else(|| CallError::Refused {
+                    code: "NoNode".to_string(),
+                    message: "this kernel has no node config, so it holds no move".to_string(),
+                })?;
+                Some(crate::instance_move::check_proposal(
+                    node, action, &payload, now,
+                )?)
+            }
             // The card of a deploy's removal lists the deploy's parts as they stand now.
             ActionKind::DeployRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
@@ -2456,6 +2467,8 @@ impl ActionExecutor {
                 | "function_create"
                 | "function_remove"
                 | "host_network_restore"
+                | "instance_move"
+                | "instance_move_finish"
         ) {
             call["approval"] = json!(grant);
         }

@@ -87,7 +87,7 @@ fn invalid(message: impl Into<String>) -> CallError {
 
 /// Whether `name` is an Incus project name the verb reads: a letter or digit, then up to 62 letters, digits, dots,
 /// underscores or hyphens.
-fn project_ok(name: &str) -> bool {
+pub(crate) fn project_ok(name: &str) -> bool {
     let bytes = name.as_bytes();
     let Some((first, rest)) = bytes.split_first() else {
         return false;
@@ -100,7 +100,7 @@ fn project_ok(name: &str) -> bool {
 }
 
 /// Whether `name` is an Incus instance name: a host name label of at most 63 letters, digits and inner hyphens.
-fn instance_ok(name: &str) -> bool {
+pub(crate) fn instance_ok(name: &str) -> bool {
     let bytes = name.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 63
@@ -172,7 +172,7 @@ fn parse_args(args: &Value) -> Result<(Vec<Reference>, String, bool), CallError>
 }
 
 /// A path segment, percent-encoded past the characters Incus names use.
-fn seg(text: &str) -> String {
+pub(crate) fn seg(text: &str) -> String {
     let mut out = String::new();
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~') {
@@ -414,7 +414,7 @@ impl Check {
 }
 
 /// A size in binary units with one decimal, such as `4.4 MiB`.
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
     if bytes < 1024 {
         return format!("{bytes} B");

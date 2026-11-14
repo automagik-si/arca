@@ -77,13 +77,18 @@ impl Verb {
     /// Whether the MCP door advertises `readOnlyHint`. A verb that records a durable proposal is not read-only even
     /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
     /// `owner_approval_status` hands its requester an approval string, so it is not advertised read-only either (droidd's
-    /// `readOnly: false`), and its minimum scope keeps it off viewers.
+    /// `readOnly: false`), and its minimum scope keeps it off viewers. `instance_move_plan` records a frozen plan in the
+    /// move journal, as `action_propose` records a proposal.
     pub fn read_only_hint(&self) -> bool {
-        !self.writes && !matches!(self.name, "action_propose" | "owner_approval_status")
+        !self.writes
+            && !matches!(
+                self.name,
+                "action_propose" | "owner_approval_status" | "instance_move_plan"
+            )
     }
 }
 
-static VERBS: [Verb; 69] = [
+static VERBS: [Verb; 73] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1055,7 +1060,299 @@ static VERBS: [Verb; 69] = [
         params: instance_move_preflight_params,
         result: instance_move_preflight_result,
     },
+    Verb {
+        name: "instance_move_plan",
+        summary: "Freeze the plan of a move of containers to a linked host, for the owner's one card. It runs instance_move_preflight again: any no-go blocks the plan with its reasons, and a virtual machine is not movable yet. When all pass it records the plan in the move journal and answers its digest: source, target and credential, each instance's uuid and measured bytes, the copy rounds and cutover, the checks, the transport (Incus pushes from this host) and the rollback promise. The plan expires in an hour; a changed source gives another digest. Nothing is stopped, copied or created.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_move_plan,
+        cut: no_cut,
+        params: instance_move_plan_params,
+        result: instance_move_plan_result,
+    },
+    Verb {
+        name: "instance_move",
+        summary: "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, is not the approved one, or whose instances changed. Per instance, Incus pushes the container and its volumes in rounds while it runs, stops it, sends the last delta, starts the copy and checks it. The downtime is measured from the stop to the passed checks. A failure before the checks pass rolls that instance back: the copy is removed and the source started again. The source is kept, stopped; instance_move_finish deletes it. Follow the run with instance_move_status.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_move,
+        cut: no_cut,
+        params: instance_move_params,
+        result: instance_move_result,
+    },
+    Verb {
+        name: "instance_move_status",
+        summary: "How a move stands, read-only: its phase, and per instance the rounds done of the total, the bytes moved of the measured bytes, the rate, the time it has taken and the time left, the measured downtime and the checks once it ends, and whether it can be finished. A figure Incus has not given yet is null. Without a move id, the recent moves.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_move_status,
+        cut: no_cut,
+        params: instance_move_status_params,
+        result: instance_move_status_result,
+    },
+    Verb {
+        name: "instance_move_finish",
+        summary: "Finish a verified move, once the owner has approved it as an action proposal: delete each moved source instance on this host and the custom volumes it took with it. It is offered only after the move's checks passed, never on a timer and never by itself; a source that runs again, or a volume another instance uses, is kept and named. instance_move_status shows what it would delete.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_move_finish,
+        cut: no_cut,
+        params: instance_move_finish_params,
+        result: instance_move_finish_result,
+    },
 ];
+
+/// A move's id: `mv-` and twelve lowercase hex digits.
+fn move_id_schema() -> Value {
+    json!({
+        "description": "The move's id, as instance_move answered it: mv- and twelve hex digits.",
+        "maxLength": 15,
+        "minLength": 15,
+        "pattern": "^mv-[0-9a-f]{12}$",
+        "type": "string"
+    })
+}
+
+fn move_project_schema() -> Value {
+    json!({
+        "description": "The Incus project the instance is in, on this node.",
+        "maxLength": 63,
+        "minLength": 1,
+        "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+        "type": "string"
+    })
+}
+
+fn move_target_schema() -> Value {
+    json!({
+        "description": "The target node: the name of one of this kernel's linked hosts (approval.linkedHosts). The move writes to its Incus through that host's incusSocket.",
+        "maxLength": 253,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+        "type": "string"
+    })
+}
+
+/// The instances a move names, `{project, name}` each, 1 to 50.
+fn move_instances_schema() -> Value {
+    json!({
+        "description": "The instances, in the plan's order: 1 to 50 {project, name} references; an empty list is refused.",
+        "items": params(vec![
+            ("project", true, move_project_schema()),
+            ("name", true, instance_name_schema()),
+        ]),
+        "maxItems": 50,
+        "type": "array"
+    })
+}
+
+fn instance_move_plan_params() -> Value {
+    let reference = params(vec![
+        ("project", true, move_project_schema()),
+        ("name", true, instance_name_schema()),
+        (
+            "spotCheck",
+            false,
+            json!({
+                "description": "A file inside the instance, best one on its data volume, read on both sides after the move and compared. Absent: /etc/hostname.",
+                "maxLength": 1024,
+                "minLength": 2,
+                "pattern": "^/[A-Za-z0-9._/-]+$",
+                "type": "string"
+            }),
+        ),
+    ]);
+    params(vec![
+        (
+            "instances",
+            true,
+            json!({
+                "description": "The containers to move, in the order they move: 1 to 50 references. A batch is one plan and one card.",
+                "items": reference,
+                "maxItems": 50,
+                "type": "array"
+            }),
+        ),
+        ("target", true, move_target_schema()),
+        (
+            "rounds",
+            false,
+            json!({
+                "description": "The copy rounds while the instance runs, before the stop: the first is a full copy, each later one a refresh. Absent: 2.",
+                "maximum": 5,
+                "minimum": 1,
+                "type": "integer"
+            }),
+        ),
+    ])
+}
+
+fn instance_move_plan_result() -> Value {
+    result(vec![
+        ("go", true, boolean()),
+        ("digest", true, nullable(string())),
+        ("expiresAt", true, nullable(int())),
+        ("target", true, string()),
+        ("plan", true, json!({ "type": ["object", "null"] })),
+        (
+            "blocked",
+            true,
+            array(result(vec![
+                ("project", true, string()),
+                ("name", true, string()),
+                ("reasons", true, array(string())),
+            ])),
+        ),
+        ("preflight", true, json!({ "type": "object" })),
+        ("message", true, string()),
+    ])
+}
+
+/// A short line for `instance_move_plan`.
+pub fn summary_move_plan(v: &Value) -> String {
+    v["message"].as_str().unwrap_or("planned").to_string()
+}
+
+fn instance_move_params() -> Value {
+    with_confirm(params(vec![
+        (
+            "plan",
+            true,
+            json!({
+                "description": "The digest instance_move_plan answered: 64 lowercase hex digits.",
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+            }),
+        ),
+        ("instances", true, move_instances_schema()),
+        ("target", true, move_target_schema()),
+        ("approval", true, approval_schema()),
+    ]))
+}
+
+fn instance_move_result() -> Value {
+    result(vec![
+        ("move", true, string()),
+        ("plan", true, string()),
+        ("target", true, string()),
+        ("phase", true, string()),
+        (
+            "instances",
+            true,
+            array(result(vec![
+                ("project", true, string()),
+                ("name", true, string()),
+            ])),
+        ),
+        ("message", true, string()),
+    ])
+}
+
+/// A short line for `instance_move`.
+pub fn summary_move(v: &Value) -> String {
+    v["message"].as_str().unwrap_or("moving").to_string()
+}
+
+fn instance_move_status_params() -> Value {
+    params(vec![("move", false, move_id_schema())])
+}
+
+fn instance_move_status_result() -> Value {
+    let instance = result(vec![
+        ("project", true, string()),
+        ("name", true, string()),
+        ("phase", true, string()),
+        (
+            "result",
+            true,
+            nullable_enum(&["moved", "rolled_back", "failed", "finished"]),
+        ),
+        ("roundsDone", true, at_least(0)),
+        ("roundsTotal", true, at_least(0)),
+        ("bytesMoved", true, nullable(int())),
+        ("bytesTotal", true, nullable(int())),
+        ("rateBytesPerSecond", true, nullable(int())),
+        ("elapsedMs", true, at_least(0)),
+        ("timeLeftMs", true, nullable(int())),
+        ("downtimeMs", true, nullable(int())),
+        ("reason", true, nullable(string())),
+        ("checks", true, array(json!({ "type": "object" }))),
+    ]);
+    let one = result(vec![
+        ("move", true, string()),
+        ("plan", true, string()),
+        ("target", true, string()),
+        ("phase", true, string()),
+        ("startedAt", true, int()),
+        ("endedAt", true, nullable(int())),
+        ("interrupted", true, boolean()),
+        ("instances", true, array(instance)),
+        (
+            "finish",
+            true,
+            result(vec![
+                ("available", true, boolean()),
+                ("reason", true, string()),
+                ("deletes", true, array(string())),
+            ]),
+        ),
+    ]);
+    result(vec![("moves", true, array(one))])
+}
+
+/// A short line for `instance_move_status`.
+pub fn summary_move_status(v: &Value) -> String {
+    let moves = v["moves"].as_array().map_or(&[][..], Vec::as_slice);
+    match moves {
+        [] => "no move".to_string(),
+        [one] => format!(
+            "move {} to {}: {}",
+            one["move"].as_str().unwrap_or("?"),
+            one["target"].as_str().unwrap_or("?"),
+            one["phase"].as_str().unwrap_or("?")
+        ),
+        many => format!("{} moves", many.len()),
+    }
+}
+
+fn instance_move_finish_params() -> Value {
+    with_confirm(params(vec![
+        ("move", true, move_id_schema()),
+        ("approval", true, approval_schema()),
+    ]))
+}
+
+fn instance_move_finish_result() -> Value {
+    result(vec![
+        ("move", true, string()),
+        ("deleted", true, array(string())),
+        ("kept", true, array(string())),
+        ("message", true, string()),
+    ])
+}
+
+/// A short line for `instance_move_finish`.
+pub fn summary_move_finish(v: &Value) -> String {
+    v["message"].as_str().unwrap_or("finished").to_string()
+}
 
 /// The checks of every `instance_move_preflight` row, in the order each row lists them.
 pub const MOVE_PREFLIGHT_CHECKS: [&str; 8] = [
@@ -2131,6 +2428,7 @@ fn not_confirmed(name: &str) -> String {
         "deploy_rollback" => "nothing was rolled back",
         "deploy_remove" => "nothing was removed",
         "function_remove" => "nothing was removed",
+        "instance_move" => "nothing was moved",
         _ => "nothing was deleted",
     };
     let spent = if name == "postgres_delete" || name == "deploy_rollback" {
@@ -2601,8 +2899,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty-four verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 24] = [
+/// The twenty-six verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 26] = [
     "service_create",
     "service_remove",
     "service_update",
@@ -2627,6 +2925,8 @@ const ACTION_NAMES: [&str; 24] = [
     "function_create",
     "function_remove",
     "host_network_restore",
+    "instance_move",
+    "instance_move_finish",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -2699,7 +2999,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 24] = [
+const ACTION_EXAMPLES: [(&str, &str); 26] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
@@ -2742,6 +3042,11 @@ const ACTION_EXAMPLES: [(&str, &str); 24] = [
     ),
     ("function_remove", r#"{"name":"relay"}"#),
     ("host_network_restore", r#"{}"#),
+    (
+        "instance_move",
+        r#"{"plan":"0000000000000000000000000000000000000000000000000000000000000000","instances":[{"project":"shop","name":"web"}],"target":"node-b"}"#,
+    ),
+    ("instance_move_finish", r#"{"move":"mv-000000000000"}"#),
 ];
 
 /// The schema keyword that tells the door's check which branch of an `anyOf` a value is held to: the one whose `title`
