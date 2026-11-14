@@ -61,6 +61,7 @@ done
 : "${GATE_POOL_GIB:=90}"     # GitHub's image uses about 55-60 GB; the rest is margin for the pool's other users
 : "${GATE_ROOT_GIB:=20}"
 : "${GATE_WAIT:=43200}"
+: "${GATE_FLOORS:=}"        # more room to keep, as "path:GiB path:GiB", e.g. "/srv/build:155"
 : "${PUBLISH_COMPRESSION:=zstd}"
 : "${DIFF_URL_BASE:=https://github.com/automagik-si/arca/blob/dev/docs/runner-image}"
 
@@ -107,6 +108,10 @@ while :; do
   why=''
   [ "$(gib "$pf")" -ge "$GATE_POOL_GIB" ] || why="$why pool $pool has $(gib "$pf") GiB free (needs $GATE_POOL_GIB);"
   [ "$(gib "$rf")" -ge "$GATE_ROOT_GIB" ] || why="$why /var/lib/incus has $(gib "$rf") GiB free (needs $GATE_ROOT_GIB);"
+  for floor in $GATE_FLOORS; do
+    free=$(df -B1 --output=avail "${floor%%:*}" | tail -1)
+    [ "$(gib "$free")" -ge "${floor##*:}" ] || why="$why ${floor%%:*} has $(gib "$free") GiB free (keep ${floor##*:});"
+  done
   if [ "$gate" = yes ]; then
     [ "$idle" -ge "$GATE_IDLE" ] || why="$why CPU idle $idle% (needs $GATE_IDLE);"
     [ "$(gib "$mem")" -ge "$GATE_MEM_GIB" ] || why="$why MemAvailable $(gib "$mem") GiB (needs $GATE_MEM_GIB);"
