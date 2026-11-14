@@ -29,6 +29,8 @@ macro_rules! shipped {
 /// Every file a shipped template needs on a node: each template's JSON and the script its entrypoint or first boot names. The image build
 /// inputs (`automagik.build.sh`, `automagik-dsh/`) are used from a checkout and are not installed.
 pub const SHIPPED: &[(&str, &str)] = shipped![
+    "arca-edge.json",
+    "arca-edge.sh",
     "automagik-server.json",
     "automagik-workspace.json",
     "automagik-workspace.sh",

@@ -73,6 +73,8 @@ pub enum ActionKind {
     FunctionCreate,
     FunctionRemove,
     HostNetworkRestore,
+    RouteAdd,
+    RouteRemove,
 }
 
 /// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
@@ -132,7 +134,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 25] = [
+    pub const ALL: [ActionKind; 27] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
@@ -158,6 +160,8 @@ impl ActionKind {
         Self::FunctionCreate,
         Self::FunctionRemove,
         Self::HostNetworkRestore,
+        Self::RouteAdd,
+        Self::RouteRemove,
     ];
 
     /// How the owner undoes this action once it has run, in the owner's words: the card says it beside what the action
@@ -211,6 +215,8 @@ impl ActionKind {
             Self::HostNetworkRestore => {
                 "There is nothing to undo: it only puts the host back to what its declared file says, and the file is not changed."
             }
+            Self::RouteAdd => "Ask your assistant to stop serving the address.",
+            Self::RouteRemove => "Ask your assistant to serve the address again.",
         }
     }
 
@@ -261,6 +267,8 @@ impl ActionKind {
             Self::FunctionCreate => "function_create",
             Self::FunctionRemove => "function_remove",
             Self::HostNetworkRestore => "host_network_restore",
+            Self::RouteAdd => "route_add",
+            Self::RouteRemove => "route_remove",
         }
     }
 
@@ -737,6 +745,48 @@ impl ActionKind {
                     "Sets IP forwarding as the host's declared file says, adds the firewall rules that let the declared bridges' containers reach out, and sets the FORWARD policy the file records. No container and nothing in Arca's own state changes.",
                 ),
             ],
+            Self::RouteAdd => {
+                let reach = args["reach"]
+                    .as_str()
+                    .and_then(crate::route::Reach::parse)
+                    .unwrap_or(crate::route::Reach::Private);
+                let project = match text("project") {
+                    "" => arca_netproject::PROJECT,
+                    project => project,
+                };
+                vec![
+                    row(
+                        "Address",
+                        &format!("https://{}", text("hostname").to_ascii_lowercase()),
+                    ),
+                    row("Instance", text("instance")),
+                    row("Project", project),
+                    row("Port", &args["port"].to_string()),
+                    row("Reach", reach.words()),
+                    row(
+                        "Edge",
+                        gpu_product.unwrap_or("read when the route is added"),
+                    ),
+                    row(
+                        "Effect",
+                        "The edge serves this address with a certificate of its own and passes each request to the instance on this port, and its firewall lets it reach that port. An address that already has a route is pointed here instead.",
+                    ),
+                ]
+            }
+            Self::RouteRemove => vec![
+                row(
+                    "Address",
+                    &format!("https://{}", text("hostname").to_ascii_lowercase()),
+                ),
+                row(
+                    "Edge",
+                    gpu_product.unwrap_or("read when the route is removed"),
+                ),
+                row(
+                    "Effect",
+                    "The edge stops serving this address and no longer opens its instance's port for it. The instance itself is not touched.",
+                ),
+            ],
             Self::DeployRemove => vec![
                 row("Deploy", text("deploy")),
                 // What the deploy holds as the proposal is made: the owner sees each part he approves the removal of.
@@ -916,6 +966,16 @@ impl ActionKind {
                 "Put this host's forwarding and firewall rules back as its declared file says"
                     .to_string()
             }
+            Self::RouteAdd => format!(
+                "Serve https://{} from the instance {} on port {}",
+                text("hostname").to_ascii_lowercase(),
+                text("instance"),
+                args["port"]
+            ),
+            Self::RouteRemove => format!(
+                "Stop serving https://{}",
+                text("hostname").to_ascii_lowercase()
+            ),
         };
         // A service that can call the kernel is named as one.
         let sentence = if self == Self::ServiceCreate && args.get("kernelAccess").is_some() {

@@ -278,7 +278,8 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "github_connect_status",
             "github_bindings",
             "github_audit",
-            "os_update"
+            "os_update",
+            "route_list"
         ]
     );
 }

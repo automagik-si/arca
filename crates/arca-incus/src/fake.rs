@@ -215,6 +215,8 @@ struct Shared {
     lxc_split: Mutex<LxcSplit>,
     host_interfaces: Mutex<Vec<HostInterface>>,
     host_netmasks: Mutex<BTreeMap<IpAddr, u8>>,
+    /// What `/os/1.0/system/network` answers, as incus-osd does on IncusOS; `None` answers 404, as any other host does.
+    os_network: Mutex<Option<Value>>,
     operations_unreadable: AtomicBool,
     /// Reads the fake answers badly: each a path prefix, how many reads are left, and what happens to them.
     read_faults: Mutex<Vec<(String, u32, ReadFault)>>,
@@ -327,6 +329,8 @@ enum Route {
     ListPools,
     HostInterfaces,
     HostInterfaceState(String),
+    /// incus-osd's `/os/1.0/system/network`.
+    OsNetwork,
     PoolResources(String),
     PoolObject(String),
     NetworkLeases(String),
@@ -428,6 +432,7 @@ impl Shared {
             fail_create_start: AtomicBool::new(false),
             lxc_split: Mutex::new(LxcSplit::default()),
             host_interfaces: Mutex::new(Vec::new()),
+            os_network: Mutex::new(None),
             host_netmasks: Mutex::new(BTreeMap::new()),
             operations_unreadable: AtomicBool::new(false),
             read_faults: Mutex::new(Vec::new()),
@@ -574,6 +579,13 @@ impl FakeIncus {
     /// `/1.0/networks?recursion=1` and each `/1.0/networks/<name>/state` from them, and nothing else reads them.
     pub fn set_host_interfaces(&self, interfaces: Vec<(String, Vec<IpAddr>)>) {
         *lock(&self.shared.host_interfaces) = interfaces;
+    }
+
+    /// Makes the fake an IncusOS host: `/os/1.0/system/network` answers `body` (its `config` and `state`), as incus-osd
+    /// does, and the listing of `/1.0/networks?recursion=1` shows the interfaces of [`Self::set_host_interfaces`] as
+    /// managed bridges, the only networks IncusOS lists there. Without it that path answers 404.
+    pub fn set_os_network(&self, body: Value) {
+        *lock(&self.shared.os_network) = Some(body);
     }
 
     /// Gives a host address its prefix length: the fake then answers it as `netmask` in the interface's state, as Incus
@@ -1332,6 +1344,9 @@ fn hold_wait(shared: &Shared, id: &str, target: &str) {
 /// The route for a target, or `None` when no route serves it.
 fn parse(target: &str) -> Option<Route> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path == "/os/1.0/system/network" && query.is_empty() {
+        return Some(Route::OsNetwork);
+    }
     let rest = path.strip_prefix("/1.0")?;
     let segments: Vec<&str> = if rest.is_empty() {
         Vec::new()
@@ -1504,13 +1519,19 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         }
         ("GET", Route::HostInterfaces) => {
             let interfaces = lock(&shared.host_interfaces);
+            // IncusOS lists only the networks Incus manages; any other host lists its own interfaces unmanaged.
+            let managed = lock(&shared.os_network).is_some();
             sync(Value::Array(
                 interfaces
                     .iter()
-                    .map(|(name, _)| json!({ "name": name, "managed": false, "type": "broadcast" }))
+                    .map(|(name, _)| json!({ "name": name, "managed": managed, "type": if managed { "bridge" } else { "broadcast" } }))
                     .collect(),
             ))
         }
+        ("GET", Route::OsNetwork) => match lock(&shared.os_network).clone() {
+            Some(body) => sync(body),
+            None => (404, String::new(), error_envelope(404, "not found")),
+        },
         ("GET", Route::HostInterfaceState(name)) => {
             let interfaces = lock(&shared.host_interfaces);
             match interfaces.iter().find(|(listed, _)| *listed == name) {
