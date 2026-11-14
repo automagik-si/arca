@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`service_update` now moves a running container service made from a local image pinned by fingerprint, as it already
+moves one made from an image by digest on a registry: the call's `digest` is the new image's fingerprint, the image
+must already be in the service project's image store, the record takes the alias the installed template pins it under
+(or keeps its own), and the data volume is kept. Keep the old image in the project store until the update has
+succeeded: a rollback in a project without snapshots rebuilds the old root from it.
+
 ## 0.29.0 (2026-11-13)
 
 A function whose `command` is a shell and its script (`["/bin/sh", "-c", <script>]`) now starts on a node whose Incus

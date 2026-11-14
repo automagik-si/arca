@@ -242,8 +242,8 @@ impl StateChanger {
     }
 
     /// Asks Incus to rebuild one instance's root disk from an image and waits for the operation. The instance keeps its
-    /// config, its devices and its uuid. It is the crate's own, for [`crate::function_run`] alone, which sends it to a
-    /// function's stopped instance and to nothing else.
+    /// config, its devices and its uuid. It is the crate's own: [`crate::function_run`] sends it to a function's stopped
+    /// instance, and [`StateChanger::rebuild_from_registry`] and [`StateChanger::rebuild_from_local`] to a service's.
     pub(crate) fn rebuild(
         &self,
         project: &str,
@@ -358,12 +358,33 @@ impl StateChanger {
         rebuilt
     }
 
-    /// Whether the store the project reads holds an image with this fingerprint. For [`crate::function_run`] alone.
-    pub(crate) fn image_present(
+    /// Gives one stopped instance the root of a local image pinned by fingerprint: Incus rebuilds the root disk from
+    /// the copy the project's own image store holds and keeps the config, the devices (a data volume among them) and
+    /// the uuid. `source` must be exactly the three fields of such an image; its fingerprint decides which image it is,
+    /// and the alias is only a name kept in the record.
+    pub fn rebuild_from_local(
         &self,
-        project: &str,
-        fingerprint: &str,
-    ) -> Result<bool, IncusError> {
+        seen: &InstanceState,
+        source: &Value,
+    ) -> Result<(), IncusError> {
+        let fresh = self.read(&seen.project, &seen.name)?;
+        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+            return Err(refused("the instance was recreated since it was read"));
+        }
+        if !fresh.is_stopped() {
+            return Err(refused("the instance is not stopped"));
+        }
+        if !local_source(source) {
+            return Err(refused(
+                "the source is not a local image pinned by fingerprint",
+            ));
+        }
+        self.rebuild(&fresh.project, &fresh.name, &json!({ "source": source }))
+    }
+
+    /// Whether the store the project reads holds an image with this fingerprint. For [`crate::function_run`] and
+    /// `service_update`, which requires a local image there before it rebuilds from it.
+    pub fn image_present(&self, project: &str, fingerprint: &str) -> Result<bool, IncusError> {
         self.allow(project)?;
         if !plain_name(project) || !plain_name(fingerprint) {
             return Err(refused("the project or the fingerprint is not plain"));
@@ -611,6 +632,25 @@ fn state_url(project: &str, name: &str) -> Result<String, IncusError> {
         return Err(refused("the project or instance name is not plain"));
     }
     Ok(format!("/1.0/instances/{name}/state?project={project}"))
+}
+
+/// Whether `source` is a local image pinned by fingerprint, and nothing more: the only source a rebuild from the
+/// project's own image store may name.
+fn local_source(source: &Value) -> bool {
+    let Some(fields) = source.as_object() else {
+        return false;
+    };
+    fields.len() == 3
+        && source["type"] == "image"
+        && source["alias"]
+            .as_str()
+            .is_some_and(|alias| !alias.is_empty())
+        && source["fingerprint"].as_str().is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 pub(crate) fn plain_name(text: &str) -> bool {

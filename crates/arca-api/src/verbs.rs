@@ -413,7 +413,7 @@ static VERBS: [Verb; 73] = [
     },
     Verb {
         name: "service_update",
-        summary: "Move a running container service made from an image by digest to another digest of that image in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new digest (data volume, config, secrets and firewall rules are kept), started, and checked within the timeout (120 seconds unless timeoutSeconds says otherwise). On any failure the old version is put back. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose.",
+        summary: "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another digest or fingerprint in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new image (data volume, config, secrets and firewall rules are kept), started, and checked within timeoutSeconds (120 by default). On any failure the old version is put back. A local image must already be in the service project's image store. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -4312,7 +4312,7 @@ pub fn summary_service_update(v: &Value) -> String {
     if v.get("follow").is_some() {
         "Service's follow setting changed.".to_string()
     } else if v["updated"] == false {
-        "Service already on that digest.".to_string()
+        "Service already runs that image.".to_string()
     } else if v.get("noNewPrivileges").is_some() {
         "Service's no-new-privileges setting changed.".to_string()
     } else {
@@ -4335,7 +4335,7 @@ fn service_update_params_base() -> Value {
                 "type": "string"
             },
             "digest": {
-                "description": "The image digest to move to: sha256: and 64 lower-case hex digits. The service keeps its image's repository. Give it, or follow, not both.",
+                "description": "The image to move to: sha256: and 64 lower-case hex digits. For an OCI image, the digest, and the service keeps its image's repository; for a service made from a local image pinned by fingerprint, the new image's fingerprint. Give it, or follow, not both.",
                 "pattern": "^sha256:[0-9a-f]{64}$",
                 "type": "string"
             },

@@ -1142,3 +1142,342 @@ fn no_new_privileges_does_not_go_with_follow() {
     );
     assert!(message.contains("not with follow"), "{message}");
 }
+
+/// The alias of the local image `worker` is made from, and the alias a later template pins it under.
+const LOCAL_ALIAS: &str = "worker-image";
+const LOCAL_NEXT_ALIAS: &str = "worker-image-next";
+
+/// A container template whose image is a local one pinned by fingerprint, with a data volume and a host port.
+fn local_template(alias: &str, fingerprint: &str) -> Value {
+    json!({
+        "name": "worker",
+        "kind": "system",
+        "image": format!("local:{alias}"),
+        "digest": format!("sha256:{fingerprint}"),
+        "ports": [8080],
+        "data": { "path": "/data", "uid": 1000, "gid": 1000 },
+        "lan": { "port": 8080 },
+        "env": {},
+        "publishable": false
+    })
+}
+
+/// A node whose service project is made by an OCI service, holding the local image `LOCAL_ALIAS` in that project's
+/// store, and the container service `worker` made from it when it was pinned to the image's fingerprint.
+fn local_rig(up: &Arc<AtomicBool>) -> (Rig, String) {
+    let rig = bare_node(up, None);
+    rig.template("app", app_template());
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("the OCI service makes the service project");
+    let fingerprint = rig.fake.add_image(PROJECT, LOCAL_ALIAS);
+    rig.template("worker", local_template(LOCAL_ALIAS, &fingerprint));
+    rig.call(
+        "service_create",
+        json!({ "name": "worker", "template": "worker" }),
+    )
+    .expect("the local pinned create");
+    (rig, fingerprint)
+}
+
+/// The data volume of the service `service`, as the fake holds it.
+fn data_volume(rig: &Rig, service: &str) -> Value {
+    rig.get(&format!(
+        "/1.0/storage-pools/pool1/volumes/custom/{service}-data?project={PROJECT}"
+    ))
+    .expect("the service's data volume")
+}
+
+/// The source the service's record holds.
+fn source_of(rig: &Rig, service: &str) -> Value {
+    rig.service_config(service).source
+}
+
+#[test]
+fn local_pinned_service_updates_to_the_fingerprint_its_template_names_and_keeps_its_data() {
+    let up = Arc::new(AtomicBool::new(true));
+    let (rig, old) = local_rig(&up);
+    let next = rig.fake.add_image(PROJECT, LOCAL_NEXT_ALIAS);
+    assert_ne!(next, old, "the two images are different");
+    // The installed template moves to the new image, under an alias of its own: the record takes that alias.
+    rig.template("worker", local_template(LOCAL_NEXT_ALIAS, &next));
+    let before = instance_named(&rig, "worker");
+    let volume = data_volume(&rig, "worker");
+    // A file inside the data volume, as the running service left it.
+    rig.fake
+        .put_guest_file(PROJECT, "worker", "/data/keep.txt", "file", "0600", 1000);
+    let files = rig.fake.service_files();
+    let writes = rig.fake.writes().len();
+
+    let done = update(
+        &rig,
+        json!({ "name": "worker", "digest": format!("sha256:{next}"), "timeoutSeconds": 1 }),
+    )
+    .expect("the local update runs");
+    assert_eq!(done["updated"], true);
+    assert_eq!(done["digest"], format!("sha256:{next}"));
+    assert_eq!(done["snapshot"], Value::Null);
+
+    // The root was rebuilt from the project's own copy of the new image, by its fingerprint.
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "worker"),
+        vec![format!("store:{next}")]
+    );
+    assert_eq!(
+        source_of(&rig, "worker"),
+        json!({ "type": "image", "alias": LOCAL_NEXT_ALIAS, "fingerprint": next }),
+        "the record names the new fingerprint and the alias the template pins it under"
+    );
+
+    // Everything that is not the root stayed: the volume, a file written in it, the devices and the uuid.
+    let after = instance_named(&rig, "worker");
+    assert_eq!(after["status"], "Running");
+    assert_eq!(after["devices"]["data"], before["devices"]["data"]);
+    assert_eq!(after["devices"]["eth0"], before["devices"]["eth0"]);
+    assert_eq!(
+        after["config"]["volatile.uuid"],
+        before["config"]["volatile.uuid"]
+    );
+    assert_eq!(data_volume(&rig, "worker"), volume);
+    assert_eq!(
+        rig.fake.service_files(),
+        files,
+        "the file the service kept in its data volume is untouched"
+    );
+    let touched: Vec<String> = rig.fake.writes()[writes..]
+        .iter()
+        .filter(|write| write.path.contains("/volumes/"))
+        .map(|write| write.path.clone())
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "the data volume was written to: {touched:?}"
+    );
+
+    let steps = journal(&rig);
+    assert!(steps.contains(&("rebuild".to_string(), true)), "{steps:?}");
+    assert!(steps.contains(&("health".to_string(), true)), "{steps:?}");
+    assert!(steps.contains(&("record".to_string(), true)), "{steps:?}");
+    assert_eq!(steps.last(), Some(&("end".to_string(), true)));
+}
+
+#[test]
+fn local_update_to_the_fingerprint_the_service_runs_changes_nothing() {
+    let up = Arc::new(AtomicBool::new(true));
+    let (rig, old) = local_rig(&up);
+    let before = instance_named(&rig, "worker");
+
+    let done = update(
+        &rig,
+        json!({ "name": "worker", "digest": format!("sha256:{old}") }),
+    )
+    .expect("the same image");
+    assert_eq!(done["updated"], false);
+    assert!(rig.fake.rebuilds(PROJECT, "worker").is_empty());
+    assert_eq!(instance_named(&rig, "worker"), before);
+    assert_eq!(source_of(&rig, "worker")["fingerprint"], old);
+    assert!(!rig.dir.join("service-updates.jsonl").exists());
+}
+
+#[test]
+fn local_update_keeps_the_alias_the_record_has_when_the_template_pins_another_fingerprint() {
+    let up = Arc::new(AtomicBool::new(true));
+    let (rig, old) = local_rig(&up);
+    let next = rig.fake.add_image(PROJECT, LOCAL_NEXT_ALIAS);
+    // The installed template still names the old alias and pins it to the old image.
+    assert_eq!(source_of(&rig, "worker")["fingerprint"], old);
+
+    update(
+        &rig,
+        json!({ "name": "worker", "digest": format!("sha256:{next}"), "timeoutSeconds": 1 }),
+    )
+    .expect("the local update runs");
+    assert_eq!(
+        source_of(&rig, "worker"),
+        json!({ "type": "image", "alias": LOCAL_ALIAS, "fingerprint": next }),
+        "the old alias stays: the template does not pin the new fingerprint"
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "worker"),
+        vec![format!("store:{next}")]
+    );
+}
+
+#[test]
+fn local_update_takes_the_template_alias_only_for_the_fingerprint_it_pins() {
+    let up = Arc::new(AtomicBool::new(true));
+    let (rig, old) = local_rig(&up);
+    let next = rig.fake.add_image(PROJECT, "worker-image-next");
+    let later = rig.fake.add_image(PROJECT, "worker-image-later");
+    assert_ne!(next, old);
+    assert_ne!(later, next);
+
+    // The template names the service's own image under another alias. The fingerprint is the same image, so the
+    // update is a no-op and the record keeps its alias: a comparison of whole sources would rebuild and take it.
+    rig.template("worker", local_template("worker-image-same", &old));
+    let same = update(
+        &rig,
+        json!({ "name": "worker", "digest": format!("sha256:{old}") }),
+    )
+    .expect("the same image");
+    assert_eq!(same["updated"], false);
+    assert!(rig.fake.rebuilds(PROJECT, "worker").is_empty());
+    assert_eq!(
+        source_of(&rig, "worker"),
+        json!({ "type": "image", "alias": LOCAL_ALIAS, "fingerprint": old })
+    );
+
+    // The template pins the new fingerprint under an alias of its own: the record takes that alias, and the journal
+    // begin line carries the old fingerprint the rollback would need from the store.
+    rig.template("worker", local_template("worker-image-template", &next));
+    update(
+        &rig,
+        json!({ "name": "worker", "digest": format!("sha256:{next}"), "timeoutSeconds": 1 }),
+    )
+    .expect("the update to the pinned image runs");
+    assert_eq!(
+        source_of(&rig, "worker"),
+        json!({ "type": "image", "alias": "worker-image-template", "fingerprint": next })
+    );
+    let begin: Value = fs::read_to_string(rig.dir.join("service-updates.jsonl"))
+        .expect("the journal")
+        .lines()
+        .next()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .expect("a begin line");
+    assert_eq!(begin["step"], "begin");
+    assert_eq!(begin["detail"]["from"], LOCAL_ALIAS);
+    assert_eq!(begin["detail"]["fromFingerprint"], old);
+
+    // The template now pins another fingerprint under another alias: moving to a third image keeps the record's alias.
+    rig.template("worker", local_template("worker-image-other", &next));
+    update(
+        &rig,
+        json!({ "name": "worker", "digest": format!("sha256:{later}"), "timeoutSeconds": 1 }),
+    )
+    .expect("the update to the third image runs");
+    assert_eq!(
+        source_of(&rig, "worker"),
+        json!({ "type": "image", "alias": "worker-image-template", "fingerprint": later }),
+        "the template alias belongs to the fingerprint it pins, not to this update"
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "worker"),
+        vec![format!("store:{next}"), format!("store:{later}")]
+    );
+}
+
+#[test]
+fn local_update_to_an_image_the_project_does_not_hold_is_refused_and_changes_nothing() {
+    let up = Arc::new(AtomicBool::new(true));
+    let (rig, old) = local_rig(&up);
+    let missing = "2".repeat(64);
+    let before = instance_named(&rig, "worker");
+    let volume = data_volume(&rig, "worker");
+    let record = source_of(&rig, "worker");
+    let writes = rig.fake.writes().len();
+
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "worker", "digest": format!("sha256:{missing}") }),
+    ));
+    assert_eq!(code, "refused");
+    assert!(message.contains("Nothing was changed"), "{message}");
+    assert!(
+        message.contains(&missing),
+        "the refusal names the image: {message}"
+    );
+    assert!(message.contains("image store"), "{message}");
+    assert!(message.contains("incus image copy"), "{message}");
+
+    // No rebuild, no write, no record, no journal: the image was checked before anything changed.
+    assert!(rig.fake.rebuilds(PROJECT, "worker").is_empty());
+    assert_eq!(rig.fake.writes().len(), writes);
+    assert_eq!(instance_named(&rig, "worker"), before);
+    assert_eq!(data_volume(&rig, "worker"), volume);
+    assert_eq!(source_of(&rig, "worker"), record);
+    assert!(!rig.dir.join("service-updates.jsonl").exists());
+    assert_eq!(source_of(&rig, "worker")["fingerprint"], old);
+}
+
+#[test]
+fn local_update_whose_health_check_fails_rolls_back_to_the_old_fingerprint_and_keeps_the_data() {
+    let up = Arc::new(AtomicBool::new(false));
+    let (rig, old) = local_rig(&up);
+    let next = rig.fake.add_image(PROJECT, LOCAL_NEXT_ALIAS);
+    let before = instance_named(&rig, "worker");
+    let volume = data_volume(&rig, "worker");
+    rig.fake
+        .put_guest_file(PROJECT, "worker", "/data/keep.txt", "file", "0600", 1000);
+    let files = rig.fake.service_files();
+
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "worker", "digest": format!("sha256:{next}"), "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rolled_back");
+    assert!(message.contains("rolled back"), "{message}");
+    assert!(message.contains("health check"), "{message}");
+
+    // The old root was rebuilt from the old fingerprint, locally: the project allows no snapshot to restore.
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "worker"),
+        vec![format!("store:{next}"), format!("store:{old}")],
+        "the rollback rebuilds the old image from the project's own copy"
+    );
+    assert!(rig.fake.restores(PROJECT, "worker").is_empty());
+    assert_eq!(source_of(&rig, "worker")["fingerprint"], old);
+    assert_eq!(instance_named(&rig, "worker")["status"], "Running");
+    assert_eq!(
+        instance_named(&rig, "worker")["devices"]["data"],
+        before["devices"]["data"]
+    );
+    assert_eq!(data_volume(&rig, "worker"), volume);
+    assert_eq!(
+        rig.fake.service_files(),
+        files,
+        "the file the service kept in its data volume is untouched"
+    );
+}
+
+#[test]
+fn local_service_without_a_pin_is_refused_with_both_kinds_it_is_not() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_node(&up, None);
+    rig.template("app", app_template());
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("the OCI service makes the service project");
+    rig.fake.add_image(PROJECT, "plain-image");
+    rig.template(
+        "plain",
+        json!({
+            "name": "plain",
+            "kind": "system",
+            "image": "local:plain-image",
+            "ports": [8080]
+        }),
+    );
+    rig.call(
+        "service_create",
+        json!({ "name": "plain", "template": "plain" }),
+    )
+    .expect("an unpinned local image is enough to create");
+
+    let (code, message) = refusal_words(update(&rig, json!({ "name": "plain", "digest": NEW })));
+    assert_eq!(code, "refused");
+    assert!(
+        message.contains("not made from an OCI image by digest on a registry"),
+        "{message}"
+    );
+    assert!(
+        message.contains("local image pinned by fingerprint"),
+        "the refusal names the other kind it is not: {message}"
+    );
+    assert!(message.contains("Nothing was changed"), "{message}");
+    assert!(rig.fake.rebuilds(PROJECT, "plain").is_empty());
+}

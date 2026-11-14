@@ -1,12 +1,14 @@
-//! `service_update`: a running service made from an image by digest moves to another digest of that image in one call.
+//! `service_update`: a running service made from an image by digest, or from a local image pinned by fingerprint,
+//! moves to another image in one call.
 //!
 //! The steps, each journalled in [`SERVICE_UPDATES_FILE`] (an append-only file of JSON lines in the state directory,
 //! one `begin` line before anything is sent to Incus, one line per step and one `end` line; no line holds a secret):
 //!
 //! 1. the instance is stopped, when it runs, and a snapshot of it is taken where the project allows one (an Arca
 //!    project never does, so on a node as Arca makes it there is none);
-//! 2. its root is rebuilt from the new digest. Incus keeps the config, the devices (the data volume among them), the
-//!    uuid, the secrets and the firewall rules; only the root is the new image's;
+//! 2. its root is rebuilt from the new digest, or, for a local image, from the project's own copy of the new
+//!    fingerprint. Incus keeps the config, the devices (the data volume among them), the uuid, the secrets and the
+//!    firewall rules; only the root is the new image's;
 //! 3. it is started;
 //! 4. the health check, within a timeout: a service with a host port (`lan`) is tried through that port's proxy, a
 //!    service whose first port is its droidd port is tried at its address, and any other must stay running for a few
@@ -125,25 +127,78 @@ pub fn digest_ok(text: &str) -> bool {
     })
 }
 
-/// `source` with its image's digest replaced: `<repository>@sha256:<new>`. `None` when `source` is not an OCI image by
-/// digest on a registry, the one kind of source an update moves.
-pub fn source_with(source: &Value, digest: &str) -> Option<Value> {
+/// `source` with its image replaced by `digest`: `<repository>@sha256:<new>` for an OCI image by digest on a registry,
+/// or the three fields of a local image pinned by the new fingerprint. `pinned_alias` is the alias of the image the
+/// installed template pins when that template pins the same fingerprint: a local source takes it, since Incus decides
+/// by the fingerprint and the alias is only a name kept in the record. `None` when `source` is neither kind.
+pub fn source_with(source: &Value, digest: &str, pinned_alias: Option<&str>) -> Option<Value> {
     let fields = source.as_object()?;
-    if fields.len() != 5
-        || source["type"] != "image"
-        || source["mode"] != "pull"
-        || source["protocol"] != "oci"
-        || !source["server"].as_str()?.starts_with("https://")
+    if fields.len() == 5 {
+        if source["type"] != "image"
+            || source["mode"] != "pull"
+            || source["protocol"] != "oci"
+            || !source["server"].as_str()?.starts_with("https://")
+        {
+            return None;
+        }
+        let (repository, old) = source["alias"].as_str()?.rsplit_once("@sha256:")?;
+        if repository.is_empty() || !digest_ok(&format!("sha256:{old}")) {
+            return None;
+        }
+        let mut next = source.clone();
+        next["alias"] = json!(format!("{repository}@{digest}"));
+        return Some(next);
+    }
+    if fields.len() != 3 || source["type"] != "image" {
+        return None;
+    }
+    if !source["fingerprint"]
+        .as_str()
+        .is_some_and(|hex| digest_ok(&format!("sha256:{hex}")))
     {
         return None;
     }
-    let (repository, old) = source["alias"].as_str()?.rsplit_once("@sha256:")?;
-    if repository.is_empty() || !digest_ok(&format!("sha256:{old}")) {
+    if !digest_ok(digest) {
         return None;
     }
-    let mut next = source.clone();
-    next["alias"] = json!(format!("{repository}@{digest}"));
-    Some(next)
+    let hex = &digest["sha256:".len()..];
+    let alias = pinned_alias
+        .or_else(|| source["alias"].as_str())
+        .filter(|alias| !alias.is_empty())?;
+    Some(json!({ "type": "image", "alias": alias, "fingerprint": hex }))
+}
+
+/// The source an update to `digest` gives the service `config`: the OCI source with its digest replaced, or the local
+/// pinned source with the new fingerprint and the installed template's alias when that template pins the same
+/// fingerprint. `None` when the service's own source is neither kind.
+fn next_source(cfg: &NodeConfig, config: &ServiceConfig, digest: &str) -> Option<Value> {
+    // Only a local source has an alias that the installed template can name; an OCI source keeps its repository.
+    let installed = config.source.get("fingerprint").and_then(|_| {
+        crate::service::load_template(&cfg.state_dir.join("templates"), &config.template).ok()
+    });
+    let pinned = installed
+        .as_ref()
+        .and_then(|template| template.local_image_pin())
+        .filter(|(_, fingerprint)| digest.strip_prefix("sha256:") == Some(*fingerprint))
+        .map(|(alias, _)| alias);
+    source_with(&config.source, digest, pinned)
+}
+
+/// Whether two sources name the same image. A local image is the same when its fingerprint is: the alias is only the
+/// name the record keeps, and Incus decides by the fingerprint.
+fn same_image(one: &Value, other: &Value) -> bool {
+    match (one["fingerprint"].as_str(), other["fingerprint"].as_str()) {
+        (Some(a), Some(b)) => a == b,
+        _ => one == other,
+    }
+}
+
+/// The refusal of an update to a local image the service project's store does not hold: a local image is copied or
+/// built in by hand, and Incus's own answer to a rebuild names no reason.
+fn local_image_missing(name: &str, fingerprint: &str, alias: &str, project: &str) -> CallError {
+    refused(format!(
+        "update service {name}: the image store of the service project {project} holds no image with the fingerprint sha256:{fingerprint} that the update would rebuild from. Put it there first (`incus image copy <image> local: --alias {alias} --project {project}`, or build the image in that project), then call service_update again. Nothing was changed"
+    ))
 }
 
 fn refused(message: impl Into<String>) -> CallError {
@@ -356,8 +411,8 @@ pub(super) fn check_proposal(
     let wanted = key_change(cfg, &config);
     let moves = payload["digest"]
         .as_str()
-        .and_then(|digest| source_with(&config.source, digest))
-        .is_some_and(|source| source != config.source);
+        .and_then(|digest| next_source(cfg, &config, digest))
+        .is_some_and(|source| !same_image(&source, &config.source));
     match (
         wanted,
         payload.get("noNewPrivileges").and_then(Value::as_bool),
@@ -588,12 +643,12 @@ impl ServiceHandler {
         }
         if config.function.is_some() || config.vm.is_some() {
             return Err(said(
-                "only a container service made from an image by digest can be updated",
+                "only a container service made from an image by digest or a local image pinned by fingerprint can be updated",
             ));
         }
-        let Some(new_source) = source_with(&config.source, &digest) else {
+        let Some(new_source) = next_source(&self.cfg, &config, &digest) else {
             return Err(said(
-                "the service is not made from an OCI image by digest on a registry",
+                "the service is not made from an OCI image by digest on a registry, nor from a local image pinned by fingerprint",
             ));
         };
         let Some(port) = config.ports.first().copied() else {
@@ -621,7 +676,7 @@ impl ServiceHandler {
         // leaves the other half done.
         let wanted = key_change(&self.cfg, &config);
         if let Some(wanted) = wanted {
-            if new_source != config.source {
+            if !same_image(&new_source, &config.source) {
                 return Err(key_first(&name, wanted));
             }
             // A card the owner approved names the setting it gave: the template must still say it.
@@ -644,7 +699,7 @@ impl ServiceHandler {
                 "noNewPrivileges: the service's template says what the service already has. Nothing was changed",
             ));
         }
-        if new_source == config.source {
+        if same_image(&new_source, &config.source) {
             return Ok(json!({
                 "updated": false,
                 "service": name,
@@ -655,6 +710,27 @@ impl ServiceHandler {
         let claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
             .ok_or_else(|| said("another update of this service is running"))?;
         let changer = self.state_changer(&config)?;
+        // A local image is copied or built into the service project by hand: require its fingerprint in the store
+        // before anything is stopped or rebuilt, since Incus's own answer to a rebuild names no reason.
+        if let Some(fingerprint) = new_source["fingerprint"].as_str() {
+            let held = changer
+                .image_present(&config.project, fingerprint)
+                .map_err(|error| {
+                    said(&format!(
+                        "the images of the service project {} could not be read to check for sha256:{fingerprint} ({})",
+                        config.project,
+                        incus_words(&error)
+                    ))
+                })?;
+            if !held {
+                return Err(local_image_missing(
+                    &name,
+                    fingerprint,
+                    new_source["alias"].as_str().unwrap_or("the image's alias"),
+                    &config.project,
+                ));
+            }
+        }
         let seen = changer
             .read(&config.project, &config.instance)
             .map_err(|error| {
@@ -688,18 +764,19 @@ impl ServiceHandler {
             service: name.clone(),
             clock: self.clock.clone(),
         };
+        let mut begin = json!({
+            "from": config.source["alias"],
+            "to": digest,
+            "timeoutSeconds": seconds,
+            "eraseData": erase,
+            "tenant": config.tenant.as_ref().map(|tenant| tenant.id.clone()),
+        });
+        // A local alias alone does not say which image a rollback would need from the store.
+        if let Some(fingerprint) = config.source["fingerprint"].as_str() {
+            begin["fromFingerprint"] = json!(fingerprint);
+        }
         journal
-            .line(
-                "begin",
-                true,
-                json!({
-                    "from": config.source["alias"],
-                    "to": digest,
-                    "timeoutSeconds": seconds,
-                    "eraseData": erase,
-                    "tenant": config.tenant.as_ref().map(|tenant| tenant.id.clone()),
-                }),
-            )
+            .line("begin", true, begin)
             .map_err(|_| said("the update journal could not be written"))?;
         // Nothing in a tenant's project is fetched with the node's credential.
         let registry = if config.tenant.is_some() {
@@ -1124,8 +1201,7 @@ impl Run<'_> {
             Some(name) => Back::Snapshot(name.clone()),
             None => Back::OldImage,
         });
-        self.changer
-            .rebuild_from_registry(instance, self.new_source, self.registry)
+        self.rebuild_from(instance, self.new_source)
             .map_err(|error| Failure::of("rebuild", &error))?;
         self.journal
             .step("rebuild", true, json!({ "digest": self.digest }));
@@ -1239,10 +1315,21 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// Gives the stopped instance the root of `source`: a local image's from the project's own store, by its
+    /// fingerprint, or an OCI image's from its registry.
+    fn rebuild_from(&self, instance: &mut InstanceState, source: &Value) -> Result<(), IncusError> {
+        if source.get("fingerprint").is_some() {
+            self.changer.rebuild_from_local(instance, source)
+        } else {
+            self.changer
+                .rebuild_from_registry(instance, source, self.registry)
+        }
+    }
+
     /// Puts the old version back, and starts it when it ran before the update. The record was never changed before
-    /// the health check passed, so it still names the old digest. A failed fetch of the old image after a failed
-    /// fetch of the new one leaves the old root as it was (Incus resolves the image before it takes the root away), so
-    /// the old version is simply started.
+    /// the health check passed, so it still names the old image. A failed rebuild from the old image after a failed
+    /// rebuild from the new one leaves the old root as it was (Incus resolves the image before it takes the root
+    /// away), so the old version is simply started.
     fn roll_back(
         &self,
         instance: &mut InstanceState,
@@ -1259,24 +1346,15 @@ impl Run<'_> {
                 self.journal
                     .step("restore", true, json!({ "snapshot": snapshot }));
             }
-            Back::OldImage => {
-                match self.changer.rebuild_from_registry(
-                    instance,
-                    &self.config.source,
-                    self.registry,
-                ) {
-                    Ok(()) => self.journal.step("rebuild back", true, json!({})),
-                    Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
-                        root_kept = true;
-                        self.journal.step(
-                            "rebuild back",
-                            false,
-                            json!({ "why": incus_words(&error) }),
-                        );
-                    }
-                    Err(error) => return Err(Failure::of("rebuild back", &error)),
+            Back::OldImage => match self.rebuild_from(instance, &self.config.source) {
+                Ok(()) => self.journal.step("rebuild back", true, json!({})),
+                Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
+                    root_kept = true;
+                    self.journal
+                        .step("rebuild back", false, json!({ "why": incus_words(&error) }));
                 }
-            }
+                Err(error) => return Err(Failure::of("rebuild back", &error)),
+            },
         }
         *instance = self
             .changer

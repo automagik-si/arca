@@ -864,9 +864,17 @@ upgrade, as any shipped template nobody edited. A service made before keeps runn
 is its own instance, and the upgrade does not touch it. Its `service_status` shows the newer release under `update`
 (`"state": "differs"`, the new digest as `templatePin`). A new service pulls 3.136.4.
 
-Keep a running service on the release it has: Arca has no way yet to move one to its template's version in place.
-The only way today is a `service_remove` and a `service_create`, and the remove deletes the service's data, which
-Arca cannot put back into the new service:
+Keep a running service on the release it has, unless you move it yourself: Arca does not move one to its template's
+version by itself. A container moves in place with `service_update {name, digest}`: to the digest an OCI template now
+names, or, for a service made from a local image pinned by fingerprint, to that image's fingerprint, which must
+already be in the service project's image store. An update in place needs an image pinned by digest or fingerprint, a
+template port for the health check, and the service's data on a declared volume (a template `data` path): the rebuild
+replaces the root, so whatever the service keeps there is gone, and a service whose template declares a volume it does
+not have is refused. A service that keeps data on its root, whose image is not pinned, or whose template declares no
+port, is not updatable in place: copy the data out, or create a new service. Keep the old image in the store until the
+update has succeeded, since a rollback in a project without snapshots rebuilds the old root from it. A virtual machine
+has no update path: the way is a `service_remove` and a `service_create`, and the remove deletes the service's data,
+which Arca cannot put back into the new service:
 
 - The server's `/data` is its own volume, `<name>-data`, which `service_remove` deletes with the instance. A snapshot
   of the instance leaves that volume out; it needs its own: `snapshot_create` with `{project: "arcak-svc", volume:
@@ -1576,17 +1584,19 @@ record is refused.
 ### Updating a service to a new image digest
 
 `service_update` takes `{name, digest, timeoutSeconds?, eraseData?, tenant?}` (or `{name, follow}`, see below) and
-moves a running container service made from an image by digest (today `automagik-server`) to another digest of the
-same image in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor` token and asks
-the owner for nothing, except for `eraseData` (see below); it works inside a tenant as outside one. There is no
-update path for `automagik-workspace` yet: it is a virtual machine, whose Docker pulls its own server image, and the
-verb refuses it. In order, each step a line in `service-updates.jsonl` in the
+moves a running container service made from an image by digest (today `automagik-server`) or from a local image
+pinned by fingerprint (a template's `local:<alias>` beside a `digest`, see "A local image may be pinned") to another
+digest, or fingerprint, in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor`
+token and asks the owner for nothing, except for `eraseData` (see below); it works inside a tenant as outside one.
+There is no update path for `automagik-workspace` yet: it is a virtual machine, whose Docker pulls its own server
+image, and the verb refuses it. In order, each step a line in `service-updates.jsonl` in the
 state directory (an append-only file of JSON lines: a `begin`, one line per step, an `end`; never a secret):
 
 1. the instance is stopped, if it runs, and a snapshot of it, `pre-update-<time>`, is taken where the project allows
    one. No project Arca makes does (each is restricted, and Incus answers that it does not allow snapshot creation),
    so on a node as Arca makes it there is no snapshot, and the answer's `snapshot` is `null`;
-2. its root is rebuilt from `<repository>@<digest>`; Incus may take up to 10 minutes to fetch the image. Incus keeps
+2. its root is rebuilt from `<repository>@<digest>`, or, for a local pinned image, from the project's own copy of the
+   image whose fingerprint is `digest`; Incus may take up to 10 minutes to fetch an OCI image. Incus keeps
    what is not the root: the config, the secrets, the firewall rules and the data volume (a template's `data`
    path, `/data` for `automagik-server`). Whatever the old version wrote to its own root is gone, so **an update of a
    service that keeps its data on its root disk is refused** (see "A service that keeps its data inside the
@@ -1608,10 +1618,25 @@ the old version is started as it is, and the refusal says so. If Incus does not 
 rolled back, so as not to rebuild twice at once: the refusal is `update_unsettled`, and the same update may be asked
 for again once Incus is idle. If the old version cannot be put back, the refusal is `rollback_failed`, says so, and
 leaves the service stopped. A failure before anything is changed (the digest is malformed, the service is not made
-from an image by digest, its instance is not the one Arca created, it has never been started, the snapshot failed for
+from an image by digest or a local image pinned by fingerprint, the image a local update names is not in the service
+project's image store, its instance is not the one Arca created, it has never been started, the snapshot failed for
 a reason other than the project not allowing one) says "Nothing was changed". A call for the digest the service
 already runs changes nothing and answers `updated: false`. A service being updated refuses a second update until
 the first ends. The call is synchronous and can take several minutes: the journal keeps what it did.
+
+A local image is moved by fingerprint: the call's `digest` is the new image's fingerprint (`sha256:` and 64 lower-case
+hex digits, as Incus writes it), and the image must be in the service project's own image store before anything is
+changed. The node reads that store first and refuses, before it stops the service and with "Nothing was changed", when
+no image there has that fingerprint, saying how to put it there (`incus image copy <image> local: --alias <alias>
+--project arcak-svc`, or a build in that project). `action_propose` does not read the image store: a card made before
+the image is put there can be approved, and its run is then refused before anything is changed. The record's alias
+becomes the installed template's alias when that template pins the same fingerprint, and stays what it was otherwise;
+the fingerprint decides which image Incus uses. **Keep the old image in the store until the update has succeeded**: a
+rollback in a project that allows no snapshot rebuilds the old root from the old fingerprint. If that image is gone, a
+rollback after a failed start or health check answers `rollback_failed`; after a failed new rebuild the old root was
+never taken away, so the answer is `rolled_back` with the old root kept. A project that allows snapshots restores the
+snapshot instead, and the record still names the old image either way. The update rebuilds from the project's own copy,
+never from an alias alone; a rebuild from an image the store no longer holds fails before it takes the old root away.
 
 #### A service that keeps its data inside the container
 
@@ -4610,9 +4635,10 @@ install --replace` from a newer release. `service_status` answers both under `up
 key on any other row. Both are read from this node's own records and files: no registry is asked and nothing is
 written. Two digests carry no order, so `differs` never says which version is the newer one. A service made from a
 system image by an alias has no version of this kind and carries no `update` (`baseImage`, above, is what it has),
-and neither does an adopted instance. For a container made from an image by digest, `service_update` moves it to another digest (see "Updating a service
-to a new image digest"); for a virtual machine the only way is `service_remove` and `service_create`. This only tells you that
-there is one.
+and neither does an adopted instance. For a container made from an image by digest or a local image pinned by
+fingerprint, `service_update` moves it to another digest, or fingerprint (see "Updating a service to a new image
+digest"); for a virtual machine the only way is `service_remove` and `service_create`. This only tells you that there
+is one.
 
 A virtual-machine template says where its version is with one key:
 
