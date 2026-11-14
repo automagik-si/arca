@@ -2300,10 +2300,13 @@ estimated downtime: 30 s for the stop, start and checks, plus the whole measured
 resends the whole volume today (see the known limit below). It is an estimate; the move measures the real one. A plan
 expires an hour after it is first made: planning the same source again answers the same digest and the same expiry, never
 a renewed one. A changed uuid, device, config, profile or size gives another digest. Plan files are pruned a day after
-they expire. An instance whose latest move moved it and was not finished is not a go: its copy on that move's target may
-run, and a second move would leave two copies running. Finish that move first (`finish move mv-…` in the reason); a
-finish that deleted the source, or read the copy on the target back gone (`copyGone` in its line), settles it. Another
-instance of the same name (another uuid) is not held.
+they expire. An instance is not a go while a copy of it that an earlier move recorded (its `targetUuid`, whatever that
+move's result: `moved`, or `failed` with the copy started or not deleted) may still run: a second move would leave two
+copies running. The plan reads each such copy on its move's target: read gone (or another instance of the name) or
+`Stopped`, it holds nothing; read running, or on a target that cannot be read, it holds the instance, and the reason
+names the move, the target and what was read. The reason says what to do: finish that move (`finish move mv-…`) while it
+may still be finished, or stop or delete the copy on that target. Another instance of the same name (another uuid) here
+is not held.
 
 ```
 arca call instance_move_plan '{"instances":[{"project":"shop","name":"web","spotCheck":"/srv/data/orders.db"}],"target":"node-b"}'
@@ -2312,16 +2315,17 @@ arca call instance_move_plan '{"instances":[{"project":"shop","name":"web","spot
 **2. The card.** `action_propose` with the action `instance_move` and the arguments `{plan: <digest>, instances, target}`,
 the instances in the plan's own order. The node refuses a card for a digest it never planned (`NoSuchPlan`), an expired
 plan (`PlanExpired`), other instances or another target (`PlanMismatch`), a plan that already ran (`AlreadyRun`), and a
-plan for an instance moved by a move that was not finished (`AlreadyMoved`, also when the plan was made before that move
-ran). The
+plan for an instance with a copy that may still run, read on its target again now (`AlreadyMoved` while that move may
+still be finished, `CopyMayRun` otherwise; also when the plan was made before that move ran, or the copy was started
+again since). The
 card shows the digest and the target, then a row per instance (what it needs on which pool, the rounds, the estimated
 downtime, its custom volumes), the transport, the credential, the rollback promise, and that the source is kept. A batch
 is one card. The owner's passkey approves the card's arguments, digest included; the grant it arms is spent by one run.
 
 **3. The run.** The approved `instance_move` (doctor) checks the plan is still the approved one before it spends the
 grant, that no other move that has not ended holds one of its instances (`InstanceMoving`; a move a stopped kernel
-left holds them until the next start settles it), and that none of them was moved by a move not finished
-(`AlreadyMoved`), then reads everything again: a plan that is no longer a go, or whose
+left holds them until the next start settles it), and, reading the targets again, that no copy an earlier move made of
+one may still run (`AlreadyMoved` or `CopyMayRun`), then reads everything again: a plan that is no longer a go, or whose
 instances changed since the card (uuid, type, devices, config, profiles, custom volumes, target pool, the target's
 addresses or certificate, or a size past the approved headroom) is refused with `PlanChanged` and nothing moves. With
 other moves running to the same target, their pending bytes are counted against its pool (`TargetFull`). The plan and the
@@ -2370,7 +2374,8 @@ move is finished. The proposal's late result is `MoveVerified`, `MovePartlyRolle
 **A stopped kernel.** A move the kernel left unfinished (a `begin` with no `end`) is not resumed. On the next start in
 kernel mode each instance without a result is settled: one whose checks passed (a `verify` line with `ok`) is recorded as
 `moved` and nothing is deleted; one whose copy had been started is left as it stands, with the source stopped, and is
-`failed` for the owner (the copy may have served writes); any other is rolled back as above, with the reason "the kernel
+`failed` for the owner (the copy may have served writes; the reason says how to keep one of them, and no other move
+takes the instance while that copy may run); any other is rolled back as above, with the reason "the kernel
 stopped during the move". The move ends `interrupted`, and the proposal gets its late result.
 
 **Progress.** `instance_move_status` (viewer, read-only) answers one move (`{"move": "mv-…"}`) or the latest 20: its
@@ -2387,8 +2392,8 @@ move ended with at least one verified instance, never on a timer and never by it
 instance and custom volume it deletes. Approved, it first reads each copy back on the target: a source is deleted only
 when its copy is there with the uuid this move recorded, the source here is the moved instance (its uuid) and it is not
 running (any status but `Stopped`, so a frozen one too); a custom volume only when its copy is read back on the target and
-no instance here uses it. Anything else is kept and named in `kept`; an instance whose copy the target answers is gone is
-also named in `copyGone`, so it may be moved again. The moved copies on the target are not touched. A finish runs once.
+no instance here uses it. Anything else is kept and named in `kept`. The moved copies on the target are not touched. A
+finish runs once; a source it kept may be moved again once its copy reads gone or stopped on the target (see the plan).
 
 **The journal.** `instance-moves.jsonl` in the state directory (0600), append-only JSON lines: `plan` (written with the
 `begin` of the move that runs it, not when planning), `begin`, `round`, `created`, `cutover`, `verify`, `result`,

@@ -1076,7 +1076,7 @@ static VERBS: [Verb; 73] = [
     },
     Verb {
         name: "instance_move",
-        summary: "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, ran, is not the approved one, or whose instances changed, another move holds, or a move not finished moved. Per instance, Incus pushes it and its volumes in rounds while it runs, stops it, sends the last round (the whole volume today), starts the copy once the source reads Stopped, and checks it; downtime is measured from the stop to the passed checks. A failure rolls that instance back, never deleting the only copy or leaving both running: only the recorded copy is removed, once the source is read back. The source is kept, stopped, until instance_move_finish.",
+        summary: "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, ran, is not the approved one, or whose instances changed, another move holds, or have an earlier copy that may run. Per instance, Incus pushes it and its volumes in rounds while it runs, stops it, sends the last round (the whole volume today), starts the copy once the source reads Stopped, and checks it; downtime runs from the stop to the passed checks. A failure rolls that instance back, never deleting the only copy or leaving both running: only the recorded copy is removed, once the source is read back. The source is kept, stopped, until instance_move_finish.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
