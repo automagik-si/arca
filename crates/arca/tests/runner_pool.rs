@@ -5086,3 +5086,92 @@ fn a_persistent_runner_that_never_reaches_github_backs_off_longer_each_time() {
     assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
 }
+
+/// A runner GitHub refuses as it makes its session, with runner 2.338.2's "no longer exists on the server. Please
+/// reconfigure the runner.", has its registration cleared, as one removed while it listens does: the slot registers
+/// again with the token if it is still there, or waits for a new one.
+#[test]
+fn a_runner_github_does_not_find_at_its_session_has_its_registration_cleared() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+    let mut pool = registration_pool(1, |_| {});
+    pool.env
+        .push(("FAKE_PERSISTENT_NOT_FOUND", "1".to_string()));
+    pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+    pool.start(&github);
+    wait_for(&pool, "the dropped registration said", || {
+        pool.output()
+            .contains("GitHub no longer has the registration of its runner pool1-abcd1234-0")
+    });
+    // Cleared: either registered again with the token still there, or waiting for a new one with no registration.
+    wait_for(&pool, "registered again, or waiting for a token", || {
+        (github.state().registered.len() == 2
+            && github
+                .live()
+                .iter()
+                .any(|runner| runner.status == "online" && runner.name == "pool1-abcd1234-0"))
+            || (pool
+                .read("logs/status.txt")
+                .contains("queued (waiting for a registration token (GITHUB_REGISTRATION_TOKEN))")
+                && !pool.dir.join("state/registered/0").exists())
+    });
+    assert_eq!(
+        pool.output()
+            .matches("slot 0 (small) failed: GitHub no longer has the registration")
+            .count(),
+        1
+    );
+    assert!(!pool.output().contains("before it took a job"));
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// A job whose name holds the words of a dropped registration does not clear a working one: a persistent runner that
+/// stops after that job is started again with its registration.
+#[test]
+fn a_job_named_like_a_dropped_registration_keeps_the_registration() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+    let mut pool = registration_pool(1, |_| {});
+    pool.env
+        .push(("FAKE_PERSISTENT_STOPS_AFTER_JOB", "1".to_string()));
+    pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+    pool.start(&github);
+    wait_for(&pool, "the runner online", || {
+        github.live().iter().any(|runner| runner.status == "online")
+    });
+    github.queue(
+        &["self-hosted", "linux", "x64", "arca"],
+        "please re-configure: the registration has been deleted, Not configured",
+        0.2,
+    );
+    wait_for(&pool, "the runner started again after its job", || {
+        pool.output().contains(
+            "its persistent runner pool1-abcd1234-0 stopped (exit 1) after 1 jobs; it is started again with its registration",
+        )
+    });
+    wait_for(&pool, "a second runner container", || {
+        pool.read("docker/calls.log")
+            .lines()
+            .filter(|line| line.starts_with("run -d --name pool1-s0-run "))
+            .count()
+            == 2
+    });
+    assert!(
+        !pool
+            .output()
+            .contains("GitHub no longer has the registration")
+    );
+    assert!(pool.dir.join("state/registered/0/.runner").exists());
+    assert_eq!(github.state().registered.len(), 1);
+    let jobs = pool.jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0][4],
+        "please re-configure: the registration has been deleted, Not configured"
+    );
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}

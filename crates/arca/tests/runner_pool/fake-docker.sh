@@ -73,6 +73,14 @@ play_runner() {
     end_play 1
     return
   fi
+  # Or GitHub refuses the first one as it makes its session, with what runner 2.338.2 says when the runner is not
+  # found; the ones after it reach GitHub.
+  if [ -n "$persistent" ] && [ -n "${FAKE_PERSISTENT_NOT_FOUND:-}" ] && [ ! -e "$root/not-found-said" ]; then
+    : >"$root/not-found-said"
+    echo "The runner no longer exists on the server. Please reconfigure the runner." >>"$dir/log"
+    end_play 1
+    return
+  fi
   if [ -z "$persistent" ]; then
     echo "Connected to GitHub" >>"$dir/log"
     echo "Listening for Jobs" >>"$dir/log"
@@ -120,7 +128,12 @@ play_runner() {
       rm -f "$dir/worker"
       echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: Job $job completed with result: $result" >>"$dir/log"
       printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/done" >/dev/null 2>&1
-      # A persistent runner goes back to listening for its next job.
+      # A persistent runner goes back to listening for its next job, unless the test makes it stop after one.
+      if [ -n "$persistent" ] && [ -n "${FAKE_PERSISTENT_STOPS_AFTER_JOB:-}" ]; then
+        echo "An error occurred: the runner stopped" >>"$dir/log"
+        end_play 1
+        return
+      fi
       if [ -n "$persistent" ]; then
         echo "Listening for Jobs" >>"$dir/log"
         continue
