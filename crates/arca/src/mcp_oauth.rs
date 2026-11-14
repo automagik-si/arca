@@ -147,8 +147,9 @@ struct Grant {
     access: Vec<Hashed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revoked_at: Option<u64>,
-    /// What the owner approved, which a refresh may narrow for one token pair and never loses: a refresh with no
-    /// `scope` gets it back (RFC 6749 6). Absent in a store written before it was kept; `scope` and `tools` stand in.
+    /// What the owner approved, which a refresh never loses. A refresh that asks for less narrows the whole grant, every
+    /// live token of it included, until a refresh with no `scope` puts this back on it (RFC 6749 6). Absent in a store
+    /// written before it was kept; `scope` and `tools` stand in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approved: Option<Approved>,
 }
@@ -207,6 +208,9 @@ struct Inner {
     used_codes: HashMap<String, (String, u64)>,
     /// When each grant's access token was last used, in memory only.
     last_used: HashMap<String, u64>,
+    /// Whether a revocation ended a grant in memory that the store on disk does not have yet: the next revocation
+    /// request saves it before anything else.
+    unsaved: bool,
 }
 
 /// The authorization server: the page origin it issues for, the resource it issues tokens to, the kernel whose owner
@@ -390,14 +394,27 @@ impl OAuth {
 
     /// Saves a revocation: once more if the first write fails, then a log line. A grant ended in memory and not on disk
     /// would come back at the next start, so the caller says so to whoever asked. Answers whether it was saved.
-    fn persist_revoked(&self, inner: &Inner) -> bool {
+    /// Saves a revocation, once more if the first write fails. When both fail, the store is marked unsaved, so the
+    /// client's retry of `/oauth/revoke` saves it, and a log line names the grant. Answers whether it was saved.
+    fn persist_revoked(&self, inner: &mut Inner, grant: Option<&str>) -> bool {
         if self.persist(inner).is_ok() || self.persist(inner).is_ok() {
+            inner.unsaved = false;
             return true;
         }
-        (self.log)(
-            "arca: a revoked MCP grant was not saved: it ends now, but would work again after a restart; revoke it again",
-        );
+        inner.unsaved = true;
+        (self.log)(&format!(
+            "arca: the revocation of MCP grant {} was not saved: it ends now, but would work again after a restart until it is saved; revoke it again",
+            grant.unwrap_or("(an access token)")
+        ));
         false
+    }
+
+    /// The journal line of a revocation, saved or not: one that was not saved says so, and is still written.
+    fn journal_revoked(&self, now: u64, event: &str, mut fields: Value, saved: bool) {
+        if !saved {
+            fields["saved"] = json!(false);
+        }
+        self.journal(now, event, fields);
     }
 
     fn journal(&self, now: u64, event: &str, fields: Value) {
@@ -902,16 +919,17 @@ impl OAuth {
             // A code used a second time takes back what it made (OAuth 2.1, 4.1.3).
             if let Some((grant, _)) = inner.used_codes.remove(&code_hash) {
                 let client = revoke_grant(&mut inner, &grant, now);
-                let saved = self.persist_revoked(&inner);
+                let saved = self.persist_revoked(&mut inner, Some(&grant));
                 drop(inner);
-                if !saved {
-                    return Err(not_saved());
-                }
-                self.journal(
+                self.journal_revoked(
                     now,
                     "code_reused",
                     json!({ "client": client, "grant": grant }),
+                    saved,
                 );
+                if !saved {
+                    return Err(not_saved());
+                }
             }
             return Err(invalid(
                 "the code is not known, was used already or expired",
@@ -1009,16 +1027,17 @@ impl OAuth {
                 .map(|grant| grant.id.clone())
             {
                 let client = revoke_grant(&mut inner, &grant, now);
-                let saved = self.persist_revoked(&inner);
+                let saved = self.persist_revoked(&mut inner, Some(&grant));
                 drop(inner);
-                if !saved {
-                    return Err(not_saved());
-                }
-                self.journal(
+                self.journal_revoked(
                     now,
                     "refresh_reused",
                     json!({ "client": client, "grant": grant }),
+                    saved,
                 );
+                if !saved {
+                    return Err(not_saved());
+                }
             }
             return Err(invalid(
                 "the refresh token is not known, was used already or was revoked",
@@ -1110,11 +1129,13 @@ impl OAuth {
     }
 
     /// RFC 7009: an access token is dropped alone; a refresh token ends its grant. An unknown token is no error. A
-    /// revocation that could not be saved is `503` (RFC 7009 2.2.1), so the client tries again.
+    /// revocation that could not be saved is `503` (RFC 7009 2.2.1), so the client tries again; the retry saves what
+    /// the failed one ended, whichever token it presents, and answers `200` only once it is on disk.
     fn revoke_token(&self, form: &HashMap<String, String>) -> Result<(), OAuthError> {
         let now = self.now();
         let presented = hash_hex(form.get("token").map(String::as_str).unwrap_or_default());
         let mut inner = self.lock();
+        let owed = inner.unsaved;
         let mut ended = None;
         let mut changed = false;
         for grant in &mut inner.stored.grants {
@@ -1131,18 +1152,26 @@ impl OAuth {
         }
         if let Some(grant) = &ended {
             let client = revoke_grant(&mut inner, grant, now);
-            let saved = self.persist_revoked(&inner);
+            let saved = self.persist_revoked(&mut inner, Some(grant));
             drop(inner);
-            if !saved {
-                return Err(not_saved());
-            }
-            self.journal(
+            self.journal_revoked(
                 now,
                 "revoked",
                 json!({ "client": client, "grant": grant, "by": "client" }),
+                saved,
             );
-        } else if changed && !self.persist_revoked(&inner) {
+            if !saved {
+                return Err(not_saved());
+            }
+        } else if (changed || owed) && !self.persist_revoked(&mut inner, None) {
             return Err(not_saved());
+        } else if owed {
+            drop(inner);
+            self.journal(
+                now,
+                "saved",
+                json!({ "what": "a revocation that was not saved before" }),
+            );
         }
         Ok(())
     }

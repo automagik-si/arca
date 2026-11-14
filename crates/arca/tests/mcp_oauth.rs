@@ -426,6 +426,31 @@ impl Rig {
         self.token(&pairs)
     }
 
+    /// The store as a restart reads it from disk.
+    fn reopened(&self) -> OAuth {
+        let ticks = Arc::clone(&self.clock);
+        OAuth::open(
+            ORIGIN,
+            RP,
+            Arc::clone(&self.kernel),
+            Arc::new(move || ticks.load(Ordering::SeqCst)),
+            &self.state_dir,
+        )
+        .expect("the store reopens")
+        .with_log(Arc::new(|_| {}))
+    }
+
+    /// `POST /oauth/revoke` of `token` for `client`.
+    fn revoke(&self, client: &str, token: &str) -> Reply {
+        self.send(
+            "POST",
+            "/oauth/revoke",
+            &[],
+            "application/x-www-form-urlencoded",
+            form(&[("token", token), ("client_id", client)]).as_bytes(),
+        )
+    }
+
     fn journal(&self) -> String {
         fs::read_to_string(self.state_dir.join(arca::mcp_oauth::JOURNAL_FILE)).unwrap_or_default()
     }
@@ -916,6 +941,90 @@ fn a_revocation_that_cannot_be_saved_is_refused_with_503_and_still_ends_the_gran
         json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
     );
     assert_eq!(call.status, 401);
+    // The journal says it, unsaved, and the store on disk still holds the grant.
+    assert!(
+        rig.journal().contains("\"event\":\"revoked\""),
+        "{}",
+        rig.journal()
+    );
+    assert!(
+        rig.journal().contains("\"saved\":false"),
+        "{}",
+        rig.journal()
+    );
+    assert!(rig.reopened().lookup(&access).is_some(), "not saved yet");
+    // The client's retry saves it, then answers 200: a restart no longer brings the grant back.
+    let retry = rig.revoke(&client, &refresh);
+    assert_eq!(retry.status, 200, "{}", retry.text());
+    assert!(
+        rig.reopened().lookup(&access).is_none(),
+        "saved by the retry"
+    );
+    assert!(
+        rig.journal().contains("\"event\":\"saved\""),
+        "{}",
+        rig.journal()
+    );
+}
+
+#[test]
+fn a_reused_code_or_refresh_token_that_cannot_be_saved_is_journalled_and_saved_by_the_next_revoke()
+{
+    let (rig, key) = Rig::new("oauth-unsaved-reuse");
+    let mode = |bits| {
+        fs::set_permissions(&rig.state_dir, fs::Permissions::from_mode(bits)).expect("chmod")
+    };
+    // A code used twice while the store cannot be written.
+    let client = rig.client("App");
+    let code = rig.code(&key, &client, "viewer");
+    let first = rig.exchange(&client, &code);
+    let access = first.json()["access_token"]
+        .as_str()
+        .expect("access")
+        .to_string();
+    mode(0o500);
+    let reused = rig.exchange(&client, &code);
+    mode(0o700);
+    assert_eq!(reused.status, 503, "{}", reused.text());
+    assert!(
+        rig.journal().contains("\"event\":\"code_reused\""),
+        "{}",
+        rig.journal()
+    );
+    assert!(rig.reopened().lookup(&access).is_some(), "not saved yet");
+    assert_eq!(rig.revoke(&client, "not-a-token").status, 200);
+    assert!(
+        rig.reopened().lookup(&access).is_none(),
+        "saved by the next revoke"
+    );
+    // A rotated refresh token used again while the store cannot be written.
+    let (client, access, first) = rig.connected(&key, "App 2", "viewer");
+    let rotated = rig.refresh(&client, &first, None);
+    assert_eq!(rotated.status, 200);
+    mode(0o500);
+    let reused = rig.refresh(&client, &first, None);
+    mode(0o700);
+    assert_eq!(reused.status, 503, "{}", reused.text());
+    let lines = rig.journal();
+    let line = lines
+        .lines()
+        .find(|line| line.contains("\"event\":\"refresh_reused\""))
+        .expect("journalled");
+    assert!(line.contains("\"saved\":false"), "{line}");
+    assert!(rig.reopened().lookup(&access).is_some(), "not saved yet");
+    assert_eq!(rig.revoke(&client, "not-a-token").status, 200);
+    assert!(
+        rig.reopened().lookup(&access).is_none(),
+        "saved by the next revoke"
+    );
+    let current = rotated.json()["refresh_token"]
+        .as_str()
+        .expect("refresh")
+        .to_string();
+    assert_eq!(
+        error_of(&rig.refresh(&client, &current, None)),
+        "invalid_grant"
+    );
 }
 
 #[test]
