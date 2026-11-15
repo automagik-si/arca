@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.31.0 (2026-11-15)
+
 A container service made from an OCI image keeps `/run` in memory (a tmpfs), never on the container's disk: a
 short-lived secret staged there no longer touches the disk. Incus mounts a tmpfs on an OCI container's `/run` only
 when the image keeps nothing there, so Arca now empties the image's `/run` on the root disk before the first start,
@@ -37,6 +39,10 @@ none waits. The templates are brought up to the release as the installer does. `
 available versions under `update`; `arca update check` says what a run would do, and `arca update run` is the run
 itself. On Arca OS the program is in the read-only image, and the OS update brings it (`os-managed`); a program its user
 may not write is staged in that user's state, and `serve`, `shim` and `link serve` hand over to it at their start.
+
+- Merge feat/auto-update: arca updates itself from signed releases, with health watch, roll back and a one-fd hand-over
+- Merge feat/janitor-hardening: no lazy fetch from a scanned partial clone, plus review 1 hardening
+- Merge fix/service-run-tmpfs: /run in memory for services, kept across reconfigure, update withTemplate and rollback
 
 ## 0.30.0 (2026-11-15)
 
