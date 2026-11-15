@@ -1,9 +1,16 @@
 //! Walking a tree the way `find -xdev` does: one filesystem, links never followed, mount points skipped.
 
 use std::collections::HashSet;
-use std::fs::{self, Metadata};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, Metadata};
+use std::io;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, openat, renameat, unlinkat};
+use rustix::io::Errno;
 
 use crate::jobs::{Ctx, Stop};
 
@@ -155,37 +162,208 @@ pub fn mtime(md: &Metadata) -> u64 {
     u64::try_from(md.mtime()).unwrap_or(0)
 }
 
-/// Remove a file, a link, or a folder and everything in it, never crossing into another filesystem and never
-/// following a link (a link is removed, not what it points at). A mount inside leaves its parent in place.
-pub fn remove_tree(path: &Path, ctx: Option<&Ctx>) -> std::io::Result<()> {
-    let md = fs::symlink_metadata(path)?;
-    if !md.is_dir() {
-        return fs::remove_file(path);
-    }
-    remove_dir_on(path, md.dev(), ctx)
+// ------------------------------------------------------------------------------------------------ removal
+
+// Removal works on folder handles, not paths. A folder is opened relative to its parent's handle with O_NOFOLLOW,
+// and every entry is unlinked relative to the handle of the folder holding it. A folder swapped for a link halfway
+// through is refused, never followed (the class of CVE-2022-21658). The path to the target is opened from `/` one
+// component at a time the same way, so a link anywhere on the way is refused too.
+
+const DIR_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+fn os(e: Errno) -> io::Error {
+    io::Error::from_raw_os_error(e.raw_os_error())
 }
 
-fn remove_dir_on(dir: &Path, dev: u64, ctx: Option<&Ctx>) -> std::io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        let md = fs::symlink_metadata(&path)?;
-        if md.is_dir() {
-            if md.dev() != dev {
-                return Err(std::io::Error::other(format!(
-                    "{} is another filesystem; left in place",
-                    path.display()
-                )));
+/// An OS error with the path it happened on.
+fn os_at(e: Errno, path: &Path) -> io::Error {
+    let e = os(e);
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+fn refused(why: String) -> io::Error {
+    io::Error::other(why)
+}
+
+/// Open a folder by its absolute path, one component at a time from `/`, never following a link.
+pub fn open_dir_nofollow(path: &Path) -> io::Result<OwnedFd> {
+    if !path.is_absolute() {
+        return Err(refused(format!("{}: not an absolute path", path.display())));
+    }
+    let mut fd = openat(CWD, "/", DIR_FLAGS, Mode::empty()).map_err(os)?;
+    let mut here = PathBuf::from("/");
+    for c in path.components() {
+        match c {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                here.push(name);
+                fd = openat(&fd, name, DIR_FLAGS, Mode::empty()).map_err(|e| match e {
+                    Errno::LOOP | Errno::NOTDIR => refused(format!(
+                        "{} is a link or not a folder; refused",
+                        here.display()
+                    )),
+                    e => os(e),
+                })?;
             }
-            remove_dir_on(&path, dev, ctx)?;
+            _ => return Err(refused(format!("{}: odd path", path.display()))),
+        }
+    }
+    Ok(fd)
+}
+
+/// The device a folder handle is on.
+fn dev_of(fd: OwnedFd) -> io::Result<(OwnedFd, u64)> {
+    let file = File::from(fd);
+    let dev = file.metadata()?.dev();
+    Ok((OwnedFd::from(file), dev))
+}
+
+/// Why a removal may not enter this folder: it is a mount point, or on another filesystem. One check for both the
+/// look-first pass and the removal itself.
+fn crossing(path: &Path, dev: u64, root_dev: u64, mounts: &HashSet<PathBuf>) -> Option<String> {
+    if mounts.contains(path) {
+        return Some(format!("{} is a mount point", path.display()));
+    }
+    if dev != root_dev {
+        return Some(format!("{} is another filesystem", path.display()));
+    }
+    None
+}
+
+/// The entries of an open folder, without `.` and `..`, read before anything in it changes.
+fn entries(fd: &OwnedFd) -> io::Result<Vec<(OsString, FileType)>> {
+    let mut out = Vec::new();
+    for entry in Dir::read_from(fd).map_err(os)? {
+        let entry = entry.map_err(os)?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        out.push((OsStr::from_bytes(name).to_os_string(), entry.file_type()));
+    }
+    Ok(out)
+}
+
+/// Open a child folder of `dir` without following a link; None when the entry is not a folder (or is a link).
+fn open_child_dir(dir: &OwnedFd, name: &OsStr) -> io::Result<Option<OwnedFd>> {
+    match openat(dir, name, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(Errno::NOTDIR | Errno::LOOP) => Ok(None),
+        Err(e) => Err(os(e)),
+    }
+}
+
+/// Look through the whole tree first: any mount point or other filesystem inside refuses the item before anything
+/// is deleted.
+fn look_first(
+    dir: &OwnedFd,
+    path: &Path,
+    root_dev: u64,
+    mounts: &HashSet<PathBuf>,
+    ctx: Option<&Ctx>,
+) -> io::Result<()> {
+    for (name, kind) in entries(dir)? {
+        if !matches!(kind, FileType::Directory | FileType::Unknown) {
+            continue;
+        }
+        let child = path.join(&name);
+        let Some(fd) = open_child_dir(dir, &name)? else {
+            continue;
+        };
+        let (fd, dev) = dev_of(fd)?;
+        if let Some(why) = crossing(&child, dev, root_dev, mounts) {
+            return Err(refused(format!("{why}; nothing removed")));
+        }
+        look_first(&fd, &child, root_dev, mounts, ctx)?;
+        if let Some(ctx) = ctx {
+            // The look is read-only, but a big tree still pauses under pressure.
+            let _ = ctx.throttle_wait();
+        }
+    }
+    Ok(())
+}
+
+/// Delete everything inside an open folder, relative to its handle.
+fn empty_fd(
+    dir: &OwnedFd,
+    path: &Path,
+    root_dev: u64,
+    mounts: &HashSet<PathBuf>,
+    ctx: Option<&Ctx>,
+) -> io::Result<()> {
+    for (name, kind) in entries(dir)? {
+        let child = path.join(&name);
+        let sub = if matches!(kind, FileType::Directory | FileType::Unknown) {
+            open_child_dir(dir, &name)?
         } else {
-            fs::remove_file(&path)?;
+            None
+        };
+        match sub {
+            Some(fd) => {
+                let (fd, dev) = dev_of(fd)?;
+                if let Some(why) = crossing(&child, dev, root_dev, mounts) {
+                    return Err(refused(format!("{why}; left in place")));
+                }
+                empty_fd(&fd, &child, root_dev, mounts, ctx)?;
+                unlinkat(dir, &name, AtFlags::REMOVEDIR).map_err(|e| os_at(e, &child))?;
+            }
+            // A file or a link: the entry itself goes, never what a link points at.
+            None => unlinkat(dir, &name, AtFlags::empty()).map_err(|e| os_at(e, &child))?,
         }
         if let Some(ctx) = ctx {
             // Pressure pauses apply inside a big removal too; a cancel waits for the item to finish.
             let _ = ctx.throttle_wait();
         }
     }
-    fs::remove_dir(dir)
+    Ok(())
+}
+
+/// Remove a file, a link, or a folder and everything in it. Nothing is followed: a link is removed, not what it
+/// points at, and a link on the way to `path` refuses the removal. A mount point or another filesystem anywhere
+/// inside refuses the whole item before anything is deleted; `mounts` is the mount table to respect, and a
+/// filesystem it does not list is still caught by its device number.
+pub fn remove_tree(path: &Path, mounts: &HashSet<PathBuf>, ctx: Option<&Ctx>) -> io::Result<()> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refused(format!("{}: no parent folder", path.display())));
+    };
+    let (parent_fd, parent_dev) = dev_of(open_dir_nofollow(parent)?)?;
+    let Some(fd) = open_child_dir(&parent_fd, name)? else {
+        return unlinkat(&parent_fd, name, AtFlags::empty()).map_err(os);
+    };
+    let (fd, dev) = dev_of(fd)?;
+    if let Some(why) = crossing(path, dev, parent_dev, mounts) {
+        return Err(refused(format!("{why}; nothing removed")));
+    }
+    look_first(&fd, path, dev, mounts, ctx)?;
+    empty_fd(&fd, path, dev, mounts, ctx)?;
+    unlinkat(&parent_fd, name, AtFlags::REMOVEDIR).map_err(os)
+}
+
+/// Delete everything inside a folder and keep the folder, with the same rules as `remove_tree`.
+pub fn empty_dir(path: &Path, mounts: &HashSet<PathBuf>, ctx: Option<&Ctx>) -> io::Result<()> {
+    let (fd, dev) = dev_of(open_dir_nofollow(path)?)?;
+    if mounts.contains(path) {
+        return Err(refused(format!(
+            "{} is a mount point; nothing removed",
+            path.display()
+        )));
+    }
+    look_first(&fd, path, dev, mounts, ctx)?;
+    empty_fd(&fd, path, dev, mounts, ctx)
+}
+
+/// Move a folder into `dest_dir` as `dest_name`, renaming relative to both parents' handles, which are opened
+/// without following a link.
+pub fn move_nofollow(path: &Path, dest_dir: &Path, dest_name: &OsStr) -> io::Result<()> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refused(format!("{}: no parent folder", path.display())));
+    };
+    let from = open_dir_nofollow(parent)?;
+    let to = open_dir_nofollow(dest_dir)?;
+    renameat(&from, name, &to, dest_name).map_err(os)
 }
 
 #[cfg(test)]
@@ -217,7 +395,7 @@ mod tests {
         // The link is counted as a link, not as the 100 KB behind it.
         assert!(usage(dir.path(), &mounts, None).unwrap() < 100_000);
         // Removing the tree removes the link, not its target.
-        remove_tree(&dir.path().join("a"), None).unwrap();
+        remove_tree(&dir.path().join("a"), &mounts, None).unwrap();
         assert!(outside.path().join("big").exists());
         assert!(!dir.path().join("a").exists());
     }

@@ -747,8 +747,8 @@ pub fn old_trash(env: &Env) -> Result<Vec<Item>, Stop> {
     Ok(items)
 }
 
-/// A scratch root's top-level folder untouched for STALE_DAYS moves to `<root>/.cleanup-trash/<date>/`; trash older
-/// than TRASH_DAYS is deleted.
+/// A scratch root's top-level folder untouched for STALE_DAYS moves to `<root>/.cleanup-trash/<date>/`, unless it is
+/// or holds a git repository or worktree with work that exists nowhere else; trash older than TRASH_DAYS is deleted.
 fn stale_scratch(env: &Env, found: &mut Found) -> Result<(), Stop> {
     found.items.extend(old_trash(env)?);
     for root in &env.prot.scratch_roots {
@@ -770,6 +770,8 @@ fn stale_scratch(env: &Env, found: &mut Found) -> Result<(), Stop> {
                 Guard::Untouched {
                     days: env.config.stale_days,
                 },
+                // Last, so git runs only for folders that are otherwise stale.
+                Guard::NoUnsavedGit,
             ];
             let candidate = item(
                 "stale-scratch",

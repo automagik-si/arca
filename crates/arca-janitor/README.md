@@ -49,8 +49,16 @@ shows the pause. Each job has a time budget (`JOB_BUDGET_MIN`) and can be cancel
 ## Results you can trust
 
 - An apply first decides every item's verdict, then changes anything. Removing one build output touches its
-  project folder, so a sibling checked afterwards would look fresh. Right before each action, only the disk is
-  checked again: the path is still there, still this user's, not a link, not a mount.
+  project folder, so a sibling checked afterwards would look fresh. Recency (modification times) is judged only in
+  that first pass.
+- Right before each item, everything else is checked again: live processes and mounts are looked at anew, the
+  other protections are gathered again when older than five minutes, and the disk must still agree (the path is
+  there, this user's, not a link, no link on the way, not a mount). A build that starts during an apply keeps its
+  folder; an item that vanished or became a link is skipped.
+- Removal works on folder handles, not paths: each folder is opened relative to its parent with `O_NOFOLLOW`
+  and each entry unlinked relative to its folder, so a folder swapped for a link halfway through is refused, never
+  followed. A mount point or another filesystem anywhere inside an item (a bind mount on the same filesystem
+  too) refuses the whole item before anything is deleted.
 - Every action is verified on disk afterwards. A removed path must be gone. A quarantined folder must be gone from
   its place and present in the trash. An emptied folder must be empty. A command must exit 0.
 - Each item ends as `done`, `skipped` (with the protection or precondition) or `failed` (with the OS error or
@@ -67,7 +75,9 @@ Linux: `caches` (npm, pnpm and uv through their own commands; go-build, node-gyp
 `claude-versions`, `arca-backups`, `docker` (untagged images, build cache older than 7 days), `runner-caches`
 (Sundays only in the daily profile), `build-outputs` (`target/` beside a Cargo.toml; `node_modules`, `.next`,
 `.turbo` and `.parcel-cache` beside a package.json; only in projects idle for `BUILD_IDLE_DAYS`), and `stale-scratch`
-(a scratch root's top-level folder untouched for `STALE_DAYS` is moved to `<root>/.cleanup-trash/<date>/`).
+(a scratch root's top-level folder untouched for `STALE_DAYS` is moved to `<root>/.cleanup-trash/<date>/`, unless
+it is or holds a git repository or worktree with changes not committed, files not tracked, a stash, or commits no
+remote has).
 
 macOS: `caches` (brew, npm, pnpm, yarn, pip, uv, go, CocoaPods, cargo, node-gyp), `xcode` (DerivedData, unavailable
 simulators), `docker`, `claude-versions`, `app-caches` (`~/Library/Caches` folders untouched for 30 days, Apple's
@@ -79,7 +89,8 @@ In the daily profile, a cache stays warm while it is under its cap (`NPM_MAX_MB`
 
 ## Never touched
 
-These are worked out again for every plan and every apply:
+These are worked out again for every plan and every apply, with every root and source in its real, link-free
+form (the form `/proc` reports), so a root reached through a linked folder is protected the same way:
 
 - anything inside a top-level folder (under the deepest root) that one of these uses: a user service (systemd
   `WorkingDirectory`, `ExecStart`, `ExecStartPre` and `EnvironmentFile`; on macOS, LaunchAgents'
@@ -89,6 +100,7 @@ These are worked out again for every plan and every apply:
 - `PROTECT` paths, and any folder holding a `.cleanup-keep` file;
 - the home's tool dot-folders (`~/.cargo`, `~/.bun`, `~/.local`...), whose `node_modules` are global installs;
 - links, mount points, files not owned by this user, and odd paths;
+- git work that exists nowhere else, in stale scratch;
 - a cache while its tool runs, and a build an active session runs.
 
 ## Config

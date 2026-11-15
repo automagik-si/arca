@@ -96,6 +96,32 @@ const DEFAULT_STOP_WORDS: &[&str] = &[
 ];
 
 impl Config {
+    /// The same config with every path in its real, link-free form, the form /proc reports (`/home` linked to a
+    /// data disk, macOS's `/tmp` in `/private/tmp`). The home and PROTECT paths are resolved fully. A root's own
+    /// last component is kept as it is, so a root that is itself a link stays refused; only the folders above it
+    /// are resolved. A path that does not exist is kept unchanged.
+    pub fn canonical(&self) -> Config {
+        let full = |p: &PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        let above = |p: &PathBuf| match (p.parent(), p.file_name()) {
+            (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                .map(|real| real.join(name))
+                .unwrap_or_else(|_| p.clone()),
+            _ => p.clone(),
+        };
+        let mut c = self.clone();
+        c.home = full(&self.home);
+        c.scratch_roots = self.scratch_roots.iter().map(above).collect();
+        c.project_roots = self.project_roots.iter().map(above).collect();
+        // PROTECT keeps both forms, so a path given through a link is matched either way.
+        c.protect = self.protect.iter().map(full).collect();
+        for p in &self.protect {
+            if !c.protect.contains(p) {
+                c.protect.push(p.clone());
+            }
+        }
+        c
+    }
+
     /// The defaults for a home and host, before any file is read.
     pub fn defaults(home: &Path, host: &str) -> Config {
         Config {

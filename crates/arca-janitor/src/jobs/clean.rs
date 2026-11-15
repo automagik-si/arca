@@ -18,7 +18,7 @@ use crate::jobs::{CleanApplyParams, CleanPlanParams, Ctx, JobError, Profile, Tra
 use crate::platform;
 use crate::protect::{self, Protections};
 use crate::util::{now, on_path, parse_date, run_cmd};
-use crate::walk::{changed_since, remove_tree};
+use crate::walk::{changed_since, empty_dir, move_nofollow, remove_tree};
 
 /// What applying an item does.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -79,6 +79,20 @@ pub enum Guard {
     NotCacheKeep,
     /// The program is installed.
     Tool { program: String },
+    /// No git repository or worktree at or inside it holds work that exists nowhere else: changes not committed,
+    /// files not tracked, a stash, or commits no remote has.
+    NoUnsavedGit,
+}
+
+impl Guard {
+    /// Whether the guard judges recency (file modification times). Those verdicts are decided once, before an apply
+    /// changes anything; every other guard is checked again right before each item is acted on.
+    pub fn is_recency(&self) -> bool {
+        matches!(
+            self,
+            Guard::ProjectIdle { .. } | Guard::Untouched { .. } | Guard::TrashOlderThan { .. }
+        )
+    }
 }
 
 /// Where an item came from: the pattern that matched it, and whose it is.
@@ -226,6 +240,11 @@ pub fn basic_check(path: &Path, env: &Env) -> Result<(), String> {
         return Err("refused: odd path".to_string());
     }
     let md = fs::symlink_metadata(path).map_err(|_| "gone".to_string())?;
+    if let Some(parent) = path.parent()
+        && fs::canonicalize(parent).is_ok_and(|real| real != parent)
+    {
+        return Err("refused: a folder on the way is a link".to_string());
+    }
     if md.uid() != env.uid() {
         return Err("refused: not owned by this user".to_string());
     }
@@ -240,6 +259,11 @@ pub fn basic_check(path: &Path, env: &Env) -> Result<(), String> {
 
 /// Check an item now: the basic checks for a path, then each of its guards.
 pub fn check(item: &Item, env: &Env) -> Result<(), String> {
+    check_with(item, env, true)
+}
+
+/// Check an item now, with or without the guards that judge recency (`Guard::is_recency`).
+pub fn check_with(item: &Item, env: &Env, recency: bool) -> Result<(), String> {
     if let Some(path) = item.action.path() {
         basic_check(path, env)?;
     }
@@ -250,7 +274,7 @@ pub fn check(item: &Item, env: &Env) -> Result<(), String> {
     }
     let path = item.action.path().unwrap_or(Path::new(""));
     let mounts = env.mounts();
-    for guard in &item.guards {
+    for guard in item.guards.iter().filter(|g| recency || !g.is_recency()) {
         match guard {
             Guard::Protected => {
                 if let Some(why) = env.prot.protected_by(path) {
@@ -329,6 +353,11 @@ pub fn check(item: &Item, env: &Env) -> Result<(), String> {
                     return Err(format!("{program} is not installed"));
                 }
             }
+            Guard::NoUnsavedGit => {
+                if let Some(why) = crate::git::unsaved_work(path, mounts) {
+                    return Err(why);
+                }
+            }
         }
     }
     Ok(())
@@ -352,6 +381,7 @@ pub fn make_plan(
     if let Some(ctx) = ctx {
         ctx.phase("working out what is protected");
     }
+    let config = &config.canonical();
     let env = build_env(config, ctx, params.profile)?;
     let mut plan = Plan {
         id: crate::util::new_id("p"),
@@ -654,27 +684,23 @@ pub fn record_run(
 /// Apply one item. Returns where a quarantined folder went.
 fn execute(item: &Item, env: &Env, ctx: Option<&Ctx>) -> Result<Option<PathBuf>, String> {
     match &item.action {
-        Action::Remove { path } => remove_tree(path, ctx)
+        Action::Remove { path } => remove_tree(path, env.mounts(), ctx)
             .map(|_| None)
             .map_err(|e| e.to_string()),
-        Action::EmptyDir { path } => {
-            let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
-            for entry in entries.flatten() {
-                let child = entry.path();
-                remove_tree(&child, ctx).map_err(|e| format!("{}: {e}", child.display()))?;
-            }
-            Ok(None)
-        }
+        Action::EmptyDir { path } => empty_dir(path, env.mounts(), ctx)
+            .map(|_| None)
+            .map_err(|e| e.to_string()),
         Action::Quarantine { path, trash } => {
             let day = trash.join(crate::util::date(env.now));
             fs::create_dir_all(&day).map_err(|e| format!("cannot make {}: {e}", day.display()))?;
             let name = path.file_name().ok_or("no name")?;
-            let mut dest = day.join(name);
-            if fs::symlink_metadata(&dest).is_ok() {
+            let mut dest_name = name.to_os_string();
+            if fs::symlink_metadata(day.join(&dest_name)).is_ok() {
                 let (_, _, _, h, m, s) = crate::util::civil(now());
-                dest = day.join(format!("{}.{h:02}{m:02}{s:02}", name.to_string_lossy()));
+                dest_name = format!("{}.{h:02}{m:02}{s:02}", name.to_string_lossy()).into();
             }
-            fs::rename(path, &dest)
+            let dest = day.join(&dest_name);
+            move_nofollow(path, &day, &dest_name)
                 .map_err(|e| format!("cannot move to {}: {e}", dest.display()))?;
             Ok(Some(dest))
         }
@@ -723,12 +749,29 @@ pub fn verify(action: &Action, moved_to: Option<&Path>) -> Result<(), String> {
     }
 }
 
+/// How long the slow protection sources (services, containers, pm2, PROTECT, .cleanup-keep) stay current during an
+/// apply. Live processes and mounts are looked at again before every item.
+const SOURCES_FRESH_SECS: u64 = 300;
+
 /// Apply a plan: every item is checked again against protections built anew, then applied or skipped.
 pub fn apply_plan(
     plan: &Plan,
     config: &Config,
     ctx: Option<&Ctx>,
 ) -> Result<ApplyResult, JobError> {
+    apply_plan_with(plan, config, ctx, &mut || {})
+}
+
+/// `apply_plan`, calling `between` after every verdict is decided and before anything is changed (tests use it to
+/// change the world in that window).
+#[doc(hidden)]
+pub fn apply_plan_with(
+    plan: &Plan,
+    config: &Config,
+    ctx: Option<&Ctx>,
+    between: &mut dyn FnMut(),
+) -> Result<ApplyResult, JobError> {
+    let config = &config.canonical();
     if plan.host != config.host {
         return Err(JobError::Failed(format!(
             "refused: plan {} was made on {}, this is {}",
@@ -738,7 +781,8 @@ pub fn apply_plan(
     if let Some(ctx) = ctx {
         ctx.phase("working out what is protected, again");
     }
-    let env = build_env(config, ctx, plan.profile)?;
+    let mut env = build_env(config, ctx, plan.profile)?;
+    let mut sources_at = now();
     let mut result = ApplyResult {
         plan: plan.id.clone(),
         ..ApplyResult::default()
@@ -772,6 +816,7 @@ pub fn apply_plan(
             }),
         }
     }
+    between();
     if let Some(ctx) = ctx {
         ctx.phase("applying");
     }
@@ -780,11 +825,27 @@ pub fn apply_plan(
             result.stopped = Some(stop_reason(stop));
             break;
         }
-        // Right before acting, only what the disk itself says is looked at again: still there, still ours, not a
-        // link, not a mount. The protections were built once for this run and do not change within it.
-        if let Some(path) = item.action.path()
-            && let Err(reason) = basic_check(path, &env)
-        {
+        // Right before acting, everything but recency is checked again: the disk (still there, still ours, no link
+        // on the way, not a mount), live processes and mounts looked at anew, and the other protections, gathered
+        // again when older than SOURCES_FRESH_SECS. A build or worker that started during the apply keeps its
+        // folder. Recency stays as decided above: this run's own removals touch parent folders.
+        if now().saturating_sub(sources_at) >= SOURCES_FRESH_SECS {
+            match build_env(config, ctx, plan.profile) {
+                Ok(fresh) => {
+                    env.prot = fresh.prot;
+                    sources_at = now();
+                }
+                Err(JobError::Stopped(stop)) => {
+                    result.stopped = Some(stop_reason(stop));
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            env.prot
+                .refresh_live(platform::live(env.uid()), platform::mount_points());
+        }
+        if let Err(reason) = check_with(item, &env, false) {
             result.skipped.push(Skip {
                 category: item.category.clone(),
                 label: item.action.label(),
@@ -923,7 +984,8 @@ pub fn apply_stored(plan: &mut Plan, ctx: &Ctx, kind: &str) -> Result<ApplyResul
 /// The trash-purge job: delete quarantine day folders older than TRASH_DAYS in every scratch root.
 pub fn trash_purge(params: &TrashPurgeParams, ctx: &Ctx) -> Result<ApplyResult, JobError> {
     ctx.phase("finding old trash");
-    let env = build_env(&ctx.config, Some(ctx), Profile::Full)?;
+    let config = ctx.config.canonical();
+    let env = build_env(&config, Some(ctx), Profile::Full)?;
     let mut plan = Plan {
         id: crate::util::new_id("p"),
         created: env.now,

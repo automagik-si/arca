@@ -22,6 +22,9 @@ use crate::walk::{Visit, Walk};
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The source name of a live process's path.
+pub const LIVE: &str = "live process";
+
 /// The paths things depend on, each with where it came from.
 #[derive(Clone, Debug, Default)]
 pub struct Sources {
@@ -69,7 +72,7 @@ pub fn gather(
     }
     s.live = platform::live(uid);
     for p in &s.live.paths {
-        s.entries.push((p.clone(), "live process"));
+        s.entries.push((p.clone(), LIVE));
     }
     let mut roots = keep_roots(&config.scratch_roots, uid);
     roots.extend(keep_roots(&config.project_roots, uid));
@@ -223,6 +226,9 @@ pub struct Protections {
     pub protect: Vec<PathBuf>,
     pub live: Live,
     pub mounts: HashSet<PathBuf>,
+    /// The sources other than live processes, each also in its real form, kept to rebuild `protected` when live
+    /// processes are looked at again.
+    pub entries: Vec<(PathBuf, &'static str)>,
 }
 
 impl Protections {
@@ -241,22 +247,58 @@ impl Protections {
             protect: config.protect.clone(),
             live: sources.live.clone(),
             mounts,
+            entries: Vec::new(),
         };
-        let mut seen = HashSet::new();
-        for (path, why) in &sources.entries {
+        // /proc reports real paths, so a source given through a link (a unit's WorkingDirectory under a linked
+        // /home, say) is matched in its real form too. Live processes come from /proc and are real already.
+        let known: HashSet<PathBuf> = p.live.paths.iter().cloned().collect();
+        for (path, why) in sources.entries {
+            if why == LIVE {
+                if !known.contains(&path) {
+                    p.live.paths.push(path);
+                }
+                continue;
+            }
             if !path.is_absolute() {
                 continue;
             }
-            if let Some(anchor) = p.anchor(path)
+            if let Ok(real) = fs::canonicalize(&path)
+                && real != path
+            {
+                p.entries.push((real, why));
+            }
+            p.entries.push((path, why));
+        }
+        p.rebuild();
+        p
+    }
+
+    /// Work out the anchored folders from the sources and the live processes.
+    fn rebuild(&mut self) {
+        let mut protected = Vec::new();
+        let mut seen = HashSet::new();
+        let live = self.live.paths.iter().map(|p| (p, LIVE));
+        for (path, why) in self.entries.iter().map(|(p, w)| (p, *w)).chain(live) {
+            if !path.is_absolute() {
+                continue;
+            }
+            if let Some(anchor) = self.anchor(path)
                 && seen.insert(anchor.clone())
             {
-                p.protected.push((anchor, why));
+                protected.push((anchor, why));
             }
         }
-        for path in &config.protect {
-            p.protected.push((path.clone(), "PROTECT"));
+        for path in &self.protect {
+            protected.push((path.clone(), "PROTECT"));
         }
-        p
+        self.protected = protected;
+    }
+
+    /// Look at live processes and mounts again (cheap), keeping the other sources as they were gathered.
+    pub fn refresh_live(&mut self, live: Live, mounts: HashSet<PathBuf>) {
+        self.live = live;
+        self.mounts = mounts;
+        self.rebuild();
     }
 
     /// The top-level folder under the deepest root that holds `path`; None when `path` is under no root (or is one).
