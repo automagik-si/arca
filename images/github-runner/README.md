@@ -31,8 +31,12 @@ What it does is written at the top of `build.sh`. In short: wait for the host to
 memory, room on the storage pool), start a capped virtual machine (4 CPUs, 8 GiB, an 80 GiB root throttled to
 150 MB/s read and 80 MB/s write) in the Incus project `ci`, run GitHub's template against it with Packer's `null`
 builder, compare the software reports, add the runner, clean up, publish the image as `arca/github-runner/<tag>`,
-delete the machine, and write `docs/runner-image/<tag>/`. Settings (`PROJECT`, `CPU`, `MEMORY`, `DISK`, the gate's
-limits) are environment variables, listed at the top of the script. One build per host at a time.
+delete the machine, and write `docs/runner-image/<tag>/`. When there is too little room under `/var/lib/incus` to
+publish (or with `--no-publish`), the image is the stopped machine `arca-runner-image-<tag>` (dots made dashes, e.g.
+`arca-runner-image-ubuntu24-20261111-370`) with a snapshot `image`, one machine per tag. Settings (`PROJECT`, `CPU`,
+`MEMORY`, `DISK`, the gate's limits, `GATE_FLOORS` for other paths whose free room must stay above a floor once the
+build has written its disk) are environment variables, listed at the top of the script. One build per host at a time,
+whoever runs it (the lock `/run/lock/arca-runner-image.lock`).
 
 The changes to GitHub's build are listed in [CHANGES.md](CHANGES.md), which every published difference includes.
 `patch-template.py` makes them, and stops the build when GitHub's template no longer looks as it expects.
@@ -47,7 +51,8 @@ images/github-runner/check-release.sh --build    # and build it
 ```
 
 Then commit `releases/<line>.env` with `docs/runner-image/<new tag>/`, run the compatibility test on the new image,
-and move the job pool to it only when that passes. Keep the previous image for a one-step rollback. The runner program
+and move the job pool to it only when that passes. Keep the previous image (its Incus image, or its
+`arca-runner-image-<tag>` machine) for a one-step rollback, and delete older ones. The runner program
 is pinned in `releases/tools.env`; GitHub stops giving jobs to a runner more than 63 days behind, so the weekly rebuild
 is also what keeps it current.
 
@@ -67,7 +72,7 @@ incus init arca/github-runner/ubuntu24/20261111.370 job-1 --project ci -c limits
 incus config set job-1 user.arca-runner.jitconfig="$ENCODED_JIT_CONFIG" --project ci
 incus start job-1 --project ci          # runs one job, then powers off: delete it then
 # When the build kept the stopped machine instead of publishing it (too little room under /var/lib/incus):
-incus copy arca-runner-build-ubuntu24/image job-1 --project ci -c limits.cpu=2 -c limits.memory=8GiB
+incus copy arca-runner-image-ubuntu24-20261111-370/image job-1 --project ci -c limits.cpu=2 -c limits.memory=8GiB
 ```
 
 ## The compatibility test

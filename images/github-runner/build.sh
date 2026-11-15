@@ -6,8 +6,9 @@
 # <line> is a file in releases/ without .env: ubuntu24 or ubuntu26. What it does, in order:
 #
 # 1. Waits for the host's gate: CPU idle >= GATE_IDLE % over 5 s, MemAvailable >= GATE_MEM_GIB, and room on the
-#    storage pool (GATE_POOL_GIB) and under /var/lib/incus (GATE_ROOT_GIB). It checks again every minute, up to
-#    GATE_WAIT seconds. One build per host at a time (a lock in WORK).
+#    storage pool (GATE_POOL_GIB) and under /var/lib/incus (GATE_ROOT_GIB), and every GATE_FLOORS path keeping its
+#    floor once the build has written its disk. It checks again every minute, up to GATE_WAIT seconds. One build per
+#    host at a time (the lock LOCK, the same for every user).
 # 2. Fetches GitHub's repository at the pinned tag (and checks the commit), Packer (checked by sha256) and GitHub's
 #    own software report for that release (internal.<line>.json).
 # 3. Starts a virtual machine `arca-runner-build-<line>` in the Incus project PROJECT from BASE_IMAGE, capped at CPU
@@ -20,7 +21,8 @@
 # 6. vm/finalize.sh: the runner user, the runner program, arca-runner.service, then the clean-up of the build.
 # 7. Stops the machine and publishes it as the Incus image `arca/github-runner/<tag>` (in PROJECT's image store), then
 #    deletes the machine. --no-publish, or too little room under /var/lib/incus, keeps the stopped machine instead,
-#    with a snapshot `image`: `incus copy` makes job machines from it (copy-on-write on btrfs and ZFS).
+#    renamed `arca-runner-image-<tag>` with a snapshot `image`: `incus copy` makes job machines from it (copy-on-write
+#    on btrfs and ZFS). Each tag keeps its own machine, so the previous image stays for a rollback.
 # 8. Writes the published difference into docs/runner-image/<tag>/ (README.md, software-report.json, the diffs, the
 #    failed tests) and deletes everything else it made, except a compressed log in WORK/logs.
 #
@@ -61,12 +63,14 @@ done
 : "${GATE_POOL_GIB:=90}"     # GitHub's image uses about 55-60 GB; the rest is margin for the pool's other users
 : "${GATE_ROOT_GIB:=20}"
 : "${GATE_WAIT:=43200}"
-: "${GATE_FLOORS:=}"        # more room to keep, as "path:GiB path:GiB", e.g. "/srv/build:155"
+: "${GATE_FLOORS:=}"        # room to keep after the build, as "path:GiB path:GiB", e.g. "/srv/build:155"
 : "${PUBLISH_COMPRESSION:=zstd}"
+: "${LOCK:=/run/lock/arca-runner-image.lock}"
 : "${DIFF_URL_BASE:=https://github.com/automagik-si/arca/blob/dev/docs/runner-image}"
 
 slug=${RUNNER_IMAGES_TAG//\//-}
 vm=arca-runner-build-$IMAGE_OS
+image_vm=arca-runner-image-${slug//./-}
 alias=arca/github-runner/$RUNNER_IMAGES_TAG
 src=$WORK/$slug
 out=$repo/docs/runner-image/$slug
@@ -79,8 +83,8 @@ say() { printf 'build: %s\n' "$*"; }
 gib() { echo $(( $1 / 1073741824 )); }
 in_vm() { incus exec "$vm" --project "$PROJECT" "$@"; }
 
-exec 9>"$WORK/build.lock"
-flock -n 9 || { say "another image build is running on this host (lock $WORK/build.lock)"; exit 1; }
+exec 9>>"$LOCK"
+flock -n 9 || { say "another image build is running on this host (lock $LOCK)"; exit 1; }
 
 pool=$(incus profile device get default root pool --project "$PROJECT")
 pool_free() { incus query "/1.0/storage-pools/$pool/resources" | jq '.space.total - .space.used'; }
@@ -94,14 +98,32 @@ cpu_idle() {
   b=$((b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8)) bi=$((b4 + b5))
   echo $(( 100 * (bi - ai) / (b - a) ))
 }
+disk_bytes=$(numfmt --from=auto "${DISK%B}")
+fs_of() { findmnt -no UUID -T "$1" | head -1; }
+# What the build itself writes on a floor's filesystem: up to DISK on the pool, and up to twice that under
+# /var/lib/incus when it publishes.
+floor_extra() {
+  local fs extra=0
+  fs=$(fs_of "$1")
+  [ "$fs" = "$(fs_of "/var/lib/incus/storage-pools/$pool")" ] && extra=$disk_bytes
+  [ "$publish" = yes ] && [ "$fs" = "$(fs_of /var/lib/incus)" ] && extra=$(( extra + 2 * disk_bytes ))
+  echo "$extra"
+}
 mem_available() { awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo; }
 
 # --- 1. the gate --------------------------------------------------------------------------------------------------
 t_start=$(date +%s)
-if incus info "$vm" --project "$PROJECT" >/dev/null 2>&1; then
-  say "the machine $vm already exists in project $PROJECT (a build was kept or is running): delete it first"
-  exit 1
-fi
+names_free() {
+  if incus info "$vm" --project "$PROJECT" >/dev/null 2>&1; then
+    say "the machine $vm already exists in project $PROJECT (a build was kept with --keep): delete it first"
+    exit 1
+  fi
+  if incus info "$image_vm" --project "$PROJECT" >/dev/null 2>&1; then
+    say "$RUNNER_IMAGES_TAG is already built: the machine $image_vm exists in project $PROJECT (delete it to rebuild)"
+    exit 1
+  fi
+}
+names_free
 waited=0 said=-600
 while :; do
   idle=$(cpu_idle) mem=$(mem_available) pf=$(pool_free) rf=$(root_free)
@@ -109,8 +131,9 @@ while :; do
   [ "$(gib "$pf")" -ge "$GATE_POOL_GIB" ] || why="$why pool $pool has $(gib "$pf") GiB free (needs $GATE_POOL_GIB);"
   [ "$(gib "$rf")" -ge "$GATE_ROOT_GIB" ] || why="$why /var/lib/incus has $(gib "$rf") GiB free (needs $GATE_ROOT_GIB);"
   for floor in $GATE_FLOORS; do
-    free=$(df -B1 --output=avail "${floor%%:*}" | tail -1)
-    [ "$(gib "$free")" -ge "${floor##*:}" ] || why="$why ${floor%%:*} has $(gib "$free") GiB free (keep ${floor##*:});"
+    free=$(df -B1 --output=avail "${floor%%:*}" | tail -1) extra=$(floor_extra "${floor%%:*}")
+    [ "$(gib $(( free - extra )))" -ge "${floor##*:}" ] ||
+      why="$why ${floor%%:*} has $(gib "$free") GiB free, $(gib "$extra") of it for the build (keep ${floor##*:});"
   done
   if [ "$gate" = yes ]; then
     [ "$idle" -ge "$GATE_IDLE" ] || why="$why CPU idle $idle% (needs $GATE_IDLE);"
@@ -128,18 +151,21 @@ while :; do
   sleep 55
   waited=$(( $(date +%s) - t_start ))
 done
+# Another run may have made either machine while this one waited.
+names_free
 say "gate open: CPU idle $idle%, MemAvailable $(gib "$mem") GiB, pool $(gib "$pf") GiB free, /var/lib/incus $(gib "$rf") GiB free"
 t_gate=$(date +%s)
 
 # --- 2. sources ---------------------------------------------------------------------------------------------------
 cleanup() {
   local status=$?
-  if [ "$status" -ne 0 ] && [ "$keep" = no ] && incus info "$vm" --project "$PROJECT" >/dev/null 2>&1; then
+  if [ "$status" -ne 0 ] && [ "$keep" = no ] && [ "$created" = yes ]; then
     say "failed (status $status): deleting $vm (use --keep to keep it)"
     incus delete -f "$vm" --project "$PROJECT" || true
   fi
   rm -rf "$src"
 }
+created=no
 trap cleanup EXIT
 
 packer=$WORK/tools/packer-$PACKER_VERSION
@@ -188,6 +214,7 @@ EOF
 incus init "$BASE_IMAGE" "$vm" --vm --project "$PROJECT" \
   -c limits.cpu="$CPU" -c limits.memory="$MEMORY" -c cloud-init.user-data="$(cat "$src/user-data")" \
   -d root,size="$DISK" -d root,limits.read="$DISK_READ" -d root,limits.write="$DISK_WRITE"
+created=yes
 incus start "$vm" --project "$PROJECT"
 for _ in $(seq 120); do in_vm -- true 2>/dev/null && break; sleep 5; done
 # cloud-init says 2 for "done, with warnings". The Incus agent can go away while the machine boots (cloud-init
@@ -215,9 +242,15 @@ done
 [ -n "$ip" ] || { say "$vm has no address"; exit 1; }
 # GitHub's template reboots the machine and Packer reconnects to the same address: pin it, so a new lease cannot move it.
 nic=$(incus query "/1.0/instances/$vm?project=$PROJECT" | jq -r '[.expanded_devices | to_entries[] | select(.value.type == "nic") | .key][0]')
-incus config device override "$vm" "$nic" ipv4.address="$ip" --project "$PROJECT" 2>/dev/null ||
-  incus config device set "$vm" "$nic" ipv4.address="$ip" --project "$PROJECT" 2>/dev/null ||
+# A NIC from a profile is copied into the machine to take the address (override); a NIC of its own takes it in place.
+if incus config device override "$vm" "$nic" ipv4.address="$ip" --project "$PROJECT" 2>/dev/null; then
+  pinned=profile
+elif incus config device set "$vm" "$nic" ipv4.address="$ip" --project "$PROJECT" 2>/dev/null; then
+  pinned=own
+else
+  pinned=no
   say "could not pin $ip on $vm (it may move after GitHub's reboot)"
+fi
 push_files() {
   local f
   in_vm -- mkdir -p /tmp/arca-image
@@ -273,8 +306,12 @@ incus stop "$vm" --project "$PROJECT"
 # The build user's cloud-init data must not go with the image: cloud-init would make that user again on every machine.
 incus config unset "$vm" cloud-init.user-data --project "$PROJECT"
 # Nor the build's pinned address (a copy would not start: the address is taken) or its disk throttle (a job machine
-# gets its class's limits, not the build's).
-incus config device unset "$vm" "$nic" ipv4.address --project "$PROJECT" 2>/dev/null || true
+# gets its class's limits, not the build's). The NIC copied from the profile goes whole, so job machines take the
+# profile's NIC again.
+case $pinned in
+  profile) incus config device remove "$vm" "$nic" --project "$PROJECT" ;;
+  own) incus config device unset "$vm" "$nic" ipv4.address --project "$PROJECT" ;;
+esac
 incus config device unset "$vm" root limits.read --project "$PROJECT"
 incus config device unset "$vm" root limits.write --project "$PROJECT"
 t_final=$(date +%s)
@@ -299,8 +336,15 @@ else
     if timeout 300 incus snapshot create "$vm" image --project "$PROJECT"; then snapshot=yes; break; fi
     say "the snapshot did not come (try $try of 3)"
   done
-  [ "$snapshot" = yes ] || { say "no snapshot: the stopped machine $vm is the image; snapshot it by hand"; keep=yes; }
-  kept="the stopped machine $vm, snapshot image, in project $PROJECT"
+  # The image's own name frees the build's for the next release, and keeps this one for a rollback.
+  incus move "$vm" "$image_vm" --project "$PROJECT"
+  created=no
+  if [ "$snapshot" = yes ]; then
+    kept="the stopped machine $image_vm, snapshot image, in project $PROJECT"
+  else
+    say "no snapshot: the stopped machine $image_vm is the image; snapshot it by hand"
+    kept="the stopped machine $image_vm (no snapshot yet), in project $PROJECT"
+  fi
 fi
 t_end=$(date +%s)
 

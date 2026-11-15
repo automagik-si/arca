@@ -49,10 +49,11 @@ for line in "${lines[@]}"; do
     echo "$line current $current"
     continue
   fi
-  commit=$(api "git/ref/tags/$newest" | jq -r '.object.sha')
+  commit=$(api "git/ref/tags/$newest" | jq -r '.object.sha // empty')
   version=$(jq -r '.body' <<<"$release" | sed -n 's/^- Image Version: *//p' | head -1 | tr -d '\r')
-  if [ -z "$commit" ] || [ -z "$version" ]; then
-    echo "$line: release $newest has no commit or no 'Image Version' line" >&2
+  # releases/<line>.env is sourced by build.sh on the host: only values of the exact expected shape go into it.
+  if ! [[ $newest =~ ^ubuntu[0-9]+/[0-9]{8}\.[0-9]+$ && $commit =~ ^[0-9a-f]{40}$ && $version =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+    echo "$line: release $newest: a tag, commit or 'Image Version' not of the expected shape; pins left as they are" >&2
     exit 1
   fi
   sed -i -e "s|^RUNNER_IMAGES_TAG=.*|RUNNER_IMAGES_TAG=$newest|" -e "s|^RUNNER_IMAGES_COMMIT=.*|RUNNER_IMAGES_COMMIT=$commit|" \
