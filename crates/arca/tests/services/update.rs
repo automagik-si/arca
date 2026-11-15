@@ -1553,3 +1553,64 @@ fn an_update_of_an_edge_writes_the_routes_it_records_onto_the_new_root_before_it
     );
     assert!(at("rebuild") < at("edge config") && at("edge config") < at("start"));
 }
+
+#[test]
+fn an_edge_update_that_rolls_back_writes_its_routes_onto_the_old_root_too() {
+    use arca_incus::exec::{EDGE_CONFIG, ExecCommand};
+    use arca_incus::fake::ExecScript;
+    // The health check never answers, and the project forbids snapshots: the old root is rebuilt from the old digest.
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = node_with(
+        &up,
+        None,
+        vec![hand_instance(
+            "app",
+            "other",
+            json!({"eth0":{"type":"nic","name":"eth0","network":"br1","ipv4.address":"10.20.30.63"}}),
+        )],
+    );
+    rig.template(
+        "edge",
+        json!({"name":"edge","kind":"oci","image":"registry.example/edge","digest":DIGEST,
+            "ports":[443],"env":{},"lan":{"port":443},"edge":true}),
+    );
+    rig.call("service_create", json!({"name":"edge","template":"edge"}))
+        .expect("the edge");
+    rig.fake
+        .script_exec(ExecScript::new(ExecCommand::EdgeReload.argv(), 0, ""));
+    rig.call(
+        "route_add",
+        json!({"hostname":"app.example.com","instance":"app","project":"other","port":8080}),
+    )
+    .expect("a route");
+
+    let failed = update(
+        &rig,
+        json!({ "name": "edge", "digest": NEW, "timeoutSeconds": 1 }),
+    )
+    .expect_err("rolled back");
+    assert!(format!("{failed:?}").contains("rolled back"), "{failed:?}");
+    let steps: Vec<String> = journal(&rig).into_iter().map(|(step, _)| step).collect();
+    let back = steps
+        .iter()
+        .position(|step| step == "rebuild back")
+        .expect("the old root was rebuilt");
+    assert_eq!(
+        steps.get(back + 1).map(String::as_str),
+        Some("edge config"),
+        "{steps:?}"
+    );
+    assert_eq!(
+        steps.iter().filter(|step| *step == "edge config").count(),
+        2,
+        "{steps:?}"
+    );
+    let record = rig.service_config("edge").edge.expect("an edge record");
+    let root = rig
+        .fake
+        .service_files()
+        .get(&format!("{PROJECT}/edge:{EDGE_CONFIG}"))
+        .map(|bytes| String::from_utf8(bytes.clone()).unwrap())
+        .expect("the edge's config");
+    assert_eq!(root, arca::route::caddyfile(&record));
+}

@@ -1150,7 +1150,18 @@ impl Run<'_> {
     /// the data volume back, which holds the routes as they were at the edge's last start.
     fn edge_root(&self) {
         if self.config.edge.is_some() {
-            let written = self.handler.write_edge_root(self.entry, self.config);
+            // The record as the kernel holds it now, as `record` reads it: a route changed since the call began is in
+            // the render too. The lock is let go before the write, which takes it again.
+            let now = self.handler.kernel.lock().ok().and_then(|kernel| {
+                service_entries(kernel.entries())
+                    .into_iter()
+                    .find(|(entry, _)| entry.id == self.entry.id)
+                    .map(|(_, config)| config)
+            });
+            let config = now
+                .filter(|config| config.edge.is_some())
+                .unwrap_or_else(|| self.config.clone());
+            let written = self.handler.write_edge_root(self.entry, &config);
             self.journal.step(
                 "edge config",
                 written.is_ok(),

@@ -324,9 +324,12 @@ pub(super) fn plan(
             json!({ "from": config.no_new_privileges, "to": no_new_privileges }),
         );
     }
-    // The entrypoint, with the scripts it reads from the template directory as they are now.
+    // The entrypoint, with the scripts it reads from the template directory as they are now. A template that names none
+    // leaves the service's own: Arca never takes an entrypoint off an instance (the reconciler sets one only), so a
+    // change to none would be a card row that is never applied.
     let entrypoint = crate::service::entrypoint(&template, &node.state_dir.join("templates"))
-        .map_err(service_template_error)?;
+        .map_err(service_template_error)?
+        .or_else(|| config.entrypoint.clone());
     if entrypoint != config.entrypoint {
         let mut change = json!({
             "from": entrypoint_words(config.entrypoint.as_deref()),
@@ -561,7 +564,11 @@ impl ServiceHandler {
             record.links = from.links.clone();
             record.raw_lxc = from.raw_lxc.clone();
             record.no_new_privileges = from.no_new_privileges;
-            record.entrypoint = from.entrypoint.clone();
+            // An entrypoint is set, never taken off: putting back a record that named none leaves the one the
+            // instance now carries in the record too, so the two stay alike.
+            if from.entrypoint.is_some() {
+                record.entrypoint = from.entrypoint.clone();
+            }
         };
         // The node saves the record before it writes the instance, so a refused write leaves the new record saved:
         // it is put back, and the answer says whether that worked. The old record's environment applies whole.
@@ -640,7 +647,12 @@ impl ServiceHandler {
             );
             return Err(service_refused(format!(
                 "reconfigure service {name}: the restart failed ({error}). {} {}",
-                if restored {
+                if restored
+                    && config.entrypoint.is_none()
+                    && first.changes.get("entrypoint").is_some()
+                {
+                    "The service's record and its instance's config are as they were, but for the template's entrypoint, which both keep: Arca does not take an entrypoint off an instance."
+                } else if restored {
                     "The service's record and its instance's config are as they were."
                 } else {
                     "The service's record could not be put back: service_status shows what it says."

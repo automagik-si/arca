@@ -638,3 +638,35 @@ fn a_reconfigure_moves_an_edge_to_the_entrypoint_its_template_says_now_and_shows
     rig.apply(&rig.service_config("edge")).expect("reconcile");
     assert_eq!(rig.fake.writes().len(), writes);
 }
+
+#[test]
+fn a_template_that_drops_its_entrypoint_shows_no_entrypoint_row_and_the_service_keeps_its_own() {
+    let key = common::SkKey::from_seed(48);
+    let rig = node(&key);
+    let mut template = first_template();
+    template["name"] = json!("plain");
+    template["entrypoint"] = json!(["/usr/bin/app", "serve"]);
+    rig.template("plain", template.clone());
+    rig.call(
+        "service_create",
+        json!({ "name": "plain", "template": "plain" }),
+    )
+    .expect("create");
+    assert_eq!(
+        instance(&rig, "plain")["config"]["oci.entrypoint"],
+        "/usr/bin/app serve"
+    );
+    // Arca never takes an entrypoint off an instance, so a template that names none changes nothing about it.
+    template.as_object_mut().unwrap().remove("entrypoint");
+    rig.template("plain", template);
+    let proposed = propose(&rig, json!({ "name": "plain" })).expect("proposed");
+    assert!(
+        proposed["args"]["changes"].get("entrypoint").is_none(),
+        "{proposed}"
+    );
+    assert_eq!(row(&proposed["details"], "Entrypoint"), None);
+    assert_eq!(
+        rig.service_config("plain").entrypoint.as_deref(),
+        Some("/usr/bin/app serve")
+    );
+}
