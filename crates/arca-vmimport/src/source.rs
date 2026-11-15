@@ -590,18 +590,28 @@ fn push_node(out: &mut String, parent: &str, node: &Node, user_data: bool) {
     if !kept(parent, &node.name) {
         return;
     }
-    out.push_str(&format!("<{}>", node.name));
+    let mut content = String::new();
     if matches!(
         node.name.as_str(),
         "TEMPLATE" | "OS" | "DISK" | "NIC" | "SECURITY_GROUP_RULE" | "CONTEXT"
     ) {
         for child in &node.children {
-            push_node(out, &node.name, child, user_data);
+            push_node(&mut content, &node.name, child, user_data);
         }
     } else {
-        push_text(out, node.text.trim());
+        push_text(&mut content, node.text.trim());
     }
-    out.push_str(&format!("</{}>", node.name));
+    push_element(out, &node.name, &content);
+}
+
+/// `<name>content</name>`, or `<name/>` when nothing is left in it, so an element the source wrote self-closed is
+/// never written longer.
+fn push_element(out: &mut String, name: &str, content: &str) {
+    if content.is_empty() {
+        out.push_str(&format!("<{name}/>"));
+    } else {
+        out.push_str(&format!("<{name}>{content}</{name}>"));
+    }
 }
 
 /// The description cut down to what [`parse`] reads, so a proposal binds and keeps no more of it than the plan uses.
@@ -609,9 +619,11 @@ fn push_node(out: &mut String, parent: &str, node: &Node, user_data: bool) {
 /// Every element `parse` reads is kept, in its order, with its text; every other element is left out, with its text
 /// (a VNC password, the template's own notes, the outside hypervisor's history). A context key the seed does not
 /// carry stays as an empty element, so the card can still name it, but its value is gone: `PASSWORD`,
-/// `CRYPTED_PASSWORD` and `START_SCRIPT_BASE64` never reach a proposal. The reduced text is never longer than the
-/// whole one, so a description under the size limit stays under it. `parse` reads the reduced text as it read the
-/// whole, but for the digest, and the reduction of a reduced text is the same text.
+/// `CRYPTED_PASSWORD` and `START_SCRIPT_BASE64` never reach a proposal. Each text is written in its shortest form, and
+/// an element with nothing left in it as `<X/>`, so the reduced text of a well-formed description is never longer than
+/// the whole one, and a description under the size limit stays under it. A text that quick-xml accepts but XML does not
+/// (a plain `]]>`) can come out longer, because the reduced text is always well-formed. `parse` reads the reduced text
+/// as it read the whole, but for the digest, and the reduction of a reduced text is the same text.
 pub fn reduce(xml: &str) -> Result<String, ParseError> {
     reduce_to(xml, true)
 }
@@ -630,11 +642,12 @@ fn reduce_to(xml: &str, user_data: bool) -> Result<String, ParseError> {
         ));
     }
     let vm = tree(xml)?;
-    let mut out = String::from("<VM>");
+    let mut content = String::new();
     for child in &vm.children {
-        push_node(&mut out, "VM", child, user_data);
+        push_node(&mut content, "VM", child, user_data);
     }
-    out.push_str("</VM>");
+    let mut out = String::new();
+    push_element(&mut out, "VM", &content);
     Ok(out)
 }
 

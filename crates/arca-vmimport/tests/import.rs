@@ -443,7 +443,7 @@ fn with_user_data(element: &str) -> String {
 }
 
 #[test]
-fn the_reduction_never_makes_a_description_longer() {
+fn the_reduction_never_makes_a_well_formed_description_longer() {
     // Review 2's growth case: many `&` in one CDATA section beside a `]]>`, which references once made five times longer.
     let ampersands = with_user_data(&format!(
         "<USER_DATA><![CDATA[#cloud-config\n{}]]]]><![CDATA[>{}]]></USER_DATA>",
@@ -460,7 +460,17 @@ fn the_reduction_never_makes_a_description_longer() {
         "<USER_DATA>#cloud-config{}</USER_DATA>",
         "&#13;<![CDATA[&<&<&<]]>a&amp;&lt;]]&gt;".repeat(900)
     ));
-    for xml in [ampersands, returns, mixed] {
+    // Review 3's case: kept elements the source wrote self-closed, and one whose children are all left out. `parse`
+    // reads the first of each name, so these change nothing it reads.
+    let closed = BIOS.replacen(
+        "</TEMPLATE>",
+        &format!(
+            "{}</TEMPLATE>",
+            "<VCPU/><MEMORY_MAX/><OS><X>y</X></OS>".repeat(500)
+        ),
+        1,
+    );
+    for xml in [ampersands, returns, mixed, closed] {
         let reduced = reduce(&xml).expect("reduced");
         assert!(
             reduced.len() <= xml.len(),
@@ -509,6 +519,54 @@ fn the_shown_description_leaves_out_the_user_data_and_nothing_else() {
         from_shown.digest.clear();
         assert_eq!(from_shown, from_kept);
     }
+}
+
+#[test]
+fn the_user_data_spelled_userdata_is_kept_and_never_shown() {
+    let xml =
+        with_user_data("<USERDATA>#cloud-config\nruncmd: [userdata-spelling-secret]</USERDATA>");
+    let kept = reduce(&xml).expect("reduced");
+    let shown = reduce_shown(&xml).expect("shown");
+    assert!(kept.contains("userdata-spelling-secret"), "{kept}");
+    assert!(
+        parse(&kept)
+            .expect("read")
+            .context
+            .user_data
+            .is_some_and(|data| data.contains("userdata-spelling-secret"))
+    );
+    assert!(!shown.contains("userdata-spelling-secret"), "{shown}");
+    assert!(shown.contains("<USERDATA/>"), "{shown}");
+    assert!(parse(&shown).expect("read").context.user_data.is_none());
+}
+
+/// The user data element of `reduce`'s text for a description whose user data is written `source`.
+fn reduced_user_data(source: &str) -> String {
+    let reduced =
+        reduce(&with_user_data(&format!("<USER_DATA>{source}</USER_DATA>"))).expect("reduced");
+    let start = reduced.find("<USER_DATA>").expect("the user data") + "<USER_DATA>".len();
+    let end = reduced.find("</USER_DATA>").expect("its end");
+    reduced[start..end].to_string()
+}
+
+#[test]
+fn each_text_is_written_in_its_shortest_well_formed_form() {
+    // A `>` after `]]` is a reference outside a section, or the text would end a section that is not open.
+    assert_eq!(reduced_user_data("a]]&gt;b"), "a]]&gt;b");
+    assert_eq!(
+        reduced_user_data("<![CDATA[a]]]]><![CDATA[>b]]>"),
+        "a]]&gt;b"
+    );
+    // A carriage return is a reference anywhere: a literal one reads back as a line feed.
+    assert_eq!(reduced_user_data("a&#13;]]&gt;b"), "a&#13;]]&gt;b");
+    // Two references are shorter than a section; twelve are longer than one.
+    assert_eq!(reduced_user_data("a<![CDATA[&&]]>b"), "a&amp;&amp;b");
+    assert_eq!(
+        reduced_user_data(&"&amp;".repeat(12)),
+        format!("<![CDATA[{}]]>", "&".repeat(12))
+    );
+    // Three at the end cost the same either way, counting the section's close; the plain form is kept.
+    assert_eq!(reduced_user_data("a&amp;&amp;&amp;"), "a&amp;&amp;&amp;");
 }
 
 #[test]
