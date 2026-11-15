@@ -2,7 +2,7 @@
 //!
 //! The service's record is rendered again from its CURRENT template: its environment (every value the template gives,
 //! then what each of its links provides, as `service_connect` gave it), the secrets the template declares, its ports,
-//! its `rawLxc` lines, its no-new-privileges and its entrypoint. The difference from the record is the `changes` of the proposal: the
+//! its `rawLxc` lines, its no-new-privileges, its entrypoint and whether its `/run` is memory (`runTmpfs`). The difference from the record is the `changes` of the proposal: the
 //! node works it out when the proposal is made, the card shows it row by row, and the approval binds it. When the
 //! approved call runs it works the difference out again and refuses, changing nothing, unless it is the one the owner
 //! approved; so what is applied is exactly what the card showed.
@@ -16,9 +16,10 @@
 //! service is restarted when it runs, and its config is read back and compared with what was applied. A write the
 //! node refused, or a restart that failed, puts the old record back. The steps are journalled in the service update
 //! journal with key and secret names only. The image and the data volume are not touched.
-use super::service_update::{Claim, Journal, SERVICE_UPDATES_FILE, state_changer_for};
+use super::service_update::{self, Claim, Journal, SERVICE_UPDATES_FILE, state_changer_for};
 use super::*;
 use crate::service::{ServiceConfig, Template};
+use arca_incus::IncusError;
 use arca_incus::StateAction;
 use arca_kernel::desired::Entry;
 use serde_json::Map;
@@ -355,6 +356,13 @@ pub(super) fn plan(
             json!({ "from": config.no_new_privileges, "to": no_new_privileges }),
         );
     }
+    // A memory `/run`, in the node's own project and in a tenant's alike: it loosens nothing.
+    if template.memory_run() != config.run_tmpfs {
+        changes.insert(
+            "runTmpfs".into(),
+            json!({ "from": config.run_tmpfs, "to": template.memory_run() }),
+        );
+    }
     // The entrypoint, with the scripts it reads from the template directory as they are now. A template that names none
     // leaves the service's own: Arca never takes an entrypoint off an instance (the reconciler sets one only), so a
     // change to none would be a card row that is never applied.
@@ -411,6 +419,7 @@ pub(super) fn plan(
     next.links = links;
     next.raw_lxc = raw_lxc;
     next.no_new_privileges = no_new_privileges;
+    next.run_tmpfs = template.memory_run();
     next.entrypoint = entrypoint;
     Ok(Plan {
         next,
@@ -463,6 +472,7 @@ pub(super) fn names_of(changes: &Value) -> Value {
         "ports": changes.get("ports").is_some(),
         "rawLxc": changes.get("rawLxc").is_some(),
         "noNewPrivileges": changes.get("noNewPrivileges").is_some(),
+        "runTmpfs": changes.get("runTmpfs").is_some(),
         "entrypoint": changes.get("entrypoint").is_some(),
     })
 }
@@ -529,6 +539,7 @@ fn fields(record: &mut ServiceConfig, from: &ServiceConfig) {
     record.links = from.links.clone();
     record.raw_lxc = from.raw_lxc.clone();
     record.no_new_privileges = from.no_new_privileges;
+    record.run_tmpfs = from.run_tmpfs;
     // An entrypoint is set, never taken off: putting back a record that named none leaves the one the
     // instance now carries in the record too, so the two stay alike.
     if from.entrypoint.is_some() {
@@ -545,6 +556,7 @@ fn planned(record: &ServiceConfig) -> Option<Value> {
         &record.ports,
         &record.raw_lxc,
         record.no_new_privileges,
+        record.run_tmpfs,
         &record.entrypoint,
     ))
     .ok()
@@ -810,7 +822,39 @@ impl ServiceHandler {
         }
         journal.step("apply", true, json!({}));
         let was_running = seen.is_running();
-        if was_running && let Err(error) = changer.change(&seen, StateAction::Restart) {
+        // A `/run` that becomes memory: the image's files under it are removed from the root disk while the service is
+        // stopped, so the start that follows mounts a memory `/run`. A running service is stopped and started for it, in
+        // place of the restart; a stopped one has it from its next start. A removal Incus does not take leaves `/run`
+        // on the disk, and the answer says so.
+        let to_memory = next.run_tmpfs && !config.run_tmpfs;
+        let restart = |seen: &arca_incus::InstanceState| -> Result<(), IncusError> {
+            if !to_memory {
+                return changer.change(seen, StateAction::Restart).map(|_| ());
+            }
+            let stopped = if seen.is_running() {
+                changer.change(seen, StateAction::Stop)?
+            } else {
+                seen.clone()
+            };
+            let emptied = changer.empty_run(&stopped);
+            journal.step(
+                "empty /run",
+                emptied.is_ok(),
+                match &emptied {
+                    Ok(removed) => json!({ "removed": removed }),
+                    Err(error) => json!({ "why": error.to_string() }),
+                },
+            );
+            if seen.is_running() {
+                changer.change(&stopped, StateAction::Start)?;
+            }
+            Ok(())
+        };
+        if !was_running && to_memory {
+            // Nothing to restart: only the removal, whose outcome the answer reads back.
+            let _ = restart(&seen);
+        }
+        if was_running && let Err(error) = restart(&seen) {
             let restored = put_back();
             let started = changer
                 .read(&config.project, &config.instance)
@@ -857,7 +901,7 @@ impl ServiceHandler {
             json!({ "differs": differs, "running": running }),
         );
         journal.step("end", differs.is_empty(), json!({}));
-        Ok(json!({
+        let mut answer = json!({
             "reconfigured": true,
             "service": name,
             "changes": first.changes,
@@ -873,6 +917,10 @@ impl ServiceHandler {
                     format!("its config read back differs at {}: service_status shows how it is", differs.join(", "))
                 }
             ),
-        }))
+        });
+        if next.run_tmpfs {
+            service_update::say_run(&self.cfg, &next, &mut answer);
+        }
+        Ok(answer)
     }
 }

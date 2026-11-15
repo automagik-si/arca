@@ -412,7 +412,13 @@ fn started_and_template_stopped_creates_are_the_same_with_start_left_out_or_true
             let bodies = create_bodies(&rig, &instance);
             assert_eq!(bodies.len(), 1, "{name}");
             assert_eq!(bodies[0]["config"]["boot.autostart"], "true", "{name}");
-            assert_eq!(bodies[0]["start"], state == "running", "{name}");
+            // Every container is created stopped, so its image's `/run` is emptied before its first start; one that
+            // starts is then started by a state change. A virtual machine has no memory `/run` and starts at its create.
+            assert_eq!(
+                bodies[0]["start"],
+                template == "vm" && state == "running",
+                "{name}"
+            );
             assert_eq!(
                 incus(&rig, tenant, name)["config"]["boot.autostart"],
                 "true",

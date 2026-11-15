@@ -6854,6 +6854,7 @@ pub(crate) fn adopted_config(
         follow_version: None,
         no_new_privileges: false,
         raw_lxc: Vec::new(),
+        run_tmpfs: false,
         edge: None,
     })
 }
@@ -7066,6 +7067,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         follow_version: None,
         no_new_privileges: parts.template.no_new_privileges,
         raw_lxc: parts.template.raw_lxc.clone(),
+        run_tmpfs: parts.template.memory_run(),
         edge: parts.template.edge.then(crate::route::EdgeRecord::default),
     })
 }
@@ -7153,6 +7155,7 @@ fn vm_service_config(
         follow_version: None,
         no_new_privileges: false,
         raw_lxc: Vec::new(),
+        run_tmpfs: false,
         edge: None,
     })
 }
@@ -8598,6 +8601,9 @@ impl ServiceHandler {
                 )?;
                 if !config.start {
                     made["stoppedBecause"] = json!(stopped_because(start, forced));
+                }
+                if config.run_tmpfs {
+                    service_update::say_run(&self.cfg, &config, &mut made);
                 }
                 // The node's front was made, or made again at another address: every tenant service's ACL follows now.
                 let front = self

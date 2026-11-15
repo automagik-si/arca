@@ -517,7 +517,7 @@ static VERBS: [Verb; 90] = [
     },
     Verb {
         name: "service_reconfigure",
-        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
+        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint, whether /run is memory), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -5231,7 +5231,22 @@ fn service_create_result() -> Value {
         "maxLength": 4096,
         "type": "string"
     });
+    with_run(&mut view);
     view
+}
+
+/// The `run` and `runNote` an answer about a container that keeps `/run` in memory carries.
+fn with_run(view: &mut Value) {
+    view["properties"]["run"] = json!({
+        "description": "Present for a container service that keeps /run in memory (its template does not say runTmpfs: false): where its /run is, read from Incus. memory: a tmpfs (for a stopped service, from its next start); disk: the files its image keeps in /run could not be removed, so /run stays on the container's disk (runNote says so); unknown: it could not be read.",
+        "enum": ["memory", "disk", "unknown"],
+        "type": "string"
+    });
+    view["properties"]["runNote"] = json!({
+        "description": "Present with run: disk: that /run stays on the container's disk, and why.",
+        "maxLength": 1024,
+        "type": "string"
+    });
 }
 
 fn service_list_params() -> Value {
@@ -5546,9 +5561,10 @@ fn template_changes_schema(who: &str) -> Value {
             "noNewPrivileges": { "type": "object" },
             "ports": { "type": "object" },
             "rawLxc": { "type": "object" },
+            "runTmpfs": { "type": "object" },
             "secrets": { "items": { "type": "object" }, "type": "array" }
         },
-        "description": format!("The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({{from, to}} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). {who}"),
+        "description": format!("The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges, runTmpfs (whether /run is memory) and entrypoint ({{from, to}} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). {who}"),
         "type": "object"
     })
 }
@@ -5568,7 +5584,7 @@ fn read_back_schema() -> Value {
 }
 
 fn service_reconfigure_result() -> Value {
-    json!({
+    let mut view = json!({
         "additionalProperties": false,
         "properties": {
             "changes": {
@@ -5593,7 +5609,9 @@ fn service_reconfigure_result() -> Value {
         },
         "required": ["reconfigured", "service", "changes", "restarted", "message"],
         "type": "object"
-    })
+    });
+    with_run(&mut view);
+    view
 }
 
 fn service_update_params() -> Value {
@@ -5636,7 +5654,7 @@ fn service_update_params_base() -> Value {
                 "type": "integer"
             },
             "withTemplate": {
-                "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
+                "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint, whether /run is memory): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
                 "type": "boolean"
             }
         },
@@ -5646,7 +5664,7 @@ fn service_update_params_base() -> Value {
 }
 
 fn service_update_result() -> Value {
-    json!({
+    let mut view = json!({
         "additionalProperties": false,
         "properties": {
             "changes": {
@@ -5680,7 +5698,9 @@ fn service_update_result() -> Value {
         },
         "required": ["updated", "service", "message"],
         "type": "object"
-    })
+    });
+    with_run(&mut view);
+    view
 }
 
 fn service_remove_result() -> Value {

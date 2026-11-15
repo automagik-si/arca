@@ -259,6 +259,59 @@ impl StateChanger {
         self.wait_for(&envelope)
     }
 
+    /// Empties `/run` on the root disk of one stopped container, so Incus mounts a memory `/run` at its next start
+    /// ([`crate::run_dir`]). The instance is read again first: one that was recreated since `seen`, one that is not a
+    /// container and one that is not stopped are refused before any removal. Returns how many entries were removed.
+    pub fn empty_run(&self, seen: &InstanceState) -> Result<usize, IncusError> {
+        self.allow(&seen.project)?;
+        let fresh = self.read(&seen.project, &seen.name)?;
+        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+            return Err(refused("the instance was recreated since it was read"));
+        }
+        if fresh.kind != "container" || !fresh.is_stopped() {
+            return Err(refused("the instance is not a stopped container"));
+        }
+        let emptied = crate::run_dir::empty_run(
+            &|method, path| self.send(method, path, None),
+            &fresh.project,
+            &fresh.name,
+        );
+        if let Some(uuid) = &fresh.uuid {
+            crate::run_dir::note_emptied(
+                &self.socket,
+                &fresh.project,
+                &fresh.name,
+                uuid,
+                emptied.is_ok(),
+            );
+        }
+        emptied
+    }
+
+    /// Where one container's `/run` is: in memory or on its disk. A stopped one gets a memory `/run` at its next start
+    /// exactly when its root holds nothing under `/run`, which is read. A running container's mount table cannot be
+    /// read through the files API, so for one this answers what this process saw when it last emptied that container
+    /// (by its uuid, so never a container made again since): emptied, so its starts since mounted a memory `/run`, or
+    /// not. A running container this process has not emptied is not known, an error.
+    pub fn run_in_memory(&self, seen: &InstanceState) -> Result<bool, IncusError> {
+        self.allow(&seen.project)?;
+        let fresh = self.read(&seen.project, &seen.name)?;
+        if fresh.uuid != seen.uuid || fresh.kind != "container" {
+            return Err(refused("the instance is not the container that was read"));
+        }
+        if fresh.is_stopped() {
+            let send = |method: &str, path: &str| self.send(method, path, None);
+            return crate::run_dir::run_is_empty(&send, &fresh.project, &fresh.name);
+        }
+        fresh
+            .uuid
+            .as_deref()
+            .and_then(|uuid| {
+                crate::run_dir::emptied(&self.socket, &fresh.project, &fresh.name, uuid)
+            })
+            .ok_or_else(|| refused("Arca has not emptied this container's /run since it began"))
+    }
+
     /// Takes a snapshot of one stopped instance, named `snapshot`, and waits for its operation. For `service_update`:
     /// the snapshot it can go back to. A project that forbids snapshots (a tenant's does, unless it allows them)
     /// answers 403, which the caller sees as [`IncusError::Status`].

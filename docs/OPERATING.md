@@ -1070,6 +1070,54 @@ If the owner later sets `restricted.containers.lowlevel` back to `block`, Incus 
 instance config of a service that has the key, since the whole config is checked: a secret, a link or an environment
 change then fails for that service. Dropping the key still works, through the update above.
 
+#### `/run` is memory (`runTmpfs`)
+
+A container service made from an OCI image (`"kind": "oci"`) keeps its `/run` in memory (a tmpfs), never on the
+container's disk, so a short-lived credential an agent or a script stages under `/run` never touches the disk.
+`runTmpfs` defaults to true; such a template says `"runTmpfs": false` for an image that needs the files it ships in
+`/run`. A system container's init mounts its own `/run`, and a virtual machine has its own, so their templates take no
+part in it.
+
+How it works: Incus mounts a tmpfs (mode 0755) on an OCI container's `/run` at every start when the container's root
+holds nothing under `/run`, and mounts nothing when the image ships files there (a Debian base keeps `/run/lock`), so
+`/run` was then a directory on the container's disk. Arca empties `/run` on the root disk while the container is stopped,
+and Incus's own rule does the rest: the create makes the container stopped, removes what the image keeps under `/run`,
+then starts it as the call asked; `service_update` does the same after each rebuild (and after putting an old version
+back); `service_reconfigure` does it for a service made before (below). Some images need what they ship in `/run`: an
+image that runs as a user other than root and keeps that user's directory there (a socket directory made at its build)
+cannot make it again in a memory `/run`, which is root's with mode 0755. So Arca reads the whole of `/run` first, and
+when any entry there is not owned by the container's root, or its owner is not said, or `/run` lists an entry that
+cannot be read back by its name (Incus lists a name that is not UTF-8 with U+FFFD in its place), it removes nothing: `/run` is left on the disk as the image
+has it, and the answer says `run: "disk"` with `runNote`. Otherwise the image's files under `/run` are removed and `/run`
+holds only what the service writes there after its start. Arca's own database template, `postgres-autopg`, says
+`"runTmpfs": false`: its image keeps its socket directory, `/var/run/autopg`, for its user. A template whose image needs
+root-owned files in `/run` says `"runTmpfs": false` too.
+Nothing is loosened for it: no `raw.lxc`, no host-path disk, and no project restriction changes, so it works the same in
+the node's own project and in a tenant's. What this mount does not have: `nosuid` and `nodev` (Incus sets only
+`mode=755`), and a size limit of its own. What a service writes in `/run` counts in its memory: when the template sets
+`limits.memory`, that bounds it; a template that sets none leaves it bounded only by the kernel's default for a tmpfs,
+half of the host's memory. The instance carries `user.arca.runtmpfs=true` as its mark, and the record keeps
+`runTmpfs: true`.
+
+The create's answer, `service_update`'s and `service_reconfigure`'s say where `/run` is: `run: "memory"` or `run:
+"disk"` with `runNote` when Arca left `/run` on the disk (an entry there that is not root's, or one it cannot read) or could not remove what
+the image keeps there (more than 256 entries, a `/run` that is not a directory, a removal Incus refused): the service is then created and runs as it did before this change, with
+`/run` on its disk, and nothing is refused for it. For a stopped service it is read from Incus (the root holds nothing
+under `/run`, so its next start mounts a memory one). A running container's mount table cannot be read through Incus's
+files API, so for a running service it is what Arca saw when it emptied that container's `/run`, just before the start.
+`run: "unknown"` means Incus could not be read, or Arca has not emptied the running container since its daemon began.
+
+A service made before this change keeps the `/run` it has. `service_reconfigure` shows `/run becomes memory, restart
+once` on its card for it, and an approved card stops the service, removes what the image keeps under `/run` (unless an
+entry there is not root's, as above: then nothing is removed and the answer says `run: "disk"`), and starts it again (a
+stopped service has it from its next start). The template default is on, so every card for such a service carries this
+row, whatever else it changes, until its template says `"runTmpfs": false`. A template that turns `runTmpfs` off shows on the card that
+Arca no longer keeps `/run` in memory, and the service is restarted once: the image's files that were removed come back
+with the next `service_update` to a new digest, which gives the container a new root, and until then Incus still mounts
+a memory `/run`, since the disk holds nothing there.
+
+To check by hand on a node, inside the container: `stat -f -c %T /run` prints `tmpfs`.
+
 `data` names an absolute printable mount `path` of at most 255 bytes that is not the root (`/`, `//` and `/.` are
 refused) and has no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit), and an optional `size` such as
 `8GiB`. Arca creates a custom volume `<service>-data` in the service project's storage pool before the instance, setting
@@ -1763,10 +1811,10 @@ two restarts. With `withTemplate: true` one card does both, with one restart:
 Install the changed template first (`arca templates install`), then propose it with `action_propose`; only the owner's
 approval runs it, and a direct call is refused with "Nothing was changed". When the proposal is made, the node works
 out what `service_reconfigure` would apply from the CURRENT template (environment, links' values, declared secrets,
-ports, `rawLxc`, no-new-privileges, entrypoint; see "Reconfiguring a service from its template") and writes it into
-the proposal as `changes`, so the card shows the digest, a `Template changes` row counting them, one row per key,
-secret, port list, low-level setting and entrypoint that changes (secrets by name only), and the summary says it is one
-restart. The approval binds the digest and `changes` together. What a caller sends as `changes` is never kept. When
+ports, `rawLxc`, no-new-privileges, entrypoint, whether `/run` is memory; see "Reconfiguring a service from its
+template") and writes it into the proposal as `changes`, so the card shows the digest, a `Template changes` row counting
+them, one row per key, secret, port list, low-level setting, entrypoint and `/run` that changes (secrets by name only),
+and the summary says it is one restart. The approval binds the digest and `changes` together. What a caller sends as `changes` is never kept. When
 the approved call runs it works the difference out again and changes nothing unless it is the one on the card ("the
 service or its template changed since the owner's card was made ... propose it again"): an edit of the template after
 the proposal needs a new card.
@@ -1783,6 +1831,13 @@ a link or a secret set since the card was made fails the step, and the update is
 the new digest is recorded and the config is read back; the answer adds `changes` and `readBack: {matches, differs}`,
 as `service_reconfigure`'s does. The journal has `apply` after `rebuild`, and `read back` before `end`, with key and
 secret names only.
+
+`/run` follows the record the start takes. When the template's settings keep `/run` in memory (a service made before
+`runTmpfs` whose template does not say `runTmpfs: false`), the card has the `/run` row, and after `apply` the new root's
+`/run` is emptied while the instance is stopped, exactly as a reconfigure empties it (see "`/run` is memory"), so the
+one start mounts a memory `/run`. An entry there that is not root's leaves it on the disk as the image has it. The
+journal has `empty /run`, and the answer adds `run` (and `runNote` for `disk`). A rollback empties the old root's
+`/run` only when the old record kept it in memory.
 
 A failure after the settings were written puts back both: the old record exactly (its environment, ports, secrets,
 links, low-level settings and its entrypoint) first, then the old root (the snapshot, or a rebuild from the old digest),
@@ -1853,6 +1908,10 @@ difference from its record, which it writes into the proposal as `changes`:
 - `ports`, `rawLxc` and `noNewPrivileges`: `{from, to}` when the template says otherwise; `rawLxc` is the container's
   `raw.lxc` lines whole, `lxc.no_new_privs=1` among them when it is set. A tenant's service keeps its low-level
   container settings.
+- `runTmpfs`: `{from, to}` when the template's `runTmpfs` (true unless it says `false`) is not the service's, in the
+  node's own project and in a tenant's alike (see "`/run` is memory"). The card says `/run becomes memory, restart
+  once`; the run then stops the service, empties `/run` on its disk and starts it, in place of the restart, and the
+  answer says `run: "memory"` or `run: "disk"` with `runNote`.
 - `entrypoint`: `{from, to}` when the template's entrypoint, with the scripts it reads from the templates directory as
   they are now, is not the one the service runs. Each side is shown whole when short, or else by its size and the start
   of its SHA-256 (a script goes as one long base64 word), and `scripts` names the template's scripts. It is applied as

@@ -12,6 +12,10 @@ use crate::desired::{EntryId, PluginId};
 pub const KERNEL_ENTRY_KEY: &str = "user.arcakernel.entry";
 /// The kernel's retiring tombstone, set by a destructive inverse before its delete. It only accompanies an entry mark.
 pub const KERNEL_RETIRING_KEY: &str = "user.arcakernel.retiring";
+/// The mark of a container service whose `/run` Arca keeps in memory: its writer empties the image's `/run` on the root
+/// disk before the container's first start, so Incus mounts a memory `/run` there. Only a service's instance carries it,
+/// in the node's own project or a tenant's.
+pub const RUN_TMPFS_KEY: &str = "user.arca.runtmpfs";
 /// Droidd's mark namespaces. Any key under one of them means droidd owns the object. A bare namespace key (for example
 /// `user.arca`) counts too, and matching ignores ASCII case, so a near-miss can only make the kernel refuse.
 pub const DROIDD_MARK_PREFIXES: [&str; 3] = ["user.droid.", "user.tactu.", "user.arca."];
@@ -140,7 +144,8 @@ pub fn classify_object(
             // stops one. A function lives in the node's own service project and nowhere else, so the key is the
             // entry's own there alone: on a tenant's instance it is another owner's key, as it always was. So is
             // the mark of the `raw.lxc` a template's `rawLxc` lines gave, which only a service there carries. The mark
-            // of an entrypoint a reconcile wrote is the entry's own in every project a service lives in.
+            // of an entrypoint a reconcile wrote, and the mark of a memory `/run`, are the entry's own in every project
+            // a service lives in.
             if object.project == "arcak-svc" {
                 &[
                     "user.arca.template",
@@ -152,6 +157,7 @@ pub fn classify_object(
                     "user.arca.function",
                     "user.arca.rawlxc",
                     "user.arca.entrypoint",
+                    RUN_TMPFS_KEY,
                 ]
             } else {
                 &[
@@ -162,6 +168,7 @@ pub fn classify_object(
                     "user.arca.published",
                     "user.arca.envkeys",
                     "user.arca.entrypoint",
+                    RUN_TMPFS_KEY,
                 ]
             }
         }

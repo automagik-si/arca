@@ -1491,12 +1491,22 @@ fn reconfigure_count(changes: &Value) -> String {
     if changes.get("entrypoint").is_some() {
         parts.push("its entrypoint".to_string());
     }
+    if changes.get("runTmpfs").is_some() {
+        parts.push("its /run".to_string());
+    }
     if parts.is_empty() {
         "no change".to_string()
     } else {
         parts.join("; ")
     }
 }
+
+/// The label of the card row that says a container's `/run` changes.
+pub const RUN_TMPFS_LABEL: &str = "/run";
+/// What a reconfigure's card says when a container's `/run` becomes memory.
+pub const RUN_TO_MEMORY: &str = "/run becomes memory, restart once: a secret staged there never touches the disk. What the image keeps in /run is read first and removed from the container's disk (a running service is stopped and started for it, a stopped one has it from its next start), unless an entry there is not root's: a non-root image keeps its own directory there and needs it, so /run is then left on the disk as it is, and the answer says run: disk. Other images may need their files in /run too: the template says runTmpfs: false for one. It holds what the service writes there, counted in the service's memory limit when the template sets one";
+/// What a reconfigure's card says when a container's `/run` goes back to its disk.
+pub const RUN_TO_DISK: &str = "Arca no longer keeps /run in memory (the template says runTmpfs: false), restart once. The files the image kept in /run come back with the next service_update to a new digest, which gives the container a new root (an update with withTemplate gives it in the same restart); until then Incus still mounts a memory /run, since the disk holds nothing there";
 
 /// The label of the card row that shows a container's `raw.lxc` lines.
 pub const RAW_LXC_LABEL: &str = "Low-level container settings (raw.lxc)";
@@ -1629,6 +1639,16 @@ fn template_rows(label: &str, changes: &Value) -> Vec<ActionDetail> {
                 if on { "on" } else { "off" },
                 if on { "can no longer" } else { "can again" }
             ),
+        ));
+    }
+    if let Some(on) = changes["runTmpfs"]["to"].as_bool() {
+        rows.push(row(
+            RUN_TMPFS_LABEL.into(),
+            if on {
+                RUN_TO_MEMORY.to_string()
+            } else {
+                RUN_TO_DISK.to_string()
+            },
         ));
     }
     if let Some(entrypoint) = changes.get("entrypoint") {

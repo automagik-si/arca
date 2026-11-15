@@ -174,6 +174,7 @@ fn one_card_moves_the_image_and_the_template_from_no_entrypoint_to_a_shell_one_w
             "snapshot",
             "rebuild",
             "apply",
+            "empty /run",
             "start",
             "health",
             "record",
@@ -418,10 +419,12 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
+    // As before, and `run`, which every service that keeps `/run` in memory answers.
     assert_eq!(
         keys,
-        ["digest", "message", "service", "snapshot", "updated"]
+        ["digest", "message", "run", "service", "snapshot", "updated"]
     );
+    assert_eq!(done["run"], "memory", "{done}");
     let after = rig.service_config("app");
     assert_eq!(after.environment, before.environment);
     assert_eq!(after.entrypoint, before.entrypoint);
@@ -434,7 +437,15 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
     assert_eq!(
         steps,
         [
-            "begin", "stop", "snapshot", "rebuild", "start", "health", "record", "end"
+            "begin",
+            "stop",
+            "snapshot",
+            "rebuild",
+            "empty /run",
+            "start",
+            "health",
+            "record",
+            "end"
         ]
     );
 }
@@ -682,4 +693,149 @@ fn a_marked_entrypoint_still_as_written_goes_when_the_record_names_none() {
     let after = config(&rig);
     assert!(after.get("oci.entrypoint").is_none(), "{after}");
     assert!(after.get(service::ENTRYPOINT_KEY).is_none(), "{after}");
+}
+
+/// A service made before Arca kept `/run` in memory (its template then said `runTmpfs: false`, so its image's `/run` is
+/// on its disk), whose template now says nothing of it: the withTemplate card carries the `/run` row, and the one
+/// restart of the update empties the new root's `/run` after the template's record goes in, so it starts with a memory
+/// `/run`, as a reconfigure gives it.
+#[test]
+fn an_older_service_gets_a_memory_run_with_its_new_image_in_the_one_restart() {
+    let key = common::SkKey::from_seed(88);
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = bare_node(&up, Some(&key));
+    rig.fake
+        .set_image_run(&["/run/lock/", "/run/lock/.keep", "/run/motd"]);
+    let mut before = first();
+    before["runTmpfs"] = json!(false);
+    rig.template("app", before);
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("create");
+    assert!(!rig.service_config("app").run_tmpfs);
+    assert!(!rig.fake.run_in_memory(PROJECT, "app"));
+    assert!(config(&rig).get(service::RUN_TMPFS_KEY).is_none());
+    rig.template("app", first());
+
+    let proposed = propose_update(&rig, with_template()).expect("proposed");
+    assert_eq!(
+        proposed["args"]["changes"],
+        json!({ "runTmpfs": { "from": false, "to": true } }),
+        "{proposed}"
+    );
+    let details = &proposed["details"];
+    assert_eq!(
+        row(details, arca::action_proposal::RUN_TMPFS_LABEL),
+        Some(arca::action_proposal::RUN_TO_MEMORY)
+    );
+    assert_eq!(row(details, "Template changes"), Some("its /run"));
+
+    let actions = rig.fake.state_actions(PROJECT, "app").len();
+    let done = approve(&rig, &key, &proposed).expect("runs");
+    assert_eq!(done["updated"], true, "{done}");
+    assert_eq!(done["run"], "memory", "{done}");
+    assert!(done.get("runNote").is_none(), "{done}");
+    assert_eq!(done["readBack"]["matches"], true, "{done}");
+    // One stop and one start: the new root's /run was emptied between them, so the start mounted a memory /run.
+    assert_eq!(
+        rig.fake.state_actions(PROJECT, "app")[actions..],
+        ["stop", "start"]
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
+    assert!(rig.fake.run_on_disk(PROJECT, "app").is_empty());
+    assert!(rig.fake.run_in_memory(PROJECT, "app"));
+    assert_eq!(config(&rig)[service::RUN_TMPFS_KEY], "true");
+    assert!(rig.service_config("app").run_tmpfs);
+    assert_eq!(alias_of_record(&rig), format!("app@{NEW}"));
+
+    let steps: Vec<String> = journal(&rig).into_iter().map(|(step, _)| step).collect();
+    let at = |name: &str| {
+        steps
+            .iter()
+            .position(|step| step == name)
+            .unwrap_or_else(|| panic!("{name} in {steps:?}"))
+    };
+    assert!(at("rebuild") < at("apply"), "{steps:?}");
+    assert!(at("apply") < at("empty /run"), "{steps:?}");
+    assert!(at("empty /run") < at("start"), "{steps:?}");
+    assert!(journal(&rig).contains(&("empty /run".to_string(), true)));
+
+    // Nothing is left to do: a reconcile writes nothing more.
+    let writes = rig.fake.writes().len();
+    rig.apply(&rig.service_config("app")).expect("reconcile");
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+/// The same older service, whose withTemplate update fails its health check: the rollback puts back the old record
+/// (`runTmpfs: false`) and the old root, and leaves that root's `/run` as the image has it. Only the new version's root
+/// was emptied, so the old version starts with `/run` on its disk, as it ran before the update.
+#[test]
+fn a_rollback_of_an_older_service_leaves_the_old_roots_run_on_its_disk() {
+    for snapshots in [false, true] {
+        let key = common::SkKey::from_seed(89);
+        let up = Arc::new(AtomicBool::new(false));
+        let rig = bare_node(&up, Some(&key));
+        rig.fake
+            .set_image_run(&["/run/lock/", "/run/lock/.keep", "/run/motd"]);
+        let mut before = first();
+        before["runTmpfs"] = json!(false);
+        rig.template("app", before);
+        rig.call(
+            "service_create",
+            json!({ "name": "app", "template": "app" }),
+        )
+        .expect("create");
+        if snapshots {
+            let path = format!("/1.0/projects/{PROJECT}");
+            let mut config = rig.get(&path).expect("the project")["config"].clone();
+            config["restricted.snapshots"] = json!("allow");
+            rig.edit("PATCH", &path, json!({ "config": config }));
+        }
+        rig.template("app", first());
+        let proposed = propose_update(&rig, with_template()).expect("proposed");
+        assert_eq!(
+            proposed["args"]["changes"],
+            json!({ "runTmpfs": { "from": false, "to": true } }),
+            "{proposed}"
+        );
+
+        let (code, message) = refusal_words(approve(&rig, &key, &proposed));
+        assert_eq!(code, "rolled_back", "{message}");
+        assert!(message.contains("health check"), "{message}");
+        if snapshots {
+            assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
+        } else {
+            assert_eq!(
+                rig.fake.rebuilds(PROJECT, "app"),
+                vec!["registry", "registry"]
+            );
+        }
+
+        // The old record and config: no memory /run, and its root keeps what the image ships in /run.
+        assert!(!rig.service_config("app").run_tmpfs);
+        assert!(config(&rig).get(service::RUN_TMPFS_KEY).is_none());
+        assert_eq!(instance(&rig)["status"], "Running");
+        assert!(
+            !rig.fake.run_on_disk(PROJECT, "app").is_empty(),
+            "snapshots {snapshots}"
+        );
+        assert!(!rig.fake.run_in_memory(PROJECT, "app"));
+
+        // The new root was emptied before its start; nothing was emptied after the old root came back.
+        let steps: Vec<String> = journal(&rig).into_iter().map(|(step, _)| step).collect();
+        let back = steps
+            .iter()
+            .position(|step| step == "restore" || step == "rebuild back")
+            .unwrap_or_else(|| panic!("the old root in {steps:?}"));
+        let emptied: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| *step == "empty /run")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(emptied.len(), 1, "{steps:?}");
+        assert!(emptied[0] < back, "{steps:?}");
+    }
 }

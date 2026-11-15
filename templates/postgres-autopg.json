@@ -11,5 +11,6 @@
   "secrets": ["POSTGRES_PASSWORD"],
   "generate": { "POSTGRES_PASSWORD": "" },
   "provides": { "env": { "DATABASE_URL": "postgresql://app:{{secret:POSTGRES_PASSWORD}}@{{host}}:{{port}}/app" } },
-  "publishable": false
+  "publishable": false,
+  "runTmpfs": false
 }
