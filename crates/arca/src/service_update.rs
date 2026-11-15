@@ -474,14 +474,9 @@ pub(super) fn check_proposal(
         if !moves {
             return Err(same_digest_with_template(name));
         }
-        payload["changes"] = service_reconfigure::plan(
-            Doing::Update,
-            cfg,
-            &scoped,
-            &config,
-            &BTreeSet::new(),
-        )?
-        .changes;
+        payload["changes"] =
+            service_reconfigure::plan(Doing::Update, cfg, &scoped, &config, &BTreeSet::new())?
+                .changes;
         return data_check(cfg, &config, payload, erase);
     }
     let payload = &payload;
@@ -1225,11 +1220,8 @@ impl Run<'_> {
                     }));
                 };
                 let differs = self.read_back(template);
-                self.journal.step(
-                    "end",
-                    differs.is_empty(),
-                    json!({ "digest": self.digest }),
-                );
+                self.journal
+                    .step("end", differs.is_empty(), json!({ "digest": self.digest }));
                 return Ok(json!({
                     "updated": true,
                     "service": name,
@@ -1288,8 +1280,7 @@ impl Run<'_> {
         };
         match self.roll_back(&mut instance, &back, failure.step) {
             Ok(back) => {
-                let mut end =
-                    json!({ "rolledBack": true, "rootKept": back.root_kept, "oldAnswers": back.answers });
+                let mut end = json!({ "rolledBack": true, "rootKept": back.root_kept, "oldAnswers": back.answers });
                 if let Some(restored) = back.record {
                     end["recordRestored"] = json!(restored);
                 }
@@ -1660,7 +1651,9 @@ impl Run<'_> {
     /// it worked.
     fn put_template_back(&self) -> Option<bool> {
         let step = self.template.filter(|step| step.written.get())?;
-        let restored = self.handler.put_plan_back(&self.entry.id.0, &step.old, true);
+        let restored = self
+            .handler
+            .put_plan_back(&self.entry.id.0, &step.old, true);
         self.journal.step("put back", restored, json!({}));
         Some(restored)
     }
@@ -1682,7 +1675,10 @@ impl Run<'_> {
         let Some(ready) = &template.ready else {
             return Vec::new();
         };
-        let differs = match self.changer.read(&self.config.project, &self.config.instance) {
+        let differs = match self
+            .changer
+            .read(&self.config.project, &self.config.instance)
+        {
             Ok(state) => service_reconfigure::read_back_differs(
                 &state,
                 &ready.applied,
@@ -1691,8 +1687,11 @@ impl Run<'_> {
             ),
             Err(_) => vec!["(the instance could not be read)".to_string()],
         };
-        self.journal
-            .step("read back", differs.is_empty(), json!({ "differs": differs }));
+        self.journal.step(
+            "read back",
+            differs.is_empty(),
+            json!({ "differs": differs }),
+        );
         differs
     }
 }

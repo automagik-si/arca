@@ -232,7 +232,9 @@ impl ActionKind {
         {
             return "It cannot be undone: the service's data is erased and cannot be brought back.";
         }
-        if self == Self::ServiceUpdate && args.get("withTemplate").and_then(Value::as_bool) == Some(true) {
+        if self == Self::ServiceUpdate
+            && args.get("withTemplate").and_then(Value::as_bool) == Some(true)
+        {
             return "If the new version's port does not answer, Arca puts the old image and the old settings back by itself. To go back after a good update, change the template back and ask your assistant to update the service to the old digest with its template.";
         }
         if self == Self::ServiceUpdate && args.get("noNewPrivileges").is_some() {

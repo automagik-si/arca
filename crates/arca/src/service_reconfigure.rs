@@ -472,7 +472,8 @@ pub(super) fn check_proposal(
     if config.adopted || config.function.is_some() || config.vm.is_some() {
         return Ok(payload);
     }
-    payload["changes"] = plan(Doing::Reconfigure, node, &scoped, &config, &BTreeSet::new())?.changes;
+    payload["changes"] =
+        plan(Doing::Reconfigure, node, &scoped, &config, &BTreeSet::new())?.changes;
     Ok(payload)
 }
 
@@ -490,7 +491,9 @@ pub(super) enum Written {
     Done,
     /// The record changed since the plan was made (a link or a secret set meanwhile): it was left as it is, and is
     /// never put back, since that would undo the change made meanwhile. `saved` is whether the node saved it.
-    Stale { saved: bool },
+    Stale {
+        saved: bool,
+    },
     /// The node refused it, in these words. The node saves the record before it writes the instance, so the new
     /// record may be saved: it has to be put back.
     Refused(String),
@@ -541,14 +544,18 @@ pub(super) fn read_back_differs(
         }
     }
     for key in old.environment.keys() {
-        if !applied.contains_key(key) && state.own_config.contains_key(&format!("environment.{key}")) {
+        if !applied.contains_key(key)
+            && state.own_config.contains_key(&format!("environment.{key}"))
+        {
             differs.push(key.clone());
         }
     }
     if state.own_config.get("raw.lxc").cloned() != crate::service::raw_lxc_value(next) {
         differs.push("raw.lxc".to_string());
     }
-    if next.entrypoint.is_some() && state.own_config.get("oci.entrypoint") != next.entrypoint.as_ref() {
+    if next.entrypoint.is_some()
+        && state.own_config.get("oci.entrypoint") != next.entrypoint.as_ref()
+    {
         differs.push("oci.entrypoint".to_string());
     }
     differs
@@ -690,7 +697,13 @@ impl ServiceHandler {
         }
         let _claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
             .ok_or_else(|| said("another update of this service is running"))?;
-        let first = plan(Doing::Reconfigure, &self.cfg, entries, &config, &BTreeSet::new())?;
+        let first = plan(
+            Doing::Reconfigure,
+            &self.cfg,
+            entries,
+            &config,
+            &BTreeSet::new(),
+        )?;
         if args.get("changes") != Some(&first.changes) {
             return Err(said(
                 "the service or its template changed since the owner's card was made, so the card no longer says what would be applied: propose it again",

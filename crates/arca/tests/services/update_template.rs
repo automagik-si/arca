@@ -115,7 +115,10 @@ fn one_card_moves_the_image_and_the_template_from_no_entrypoint_to_a_shell_one_w
     let key = common::SkKey::from_seed(81);
     let up = Arc::new(AtomicBool::new(true));
     let rig = node(&up, &key, false);
-    assert!(config(&rig).get("oci.entrypoint").is_none(), "the image's own runs");
+    assert!(
+        config(&rig).get("oci.entrypoint").is_none(),
+        "the image's own runs"
+    );
     rig.template("app", second());
 
     let proposed = propose_update(&rig, with_template()).expect("proposed");
@@ -226,7 +229,10 @@ fn a_failed_health_check_puts_back_the_old_root_and_no_entrypoint_exactly() {
         let after = config(&rig);
         assert!(after.get("oci.entrypoint").is_none(), "{after}");
         assert!(after.get(service::ENTRYPOINT_KEY).is_none(), "{after}");
-        assert!(after.get("environment.APP_CONTROL_DATABASE").is_none(), "{after}");
+        assert!(
+            after.get("environment.APP_CONTROL_DATABASE").is_none(),
+            "{after}"
+        );
         assert_eq!(after["environment.MODE"], old_config["environment.MODE"]);
         assert_eq!(instance(&rig)["status"], "Running");
         // The new version was started once, then the old one: two starts, no restart.
@@ -264,11 +270,17 @@ fn an_exec_form_entrypoint_moves_to_the_shell_form_and_a_rollback_puts_the_exec_
     // A failed health check first: the exec form comes back on the record and on the instance.
     up.store(false, Ordering::SeqCst);
     let proposed = propose_update(&rig, with_template()).expect("proposed");
-    assert_eq!(proposed["args"]["changes"]["entrypoint"]["from"], old.as_str());
+    assert_eq!(
+        proposed["args"]["changes"]["entrypoint"]["from"],
+        old.as_str()
+    );
     let (code, message) = refusal_words(approve(&rig, &key, &proposed));
     assert_eq!(code, "rolled_back", "{message}");
     assert_eq!(config(&rig)["oci.entrypoint"], old.as_str());
-    assert_eq!(rig.service_config("app").entrypoint.as_deref(), Some(old.as_str()));
+    assert_eq!(
+        rig.service_config("app").entrypoint.as_deref(),
+        Some(old.as_str())
+    );
 
     // Then the same card made again, healthy: the shell form, byte for byte.
     up.store(true, Ordering::SeqCst);
@@ -308,7 +320,8 @@ fn the_card_binds_the_template_difference_and_an_edit_after_proposing_needs_a_ne
     let actions = rig.fake.state_actions(PROJECT, "app").len();
     let (_, message) = refusal_words(approve(&rig, &key, &proposed));
     assert!(
-        message.contains("changed since the owner's card was made") && message.ends_with("Nothing was changed"),
+        message.contains("changed since the owner's card was made")
+            && message.ends_with("Nothing was changed"),
         "{message}"
     );
     assert!(rig.fake.rebuilds(PROJECT, "app").is_empty());
@@ -334,7 +347,8 @@ fn what_service_reconfigure_would_refuse_is_refused_in_words_and_changes_nothing
     // Only an approved card runs it.
     let (_, message) = refusal_words(update(&rig, with_template()));
     assert!(
-        message.contains("only from a card the owner approved") && message.ends_with("Nothing was changed"),
+        message.contains("only from a card the owner approved")
+            && message.ends_with("Nothing was changed"),
         "{message}"
     );
     // A template that is now a virtual machine's.
@@ -348,13 +362,22 @@ fn what_service_reconfigure_would_refuse_is_refused_in_words_and_changes_nothing
     rig.template("app", second());
     // Not with follow or noNewPrivileges, and not without a digest.
     for (args, word) in [
-        (json!({ "name": "app", "follow": true, "withTemplate": true }), "withTemplate"),
+        (
+            json!({ "name": "app", "follow": true, "withTemplate": true }),
+            "withTemplate",
+        ),
         (
             json!({ "name": "app", "digest": NEW, "withTemplate": true, "noNewPrivileges": true }),
             "noNewPrivileges",
         ),
-        (json!({ "name": "app", "withTemplate": true }), "withTemplate"),
-        (json!({ "name": "app", "digest": NEW, "withTemplate": "yes" }), "withTemplate"),
+        (
+            json!({ "name": "app", "withTemplate": true }),
+            "withTemplate",
+        ),
+        (
+            json!({ "name": "app", "digest": NEW, "withTemplate": "yes" }),
+            "withTemplate",
+        ),
     ] {
         match propose_update(&rig, args.clone()) {
             Err(CallError::Invalid(why)) => assert!(why.contains(word), "{args}: {why}"),
@@ -395,7 +418,10 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["digest", "message", "service", "snapshot", "updated"]);
+    assert_eq!(
+        keys,
+        ["digest", "message", "service", "snapshot", "updated"]
+    );
     let after = rig.service_config("app");
     assert_eq!(after.environment, before.environment);
     assert_eq!(after.entrypoint, before.entrypoint);
