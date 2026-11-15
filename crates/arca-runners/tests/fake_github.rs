@@ -702,3 +702,66 @@ async fn a_refused_connection_is_dropped_by_its_holder_too() {
     );
     assert_eq!(access.forgotten.load(Ordering::Relaxed), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_busy_runner_survives_a_long_run_of_failed_reads() {
+    let timing = Timing {
+        watch_retry: Duration::from_millis(50),
+        ..Timing::default()
+    };
+    let rig = rig_timed(config(0, 4, 32), timing, |_, _| {}).await;
+    until("the session", Duration::from_secs(10), || {
+        rig.github.session_open(LABEL)
+    })
+    .await;
+    rig.github.queue_job(job("long", &[LABEL], 1.0));
+    until("the job running", Duration::from_secs(10), || {
+        rig.pool.status().classes[0].busy == 1
+    })
+    .await;
+    // Far more failed reads than a runner without a job is given up after.
+    rig.launcher.fail_watches(150);
+    until("the long job", Duration::from_secs(30), || {
+        rig.github.finished().len() == 1
+    })
+    .await;
+    let finished = rig.github.finished();
+    assert_eq!(finished[0].result, "succeeded", "{finished:?}");
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_runner_is_given_up_after_the_bound_and_taken_off_github_first() {
+    let timing = Timing {
+        watch_retry: Duration::from_millis(50),
+        ..Timing::default()
+    };
+    let rig = rig_timed(config(1, 4, 32), timing, |_, _| {}).await;
+    until("a warm runner", Duration::from_secs(10), || {
+        rig.pool.status().classes[0].idle == 1
+    })
+    .await;
+    let first = rig.launcher.live()[0].clone();
+    // One failure short of the bound: the runner stays.
+    rig.launcher.fail_watches(59);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(rig.launcher.live().contains(&first), "given up too early");
+    // Reads that never work again: the runner is given up, removed from GitHub before its machine goes.
+    rig.launcher.fail_watches(100_000);
+    until("the idle runner given up", Duration::from_secs(20), || {
+        !rig.launcher.live().contains(&first)
+    })
+    .await;
+    assert!(!rig.github.runner_registered(&first));
+    assert!(
+        !rig.launcher.destroyed_while_registered().contains(&first),
+        "{:?}",
+        rig.launcher.destroyed_while_registered()
+    );
+    rig.launcher.fail_watches(0);
+    until("a fresh warm runner", Duration::from_secs(15), || {
+        rig.pool.status().classes[0].idle == 1
+    })
+    .await;
+    rig.finish().await;
+}
