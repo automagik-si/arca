@@ -755,12 +755,18 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             page: approval_page.clone(),
         }),
     );
-    let router = server.router();
     let linked_hosts = cfg
         .approval
         .as_ref()
         .map(|approval| approval.linked_hosts.clone())
         .unwrap_or_default();
+    // A read or a proposal that names a linked node (`node`) is relayed to it by the door, after the caller is checked here.
+    if !linked_hosts.is_empty() {
+        server = server.linked_nodes(Arc::new(crate::linked::LinkedNodes {
+            hosts: linked_hosts.clone(),
+        }));
+    }
+    let router = server.router();
     // The page host keeps its own passkey list in sync on each linked host that asks for it: now, every ten minutes, and
     // when the approval page asks.
     let peer_sync = (cfg.approval_origin.is_some() && !linked_hosts.is_empty())

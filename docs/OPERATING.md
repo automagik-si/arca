@@ -1899,6 +1899,34 @@ in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
 
+### Asking a linked node: `node`
+
+One door reaches every kernel this one is linked to (`approval.linkedHosts`, see
+[Approving on another kernel of this machine](#approving-on-another-kernel-of-this-machine)). Every read the door serves,
+and `action_propose`, take an optional `node`: the `name` of one linked host. `arca_status` lists the names under
+`approval.linkedHosts`. Without `node` a call is this kernel's own, exactly as before.
+
+With `node` set, the door first checks the caller here, exactly as for a call of its own: its scope and its tool list. A
+caller that may not make the call on this kernel may not make it on a linked node, whatever the linked token holds. The
+door then takes `node` out and sends the rest of the call to that host's `socket` with the token in its `tokenFile`, the
+way the approval page relays, and returns the host's answer as the host gave it, with `node` naming it: in the structured
+content of a result (`arca_status` keeps that node's own id as `nodeId` there), in `data` of a refusal, and as a last
+text line of a tool error. So `watch_report` with `"node": "beta"` answers with beta's instances, and `action_propose`
+with `"node": "beta"` records the proposal on beta: it waits in beta's plans, this kernel's approval page lists it under
+beta with the machine named on the card, and the owner's passkey approval goes to beta, which checks it itself. This
+kernel's terminal is never asked about a plan that waits on another node.
+
+- A `node` that is not linked is an invalid argument (`invalid_arguments: /node: not a linked node of this kernel; the
+  linked nodes are beta, gamma`). On a kernel with no linked hosts it says so.
+- A linked host that does not answer is refused `Unreachable`, naming it; one that refuses the token for that verb is
+  refused `LinkToken`, naming it. Neither is ever answered by this kernel instead.
+
+The three `owner_approval_*` reads take no `node`: their rows are the calling token's own requests, and a relayed call
+is made with the linked token. The token in `tokenFile` must admit each verb relayed: the page's token minted with
+`--tools plan_list,action_approve,plan_decline` admits only those, so `watch_report` through it is refused `LinkToken`.
+To read and propose through the door as well, mint the linked kernel's token at `doctor` without `--tools`, or list the
+reads and `action_propose` beside the page's three verbs.
+
 ### When Incus does not answer, and when the answer is "internal"
 
 Every service verb, a read too, first asks Incus for the node's instances. That listing holds each instance's status,

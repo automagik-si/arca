@@ -54,7 +54,7 @@ use crate::auth::{Caller, IssuedTokens, TokenStore};
 use crate::elicit::TerminalApprover;
 use crate::fresh::{fresh_dir, process_uid};
 use crate::jsonrpc;
-use crate::tools::{CallError, ToolHandler};
+use crate::tools::{CallError, LinkedNodes, ToolHandler};
 use crate::version::{Mirrored, Mirrors};
 
 /// The most body bytes one request may carry.
@@ -99,6 +99,8 @@ pub struct Server {
     pub(crate) terminal: Option<crate::elicit::Terminal>,
     /// The authorization server's tokens and the URL of this server's protected resource metadata ([`Server::oauth`]).
     oauth: Option<(Arc<dyn IssuedTokens>, String)>,
+    /// The linked nodes a call may name with `node` ([`Server::linked_nodes`]).
+    pub(crate) linked: Option<Arc<dyn LinkedNodes>>,
 }
 
 /// Answers one GET route with a body. The server runs it on a blocking thread, after the bearer check.
@@ -139,7 +141,15 @@ impl Server {
             terminal_timeout: crate::elicit::DEFAULT_TIMEOUT,
             terminal: None,
             oauth: None,
+            linked: None,
         }
+    }
+
+    /// Relays a call that names a linked node with `node` to `nodes`, after the caller's own scope and tool list are
+    /// checked here. Without it a call that names a node is refused as an invalid argument: this kernel has none.
+    pub fn linked_nodes(mut self, nodes: Arc<dyn LinkedNodes>) -> Self {
+        self.linked = Some(nodes);
+        self
     }
 
     /// Accepts the tokens an OAuth authorization server issued for this server, besides the stored ones, and names

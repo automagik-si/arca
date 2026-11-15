@@ -7,6 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+One MCP door reaches the whole fleet: every read the door serves, and `action_propose`, take an optional `node`, the
+name of one of `approval.linkedHosts` (`arca_status` lists them). The caller is checked on this kernel first, as for a
+call of its own; the call then runs on that node with its linked token, and its answer comes back as the node gave it,
+with `node` naming it. A proposal made this way waits on that node, and this kernel's approval page shows it with the
+machine named on the card. A name that is not linked is an invalid argument listing the linked names; a node that does
+not answer is refused `Unreachable`, and one that refuses the token `LinkToken`. Without `node` nothing changes. The
+linked kernel's token must admit the relayed verbs: the page's three-verb token does not (see "Asking a linked node" in
+OPERATING.md).
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and
