@@ -1997,7 +1997,11 @@ In Claude Desktop, add a custom connector with the same URL. Then, in the client
 - the app's name, as the app registered it, and a warning when another app registered the same name;
 - the host its answer goes to (`127.0.0.1` for an app on the computer you are using);
 - the scope it asks for, in words: `viewer` looks, `doctor` also creates, changes, starts and stops (what erases
-  still waits for your passkey), `operator` also lists tokens and settles plans.
+  still waits for your passkey), `operator` also lists tokens and settles plans;
+- when it asks for more than `viewer`, a choice of what to grant it, from `viewer` up to the most it asked for. The
+  lowest level it asked for is checked: an app that asks for every level at once (Claude Code asks for all of
+  `scopes_supported`) gets `viewer` unless you pick more. It never gets more than it asked for. The passkey binds the
+  level you picked, and the token and the grant carry it. When the app later needs more, it asks again (below).
 
 **Approve with passkey** signs you in and approves in one tap: the passkey signs a statement (action `mcp_authorize`, the
 app's client id, a digest of the whole request) that the kernel checks as it checks every approval, owner passkeys only,

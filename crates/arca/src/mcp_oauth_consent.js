@@ -46,7 +46,9 @@ async function approve() {
   buttons(false);
   status("Confirm with your passkey…", "");
   try {
-    const begun = await post(paths.begin, { id: request });
+    // The level the owner picked on a consent page; a page without a pick (the step-up page) sends none.
+    const picked = document.querySelector('input[name="scope"]:checked');
+    const begun = await post(paths.begin, picked ? { id: request, scope: picked.value } : { id: request });
     const challenge = await crypto.subtle.digest(
       "SHA-256",
       enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + begun.statement),

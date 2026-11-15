@@ -377,7 +377,13 @@ impl Rig {
     }
 
     /// The whole flow for `client` asking `scope`, the owner picking `pick` on the page: the code.
-    fn code_picking(&self, key: &SoftPasskey, client: &str, scope: &str, pick: Option<&str>) -> String {
+    fn code_picking(
+        &self,
+        key: &SoftPasskey,
+        client: &str,
+        scope: &str,
+        pick: Option<&str>,
+    ) -> String {
         let page = self.authorize(client, &[("scope", Some(scope))]);
         let id = Rig::request_id(&page);
         let approved = self.approve_picking(key, &id, pick);
@@ -2555,7 +2561,10 @@ fn the_lowest_scope_asked_is_the_default_and_viewer_is_always_offered() {
     let page = rig.authorize(&client, &[("scope", Some("viewer"))]);
     assert!(offered(&page.text()).is_empty(), "{}", page.text());
     let code = rig.code(&key, &client, "operator");
-    assert_eq!(rig.exchange(&client, &code).json()["scope"], json!("operator"));
+    assert_eq!(
+        rig.exchange(&client, &code).json()["scope"],
+        json!("operator")
+    );
 }
 
 #[test]
@@ -2590,7 +2599,12 @@ fn the_owner_picks_a_scope_the_passkey_binds_and_never_more_than_asked() {
     );
     let code = rig.code_picking(&key, &client, "viewer doctor approvals", Some("doctor"));
     let reply = rig.exchange(&client, &code);
-    assert_eq!(reply.json()["scope"], json!("doctor approvals"), "{}", reply.text());
+    assert_eq!(
+        reply.json()["scope"],
+        json!("doctor approvals"),
+        "{}",
+        reply.text()
+    );
 }
 
 #[test]
@@ -2616,4 +2630,3 @@ fn a_device_flow_gets_the_scope_the_owner_picks() {
         assert_eq!(reply.json()["scope"], json!(granted), "{pick:?}");
     }
 }
-
