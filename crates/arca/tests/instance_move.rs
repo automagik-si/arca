@@ -2824,3 +2824,70 @@ fn a_failed_rollback_that_removed_the_copy_leaves_autostart_alone() {
     assert_eq!(autostart_writes(&rig), 0);
     assert_eq!(result_line(&rig, "web")["autostartOff"], Value::Null);
 }
+
+/// R6-1: a verified copy whose boot.autostart cannot be set to the source's is still moved, and the result says so for
+/// the owner.
+#[test]
+fn a_moved_copy_whose_autostart_cannot_be_set_is_named_in_the_result() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    rig.target.set_reject_patch("/1.0/instances/web");
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "moved", "{status}");
+    assert_eq!(copy_autostart(&rig), "false");
+    let line = result_line(&rig, "web");
+    assert_eq!(line["copyAutostartSet"], false, "{line}");
+    assert_eq!(line["autostartOff"], true, "{line}");
+    assert!(
+        line["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be set back on the copy on node-b"),
+        "{line}"
+    );
+    let late = (0..400).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(25));
+        let path = find_file(&rig.dir, "action-proposals.jsonl")?;
+        let text = fs::read_to_string(path).ok()?;
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|line| {
+                line["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("Move"))
+            })
+    });
+    assert_eq!(late.expect("a late result")["code"], "MoveNeedsOwner");
+}
+
+/// R6-1: the next start gives a verified copy the source's boot.autostart as the copy's creation recorded it, not as
+/// the source reads after the run turned it off.
+#[test]
+fn a_verified_copy_the_next_start_records_takes_the_recorded_autostart() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "false");
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Running");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid, "sourceAutostart": "true" }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+            json!({ "event": "cutover", "step": "started" }),
+            json!({ "event": "verify", "ok": true, "checks": [], "downtimeMs": 1234 }),
+        ],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "moved", "{status}");
+    assert_eq!(copy_autostart(&rig), "true");
+    assert_eq!(source_autostart(&rig), "false");
+    assert_eq!(result_line(&rig, "web")["copyAutostartSet"], true);
+}

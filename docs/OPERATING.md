@@ -2511,9 +2511,13 @@ goes on in the background, one instance after the other:
   spot-check file reads the same on both sides: the source's as read after the stop, or, when that read fails (a stopped
   container's custom volumes are not mounted), as read just before it. When neither read worked, the check fails.
 - the downtime is measured from the stop to the passed checks, and is in the `result` line and the status.
+- the copy is created with `boot.autostart` false, whatever the source's, so a copy a failed move leaves on the target
+  does not start by itself on a restart of that host beside the source. Once verified, the copy takes the source's own
+  value, as its creation recorded it (`true` stays `true`, unset stays unset; `copyAutostartSet` in the result line).
 - a verified source is kept, stopped, with `boot.autostart` off, so a reboot of this host does not start it next to its
-  copy (`autostartOff` in the result line). When turning it off fails, the instance is still `moved`, but its reason says
-  so (turn `boot.autostart` off by hand, or finish the move), and the proposal's late result is `MoveNeedsOwner`.
+  copy (`autostartOff` in the result line). When turning it off, or setting the copy's, fails, the instance is still
+  `moved`, but its reason says so (set `boot.autostart` by hand, or finish the move), and the proposal's late result is
+  `MoveNeedsOwner`.
 
 **Failure and rollback.** Any failure before the checks pass rolls that instance back, under the rule above. A failed
 push first waits (up to a minute) for the target's receiving operation to end, and a delete Incus answers as busy is
@@ -2524,18 +2528,22 @@ is read back here. The source is started again only when this move stopped it an
 a target that cannot be read leaves the source stopped. The source's own volumes are never touched. A clean rollback is
 `rolled_back` with the reason; anything else (the source not read back, a copy kept, a target not read) is `failed` with
 what was left and why, and the move's phase is `needs_owner`. When such a failure leaves the source stopped here while
-a copy may still run on the target (not removed, or not read), the source's `boot.autostart` is turned off, as for a
-verified source, so a restart of this host does not start it beside the copy (`autostartOff` in the result line; when
-that fails, the reason says so). The next instance of a batch still moves. A verified
+a copy may still run on the target (not removed, or not read), a source `boot.autostart` that reads true (a profile's
+counts) is turned off, so a restart of this host does not start it beside the copy, and the reason says so (set it back
+to true once you keep the source). Unset or `last-state` restores the last state, stopped, and is left as it is. A
+source that is gone, or another instance of the name, is left alone (`autostartOff` in the result line: true when a
+restart keeps the source stopped, null when nothing of the plan's was there; when turning it off fails, the reason says
+so). The next instance of a batch still moves. A verified
 instance's source stays on this host, stopped: to go back, stop the copy on the target and start the source, until the
 move is finished. The proposal's late result is `MoveVerified`, `MovePartlyRolledBack`, `MoveRolledBack`, or
 `MoveNeedsOwner` when any instance is `failed` or kept its `boot.autostart`.
 
 **A stopped kernel.** A move the kernel left unfinished (a `begin` with no `end`) is not resumed. On the next start in
 kernel mode each instance without a result is settled: one whose checks passed (a `verify` line with `ok`) is recorded as
-`moved` and nothing is deleted; one whose copy had been started is left as it stands, with the source stopped, and is
+`moved` and nothing is deleted (its copy takes the source's `boot.autostart` and the source's is turned off, as at the
+end of a run, with the same reason and late result when either fails); one whose copy had been started is left as it stands, with the source stopped, and is
 `failed` for the owner (the copy may have served writes; the reason says how to keep one of them, and no other move
-takes the instance while that copy may run), with the source's `boot.autostart` turned off as above; any other is rolled back as above, with the reason "the kernel
+takes the instance while that copy may run), with the source's `boot.autostart` kept off as above; any other is rolled back as above, with the reason "the kernel
 stopped during the move". The move ends `interrupted`, and the proposal gets its late result.
 
 **Progress.** `instance_move_status` (viewer, read-only) answers one move (`{"move": "mv-…"}`) or the latest 20: its
@@ -2924,7 +2932,7 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-seven gated
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-nine gated
 service, database, GPU, storage, snapshot, instance, function or tenant verbs: `service_create`, `service_remove`,
 `service_update` (see [Updating a service to a new image digest](#updating-a-service-to-a-new-image-digest)),
 `service_reconfigure` (see [Reconfiguring a service from its template](#reconfiguring-a-service-from-its-template)),
@@ -2937,9 +2945,10 @@ service, database, GPU, storage, snapshot, instance, function or tenant verbs: `
 `instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)).
 `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and
 `deploy_remove` (see [Tenants](#tenants)), and `route_add` and `route_remove` (see
-[Routes](#routes-names-for-your-instances-served-by-the-nodes-edge)), are proposed the same way. The canvas Doctor
-proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`, `route_add` or
-`route_remove`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
+[Routes](#routes-names-for-your-instances-served-by-the-nodes-edge)), and `instance_move` and `instance_move_finish`
+(see [Moving containers to a linked host](#moving-containers-to-a-linked-host-instance_move)), are proposed the same
+way. The canvas Doctor proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`,
+`route_add`, `route_remove`, `instance_move` or `instance_move_finish`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
 came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a
 function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against
 that verb's own parameter schema, with

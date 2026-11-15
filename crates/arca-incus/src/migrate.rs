@@ -6,8 +6,8 @@
 //! volume to that operation, over the network, with the target's certificate. The kernel moves no byte itself: it starts
 //! the two operations, follows their progress, and reads what landed.
 //!
-//! Besides the copy the writer starts and stops an instance, reads a file inside one (the spot-check), turns a kept
-//! source's `boot.autostart` off, and deletes an instance or a custom volume: a target copy when a move is rolled back,
+//! Besides the copy the writer starts and stops an instance, reads a file inside one (the spot-check), sets
+//! `boot.autostart` (off on a kept source, the source's own value on a verified copy), and deletes an instance or a custom volume: a target copy when a move is rolled back,
 //! and a source when the owner finishes a move.
 //! Every write is one of the closed shapes [`write_allowed`] lists, with plain names and a `project` query, and every
 //! body is built here: no caller sends a body of its own. The websocket secrets are never logged or returned in a
@@ -206,7 +206,10 @@ impl MoveWriter {
 
     /// Asks the receiving side to create the instance `name` in `project` from a migration push, or, with `refresh`, to
     /// bring the copy it holds up to date. `source` is the instance as the sending side reads it: its architecture, its own
-    /// config (see [`moved_config`]), devices, profiles and description go with it.
+    /// config (see [`moved_config`]), devices, profiles and description go with it. The copy is made with
+    /// `boot.autostart` false, whatever the source's is: a copy a failed move leaves on the target must not start by
+    /// itself on a restart of that host, beside the source. A move gives it the source's own value once it is verified
+    /// ([`MoveWriter::set_autostart`]).
     pub fn receive_instance(
         &self,
         project: &str,
@@ -218,11 +221,12 @@ impl MoveWriter {
         if source.get("type").and_then(Value::as_str) != Some("container") {
             return Err(refused("only a container is moved"));
         }
-        let config = source
+        let mut config = source
             .get("config")
             .and_then(Value::as_object)
             .map(moved_config)
             .unwrap_or_default();
+        config.insert("boot.autostart".to_string(), json!("false"));
         let body = json!({
             "name": name,
             "type": "container",
@@ -399,8 +403,22 @@ impl MoveWriter {
     /// Turns `boot.autostart` off on the instance `name` of `project`: a kept source must not start by itself on a host
     /// reboot next to its moved copy. The body is this one key and nothing else.
     pub fn disable_autostart(&self, project: &str, name: &str) -> Result<(), IncusError> {
+        self.set_autostart(project, name, "false")
+    }
+
+    /// Sets `boot.autostart` on the instance `name` of `project` to `value`, or unsets it when `value` is empty (Incus
+    /// keeps no key written empty): a verified copy takes its source's own value. The body is this one key and nothing
+    /// else.
+    pub fn set_autostart(&self, project: &str, name: &str, value: &str) -> Result<(), IncusError> {
         names_ok(&[project, name])?;
-        let body = json!({ "config": { "boot.autostart": "false" } });
+        if value.len() > 16
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(refused("the boot.autostart value is not plain"));
+        }
+        let body = json!({ "config": { "boot.autostart": value } });
         let envelope = self.send(
             "PATCH",
             &format!("/1.0/instances/{name}?project={project}"),

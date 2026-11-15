@@ -615,16 +615,93 @@ fn answers(host: &str, port: u16) -> bool {
 /// What a result says when [`keep_down`] could not turn `boot.autostart` off.
 const AUTOSTART_LEFT_ON: &str = "boot.autostart could not be turned off on the stopped source here: a restart of this host would start it beside its copy; turn it off";
 
-/// Turns `boot.autostart` off on a source a move leaves stopped while a copy of it may run, so a restart of this host
-/// does not start it beside the copy. `None` when there is nothing of the plan's to turn off: the source is gone, or it
-/// is another instance of the name (another uuid), which is left alone. Otherwise whether it was turned off.
-fn keep_down(source: &MoveWriter, project: &str, name: &str, uuid: Option<&str>) -> Option<bool> {
-    match source.get(&instance_path(project, name)) {
-        Err(IncusError::Status { code: 404, .. }) => return None,
-        Ok(doc) if uuid.is_some() && uuid_of(&doc).as_deref() != uuid => return None,
-        _ => {}
+/// What a result says when [`keep_down`] turned `boot.autostart` off.
+const AUTOSTART_TURNED_OFF: &str = "boot.autostart was true on the stopped source here and is now false, so a restart of this host does not start it beside its copy; once you keep the source, set it back to true";
+
+/// What [`keep_down`] did to a stopped source's `boot.autostart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeptDown {
+    /// Nothing of the plan's: the source is gone, or it is another instance of the name (another uuid), left alone.
+    NotOurs,
+    /// The key is not true (unset, `last-state` or false): a restart of this host keeps the stopped source stopped, so it
+    /// was left as it was.
+    Down,
+    /// The key was true (or could not be read) and is now `"false"`.
+    TurnedOff,
+    /// The key was true (or could not be read) and could not be turned off.
+    LeftOn,
+}
+
+impl KeptDown {
+    /// The result line's `autostartOff`: whether a restart of this host keeps the source stopped, or null when nothing
+    /// of the plan's was there.
+    fn field(self) -> Value {
+        match self {
+            KeptDown::NotOurs => Value::Null,
+            KeptDown::Down | KeptDown::TurnedOff => json!(true),
+            KeptDown::LeftOn => json!(false),
+        }
     }
-    Some(source.disable_autostart(project, name).is_ok())
+
+    /// `reason`, saying what was changed or could not be.
+    fn reason(self, reason: String) -> String {
+        match self {
+            KeptDown::TurnedOff => format!("{reason}; {AUTOSTART_TURNED_OFF}"),
+            KeptDown::LeftOn => format!("{reason}; {AUTOSTART_LEFT_ON}"),
+            KeptDown::NotOurs | KeptDown::Down => reason,
+        }
+    }
+}
+
+/// Whether an Incus boolean reads true, as Incus reads one.
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
+}
+
+/// Keeps a source a move leaves stopped, while a copy of it may run, from starting by itself on a restart of this host.
+/// Only a `boot.autostart` that reads true (in the expanded config, so a profile's counts) is changed, to `"false"`:
+/// unset or `last-state` restores the last state, stopped, and is left as the owner set it. A source that cannot be
+/// read is turned off. A source that is gone, or another instance of the name (another uuid), is left alone.
+fn keep_down(source: &MoveWriter, project: &str, name: &str, uuid: Option<&str>) -> KeptDown {
+    match source.get(&instance_path(project, name)) {
+        Err(IncusError::Status { code: 404, .. }) => return KeptDown::NotOurs,
+        Ok(doc) if uuid.is_some() && uuid_of(&doc).as_deref() != uuid => return KeptDown::NotOurs,
+        Ok(doc) => {
+            let key = doc["expanded_config"]["boot.autostart"]
+                .as_str()
+                .or(doc["config"]["boot.autostart"].as_str());
+            if !key.is_some_and(truthy) {
+                return KeptDown::Down;
+            }
+        }
+        Err(_) => {}
+    }
+    if source.disable_autostart(project, name).is_ok() {
+        KeptDown::TurnedOff
+    } else {
+        KeptDown::LeftOn
+    }
+}
+
+/// The reason of a `moved` result that could not set the copy's `boot.autostart` to the source's, or turn the kept
+/// source's off; `None` when both were done.
+fn moved_trouble(copy_set: bool, autostart_off: bool, target: &str) -> Option<String> {
+    let mut trouble = Vec::new();
+    if !copy_set {
+        trouble.push(format!(
+            "boot.autostart could not be set back on the copy on {target}: it stays false, so a restart of {target} leaves the moved instance stopped; set it as it was on the source"
+        ));
+    }
+    if !autostart_off {
+        trouble.push(
+            "boot.autostart could not be turned off on the kept source here: a reboot of this host would start it beside its copy; turn it off, or finish the move"
+                .to_string(),
+        );
+    }
+    (!trouble.is_empty()).then(|| trouble.join("; "))
 }
 
 /// Reads a copy an earlier move recorded (`uuid` on `target`): `None` when it cannot run there (gone, another instance
@@ -827,6 +904,8 @@ struct Made {
     target_uuid: Option<String>,
     volumes: Vec<Value>,
     stopped_source: bool,
+    /// The source's own `boot.autostart` when its copy was made ("" for unset): the copy takes it once verified.
+    source_autostart: Option<String>,
 }
 
 /// What the source looked like just before the stop: its file for the spot-check, and the TCP ports of its wildcard
@@ -1554,17 +1633,25 @@ impl Moves {
         self.clear_live(id, &project, &name);
         match outcome {
             Ok(downtime) => {
-                // A kept source must not come back by itself on a reboot of this host, next to its copy.
+                // The verified copy takes the source's own boot.autostart (it was made with it off), and the kept source
+                // must not come back by itself on a reboot of this host, next to its copy.
+                let copy_set = dest
+                    .set_autostart(
+                        &project,
+                        &name,
+                        made.source_autostart.as_deref().unwrap_or_default(),
+                    )
+                    .is_ok();
                 let autostart_off = source.disable_autostart(&project, &name).is_ok();
-                let reason = (!autostart_off).then_some(
-                    "moved, but boot.autostart could not be turned off on the kept source here: a reboot of this host would start it beside its copy; turn it off, or finish the move",
-                );
+                let reason = moved_trouble(copy_set, autostart_off, target_name)
+                    .map(|trouble| format!("moved, but {trouble}"));
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
                     "result": "moved", "downtimeMs": downtime, "reason": reason,
                     "targetUuid": made.target_uuid, "autostartOff": autostart_off,
+                    "copyAutostartSet": copy_set,
                 }));
-                if autostart_off {
+                if copy_set && autostart_off {
                     "moved"
                 } else {
                     "moved_autostart_on"
@@ -1594,18 +1681,13 @@ impl Moves {
                     )
                 };
                 // A source left stopped while its copy may run must not come back by itself on a restart of this host.
-                let autostart_off =
-                    (!rolled.clean && !rolled.source_running && !rolled.target_removed)
-                        .then(|| keep_down(&source, &project, &name, one["uuid"].as_str()))
-                        .flatten();
-                let reason = if autostart_off == Some(false) {
-                    format!("{reason}; {AUTOSTART_LEFT_ON}")
-                } else {
-                    reason
-                };
+                let kept = (!rolled.clean && !rolled.source_running && !rolled.target_removed)
+                    .then(|| keep_down(&source, &project, &name, one["uuid"].as_str()))
+                    .unwrap_or(KeptDown::NotOurs);
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
-                    "result": result, "downtimeMs": null, "reason": reason, "autostartOff": autostart_off,
+                    "result": result, "downtimeMs": null, "reason": kept.reason(reason),
+                    "autostartOff": kept.field(),
                 }));
                 result
             }
@@ -1823,7 +1905,7 @@ impl Moves {
                 }
                 json!({
                     "event": "created", "at": self.now(), "move": id, "project": project, "name": name,
-                    "targetUuid": made.target_uuid,
+                    "targetUuid": made.target_uuid, "sourceAutostart": made.source_autostart,
                 })
             }
         };
@@ -1953,6 +2035,14 @@ impl Moves {
         let doc = source
             .get(&instance_path(project, name))
             .map_err(|error| format!("{what} could not be read here: {error}"))?;
+        if made.source_autostart.is_none() {
+            made.source_autostart = Some(
+                doc["config"]["boot.autostart"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
         let receive = dest
             .receive_instance(project, name, &doc, refresh)
             .map_err(|error| format!("the target did not take {what}: {error}"))?;
@@ -2347,14 +2437,46 @@ impl Moves {
             }
             // The checks passed and were journaled: the copy is the moved instance. Nothing is deleted or started.
             if instance.verified {
+                // As at the end of a run: the copy takes the source's boot.autostart (as its creation recorded it, or
+                // as the source reads now), and the kept source's is turned off.
+                let value = instance.source_autostart.clone().or_else(|| {
+                    source
+                        .get(&instance_path(&instance.project, &instance.name))
+                        .ok()
+                        .map(|doc| {
+                            doc["config"]["boot.autostart"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string()
+                        })
+                });
+                let copy_set = match (&target, &value) {
+                    (Ok(target), Some(value)) => MoveWriter::new(target.socket.clone())
+                        .set_autostart(&instance.project, &instance.name, value)
+                        .is_ok(),
+                    _ => false,
+                };
+                let autostart_off = source
+                    .disable_autostart(&instance.project, &instance.name)
+                    .is_ok();
+                let reason = format!(
+                    "{stopped} after the copy passed its checks; the next start recorded it as moved"
+                );
+                let reason = match moved_trouble(copy_set, autostart_off, &record.target) {
+                    Some(trouble) => format!("{reason}, but {trouble}"),
+                    None => reason,
+                };
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
                     "name": instance.name, "result": "moved", "downtimeMs": instance.verify_downtime,
-                    "reason": format!("{stopped} after the copy passed its checks; the next start recorded it as moved"),
-                    "targetUuid": instance.target_uuid, "recovered": true,
+                    "reason": reason, "targetUuid": instance.target_uuid, "recovered": true,
+                    "autostartOff": autostart_off, "copyAutostartSet": copy_set,
                 }));
-                let _ = source.disable_autostart(&instance.project, &instance.name);
-                results.push("moved");
+                results.push(if copy_set && autostart_off {
+                    "moved"
+                } else {
+                    "moved_autostart_on"
+                });
                 continue;
             }
             // The copy was started, and may have served writes: nothing is deleted, and the source is not started next
@@ -2364,21 +2486,16 @@ impl Moves {
                     "{stopped} after the copy was started on {target} and before its checks were journaled: the copy may have served writes, so it was left as it is and the source stays stopped. Keep one of them: to come back, stop the copy on {target} and start the source here; to keep the copy, leave the source stopped. Until the copy on {target} is stopped or gone, no other move takes this instance",
                     target = record.target
                 );
-                let autostart_off = keep_down(
+                let kept = keep_down(
                     &source,
                     &instance.project,
                     &instance.name,
                     instance.uuid.as_deref(),
                 );
-                let reason = if autostart_off == Some(false) {
-                    format!("{reason}; {AUTOSTART_LEFT_ON}")
-                } else {
-                    reason
-                };
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
-                    "name": instance.name, "result": "failed", "downtimeMs": null, "reason": reason,
-                    "targetUuid": instance.target_uuid, "recovered": true, "autostartOff": autostart_off,
+                    "name": instance.name, "result": "failed", "downtimeMs": null, "reason": kept.reason(reason),
+                    "targetUuid": instance.target_uuid, "recovered": true, "autostartOff": kept.field(),
                 }));
                 results.push("failed");
                 continue;
@@ -2391,6 +2508,7 @@ impl Moves {
                 target_uuid: instance.target_uuid.clone(),
                 volumes: instance.created_volumes.clone(),
                 stopped_source: instance.stopped_source,
+                source_autostart: instance.source_autostart.clone(),
             };
             let rolled = match &target {
                 Ok(target) => rollback(
@@ -2400,10 +2518,14 @@ impl Moves {
                     &made,
                     &record.target,
                 ),
+                // Nothing was read on the target; the source is read as it stands, so one the move never stopped is
+                // not taken for stopped.
                 Err(why) => RolledBack {
                     source_intact: false,
                     target_removed: false,
-                    source_running: false,
+                    source_running: source
+                        .get(&instance_path(&instance.project, &instance.name))
+                        .is_ok_and(|doc| running(&doc)),
                     clean: false,
                     detail: vec![format!(
                         "the target was not reached ({why}), so nothing was deleted or started"
@@ -2428,7 +2550,7 @@ impl Moves {
                     ),
                 )
             };
-            let autostart_off = (!rolled.clean && !rolled.source_running && !rolled.target_removed)
+            let kept = (!rolled.clean && !rolled.source_running && !rolled.target_removed)
                 .then(|| {
                     keep_down(
                         &source,
@@ -2437,16 +2559,11 @@ impl Moves {
                         instance.uuid.as_deref(),
                     )
                 })
-                .flatten();
-            let reason = if autostart_off == Some(false) {
-                format!("{reason}; {AUTOSTART_LEFT_ON}")
-            } else {
-                reason
-            };
+                .unwrap_or(KeptDown::NotOurs);
             self.note(json!({
                 "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
-                "name": instance.name, "result": result, "downtimeMs": null, "reason": reason,
-                "autostartOff": autostart_off,
+                "name": instance.name, "result": result, "downtimeMs": null, "reason": kept.reason(reason),
+                "autostartOff": kept.field(),
             }));
             results.push(result);
         }
@@ -2754,6 +2871,8 @@ struct InstanceRecord {
     target_pool: String,
     volumes: Value,
     target_uuid: Option<String>,
+    /// The source's own `boot.autostart` as the copy's creation recorded it ("" for unset).
+    source_autostart: Option<String>,
     /// The rollback journaled the copy on the target removed (deleted, or read back gone).
     target_removed: bool,
     created_volumes: Vec<Value>,
@@ -2836,6 +2955,9 @@ fn fold(lines: &[Value]) -> BTreeMap<String, MoveRecord> {
             Some("created") => {
                 if let Some(uuid) = line["targetUuid"].as_str() {
                     instance.target_uuid = Some(uuid.to_string());
+                }
+                if let Some(value) = line["sourceAutostart"].as_str() {
+                    instance.source_autostart = Some(value.to_string());
                 }
                 if line["volume"].is_object() {
                     instance.created_volumes.push(line["volume"].clone());
