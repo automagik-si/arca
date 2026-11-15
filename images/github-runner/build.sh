@@ -83,7 +83,12 @@ say() { printf 'build: %s\n' "$*"; }
 gib() { echo $(( $1 / 1073741824 )); }
 in_vm() { incus exec "$vm" --project "$PROJECT" "$@"; }
 
-exec 9>>"$LOCK"
+# Whoever comes first makes the lock file; every user then locks it through a read-only descriptor. In a sticky
+# world-writable directory such as /run/lock the kernel refuses a create-or-write open of another user's file
+# (fs.protected_regular), root included; a read-only open of a 0644 file works for everyone, and so does flock on it.
+[ -e "$LOCK" ] || { touch "$LOCK" && chmod 0644 "$LOCK"; } 2>/dev/null || :
+[ -r "$LOCK" ] || { say "cannot read the lock $LOCK: make it readable by every user who builds (chmod 0644)"; exit 1; }
+exec 9<"$LOCK"
 flock -n 9 || { say "another image build is running on this host (lock $LOCK)"; exit 1; }
 
 pool=$(incus profile device get default root pool --project "$PROJECT")
@@ -114,12 +119,16 @@ mem_available() { awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo; }
 # --- 1. the gate --------------------------------------------------------------------------------------------------
 t_start=$(date +%s)
 names_free() {
+  # Never told to delete: the machine in the way may be a line's only image.
   if incus info "$vm" --project "$PROJECT" >/dev/null 2>&1; then
-    say "the machine $vm already exists in project $PROJECT (a build was kept with --keep): delete it first"
+    say "the machine $vm already exists in project $PROJECT. If it is a kept image (stopped, with a snapshot image, as
+build.sh left them before per-tag names), give it its tag's name: incus move $vm arca-runner-image-<its tag, dots as
+dashes> --project $PROJECT. If a --keep build left it, look at it, then move it out of the way the same way."
     exit 1
   fi
   if incus info "$image_vm" --project "$PROJECT" >/dev/null 2>&1; then
-    say "$RUNNER_IMAGES_TAG is already built: the machine $image_vm exists in project $PROJECT (delete it to rebuild)"
+    say "$RUNNER_IMAGES_TAG is already built: it is the machine $image_vm in project $PROJECT. To build it again, move
+that one aside first: incus move $image_vm $image_vm-previous --project $PROJECT"
     exit 1
   fi
 }
@@ -337,8 +346,12 @@ else
     say "the snapshot did not come (try $try of 3)"
   done
   # The image's own name frees the build's for the next release, and keeps this one for a rollback.
-  incus move "$vm" "$image_vm" --project "$PROJECT"
+  # From here the machine is the image: no failure deletes it.
   created=no
+  if ! incus move "$vm" "$image_vm" --project "$PROJECT"; then
+    say "could not rename $vm to $image_vm: the image stays as $vm"
+    image_vm=$vm
+  fi
   if [ "$snapshot" = yes ]; then
     kept="the stopped machine $image_vm, snapshot image, in project $PROJECT"
   else

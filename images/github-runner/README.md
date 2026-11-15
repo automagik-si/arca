@@ -33,7 +33,9 @@ memory, room on the storage pool), start a capped virtual machine (4 CPUs, 8 GiB
 builder, compare the software reports, add the runner, clean up, publish the image as `arca/github-runner/<tag>`,
 delete the machine, and write `docs/runner-image/<tag>/`. When there is too little room under `/var/lib/incus` to
 publish (or with `--no-publish`), the image is the stopped machine `arca-runner-image-<tag>` (dots made dashes, e.g.
-`arca-runner-image-ubuntu24-20261111-370`) with a snapshot `image`, one machine per tag. Settings (`PROJECT`, `CPU`,
+`arca-runner-image-ubuntu24-20261111-370`) with a snapshot `image`, one machine per tag. A build never deletes one:
+when a machine is in its way it stops and says which `incus move` frees the name (an image kept under the build's name
+`arca-runner-build-<line>` by an earlier build is renamed to its tag's name once, by hand). Settings (`PROJECT`, `CPU`,
 `MEMORY`, `DISK`, the gate's limits, `GATE_FLOORS` for other paths whose free room must stay above a floor once the
 build has written its disk) are environment variables, listed at the top of the script. One build per host at a time,
 whoever runs it (the lock `/run/lock/arca-runner-image.lock`).
