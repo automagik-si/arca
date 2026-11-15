@@ -59,6 +59,7 @@ pub mod peer_sync;
 pub mod registry;
 pub mod route;
 pub mod runners;
+pub mod self_update;
 pub mod service;
 pub mod service_exec;
 pub mod service_import;
@@ -105,6 +106,8 @@ const USAGE: &str = "usage: arca <command>
   oauth revoke <client> [--config <file>] (disconnect one: its tokens stop working at once)
   store check [--config <file>]
   templates install [--config <file>] [--replace]
+  update check [--config <file>] (whether a newer Arca release is published, and which programs it would replace)
+  update run [--config <file>] (look, and install a newer release into every unit that runs Arca; what serve starts)
   service import plan --name <service> [--config <file>]
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
   adopt plan --instance <name> --expect-ip <ipv4> --json [--config <file>]
@@ -580,6 +583,7 @@ const COMMANDS: &[&str] = &[
     "oauth",
     "store",
     "templates",
+    "update",
     "service",
     "shim",
     "adopt",
@@ -636,6 +640,19 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
                 "a templates action",
                 other.map(|(action, _)| action.as_str()),
                 &["install"],
+            )),
+        },
+        "update" => match rest.split_first() {
+            Some((action, rest)) if action == "check" => {
+                self_update::command(&parse_flags(rest, &["config"], &[])?, false)
+            }
+            Some((action, rest)) if action == "run" => {
+                self_update::command(&parse_flags(rest, &["config"], &[])?, true)
+            }
+            other => Err(unknown_word(
+                "an update action",
+                other.map(|(action, _)| action.as_str()),
+                &["check", "run"],
             )),
         },
         "oauth" => match rest.split_first() {

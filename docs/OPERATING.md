@@ -96,6 +96,8 @@ node takes a new token after `arca token reload` or a restart.
 | `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
 | `arca store check [--config <file>]` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
 | `arca templates install [--config <file>] [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept", "replaced" }` as JSON. A file that is an earlier release's own, byte for byte, is brought up to this release's and named under `replaced`; any other file that differs is the owner's edit and is kept unless `--replace` is given |
+| `arca update check [--config <file>]` | the releases and this systemd manager's units: nothing is changed and nothing is written | `{ "result", "reason", "available", "current", "detail": { "programs": [...] } }`: `available` when a program is behind the newest release; each program with its path, version, units and whether it is behind. See "Keeping Arca up to date: the kernel update" |
+| `arca update run [--config <file>]` | the same, and installs the release into every program behind it, restarts their units, and rolls back a unit that does not come back; what `serve` starts on its schedule | the same object, with the units moved under `detail.units`; exit 1 when the run `failed` or was `rolled-back` |
 | `arca probe consumer add --name <n> --image <fingerprint> [--config <file>]` / `remove --name <n> [--config <file>]` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve [--config <file>]` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan and two questions; it writes the config's missing keys after a yes, and ends in five lines: what changed, who does not wait for the page, the one next step, where a database comes from, and one pointer to the rest. See "Turning on changes" |
@@ -180,6 +182,7 @@ refused without the value being echoed back.
 | `kernel.serviceListenAddresses` | no | `["<one IPv4 address>", ...]`, at most 8: the host addresses a service's private port may listen on, each an address of an interface of this host, such as the address of a private link to a second node. Empty by default: no service has a private port. An entry alone opens nothing. See "A service port on one host address". |
 | `link` | no | The node link: `name`, `forward`, `pairMinutes`, `localOnly`, `port` and `peers`. See "The link". |
 | `follow.intervalSeconds` | no | Seconds between two looks of the Automagik follower at Automagik's published record, 60 to 86400. 600 when absent. |
+| `update.automatic`, `update.channel`, `update.checkEverySeconds`, `update.window`, `update.source`, `update.healthSeconds` | no | The kernel update: whether the node looks for a newer Arca release and installs it on its own (`true`), which releases (`stable`; `prerelease` takes pre-releases too), how often it looks (600 to 604800 seconds, 21600 when absent), when an install may start (`HH:MM-HH:MM` in UTC; absent, at any hour), where the releases are listed (`https://api.github.com/repos/automagik-si/arca`), and how long a restarted unit has to come back (5 to 600 seconds, 30). See "Keeping Arca up to date: the kernel update". |
 | `hostNetwork.socket`, `hostNetwork.status` | no | Absolute paths of the root part's socket and status file; `/run/arca-host-network/host-network.sock` and `/run/arca-host-network/status.json` when absent. See "Host forwarding and the firewall". |
 | `console.tokenFile` | no | Absolute path of the file `serve` writes the machine's own console's token to: one viewer token limited to `node_metrics`, `arca_status`, `alerts_list` and `service_list`, made at each start and held in memory only. Absent, no such token is made. See "The console's token". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
@@ -804,7 +807,8 @@ program holds their SHA-256 hashes):
 - a template and the script it reads move together: where one of the two is edited, the other is kept as it is too,
   though it is an earlier release's, so a new template is never paired with a script it was not shipped with.
 
-The installer runs this step on an upgrade (`sh install.sh` on a machine that has Arca), for the node it runs as
+The kernel update runs this step after every update it installs, for every node that has templates (see "Keeping Arca
+up to date: the kernel update"). The installer runs it on an upgrade (`sh install.sh` on a machine that has Arca), for the node it runs as
 a service and only where templates are already installed: a node that only looks has none and gets none. Its
 report names what it brought up to this release, and what it kept because it was edited, with the one command that
 replaces those (`arca templates install --replace --config <file>`). Where the run puts an older program over a
@@ -2667,6 +2671,111 @@ Every field is present, and `null` when unknown. The raw `state.last_error` text
 kept beyond the version token. `lastResult` and `lastReason` are the OS's own words, so the verb is marked `untrusted`.
 The canvas's Fleet view reads this verb on every configured host. The update server's newest version for a channel is not
 in the update document, so the view compares a node with the newest version reported on the fleet's own nodes.
+
+## Keeping Arca up to date: the kernel update
+
+Every node keeps the Arca programs of its machine on the newest release by itself. Nobody runs anything and nobody types
+anything: the look, the download, the check, the install, the restarts and a rollback all happen without a person.
+`sh install.sh` is only for the first install.
+
+### When it runs
+
+`arca serve` looks on a schedule: five minutes after it starts, then every `update.checkEverySeconds` (six hours when
+absent). It looks only when systemd runs it as a service; a `serve` started by hand has no unit to restart, and never
+looks. It starts the run as a transient unit of its own manager (`systemd-run`, `arca-update-<time>.service`), so the
+run outlives the restarts it makes. The run is `arca update run --config <the node's config>`, which can also be run by
+hand; `arca update check` does the same look, changes nothing and writes nothing, and says what a run would do.
+
+| Key | Absent | What it does |
+|-----|--------|--------------|
+| `update.automatic` | `true` | `false`: the node never looks on its own. `arca update run` still works by hand. |
+| `update.channel` | `stable` | `stable` takes releases only; `prerelease` takes pre-releases too. A draft is never taken. |
+| `update.checkEverySeconds` | 21600 | Seconds between two looks, 600 to 604800. |
+| `update.window` | any hour | `HH:MM-HH:MM` in UTC (`"02:00-05:00"`, or `"23:00-01:00"` over midnight): an install starts only inside it. A look outside it still says what is available. |
+| `update.source` | `https://api.github.com/repos/automagik-si/arca` | The releases API of the repository. Another `https` address is a mirror; `http` is taken only for a loopback address. |
+| `update.healthSeconds` | 30 | How long a restarted unit has to be running again before the update is rolled back, 5 to 600. |
+
+A look that was put off (a waiting owner card, a closed window, no answer from the releases) is tried again within
+fifteen minutes. Several nodes on one machine share one result: a run records it in the state directory of every node
+it found, so the next node whose look is due sees that the machine was just looked at. One run holds the machine's
+update lock (`$XDG_RUNTIME_DIR/arca-update.lock`, or `/run/arca-update.lock` for root); a second run that finds it held
+ends as `busy` and changes nothing.
+
+### What one run does
+
+1. It reads the releases and takes the newest of the channel: a `v<version>` tag, by semantic version.
+2. It finds every unit of its own systemd manager whose `ExecStart` runs an Arca program: the installer's `arca.service`,
+   the guide's hand-made `arca-shim.service` and `arca-watch.service`, a link (`arca link serve`), a second node, and a
+   unit that runs its own copy of the program from another path. A program is a file whose name starts with `arca`
+   and that answers `--version` with `Automagik Arca <version>`. Units whose paths lead to one file share that program.
+3. A program as new as the release, or newer (a build from a branch), is kept as it is, and its units are not
+   restarted. An older program is never put over a newer one.
+4. Outside `update.window` it stops here (`waiting-for-window`). While a node it would restart has an owner approval
+   card waiting (an action plan, a delete plan or an owner approval request, the rows `owner_approval_pending` lists),
+   it stops here too (`deferred`): a restart would take the card's page and the owner's session away from the owner.
+   Each `serve` writes its count of waiting cards each minute for this; a count older than three minutes is not read.
+5. It downloads `arca-<version>-linux-<arch>` for this machine (`x86_64` or `aarch64`), the release's `SHA256SUMS` and
+   its `install.sh`, and checks both files against `SHA256SUMS`. A checksum that does not match, a file the release
+   does not have, or a binary that does not answer `--version` with the release's version on this machine keeps every
+   program as it was (`failed`).
+6. It puts the binary where each program is, as the installer does: written beside it on the same file system and
+   renamed over it in one step, so a unit that starts in between finds a whole program. The old program is kept beside
+   it as `<program>.previous`. Where the installer's own note names the old program
+   (`~/.local/state/arca-install/program.sha256`), it names the new one, so `sh install.sh --uninstall` still removes it.
+   A program on a file system the run cannot write is staged instead (see "On Arca OS").
+7. It restarts the units of the programs it changed, one at a time: shims first, then nodes, then links, then any
+   other. A unit that was stopped is not started. After each restart it waits for the unit to be running, then a few
+   seconds more, and reads the version its main process runs (`/proc/<pid>/exe --version`). The unit must still run the
+   same process, must not have restarted, and must say the release's version.
+8. When a unit does not come back that way, every program it changed is put back (the `.previous` file, or the staged
+   program before), the units it had restarted are restarted again, and their versions are read back. The run ends
+   `rolled-back` and the `kernel-update-failed` alert fires.
+9. When every unit came back, it runs `arca templates install --config <config>` with the new program for each node
+   that has templates (`<stateDir>/templates`), as the installer does on an upgrade (see "Templates an earlier release
+   installed"). A template the owner edited is kept, as always.
+
+### What it records
+
+Each node the run found keeps:
+
+- `<stateDir>/kernel-update/journal.jsonl`: one JSON line for every look (`check`, with its `result`) and every step
+  (`deferred`, `download`, `install` with `from`, `to` and `how`, `restart` with the version read back, `templates`,
+  `updated`, `failed`, `rolled-back`), each with `atMs`;
+- `<stateDir>/kernel-update/state.json`: the last look's `result`, `reason`, `available` and `checkedAtMs`, whether it
+  `failed`, and the time and units of the last update (`updatedAtMs`, `updated`).
+
+`arca_status` answers with `update`:
+
+| Field | Meaning |
+|-------|---------|
+| `automatic`, `channel`, `window` | The node's `update` settings. |
+| `current` | The version this node runs. |
+| `available` | The newest release of the channel at the last look, or null before one. |
+| `lastCheckAt`, `lastResult`, `lastReason` | The last look: when (epoch milliseconds), what it ended with (`up-to-date`, `updated`, `deferred`, `waiting-for-window`, `check-failed`, `failed`, `rolled-back`) and why. |
+| `lastUpdateAt` | When the last update finished. |
+| `failed` | Whether the last run failed or was rolled back: the `kernel-update-failed` alert's reading. |
+
+`kernel-update-failed` (warning) reads 1 while the last run ended `failed` or `rolled-back`, and clears when a later run
+ends up to date or updated. A look that got no answer from the releases is `check-failed` and does not fire it; it is
+tried again within fifteen minutes.
+
+### On Arca OS
+
+Arca OS runs the node as the system unit `arca.service`, from `/usr/local/bin/arca` in the OS image, which cannot be
+written. The run finds that unit in the system manager, and because the program's file system refuses the write, it
+stages the release in the node's state directory instead: `<stateDir>/kernel-update/arca-<version>`, named with its
+SHA-256 in `<stateDir>/kernel-update/current.json` (the manifest before it is kept as `previous.json`). At its start,
+before it does anything else, `serve` checks the staged program (a regular file of its own user that nobody else may
+write, whose SHA-256 is the manifest's) and, when it is newer than its own version, becomes that program with the same
+arguments. The rest of the run is the same: the restart, the version read back from the process, the rollback (the
+manifest before is put back, or removed when there was none, and the node runs the image's program again).
+
+Arca OS updates the OS on its own channel (incus-osd's, read by `os_update`), and that update brings the image's own
+`arca`. The two meet at the hand-over: the node runs whichever is newer. An OS update whose `arca` is newer than the
+staged one wins at the next boot, and the staged one is not used again; a kernel release newer than the image's `arca`
+runs from the state directory until an OS update brings one at least as new. The kernel update never touches the OS,
+and the OS update never removes a staged program: the run removes staged programs that are neither the current one nor
+the one before it.
 
 ## Starting, stopping and restarting instances
 
@@ -4692,6 +4801,7 @@ default is `forS` 60 and `clearForS` 120, so a condition that lasts 59 seconds n
 | `gpu-gone` | 1 for each card that was in the inventory and is gone from it now | 0 | 0 | critical |
 | `host-network-drift` | 1 for each item of the host's declared forwarding and firewall that is not as declared, keyed by `item`, from the root part's status file (see "Host forwarding and the firewall") | 0 | 0 | critical |
 | `runner-signin` | 1 for each runner pool whose last exchange with GitHub failed for a credential reason (401 bad credentials, 404 App not installed, 403 forbidden, or no credential in the kernel), keyed by `pool` (see [`RUNNERS.md`](RUNNERS.md)) | 0 | 0 | critical |
+| `kernel-update-failed` | 1 while the kernel update's last run on this node ended `failed` (a release that did not verify) or `rolled-back` (a unit that did not come back on it), from `<stateDir>/kernel-update/state.json`; 0 when it never ran (see "Keeping Arca up to date: the kernel update") | 0 | 0 | warning |
 
 A yes-or-no rule reads 1 when it is bad and 0 when it is fine, so its threshold of 0 fires on 1. The thresholds are a
 starting point. Tune them after a week of data.

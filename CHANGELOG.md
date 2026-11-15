@@ -7,6 +7,18 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Arca keeps itself up to date. Every node looks for a newer release of `automagik-si/arca` every six hours (the new
+`update` config key: on by default, releases only, at any hour; a window, the pre-release channel and the interval can
+be set) and installs it with nobody at a terminal: it finds every systemd unit that runs an Arca program (the
+installer's `arca.service`, the guide's hand-made units, links, nodes with their own program path), checks the binary
+and the release's `install.sh` against `SHA256SUMS`, replaces each program behind the release and keeps the old one as
+`<program>.previous`, restarts shims, then nodes, then links, one at a time, and reads back the version each one runs.
+A unit that does not come back rolls every program back and fires the new `kernel-update-failed` alert. A node with an
+owner approval card waiting is not restarted until none waits. The templates are brought up to the release as the
+installer does. `arca_status` shows the current and available versions under `update`; `arca update check` says what a
+run would do, and `arca update run` is the run itself. On Arca OS, whose program is in the read-only image, the
+release is staged in the node's state directory and `serve` hands over to it at its start when it is newer.
+
 `instance_import` moves one virtual machine from an outside hypervisor (the `onevm show -x` XML, passed in by
 the operator) into Incus behind one owner card: the same CPUs, memory, firmware, disks and MACs, the source's
 security groups as an Incus network ACL, a cloud-init seed from its context, a full sparse disk copy from the source

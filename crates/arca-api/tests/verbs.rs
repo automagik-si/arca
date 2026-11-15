@@ -735,6 +735,25 @@ fn arca_status_schemas_equal_its_table_row() {
                         "passkeys": { "type": ["integer", "null"], "minimum": 0 },
                     },
                     "required": ["url", "open", "reason", "passkeys"],
+                },
+                "update": {
+                    "type": "object",
+                    "properties": {
+                        "automatic": { "type": "boolean" },
+                        "channel": { "type": "string", "enum": ["stable", "prerelease"] },
+                        "window": { "type": ["string", "null"] },
+                        "current": { "type": "string" },
+                        "available": { "type": ["string", "null"] },
+                        "lastCheckAt": { "type": ["integer", "null"] },
+                        "lastResult": { "type": ["string", "null"] },
+                        "lastReason": { "type": ["string", "null"] },
+                        "lastUpdateAt": { "type": ["integer", "null"] },
+                        "failed": { "type": "boolean" },
+                    },
+                    "required": [
+                        "automatic", "channel", "window", "current", "available", "lastCheckAt",
+                        "lastResult", "lastReason", "lastUpdateAt", "failed"
+                    ],
                 }
             }),
             &[
