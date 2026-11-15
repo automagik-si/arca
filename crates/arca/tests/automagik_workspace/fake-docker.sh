@@ -11,6 +11,10 @@
 # - `docker network` keeps each network as a directory under $FAKE_DOCKER_DIR/networks, internal when it was made
 #   so. A running container that is connected to one gets the next address of 10.88.0.0/24 there, which
 #   `docker inspect` then answers.
+# - An image is on this machine once it was pulled: a file under $FAKE_DOCKER_DIR/images, which `docker image
+#   inspect` answers. `docker pull` puts it there (it fails while $FAKE_DOCKER_DIR/fail-pull is there, with that
+#   file's words), and so does a `docker run` without `--pull never`, as Docker pulls a missing image itself. A run
+#   with `--pull never` of an image that is not here fails, as with Docker.
 # - While $FAKE_DOCKER_DIR/fail-rm-<name> is there, `docker rm` leaves that container and fails.
 # - While $FAKE_DOCKER_DIR/fail-inspect is there, `docker inspect` fails as it does when the daemon cannot be
 #   reached; while warn-inspect is there it prints a warning beside its answer.
@@ -19,14 +23,19 @@
 #   the code in $FAKE_DOCKER_DIR/health-<name> (401 when there is no such file) and succeeds on 401.
 set -u
 root=$FAKE_DOCKER_DIR
-mkdir -p "$root/containers" "$root/networks"
+mkdir -p "$root/containers" "$root/networks" "$root/images"
+# The file that stands for one image here.
+image_file() {
+  local ref=$1
+  printf '%s/images/%s' "$root" "${ref//[\/:@]/_}"
+}
 printf '%s\n' "$*" >>"$root/calls.log"
 command=${1-}
 [ $# -gt 0 ] && shift
 
 case $command in
   run)
-    name='' token_dir='' token_file='' joins='' netmode=default
+    name='' token_dir='' token_file='' joins='' netmode=default pull=missing
     while [ $# -gt 0 ]; do
       case $1 in
         --name) name=$2; shift 2 ;;
@@ -42,6 +51,7 @@ case $command in
           esac
           shift 2
           ;;
+        --pull) pull=$2; shift 2 ;;
         -e | --restart | --user | --cap-drop | --security-opt | --entrypoint) shift 2 ;;
         -*) shift ;;
         *) break ;;
@@ -50,6 +60,13 @@ case $command in
     if [ -e "$root/fail-$name" ]; then
       cat "$root/fail-$name" >&2
       exit 125
+    fi
+    if [ ! -e "$(image_file "${1-}")" ]; then
+      if [ "$pull" = never ]; then
+        echo "docker: Error response from daemon: No such image: ${1-}" >&2
+        exit 125
+      fi
+      : >"$(image_file "${1-}")"
     fi
     if [ -d "$root/containers/$name" ]; then
       echo "docker: Error response from daemon: Conflict. The container name \"/$name\" is already in use" >&2
@@ -95,6 +112,27 @@ case $command in
         ;;
       *) exit 2 ;;
     esac
+    ;;
+  image)
+    [ "${1-}" = inspect ] || exit 2
+    if [ -e "$root/fail-inspect" ]; then
+      echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
+      exit 1
+    fi
+    [ -e "$(image_file "${2-}")" ] || {
+      echo "Error response from daemon: No such image: ${2-}" >&2
+      exit 1
+    }
+    echo '[{}]'
+    ;;
+  pull)
+    [ "${1-}" = -q ] && shift
+    if [ -e "$root/fail-pull" ]; then
+      cat "$root/fail-pull" >&2
+      exit 1
+    fi
+    : >"$(image_file "${1-}")"
+    echo "${1-}"
     ;;
   network)
     action=${1-}

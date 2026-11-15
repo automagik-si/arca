@@ -3444,10 +3444,15 @@ fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
 const AUTOMAGIK_3_136_4: &str =
     "sha256:49e997e36dc35b79b704fac45f2f14cc07cbe7cf3c943e0a5ceebb5a4c1d5dcc";
 
-/// A new Automagik starts from Automagik's own published image, pulled by its digest: the server template and the
-/// workspace's server name the same release, and neither names an image built on the node.
+/// Automagik's published release 3.146.4 (tag v3.146.4, commit 6cbb66e): the image a new workspace starts from.
+const AUTOMAGIK_3_146_4: &str =
+    "sha256:9dfb5fd6ef3a506c0a52d9db600ff8e3cc7afa5b6e8ed7d37a6eea525dbdaea1";
+
+/// A new Automagik starts from Automagik's own published image, pulled by its digest: the server template names
+/// release 3.136.4, the workspace's server release 3.146.4 from the same repository, and neither names an image built
+/// on the node.
 #[test]
-fn the_server_and_the_workspace_pin_automagiks_published_release_by_one_digest() {
+fn the_server_and_the_workspace_pin_automagiks_published_releases_by_digest() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let server = service::load_template(&dir, "automagik-server").unwrap();
     assert_eq!(server.digest.as_deref(), Some(AUTOMAGIK_3_136_4));
@@ -3464,7 +3469,7 @@ fn the_server_and_the_workspace_pin_automagiks_published_release_by_one_digest()
     let workspace = service::load_template(&dir, "automagik-workspace").unwrap();
     assert_eq!(
         workspace.settings.as_ref().unwrap()["serverImage"],
-        format!("{}@{AUTOMAGIK_3_136_4}", server.image)
+        format!("{}@{AUTOMAGIK_3_146_4}", server.image)
     );
     assert!(
         server

@@ -55,7 +55,9 @@
 #   Those a service_create gave (the template lists which it may) stand in place of the template's own.
 #   publicUrl is the workspace's exact public origin (https://<host>, no path); empty, as the template ships it,
 #   means "not set". accessTeamDomain, accessAudience and accessEmails are the owner's Cloudflare Access application for
-#   that address (none of them a secret): all three are set, or none. serverImage is the server's image by digest.
+#   that address (none of them a secret): all three are set, or none. accessEmails is text, one address or several
+#   separated by commas, which the gate gets unchanged; a list with one address in each entry, as workspaces made
+#   before took it, is taken too. serverImage is the server's image by digest.
 #   reach is "cloudflare" (also when it is left out) or "tailnet"; with "tailnet" publicUrl is the node's own
 #   https://<machine>.<tailnet>.ts.net and the Access settings are refused.
 # - /etc/arca-secrets/TUNNEL_TOKEN (reach "cloudflare") or /etc/arca-secrets/TAILSCALE_AUTHKEY (reach "tailnet"):
@@ -71,6 +73,12 @@
 # (`--token-file`) and the tailnet node is told the file's path (`TS_AUTHKEY=file:<path>`), so the secret is not in
 # Docker's record of the container either. The keeper keeps only its digest, to see when it changes. The keeper never reads the server's or
 # the gate's data, and it never copies their output to the console: the server's sign-in link is in both.
+#
+# The server's image is pulled only once its GitHub build provenance verifies: the attestation Automagik's release
+# workflow makes for that digest, in the automagik-si/automagik repository, checked by cosign (Sigstore's own release,
+# at the version and checksum fixed below, which the first boot downloads and checks). An image that does not verify
+# is not pulled, and the server does not start; the keeper says why and tries again after a pause. Every container
+# made from the server's image is started with `--pull never`, so Docker never pulls it by itself.
 #
 # Every path, pause and external program below can be replaced through the environment, which is how the test in
 # crates/arca/tests/automagik_workspace.rs drives the keeper against a fake docker.
@@ -95,6 +103,8 @@ set -u
 : "${WS_REFUSE_EVERY:=300}"   # seconds between two tellings of why the workspace does not start
 : "${WS_BACKOFF_MAX:=300}"    # the longest pause before a part that keeps failing is started again, in seconds
 : "${WS_APT_PAUSE:=20}"       # seconds between two tries of the first boot's package install
+: "${WS_COSIGN:=/usr/local/lib/arca-automagik-workspace/cosign}"  # the provenance verifier, as the first boot installs it
+: "${WS_COSIGN_SHA256:=}"     # the verifier's checksum; empty is the one fixed below for this machine's architecture
 
 SERVER=automagik-server
 GATE=automagik-gate
@@ -105,7 +115,7 @@ RELAY_NET=automagik-relay
 
 # What this script takes from the Automagik server image, each in this one place, as the Automagik repository has
 # them at commit 5fe0be6 (server/compose.gate.yml, server/gate-entrypoint.mjs, server/gate-access.mjs,
-# server/gate-claim.mjs). Those four files are the same at 7aaa512, the commit of release 3.136.4, the build the
+# server/gate-claim.mjs). Those four files are the same at 6cbb66e, the commit of release 3.146.4, the build the
 # shipped template pins. A later build that changes one of them changes one line here.
 SERVER_PORT=3081                                  # the server's own port, fixed in the image
 GATE_PORT=3082                                    # the gate's port, the one upstream's compose file fixes
@@ -133,6 +143,16 @@ TAILNET_IMAGE=docker.io/tailscale/tailscale@sha256:ed6480b33c6eb67c9cbd203ed42b9
 TAILNET_STATE_DIR=/var/lib/tailscale
 TAILNET_SOCKET=/tmp/tailscaled.sock
 
+# The provenance verifier: cosign v3.1.4, Sigstore's own release on GitHub, one binary for each architecture, by its
+# sha256 (the release's cosign_checksums.txt). It trusts what it carries itself, Sigstore's public root, and nothing
+# else: no key, no account and no token. The server's image verifies when it has a build-provenance attestation
+# (SLSA v1) whose signing certificate GitHub Actions issued to a workflow of PROVENANCE_REPO.
+COSIGN_RELEASE=https://github.com/sigstore/cosign/releases/download/v3.1.4
+COSIGN_AMD64=424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+COSIGN_ARM64=ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2
+PROVENANCE_REPO=automagik-si/automagik
+PROVENANCE_ISSUER=https://token.actions.githubusercontent.com
+
 # The relay's whole program, for the server image's node: it listens on the one address and port it is given and
 # copies bytes to and from the same port on loopback. Bytes only: the visitor's Host header reaches the gate as the
 # node sent it.
@@ -141,13 +161,13 @@ RELAY_PROGRAM='const net=require("net");const [ip,port]=process.argv.slice(1);ne
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it.
 WS_PROGRAMS='docker jq systemctl apt-get hostname sha256sum install tr cut date sleep cat chmod chown mv rm grep
-tail mkdir stat'
+tail mkdir stat curl uname'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
 # which docker.io only recommends. The ones the image already carries are named too, so the list says what the script
 # stands on.
-WS_PACKAGES='docker.io docker-cli jq ca-certificates coreutils'
+WS_PACKAGES='docker.io docker-cli jq ca-certificates coreutils curl'
 
 say() { printf 'arca-automagik-workspace: %s\n' "$*"; }
 now() { date +%s; }
@@ -196,6 +216,10 @@ install_workspace() {
     boot_say "first boot failed: these commands are missing after the install: $missing. The packages asked for were: $WS_PACKAGES. The package manager's own words are in /var/log/cloud-init-output.log inside the machine. The machine has no workspace; service_remove it and create it again once it can reach its package mirror"
     exit 1
   fi
+  if ! install_verifier; then
+    boot_say "first boot failed: $REFUSAL. The machine has no workspace; service_remove it and create it again once it can reach github.com"
+    exit 1
+  fi
   mkdir -p "$WS_DOCKER_ETC"
   if [ ! -e "$WS_DOCKER_ETC/daemon.json" ]; then
     # The containers' own output is bounded, so it never fills the machine's disk.
@@ -235,6 +259,40 @@ UNIT
   boot_say "first boot done: the keeper is installed and started"
 }
 
+# The provenance verifier: Sigstore's release of cosign for this machine's architecture, downloaded and kept only
+# when its sha256 is the one fixed above. A download that fails is tried again, as the package install is.
+install_verifier() {
+  local arch sum got try part="$WS_COSIGN.part"
+  case $(uname -m) in
+    x86_64) arch=amd64 sum=$COSIGN_AMD64 ;;
+    aarch64) arch=arm64 sum=$COSIGN_ARM64 ;;
+    *)
+      refuse "the provenance verifier (cosign) has no build fixed here for this machine's architecture, $(uname -m)"
+      return
+      ;;
+  esac
+  sum=${WS_COSIGN_SHA256:-$sum}
+  boot_say "first boot: installing the provenance verifier, cosign-linux-$arch from $COSIGN_RELEASE"
+  if ! mkdir -p "${WS_COSIGN%/*}"; then
+    refuse "the provenance verifier's directory ${WS_COSIGN%/*} could not be made"
+    return
+  fi
+  for try in 1 2 3 4 5 6; do
+    curl -fsSL --proto '=https' -o "$part" "$COSIGN_RELEASE/cosign-linux-$arch" && break
+    boot_say "first boot: the provenance verifier could not be downloaded (try $try of 6); trying again in $WS_APT_PAUSE seconds"
+    sleep "$WS_APT_PAUSE"
+  done
+  got=$(sha256sum "$part" 2>/dev/null | cut -d' ' -f1)
+  if [ "$got" != "$sum" ]; then
+    rm -f "$part"
+    refuse "the provenance verifier from $COSIGN_RELEASE/cosign-linux-$arch is not the one this script fixes (sha256 ${got:-of nothing: it was not downloaded}, where $sum was expected)"
+    return
+  fi
+  if ! { chmod 0755 "$part" && mv -f "$part" "$WS_COSIGN"; }; then
+    refuse "the provenance verifier could not be put at $WS_COSIGN"
+  fi
+}
+
 # The server's /data and the gate's /data: two directories on the machine's own disk, the server user's. Only the
 # directories themselves are touched; what the server and the gate keep in them is never read or changed.
 data_directories() {
@@ -268,12 +326,14 @@ load_settings() {
   url=$(jq -r '.publicUrl | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   REACH=$(jq -r '.reach | if . == null then "cloudflare" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   SERVER_IMAGE=$(jq -r '.serverImage | if type == "string" then . else "" end' "$WS_SETTINGS")
-  # A missing key is an empty one, and so is an empty list. A value of the wrong kind becomes "!", which no rule
-  # below takes. Each entry of the list is one whole address: an entry that holds a comma, a space or a line break
-  # is not one, so the comma-separated value the gate gets has exactly as many addresses as the list has entries.
+  # A missing key is an empty one, and so is an empty list or text of spaces alone. A value of the wrong kind
+  # becomes "!", which no rule below takes. accessEmails is text the gate gets unchanged: one address or several,
+  # separated by commas, spaces around each allowed (the gate trims each one and compares them without regard to
+  # case). The list form, one whole address in each entry, is joined with commas: an entry that holds a comma, a
+  # space or a line break is not one address, so the value the gate gets has as many addresses as the list entries.
   ACCESS_TEAM=$(jq -r '.accessTeamDomain | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   ACCESS_AUDIENCE=$(jq -r '.accessAudience | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
-  ACCESS_EMAILS=$(jq -r --arg address "\\A$address\\z" '.accessEmails | if . == null or . == [] then "" elif type == "array" and length <= 16 and all(.[]; type == "string" and test($address)) then join(",") else "!" end' "$WS_SETTINGS" 2>/dev/null) || ACCESS_EMAILS='!'
+  ACCESS_EMAILS=$(jq -r --arg address "\\A$address\\z" '.accessEmails | if . == null or . == [] then "" elif type == "string" then (if test("\\A *\\z") then "" else . end) elif type == "array" and length <= 16 and all(.[]; type == "string" and test($address)) then join(",") else "!" end' "$WS_SETTINGS" 2>/dev/null) || ACCESS_EMAILS='!'
   ACCESS_COUNT=0
   if [ "$REACH" != cloudflare ] && [ "$REACH" != tailnet ]; then
     REACH=cloudflare
@@ -328,11 +388,13 @@ load_settings() {
     refuse "settings.accessAudience is the Access application's audience tag: 32 to 128 letters and digits"
     return
   fi
-  if ! [[ $ACCESS_EMAILS =~ ^$address(,$address){0,15}$ ]]; then
-    refuse "settings.accessEmails is a list of 1 to 16 e-mail addresses, one in each entry"
+  if ! [[ $ACCESS_EMAILS =~ ^\ *$address\ *(,\ *$address\ *){0,15}$ ]]; then
+    refuse "settings.accessEmails is 1 to 16 e-mail addresses: one, or several separated by commas (owner@example.com, second@example.com), or a list with one address in each entry"
     return
   fi
-  ACCESS_COUNT=$(jq -r '.accessEmails | length' "$WS_SETTINGS")
+  # One address for each comma, and one more.
+  local commas=${ACCESS_EMAILS//[^,]/}
+  ACCESS_COUNT=$((${#commas} + 1))
 }
 
 pinned() {
@@ -417,14 +479,53 @@ keep_server() {
     return 0
   fi
   due server || return 0
-  say "starting the server (Docker downloads its image first when it is not on this machine yet)"
-  if out=$(docker run -d --name "$SERVER" --restart no -v "$WS_DATA:/data" "$SERVER_IMAGE" 2>&1 >/dev/null); then
+  server_image_here || return 0
+  say "starting the server"
+  if out=$(docker run -d --name "$SERVER" --pull never --restart no -v "$WS_DATA:/data" "$SERVER_IMAGE" 2>&1 >/dev/null); then
     say "the server is started from $SERVER_IMAGE"
   else
     docker rm -f "$SERVER" >/dev/null 2>&1
     failed server
     say "the server did not start: $(last_line "$out")"
   fi
+}
+
+# The server's image on this machine, pulled only once its build provenance verifies. An image that is here already
+# was pulled that way: every container made from it is started with --pull never. When it does not verify or cannot be
+# pulled, that is said, the server waits a pause, and the status line says why the server is not started.
+server_image_here() {
+  local out why=''
+  docker image inspect "$SERVER_IMAGE" >/dev/null 2>&1 && return 0
+  say "verifying the server image's build provenance before pulling it: $SERVER_IMAGE, built on GitHub by a workflow of $PROVENANCE_REPO"
+  if [ ! -x "$WS_COSIGN" ]; then
+    why="the verifier $WS_COSIGN is not on this machine: the first boot did not finish"
+  elif ! out=$(verify_provenance 2>&1 >/dev/null); then
+    out=$(last_line "$out")
+    why="cosign says: ${out:-nothing}"
+  fi
+  if [ -n "$why" ]; then
+    failed server
+    UNVERIFIED="the server is not started: its image's build provenance did not verify, so the image is not pulled ($why)"
+    say "$UNVERIFIED. It is tried again after a pause; when it keeps failing, the image is not one Automagik's release workflow built"
+    return 1
+  fi
+  UNVERIFIED=''
+  say "the server image's build provenance verifies: built on GitHub by a workflow of $PROVENANCE_REPO; pulling it"
+  if ! out=$(docker pull -q "$SERVER_IMAGE" 2>&1 >/dev/null); then
+    failed server
+    say "the server's image could not be pulled: $(last_line "$out")"
+    return 1
+  fi
+}
+
+# cosign's check of the server's image, with a home of its own on the machine's memory for Sigstore's root, which it
+# refreshes from Sigstore's own address. It needs no account: the image and its attestation are public.
+verify_provenance() {
+  mkdir -p "$WS_RUN/cosign" &&
+    HOME="$WS_RUN/cosign" "$WS_COSIGN" verify-attestation --type slsaprovenance1 \
+      --certificate-oidc-issuer "$PROVENANCE_ISSUER" \
+      --certificate-identity-regexp "^https://github\\.com/$PROVENANCE_REPO/" \
+      --certificate-github-workflow-repository "$PROVENANCE_REPO" "$SERVER_IMAGE"
 }
 
 # The gate: the same image and digest as the server, the gate's entrypoint, the server's namespace, a file system it
@@ -445,7 +546,7 @@ keep_gate() {
       ;;
   esac
   due gate || return 0
-  local args=(run -d --name "$GATE" --network "container:$SERVER" --restart no --read-only --cap-drop ALL
+  local args=(run -d --name "$GATE" --pull never --network "container:$SERVER" --restart no --read-only --cap-drop ALL
     --security-opt no-new-privileges:true --entrypoint "$IMAGE_NODE"
     -e "$GATE_ENABLED_ENV=1" -e "$GATE_ORIGIN_ENV=$PUBLIC_URL" -e "$GATE_PORT_ENV=$GATE_PORT")
   [ "$ACCESS_COUNT" -eq 0 ] || args+=(-e "$ACCESS_TEAM_ENV=$ACCESS_TEAM" -e "$ACCESS_AUDIENCE_ENV=$ACCESS_AUDIENCE"
@@ -607,7 +708,7 @@ keep_relay() {
     return 0
   fi
   say "starting the relay to the gate"
-  if out=$(docker run -d --name "$RELAY" --network "container:$SERVER" --restart no --read-only --cap-drop ALL \
+  if out=$(docker run -d --name "$RELAY" --pull never --network "container:$SERVER" --restart no --read-only --cap-drop ALL \
     --security-opt no-new-privileges:true --entrypoint "$IMAGE_NODE" "$SERVER_IMAGE" \
     -e "$RELAY_PROGRAM" "$address" "$GATE_PORT" 2>&1 >/dev/null); then
     RELAY_IP=$address
@@ -747,6 +848,7 @@ health_words() {
 look_at_server() {
   health_words server "$SERVER" "$SERVER_PORT"
   SERVER_STATE=$WORDS
+  [ -z "$UNVERIFIED" ] || [ "$WORDS" != "the server is not running" ] || SERVER_STATE=$UNVERIFIED
 }
 
 look_at_gate() {
@@ -882,6 +984,7 @@ KEEPING=''
 KEEPER=''
 WORDS=''
 SERVER_STATE=''
+UNVERIFIED=''
 GATE_STATE=''
 TUNNEL_STATE=''
 
