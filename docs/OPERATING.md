@@ -1680,10 +1680,14 @@ the approved call runs it works the difference out again and changes nothing unl
 service or its template changed since the owner's card was made ... propose it again"): an edit of the template after
 the proposal needs a new card.
 
-The run is the update above with one more step. After the rebuild, while the instance is stopped, the node makes the
-secrets the template generates, saves the record with the template's settings (the node writes the instance's
-environment, `raw.lxc`, ports and `oci.entrypoint` from it) and then starts the service once: one stop and one start for
-the image and the settings together. The record is read again under the node's write gate right before it is written:
+The run is the update above with one more step. Before anything is stopped, the node makes the secrets the template
+generates and puts each secret's and link's value behind a reference; a plan that moved meanwhile is refused with
+nothing changed. After the rebuild, while the instance is stopped, it saves the record with the template's settings
+(the node writes the instance's environment, `raw.lxc`, ports and `oci.entrypoint` from it) and then starts the service
+once: one stop and one start for the image and the settings together. The health check looks at the port the new
+version listens on, the first of the template's ports: through the lan or private port's proxy as before, at the
+service's address when that port is its droidd port, and otherwise by checking that the instance stays running. It
+never looks at a port the template has moved away from. The record is read again under the node's write gate right before it is written:
 a link or a secret set since the card was made fails the step, and the update is rolled back. After the health check
 the new digest is recorded and the config is read back; the answer adds `changes` and `readBack: {matches, differs}`,
 as `service_reconfigure`'s does. The journal has `apply` after `rebuild`, and `read back` before `end`, with key and

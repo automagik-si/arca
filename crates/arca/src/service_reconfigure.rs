@@ -38,7 +38,6 @@ enum Kind {
     Link(String),
 }
 
-/// The service as its template says now, and how that differs from its record.
 /// The verb a template's difference is applied by, which its words name.
 #[derive(Clone, Copy)]
 pub(super) enum Doing {
@@ -63,9 +62,10 @@ impl Doing {
     }
 }
 
+/// The service as its template says now, and how that differs from its record.
 pub(super) struct Plan {
     /// The record as it will be. Its environment holds each value as it is, not yet behind a reference.
-    next: ServiceConfig,
+    pub(super) next: ServiceConfig,
     /// The environment keys whose values are kept behind a reference: those that hold a secret or come from a link.
     hidden: BTreeSet<String>,
     /// The secrets the template makes that the service does not hold yet, with their prefixes.

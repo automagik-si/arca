@@ -438,3 +438,248 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
         ]
     );
 }
+
+/// The node's handlers again, with `clock` and `probe` of the test's own.
+fn handlers_with(
+    rig: &mut Rig,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    probe: Arc<dyn Fn(&str, u16, bool) -> bool + Send + Sync>,
+) {
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(),
+        clock,
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe,
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
+}
+
+/// The template of a service reached at its address on `droidd`, one of `ports`: no lan proxy.
+fn direct(ports: [u16; 2], droidd: u16) -> Value {
+    let mut template = first();
+    template.as_object_mut().expect("an object").remove("lan");
+    template["ports"] = json!(ports);
+    template["droiddPort"] = json!(droidd);
+    template
+}
+
+#[test]
+fn the_health_check_looks_at_the_port_the_template_moves_the_service_to_never_the_old_one() {
+    // The first port was the droidd port, so the old version was probed there. The template moves the first port to
+    // one the node's firewall does not open to it: the new version is checked by staying running, never at 8080.
+    let key = common::SkKey::from_seed(87);
+    let up = Arc::new(AtomicBool::new(true));
+    let mut rig = bare_node(&up, Some(&key));
+    rig.template("app", direct([8080, 9090], 8080));
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("create");
+    let probed = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&probed);
+    handlers_with(
+        &mut rig,
+        Arc::new(|| NOW),
+        Arc::new(move |_, port, _| {
+            log.lock().unwrap().push(port);
+            port == 9090
+        }),
+    );
+    let mut moved = direct([9090, 8080], 8080);
+    moved["entrypoint"] = json!(["/bin/sh", "-ec", SHELL_SCRIPT]);
+    rig.template("app", moved);
+    let proposed = propose_update(&rig, with_template()).expect("proposed");
+    assert!(
+        proposed["args"]["changes"].get("ports").is_some(),
+        "{proposed}"
+    );
+    let done = approve(&rig, &key, &proposed).expect("the new version runs");
+    assert_eq!(done["updated"], true, "{done}");
+    assert!(probed.lock().unwrap().is_empty(), "{:?}", probed.lock());
+    assert_eq!(rig.service_config("app").ports, vec![9090, 8080]);
+
+    // The other way round: the first port the template moves to is the droidd port, so the new version is probed
+    // there, at the service's own address, where it now listens.
+    let key = common::SkKey::from_seed(88);
+    let mut rig = bare_node(&up, Some(&key));
+    rig.template("app", direct([8080, 9090], 9090));
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("create");
+    let probed = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&probed);
+    handlers_with(
+        &mut rig,
+        Arc::new(|| NOW),
+        Arc::new(move |address, port, forwarded| {
+            log.lock()
+                .unwrap()
+                .push((address.to_string(), port, forwarded));
+            port == 9090
+        }),
+    );
+    rig.template("app", direct([9090, 8080], 9090));
+    let proposed = propose_update(&rig, with_template()).expect("proposed");
+    approve(&rig, &key, &proposed).expect("the new version answers on 9090");
+    let seen = probed.lock().unwrap().clone();
+    assert!(!seen.is_empty(), "the new version was probed");
+    let address = rig.service_config("app").ipv4;
+    assert!(
+        seen.iter()
+            .all(|probe| *probe == (address.clone(), 9090, false)),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn a_secret_set_while_the_update_runs_leaves_the_template_unwritten_and_the_rollback_keeps_that_record()
+ {
+    let key = common::SkKey::from_seed(89);
+    let up = Arc::new(AtomicBool::new(true));
+    let mut rig = bare_node(&up, Some(&key));
+    let mut with_secret = first();
+    with_secret["secrets"] = json!(["TOKEN"]);
+    rig.template("app", with_secret);
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("create");
+    let mut later = second();
+    later["secrets"] = json!(["TOKEN"]);
+    rig.template("app", later);
+
+    // The node's clock is the test's hook: when the update journal's last line is its stop, the operator sets the
+    // secret, once, while the instance is stopped and before the template's settings are written.
+    let journal_file = rig.dir.join("service-updates.jsonl");
+    let setter: Arc<std::sync::OnceLock<Arc<dyn ToolHandler>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let fired = Arc::new(AtomicBool::new(false));
+    let clock = {
+        let setter = Arc::clone(&setter);
+        let fired = Arc::clone(&fired);
+        Arc::new(move || {
+            let stopped = fs::read_to_string(&journal_file)
+                .ok()
+                .and_then(|text| text.lines().last().map(str::to_string))
+                .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+                .is_some_and(|line| line["step"] == "stop");
+            if stopped && !fired.swap(true, Ordering::SeqCst) {
+                setter
+                    .get()
+                    .expect("the handlers")
+                    .call(
+                        json!({ "name": "app", "key": "TOKEN", "value": "set-meanwhile" }),
+                        &Caller {
+                            token_id: "operator".into(),
+                            scope: Scope::Operator,
+                            tools: None,
+                        },
+                    )
+                    .expect("the secret is set meanwhile");
+            }
+            NOW
+        })
+    };
+    handlers_with(&mut rig, clock, Arc::new(|_, _, _| true));
+    assert!(
+        setter
+            .set(Arc::clone(&rig.handlers["service_secret_set"]))
+            .is_ok()
+    );
+    let proposed = propose_update(&rig, with_template()).expect("proposed");
+    let actions = rig.fake.state_actions(PROJECT, "app").len();
+    let (code, message) = refusal_words(approve(&rig, &key, &proposed));
+    assert!(fired.load(Ordering::SeqCst), "the hook ran");
+    assert_eq!(code, "rolled_back", "{message}");
+    assert!(
+        message.contains("a link or a secret was set meanwhile"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("its old settings are back"),
+        "nothing was written, so nothing was put back: {message}"
+    );
+
+    // The record is the one the operator left: the secret stays, and none of the template's settings went in.
+    let record = rig.service_config("app");
+    assert!(
+        record.secret_refs.contains_key("TOKEN"),
+        "{:?}",
+        record.secret_refs
+    );
+    assert_eq!(record.entrypoint, None);
+    assert!(!record.environment.contains_key("APP_CONTROL_DATABASE"));
+    let after = config(&rig);
+    assert!(after.get("oci.entrypoint").is_none(), "{after}");
+    assert!(after.get(service::ENTRYPOINT_KEY).is_none(), "{after}");
+    // The old version runs again from its own digest, with one stop and one start: no second restart.
+    assert_eq!(
+        rig.fake.state_actions(PROJECT, "app")[actions..],
+        ["stop", "start"]
+    );
+    let steps = journal(&rig);
+    assert!(steps.contains(&("apply".to_string(), false)), "{steps:?}");
+    assert!(
+        !steps.iter().any(|(step, _)| step == "put back"),
+        "{steps:?}"
+    );
+}
+
+/// PATCHes the instance's config as an operator would with Incus, outside Arca.
+fn patch_instance(rig: &Rig, add: Value) {
+    let path = format!("/1.0/instances/app?project={PROJECT}");
+    let mut config = rig.get(&path).expect("the instance")["config"].clone();
+    for (key, value) in add.as_object().expect("an object") {
+        config[key] = value.clone();
+    }
+    rig.edit("PATCH", &path, json!({ "config": config }));
+}
+
+#[test]
+fn an_operator_entrypoint_on_a_service_whose_record_names_none_is_never_taken_off() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = rig(&up);
+    assert_eq!(rig.service_config("app").entrypoint, None);
+    patch_instance(&rig, json!({ "oci.entrypoint": "/opt/own serve" }));
+    rig.apply(&rig.service_config("app")).expect("reconcile");
+    let after = config(&rig);
+    assert_eq!(after["oci.entrypoint"], "/opt/own serve", "{after}");
+    assert!(after.get(service::ENTRYPOINT_KEY).is_none(), "{after}");
+}
+
+#[test]
+fn a_marked_entrypoint_an_operator_changed_since_is_left_and_only_the_mark_goes() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = rig(&up);
+    patch_instance(
+        &rig,
+        json!({ "oci.entrypoint": "/opt/changed serve", service::ENTRYPOINT_KEY: "/opt/arca wrote" }),
+    );
+    rig.apply(&rig.service_config("app")).expect("reconcile");
+    let after = config(&rig);
+    assert_eq!(after["oci.entrypoint"], "/opt/changed serve", "{after}");
+    assert!(after.get(service::ENTRYPOINT_KEY).is_none(), "{after}");
+}
+
+#[test]
+fn a_marked_entrypoint_still_as_written_goes_when_the_record_names_none() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = rig(&up);
+    patch_instance(
+        &rig,
+        json!({ "oci.entrypoint": "/opt/arca wrote", service::ENTRYPOINT_KEY: "/opt/arca wrote" }),
+    );
+    rig.apply(&rig.service_config("app")).expect("reconcile");
+    let after = config(&rig);
+    assert!(after.get("oci.entrypoint").is_none(), "{after}");
+    assert!(after.get(service::ENTRYPOINT_KEY).is_none(), "{after}");
+}

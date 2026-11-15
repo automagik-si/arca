@@ -756,20 +756,7 @@ impl ServiceHandler {
                 "its template declares no port, so there is nothing to check after the start",
             ));
         };
-        // How the node can tell that it answers: the host port's proxy, the droidd port, or only that it runs.
-        let reach = if let Some(lan) = &config.lan {
-            Reach::Lan(lan.port)
-        } else if let Some((address, port)) = config
-            .private_port
-            .as_ref()
-            .and_then(|private| Some((private.address.parse().ok()?, private.port)))
-        {
-            Reach::Private(address, port)
-        } else if config.droidd_port == Some(port) {
-            Reach::Direct(port)
-        } else {
-            Reach::Running
-        };
+        let reach = reach_of(&config, port);
         // What the template says now about no-new-privileges, against what the service has. A difference is applied
         // as a config write and a restart, never a rebuild, so the data stays where it is. It is its own step: an
         // update that also moves the digest is refused, so no answer mixes the two and a failure of one never
@@ -882,6 +869,18 @@ impl ServiceHandler {
             Some(first)
         } else {
             None
+        };
+        // The new version listens where its template says now, so the health check looks there, never at the old port.
+        let (port, reach) = match &first {
+            Some(first) => {
+                let Some(port) = first.next.ports.first().copied() else {
+                    return Err(said(
+                        "its template now declares no port, so there is nothing to check after the start",
+                    ));
+                };
+                (port, reach_of(&first.next, port))
+            }
+            None => (port, reach),
         };
         let journal = Journal {
             path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
@@ -1154,6 +1153,24 @@ struct KeyUpdate {
     port: u16,
     reach: Reach,
     seconds: u64,
+}
+
+/// How the node can tell that the service `config` answers on its first port `port`: the host port's proxy, the
+/// droidd port its firewall opens to the node, or only that it runs.
+fn reach_of(config: &ServiceConfig, port: u16) -> Reach {
+    if let Some(lan) = &config.lan {
+        Reach::Lan(lan.port)
+    } else if let Some((address, port)) = config
+        .private_port
+        .as_ref()
+        .and_then(|private| Some((private.address.parse().ok()?, private.port)))
+    {
+        Reach::Private(address, port)
+    } else if config.droidd_port == Some(port) {
+        Reach::Direct(port)
+    } else {
+        Reach::Running
+    }
 }
 
 /// How the node tells that a service answers.
