@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -219,42 +219,26 @@ impl Rig {
         content_type: &str,
         body: &[u8],
     ) -> Reply {
-        let mut stream = UnixStream::connect(&self.socket).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
-        let mut head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nContent-Length: {}\r\n",
-            body.len()
-        );
-        if !body.is_empty() {
-            head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        send_on(&self.socket, method, path, headers, content_type, body)
+    }
+
+    /// The store as a restart reads it from disk, serving its routes on a socket of its own: its path.
+    fn serve_reopened(&self, name: &str) -> PathBuf {
+        let router = Arc::new(self.reopened()).router();
+        let socket = self._scratch.path(name);
+        let served = socket.clone();
+        self._runtime.spawn(async move {
+            let _ = serve_unix(router, &served).await;
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(
+                Instant::now() < until,
+                "the reopened store's server started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
-        for (name, value) in headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
-        head.push_str("\r\n");
-        let mut bytes = head.into_bytes();
-        bytes.extend_from_slice(body);
-        stream.write_all(&bytes).expect("write");
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("read");
-        let split = raw
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("a response head");
-        let head = String::from_utf8_lossy(&raw[..split]).to_string();
-        let status = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|status| status.parse().ok())
-            .expect("a status");
-        Reply {
-            status,
-            head,
-            body: raw[split + 4..].to_vec(),
-        }
+        socket
     }
 
     fn get(&self, path: &str) -> Reply {
@@ -458,6 +442,53 @@ impl Rig {
 
     fn journal(&self) -> String {
         fs::read_to_string(self.state_dir.join(arca::mcp_oauth::JOURNAL_FILE)).unwrap_or_default()
+    }
+}
+
+/// One HTTP request on the unix socket `socket`, read to the end.
+fn send_on(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    content_type: &str,
+    body: &[u8],
+) -> Reply {
+    let mut stream = UnixStream::connect(socket).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if !body.is_empty() {
+        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    stream.write_all(&bytes).expect("write");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .expect("a status");
+    Reply {
+        status,
+        head,
+        body: raw[split + 4..].to_vec(),
     }
 }
 
@@ -2290,12 +2321,30 @@ fn a_client_registered_for_its_redirect_alone_cannot_start_a_device_flow() {
     let id = body["client_id"].as_str().expect("a client id").to_string();
     assert_eq!(rig.device_authorization(&[("client_id", &id)]).status, 200);
     assert!(rig.authorize(&id, &[]).text().contains("data-request"));
-    // The grant types survive a restart of the store.
-    let reopened = rig.reopened();
-    drop(reopened);
-    let store =
-        fs::read_to_string(rig.state_dir.join(arca::mcp_oauth::STORE_FILE)).expect("the store");
-    assert!(store.contains(DEVICE_GRANT), "{store}");
+    // The grant types survive a restart of the store: the reopened store still starts a device flow for a device
+    // client, and still refuses one to the client that registered its redirect alone.
+    let agent = rig.device_client("Agent on a server");
+    let socket = rig.serve_reopened("reopened.sock");
+    let start = |client: &str| {
+        send_on(
+            &socket,
+            "POST",
+            "/oauth/device_authorization",
+            &[],
+            "application/x-www-form-urlencoded",
+            form(&[("client_id", client), ("scope", "viewer")]).as_bytes(),
+        )
+    };
+    let started = start(&agent);
+    assert_eq!(started.status, 200, "{}", started.text());
+    assert!(
+        started.json()["device_code"].is_string(),
+        "{}",
+        started.text()
+    );
+    let refused = start(&desktop);
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    assert_eq!(error_of(&refused), "unauthorized_client");
 }
 
 #[test]
@@ -2330,8 +2379,13 @@ fn the_passkey_statement_of_a_device_request_binds_its_user_code() {
 fn a_revoked_clients_waiting_device_code_ends_at_once() {
     let (rig, _key) = Rig::new("oauth-device-revoked");
     let client = rig.device_client("Gone");
+    let kept = rig.device_client("Kept");
     let device = rig.device_code(&client, "viewer");
     let code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    let kept_code = rig.device_code(&kept, "viewer")["device_code"]
         .as_str()
         .expect("a device code")
         .to_string();
@@ -2339,6 +2393,11 @@ fn a_revoked_clients_waiting_device_code_ends_at_once() {
     rig.oauth.revoke_client(&client, "test").expect("revoked");
     rig.advance(5_000);
     assert_eq!(error_of(&rig.poll(&client, &code)), "invalid_grant");
+    // Only that client's codes end: another client's waiting code still waits.
+    assert_eq!(
+        error_of(&rig.poll(&kept, &kept_code)),
+        "authorization_pending"
+    );
 }
 
 #[test]
@@ -2351,9 +2410,30 @@ fn a_device_grant_with_approvals_is_the_owners_session_as_the_code_flows_is() {
             .as_str()
             .expect("a link"),
     ));
-    assert!(page.text().contains("id=\"approvals\""), "{}", page.text());
+    // The device consent page says it plainly, as the code flow's does.
+    let text = page.text();
+    assert!(text.contains("id=\"approvals\""), "{text}");
+    assert!(
+        text.contains("It also asks to be your signed-in session for approvals."),
+        "{text}"
+    );
+    assert!(
+        text.contains("<strong id=\"scope\">viewer approvals</strong>"),
+        "{text}"
+    );
+    assert!(text.contains("id=\"device-note\""), "{text}");
     let approved = rig.approve_with(&key, &Rig::request_id(&page));
     assert_eq!(approved.status, 200, "{}", approved.text());
+    let granted = rig
+        .journal()
+        .lines()
+        .find(|line| line.contains("\"event\":\"granted\""))
+        .expect("a granted line")
+        .to_string();
+    assert!(
+        granted.contains("\"device\":true") && granted.contains("\"scope\":\"viewer approvals\""),
+        "{granted}"
+    );
     // The agent polls a little later: the passkey still counts from the moment it approved.
     rig.advance(10_000);
     let reply = rig.poll(
