@@ -1407,6 +1407,16 @@ pub fn plan_handlers_versioned(
             .and_then(crate::vm_import::ImportBackend::from_node)
             .map(Arc::new),
     );
+    // A waiting import's card names the source cluster the run reads: the one of this node's config, the config the
+    // backend above was made from. A card proposed under another config is written again before anything is served.
+    if let Ok(mut kernel) = kernel.lock() {
+        let import = node
+            .as_deref()
+            .and_then(|node| node.kernel.instance_import.as_ref());
+        kernel.reword_import_cards(|args, stored| {
+            crate::vm_import::row_after_restart(import, args, stored)
+        });
+    }
     let host_network_socket = node.as_ref().map_or_else(
         || std::path::PathBuf::from(arca_hostnet::SOCKET_FILE),
         |node| node.host_network.socket.clone(),

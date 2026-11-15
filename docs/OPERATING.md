@@ -2864,7 +2864,9 @@ The copy reads the source cluster with that client alone and writes the Incus po
 cluster; Arca never writes the source cluster, and the client's read-only grant above keeps anything else run as it
 from writing there. The card's `Ceph` row names both clusters (and says when the two config files name one `fsid`: one
 cluster under two names), and the run's answer says `Copied from the Ceph cluster <name> … to the Ceph cluster
-<Incus's cluster>` (its `ceph` field). A failed copy names the side that failed, its cluster and its client.
+<Incus's cluster>` (its `ceph` field). A failed copy names the side that failed, its cluster and its client. If you
+change `kernel.instanceImport` while an import waits for the owner, the restart writes that card's `Ceph` row again from
+the new config, which is what the run will read with; without `kernel.instanceImport` the card has no `Ceph` row.
 
 The copy streams through the node, from one `rbd` into the other by an OS pipe (64 KiB): the node holds that pipe and up
 to about 100 MiB per `rbd` process, whatever the disk's size. It takes the data the disk holds (unwritten parts are not sent) over the slowest of the

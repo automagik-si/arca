@@ -1982,6 +1982,37 @@ impl ActionProposalStore {
         store
     }
 
+    /// Writes each waiting import's `Ceph` row again as `row_of` gives it for the import's arguments and the row it shows
+    /// now (`None`: no row), and rewrites the journal when a card changed. The row was read from the node's config when
+    /// the import was proposed; `serve` calls this with the config it runs with, so a card never names a source cluster
+    /// the run would not read. The arguments, their digest and every other row stay as they are.
+    pub fn reword_imports(&mut self, row_of: impl Fn(&Value, Option<&str>) -> Option<String>) {
+        let action = ActionKind::InstanceImport;
+        let mut changed = false;
+        for proposal in &mut self.waiting {
+            if proposal.action != action.as_str() {
+                continue;
+            }
+            let stored = proposal
+                .details
+                .iter()
+                .find(|row| row.label == "Ceph")
+                .map(|row| row.value.as_str());
+            let details = match row_of(&proposal.args, stored) {
+                Some(row) => action
+                    .details_with_gpu(&proposal.args, Some(&crate::vm_import::ceph_fact(&row))),
+                None => action.details(&proposal.args),
+            };
+            if details != proposal.details {
+                proposal.details = details;
+                changed = true;
+            }
+        }
+        if changed {
+            self.compact();
+        }
+    }
+
     /// The waiting proposals, in the order they were made.
     pub fn waiting(&self) -> &[ActionProposal] {
         &self.waiting
@@ -2943,6 +2974,71 @@ mod tests {
         assert_eq!(store.waiting().len(), 1);
         assert_eq!(store.waiting()[0].details, proposed.details);
         assert_eq!(store.waiting()[0].summary, proposed.summary);
+    }
+
+    #[test]
+    fn an_import_card_names_the_source_cluster_of_the_config_serve_starts_with() {
+        let dir = Temp::new("import-reword");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let fact = crate::vm_import::ceph_fact(IMPORT_CEPH_ROW);
+        let proposed = store
+            .propose(
+                ActionKind::InstanceImport,
+                import_args(),
+                1_000,
+                Some(&fact),
+            )
+            .expect("an import proposal");
+        drop(store);
+        let config = |cluster: &str| -> crate::config::InstanceImportConfig {
+            serde_json::from_value(json!({ "sourcePool": "src-pool", "cephCluster": cluster }))
+                .expect("an import config")
+        };
+        let reopened = |import: Option<&crate::config::InstanceImportConfig>| {
+            let mut store = ActionProposalStore::open(&dir.0, 2_000, None);
+            store.reword_imports(|args, stored| {
+                crate::vm_import::row_after_restart(import, args, stored)
+            });
+            let details = store.waiting()[0].details.clone();
+            drop(store);
+            // The journal holds the card as it was written again.
+            assert_eq!(
+                ActionProposalStore::open(&dir.0, 2_000, None).waiting()[0].details,
+                details
+            );
+            details
+        };
+        let ceph = |details: &[ActionDetail]| -> Option<String> {
+            details
+                .iter()
+                .find(|row| row.label == "Ceph")
+                .map(|row| row.value.clone())
+        };
+
+        // The config the card was proposed under: the card stays as it was.
+        assert_eq!(reopened(Some(&config("source-b"))), proposed.details);
+        // Another source cluster: the row names it, and the target's cluster is left to Incus.
+        let other = reopened(Some(&config("source-c")));
+        assert_eq!(
+            ceph(&other).as_deref(),
+            Some(
+                "Arca reads the source pool src-pool on the Ceph cluster source-c as client.arca-import, set up to only read, and never writes it. It writes only the images Incus makes in the Incus pool remote, on the cluster Incus names for it when the import runs"
+            )
+        );
+        assert_eq!(labels(&other), labels(&proposed.details));
+        // A source pool that does not hold the disks: the run refuses, and the card has no row.
+        let elsewhere: crate::config::InstanceImportConfig =
+            serde_json::from_value(json!({ "sourcePool": "one", "cephCluster": "source-c" }))
+                .expect("an import config");
+        assert_eq!(ceph(&reopened(Some(&elsewhere))), None);
+        // No import config: no row, and every other row as it was.
+        let none = reopened(None);
+        assert_eq!(ceph(&none), None);
+        assert_eq!(none, ActionKind::InstanceImport.details(&import_args()));
+        assert_eq!(
+            ActionProposalStore::open(&dir.0, 2_000, None).waiting()[0].args_digest,
+            proposed.args_digest
+        );
     }
 
     #[test]

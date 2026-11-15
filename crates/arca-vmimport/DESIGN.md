@@ -181,9 +181,12 @@ minutes. On 10 Gbit/s the clusters are usually the limit, a few hundred MB/s.
 The card's `Ceph` row names both clusters, as the node's config and Incus say when the proposal is made, and the run's
 answer says `Copied from the Ceph cluster <source> … to the Ceph cluster <target>`. Two config names are two clusters
 on the card unless their files name one `fsid`, which the row then says. A target pool that is not Ceph, or one Incus
-does not answer for, gets a row that says so; neither refuses the proposal. The row is kept when `serve` restarts with
-the proposal waiting. A failed `rbd` names its side, cluster and client (`reading the Ceph cluster b as
-client.arca-import: …`, `writing the Ceph cluster ceph as client.admin: …`).
+does not answer for, gets a row that says so; neither refuses the proposal. When `serve` restarts with the proposal
+waiting, the row is kept if the node's import config still names the same source pool, cluster and client, the ones the
+run reads with. Otherwise the row is written again from the config the run reads, with the target's cluster left to
+Incus; a node with no `kernel.instanceImport` any more shows no row, and its run refuses. The arguments and their digest
+never change. A failed `rbd` names its side, cluster and client (`reading the Ceph cluster b as client.arca-import: …`,
+`writing the Ceph cluster ceph as client.admin: …`).
 
 ## Ceph access
 

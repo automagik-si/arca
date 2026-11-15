@@ -40,6 +40,42 @@ struct Rig {
     copy: Arc<FakeCopy>,
 }
 
+/// The node config `serve` reads, with `import` as its `kernel.instanceImport`.
+fn node(scratch: &Scratch, fake: &arca_incus::FakeIncus, import: Option<Value>) -> NodeConfig {
+    let mut kernel = json!({ "projects": ["arcak-svc"], "droiddProjects": ["people"] });
+    if let Some(import) = import {
+        kernel["instanceImport"] = import;
+    }
+    serde_json::from_value(json!({
+        "stateDir": scratch.dir.join("node-state"),
+        "incus": { "socket": fake.socket() },
+        "listen": { "unix": scratch.dir.join("arca.sock") },
+        "tokens": { "hashDir": scratch.dir.join("tokens") },
+        "kernel": kernel
+    }))
+    .expect("the node config")
+}
+
+/// The plan handlers `serve` makes for `node`.
+fn served(
+    kernel: &Arc<Mutex<Kernel>>,
+    clock: Arc<AtomicU64>,
+    node: NodeConfig,
+) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
+    plan_handlers_served(
+        Arc::clone(kernel),
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+        None,
+        None,
+        None,
+        None,
+        ActionSlot::default(),
+        Some(Arc::new(node)),
+    )
+    .into_iter()
+    .collect()
+}
+
 fn rig(tag: &str, key: &SkKey) -> Rig {
     let scratch = Scratch::new(tag);
     let mut state = fake_state();
@@ -56,30 +92,15 @@ fn rig(tag: &str, key: &SkKey) -> Rig {
     ));
     let clock = Arc::new(AtomicU64::new(NOW));
     // The node reads the source pool on a Ceph cluster of its own, `source-b`; the Incus pool is on `cluster-b`.
-    let node: NodeConfig = serde_json::from_value(json!({
-        "stateDir": scratch.dir.join("node-state"),
-        "incus": { "socket": fake.socket() },
-        "listen": { "unix": scratch.dir.join("arca.sock") },
-        "tokens": { "hashDir": scratch.dir.join("tokens") },
-        "kernel": {
-            "projects": ["arcak-svc"],
-            "droiddProjects": ["people"],
-            "instanceImport": { "sourcePool": "src-pool", "cephCluster": "source-b" }
-        }
-    }))
-    .expect("the node config");
-    let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = plan_handlers_served(
-        Arc::clone(&kernel),
-        Arc::new(move || clock.load(Ordering::SeqCst)),
-        None,
-        None,
-        None,
-        None,
-        ActionSlot::default(),
-        Some(Arc::new(node)),
-    )
-    .into_iter()
-    .collect();
+    let handlers = served(
+        &kernel,
+        clock,
+        node(
+            &scratch,
+            &fake,
+            Some(json!({ "sourcePool": "src-pool", "cephCluster": "source-b" })),
+        ),
+    );
     let copy = Arc::new(FakeCopy::on_cluster("source-b"));
     copy.target(
         "remote/virtual-machine_people_web-1.block",
@@ -198,6 +219,71 @@ fn a_pool_incus_does_not_have_or_that_is_not_ceph_still_gets_a_card_that_says_so
         ceph_row(&not_ceph)
     );
     assert!(rig.writes().is_empty(), "a proposal changes nothing");
+}
+
+#[test]
+fn after_a_restart_the_card_names_the_source_cluster_the_run_reads() {
+    let key = SkKey::from_seed(45);
+    let tag = "import-restart";
+    let rig = rig(tag, &key);
+    let proposal = rig
+        .propose("instance_import", import_args())
+        .expect("proposed");
+    let proposed = ceph_row(&proposal);
+    assert!(proposed.contains("on the Ceph cluster source-b as client.arca-import"));
+    let Rig {
+        _scratch: scratch,
+        fake,
+        kernel,
+        handlers,
+        executor,
+        ..
+    } = rig;
+    drop((handlers, executor, kernel));
+
+    // `serve` starts again with `import` as its config: the waiting card, as the approval page reads it.
+    let reopened = |import: Option<Value>| -> Value {
+        let verifier = verifier_for(&scratch, &[&key], tag);
+        let kernel = Arc::new(Mutex::new(
+            kernel_with_image(&scratch, &fake, verifier, NOW, None).expect("the kernel opens"),
+        ));
+        let handlers = served(
+            &kernel,
+            Arc::new(AtomicU64::new(NOW)),
+            node(&scratch, &fake, import),
+        );
+        let waiting = kernel.lock().expect("the kernel lock").action_proposals()[0].clone();
+        drop((handlers, kernel));
+        assert_eq!(
+            waiting.args_digest, proposal["argsDigest"],
+            "the digest stays"
+        );
+        serde_json::to_value(waiting).expect("the card")
+    };
+
+    // The same config: the card as the owner was first shown it.
+    let same = reopened(Some(
+        json!({ "sourcePool": "src-pool", "cephCluster": "source-b" }),
+    ));
+    assert_eq!(ceph_row(&same), proposed);
+    // The source is now on `source-c`, which is what the run would read: the card says so.
+    let moved = reopened(Some(
+        json!({ "sourcePool": "src-pool", "cephCluster": "source-c" }),
+    ));
+    assert_eq!(
+        ceph_row(&moved),
+        "Arca reads the source pool src-pool on the Ceph cluster source-c as client.arca-import, set up to only read, and never writes it. It writes only the images Incus makes in the Incus pool remote, on the cluster Incus names for it when the import runs"
+    );
+    // A node that no longer imports: no row; its run refuses.
+    let off = reopened(None);
+    assert!(
+        off["details"]
+            .as_array()
+            .expect("the card's rows")
+            .iter()
+            .all(|row| row["label"] != "Ceph"),
+        "{off}"
+    );
 }
 
 fn import_args() -> Value {

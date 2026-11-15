@@ -624,4 +624,39 @@ mod tests {
         assert!(copy.copy(&bad, &target()).is_err());
         assert!(copy.runner.calls.lock().expect("calls").is_empty());
     }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    /// Real processes: the side whose process exits with a failure is the side the failure names. `sh` stands in for
+    /// each `rbd`.
+    #[test]
+    fn a_real_pipe_names_the_side_whose_process_failed() {
+        let runner = ProcessRunner;
+        let reader = runner
+            .pipe(
+                &argv(&["sh", "-c", "echo gone >&2; exit 3"]),
+                &argv(&["cat"]),
+            )
+            .expect_err("the reader failed");
+        assert_eq!(reader.writer, None, "{reader:?}");
+        assert_eq!(reader.reader.as_deref(), Some("sh failed: gone"));
+        let writer = runner
+            .pipe(
+                &argv(&["echo", "x"]),
+                &argv(&["sh", "-c", "cat >/dev/null; echo denied >&2; exit 4"]),
+            )
+            .expect_err("the writer failed");
+        assert_eq!(writer.reader, None, "{writer:?}");
+        assert_eq!(writer.writer.as_deref(), Some("sh failed: denied"));
+        let both = runner
+            .pipe(
+                &argv(&["sh", "-c", "exit 3"]),
+                &argv(&["sh", "-c", "exit 4"]),
+            )
+            .expect_err("both failed");
+        assert!(both.reader.is_some() && both.writer.is_some(), "{both:?}");
+        assert_eq!(runner.pipe(&argv(&["echo", "x"]), &argv(&["cat"])), Ok(()));
+    }
 }
