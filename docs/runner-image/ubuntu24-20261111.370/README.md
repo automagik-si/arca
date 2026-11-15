@@ -9,7 +9,7 @@ Built from GitHub's own scripts in [actions/runner-images ubuntu24/20261111.370]
 | Built on | 2026-11-14, a virtual machine of 4 CPUs and 8GiB, root disk throttled to 150MB/s read and 80MB/s write; Packer 1.16.2; base images:ubuntu/24.04/cloud |
 | Build time | 1h35m in all: machine 0h05m, GitHub's template 1h29m, report and finish 0h00m, image 0h00m |
 | Size | 54 GiB used on the root disk |
-| Result | the stopped machine arca-runner-build-ubuntu24, snapshot image, in project ci |
+| Result | the stopped machine arca-runner-image-ubuntu24-20261111-370, snapshot image, in project ci |
 | GitHub's image tests | all passed |
 
 ## What we change from GitHub's build, and what differs

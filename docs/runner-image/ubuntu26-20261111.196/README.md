@@ -9,7 +9,7 @@ Built from GitHub's own scripts in [actions/runner-images ubuntu26/20261111.196]
 | Built on | 2026-11-15, a virtual machine of 4 CPUs and 7GiB, root disk throttled to 150MB/s read and 80MB/s write; Packer 1.16.2; base images:ubuntu/26.04/cloud |
 | Build time | 1h08m in all: machine 0h03m, GitHub's template 1h02m, report and finish 0h00m, image 0h01m |
 | Size | 52 GiB used on the root disk |
-| Result | the stopped machine arca-runner-build-ubuntu26, snapshot image, in project ci |
+| Result | the stopped machine arca-runner-image-ubuntu26-20261111-196, snapshot image, in project ci |
 | GitHub's image tests | all passed |
 
 ## What we change from GitHub's build, and what differs
@@ -206,3 +206,5 @@ Our full software list is [software-report.md](software-report.md) (GitHub's gen
   without them.
 - The image was kept as the stopped machine with a snapshot, not published: publishing needs about twice its size free
   under `/var/lib/incus` on the build host.
+- Its snapshot was made a third time without the build's NIC, which the address pin had copied from the profile into
+  the machine (a copy would have kept it over its own profile's NIC).
