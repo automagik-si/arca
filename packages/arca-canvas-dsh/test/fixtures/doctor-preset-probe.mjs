@@ -35,6 +35,42 @@ export function apply(ctx, config) {
     setup: async (agentCtx) => { await ctx.agentPresets.mount(agentCtx, preset); },
   });
 
+  // A Doctor turn stopped by one of its limits. The per-turn tool-call cap is the one that needs no model: inside the
+  // turn's first pre-step, before any request, the probe calls a Doctor read 41 times as the agent loop would. The
+  // reads fail (the config's hosts are placeholders) but each one counts, and the 41st makes the Doctor stop the turn.
+  const stoppedTurn = async () => {
+    const handle = await open('arca-doctor');
+    const { agent } = handle;
+    const ends = [];
+    const off = ctx.on('session/event', (session, event) => {
+      if (session?.id === agent.session.id && event?.type === 'turn/end') ends.push(event.data?.reason ?? null);
+    });
+    const refusals = [];
+    agent.ctx.on('agent/pre-step', async (input, next) => {
+      if (!refusals.length) {
+        const read = ctx.tools.get('arca_status', agent);
+        for (let index = 1; index <= 41; index += 1) {
+          try {
+            await read.execute({}, { callId: `probe-${index}`, agent, signal: new AbortController().signal });
+            refusals.push('ran');
+          } catch (error) {
+            refusals.push(String(error?.message ?? error));
+          }
+        }
+      }
+      return next();
+    });
+    const message = Object.freeze({
+      id: randomUUID(), role: 'user', content: [{ type: 'text', text: 'probe' }], source: { kind: 'user' },
+    });
+    agent.send(message, 'next-turn', true);
+    await Promise.race([agent.whenIdle().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 20_000))]);
+    off();
+    // Closing the session writes what it holds to its file.
+    await handle.dispose?.();
+    return { sessionId: agent.session.id, last: refusals.at(-1) ?? null, counted: refusals.length, ends };
+  };
+
   const run = async () => {
     const out = { route: ROUTE, agents: [] };
     try {
@@ -47,6 +83,7 @@ export function apply(ctx, config) {
       out.agents.push(await seen(blank.agent, 'blank-before-switch'));
       await ctx.agentPresets.select(blank.agent, 'arca-doctor');
       out.agents.push(await seen(blank.agent, 'switched'));
+      out.stopped = await stoppedTurn();
     } catch (error) {
       out.error = String(error?.stack ?? error);
     }

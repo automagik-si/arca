@@ -3,14 +3,15 @@
 // construction: they are fork detectors, and fail only if one entry stops using the shared module. What the fences
 // actually do is pinned with literal expectations here, and on a real DSH in doctor-preset-real-dsh.test.js.
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import yaml from 'js-yaml';
 import * as canvas from '../index.js';
 import * as terminal from '../doctor.js';
-import { findDoctorPreset, main as launch } from '../doctor-launch.js';
+import { doctorPresetProblem, findDoctorPreset, main as launch } from '../doctor-launch.js';
 import { ChatStore, createDoctorChat } from '../src/chat.js';
 import {
   DOCTOR_LIMITS, DOCTOR_MODEL, DOCTOR_PRESET, DOCTOR_TOOLS, PROPOSE_TOOL, createDoctorTools, createHostReaders,
@@ -103,7 +104,7 @@ async function openWebDoctor(config) {
 // step conditions, the agent registry (its creation edge and its live list), tools/change, and agents that either
 // joined this preset (they see its tools) or did not.
 function terminalHost({ titles } = {}) {
-  const host = { registered: [], when: new Map(), listeners: new Map(), live: [], renamed: [] };
+  const host = { registered: [], when: new Map(), listeners: new Map(), live: [], renamed: [], warnings: [] };
   const view = (agent) => (agent.joined ? new Map(host.registered.map((definition) => [definition.name, definition])) : new Map());
   host.ctx = {
     tools: {
@@ -125,7 +126,7 @@ function terminalHost({ titles } = {}) {
       }
       return undefined;
     },
-    logger: { info() {}, warn() {} },
+    logger: { info() {}, warn(line) { host.warnings.push(line); } },
   };
   host.emit = (event, payload) => {
     for (const listener of host.listeners.get(event) ?? []) listener(payload);
@@ -138,7 +139,7 @@ function terminalHost({ titles } = {}) {
       session: { id: `session-${host.live.length}` },
       model: { select(selection) { scope.selected.push(selection); } },
       cancels: [],
-      cancel(reason) { this.cancels.push(reason); },
+      cancel(cause) { this.cancels.push(cause); },
     };
     host.live.push(agent);
     for (const listener of host.listeners.get('agent/created') ?? []) await listener({ agent, source: 'fresh' });
@@ -375,6 +376,11 @@ test('a switched session the fences cannot be installed on refuses every call an
   assert.equal(scope.guards[0]({ name: 'arca_status' }), terminal.SETUP_FAILED);
   assert.equal(scope.guards[0]({ name: 'bash' }), terminal.SETUP_FAILED);
   assert.deepEqual(host.stepTools(agent), [], 'the Doctor\'s tools stay out of its steps');
+  host.emit('tools/change');
+  host.emit('tools/change');
+  assert.equal(scope.guards.length, 1, 'one attempt: later changes stack nothing');
+  assert.equal(scope.sections.length, 0);
+  assert.equal(host.warnings.filter((line) => line.includes(terminal.SETUP_FAILED)).length, 1, 'and one warning');
 });
 
 test('the Doctor\'s tools reach a model step only for an agent the terminal entry fenced', async () => {
@@ -408,7 +414,7 @@ test('a terminal turn stops at the canvas\'s 40-tool-call cap and starts over on
     assert.doesNotMatch(await call(index), /tool-call limit/, `call ${index} is within the cap`);
   }
   assert.equal(await call(41), 'This answer stopped at the 40-tool-call limit for one turn.');
-  assert.deepEqual(agent.cancels, ['tool-calls']);
+  assert.deepEqual(agent.cancels, [{ kind: 'hook', reason: 'tool-calls' }], 'a DSH cancel cause, never a bare string');
   assert.equal(await call(42), 'This answer stopped at the 40-tool-call limit for one turn.');
   sessionEvent(agent, scope, 'turn/end', { turn: 1 });
   sessionEvent(agent, scope, 'turn/start', { turn: 2 });
@@ -423,7 +429,7 @@ test('a terminal turn stops past the canvas\'s per-turn output tokens', async ()
   sessionEvent(agent, scope, 'assistant/message', { turn: 1, usage: { inputTokens: 10, outputTokens: 40_000 } });
   assert.deepEqual(agent.cancels, []);
   sessionEvent(agent, scope, 'assistant/message', { turn: 1, usage: { inputTokens: 10, outputTokens: 30_000 } });
-  assert.deepEqual(agent.cancels, ['output-tokens']);
+  assert.deepEqual(agent.cancels, [{ kind: 'hook', reason: 'output-tokens' }]);
   await settle();
 });
 
@@ -440,7 +446,7 @@ test('the terminal honours the daily token budget: the turn that spends it stops
   sessionEvent(agent, scope, 'turn/start', { turn: 1 });
   sessionEvent(agent, scope, 'assistant/message', { turn: 1, usage: { totalTokens: 150 } });
   for (let wait = 0; wait < 50 && !agent.cancels.length; wait += 1) await settle();
-  assert.deepEqual(agent.cancels, ['budget']);
+  assert.deepEqual(agent.cancels, [{ kind: 'hook', reason: 'budget' }]);
   assert.deepEqual(await preStep({}, () => assert.fail('a spent budget must not reach the model')), { kind: 'reject' });
   const stored = JSON.parse(await readFile(join(dir, 'arca-doctor-terminal.json'), 'utf8'));
   assert.equal(stored.dailyTokens, 150);
@@ -475,6 +481,18 @@ test('the launcher finds the Doctor preset only when it is in the profile and sw
   assert.equal(findDoctorPreset(PRESET_ROW.replace('  config:\n', '  disabled: !!js >-\n    false\n  config:\n')), false,
     'a disabled expression cannot be evaluated here, so it counts as disabled');
   assert.equal(findDoctorPreset(PRESET_ROW.replace('  config:\n', '  disabled: false\n  config:\n')), true);
+  const child = (extra) => PRESET_ROW.replace('      - name: arca-canvas-dsh/doctor\n', `      - name: arca-canvas-dsh/doctor\n${extra}`);
+  assert.equal(findDoctorPreset(child('        disabled: true\n')), false, 'the Doctor plugin itself switched off');
+  assert.equal(findDoctorPreset(child('        disabled: !!js >-\n          true\n')), false, 'switched off by an expression');
+  assert.equal(findDoctorPreset(child('        disabled: false\n')), true);
+  assert.equal(findDoctorPreset(PRESET_ROW.replace('          socketPath', '          disabled: true\n          socketPath')), true,
+    'a key inside the plugin\'s config is not the plugin\'s switch');
+  const second = PRESET_ROW.replace('- id: arca-doctor-preset', '- id: arca-doctor-preset-2');
+  assert.equal(findDoctorPreset(`${PRESET_ROW}\n${second}\n`), false, 'two arca-doctor presets: refused');
+  assert.equal(findDoctorPreset(`${PRESET_ROW}\n${second.replace('  config:\n', '  disabled: true\n  config:\n')}\n`), true,
+    'a second one switched off does not count');
+  assert.match(doctorPresetProblem(`${PRESET_ROW}\n${second}\n`), /2 arca-doctor presets switched on/);
+  assert.match(doctorPresetProblem(child('        disabled: true\n')), /plugin is switched off/);
 });
 
 test('the launcher refuses to start without the preset and starts dsh-tui pinned to the preset', async (t) => {
@@ -504,4 +522,37 @@ process.exit(7);
   assert.deepEqual(JSON.parse(await readFile(out, 'utf8')), {
     args: ['--profile', 'bot', '--patch', '/p.yml', '--resume', 'abc'], preset: 'arca-doctor',
   });
+});
+
+// Two terminal Doctors on one DSH home, each in its own process, adding to one counter at once.
+test('the daily counter keeps every count when several processes add to it at once', async () => {
+  const dir = await mkdtemp(join(STATE_DIR, 'shared-'));
+  const file = join(dir, 'arca-doctor-terminal.json');
+  const doctorUrl = new URL('../doctor.js', import.meta.url).href;
+  const adder = (count) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', `
+      const { dailyCounter } = await import(${JSON.stringify(doctorUrl)});
+      const counter = dailyCounter(${JSON.stringify(file)});
+      await Promise.all(Array.from({ length: ${count} }, () => counter.add(1)));
+    `], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let said = '';
+    child.stderr.on('data', (chunk) => { said += chunk; });
+    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`adder exited ${code}: ${said}`))));
+  });
+  await Promise.all([adder(60), adder(60), adder(60)]);
+  const stored = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(stored.dailyTokens, 180, 'no count is lost between processes');
+  await assert.rejects(readFile(`${file}.lock`), 'the lock is released');
+});
+
+test('a lock left by a process that died is taken over, and a live one is waited for', async () => {
+  const dir = await mkdtemp(join(STATE_DIR, 'lock-'));
+  const file = join(dir, 'counter.json');
+  await writeFile(`${file}.lock`, '');
+  const old = new Date(Date.now() - 60_000);
+  await utimes(`${file}.lock`, old, old);
+  assert.equal(await terminal.withFileLock(file, async () => 'ran'), 'ran', 'a stale lock is removed');
+  await writeFile(`${file}.lock`, '');
+  await assert.rejects(terminal.withFileLock(file, async () => 'ran', { waitMs: 100 }), /daily counter is locked/,
+    'a live lock is never broken early');
 });

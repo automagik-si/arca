@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
+import { zstdDecompressSync } from 'node:zlib';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -32,6 +33,61 @@ function findDsh() {
   return '';
 }
 const dsh = findDsh();
+
+// The turn/end events in a session's saved file, once the file has them.
+async function savedTurnEnds(home, sessionId) {
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    const file = findFile(home, sessionId, 'session.v4.jsonl.zstd');
+    if (file) {
+      const ends = zstdFrames(await readFile(file)).toString('utf8').split('\n').filter(Boolean)
+        .map((line) => JSON.parse(line)).map((record) => record.event ?? record)
+        .filter((event) => event.type === 'turn/end').map((event) => event.data?.reason ?? null);
+      if (ends.length) return ends;
+    }
+    assert.ok(Date.now() < deadline, `no saved turn/end for session ${sessionId}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+// A DSH session file is one zstd frame per append. Node decodes one frame per call, so walk the frames: the frame
+// header gives its own length, then each block header its size, until the last block (RFC 8878, section 3.1.1).
+function zstdFrames(buffer) {
+  const out = [];
+  let at = 0;
+  while (at < buffer.length) {
+    const magic = buffer.readUInt32LE(at);
+    if ((magic & 0xfffffff0) === 0x184d2a50) {
+      at += 8 + buffer.readUInt32LE(at + 4);
+      continue;
+    }
+    assert.equal(magic, 0xfd2fb528, 'a zstd frame');
+    const start = at;
+    const descriptor = buffer[at + 4];
+    const single = (descriptor >> 5) & 1;
+    const sizeField = descriptor >> 6;
+    at += 5 + (single ? 0 : 1) + [0, 1, 2, 4][descriptor & 3] + (sizeField === 0 ? single : [1, 2, 4, 8][sizeField]);
+    for (let last = 0; !last;) {
+      const block = buffer.readUIntLE(at, 3);
+      last = block & 1;
+      at += 3 + (((block >> 1) & 3) === 1 ? 1 : block >> 3);
+    }
+    if ((descriptor >> 2) & 1) at += 4;
+    out.push(zstdDecompressSync(buffer.subarray(start, at)));
+  }
+  return Buffer.concat(out);
+}
+
+function findFile(dir, sessionId, name) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === 'node_modules') continue;
+    const path = join(dir, entry.name);
+    if (entry.name === sessionId && existsSync(join(path, name))) return join(path, name);
+    const found = findFile(path, sessionId, name);
+    if (found) return found;
+  }
+  return '';
+}
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -121,12 +177,29 @@ test('on a real DSH, a Doctor session is fenced whether it is created on the pre
     assert.equal(agent.guard.arca_propose, null, `${agent.how}: a proposal is allowed`);
     assert.deepEqual(agent.model, result.route, `${agent.how}: runs on the canvas Doctor's model`);
   }
+  // A turn a limit stops ends as an aborted turn with the Doctor's cause, live and in the saved session, which is
+  // what dsh-tui replays a session's history and its tree entry from. A bare-string cause is written as null there.
+  const stopped = result.stopped;
+  const aborted = { kind: 'aborted', reason: { kind: 'hook', reason: 'tool-calls' } };
+  assert.equal(stopped.counted, 41, 'the turn reached its first step');
+  assert.equal(stopped.last, 'This answer stopped at the 40-tool-call limit for one turn.');
+  assert.deepEqual(stopped.ends, [aborted], 'the live turn/end');
+  const saved = await savedTurnEnds(home, stopped.sessionId);
+  assert.deepEqual(saved, [aborted], 'the saved turn/end');
+
   // The launcher a bot starts it with reads the same profile: with the preset it passes, without it refuses.
   const check = (...patch) => spawnSync(process.execPath, [
     join(packageDir, 'doctor-launch.js'), '--profile', 'web', ...patch, '--check',
   ], { cwd: home, env: { ...env, ARCA_DOCTOR_DSH: dsh }, encoding: 'utf8', timeout: 120_000 });
   const withPreset = check('--patch', join(packageDir, 'doctor.patch.yml'));
   assert.equal(withPreset.status, 0, `the launcher finds the shipped preset:\n${secret(withPreset.stderr)}`);
+  const disabledChild = join(scratch, 'disabled-child.patch.yml');
+  const shipped = await readFile(join(packageDir, 'doctor.patch.yml'), 'utf8');
+  await writeFile(disabledChild, shipped.replace('          - name: arca-canvas-dsh/doctor\n',
+    '          - name: arca-canvas-dsh/doctor\n            disabled: true\n'));
+  const off = check('--patch', disabledChild);
+  assert.equal(off.status, 2, 'the launcher refuses a preset whose Doctor plugin is switched off');
+  assert.match(off.stderr, /plugin is switched off, so the Doctor was not started/);
   const without = check();
   assert.equal(without.status, 2, 'the launcher refuses a profile without the preset');
   assert.match(without.stderr, /has no arca-doctor preset switched on, so the Doctor was not started/);
