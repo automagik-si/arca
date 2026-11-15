@@ -467,6 +467,8 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "function_runs",
             "registry_list",
             "instance_move_preflight",
+            "instance_move_plan",
+            "instance_move_status",
             "github_connect_status",
             "github_bindings",
             "github_audit",

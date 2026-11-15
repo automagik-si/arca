@@ -105,6 +105,10 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "registry_secret_remove",
             "host_network_restore",
             "instance_move_preflight",
+            "instance_move_plan",
+            "instance_move",
+            "instance_move_status",
+            "instance_move_finish",
             "github_oauth_app_set",
             "github_connect",
             "github_connect_status",
@@ -217,6 +221,28 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
             Scope::Viewer,
             false,
             false,
+        ),
+        (
+            "instance_move_plan",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
+        ),
+        ("instance_move", VerbClass::L, Scope::Doctor, true, true),
+        (
+            "instance_move_status",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
+        ),
+        (
+            "instance_move_finish",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            true,
         ),
         (
             "github_oauth_app_set",
@@ -381,6 +407,8 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "function_create",
         "function_remove",
         "host_network_restore",
+        "instance_move",
+        "instance_move_finish",
         "route_add",
         "route_remove",
     ];
@@ -1650,6 +1678,8 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "deploy_rollback",
             "deploy_remove",
             "function_remove",
+            "instance_move",
+            "instance_move_finish",
             "github_disconnect",
         ]
     );
@@ -1863,7 +1893,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 27);
+    assert_eq!(actions.len(), 29);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));
