@@ -1682,6 +1682,21 @@ in `crates/arca-incus/src/function_run.rs`. Tests in `crates/arca/tests/function
 (`a_registry_rebuild_carries_the_credential_and_only_an_unused_cached_image_is_deleted`,
 `the_turn_off_after_a_rebuild_goes_on_past_an_image_that_incus_will_not_change`).
 
+## A runner machine
+
+**Rule 77.** A CI runner pool's job machines are a path beside the effect journal, as a function's run is: a machine
+lives for one job and is never declared. `RunnerVms` is the only writer of them. It writes in the pool's own project
+and in no other, and only virtual machines whose own config carries `user.arcakernel.runner` set to the pool's name. A
+create sets that key; every later request (a file written into or read from the guest through the Incus agent, the
+one command started through the agent, a forced stop, a delete) reads the instance first and refuses one that is not a
+virtual machine carrying this pool's value. The key is in the kernel's namespace and names no entry, so every other
+writer classes such a machine as foreign and never writes it (Rules 2 and 3). The pool keeps a line per machine in
+`<stateDir>/runners/<pool>/jobs.jsonl`, as a run is a line of the run log. The writer is compiled with `arca-incus`'s
+`write` feature, which `arca-runners` receives through `arca-providers` and never enables itself (Rule 28).
+Source: `RunnerVms` and `RUNNER_KEY` in `crates/arca-incus/src/runner_vm.rs`; test
+`a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go` in `crates/arca-runners/tests/incus_launcher.rs`;
+`crates/arca-runners/Cargo.toml`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is

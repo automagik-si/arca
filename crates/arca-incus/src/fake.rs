@@ -4221,6 +4221,13 @@ impl FakeIncus {
     pub fn service_files(&self) -> BTreeMap<String, Vec<u8>> {
         lock(&self.shared.service).files.clone()
     }
+    /// Puts `bytes` at `path` in the instance as its image put it there: what a rebuilt root holds, since the fake keeps
+    /// no root of its own.
+    pub fn set_service_file(&self, project: &str, instance: &str, path: &str, bytes: &[u8]) {
+        lock(&self.shared.service)
+            .files
+            .insert(format!("{project}/{instance}:{path}"), bytes.to_vec());
+    }
     /// Makes the next `times` file requests to a virtual machine fail, as Incus fails them while the guest agent has
     /// not started yet.
     pub fn set_guest_agent_unready(&self, times: u32) {

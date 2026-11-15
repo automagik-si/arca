@@ -1,7 +1,10 @@
-// The MCP consent page: one passkey assertion over the statement Arca minted signs the owner in and approves the app.
+// The MCP consent page, and the step-up page of the owner's signed-in session: one passkey assertion over the statement
+// Arca minted signs the owner in and approves the app, or confirms the session again.
 "use strict";
 
-const request = document.querySelector("main").dataset.request;
+const main = document.querySelector("main");
+const request = main.dataset.request;
+const paths = { begin: main.dataset.begin, approve: main.dataset.approve };
 const enc = new TextEncoder();
 
 function b64url(bytes) {
@@ -22,8 +25,10 @@ function status(text, tone) {
 }
 
 function buttons(enabled) {
-  document.getElementById("approve").disabled = !enabled;
-  document.getElementById("deny").disabled = !enabled;
+  for (const id of ["approve", "deny"]) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = !enabled;
+  }
 }
 
 async function post(path, body) {
@@ -41,7 +46,7 @@ async function approve() {
   buttons(false);
   status("Confirm with your passkey…", "");
   try {
-    const begun = await post("/oauth/authorize/begin", { id: request });
+    const begun = await post(paths.begin, { id: request });
     const challenge = await crypto.subtle.digest(
       "SHA-256",
       enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + begun.statement),
@@ -66,9 +71,13 @@ async function approve() {
       signature: b64url(new Uint8Array(response.signature)),
       v: 1,
     };
-    const done = await post("/oauth/authorize/approve", { id: request, statement: begun.statement, proof });
-    status("Approved. Taking you back to the app…", "ok");
-    location.assign(done.redirect);
+    const done = await post(paths.approve, { id: request, statement: begun.statement, proof });
+    if (done.redirect) {
+      status("Approved. Taking you back to the app…", "ok");
+      location.assign(done.redirect);
+    } else {
+      status("Confirmed. Go back to " + (done.name || "the app") + ": it can ask you now.", "ok");
+    }
   } catch (error) {
     const name = error && error.name;
     status(name === "NotAllowedError" ? "The passkey prompt was closed. Nothing was approved." : String(error.message || error), "bad");
@@ -89,4 +98,5 @@ async function deny() {
 }
 
 document.getElementById("approve").addEventListener("click", approve);
-document.getElementById("deny").addEventListener("click", deny);
+const denyButton = document.getElementById("deny");
+if (denyButton) denyButton.addEventListener("click", deny);

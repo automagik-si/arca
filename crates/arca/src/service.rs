@@ -1370,6 +1370,13 @@ impl Plugin for Service {
                     changes.insert(key.into(), value);
                 }
             }
+            // The entrypoint follows the record when the record names one (`service_reconfigure` moves it to what the
+            // template says now); Incus takes it at the instance's next start. One the record does not name is left.
+            if let Some(entrypoint) = desired["config"]["oci.entrypoint"].as_str()
+                && current.get("oci.entrypoint").and_then(Value::as_str) != Some(entrypoint)
+            {
+                changes.insert("oci.entrypoint".into(), Some(entrypoint.to_owned()));
+            }
             for (key, value) in &cfg.environment {
                 if cfg
                     .environment_patch

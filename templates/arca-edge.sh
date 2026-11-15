@@ -9,7 +9,7 @@
 # the root is not one Arca wrote (its first line is Arca's) and the volume keeps one that is, the kept copy goes back
 # in place. A root file of Arca's always wins, since it is the newer when a route changed while the edge was stopped,
 # and it is copied to the volume first, so a rebuild after such a change brings it back too. A copy that cannot be
-# made does not stop Caddy from starting.
+# made, either way, does not stop Caddy from starting.
 set -eu
 # The two ARCA_EDGE_* names are for the tests; the image sets neither.
 LIVE=${ARCA_EDGE_CONFIG:-/etc/caddy/Caddyfile}
@@ -24,8 +24,6 @@ if arcas "$LIVE"; then
     { cp "$LIVE" "$KEPT.arca-new" && chmod 600 "$KEPT.arca-new" && mv -f "$KEPT.arca-new" "$KEPT"; } || true
   fi
 elif arcas "$KEPT"; then
-  cp "$KEPT" "$LIVE.arca-new"
-  chmod 600 "$LIVE.arca-new"
-  mv -f "$LIVE.arca-new" "$LIVE"
+  { cp "$KEPT" "$LIVE.arca-new" && chmod 600 "$LIVE.arca-new" && mv -f "$LIVE.arca-new" "$LIVE"; } || true
 fi
 exec "$CADDY" run --config "$LIVE" --adapter caddyfile

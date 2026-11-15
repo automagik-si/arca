@@ -8,6 +8,7 @@ pub mod gpu;
 mod incus;
 mod mode;
 mod osd;
+pub use osd::rfc3339_ms;
 pub mod probe;
 mod procfs;
 mod sample;

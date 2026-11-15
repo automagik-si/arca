@@ -25,6 +25,8 @@ pub const PROBE_MAX_AGE_MS: u64 = 90_000;
 pub const OSD_MAX_AGE_MS: u64 = 900_000;
 /// The newest the root part's status file may be, in milliseconds: three of its minute rereads.
 pub const HOST_NETWORK_MAX_AGE_MS: u64 = 180_000;
+/// The runner pools' sign-in board may be this old, in milliseconds, before it is unknown.
+pub const RUNNER_SIGNIN_MAX_AGE_MS: u64 = 15_000;
 /// A SMART reading may be this old, in milliseconds, before it is unknown (2 hours).
 pub const SMART_MAX_AGE_MS: u64 = 7_200_000;
 
@@ -45,10 +47,11 @@ pub enum RuleId {
     GpuVramHigh,
     GpuGone,
     HostNetwork,
+    RunnerSignIn,
 }
 
 impl RuleId {
-    pub const ALL: [RuleId; 11] = [
+    pub const ALL: [RuleId; 12] = [
         Self::DiskPoolFull,
         Self::MemPsiHigh,
         Self::CpuHot,
@@ -60,6 +63,7 @@ impl RuleId {
         Self::GpuVramHigh,
         Self::GpuGone,
         Self::HostNetwork,
+        Self::RunnerSignIn,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -75,6 +79,7 @@ impl RuleId {
             Self::GpuVramHigh => "gpu-vram-high",
             Self::GpuGone => "gpu-gone",
             Self::HostNetwork => "host-network-drift",
+            Self::RunnerSignIn => "runner-signin",
         }
     }
 
@@ -131,7 +136,7 @@ impl Rule {
 pub struct Rules(pub Vec<Rule>);
 
 impl Default for Rules {
-    /// The eleven defaults. Disk is percent used, `mem-psi-high` the memory `some` avg10, `cpu-hot` °C. The yes-or-no rules
+    /// The twelve defaults. Disk is percent used, `mem-psi-high` the memory `some` avg10, `cpu-hot` °C. The yes-or-no rules
     /// read 1 when bad, `drift` a count, and `crash-loop` the starts of the last 10 minutes.
     fn default() -> Rules {
         use RuleId as R;
@@ -168,6 +173,9 @@ impl Default for Rules {
             // An item of the host's declared forwarding and firewall that is not as declared: containers may have lost their
             // way out. The root part rereads each minute, so a minute of drift fires it.
             Rule::default_of(R::HostNetwork, 0.0, 0.0, Critical),
+            // A runner pool whose GitHub credential is refused (401), whose App is not installed (404) or lacks the
+            // permission (403): no job can reach the pool until someone acts.
+            Rule::default_of(R::RunnerSignIn, 0.0, 0.0, Critical),
         ])
     }
 }
@@ -211,6 +219,8 @@ pub struct Inputs {
     /// The items of the host's declared forwarding and firewall that are not as declared, from the root part's status file.
     /// `None` when there is no status file, so a node that has none is unknown and never resolves a firing alert.
     pub host_network: Option<Timed<Vec<HostNetworkItem>>>,
+    /// Each runner pool's sign-in state. A node with no pools has a known, empty list.
+    pub runner_signin: Option<Timed<Vec<RunnerSignInUse>>>,
     /// The rules whose reading this node can never provide, such as PSI and CPU temperature on a remote metrics source.
     /// A firing alert of one resolves with `no data` after its clear window; a transient outage never does.
     pub unavailable: BTreeSet<RuleId>,
@@ -284,6 +294,13 @@ pub struct GpuGone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostNetworkItem {
     pub item: String,
+}
+
+/// One runner pool's sign-in state: `reason` names why it fails, and is `None` while it signs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerSignInUse {
+    pub pool: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -595,6 +612,22 @@ fn source_of(id: RuleId, inputs: &Inputs, now: u64) -> Source {
                 items
                     .iter()
                     .map(|drift| (labels_of([("item", drift.item.as_str())]), Some(1.0)))
+                    .collect()
+            },
+        ),
+        RuleId::RunnerSignIn => read(
+            &inputs.runner_signin,
+            RUNNER_SIGNIN_MAX_AGE_MS,
+            now,
+            |pools| {
+                pools
+                    .iter()
+                    .map(|pool| {
+                        (
+                            labels_of([("pool", pool.pool.as_str())]),
+                            Some(bad_as(pool.reason.is_some())),
+                        )
+                    })
                     .collect()
             },
         ),

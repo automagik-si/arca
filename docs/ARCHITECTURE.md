@@ -10,6 +10,7 @@
 | `arca-incus` | the Incus client over the unix socket, a fake Incus, a GET-only recording shim, and the writer (feature `write`) |
 | `arca-providers` | the Incus provider plugins are served through |
 | `arca-reconcile` | the single reconciler: applies desired state, reverts removed entries, deletes only under an approved plan |
+| `arca-runners` | GitHub Actions runner pools: the scale set protocol, the controller that starts one fresh VM per job, the launchers and a fake GitHub ([`RUNNERS.md`](RUNNERS.md)) |
 | `arca-watch` | the watch-only plugin |
 | `arca-netproject` | the shared service project and its bridge, and the tenant projects |
 | `arca-postgres` | database instances, their ingress ACL and consumer links |
@@ -20,7 +21,7 @@
 | `arca-api`, `arca-mcp` | the verb table, the OpenRPC document, and the MCP server |
 | `arca-wit` | the WIT world `arca:plugin@0.1.0` |
 
-Those are the 16 crates under `crates/`. Beside them: `packages/arca-canvas-dsh` (the canvas plugin, a Node package),
+Those are the 17 crates under `crates/`. Beside them: `packages/arca-canvas-dsh` (the canvas plugin, a Node package),
 `templates/` (the shipped service templates), `schema/` (the OpenRPC document, `arca.openrpc.json`, and the released
 `0.1.0` one it is checked against), `ontology/`, `wit/`, `deploy/systemd/` and `scripts/`.
 

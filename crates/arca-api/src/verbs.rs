@@ -79,16 +79,20 @@ impl Verb {
     /// `owner_approval_status` hands its requester an approval string, so it is not advertised read-only either (droidd's
     /// `readOnly: false`), and its minimum scope keeps it off viewers. `instance_move_plan` keeps a frozen plan in a file of
     /// its own, as `action_propose` records a proposal.
+    /// `owner_approval_pending` asks the owner's signed-in session about each plan, and a yes approves and runs it.
     pub fn read_only_hint(&self) -> bool {
         !self.writes
             && !matches!(
                 self.name,
-                "action_propose" | "owner_approval_status" | "instance_move_plan"
+                "action_propose"
+                    | "owner_approval_status"
+                    | "instance_move_plan"
+                    | "owner_approval_pending"
             )
     }
 }
 
-static VERBS: [Verb; 86] = [
+static VERBS: [Verb; 87] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -427,7 +431,7 @@ static VERBS: [Verb; 86] = [
     },
     Verb {
         name: "service_reconfigure",
-        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
+        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -653,6 +657,20 @@ static VERBS: [Verb; 86] = [
         cut: no_cut,
         params: owner_approval_list_params,
         result: owner_approval_list_result,
+    },
+    Verb {
+        name: "owner_approval_pending",
+        summary: "Everything waiting for the owner, whoever made it (a worker's plans too): action plans, delete plans and owner approval requests, with the approval page. In the owner's own signed-in session (an app connected with the approvals scope) whose client declared elicitation, it also asks the owner yes or no for each plan that can be approved there, and answers what was decided; plans that delete or erase, and approval requests, keep the passkey card. The requesters' words are untrusted.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_owner_approval_pending,
+        cut: no_cut,
+        params: owner_approval_pending_params,
+        result: owner_approval_pending_result,
     },
     Verb {
         name: "enroll_confirm",
@@ -3869,10 +3887,14 @@ fn action_proposal() -> Value {
         ("expiresAt", true, int()),
         ("statement", false, string()),
         ("host", false, string()),
-        // Set on the answer of an action_propose that the admin token approved in the terminal.
+        // Set while the owner's signed-in session is connected: the proposal stays open for it instead of lapsing.
+        ("heldForSession", false, boolean()),
+        // Set on the answer of an action_propose approved in the terminal (the admin token's or the owner's session's).
         ("approvedIn", false, string()),
         ("approvedBy", false, string()),
         ("approval", false, json!({ "type": "object" })),
+        // Set on the answer of an action_propose the owner's signed-in session said no to: the plan is declined.
+        ("declinedIn", false, string()),
     ])
 }
 
@@ -5071,13 +5093,14 @@ fn service_reconfigure_params() -> Value {
             "changes": {
                 "additionalProperties": false,
                 "properties": {
+                    "entrypoint": { "type": "object" },
                     "environment": { "items": { "type": "object" }, "type": "array" },
                     "noNewPrivileges": { "type": "object" },
                     "ports": { "type": "object" },
                     "rawLxc": { "type": "object" },
                     "secrets": { "items": { "type": "object" }, "type": "array" }
                 },
-                "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc and noNewPrivileges ({from, to} each). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
+                "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
                 "type": "object"
             },
             "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
@@ -5098,7 +5121,7 @@ fn service_reconfigure_result() -> Value {
             "message": { "type": "string" },
             "readBack": {
                 "additionalProperties": false,
-                "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc) that differ. Never a value.",
+                "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc, or oci.entrypoint) that differ. Never a value.",
                 "properties": {
                     "differs": { "items": { "type": "string" }, "type": "array" },
                     "matches": { "type": "boolean" }
@@ -5904,6 +5927,91 @@ fn owner_approval_list_result() -> Value {
     })
 }
 
+fn owner_approval_pending_params() -> Value {
+    json!({"additionalProperties": false, "properties": {}, "type": "object"})
+}
+fn owner_approval_pending_result() -> Value {
+    // The card's rows as plan_list gives them: no cap on their number or length, so any card a plan has fits.
+    let row = json!({"additionalProperties": false, "properties": {"label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label", "value"], "type": "object"});
+    let plan = json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": {"maxLength": 128, "type": "string"},
+            "kind": {"description": "action: an action plan; delete: a delete plan of the reconciler; request: an owner approval request.", "enum": ["action", "delete", "request"], "type": "string"},
+            "action": {"maxLength": 64, "type": "string"},
+            "summary": {"type": "string"},
+            "details": {"items": row, "type": "array"},
+            "createdAt": {"description": "Unix milliseconds.", "minimum": 0, "type": "integer"},
+            "expiresAt": {"description": "Unix milliseconds, or an ISO time for a request.", "type": ["integer", "string"]},
+            "askedHere": {"description": "Whether the owner's signed-in session is asked about it.", "type": "boolean"},
+            "heldForSession": {"description": "Whether it stays open past its fifteen minutes because the owner's signed-in session is connected.", "type": "boolean"},
+            "why": {"description": "Why it is not asked here, when it is not.", "maxLength": 300, "type": "string"}
+        },
+        "required": ["id", "kind", "summary", "createdAt", "askedHere"],
+        "type": "object"
+    });
+    let decision = json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": {"maxLength": 128, "type": "string"},
+            "decision": {"description": "approved: approved and run; refused: approved but not run, with why; declined: the owner said no, and the plan is declined; left: not decided, still waiting on its card.", "enum": ["approved", "refused", "declined", "left"], "type": "string"},
+            "result": {"description": "What the run answered."},
+            "message": {"maxLength": 2000, "type": "string"}
+        },
+        "required": ["id", "decision"],
+        "type": "object"
+    });
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "plans": {"items": plan, "maxItems": 100, "type": "array"},
+            "session": {"description": "asks: this session is asked about each plan; step-up: it is asked once the owner confirms with a passkey at stepUp; none: it is never asked (it lists only).", "enum": ["asks", "step-up", "none"], "type": "string"},
+            "stepUp": {"description": "The page where one passkey tap lets this session be asked for the next 12 hours.", "maxLength": 600, "type": "string"},
+            "page": {"description": "The approval page, where every card waits.", "maxLength": 600, "type": "string"},
+            "decisions": {"items": decision, "maxItems": 100, "type": "array"}
+        },
+        "required": ["plans", "session"],
+        "type": "object"
+    })
+}
+
+pub fn summary_owner_approval_pending(v: &Value) -> String {
+    let plans = v["plans"].as_array().map_or(&[][..], Vec::as_slice);
+    let asked = plans.iter().filter(|p| p["askedHere"] == true).count();
+    let mut text = format!(
+        "{} plan(s) and request(s) wait for the owner; {asked} can be approved in this session.",
+        plans.len()
+    );
+    if let Some(decisions) = v["decisions"].as_array() {
+        let count = |what: &str| decisions.iter().filter(|d| d["decision"] == what).count();
+        text.push_str(&format!(
+            " Asked here: {} approved and run, {} refused, {} declined, {} left waiting on their cards.",
+            count("approved"),
+            count("refused"),
+            count("declined"),
+            count("left")
+        ));
+    }
+    match v["session"].as_str() {
+        Some("step-up") => {
+            if let Some(url) = v["stepUp"].as_str() {
+                text.push_str(&format!(
+                    " Confirm with your passkey at {url} so this session can ask you."
+                ));
+            }
+        }
+        Some("none") => {
+            text.push_str(" This session is not asked: approve them on the approval page.")
+        }
+        _ => {}
+    }
+    if let Some(page) = v["page"].as_str()
+        && plans.iter().any(|p| p["askedHere"] != true)
+    {
+        text.push_str(&format!(" The others wait on {page}."));
+    }
+    text
+}
 pub fn summary_owner_approval_request(v: &Value) -> String {
     let page = v["dashboard"]
         .as_str()

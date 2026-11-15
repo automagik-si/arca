@@ -260,6 +260,32 @@ impl ServiceHandler {
         })
     }
 
+    /// Writes the Caddyfile of the edge's own record onto its root, nothing else: what a rebuilt root gets before the
+    /// edge starts, so a route change made while the edge was stopped is what it serves after an update too (the copy on
+    /// the data volume may be older, and the entrypoint puts it back only over a root file that is not Arca's).
+    pub(super) fn write_edge_root(
+        &self,
+        entry: &Entry,
+        edge: &ServiceConfig,
+    ) -> Result<(), String> {
+        let record = edge.edge.as_ref().ok_or("the service is not an edge")?;
+        let owned = self
+            .live_owned(entry, edge)
+            .map_err(|error| words(&error))?;
+        let target = self
+            .exec_target(entry, edge)
+            .map_err(|error| words(&error))?;
+        self.exec
+            .writer(&target, Duration::from_secs(10))
+            .map_err(|_| "this node could not reach Incus".to_string())?
+            .write_service_file(
+                &owned,
+                &ServiceFile::EdgeConfig,
+                route::caddyfile(record).as_bytes(),
+            )
+            .map_err(|_| "Incus did not take the edge's config file".to_string())
+    }
+
     /// Writes the Caddyfile of `record` into the edge, and reloads Caddy when the edge runs. Once Caddy took it, the copy
     /// on the data volume is written too, so the volume only ever keeps a config Caddy accepted. A reload Caddy refuses
     /// puts the render of `before` back on the root, so the edge still starts on the config it serves. `reloaded` is false

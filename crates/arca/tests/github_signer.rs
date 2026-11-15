@@ -1258,3 +1258,96 @@ async fn a_busy_github_is_asked_again_and_slow_down_is_obeyed_while_polling() {
     );
     assert!(fake.with(|s| s.grant_deleted));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_pool_signs_in_and_mints_through_the_signer_inside_its_group() {
+    use arca_runners::Access as _;
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    let signer = signer(&scratch, &fake);
+    let id = installed_app(&signer, &fake).await;
+    let group = signer
+        .binding(&id)
+        .expect("the binding")
+        .runner_group_id
+        .expect("the group the App made");
+    fake.with(|s| s.scale_sets = vec![(7, group), (8, group + 1)]);
+    let access = arca::runners::SignerAccess::new(signer.clone());
+
+    // The pool's scale sets go into the group the connection made.
+    assert_eq!(access.runner_group(&id).await.expect("read"), Some(group));
+    let connection = access.actions_connection(&id).await.expect("a connection");
+    assert!(
+        connection.service_url.contains("/tenant"),
+        "{}",
+        connection.service_url
+    );
+
+    let request = |name: &str, scale_set: u64, set: &[&str]| arca_runners::MintRequest {
+        binding: id.clone(),
+        scale_set_id: scale_set,
+        runner_name: name.to_string(),
+        labels: labels(set),
+        work_folder: "/home/runner/work".to_string(),
+        caller: "runner-pool:acme".to_string(),
+    };
+    let minted = access
+        .mint(request("acme-0-00000001", 7, &["x64", "linux"]))
+        .await
+        .expect("a runner in the group's scale set");
+    assert!(minted.runner_id > 0);
+    assert!(minted.encoded_jit_config.expose().starts_with(JIT));
+    // The work folder reached GitHub as the pool asked, and the configuration is no text the pool prints.
+    let folder = fake.with(|s| s.runners.last().map(|runner| runner["workFolder"].clone()));
+    assert_eq!(folder, Some(json!("/home/runner/work")));
+    assert!(!format!("{:?}", minted.encoded_jit_config).contains(JIT));
+
+    // A scale set outside the connection's group and labels outside its sets are refused, and neither is a sign-in failure.
+    let outside = access
+        .mint(request("acme-0-00000002", 8, &["linux", "x64"]))
+        .await
+        .expect_err("a scale set of another group");
+    assert_eq!(outside.signin(), None, "{outside}");
+    let labels_refused = access
+        .mint(request("acme-0-00000003", 7, &["acme-4vcpu-ubuntu-2404"]))
+        .await
+        .expect_err("labels outside the connection's sets");
+    assert_eq!(labels_refused.signin(), None, "{labels_refused}");
+
+    // The job the runner took joins its mint in the signer's audit log.
+    access
+        .attach_job(
+            minted.mint_id,
+            arca_runners::JobRef {
+                repo: "acme/omni".to_string(),
+                run_id: Some(41),
+                job_id: None,
+                job_name: Some("plugin-gate".to_string()),
+                workflow_ref: Some(
+                    "acme/omni/.github/workflows/ci.yml@refs/heads/main".to_string(),
+                ),
+            },
+        )
+        .await;
+    let audit = signer.audit_log(Some(&id), 100);
+    assert!(audit.iter().any(|line| line["kind"] == "mint"
+        && line["caller"] == "runner-pool:acme"
+        && line["outcome"] == "minted"));
+    // A job line names its mint, not the binding, so it is read from the whole log.
+    assert!(
+        signer
+            .audit_log(None, 100)
+            .iter()
+            .any(|line| line["kind"] == "job" && line["mintId"] == json!(minted.mint_id))
+    );
+
+    // A connection that does not exist is no credential.
+    let unknown = access
+        .actions_connection("gh-nobody")
+        .await
+        .expect_err("no such connection");
+    assert_eq!(
+        unknown.signin(),
+        Some(arca_runners::SignInReason::NoCredential)
+    );
+}
