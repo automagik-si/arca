@@ -133,7 +133,7 @@ static VERBS: [Verb; 83] = [
     },
     Verb {
         name: "token_list",
-        summary: "The interim API tokens by id and scope. Never a secret or a hash.",
+        summary: "The interim API tokens by id and scope, and the node's own unstored console token marked as such. Never a secret or a hash.",
         class: VerbClass::L,
         min_scope: Scope::Operator,
         writes: false,
@@ -3292,6 +3292,8 @@ fn token_list_result() -> Value {
             ("scope", true, one_of(&["viewer", "doctor", "operator"])),
             ("tools", false, array(string())),
             ("admin", false, boolean()),
+            ("stored", false, boolean()),
+            ("console", false, boolean()),
         ])),
     )])
 }

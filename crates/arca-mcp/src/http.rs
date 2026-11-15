@@ -184,13 +184,37 @@ impl Server {
     }
 
     /// `403` for a caller the verb `name` does not admit: with `insufficient_scope` and the verb's scope for an issued
-    /// token, bare for a stored one.
-    fn forbidden(&self, caller: &Caller, name: &str) -> Response {
-        let (Some((_, metadata)), true) = (&self.oauth, caller.is_issued()) else {
-            return StatusCode::FORBIDDEN.into_response();
-        };
+    /// token. For a stored or held one, a `tools/call` on `/mcp` (`say_verb`) gets a one-line plain-text body that names
+    /// the verb (a name from the verb table, never the request's own text) and never the token; a GET route's refusal
+    /// stays bare, so it says nothing of the query the route would have read.
+    fn forbidden(&self, caller: &Caller, name: &str, say_verb: bool) -> Response {
         let Some(verb) = self.verbs.iter().find(|verb| verb.name == name) else {
             return StatusCode::FORBIDDEN.into_response();
+        };
+        let (Some((_, metadata)), true) = (&self.oauth, caller.is_issued()) else {
+            if !say_verb {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            let why = if !caller.allows_tool(verb.name) {
+                format!(
+                    "forbidden: {} is not on this token's list of tools\n",
+                    verb.name
+                )
+            } else if !may_call(caller.scope, verb) {
+                format!(
+                    "forbidden: {} needs a token of scope {} or higher\n",
+                    verb.name,
+                    verb.min_scope.as_str()
+                )
+            } else {
+                format!("forbidden: {} refused this token\n", verb.name)
+            };
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                why,
+            )
+                .into_response();
         };
         let mut scope = verb.min_scope.max(caller.scope).as_str().to_string();
         if let Some(tools) = &caller.tools {
@@ -341,7 +365,7 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
         Ok(Some(answer)) if answer.stream.is_some() => sse(answer),
         Ok(Some(answer)) => (answer.status, Json(answer.body)).into_response(),
         Ok(None) => StatusCode::ACCEPTED.into_response(),
-        Err(CallError::Forbidden { verb }) => server.forbidden(&caller, &verb),
+        Err(CallError::Forbidden { verb }) => server.forbidden(&caller, &verb, true),
         Err(CallError::Unauthenticated) => server.unauthorized(&headers),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -386,7 +410,7 @@ async fn serve_get(
         .find(|verb| verb.name == tool)
         .is_some_and(|verb| may_call(caller.scope, verb) && caller.allows_tool(verb.name));
     if !admitted {
-        return server.forbidden(&caller, tool);
+        return server.forbidden(&caller, tool, false);
     }
     let query = uri.query().map(str::to_string);
     let outcome = tokio::task::spawn_blocking(move || handler.get(query.as_deref(), &caller)).await;
@@ -441,16 +465,21 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 /// directory or symlink at `path` is refused and left alone. A socket that answers is a live server and is refused; a
 /// socket that refuses connections is stale and is replaced; any other connect error fails the start.
 pub async fn serve_unix(router: Router, path: &Path) -> io::Result<()> {
-    serve_unix_bound(router, path, || {}).await
+    serve_unix_bound(router, path, || Ok(())).await
 }
 
 /// [`serve_unix`], calling `bound` once: after this process holds the socket at `path`, and before it serves a request.
 /// A start that is refused (a live server on the path, something other than a socket there) never calls it, so what
-/// `bound` publishes is true of this process's own listener.
-pub async fn serve_unix_bound(router: Router, path: &Path, bound: impl FnOnce()) -> io::Result<()> {
+/// `bound` publishes is true of this process's own listener. An error from `bound` stops the start with that error, and
+/// nothing is served on the socket.
+pub async fn serve_unix_bound(
+    router: Router,
+    path: &Path,
+    bound: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     clear_stale_socket(path)?;
     let (listener, uid) = bind_staged(path)?;
-    bound();
+    bound()?;
     let listener = OwnerListener {
         listener,
         uid,

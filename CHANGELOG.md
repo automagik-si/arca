@@ -7,6 +7,14 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A node can make a token for the machine's own console: with `console.tokenFile` in the config, `serve` makes one viewer
+token at each start, limited to `node_metrics`, `arca_status`, `alerts_list` and `service_list`, holds it in memory only
+and writes it to that file at mode 0400. A reload keeps it, a restart replaces it, and a stop removes the file. The start
+is refused when the file's directory is open to group or others or not the node user's, or when a link or another file is
+at its path. `token_list` shows it as the console's (`console: true`, `stored: false`), `arca status --security` counts it
+among the tokens that only look, and `token revoke` of it says to remove the key instead. A `403` to a `tools/call` with a stored
+token now carries one line that names the refused verb; a GET route's `403` stays bare. See "The console's token" in docs/OPERATING.md.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and

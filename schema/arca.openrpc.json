@@ -1445,6 +1445,9 @@
                   "admin": {
                     "type": "boolean"
                   },
+                  "console": {
+                    "type": "boolean"
+                  },
                   "id": {
                     "type": "string"
                   },
@@ -1455,6 +1458,9 @@
                       "operator"
                     ],
                     "type": "string"
+                  },
+                  "stored": {
+                    "type": "boolean"
                   },
                   "tools": {
                     "items": {
@@ -1478,7 +1484,7 @@
           "type": "object"
         }
       },
-      "summary": "The interim API tokens by id and scope. Never a secret or a hash.",
+      "summary": "The interim API tokens by id and scope, and the node's own unstored console token marked as such. Never a secret or a hash.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,

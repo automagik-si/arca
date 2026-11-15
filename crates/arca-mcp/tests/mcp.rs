@@ -499,6 +499,22 @@ fn a_tools_allowlist_hides_and_refuses_every_verb_outside_it() {
 }
 
 #[test]
+fn a_limited_token_refused_a_verb_outside_its_list_is_told_which_verb() {
+    let fx = Fixture::start("tools-refusal-names");
+    let reply = fx.tool_call(&fx.viewer_tools, "node_metrics", json!({}));
+    assert_eq!(reply.status, 403);
+    assert!(
+        reply.body.contains("node_metrics"),
+        "the refusal names the verb: {:?}",
+        reply.body
+    );
+    assert!(
+        !reply.body.contains(&fx.viewer_tools),
+        "never the token itself"
+    );
+}
+
+#[test]
 fn a_doctor_tools_list_adds_the_write_verb_but_not_token_list() {
     let fx = Fixture::start("list-doctor");
     let reply = fx.call(&fx.doctor, "tools/list", json!({}));
