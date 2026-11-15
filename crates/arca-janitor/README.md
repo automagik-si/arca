@@ -76,8 +76,9 @@ Linux: `caches` (npm, pnpm and uv through their own commands; go-build, node-gyp
 (Sundays only in the daily profile), `build-outputs` (`target/` beside a Cargo.toml; `node_modules`, `.next`,
 `.turbo` and `.parcel-cache` beside a package.json; only in projects idle for `BUILD_IDLE_DAYS`), and `stale-scratch`
 (a scratch root's top-level folder untouched for `STALE_DAYS` is moved to `<root>/.cleanup-trash/<date>/`, unless
-it is or holds a git repository or worktree with changes not committed, files not tracked, a stash, or commits no
-remote has).
+it is or holds, at any depth, a git repository, worktree or bare repository with changes not committed, files not
+tracked, a stash, commits no remote has on any ref or worktree HEAD, or a worktree kept outside the folder). Nested
+repositories and worktrees are checked too, even when the outer repository ignores them.
 
 macOS: `caches` (brew, npm, pnpm, yarn, pip, uv, go, CocoaPods, cargo, node-gyp), `xcode` (DerivedData, unavailable
 simulators), `docker`, `claude-versions`, `app-caches` (`~/Library/Caches` folders untouched for 30 days, Apple's

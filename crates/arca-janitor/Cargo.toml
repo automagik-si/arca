@@ -14,6 +14,12 @@ path = "src/lib.rs"
 name = "arca-janitor"
 path = "src/main.rs"
 
+# Mount cases need a user namespace; their own harness reports them as ignored where there is none.
+[[test]]
+name = "mounts"
+path = "tests/mounts.rs"
+harness = false
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

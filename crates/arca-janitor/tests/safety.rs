@@ -1,14 +1,13 @@
 //! Deletion safety: what an apply must never touch even when the world changes under it.
 //!
 //! - A root reached through a linked folder still sees live processes, which /proc reports by real path.
-//! - A removal never goes into a mount point, even one on the same filesystem (a bind mount) or one the run's mount
-//!   table does not list, and a refused item deletes nothing.
 //! - Right before each item, live processes and the disk are looked at again: a process that starts during an
 //!   apply keeps its folder, and an item that vanished or was swapped for a link is skipped, not failed.
 //! - A removal never follows a link on the way to its target.
-//! - Stale scratch holding git work that exists nowhere else is never moved to the trash.
+//! - Stale scratch holding git work that exists nowhere else is never moved to the trash, including work in
+//!   repositories and worktrees nested inside a clean one, and in bare repositories.
 //!
-//! The mount tests need a user namespace (`unshare -rm`) and are skipped where it is not available.
+//! The mount cases are in `mounts.rs`, which reports them as ignored where user namespaces are not available.
 
 use std::collections::HashSet;
 use std::fs;
@@ -20,7 +19,6 @@ use std::time::Duration;
 use arca_janitor::config::Config;
 use arca_janitor::jobs::clean::{apply_plan_with, make_plan};
 use arca_janitor::jobs::{CleanPlanParams, Profile};
-use arca_janitor::platform;
 use arca_janitor::testutil::{TempDir, age_tree};
 use arca_janitor::walk::remove_tree;
 
@@ -197,107 +195,6 @@ fn an_item_that_vanished_or_became_a_link_is_skipped_and_nothing_behind_the_link
     assert!(!work.join("kept/target").exists());
 }
 
-// ------------------------------------------------------------------------------------------------ mounts
-
-const NS_DIR: &str = "JANITOR_TEST_NS_DIR";
-
-/// Run one test of this binary again inside a new user and mount namespace, with `dir` passed along. False when
-/// user namespaces are not available here.
-fn in_namespace(test: &str, dir: &Path) -> bool {
-    let ok = Command::new("unshare")
-        .args(["-rm", "true"])
-        .status()
-        .is_ok_and(|s| s.success());
-    if !ok {
-        eprintln!("skipped: no user namespaces here");
-        return false;
-    }
-    let out = Command::new("unshare")
-        .arg("-rm")
-        .arg(std::env::current_exe().unwrap())
-        .args([test, "--exact", "--nocapture", "--test-threads=1"])
-        .env(NS_DIR, dir)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "inside the namespace:\n{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    true
-}
-
-fn mount(args: &[&str]) {
-    let out = Command::new("mount").args(args).output().unwrap();
-    assert!(
-        out.status.success(),
-        "mount {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn tree_with_mount(dir: &Path) -> (PathBuf, PathBuf) {
-    let tree = dir.join("tree");
-    fs::create_dir_all(tree.join("inner")).unwrap();
-    fs::create_dir_all(tree.join("a/b")).unwrap();
-    fs::write(tree.join("a/b/sibling"), b"x").unwrap();
-    (tree.clone(), tree.join("inner"))
-}
-
-#[test]
-fn a_removal_stops_at_a_bind_mount_on_the_same_filesystem_and_deletes_nothing() {
-    if let Ok(dir) = std::env::var(NS_DIR) {
-        let dir = PathBuf::from(dir);
-        let (tree, inner) = tree_with_mount(&dir);
-        let source = dir.join("elsewhere");
-        mount(&["--bind", source.to_str().unwrap(), inner.to_str().unwrap()]);
-        let mounts = platform::mount_points();
-        assert!(mounts.contains(&inner), "the bind mount is listed");
-        let e = remove_tree(&tree, &mounts, None).expect_err("refused");
-        assert!(e.to_string().contains("mount point"), "{e}");
-        assert!(
-            inner.join("precious").exists(),
-            "the bind source is untouched"
-        );
-        assert!(tree.join("a/b/sibling").exists(), "nothing was removed");
-        return;
-    }
-    let t = TempDir::new("bind");
-    fs::create_dir_all(t.path().join("elsewhere")).unwrap();
-    fs::write(t.path().join("elsewhere/precious"), b"keep").unwrap();
-    if in_namespace(
-        "a_removal_stops_at_a_bind_mount_on_the_same_filesystem_and_deletes_nothing",
-        t.path(),
-    ) {
-        assert!(t.path().join("elsewhere/precious").exists());
-        assert!(t.path().join("tree/a/b/sibling").exists());
-    }
-}
-
-#[test]
-fn a_removal_stops_at_another_filesystem_the_mount_table_does_not_list() {
-    if let Ok(dir) = std::env::var(NS_DIR) {
-        let dir = PathBuf::from(dir);
-        let (tree, inner) = tree_with_mount(&dir);
-        mount(&["-t", "tmpfs", "none", inner.to_str().unwrap()]);
-        fs::write(inner.join("on-tmpfs"), b"keep").unwrap();
-        // A table read before the mount appeared: only the device number shows it.
-        let e = remove_tree(&tree, &HashSet::new(), None).expect_err("refused");
-        assert!(e.to_string().contains("another filesystem"), "{e}");
-        assert!(inner.join("on-tmpfs").exists());
-        assert!(tree.join("a/b/sibling").exists(), "nothing was removed");
-        return;
-    }
-    let t = TempDir::new("tmpfs");
-    if in_namespace(
-        "a_removal_stops_at_another_filesystem_the_mount_table_does_not_list",
-        t.path(),
-    ) {
-        assert!(t.path().join("tree/a/b/sibling").exists());
-    }
-}
-
 // ------------------------------------------------------------------------------------------------ git work
 
 fn git(dir: &Path, args: &[&str]) {
@@ -374,6 +271,116 @@ fn stale_scratch_with_git_work_found_nowhere_else_is_never_moved() {
     // No git at all.
     fs::create_dir_all(scratch.join("plain")).unwrap();
     fs::write(scratch.join("plain/f"), "x").unwrap();
+
+    // Clean, pushed repositories that hold work further in, where the outer repository does not see it.
+    let pushed_repo = |name: &str, ignore: &str| -> PathBuf {
+        let r = scratch.join(name);
+        repo(&r);
+        git(&r, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&r, &["push", "-q", "origin", &format!("main:{name}")]);
+        git(&r, &["fetch", "-q", "origin"]);
+        git(&r, &["branch", "-q", "-u", &format!("origin/{name}")]);
+        fs::write(r.join(".git/info/exclude"), format!("{ignore}\n")).unwrap();
+        r
+    };
+    // An ignored agent worktree on a pushed branch, with an edit and a new file.
+    let r = pushed_repo("nested-worktree", ".claude/");
+    git(
+        &r,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            ".claude/worktrees/feat",
+        ],
+    );
+    git(&r, &["push", "-q", "origin", "feat"]);
+    fs::write(r.join(".claude/worktrees/feat/README"), "edited").unwrap();
+    fs::write(r.join(".claude/worktrees/feat/new.txt"), "new").unwrap();
+    // The same, one level down in a plain folder: the search goes on past the first repository it finds.
+    let r = pushed_repo("deep/inner", ".claude/");
+    git(
+        &r,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat3",
+            ".claude/worktrees/f",
+        ],
+    );
+    git(&r, &["push", "-q", "origin", "feat3"]);
+    fs::write(r.join(".claude/worktrees/f/README"), "edited").unwrap();
+    // The same, clean: may go.
+    let r = pushed_repo("nested-clean", ".claude/");
+    git(
+        &r,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat2",
+            ".claude/worktrees/feat",
+        ],
+    );
+    git(&r, &["push", "-q", "origin", "feat2"]);
+    git(&r, &["fetch", "-q", "origin"]);
+    // A detached worktree holding a commit only it has.
+    let r = pushed_repo("nested-detached", ".worktrees/");
+    git(&r, &["worktree", "add", "-q", "--detach", ".worktrees/x"]);
+    fs::write(r.join(".worktrees/x/README"), "only here").unwrap();
+    git(
+        &r.join(".worktrees/x"),
+        &["commit", "-q", "-am", "only here"],
+    );
+    // An ignored repository inside, with a commit no remote has.
+    let r = pushed_repo("nested-repo", "vendor/");
+    repo(&r.join("vendor/lib"));
+    // A commit only a tag reaches: no branch has it.
+    let r = pushed_repo("tagged", "");
+    git(&r, &["checkout", "-q", "--detach"]);
+    fs::write(r.join("README"), "tagged").unwrap();
+    git(&r, &["commit", "-q", "-am", "tagged"]);
+    git(&r, &["tag", "local-only"]);
+    git(&r, &["checkout", "-q", "main"]);
+    // A worktree kept outside the folder, which would lose its repository.
+    let r = pushed_repo("outside-wt", "");
+    git(
+        &r,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            home.join("work/outside").to_str().unwrap(),
+        ],
+    );
+    // A bare repository with a commit no other repository has.
+    git(
+        &scratch,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            remote.to_str().unwrap(),
+            "bare.git",
+        ],
+    );
+    let src = t.path().join("src");
+    repo(&src);
+    git(
+        &src,
+        &[
+            "push",
+            "-q",
+            scratch.join("bare.git").to_str().unwrap(),
+            "main:only-in-bare",
+        ],
+    );
     age_tree(&home, 30);
 
     let plan = plan_only(&config(&home), "stale-scratch");
@@ -383,13 +390,25 @@ fn stale_scratch_with_git_work_found_nowhere_else_is_never_moved() {
         .map(|i| i.action.label().rsplit('/').next().unwrap().to_string())
         .collect();
     planned.sort();
-    assert_eq!(planned, vec!["plain", "pushed"], "{:?}", plan.skipped);
+    assert_eq!(
+        planned,
+        vec!["nested-clean", "plain", "pushed"],
+        "{:?}",
+        plan.skipped
+    );
     for (name, why) in [
         ("untracked", "not committed"),
         ("unpushed", "not pushed"),
         ("stashed", "stash"),
         ("wt", "not committed"),
         ("holder", "not pushed"),
+        ("nested-worktree", "not committed in"),
+        ("deep", "not committed in"),
+        ("nested-detached", "not pushed"),
+        ("nested-repo", "not pushed in"),
+        ("tagged", "not pushed"),
+        ("outside-wt", "worktree"),
+        ("bare.git", "not pushed"),
     ] {
         assert!(
             plan.skipped
