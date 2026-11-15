@@ -216,8 +216,9 @@ pub struct PeerKeysConfig {
     pub origins: Vec<String>,
 }
 
-/// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token the page relays
-/// with (scope `doctor`, and ideally limited to `plan_list`, `action_approve` and `plan_decline`). `incusSocket`, when set,
+/// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token this kernel relays
+/// with: the approval page (`plan_list`, `action_approve`, `plan_decline`) and the MCP door's calls that name it with
+/// `node` (the reads and `action_propose`). Scope `doctor`, limited to the verbs relayed with it. `incusSocket`, when set,
 /// is that machine's Incus socket on this one (local, or forwarded to a path here): `instance_move_preflight` reads the
 /// linked host's facts through it, with GETs only.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

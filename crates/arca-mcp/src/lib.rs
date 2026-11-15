@@ -30,5 +30,5 @@ pub use http::{
     serve_loopback, serve_loopback_with, serve_proxy, serve_services, serve_tailnet, serve_unix,
     serve_unix_bound, services_path_ok, tailnet_addr_ok,
 };
-pub use tools::{CallError, ToolHandler};
+pub use tools::{CallError, LinkedNodes, ToolHandler};
 pub use version::{PROTOCOL_VERSION, STATELESS_PROTOCOL_VERSION, SUPPORTED_VERSIONS};
