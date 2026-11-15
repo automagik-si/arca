@@ -2013,6 +2013,26 @@ expired or revoked is answered `401` with `error="invalid_token"`. An app asks f
 `WWW-Authenticate: Bearer error="insufficient_scope", scope="<scope the verb needs>"`, and the app asks you again for that
 scope. `admin` is never granted to an app: the admin token stays a stored one.
 
+#### An agent away from your browser: a link and a code
+
+An agent that runs where no browser of yours is (Codex or Claude in a container, or on a server) connects with the
+device authorization grant (RFC 8628) instead. The agent shows a short link and a code:
+
+```text
+Open https://arca.example.com/oauth/device and type BCDF-GHJK
+```
+
+Open the link on any device (your phone works), type the code, or follow the full link the agent may also show, which
+carries it. The same consent page opens, with the code in place of where the answer goes; check that the agent shows
+that same code, and approve with your passkey as above. The passkey's statement binds the code. The agent polls for its
+tokens every five seconds (more slowly when it polls too fast), and gets them within seconds of your approval: the same
+scopes, the same one-hour and thirty-day tokens, and the same step-up (it asks again, with a new code, for the scope the
+door names). **Don't allow** tells the agent no. A code lasts ten minutes and works once. Never type a code someone else
+sent you: whoever started that request gets the access.
+
+Apps on the computer you are using keep the redirect flow above, with PKCE. A client registers for the device grant by
+naming `urn:ietf:params:oauth:grant-type:device_code` in `grant_types`, and then needs no redirect URI.
+
 The approval page lists the connected apps under **Connected apps**, each with the most it may do across its approvals
 and when it was last used, and **Disconnect**. On the node's own terminal:
 
@@ -2032,13 +2052,15 @@ What the node serves, all on `approvalOrigin`:
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata: `code` with PKCE `S256` only, public clients (`none`), the RFC 9207 `iss` |
 | `POST /oauth/register` | RFC 7591 registration: redirect URIs are exact, and `https`, or `http` on `127.0.0.1`, `[::1]` or `localhost` |
 | `GET /oauth/authorize` | the consent page; `resource` (RFC 8707) must be `<origin>/mcp` |
-| `POST /oauth/token` | `authorization_code` with the PKCE verifier, `refresh_token` with rotation |
+| `POST /oauth/device_authorization` | RFC 8628: a device code for the agent, a user code and link for the person; ten minutes, polled every five seconds |
+| `GET /oauth/device` | the page where the person types the code (or follows `?user_code=`), then the consent page |
+| `POST /oauth/token` | `authorization_code` with the PKCE verifier, `refresh_token` with rotation, and the device code grant (`authorization_pending`, `slow_down`, `access_denied`, `expired_token`, then the tokens once) |
 | `GET /oauth/step-up?grant=<id>` | the step-up page of a session with `approvals`: one tap of the owner's passkey (`POST /oauth/step-up/begin`, then `/approve`) |
 | `POST /oauth/revoke` | RFC 7009: an access token alone, or a refresh token and its grant; `503` when the revocation could not be saved (the grant has ended, and the journal says `"saved":false`); the retry saves it before it answers `200` |
 
 Files in the state directory: `mcp-oauth.json` (the apps and their grants, with only the SHA-256 of each token, mode 0600)
 and `mcp-oauth-journal.jsonl` (each registration, grant, denial and revocation, and each refresh token or code used twice;
-never a token). Consent requests (ten minutes) and codes (one minute, one use) are kept in memory only.
+never a token). Consent requests and device codes (ten minutes) and codes (one minute, one use) are kept in memory only.
 
 The node must be reached at `approvalOrigin` by the app too: the reverse proxy or the tailnet listener that serves the
 page serves these routes and `/mcp` under the same name. A page at `http://localhost:<port>` serves an app on the same

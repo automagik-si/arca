@@ -1835,3 +1835,379 @@ fn the_session_is_never_asked_about_an_erasing_plan_that_action_propose_answers_
         asked.message
     );
 }
+
+// -------------------------------------------------------------------------------------------------------------------
+// The device authorization grant (RFC 8628): an agent away from the person's browser (in a container or on a server)
+// shows a short link and a code; the person approves on any device with the passkey; the agent polls for its token.
+
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// The letters a user code is made of (RFC 8628 6.1: no vowels, nothing that reads as another letter or a digit).
+const USER_CODE_LETTERS: &str = "BCDFGHJKLMNPQRSTVWXZ";
+
+impl Rig {
+    /// A client that registers for the device grant alone, with no redirect.
+    fn device_client(&self, name: &str) -> String {
+        let reply = self.send(
+            "POST",
+            "/oauth/register",
+            &[],
+            "application/json",
+            json!({ "client_name": name, "grant_types": [DEVICE_GRANT, "refresh_token"], "token_endpoint_auth_method": "none" })
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(reply.status, 201, "register: {}", reply.text());
+        let body = reply.json();
+        assert_eq!(body["grant_types"], json!([DEVICE_GRANT, "refresh_token"]));
+        body["client_id"].as_str().expect("a client id").to_string()
+    }
+
+    /// `POST /oauth/device_authorization` with `pairs`.
+    fn device_authorization(&self, pairs: &[(&str, &str)]) -> Reply {
+        self.send(
+            "POST",
+            "/oauth/device_authorization",
+            &[],
+            "application/x-www-form-urlencoded",
+            form(pairs).as_bytes(),
+        )
+    }
+
+    /// A device authorization for `client` at `scope` that must be taken: its answer.
+    fn device_code(&self, client: &str, scope: &str) -> Value {
+        let reply = self.device_authorization(&[
+            ("client_id", client),
+            ("scope", scope),
+            ("resource", &format!("{ORIGIN}/mcp")),
+        ]);
+        assert_eq!(reply.status, 200, "device authorization: {}", reply.text());
+        assert_eq!(reply.header("cache-control").as_deref(), Some("no-store"));
+        reply.json()
+    }
+
+    /// The agent's poll of the token endpoint with `device_code`.
+    fn poll(&self, client: &str, device_code: &str) -> Reply {
+        self.token(&[
+            ("grant_type", DEVICE_GRANT),
+            ("device_code", device_code),
+            ("client_id", client),
+        ])
+    }
+}
+
+/// The path and query of `url` on this origin.
+fn on_origin(url: &str) -> String {
+    url.strip_prefix(ORIGIN)
+        .expect("a URL on the page origin")
+        .to_string()
+}
+
+#[test]
+fn an_agent_away_from_the_browser_shows_a_link_and_a_code_and_polls_for_its_token_after_the_passkey()
+ {
+    let (rig, key) = Rig::new("oauth-device");
+    let client = rig.device_client("Codex in a container");
+    let device = rig.device_code(&client, "doctor");
+    let user_code = device["user_code"]
+        .as_str()
+        .expect("a user code")
+        .to_string();
+    let (left, right) = user_code.split_once('-').expect("two groups of four");
+    assert!(
+        left.len() == 4
+            && right.len() == 4
+            && left
+                .chars()
+                .chain(right.chars())
+                .all(|c| USER_CODE_LETTERS.contains(c)),
+        "{user_code}"
+    );
+    assert_eq!(
+        device["verification_uri"],
+        json!(format!("{ORIGIN}/oauth/device"))
+    );
+    assert_eq!(
+        device["verification_uri_complete"],
+        json!(format!("{ORIGIN}/oauth/device?user_code={user_code}"))
+    );
+    assert_eq!(device["expires_in"], json!(600));
+    assert_eq!(device["interval"], json!(5));
+    let device_code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    assert!(
+        !rig.journal().contains(&device_code),
+        "no device code in the journal"
+    );
+
+    // Nobody approved yet: the agent is told to keep waiting.
+    let waiting = rig.poll(&client, &device_code);
+    assert_eq!(waiting.status, 400, "{}", waiting.text());
+    assert_eq!(error_of(&waiting), "authorization_pending");
+
+    // The link alone opens a page where the person types the code.
+    let entry = rig.get("/oauth/device");
+    assert_eq!(entry.status, 200, "{}", entry.text());
+    assert!(
+        entry.text().contains("name=\"user_code\""),
+        "{}",
+        entry.text()
+    );
+    // The full link, or the code typed in lower case without its dash, opens the consent page for it.
+    let typed = rig.get(&format!(
+        "/oauth/device?user_code={}",
+        user_code.replace('-', "").to_lowercase()
+    ));
+    assert_eq!(
+        Rig::request_id(&typed),
+        Rig::request_id(
+            &rig.get(&on_origin(
+                device["verification_uri_complete"]
+                    .as_str()
+                    .expect("a link")
+            ))
+        )
+    );
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    let text = page.text();
+    assert!(text.contains("Codex in a container"), "the name is shown");
+    assert!(
+        text.contains(&user_code),
+        "the code is shown, to match with the agent's"
+    );
+    assert!(text.contains("<strong id=\"scope\">doctor</strong>"));
+    assert!(text.contains("another device"), "{text}");
+    assert!(
+        !text.contains("redirect-host"),
+        "a device request has no redirect"
+    );
+
+    // The passkey approves; the page answers with words, not a redirect.
+    rig.advance(5_000);
+    let approved = rig.approve_with(&key, &Rig::request_id(&page));
+    assert_eq!(approved.status, 200, "{}", approved.text());
+    assert!(
+        approved.json().get("redirect").is_none(),
+        "{}",
+        approved.text()
+    );
+    assert!(
+        approved.json()["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("app"))
+    );
+
+    // The next poll gets the tokens, at the scope approved, and they call MCP with it.
+    let reply = rig.poll(&client, &device_code);
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(reply.header("cache-control").as_deref(), Some("no-store"));
+    let body = reply.json();
+    assert_eq!(body["token_type"], json!("Bearer"));
+    assert_eq!(body["scope"], json!("doctor"));
+    let access = body["access_token"].as_str().expect("access").to_string();
+    let refresh = body["refresh_token"].as_str().expect("refresh").to_string();
+    assert!(
+        rig.tools(&access).contains(&"service_remove".to_string()),
+        "a doctor verb"
+    );
+    // The device code works once.
+    rig.advance(5_000);
+    let again = rig.poll(&client, &device_code);
+    assert_eq!(error_of(&again), "invalid_grant", "{}", again.text());
+    // It refreshes like any grant.
+    let renewed = rig.refresh(&client, &refresh, None);
+    assert_eq!(renewed.status, 200, "{}", renewed.text());
+    // The journal says it was granted to a device, by the passkey, with no secret.
+    let journal = rig.journal();
+    assert!(journal.contains("\"event\":\"granted\""), "{journal}");
+    assert!(journal.contains("\"device\":true"), "{journal}");
+    for secret in [&access, &refresh, &device_code] {
+        assert!(!journal.contains(secret.as_str()));
+    }
+}
+
+#[test]
+fn a_device_viewer_is_stepped_up_by_asking_again_with_the_scope_the_door_names() {
+    let (rig, key) = Rig::new("oauth-device-step-up");
+    let client = rig.device_client("Claude on a server");
+    let connect = |scope: &str| {
+        let device = rig.device_code(&client, scope);
+        let page = rig.get(&on_origin(
+            device["verification_uri_complete"]
+                .as_str()
+                .expect("a link"),
+        ));
+        let approved = rig.approve_with(&key, &Rig::request_id(&page));
+        assert_eq!(approved.status, 200, "{}", approved.text());
+        let reply = rig.poll(
+            &client,
+            device["device_code"].as_str().expect("a device code"),
+        );
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        reply.json()["access_token"]
+            .as_str()
+            .expect("access")
+            .to_string()
+    };
+    let viewer = connect("viewer");
+    let call = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "service_remove", "arguments": { "name": "nats" } } });
+    let refused = rig.mcp(Some(&viewer), call.clone());
+    assert_eq!(refused.status, 403);
+    assert!(
+        refused
+            .header("www-authenticate")
+            .is_some_and(|c| c.starts_with("Bearer error=\"insufficient_scope\", scope=\"doctor\"")),
+        "{:?}",
+        refused.header("www-authenticate")
+    );
+    let doctor = connect("doctor");
+    assert_ne!(rig.mcp(Some(&doctor), call).status, 403);
+}
+
+#[test]
+fn a_device_code_polled_too_fast_slows_down_and_a_no_or_the_clock_ends_it() {
+    let (rig, key) = Rig::new("oauth-device-poll");
+    let _ = key;
+    let client = rig.device_client("Codex");
+    let device = rig.device_code(&client, "viewer");
+    let code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    assert_eq!(error_of(&rig.poll(&client, &code)), "authorization_pending");
+    // Again at once, under the interval: slow down, and the interval grows by five seconds (RFC 8628 3.5).
+    assert_eq!(error_of(&rig.poll(&client, &code)), "slow_down");
+    rig.advance(5_000);
+    assert_eq!(
+        error_of(&rig.poll(&client, &code)),
+        "slow_down",
+        "the interval is ten seconds now"
+    );
+    rig.advance(10_000);
+    assert_eq!(error_of(&rig.poll(&client, &code)), "authorization_pending");
+    // The person says no on the page: the agent is told access_denied, once.
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    let denied = rig.page_post(
+        "/oauth/authorize/deny",
+        json!({ "id": Rig::request_id(&page) }),
+    );
+    assert_eq!(denied.status, 200, "{}", denied.text());
+    assert!(denied.json().get("redirect").is_none(), "{}", denied.text());
+    // Decided, its link opens no consent page any more.
+    let decided = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    assert_eq!(decided.status, 404, "{}", decided.text());
+    rig.advance(10_000);
+    assert_eq!(error_of(&rig.poll(&client, &code)), "access_denied");
+    rig.advance(10_000);
+    assert_eq!(error_of(&rig.poll(&client, &code)), "invalid_grant");
+    assert!(rig.journal().contains("\"event\":\"denied\""));
+    // Ten minutes on, a device code nobody approved has expired, and its link opens no consent page.
+    let late = rig.device_code(&client, "viewer");
+    rig.advance(600_000);
+    let expired = rig.poll(
+        &client,
+        late["device_code"].as_str().expect("a device code"),
+    );
+    assert_eq!(error_of(&expired), "expired_token", "{}", expired.text());
+    let gone = rig.get(&on_origin(
+        late["verification_uri_complete"].as_str().expect("a link"),
+    ));
+    assert_eq!(gone.status, 404, "{}", gone.text());
+    assert!(!gone.text().contains("data-request"));
+}
+
+#[test]
+fn a_device_request_is_checked_like_a_consent_request_and_its_code_is_bound_to_its_client() {
+    let (rig, key) = Rig::new("oauth-device-checks");
+    let client = rig.device_client("Codex");
+    let other = rig.device_client("Another agent");
+    let resource = format!("{ORIGIN}/mcp");
+    let refused = |pairs: &[(&str, &str)]| error_of(&rig.device_authorization(pairs));
+    assert_eq!(
+        refused(&[("client_id", "mcpc-unknown"), ("scope", "viewer")]),
+        "invalid_client"
+    );
+    assert_eq!(
+        refused(&[("client_id", &client), ("scope", "admin")]),
+        "invalid_scope"
+    );
+    assert_eq!(
+        refused(&[
+            ("client_id", &client),
+            ("scope", "viewer"),
+            ("resource", "https://elsewhere.example.com/mcp")
+        ]),
+        "invalid_target"
+    );
+    // No scope means viewer, as on the consent page; no resource means this node's.
+    let plain = rig.device_authorization(&[("client_id", &client)]);
+    assert_eq!(plain.status, 200, "{}", plain.text());
+    // A device code polled by another client is refused, and stays its client's.
+    let device = rig.device_code(&client, "viewer");
+    let code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    let approved = rig.approve_with(&key, &Rig::request_id(&page));
+    assert_eq!(approved.status, 200, "{}", approved.text());
+    assert_eq!(error_of(&rig.poll(&other, &code)), "invalid_grant");
+    assert_eq!(rig.poll(&client, &code).status, 200);
+    // A code nobody issued opens no consent page.
+    let unknown = rig.get("/oauth/device?user_code=BCDF-GHJK");
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
+    // A client with neither a redirect nor the device grant is still refused at registration.
+    let bare = rig.send(
+        "POST",
+        "/oauth/register",
+        &[],
+        "application/json",
+        json!({ "client_name": "Nothing", "token_endpoint_auth_method": "none" })
+            .to_string()
+            .as_bytes(),
+    );
+    assert_eq!(bare.status, 400, "{}", bare.text());
+    // A device-only client has no redirect, so the code flow never sends anything anywhere for it.
+    let code_flow = rig.authorize(&client, &[("redirect_uri", None)]);
+    assert!(
+        !code_flow.text().contains("data-request"),
+        "{}",
+        code_flow.text()
+    );
+    let _ = resource;
+}
+
+#[test]
+fn the_metadata_names_the_device_endpoint_and_grant() {
+    let (rig, _key) = Rig::new("oauth-device-metadata");
+    let metadata = rig.get("/.well-known/oauth-authorization-server").json();
+    assert_eq!(
+        metadata["device_authorization_endpoint"],
+        json!(format!("{ORIGIN}/oauth/device_authorization"))
+    );
+    let grants = metadata["grant_types_supported"]
+        .as_array()
+        .expect("grant types");
+    assert!(grants.contains(&json!(DEVICE_GRANT)), "{grants:?}");
+    assert!(
+        grants.contains(&json!("authorization_code")),
+        "the code flow stays"
+    );
+}

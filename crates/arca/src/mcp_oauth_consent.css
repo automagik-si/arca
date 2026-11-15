@@ -38,7 +38,11 @@ p { margin: 0 0 12px; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 0 0 16px; }
 dt { color: var(--arca-muted); }
 dd { margin: 0; overflow-wrap: anywhere; }
-#redirect-host { font-family: var(--arca-mono); font-size: 16px; }
+#redirect-host, #user-code { font-family: var(--arca-mono); font-size: 16px; }
+#user-code { letter-spacing: .08em; }
+label { display: block; color: var(--arca-muted); margin: 0 0 6px; }
+input { font: 600 20px/1.2 var(--arca-mono); letter-spacing: .12em; text-transform: uppercase; width: 100%; max-width: 14rem; padding: 10px 12px; border: 1px solid var(--arca-line); border-radius: 10px; background: var(--arca-bg); color: var(--arca-ink); }
+input:focus-visible, button:focus-visible { outline: 2px solid var(--arca-accent); outline-offset: 2px; }
 code { font-family: var(--arca-mono); }
 .approvals { border: 1px solid var(--arca-line); border-left: 4px solid var(--arca-accent); padding: 10px 12px; border-radius: 8px; margin: 0 0 16px; }
 .approvals p { margin: 0; }

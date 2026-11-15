@@ -24,6 +24,13 @@
 //! - `GET /oauth/step-up?grant=<id>`: the page where one passkey tap (action `mcp_authorize`, target the client id,
 //!   `paramsDigest` over the grant) confirms the owner's signed-in session again for [`STEP_UP_MS`]; its
 //!   `POST /oauth/step-up/begin` and `.../approve` work as the consent page's.
+//! - `POST /oauth/device_authorization` (RFC 8628): for an agent away from the person's browser (in a container, on a
+//!   server). Checked as an authorization request is, it answers a device code for the agent and a user code (eight
+//!   letters, `XXXX-XXXX`) with the link `GET /oauth/device?user_code=...`, where the person approves on any device on
+//!   the same consent page, with the same passkey statement, which binds the user code instead of a redirect. The agent
+//!   polls `POST /oauth/token` with the device code grant: `authorization_pending`, `slow_down` (the interval grows by
+//!   five seconds), `access_denied`, `expired_token` after ten minutes, then the tokens, once. A client may register for
+//!   the device grant with no redirect at all.
 //! - `GET /approve/oauth/clients` and `POST /approve/oauth/revoke`: the owner's list of connected clients and its revoke.
 //! - On the unix socket alone, `POST /local/oauth/clients` and `POST /local/oauth/revoke`, behind the setup code's
 //!   proof file: what `arca oauth list` and `arca oauth revoke` call.
@@ -36,9 +43,9 @@
 //! card. While a grant with `approvals` is live, the waiting action plans stay open past their fifteen minutes. An access
 //! token lives one hour and a refresh token thirty days; a code lives sixty seconds.
 //!
-//! Tokens are opaque: `arca_at_` or `arca_rt_` and 43 base64url characters (256 random bits). The state directory keeps
-//! only their SHA-256, in `mcp-oauth.json` (mode 0600, written whole and renamed). Codes and consent requests live in
-//! memory only. `mcp-oauth-journal.jsonl` records each registration, grant, denial and revocation, and each refresh
+//! Tokens and device codes are opaque: `arca_at_`, `arca_rt_` or `arca_dc_` and 43 base64url characters (256 random bits). The state directory keeps
+//! only their SHA-256, in `mcp-oauth.json` (mode 0600, written whole and renamed). Codes, device codes and consent
+//! requests live in memory only. `mcp-oauth-journal.jsonl` records each registration, grant, denial and revocation, and each refresh
 //! token or code used twice. No token, code, verifier or proof reaches the journal, a log line or an error.
 
 use std::collections::HashMap;
@@ -95,6 +102,14 @@ pub const TOKEN_PATH: &str = "/oauth/token";
 pub const REGISTER_PATH: &str = "/oauth/register";
 pub const REVOKE_PATH: &str = "/oauth/revoke";
 pub const RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+/// Where an agent away from the person's browser asks for a device code (RFC 8628 3.1), and the page the person opens.
+pub const DEVICE_AUTHORIZATION_PATH: &str = "/oauth/device_authorization";
+pub const DEVICE_PATH: &str = "/oauth/device";
+/// The grant type an agent polls the token endpoint with (RFC 8628 3.4).
+pub const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// How long an agent waits between polls at first, and how much longer after each poll that came too soon (RFC 8628 3.5).
+pub const DEVICE_INTERVAL_MS: u64 = 5 * 1000;
+const SLOW_DOWN_MS: u64 = 5 * 1000;
 pub const SERVER_METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
 /// The unix socket's routes for `arca oauth`.
 pub const LOCAL_CLIENTS_PATH: &str = "/local/oauth/clients";
@@ -103,6 +118,10 @@ pub const LOCAL_REVOKE_PATH: &str = "/local/oauth/revoke";
 const ACCESS_PREFIX: &str = "arca_at_";
 const REFRESH_PREFIX: &str = "arca_rt_";
 const CODE_PREFIX: &str = "arca_ac_";
+const DEVICE_CODE_PREFIX: &str = "arca_dc_";
+/// The letters of a user code: no vowels, and nothing that reads as another letter or a digit (RFC 8628 6.1). Eight of
+/// them, shown as two groups of four, are 20^8 (about 2.6 * 10^10) codes.
+const USER_CODE_LETTERS: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
 const SECRET_CHARS: usize = 43;
 /// The scopes a client may ask for, lowest first.
 const LEVELS: [Scope; 3] = [Scope::Viewer, Scope::Doctor, Scope::Operator];
@@ -120,6 +139,9 @@ const ROTATED_MAX: usize = 32;
 const BODY_MAX: usize = 16 * 1024;
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; \
                    frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'none'";
+/// The device page's: the same, but its one form (type the code) may be sent to this page.
+const DEVICE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; \
+                          frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'";
 
 /// A client that registered (RFC 7591).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +232,39 @@ struct Pending {
     created: u64,
     statement: Option<String>,
     begun_at: Option<u64>,
+    /// For a request an agent made with the device grant: the SHA-256 of its device code, and the user code the person
+    /// typed or followed. It has no redirect, state or PKCE challenge.
+    device: Option<(String, String)>,
+}
+
+/// A device code (RFC 8628) until the agent's poll takes its answer.
+#[derive(Debug, Clone)]
+struct Device {
+    client_id: String,
+    user_code: String,
+    /// The consent request the person approves or denies.
+    request: String,
+    expires: u64,
+    /// How long the agent waits between polls now, and when it last polled in time.
+    interval: u64,
+    last_poll: Option<u64>,
+    answer: DeviceAnswer,
+}
+
+#[derive(Debug, Clone)]
+enum DeviceAnswer {
+    Waiting,
+    /// The owner's passkey approved: what the grant carries.
+    Approved {
+        scope: Scope,
+        tools: Option<Vec<String>>,
+        resource: String,
+        key: String,
+        /// Whether the owner made it their signed-in session for approvals, and when the passkey approved it.
+        approvals: bool,
+        approved_at: u64,
+    },
+    Denied,
 }
 
 /// A code the owner's approval made, until the client exchanges it.
@@ -235,6 +290,8 @@ struct Inner {
     codes: HashMap<String, Code>,
     /// Codes exchanged once, with the grant they made and when they would have expired.
     used_codes: HashMap<String, (String, u64)>,
+    /// Device codes by the SHA-256 of each, in memory only, kept a while past their expiry to answer `expired_token`.
+    devices: HashMap<String, Device>,
     /// When each grant's access token was last used, in memory only.
     last_used: HashMap<String, u64>,
     /// Whether a revocation ended a grant in memory that the store on disk does not have yet: the next revocation
@@ -542,6 +599,9 @@ impl OAuth {
             .pending
             .retain(|pending| now.saturating_sub(pending.created) < REQUEST_TTL_MS);
         inner.codes.retain(|_, code| now < code.expires);
+        inner
+            .devices
+            .retain(|_, device| now < device.expires.saturating_add(REQUEST_TTL_MS));
         inner.used_codes.retain(|_, (_, expires)| now < *expires);
         for grant in &mut inner.stored.grants {
             grant.access.retain(|token| now < token.expires);
@@ -597,10 +657,17 @@ impl OAuth {
                     .collect()
             })
             .unwrap_or_default();
-        if uris.is_empty() || uris.len() > REDIRECTS_MAX {
+        // A client that asks for the device grant (an agent away from the browser) may register no redirect at all.
+        let device = metadata
+            .get("grant_types")
+            .and_then(Value::as_array)
+            .is_some_and(|grants| grants.iter().any(|grant| grant == DEVICE_GRANT));
+        if (uris.is_empty() && !device) || uris.len() > REDIRECTS_MAX {
             return Err(OAuthError::new(
                 "invalid_redirect_uri",
-                format!("a client registers 1 to {REDIRECTS_MAX} redirect_uris"),
+                format!(
+                    "a client registers 1 to {REDIRECTS_MAX} redirect_uris, or none with grant_types naming {DEVICE_GRANT}"
+                ),
             ));
         }
         if let Some(bad) = uris.iter().find(|uri| !redirect_ok(uri)) {
@@ -659,13 +726,24 @@ impl OAuth {
             "registered",
             json!({ "client": client.id, "name": client.name, "redirects": client.redirect_uris.iter().map(|uri| redirect_host(uri)).collect::<Vec<_>>() }),
         );
+        let (grant_types, response_types) = match (client.redirect_uris.is_empty(), device) {
+            (true, _) => (json!([DEVICE_GRANT, "refresh_token"]), json!([])),
+            (false, true) => (
+                json!(["authorization_code", DEVICE_GRANT, "refresh_token"]),
+                json!(["code"]),
+            ),
+            (false, false) => (
+                json!(["authorization_code", "refresh_token"]),
+                json!(["code"]),
+            ),
+        };
         Ok(json!({
             "client_id": client.id,
             "client_id_issued_at": now / 1000,
             "client_name": client.name,
             "redirect_uris": client.redirect_uris,
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
+            "grant_types": grant_types,
+            "response_types": response_types,
             "token_endpoint_auth_method": "none",
         }))
     }
@@ -782,6 +860,7 @@ impl OAuth {
             created: now,
             statement: None,
             begun_at: None,
+            device: None,
         };
         inner.pending.push(pending.clone());
         let shared = Self::name_shared(&inner, &client);
@@ -790,7 +869,7 @@ impl OAuth {
 
     /// The arguments the owner's statement binds for a consent request: every field the code will carry.
     fn bound(pending: &Pending, client: &Client) -> Value {
-        json!({
+        let mut bound = json!({
             "request": pending.id,
             "client": client.id,
             "name": client.name,
@@ -798,7 +877,12 @@ impl OAuth {
             "scope": scope_text(pending.scope, pending.tools.as_deref(), pending.approvals),
             "resource": pending.resource,
             "codeChallenge": pending.challenge,
-        })
+        });
+        // A device request binds the code the person saw instead of a redirect.
+        if let Some((_, user_code)) = &pending.device {
+            bound["userCode"] = json!(user_code);
+        }
+        bound
     }
 
     fn begin(&self, id: &str) -> Result<Value, Refusal> {
@@ -868,6 +952,37 @@ impl OAuth {
             proof,
             now,
         )?;
+        if let Some((device_hash, _)) = &pending.device {
+            {
+                let mut inner = self.lock();
+                if !inner.pending.iter().any(|kept| kept.id == pending.id) {
+                    return Err(gone());
+                }
+                inner.pending.retain(|kept| kept.id != pending.id);
+                let device = inner.devices.get_mut(device_hash).ok_or_else(gone)?;
+                device.answer = DeviceAnswer::Approved {
+                    scope: pending.scope,
+                    tools: pending.tools.clone(),
+                    resource: pending.resource.clone(),
+                    key: key.clone(),
+                    approvals: pending.approvals,
+                    approved_at: now,
+                };
+            }
+            let scope = scope_text(pending.scope, pending.tools.as_deref(), pending.approvals);
+            self.journal(
+                now,
+                "granted",
+                json!({ "client": client.id, "name": client.name, "scope": scope, "device": true, "by": format!("passkey {key}") }),
+            );
+            (self.log)(&format!(
+                "arca: the owner approved MCP client {} ({}) on a device code with scope {scope}",
+                client.id, client.name
+            ));
+            return Ok(json!({
+                "message": "Approved. Go back to the app: it connects within a few seconds.",
+            }));
+        }
         let code = secret(CODE_PREFIX);
         {
             let mut inner = self.lock();
@@ -917,12 +1032,20 @@ impl OAuth {
         Self::sweep(&mut inner, now);
         let pending = find_pending(&inner, id)?.clone();
         inner.pending.retain(|kept| kept.id != id);
+        if let Some((device_hash, _)) = &pending.device
+            && let Some(device) = inner.devices.get_mut(device_hash)
+        {
+            device.answer = DeviceAnswer::Denied;
+        }
         drop(inner);
         self.journal(
             now,
             "denied",
-            json!({ "client": pending.client_id, "scope": scope_text(pending.scope, pending.tools.as_deref(), pending.approvals) }),
+            json!({ "client": pending.client_id, "scope": scope_text(pending.scope, pending.tools.as_deref(), pending.approvals), "device": pending.device.is_some() }),
         );
+        if pending.device.is_some() {
+            return Ok(json!({ "message": "Not allowed. The app is told no." }));
+        }
         Ok(json!({
             "redirect": with_params(&pending.redirect_uri, &[
                 ("error", Some("access_denied")),
@@ -1159,17 +1282,280 @@ impl OAuth {
     }
 
     // ---------------------------------------------------------------------------------------------------------------
+    // The device authorization grant (RFC 8628)
+
+    /// `POST /oauth/device_authorization`: a consent request for an agent away from the person's browser, checked as a
+    /// `GET /oauth/authorize` is, answered with the device code the agent polls with and the user code the person types.
+    fn device_authorize(&self, form: &HashMap<String, String>) -> Result<Value, OAuthError> {
+        let now = self.now();
+        let param = |key: &str| form.get(key).map(String::as_str);
+        let mut inner = self.lock();
+        Self::sweep(&mut inner, now);
+        let client = param("client_id")
+            .and_then(|id| Self::client(&inner, id))
+            .cloned()
+            .ok_or_else(|| {
+                OAuthError::new(
+                    "invalid_client",
+                    "Arca does not know this app: register it first",
+                )
+            })?;
+        let resource = match param("resource") {
+            None => self.resource.clone(),
+            Some(asked) if canonical_resource(asked) == canonical_resource(&self.resource) => {
+                self.resource.clone()
+            }
+            Some(_) => {
+                return Err(OAuthError::new(
+                    "invalid_target",
+                    format!("Arca issues tokens for {} only", self.resource),
+                ));
+            }
+        };
+        let (scope, tools, approvals) = parse_scope(param("scope").unwrap_or_default())
+            .map_err(|why| OAuthError::new("invalid_scope", why))?;
+        if inner.pending.len() >= PENDING_MAX {
+            return Err(OAuthError::new(
+                "temporarily_unavailable",
+                "too many requests are waiting for the owner",
+            )
+            .status(StatusCode::TOO_MANY_REQUESTS));
+        }
+        let user_code = loop {
+            let code = user_code();
+            if !inner
+                .devices
+                .values()
+                .any(|device| device.user_code == code)
+            {
+                break code;
+            }
+        };
+        let device_code = secret(DEVICE_CODE_PREFIX);
+        let device_hash = hash_hex(&device_code);
+        let request = format!("oar-{}", random_hex(16));
+        inner.pending.push(Pending {
+            id: request.clone(),
+            client_id: client.id.clone(),
+            redirect_uri: String::new(),
+            redirect_given: false,
+            state: None,
+            scope,
+            tools,
+            resource,
+            challenge: String::new(),
+            created: now,
+            statement: None,
+            begun_at: None,
+            device: Some((device_hash.clone(), user_code.clone())),
+            approvals,
+        });
+        inner.devices.insert(
+            device_hash,
+            Device {
+                client_id: client.id,
+                user_code: user_code.clone(),
+                request,
+                expires: now.saturating_add(REQUEST_TTL_MS),
+                interval: DEVICE_INTERVAL_MS,
+                last_poll: None,
+                answer: DeviceAnswer::Waiting,
+            },
+        );
+        let page = format!("{}{DEVICE_PATH}", self.origin);
+        Ok(json!({
+            "device_code": device_code,
+            "user_code": user_code,
+            "verification_uri": page,
+            "verification_uri_complete": format!("{page}?user_code={user_code}"),
+            "expires_in": REQUEST_TTL_MS / 1000,
+            "interval": DEVICE_INTERVAL_MS / 1000,
+        }))
+    }
+
+    /// The consent request a user code opens, as the person typed it (any case, with or without its dash), with its client
+    /// and whether its name is shared. `None` for a code nobody issued, one already decided, or one that expired.
+    fn device_request(&self, typed: &str) -> Option<(Pending, Client, bool)> {
+        let letters: String = typed
+            .chars()
+            .filter(char::is_ascii_alphabetic)
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        if letters.len() != 8 {
+            return None;
+        }
+        let user_code = format!("{}-{}", &letters[..4], &letters[4..]);
+        let now = self.now();
+        let mut inner = self.lock();
+        Self::sweep(&mut inner, now);
+        let device = inner.devices.values().find(|device| {
+            device.user_code == user_code
+                && now < device.expires
+                && matches!(device.answer, DeviceAnswer::Waiting)
+        })?;
+        let pending = inner
+            .pending
+            .iter()
+            .find(|pending| pending.id == device.request)?
+            .clone();
+        let client = Self::client(&inner, &pending.client_id)?.clone();
+        let shared = Self::name_shared(&inner, &client);
+        Some((pending, client, shared))
+    }
+
+    /// The agent's poll of the token endpoint with its device code (RFC 8628 3.4, 3.5).
+    fn device_token(&self, form: &HashMap<String, String>) -> Result<Value, OAuthError> {
+        let now = self.now();
+        let param = |key: &str| form.get(key).map(String::as_str);
+        let device_hash = hash_hex(param("device_code").unwrap_or_default());
+        let mut inner = self.lock();
+        Self::sweep(&mut inner, now);
+        let Some(device) = inner.devices.get_mut(&device_hash) else {
+            return Err(OAuthError::new(
+                "invalid_grant",
+                "the device code is not known, was used already or expired long ago",
+            ));
+        };
+        if param("client_id") != Some(device.client_id.as_str()) {
+            return Err(OAuthError::new(
+                "invalid_grant",
+                "the device code was issued to another client",
+            ));
+        }
+        if now >= device.expires {
+            return Err(OAuthError::new(
+                "expired_token",
+                "the device code expired: ask for a new one",
+            ));
+        }
+        match device.answer.clone() {
+            DeviceAnswer::Waiting => {
+                if device
+                    .last_poll
+                    .is_some_and(|last| now < last.saturating_add(device.interval))
+                {
+                    device.interval = device.interval.saturating_add(SLOW_DOWN_MS);
+                    return Err(OAuthError::new(
+                        "slow_down",
+                        format!("poll every {} seconds at most", device.interval / 1000),
+                    ));
+                }
+                device.last_poll = Some(now);
+                Err(OAuthError::new(
+                    "authorization_pending",
+                    "the owner has not approved yet",
+                ))
+            }
+            DeviceAnswer::Denied => {
+                inner.devices.remove(&device_hash);
+                Err(OAuthError::new("access_denied", "the owner said no"))
+            }
+            DeviceAnswer::Approved {
+                scope,
+                tools,
+                resource,
+                key,
+                approvals,
+                approved_at,
+            } => {
+                let Some(device) = inner.devices.remove(&device_hash) else {
+                    return Err(OAuthError::new("invalid_grant", "the device code was used"));
+                };
+                if Self::client(&inner, &device.client_id).is_none() {
+                    return Err(OAuthError::new("invalid_grant", "the client was revoked"));
+                }
+                match self.issue(
+                    &mut inner,
+                    &device.client_id,
+                    scope,
+                    tools,
+                    &resource,
+                    &key,
+                    approvals,
+                    approved_at,
+                    now,
+                ) {
+                    Ok((access, refresh, grant)) => Ok(token_answer(&access, &refresh, &grant)),
+                    Err(error) => {
+                        // Not saved: the agent may poll again for the same answer.
+                        inner.devices.insert(device_hash, device);
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
     // Tokens
 
     fn token(&self, form: &HashMap<String, String>) -> Result<Value, OAuthError> {
         match form.get("grant_type").map(String::as_str) {
             Some("authorization_code") => self.exchange(form),
             Some("refresh_token") => self.refresh(form),
+            Some(DEVICE_GRANT) => self.device_token(form),
             _ => Err(OAuthError::new(
                 "unsupported_grant_type",
-                "Arca takes authorization_code and refresh_token",
+                format!("Arca takes authorization_code, refresh_token and {DEVICE_GRANT}"),
             )),
         }
+    }
+
+    /// Makes and saves a new grant of `scope` (and `tools`) for `client_id`, which the owner's passkey `key` approved, with
+    /// its first access and refresh tokens.
+    #[allow(clippy::too_many_arguments)]
+    fn issue(
+        &self,
+        inner: &mut Inner,
+        client_id: &str,
+        scope: Scope,
+        tools: Option<Vec<String>>,
+        resource: &str,
+        key: &str,
+        approvals: bool,
+        approved_at: u64,
+        now: u64,
+    ) -> Result<(String, String, Grant), OAuthError> {
+        let access = secret(ACCESS_PREFIX);
+        let refresh = secret(REFRESH_PREFIX);
+        let grant = Grant {
+            id: format!("g-{}", random_hex(12)),
+            client_id: client_id.to_string(),
+            scope: scope.as_str().to_string(),
+            tools: tools.clone(),
+            resource: resource.to_string(),
+            approved_at: now,
+            key: key.to_string(),
+            refresh: Some(Hashed {
+                sha256: hash_hex(&refresh),
+                expires: now + REFRESH_TTL_MS,
+            }),
+            rotated: Vec::new(),
+            access: vec![Hashed {
+                sha256: hash_hex(&access),
+                expires: now + ACCESS_TTL_MS,
+            }],
+            revoked_at: None,
+            approved: Some(Approved {
+                scope: scope.as_str().to_string(),
+                tools,
+            }),
+            approvals,
+            // The consent's passkey counts for the owner's session from the moment it approved.
+            stepped_up_until: if approvals {
+                approved_at.saturating_add(STEP_UP_MS)
+            } else {
+                0
+            },
+            step_key: None,
+        };
+        inner.stored.grants.push(grant.clone());
+        if self.persist(inner).is_err() {
+            inner.stored.grants.pop();
+            return Err(OAuthError::new("server_error", "the grant was not saved")
+                .status(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+        Ok((access, refresh, grant))
     }
 
     fn exchange(&self, form: &HashMap<String, String>) -> Result<Value, OAuthError> {
@@ -1230,48 +1616,20 @@ impl OAuth {
         if Self::client(&inner, &code.client_id).is_none() {
             return Err(invalid("the client was revoked"));
         }
-        let access = secret(ACCESS_PREFIX);
-        let refresh = secret(REFRESH_PREFIX);
-        let grant = Grant {
-            id: format!("g-{}", random_hex(12)),
-            client_id: code.client_id.clone(),
-            scope: code.scope.as_str().to_string(),
-            tools: code.tools.clone(),
-            resource: code.resource.clone(),
-            approved_at: now,
-            key: code.key.clone(),
-            refresh: Some(Hashed {
-                sha256: hash_hex(&refresh),
-                expires: now + REFRESH_TTL_MS,
-            }),
-            rotated: Vec::new(),
-            access: vec![Hashed {
-                sha256: hash_hex(&access),
-                expires: now + ACCESS_TTL_MS,
-            }],
-            revoked_at: None,
-            approved: Some(Approved {
-                scope: code.scope.as_str().to_string(),
-                tools: code.tools.clone(),
-            }),
-            approvals: code.approvals,
-            // The consent's passkey counts for the session from the moment it approved.
-            stepped_up_until: if code.approvals {
-                code.approved_at.saturating_add(STEP_UP_MS)
-            } else {
-                0
-            },
-            step_key: None,
-        };
+        let (access, refresh, grant) = self.issue(
+            &mut inner,
+            &code.client_id,
+            code.scope,
+            code.tools.clone(),
+            &code.resource,
+            &code.key,
+            code.approvals,
+            code.approved_at,
+            now,
+        )?;
         inner
             .used_codes
             .insert(code_hash, (grant.id.clone(), code.expires));
-        inner.stored.grants.push(grant.clone());
-        if self.persist(&inner).is_err() {
-            inner.stored.grants.pop();
-            return Err(OAuthError::new("server_error", "the grant was not saved")
-                .status(StatusCode::INTERNAL_SERVER_ERROR));
-        }
         Ok(token_answer(&access, &refresh, &grant))
     }
 
@@ -1581,6 +1939,8 @@ impl OAuth {
             .route(TOKEN_PATH, post(token))
             .route(REVOKE_PATH, post(revoke))
             .route(AUTHORIZE_PATH, get(authorize))
+            .route(DEVICE_AUTHORIZATION_PATH, post(device_authorization))
+            .route(DEVICE_PATH, get(device_page))
             .route("/oauth/authorize/begin", post(consent_begin))
             .route("/oauth/authorize/approve", post(consent_approve))
             .route("/oauth/authorize/deny", post(consent_deny))
@@ -1881,6 +2241,21 @@ fn random_hex(bytes: usize) -> String {
 }
 
 /// A new secret: `prefix` and 43 base64url characters of 32 random bytes.
+/// A new user code: eight of [`USER_CODE_LETTERS`], each from an unbiased random byte, shown as `XXXX-XXXX`.
+fn user_code() -> String {
+    let mut letters = Vec::with_capacity(8);
+    while letters.len() < 8 {
+        for byte in random_bytes::<16>() {
+            // 240 is the largest multiple of 20 below 256: a byte at or above it would favour the first letters.
+            if byte < 240 && letters.len() < 8 {
+                letters.push(USER_CODE_LETTERS[usize::from(byte % 20)]);
+            }
+        }
+    }
+    let text = String::from_utf8(letters).unwrap_or_default();
+    format!("{}-{}", &text[..4], &text[4..])
+}
+
 fn secret(prefix: &str) -> String {
     format!("{prefix}{}", URL_SAFE_NO_PAD.encode(random_bytes::<32>()))
 }
@@ -1985,7 +2360,13 @@ async fn rules(State(oauth): State<Arc<OAuth>>, request: Request, next: Next) ->
     }
     let path = request.uri().path().to_string();
     let for_clients = path.starts_with("/.well-known/")
-        || [REGISTER_PATH, TOKEN_PATH, REVOKE_PATH].contains(&path.as_str());
+        || [
+            REGISTER_PATH,
+            TOKEN_PATH,
+            REVOKE_PATH,
+            DEVICE_AUTHORIZATION_PATH,
+        ]
+        .contains(&path.as_str());
     if for_clients && request.method() == Method::OPTIONS {
         let mut response = StatusCode::NO_CONTENT.into_response();
         cors(response.headers_mut());
@@ -2013,7 +2394,7 @@ async fn rules(State(oauth): State<Arc<OAuth>>, request: Request, next: Next) ->
     }
     headers.insert(
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static(CSP),
+        HeaderValue::from_static(if path == DEVICE_PATH { DEVICE_CSP } else { CSP }),
     );
     headers.insert(
         HeaderName::from_static("x-content-type-options"),
@@ -2065,9 +2446,10 @@ async fn server_metadata(State(oauth): State<Arc<OAuth>>) -> Response {
         "token_endpoint": format!("{origin}{TOKEN_PATH}"),
         "registration_endpoint": format!("{origin}{REGISTER_PATH}"),
         "revocation_endpoint": format!("{origin}{REVOKE_PATH}"),
+        "device_authorization_endpoint": format!("{origin}{DEVICE_AUTHORIZATION_PATH}"),
         "response_types_supported": ["code"],
         "response_modes_supported": ["query"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "grant_types_supported": ["authorization_code", "refresh_token", DEVICE_GRANT],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "revocation_endpoint_auth_methods_supported": ["none"],
@@ -2117,6 +2499,52 @@ async fn token(State(oauth): State<Arc<OAuth>>, body: Bytes) -> Response {
             .into_response(),
         Ok(Err(error)) => error.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn device_authorization(State(oauth): State<Arc<OAuth>>, body: Bytes) -> Response {
+    let outcome = tokio::task::spawn_blocking(move || {
+        form(&body).and_then(|form| oauth.device_authorize(&form))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(answer)) => (
+            StatusCode::OK,
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::PRAGMA, "no-cache"),
+            ],
+            Json(answer),
+        )
+            .into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `GET /oauth/device`: with no code, the page where the person types the one the app shows; with `user_code`, the
+/// consent page for it.
+async fn device_page(
+    State(oauth): State<Arc<OAuth>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(typed) = query
+        .get("user_code")
+        .filter(|typed| !typed.trim().is_empty())
+    else {
+        return html(StatusCode::OK, device_entry_page(None));
+    };
+    match oauth.device_request(typed) {
+        Some((pending, client, shared)) => html(
+            StatusCode::OK,
+            consent_page(&oauth, &pending, &client, shared),
+        ),
+        None => html(
+            StatusCode::NOT_FOUND,
+            device_entry_page(Some(
+                "Arca does not know this code, or it expired. Check it, or ask the app for a new one.",
+            )),
+        ),
     }
 }
 
@@ -2350,12 +2778,31 @@ fn scope_words(scope: Scope) -> &'static str {
 }
 
 fn consent_page(oauth: &OAuth, pending: &Pending, client: &Client, shared: bool) -> String {
-    let host = redirect_host(&pending.redirect_uri);
-    let local = matches!(host.as_str(), "127.0.0.1" | "[::1]" | "localhost");
-    let where_text = if local {
-        "an app on the computer you are using".to_string()
+    let answers = match &pending.device {
+        // An agent on another device polls for its answer: the person matches the code it shows.
+        Some((_, user_code)) => format!(
+            "<dt>Code</dt><dd><strong id=\"user-code\">{code}</strong>: an app on another device, which shows this same code</dd>",
+            code = escape_html(user_code),
+        ),
+        None => {
+            let host = redirect_host(&pending.redirect_uri);
+            let local = matches!(host.as_str(), "127.0.0.1" | "[::1]" | "localhost");
+            let where_text = if local {
+                "an app on the computer you are using".to_string()
+            } else {
+                host.clone()
+            };
+            format!(
+                "<dt>Answers go to</dt><dd><strong id=\"redirect-host\">{host}</strong> ({where_text})</dd>",
+                host = escape_html(&host),
+                where_text = escape_html(&where_text),
+            )
+        }
+    };
+    let device_note = if pending.device.is_some() {
+        "<p class=\"warn\" id=\"device-note\">Approve only if you started this yourself, just now, and the app shows this same code. Someone who sent you a code is asking for your access.</p>"
     } else {
-        host.clone()
+        ""
     };
     let shared_note = if shared {
         "<p class=\"warn\" id=\"name-shared\">Another app registered with this same name. Approve only if you just added Arca to this app yourself.</p>"
@@ -2385,9 +2832,8 @@ stay open for it instead of lapsing after 15 minutes.</p></div>"
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
 <title>Connect an app to Arca</title><link rel=\"stylesheet\" href=\"/oauth/consent.css\"></head>\
 <body><main data-request=\"{id}\" data-begin=\"/oauth/authorize/begin\" data-approve=\"/oauth/authorize/approve\">\
-<h1>Connect <span id=\"client-name\">{name}</span> to Arca?</h1>{shared_note}\
-<dl><dt>App</dt><dd><strong>{name}</strong></dd>\
-<dt>Answers go to</dt><dd><strong id=\"redirect-host\">{host}</strong> ({where_text})</dd>\
+<h1>Connect <span id=\"client-name\">{name}</span> to Arca?</h1>{shared_note}{device_note}\
+<dl><dt>App</dt><dd><strong>{name}</strong></dd>{answers}\
 <dt>It asks to</dt><dd><strong id=\"scope\">{scope}</strong>: {words}</dd>\
 <dt>For</dt><dd>{resource}</dd></dl>{tools}{approvals}\
 <p>Your passkey signs you in and approves this in one step. You can disconnect the app any time on the approval page.</p>\
@@ -2396,8 +2842,6 @@ stay open for it instead of lapsing after 15 minutes.</p></div>"
 <p id=\"status\" role=\"status\"></p></main><script src=\"/oauth/consent.js\"></script></body></html>\n",
         id = escape_html(&pending.id),
         name = escape_html(&client.name),
-        host = escape_html(&host),
-        where_text = escape_html(&where_text),
         scope = scope_text(pending.scope, None, pending.approvals),
         words = scope_words(pending.scope),
         resource = escape_html(&oauth.resource),
@@ -2417,6 +2861,23 @@ yes or no, for the next 12 hours. Plans that delete or erase still wait for your
 <p id=\"status\" role=\"status\"></p></main><script src=\"/oauth/consent.js\"></script></body></html>\n",
         id = escape_html(&grant.id),
         name = escape_html(&client.name),
+    )
+}
+
+/// The page where the person types the code an app on another device shows, with `problem` above it when the last one
+/// was not known.
+fn device_entry_page(problem: Option<&str>) -> String {
+    let problem = problem
+        .map(|text| format!("<p class=\"warn\" id=\"problem\">{}</p>", escape_html(text)))
+        .unwrap_or_default();
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Connect an app to Arca</title><link rel=\"stylesheet\" href=\"/oauth/consent.css\"></head>\
+<body><main><h1>Connect an app to Arca</h1>{problem}\
+<p>Type the code the app shows. It looks like <code>BCDF-GHJK</code>.</p>\
+<form method=\"get\" action=\"{DEVICE_PATH}\"><label for=\"user_code\">Code</label>\
+<input id=\"user_code\" name=\"user_code\" autocomplete=\"off\" autocapitalize=\"characters\" spellcheck=\"false\" required>\
+<div class=\"actions\"><button type=\"submit\">Continue</button></div></form></main></body></html>\n"
     )
 }
 
