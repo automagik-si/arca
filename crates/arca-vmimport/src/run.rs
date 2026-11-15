@@ -359,7 +359,7 @@ pub fn copied_words(
         )
     };
     format!(
-        "Copied from the Ceph cluster {source_cluster} (the pool {source_pool}, read only) to {to} (written as client.{})",
+        "Copied from the Ceph cluster {source_cluster} (the pool {source_pool}, which Arca only read) to {to} (written as client.{})",
         target.client
     )
 }

@@ -1844,6 +1844,31 @@ fn loaded_rows(
             },
         );
     }
+    // An import's `Ceph` row was read from the node's config and from Incus when it was proposed, and is not in its
+    // arguments either: the journal's rows are kept when they are, row for row, the card this action writes for these
+    // arguments with one `Ceph` row of the shape the kernel writes, after the last disk. Anything else is rebuilt, which
+    // drops the row rather than show one the kernel did not write.
+    if action == ActionKind::InstanceImport {
+        let ceph: Vec<&ActionDetail> = stored_details
+            .iter()
+            .filter(|row| row.label == "Ceph")
+            .collect();
+        let fits = match ceph.as_slice() {
+            [row] if row.value.starts_with(crate::vm_import::CEPH_ROW_START) => {
+                let fact = crate::vm_import::ceph_fact(&row.value);
+                stored_details == action.details_with_gpu(args, Some(&fact)).as_slice()
+            }
+            _ => false,
+        };
+        return (
+            action.summary(args),
+            if fits {
+                stored_details.to_vec()
+            } else {
+                action.details(args)
+            },
+        );
+    }
     // What the node read from its database template when a database was proposed (that the template generates the
     // password, or why the database is created stopped) is not in the arguments either: the journal's rows are kept
     // when they are the rows this action writes for these arguments, with that claim or with such a `Start` row.
@@ -2872,6 +2897,105 @@ mod tests {
         assert_eq!(store.waiting()[0].details, proposed.details);
         assert_eq!(store.waiting()[0].summary, proposed.summary);
         assert!(store.waiting()[0].details[3].value.contains("shared"));
+    }
+
+    fn import_args() -> Value {
+        ActionKind::InstanceImport
+            .prepare(
+                &json!({
+                    "name": "web-1", "project": "people", "pool": "remote", "bridge": "br-lan",
+                    "source": include_str!("../../arca-vmimport/tests/fixtures/uefi-two-disks-sg.xml"),
+                }),
+                None,
+            )
+            .expect("valid import arguments")
+    }
+
+    const IMPORT_CEPH_ROW: &str = "Arca reads the source pool src-pool on the Ceph cluster source-b as client.arca-import, set up to only read, and never writes it. It copies to the Ceph cluster ceph, writing only the images Incus made in the Incus pool remote";
+
+    fn labels(details: &[ActionDetail]) -> Vec<&str> {
+        details.iter().map(|row| row.label.as_str()).collect()
+    }
+
+    #[test]
+    fn an_import_card_keeps_its_ceph_row_across_a_restart() {
+        let dir = Temp::new("import-ceph");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let fact = crate::vm_import::ceph_fact(IMPORT_CEPH_ROW);
+        let proposed = store
+            .propose(
+                ActionKind::InstanceImport,
+                import_args(),
+                1_000,
+                Some(&fact),
+            )
+            .expect("an import proposal");
+        let at = labels(&proposed.details)
+            .iter()
+            .position(|label| *label == "Ceph")
+            .expect("a Ceph row");
+        assert_eq!(proposed.details[at - 1].label, "Disk 2");
+        assert_eq!(proposed.details[at].value, IMPORT_CEPH_ROW);
+        drop(store);
+
+        // A restart shows the card the owner was shown: the row is not in the arguments, the journal is the kernel's.
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
+        assert_eq!(store.waiting().len(), 1);
+        assert_eq!(store.waiting()[0].details, proposed.details);
+        assert_eq!(store.waiting()[0].summary, proposed.summary);
+    }
+
+    #[test]
+    fn an_import_card_with_a_row_the_kernel_did_not_write_is_rebuilt() {
+        let args = import_args();
+        let line = |details: Vec<ActionDetail>| -> String {
+            let mut line: Value =
+                serde_json::from_str(&proposed_line("instance_import", &args, 1_000))
+                    .expect("a journal line");
+            line["proposal"]["details"] = serde_json::to_value(details).expect("rows");
+            line.to_string()
+        };
+        let row = |value: &str| ActionDetail {
+            label: "Ceph".to_string(),
+            value: value.to_string(),
+        };
+        let plain = ActionKind::InstanceImport.details(&args);
+        let at = labels(&plain)
+            .iter()
+            .rposition(|label| label.starts_with("Disk"))
+            .expect("a disk row")
+            + 1;
+        let with = |rows: &[ActionDetail], at: usize| {
+            let mut details = plain.clone();
+            details.splice(at..at, rows.iter().cloned());
+            details
+        };
+        for forged in [
+            // Not a row the kernel writes.
+            with(&[row("Writes nothing anywhere")], at),
+            // Two rows.
+            with(&[row(IMPORT_CEPH_ROW), row(IMPORT_CEPH_ROW)], at),
+            // In the wrong place.
+            with(&[row(IMPORT_CEPH_ROW)], 0),
+        ] {
+            let dir = Temp::new("import-forged");
+            write_journal(&dir.0, &format!("{}\n", line(forged)));
+            let store = ActionProposalStore::open(&dir.0, 2_000, None);
+            assert_eq!(store.waiting().len(), 1);
+            assert_eq!(store.waiting()[0].details, plain);
+        }
+        // Another row changed beside a good Ceph row is rebuilt too.
+        let mut changed = with(&[row(IMPORT_CEPH_ROW)], at);
+        changed[0].value = "a VM the owner did not see".to_string();
+        let dir = Temp::new("import-changed");
+        write_journal(&dir.0, &format!("{}\n", line(changed)));
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
+        assert_eq!(store.waiting()[0].details, plain);
+        // A card without the row stays without it.
+        let dir = Temp::new("import-plain");
+        write_journal(&dir.0, &format!("{}\n", line(plain.clone())));
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
+        assert_eq!(store.waiting()[0].details, plain);
     }
 
     #[test]

@@ -166,18 +166,24 @@ which cluster is which. `kernel.instanceImport.cephCluster` names the source's c
 (`/etc/ceph/<name>.conf`, with that cluster's `mon_host` and `fsid`), and the source client's keyring sits beside it
 (`/etc/ceph/<name>.client.<client>.keyring`). The target pool's cluster is the one Incus names for it
 (`ceph.cluster_name`, default `ceph`). Each `rbd` reads its own cluster's config and key, so the reader holds no key of
-the target cluster and the writer none of the source's. The source cluster is only ever read: `status`, `info` and
-`export-diff` to the pipe; a recorded-command test holds the run to that, in both directions and on a failed copy.
+the target cluster and the writer none of the source's. Arca's commands only read the source cluster: `status`, `info`
+and `export-diff` to the pipe; a recorded-command test holds the run to that, in both directions and on a failed copy.
+That the source client can only read is the operator's grant (below), which Arca does not check.
 
-The copy streams through the node: the reader's output is the writer's input, a pipe the kernel never buffers, so the
-node holds at most the pipe and each `rbd` process's own in-flight requests (by default ten objects of 4 MiB, tens of
-MiB per process), whatever the disk's size. Its time is the data the disk holds (`export-diff` sends no unwritten
+The copy streams through the node: the reader's output is the writer's input through an OS pipe (64 KiB by default), and
+no disk byte passes through Arca's own process. Each `rbd` holds its in-flight requests, which librados caps at about
+100 MiB by default, and the writer its librbd cache, so the node holds a 64 KiB pipe and up to about 100 MiB per `rbd`
+process, whatever the disk's size. Its time is the data the disk holds (`export-diff` sends no unwritten
 extent) over the slowest of the source cluster's read, the network between the node and the source cluster's OSDs, and
 the target cluster's write. On 1 Gbit/s that is about 110 MB/s: about 10 seconds per GiB held, so 100 GiB in about 16
 minutes. On 10 Gbit/s the clusters are usually the limit, a few hundred MB/s.
 
 The card's `Ceph` row names both clusters, as the node's config and Incus say when the proposal is made, and the run's
-answer says `Copied from the Ceph cluster <source> … to the Ceph cluster <target>`.
+answer says `Copied from the Ceph cluster <source> … to the Ceph cluster <target>`. Two config names are two clusters
+on the card unless their files name one `fsid`, which the row then says. A target pool that is not Ceph, or one Incus
+does not answer for, gets a row that says so; neither refuses the proposal. The row is kept when `serve` restarts with
+the proposal waiting. A failed `rbd` names its side, cluster and client (`reading the Ceph cluster b as
+client.arca-import: …`, `writing the Ceph cluster ceph as client.admin: …`).
 
 ## Ceph access
 

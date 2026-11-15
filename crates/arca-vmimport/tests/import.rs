@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 use arca_vmimport::source::{Bus, DiskKind, Firmware, Protocol};
 use arca_vmimport::{
-    FakeCopy, Held, IMPORT_KEY, ImportIncus, Place, Plan, PoolInfo, Probe, RbdCopy, Runner, parse,
-    plan_of, reduce, reduce_shown, run, undo,
+    FakeCopy, Held, IMPORT_KEY, ImportIncus, PipeFailure, Place, Plan, PoolInfo, Probe, RbdCopy,
+    Runner, parse, plan_of, reduce, reduce_shown, run, undo,
 };
 use serde_json::{Value, json};
 
@@ -1029,12 +1029,14 @@ impl Runner for RecordedRbd {
         }
     }
 
-    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String> {
+    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), PipeFailure> {
         let mut calls = self.calls.lock().expect("calls");
         calls.push(first.to_vec());
         calls.push(second.to_vec());
         match &self.fail_into {
-            Some(spec) if second.last() == Some(spec) => Err("rbd import-diff failed".to_string()),
+            Some(spec) if second.last() == Some(spec) => {
+                Err(PipeFailure::writer("rbd failed: Permission denied"))
+            }
             _ => Ok(()),
         }
     }
@@ -1049,7 +1051,8 @@ const READ_VERBS: [&str; 3] = ["status", "info", "export-diff"];
 
 /// Checks every recorded command: each names a cluster and a client; every command on the source cluster, or as the
 /// source client, is a read of a source image to standard output; every write is `import-diff` on the target cluster
-/// as Incus's client, into the target pool. Answers how many commands read the source.
+/// as Incus's client, into the target pool. Answers how many commands read the source. It needs two cluster names:
+/// with one name every command counts as the source's, so the one-cluster commands are checked by `copy.rs`'s own tests.
 fn source_only_read(calls: &[Vec<String>], source: (&str, &str), target: (&str, &str)) -> usize {
     let mut reads = 0;
     for argv in calls {
@@ -1140,7 +1143,7 @@ fn across_two_ceph_clusters_the_source_cluster_is_only_ever_read() {
     assert_eq!(answer["ceph"]["to"], "ceph");
     assert_eq!(
         answer["ceph"]["copied"],
-        "Copied from the Ceph cluster source-b (the pool src-pool, read only) to the Ceph cluster ceph, into the Incus pool remote (written as client.incus)"
+        "Copied from the Ceph cluster source-b (the pool src-pool, which Arca only read) to the Ceph cluster ceph, into the Incus pool remote (written as client.incus)"
     );
     assert_eq!(answer["note"], "The VM runs and read back.");
 }
@@ -1213,6 +1216,13 @@ fn a_failed_copy_across_two_clusters_still_only_reads_the_source() {
     let failure =
         run(&plan, "src-pool", &incus, &copy, &probe(Some(1))).expect_err("the copy fails");
     assert_eq!(failure.step, "Copying a disk");
+    assert!(
+        failure.message.ends_with(
+            "writing the Ceph cluster ceph as client.incus: rbd failed: Permission denied"
+        ),
+        "{}",
+        failure.message
+    );
     assert!(failure.words().ends_with("The source was not written."));
     let calls = copy_calls(&copy);
     assert_eq!(
@@ -1247,7 +1257,7 @@ fn on_one_cluster_the_answer_says_so() {
     assert_eq!(answer["ceph"]["to"], "ceph");
     assert_eq!(
         answer["ceph"]["copied"],
-        "Copied from the Ceph cluster ceph (the pool src-pool, read only) to the same cluster, into the Incus pool remote (written as client.incus)"
+        "Copied from the Ceph cluster ceph (the pool src-pool, which Arca only read) to the same cluster, into the Incus pool remote (written as client.incus)"
     );
 }
 

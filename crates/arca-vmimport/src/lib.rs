@@ -10,7 +10,9 @@ pub mod plan;
 pub mod run;
 pub mod source;
 
-pub use copy::{DiskCopy, FakeCopy, ProcessRunner, RbdCopy, Runner, SourceImage, TargetImage};
+pub use copy::{
+    DiskCopy, FakeCopy, PipeFailure, ProcessRunner, RbdCopy, Runner, SourceImage, TargetImage,
+};
 pub use plan::{ACL_PREFIX, IMPORT_KEY, Plan, Request, Target};
 pub use run::{
     Failure, Held, ImportIncus, Place, PoolInfo, Probe, copied_words, incus_rbd_image, run, undo,

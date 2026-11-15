@@ -45,15 +45,17 @@ fn rig(tag: &str, key: &SkKey) -> Rig {
     let mut state = fake_state();
     state.projects.push(json!({ "name": "people", "description": "", "config": { "features.storage.volumes": "true" } }));
     state.pools.push(("remote".to_string(), json!({})));
+    state.pools.push(("local".to_string(), json!({})));
     state.networks.push(json!({ "name": "br-lan", "project": "default", "managed": true, "type": "bridge", "config": {} }));
     let fake = arca_incus::FakeIncus::start(&scratch.dir, state).expect("the fake serves");
     fake.set_pool_driver("remote", "ceph");
+    fake.set_pool_config("remote", "ceph.cluster_name", "cluster-b");
     let verifier = verifier_for(&scratch, &[key], tag);
     let kernel = Arc::new(Mutex::new(
         kernel_with_image(&scratch, &fake, verifier, NOW, None).expect("the kernel opens"),
     ));
     let clock = Arc::new(AtomicU64::new(NOW));
-    // The node reads the source pool on a Ceph cluster of its own, `source-b`; the Incus pool is on `ceph`.
+    // The node reads the source pool on a Ceph cluster of its own, `source-b`; the Incus pool is on `cluster-b`.
     let node: NodeConfig = serde_json::from_value(json!({
         "stateDir": scratch.dir.join("node-state"),
         "incus": { "socket": fake.socket() },
@@ -159,6 +161,45 @@ impl Rig {
     }
 }
 
+/// The `Ceph` row of a proposal's card.
+fn ceph_row(proposal: &Value) -> String {
+    proposal["details"]
+        .as_array()
+        .expect("the card's rows")
+        .iter()
+        .find(|row| row["label"] == "Ceph")
+        .and_then(|row| row["value"].as_str())
+        .expect("a Ceph row")
+        .to_string()
+}
+
+#[test]
+fn a_pool_incus_does_not_have_or_that_is_not_ceph_still_gets_a_card_that_says_so() {
+    let key = SkKey::from_seed(44);
+    let rig = rig("import-pools", &key);
+    let mut args = import_args();
+    args["pool"] = json!("nowhere");
+    let unread = rig.propose("instance_import", args).expect("proposed");
+    assert!(
+        ceph_row(&unread).ends_with(
+            "It writes only the images Incus makes in the Incus pool nowhere, on the cluster Incus names for it when the import runs"
+        ),
+        "{}",
+        ceph_row(&unread)
+    );
+    let mut args = import_args();
+    args["pool"] = json!("local");
+    let not_ceph = rig.propose("instance_import", args).expect("proposed");
+    assert!(
+        ceph_row(&not_ceph).ends_with(
+            "The Incus pool local is not a Ceph pool (its driver is dir), so the import stops before it makes anything"
+        ),
+        "{}",
+        ceph_row(&not_ceph)
+    );
+    assert!(rig.writes().is_empty(), "a proposal changes nothing");
+}
+
 fn import_args() -> Value {
     json!({ "name": "web-1", "project": "people", "pool": "remote", "bridge": "br-lan", "source": UEFI })
 }
@@ -194,7 +235,7 @@ fn an_approved_import_makes_the_vm_copies_the_disks_and_reads_back_and_the_undo_
     assert_eq!(rows[at - 1].0, "Disk 2");
     assert_eq!(
         rows[at].1,
-        "Read from the Ceph cluster source-b (the pool src-pool, as client.arca-import, which may only read), and copied to the Ceph cluster ceph, into the Incus pool remote. The source cluster is never written"
+        "Arca reads the source pool src-pool on the Ceph cluster source-b as client.arca-import, set up to only read, and never writes it. It copies to the Ceph cluster cluster-b, writing only the images Incus made in the Incus pool remote"
     );
 
     // A direct call without the owner's approval runs nothing.
@@ -216,8 +257,8 @@ fn an_approved_import_makes_the_vm_copies_the_disks_and_reads_back_and_the_undo_
         result["ceph"],
         json!({
             "from": "source-b",
-            "to": "ceph",
-            "copied": "Copied from the Ceph cluster source-b (the pool src-pool, read only) to the Ceph cluster ceph, into the Incus pool remote (written as client.admin)"
+            "to": "cluster-b",
+            "copied": "Copied from the Ceph cluster source-b (the pool src-pool, which Arca only read) to the Ceph cluster cluster-b, into the Incus pool remote (written as client.admin)"
         })
     );
     assert_eq!(

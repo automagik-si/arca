@@ -2861,11 +2861,13 @@ round: a node on cluster A imports from cluster B, and a node on cluster B from 
 The node must reach the source cluster's monitors (ports 3300 and 6789) and every OSD (ports 6800 to 7300) on that
 cluster's public network. `rbd --cluster <name> --id arca-import ls <source pool>` on the node checks the three steps.
 The copy reads the source cluster with that client alone and writes the Incus pool with Incus's own user on Incus's own
-cluster; the source cluster is never written. The card's `Ceph` row names both clusters, and the run's answer says
-`Copied from the Ceph cluster <name> … to the Ceph cluster <Incus's cluster>` (its `ceph` field).
+cluster; Arca never writes the source cluster, and the client's read-only grant above keeps anything else run as it
+from writing there. The card's `Ceph` row names both clusters (and says when the two config files name one `fsid`: one
+cluster under two names), and the run's answer says `Copied from the Ceph cluster <name> … to the Ceph cluster
+<Incus's cluster>` (its `ceph` field). A failed copy names the side that failed, its cluster and its client.
 
-The copy streams through the node, from one `rbd` into the other by a pipe: the node holds tens of MiB per disk at
-most, whatever its size. It takes the data the disk holds (unwritten parts are not sent) over the slowest of the
+The copy streams through the node, from one `rbd` into the other by an OS pipe (64 KiB): the node holds that pipe and up
+to about 100 MiB per `rbd` process, whatever the disk's size. It takes the data the disk holds (unwritten parts are not sent) over the slowest of the
 source cluster's read, the network to it, and the Incus cluster's write: about 10 seconds per GiB held on 1 Gbit/s
 (100 GiB in about 16 minutes), and on 10 Gbit/s usually what the clusters give, a few hundred MB/s. The downtime row of
 the card counts from the source's power-off, so plan it with this figure.
