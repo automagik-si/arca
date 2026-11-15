@@ -165,7 +165,15 @@ fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest(
     assert_eq!(
         steps,
         [
-            "begin", "stop", "snapshot", "rebuild", "start", "health", "record", "end"
+            "begin",
+            "stop",
+            "snapshot",
+            "rebuild",
+            "empty /run",
+            "start",
+            "health",
+            "record",
+            "end"
         ]
     );
 
@@ -1613,4 +1621,27 @@ fn an_edge_update_that_rolls_back_writes_its_routes_onto_the_old_root_too() {
         .map(|bytes| String::from_utf8(bytes.clone()).unwrap())
         .expect("the edge's config");
     assert_eq!(root, arca::route::caddyfile(&record));
+}
+
+#[test]
+fn an_update_empties_the_new_roots_run_so_the_service_keeps_a_memory_run() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = rig(&up);
+    assert!(rig.fake.run_in_memory(PROJECT, "app"));
+    // The new image keeps files in /run, as a Debian base does.
+    rig.fake.set_image_run(&["/run/lock/", "/run/motd"]);
+    let done = update(&rig, json!({ "name": "app", "digest": NEW })).expect("update");
+    assert_eq!(done["updated"], true, "{done}");
+    assert_eq!(done["run"], "memory", "{done}");
+    assert!(rig.fake.run_on_disk(PROJECT, "app").is_empty());
+    assert!(rig.fake.run_in_memory(PROJECT, "app"));
+    let steps: Vec<(String, bool)> = journal(&rig);
+    let at = |step: &str| {
+        steps
+            .iter()
+            .position(|(name, _)| name == step)
+            .unwrap_or_else(|| panic!("{step} in {steps:?}"))
+    };
+    assert!(at("rebuild") < at("empty /run") && at("empty /run") < at("start"));
+    assert!(steps[at("empty /run")].1, "{steps:?}");
 }

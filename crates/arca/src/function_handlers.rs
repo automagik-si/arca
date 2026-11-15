@@ -656,6 +656,7 @@ impl ServiceHandler {
             follow_version: None,
             no_new_privileges: false,
             raw_lxc: Vec::new(),
+            run_tmpfs: false,
             edge: None,
         };
         let template = function::template(&config).ok_or_else(internal)?;

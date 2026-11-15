@@ -70,7 +70,7 @@
 //!
 //! The fake records each request, and each write with the names of the config keys it carried. It never records a value.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::net::IpAddr;
@@ -262,6 +262,14 @@ struct Store {
     live: BTreeMap<(String, String), Value>,
     /// The root disk usage, in bytes, an instance reports in its state, by project and name.
     disk_usage: BTreeMap<(String, String), u64>,
+    /// What a container's image keeps under `/run`, put on its root at every create and rebuild: absolute paths, a
+    /// directory's ending in `/`. Empty unless a test sets it with [`FakeIncus::set_image_run`].
+    image_run: Vec<String>,
+    /// What each container's root disk holds under `/run`, by project and name, in the same form.
+    run_disk: BTreeMap<(String, String), BTreeSet<String>>,
+    /// The running containers Incus gave a memory `/run`, by project and name: Incus mounts one on an OCI container's
+    /// `/run` only when the root holds nothing there at its start.
+    run_memory: BTreeSet<(String, String)>,
 }
 
 /// One DHCP lease: the network, the MAC that holds it and its address, and whether a device's `ipv4.address` pinned it.
@@ -417,6 +425,9 @@ impl Shared {
             usage: BTreeMap::new(),
             live: BTreeMap::new(),
             disk_usage: BTreeMap::new(),
+            image_run: Vec::new(),
+            run_disk: BTreeMap::new(),
+            run_memory: BTreeSet::new(),
         };
         for index in 0..store.objects.len() {
             store.expand(index, false);
@@ -535,6 +546,30 @@ impl FakeIncus {
     /// Takes back [`FakeIncus::lose_image`] and [`FakeIncus::refuse_rebuild`].
     pub fn allow_rebuild(&self, project: &str, name: &str) {
         lock(&self.shared.rebuild_refusals).remove(&(project.to_string(), name.to_string()));
+    }
+
+    /// What every container's image keeps under `/run` from now on: absolute paths under `/run`, a directory's ending
+    /// in `/` (`/run/lock/`). Each later create and rebuild puts them on the container's root, as a Debian image's
+    /// `/run/lock` is, and Incus then mounts no memory `/run` on it at its start.
+    pub fn set_image_run(&self, paths: &[&str]) {
+        lock(&self.shared.store).image_run = paths.iter().map(|path| path.to_string()).collect();
+    }
+
+    /// What the root disk of the container `name` in `project` holds under `/run` now, in the form of
+    /// [`FakeIncus::set_image_run`].
+    pub fn run_on_disk(&self, project: &str, name: &str) -> Vec<String> {
+        lock(&self.shared.store)
+            .run_disk
+            .get(&(project.to_string(), name.to_string()))
+            .map(|paths| paths.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether the container `name` in `project` runs with a memory `/run`: Incus gave it one at its last start.
+    pub fn run_in_memory(&self, project: &str, name: &str) -> bool {
+        lock(&self.shared.store)
+            .run_memory
+            .contains(&(project.to_string(), name.to_string()))
     }
 
     /// Sets the raw console log a project's instance serves from `/console`.
@@ -2302,6 +2337,13 @@ fn create(
     store.objects.push(stored);
     if kind == "instance" {
         let at = store.objects.len() - 1;
+        let key = (
+            store.objects[at].project.clone(),
+            store.objects[at].name.clone(),
+        );
+        let image_run = store.image_run.iter().cloned().collect();
+        store.run_memory.remove(&key);
+        store.run_disk.insert(key, image_run);
         if store.objects[at].body.get("start") == Some(&json!(true)) {
             if shared.fail_create_start.load(Ordering::SeqCst) {
                 store.objects[at].body["status"] = json!("Stopped");
@@ -3025,6 +3067,19 @@ impl Store {
     /// Starts the instance at `index`. Each NIC on a network gets its MAC (a new one is kept in `volatile.<dev>.hwaddr`) and
     /// its IPv4: a device's `ipv4.address` pins its lease, and a MAC without a lease is leased a free address.
     fn start(&mut self, index: usize, seed: u64) {
+        // Incus mounts a memory `/run` on a container whose root holds nothing there at its start, and on no other.
+        let key = (
+            self.objects[index].project.clone(),
+            self.objects[index].name.clone(),
+        );
+        let container = self.objects[index].body["type"]
+            .as_str()
+            .is_none_or(|kind| kind == "container");
+        if container && self.run_disk.get(&key).is_none_or(BTreeSet::is_empty) {
+            self.run_memory.insert(key);
+        } else {
+            self.run_memory.remove(&key);
+        }
         // Incus records that the instance has run, as it does at every start.
         if let Some(config) = self.objects[index]
             .body
@@ -3465,6 +3520,9 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
             },
             |fingerprint| format!("store:{fingerprint}"),
         );
+    // The new root holds what the image keeps under `/run`, as a created one does.
+    let image_run = store.image_run.iter().cloned().collect();
+    store.run_disk.insert(key.clone(), image_run);
     lock(&shared.rebuilds).entry(key).or_default().push(named);
     // A rebuild takes away the id map the container would start with next, as Incus does: one that has run starts
     // from the map it last ran with, and one that never ran has none left.
@@ -3527,6 +3585,15 @@ fn change_state(
             {
                 return answered(shared, store, "instance", "PUT", Err((400, reason)));
             }
+            // A create's start fails too when the writer sends it as a state change right after the create: the first
+            // start of a container that empties its image's `/run` before it.
+            let config = &store.objects[index].body["config"];
+            let creates_start = config.get("volatile.last_state.power").is_none()
+                && config[arca_kernel::ownership::RUN_TMPFS_KEY] == "true";
+            if creates_start && shared.fail_create_start.load(Ordering::SeqCst) {
+                let failure = Err((400, "Failed starting instance".to_string()));
+                return answered(shared, store, "instance", "PUT", failure);
+            }
             // A container the fake gave an id map starts from the next one, or from the one it last ran with. A
             // rebuild takes the next one away, so a container that was rebuilt before it ever started has neither:
             // Incus refuses its start, and leaves an empty map behind.
@@ -3569,6 +3636,9 @@ fn change_state(
             if let Some(body) = store.objects[index].body.as_object_mut() {
                 body.insert("status".to_string(), json!("Stopped"));
             }
+            store
+                .run_memory
+                .remove(&(address.project.clone(), address.name.clone()));
             if let Some(config) = store.objects[index]
                 .body
                 .get_mut("config")
@@ -4076,14 +4146,83 @@ fn file_headers(shared: &Shared, request: &Request, status: u16) -> String {
     let query = request.target.split_once('?').map_or("", |(_, q)| q);
     let project = query_param(query, "project").unwrap_or(DEFAULT_PROJECT);
     let path = crate::read::percent_decode(query_param(query, "path").unwrap_or(""));
-    match lock(&shared.service)
-        .file_meta
-        .get(&format!("{project}/{name}:{path}"))
-    {
+    let service = lock(&shared.service);
+    match service.file_meta.get(&format!("{project}/{name}:{path}")) {
         Some([kind, mode, uid, gid]) => format!(
             "X-Incus-type: {kind}\r\nX-Incus-mode: {mode}\r\nX-Incus-uid: {uid}\r\nX-Incus-gid: {gid}\r\n"
         ),
-        None => String::new(),
+        None => {
+            let store = lock(&shared.store);
+            match run_on_disk_entry(&store, &service, project, name, &path) {
+                Some(RunEntry::Directory(_)) => {
+                    "X-Incus-type: directory\r\nX-Incus-mode: 0755\r\nX-Incus-uid: 0\r\nX-Incus-gid: 0\r\n"
+                        .to_string()
+                }
+                Some(RunEntry::File) => {
+                    "X-Incus-type: file\r\nX-Incus-mode: 0644\r\nX-Incus-uid: 0\r\nX-Incus-gid: 0\r\n"
+                        .to_string()
+                }
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// What is at `path` under `/run` on a container's root disk, when its `/run` is not a memory one: what its image put
+/// there and what was written since. `None` for a path elsewhere, one with nothing there, and any path of a container
+/// that runs with a memory `/run`.
+enum RunEntry {
+    /// A directory, with the names in it.
+    Directory(Vec<String>),
+    File,
+}
+
+fn run_on_disk_entry(
+    store: &Store,
+    service: &ServiceFake,
+    project: &str,
+    name: &str,
+    path: &str,
+) -> Option<RunEntry> {
+    let key = (project.to_string(), name.to_string());
+    if (path != "/run" && !path.starts_with("/run/")) || store.run_memory.contains(&key) {
+        return None;
+    }
+    let prefix = format!("{path}/");
+    let written = format!("{project}/{name}:");
+    let paths = store
+        .run_disk
+        .get(&key)
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .chain(
+            service
+                .files
+                .keys()
+                .filter_map(|file| file.strip_prefix(written.as_str())),
+        );
+    let mut names = BTreeSet::new();
+    let mut directory = path == "/run";
+    let mut file = false;
+    for found in paths {
+        if found == prefix {
+            directory = true;
+        } else if found == path {
+            file = true;
+        } else if let Some(rest) = found.strip_prefix(prefix.as_str()) {
+            directory = true;
+            if let Some(first) = rest.split('/').next().filter(|first| !first.is_empty()) {
+                names.insert(first.to_string());
+            }
+        }
+    }
+    if directory {
+        Some(RunEntry::Directory(names.into_iter().collect()))
+    } else if file {
+        Some(RunEntry::File)
+    } else {
+        None
     }
 }
 
@@ -4151,6 +4290,35 @@ fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)
                 service.agent_unready -= 1;
                 return Some(encoded(500, "Failed to connect to the agent"));
             }
+        }
+        // `/run` on the root disk: a directory reads as the list of its names, and only an empty one is removed.
+        if matches!(request.method.as_str(), "GET" | "DELETE")
+            && let Some(entry) = run_on_disk_entry(&store, &service, project, name, &path)
+        {
+            if request.method == "GET" {
+                if let RunEntry::Directory(names) = entry {
+                    let listing = json!({
+                        "type": "sync", "status": "Success", "status_code": 200,
+                        "operation": "", "error_code": 0, "error": "", "metadata": names,
+                    });
+                    return Some((200, serde_json::to_vec(&listing).unwrap()));
+                }
+                return Some((200, service.files.get(&key).cloned().unwrap_or_default()));
+            }
+            if matches!(&entry, RunEntry::Directory(names) if !names.is_empty()) {
+                return Some(encoded(
+                    500,
+                    &format!("remove {path}: sftp: \"remove {path}: directory not empty\""),
+                ));
+            }
+            let run_key = (project.to_string(), name.to_string());
+            if let Some(disk) = store.run_disk.get_mut(&run_key) {
+                disk.remove(&path);
+                disk.remove(&format!("{path}/"));
+            }
+            service.files.remove(&key);
+            service.file_meta.remove(&key);
+            return Some((200, b"{}".to_vec()));
         }
         return Some(match request.method.as_str() {
             "POST" => {

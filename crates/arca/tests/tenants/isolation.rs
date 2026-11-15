@@ -1117,6 +1117,8 @@ fn file_requests(rig: &Rig) -> Vec<String> {
         .service_requests()
         .into_iter()
         .filter(|request| request.path.split('?').next().unwrap().ends_with("/files"))
+        // A container's create empties the image's `/run` and reads its mounts back: no guest is asked anything.
+        .filter(|request| !request.path.contains("path=/run"))
         .map(|request| format!("{} {}", request.method, request.path))
         .collect()
 }

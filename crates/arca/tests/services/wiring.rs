@@ -1261,7 +1261,7 @@ fn g5_file_request_is_root_0600_and_exec_environment_adds_nothing() {
     let calls = rig.fake.service_requests();
     let files: Vec<_> = calls
         .iter()
-        .filter(|r| r.path.contains("/files?"))
+        .filter(|r| r.path.contains("/files?") && r.method == "POST")
         .collect();
     assert_eq!(files.len(), 1);
     let file = files[0];

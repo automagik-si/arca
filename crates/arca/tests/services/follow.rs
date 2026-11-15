@@ -255,6 +255,7 @@ fn a_service_of_the_automagik_template_moves_to_a_newer_lane_record_and_the_chan
             "stop",
             "snapshot",
             "rebuild",
+            "empty /run",
             "start",
             "health",
             "record",

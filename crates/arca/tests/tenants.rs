@@ -530,6 +530,8 @@ mod refused_at_propose;
 mod remove_card;
 #[path = "tenants/room_at_propose.rs"]
 mod room_at_propose;
+#[path = "tenants/run_tmpfs.rs"]
+mod run_tmpfs;
 #[path = "tenants/template_binding.rs"]
 mod template_binding;
 

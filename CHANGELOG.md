@@ -7,6 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A container service made from an OCI image keeps `/run` in memory (a tmpfs), never on the container's disk: a short-lived secret staged there no
+longer touches the disk. Incus mounts a tmpfs on an OCI container's `/run` only when the image keeps nothing there, so
+Arca now empties the image's `/run` on the root disk before the first start, after each `service_update` rebuild, and in
+a `service_reconfigure` of a service made before (its card says `/run becomes memory, restart once`). No project
+restriction is loosened and it works in tenants too. The mount has `mode=755` but neither `nosuid` nor `nodev`, and no
+size of its own: the service's memory limit bounds it. A template says `"runTmpfs": false` for an image that needs its
+own files in `/run`. The answers say `run: "memory"`, or `run: "disk"` with the reason when the image's files could not
+be removed, in which case the service runs as before.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and

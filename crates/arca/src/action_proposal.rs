@@ -1343,12 +1343,22 @@ fn reconfigure_count(changes: &Value) -> String {
     if changes.get("entrypoint").is_some() {
         parts.push("its entrypoint".to_string());
     }
+    if changes.get("runTmpfs").is_some() {
+        parts.push("its /run".to_string());
+    }
     if parts.is_empty() {
         "no change".to_string()
     } else {
         parts.join("; ")
     }
 }
+
+/// The label of the card row that says a container's `/run` changes.
+pub const RUN_TMPFS_LABEL: &str = "/run";
+/// What a reconfigure's card says when a container's `/run` becomes memory.
+pub const RUN_TO_MEMORY: &str = "/run becomes memory, restart once: a secret staged there never touches the disk. The files the image keeps in /run are removed from the container's disk first (a running service is stopped and started for it, a stopped one has it from its next start). It holds what the service writes there, counted in its memory limit; the template says runTmpfs: false for an image that needs its own files in /run";
+/// What a reconfigure's card says when a container's `/run` goes back to its disk.
+pub const RUN_TO_DISK: &str = "Arca no longer keeps /run in memory (the template says runTmpfs: false), restart once. The files the image kept in /run come back with the next service_update to a new digest, which gives the container a new root; until then Incus still mounts a memory /run, since the disk holds nothing there";
 
 /// The label of the card row that shows a container's `raw.lxc` lines.
 pub const RAW_LXC_LABEL: &str = "Low-level container settings (raw.lxc)";
@@ -1471,6 +1481,16 @@ fn reconfigure_rows(args: &Value) -> Vec<ActionDetail> {
                 if on { "on" } else { "off" },
                 if on { "can no longer" } else { "can again" }
             ),
+        ));
+    }
+    if let Some(on) = changes["runTmpfs"]["to"].as_bool() {
+        rows.push(row(
+            RUN_TMPFS_LABEL.into(),
+            if on {
+                RUN_TO_MEMORY.to_string()
+            } else {
+                RUN_TO_DISK.to_string()
+            },
         ));
     }
     if let Some(entrypoint) = changes.get("entrypoint") {

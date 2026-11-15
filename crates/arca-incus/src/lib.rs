@@ -28,6 +28,9 @@ pub mod import;
 #[cfg(feature = "write")]
 pub mod lifecycle;
 pub mod read;
+/// A container service's `/run` in memory: the image's `/run` emptied on the root disk, and the mount read back.
+#[cfg(feature = "write")]
+pub mod run_dir;
 /// The per-job runner machines of a CI runner pool: created, written into, run and deleted, only with the pool's mark.
 #[cfg(feature = "write")]
 pub mod runner_vm;

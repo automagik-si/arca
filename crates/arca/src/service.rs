@@ -311,6 +311,14 @@ pub fn template_raw_lxc(template: &Template) -> Vec<String> {
     lines
 }
 
+/// A template that does not say `runTmpfs` keeps its container's `/run` in memory.
+fn run_tmpfs_default() -> bool {
+    true
+}
+
+/// The mark of a container whose `/run` is memory ([`ServiceConfig::run_tmpfs`]).
+pub use arca_kernel::ownership::RUN_TMPFS_KEY;
+
 /// Whether a `raw.lxc` line may loosen the container's isolation, so a card says it in plain words. Every line may,
 /// except the few Arca knows are harmless (`lxc.sched.core`, `lxc.no_new_privs=1`): `raw.lxc` is applied last, so a
 /// line can replace what Incus set (the root, the AppArmor profile, the namespaces, the network, a limit). Nothing is
@@ -437,6 +445,12 @@ pub struct ServiceConfig {
     /// it always was. Only a container of the node's own project carries it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_lxc: Vec<String>,
+    /// Set from the template's `runTmpfs` (on unless it says `false`): the container's `/run` is memory, never its disk.
+    /// Its instance carries [`RUN_TMPFS_KEY`], and the writer empties the image's `/run` on the root disk before the
+    /// first start, so Incus mounts a memory `/run` at every start ([`arca_incus::run_dir`]). Off in a record that never
+    /// says it, so every older service keeps the `/run` it has until `service_reconfigure` gives it this one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub run_tmpfs: bool,
     /// Set when the service was made from an edge template (`"edge": true`): the node's routes, which the kernel
     /// renders into the edge's Caddyfile. Absent on every other service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -968,6 +982,9 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
         }
         config.insert("raw.lxc".into(), json!(raw));
     }
+    if cfg.run_tmpfs {
+        config.insert(RUN_TMPFS_KEY.into(), json!("true"));
+    }
     if cfg.function.is_some() {
         // The mark the writer of a run looks for, and a memory limit that swap does not stretch.
         config.insert(FUNCTION_KEY.into(), json!("true"));
@@ -1361,7 +1378,15 @@ impl Plugin for Service {
                     }
                 }
             }
-            for key in [ENVKEYS_KEY, LINKS_KEY, PUBLISHED_KEY, PORTS_KEY] {
+            // The memory `/run` mark follows the record too. Taking it off an instance changes nothing until the next
+            // start, and putting it on one empties nothing: `service_reconfigure` does that while the service is stopped.
+            for key in [
+                ENVKEYS_KEY,
+                LINKS_KEY,
+                PUBLISHED_KEY,
+                PORTS_KEY,
+                RUN_TMPFS_KEY,
+            ] {
                 let value = desired["config"]
                     .get(key)
                     .and_then(Value::as_str)
@@ -1493,6 +1518,10 @@ pub struct Template {
     /// project is created from such a template, and the project must allow low-level container config.
     #[serde(default)]
     pub raw_lxc: Vec<String>,
+    /// An OCI container template whose service keeps `/run` in memory: on unless it says `false`, which an image that
+    /// needs the files it ships in `/run` says. Only an OCI template's is taken into account ([`Template::memory_run`]).
+    #[serde(default = "run_tmpfs_default")]
+    pub run_tmpfs: bool,
     /// A virtual-machine template whose service runs a version the template names: `{ "pin": "<a key of settings>" }`.
     /// No other kind sets it.
     #[serde(default)]
@@ -1657,6 +1686,12 @@ fn setting_rules_refusal(template: &Template) -> Option<String> {
 impl Template {
     pub fn is_vm(&self) -> bool {
         self.kind == VM_KIND
+    }
+
+    /// Whether a service made from this template keeps `/run` in memory: an OCI container's template that does not say
+    /// `runTmpfs: false`. A system container's init mounts its own `/run`, and a virtual machine has none of this.
+    pub fn memory_run(&self) -> bool {
+        self.run_tmpfs && self.kind == "oci"
     }
 
     /// The alias of a template's local image, and the fingerprint the template pins it to, when its image is a local

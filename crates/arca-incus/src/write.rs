@@ -361,6 +361,14 @@ impl UnixIncusWriter {
         if target.kind == IncusKind::Instance {
             sent.entry("start").or_insert(json!(true));
         }
+        // A container whose service keeps `/run` in memory is created stopped, its image's `/run` emptied, and only
+        // then started as the body asked: Incus mounts a memory `/run` at a start only when the root holds nothing there.
+        let memory_run =
+            target.kind == IncusKind::Instance && crate::run_dir::body_wants_memory_run(&sent);
+        let start_after = memory_run && sent.get("start") != Some(&json!(false));
+        if memory_run {
+            sent.insert("start".to_string(), json!(false));
+        }
         if target.kind == IncusKind::Forward {
             sent.insert("listen_address".to_string(), json!(target.name));
         }
@@ -389,6 +397,41 @@ impl UnixIncusWriter {
             self.fetched_images_stay_put(&target.project, &target.name);
         }
         posted?;
+        let owned = self.confirm(target, |_| Ok(()))?;
+        if !memory_run {
+            return Ok(owned);
+        }
+        // A `/run` that could not be emptied stays on the container's disk, as before: the create goes on, the outcome
+        // is kept, and the service's answer says where `/run` is.
+        let emptied = crate::run_dir::empty_run(
+            &|method, path| self.send(method, path, None, None),
+            &target.project,
+            &target.name,
+        );
+        if let Some(uuid) = owned.uuid() {
+            crate::run_dir::note_emptied(
+                &self.socket,
+                &target.project,
+                &target.name,
+                uuid,
+                emptied.is_ok(),
+            );
+        }
+        if let Err(error) = emptied {
+            eprintln!(
+                "arca: the image's /run of {} was not emptied, so its /run stays on the container's disk: {error}",
+                target.name
+            );
+        }
+        if !start_after {
+            return Ok(owned);
+        }
+        let state = format!(
+            "/1.0/instances/{}/state?project={}",
+            segment(&target.name)?,
+            segment(&target.project)?
+        );
+        self.mutate("PUT", &state, None, Some(&json!({ "action": "start" })))?;
         self.confirm(target, |_| Ok(()))
     }
 

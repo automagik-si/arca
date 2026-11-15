@@ -670,3 +670,167 @@ fn a_template_that_drops_its_entrypoint_shows_no_entrypoint_row_and_the_service_
         Some("/usr/bin/app serve")
     );
 }
+
+/// A node whose owner holds `key`, where `app` was made from a template that kept the image's `/run` (as every service
+/// made before Arca kept `/run` in memory): its image ships files there, so its `/run` is on its disk. The template then
+/// says nothing of `runTmpfs`, which keeps `/run` in memory.
+fn node_with_run_on_disk(key: &common::SkKey, start: bool) -> Rig {
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+        Some(key),
+    );
+    rig.fake
+        .set_image_run(&["/run/lock/", "/run/lock/.keep", "/run/motd"]);
+    let mut before = first_template();
+    before["runTmpfs"] = json!(false);
+    rig.template("app", before);
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app", "start": start }),
+    )
+    .expect("create");
+    assert!(!rig.fake.run_in_memory(PROJECT, "app"));
+    assert!(!rig.service_config("app").run_tmpfs);
+    rig.template("app", first_template());
+    rig
+}
+
+/// The state changes sent to `app` from the `from`th request the fake recorded on.
+fn states_since(rig: &Rig, from: usize) -> Vec<Value> {
+    rig.fake.service_requests()[from..]
+        .iter()
+        .filter(|request| {
+            request.method == "PUT" && request.path.starts_with("/1.0/instances/app/state?")
+        })
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .map(|body| body["action"].clone())
+        .collect()
+}
+
+#[test]
+fn a_service_made_before_gets_a_memory_run_from_its_reconfigure_card() {
+    let key = common::SkKey::from_seed(51);
+    let rig = node_with_run_on_disk(&key, true);
+    let proposed = propose(&rig, json!({ "name": "app" })).expect("proposed");
+    assert_eq!(
+        proposed["args"]["changes"],
+        json!({ "runTmpfs": { "from": false, "to": true } }),
+        "{proposed}"
+    );
+    let details = &proposed["details"];
+    assert_eq!(
+        row(details, arca::action_proposal::RUN_TMPFS_LABEL),
+        Some(arca::action_proposal::RUN_TO_MEMORY)
+    );
+    assert!(arca::action_proposal::RUN_TO_MEMORY.starts_with("/run becomes memory, restart once"));
+    assert_eq!(row(details, "Changes"), Some("its /run"));
+
+    let from = rig.fake.service_requests().len();
+    let done = approve_and_run(&rig, &key, &proposed).expect("the approved reconfigure runs");
+    assert_eq!(done["reconfigured"], true, "{done}");
+    assert_eq!(done["restarted"], true);
+    assert_eq!(done["run"], "memory", "{done}");
+    assert_eq!(done["readBack"], json!({ "matches": true, "differs": [] }));
+    // Stopped, emptied, started: in place of the restart, so the start finds nothing under /run.
+    assert_eq!(
+        states_since(&rig, from),
+        vec![json!("stop"), json!("start")]
+    );
+    assert!(rig.fake.run_on_disk(PROJECT, "app").is_empty());
+    assert!(rig.fake.run_in_memory(PROJECT, "app"));
+    assert_eq!(
+        instance(&rig, "app")["config"][service::RUN_TMPFS_KEY],
+        "true"
+    );
+    assert!(rig.service_config("app").run_tmpfs);
+    let journal = fs::read_to_string(rig.dir.join("service-updates.jsonl")).expect("the journal");
+    assert!(journal.contains("empty /run"), "{journal}");
+
+    // Nothing is left to change.
+    let again = propose(&rig, json!({ "name": "app" })).expect("a second proposal");
+    assert_eq!(again["args"]["changes"], json!({}));
+
+    // A template that opts out takes the mark off with one plain restart; nothing is emptied again.
+    let mut own = first_template();
+    own["runTmpfs"] = json!(false);
+    rig.template("app", own);
+    let proposed = propose(&rig, json!({ "name": "app" })).expect("proposed");
+    assert_eq!(
+        proposed["args"]["changes"],
+        json!({ "runTmpfs": { "from": true, "to": false } })
+    );
+    assert_eq!(
+        row(&proposed["details"], arca::action_proposal::RUN_TMPFS_LABEL),
+        Some(arca::action_proposal::RUN_TO_DISK)
+    );
+    let from = rig.fake.service_requests().len();
+    let done = approve_and_run(&rig, &key, &proposed).expect("runs");
+    assert!(done.get("run").is_none(), "{done}");
+    assert_eq!(states_since(&rig, from), vec![json!("restart")]);
+    assert!(
+        instance(&rig, "app")["config"]
+            .get(service::RUN_TMPFS_KEY)
+            .is_none()
+    );
+    assert!(!rig.service_config("app").run_tmpfs);
+}
+
+#[test]
+fn a_stopped_service_has_its_run_emptied_by_the_reconfigure_and_memory_from_its_next_start() {
+    let key = common::SkKey::from_seed(52);
+    let rig = node_with_run_on_disk(&key, false);
+    let proposed = propose(&rig, json!({ "name": "app" })).expect("proposed");
+    assert_eq!(
+        proposed["args"]["changes"],
+        json!({ "runTmpfs": { "from": false, "to": true } })
+    );
+    let from = rig.fake.service_requests().len();
+    let done = approve_and_run(&rig, &key, &proposed).expect("runs");
+    assert_eq!(done["restarted"], false, "{done}");
+    assert_eq!(done["run"], "memory", "{done}");
+    assert!(states_since(&rig, from).is_empty(), "nothing was started");
+    assert!(rig.fake.run_on_disk(PROJECT, "app").is_empty());
+    rig.edit(
+        "PUT",
+        &format!("/1.0/instances/app/state?project={PROJECT}"),
+        json!({ "action": "start" }),
+    );
+    assert!(rig.fake.run_in_memory(PROJECT, "app"));
+}
+
+#[test]
+fn a_reconfigure_to_a_memory_run_keeps_the_templates_raw_lxc_lines() {
+    let key = common::SkKey::from_seed(53);
+    let rig = node_with_run_on_disk(&key, true);
+    rig.allow_low_level();
+    let mut lines = first_template();
+    lines["runTmpfs"] = json!(false);
+    lines["rawLxc"] = json!(["lxc.sched.core=0"]);
+    rig.template("app", lines.clone());
+    let proposed = propose(&rig, json!({ "name": "app" })).expect("proposed");
+    approve_and_run(&rig, &key, &proposed).expect("the line is applied first");
+    lines.as_object_mut().expect("template").remove("runTmpfs");
+    rig.template("app", lines);
+    let proposed = propose(&rig, json!({ "name": "app" })).expect("proposed");
+    assert_eq!(
+        proposed["args"]["changes"],
+        json!({ "runTmpfs": { "from": false, "to": true } })
+    );
+    let done = approve_and_run(&rig, &key, &proposed).expect("runs");
+    assert_eq!(done["run"], "memory", "{done}");
+    let config = instance(&rig, "app")["config"].clone();
+    assert_eq!(config["raw.lxc"], "lxc.sched.core=0");
+    assert_eq!(config[service::RUN_TMPFS_KEY], "true");
+    assert_eq!(
+        rig.service_config("app").raw_lxc,
+        vec!["lxc.sched.core=0".to_string()]
+    );
+}

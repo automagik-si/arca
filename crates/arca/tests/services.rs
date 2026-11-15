@@ -443,14 +443,19 @@ fn service_create_list_status_round_trip() {
     assert_eq!(created["links"], json!([]));
     assert_eq!(created["published"], Value::Null);
     assert_eq!(created["lanPort"], Value::Null);
+    assert_eq!(created["run"], "memory");
     let listed = rig.call("service_list", json!({})).expect("list");
-    assert_eq!(listed["services"], json!([created]));
+    let mut row = created.clone();
+    row.as_object_mut()
+        .expect("the create's answer")
+        .remove("run");
+    assert_eq!(listed["services"], json!([row]));
     let status = rig
         .call("service_status", json!({"name":"nats"}))
         .expect("status");
     // The status is the create's view, with the version the service runs beside the one its template names: the
     // same here, so the listing above carries no such key.
-    let mut expected = created.clone();
+    let mut expected = row.clone();
     let pin = format!("docker.io/library/nats@{DIGEST}");
     expected["update"] = json!({ "pin": pin, "templatePin": pin, "state": "same" });
     assert_eq!(status, expected);
@@ -745,6 +750,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         kernel_access: None,
         no_new_privileges: false,
         raw_lxc: Vec::new(),
+        run_tmpfs: true,
         edge: false,
         update: None,
     }
@@ -955,7 +961,7 @@ fn service_create_puts_each_service_in_the_project_with_desired_service_nic_its_
         .expect("create");
     assert_eq!(
         created,
-        json!({"name":"nats","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[4222],"links":[],"published":null,"lanPort":null})
+        json!({"name":"nats","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[4222],"links":[],"published":null,"lanPort":null,"run":"memory"})
     );
     let instance = rig
         .get(&format!("/1.0/instances/nats?project={PROJECT}"))
@@ -3329,6 +3335,8 @@ mod private_port;
 mod reconfigure;
 #[path = "services/routes.rs"]
 mod routes;
+#[path = "services/run_tmpfs.rs"]
+mod run_tmpfs;
 #[path = "services/tunnel.rs"]
 mod tunnel;
 #[path = "services/update.rs"]

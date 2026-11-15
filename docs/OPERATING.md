@@ -997,6 +997,44 @@ If the owner later sets `restricted.containers.lowlevel` back to `block`, Incus 
 instance config of a service that has the key, since the whole config is checked: a secret, a link or an environment
 change then fails for that service. Dropping the key still works, through the update above.
 
+#### `/run` is memory (`runTmpfs`)
+
+A container service made from an OCI image (`"kind": "oci"`) keeps its `/run` in memory (a tmpfs), never on the
+container's disk, so a short-lived credential an agent or a script stages under `/run` never touches the disk.
+`runTmpfs` defaults to true; such a template says `"runTmpfs": false` for an image that needs the files it ships in
+`/run`. A system container's init mounts its own `/run`, and a virtual machine has its own, so their templates take no
+part in it.
+
+How it works: Incus mounts a tmpfs (mode 0755) on an OCI container's `/run` at every start when the container's root
+holds nothing under `/run`, and mounts nothing when the image ships files there (a Debian base keeps `/run/lock`), so
+`/run` was then a directory on the container's disk. Arca empties `/run` on the root disk while the container is stopped,
+and Incus's own rule does the rest: the create makes the container stopped, removes what the image keeps under `/run`,
+then starts it as the call asked; `service_update` does the same after each rebuild (and after putting an old version
+back); `service_reconfigure` does it for a service made before (below). The image's own files under `/run` are not
+needed by the services Arca runs and are not kept: `/run` holds only what the service writes there after its start.
+Nothing is loosened for it: no `raw.lxc`, no host-path disk, and no project restriction changes, so it works the same in
+the node's own project and in a tenant's. What this mount does not have: `nosuid` and `nodev` (Incus sets only
+`mode=755`), and a size limit of its own. What a service writes in `/run` counts in its memory, so the template's
+`limits.memory` bounds it. The instance carries `user.arca.runtmpfs=true` as its mark, and the record keeps
+`runTmpfs: true`.
+
+The create's answer, `service_update`'s and `service_reconfigure`'s say where `/run` is: `run: "memory"` or `run:
+"disk"` with `runNote` when Arca could not remove what the image keeps there (more than 256 entries, a `/run` that is
+not a directory, a removal Incus refused): the service is then created and runs as it did before this change, with
+`/run` on its disk, and nothing is refused for it. For a stopped service it is read from Incus (the root holds nothing
+under `/run`, so its next start mounts a memory one). A running container's mount table cannot be read through Incus's
+files API, so for a running service it is what Arca saw when it emptied that container's `/run`, just before the start.
+`run: "unknown"` means Incus could not be read, or Arca has not emptied the running container since its daemon began.
+
+A service made before this change keeps the `/run` it has. `service_reconfigure` shows `/run becomes memory, restart
+once` on its card for it, and an approved card stops the service, removes what the image keeps under `/run`, and starts
+it again (a stopped service has it from its next start). A template that turns `runTmpfs` off shows on the card that
+Arca no longer keeps `/run` in memory, and the service is restarted once: the image's files that were removed come back
+with the next `service_update` to a new digest, which gives the container a new root, and until then Incus still mounts
+a memory `/run`, since the disk holds nothing there.
+
+To check by hand on a node, inside the container: `stat -f -c %T /run` prints `tmpfs`.
+
 `data` names an absolute printable mount `path` of at most 255 bytes that is not the root (`/`, `//` and `/.` are
 refused) and has no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit), and an optional `size` such as
 `8GiB`. Arca creates a custom volume `<service>-data` in the service project's storage pool before the instance, setting
@@ -1712,6 +1750,10 @@ difference from its record, which it writes into the proposal as `changes`:
 - `ports`, `rawLxc` and `noNewPrivileges`: `{from, to}` when the template says otherwise; `rawLxc` is the container's
   `raw.lxc` lines whole, `lxc.no_new_privs=1` among them when it is set. A tenant's service keeps its low-level
   container settings.
+- `runTmpfs`: `{from, to}` when the template's `runTmpfs` (true unless it says `false`) is not the service's, in the
+  node's own project and in a tenant's alike (see "`/run` is memory"). The card says `/run becomes memory, restart
+  once`; the run then stops the service, empties `/run` on its disk and starts it, in place of the restart, and the
+  answer says `run: "memory"` or `run: "disk"` with `runNote`.
 - `entrypoint`: `{from, to}` when the template's entrypoint, with the scripts it reads from the templates directory as
   they are now, is not the one the service runs. Each side is shown whole when short, or else by its size and the start
   of its SHA-256 (a script goes as one long base64 word), and `scripts` names the template's scripts. It is applied as

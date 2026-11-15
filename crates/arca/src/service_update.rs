@@ -315,6 +315,27 @@ pub(super) fn state_changer_for(
     Ok(changer)
 }
 
+/// Why a service that keeps `/run` in memory has it on its disk, as its answer says it.
+pub(super) const RUN_ON_DISK: &str = "/run stays on the container's disk: Arca could not empty the files its image keeps in /run, and Incus mounts a memory /run only on an empty one. A secret staged under /run touches the disk";
+
+/// Says in the answer of a service that keeps `/run` in memory where its container's `/run` is, read from Incus:
+/// `run: "memory"` (for a stopped one, from its next start), or `run: "disk"` with `runNote` saying why, or
+/// `run: "unknown"` when it could not be read.
+pub(super) fn say_run(cfg: &NodeConfig, config: &ServiceConfig, answer: &mut Value) {
+    let place = state_changer_for(cfg, config).ok().and_then(|changer| {
+        let seen = changer.read(&config.project, &config.instance).ok()?;
+        changer.run_in_memory(&seen).ok()
+    });
+    match place {
+        Some(true) => answer["run"] = json!("memory"),
+        Some(false) => {
+            answer["run"] = json!("disk");
+            answer["runNote"] = json!(RUN_ON_DISK);
+        }
+        None => answer["run"] = json!("unknown"),
+    }
+}
+
 /// Where the service's template declares a data volume while its instance has no `data` device: the path its data is
 /// kept at inside the container, which a rebuild of the root erases. The template is read as the record kept it, then
 /// as installed on the node, then as this build ships it: an installed file that is stale, edited or half installed
@@ -1048,7 +1069,7 @@ impl Run<'_> {
             Ok(snapshot) => {
                 self.journal
                     .step("end", true, json!({ "digest": self.digest }));
-                return Ok(json!({
+                let mut answer = json!({
                     "updated": true,
                     "service": name,
                     "digest": self.digest,
@@ -1057,7 +1078,11 @@ impl Run<'_> {
                         "service {name} runs {} and its port {} answered",
                         self.digest, self.port,
                     ),
-                }));
+                });
+                if self.config.run_tmpfs {
+                    say_run(&self.handler.cfg, self.config, &mut answer);
+                }
+                return Ok(answer);
             }
             Err(failure) => failure,
         };
@@ -1173,6 +1198,23 @@ impl Run<'_> {
         }
     }
 
+    /// A service that keeps `/run` in memory has just been given a root (an image's, or its snapshot's), which may keep
+    /// files under `/run`: they are removed while the instance is stopped, so its start mounts a memory `/run`. A
+    /// removal Incus does not take is journalled and the update goes on, with `/run` on the disk as before.
+    fn run_emptied(&self, instance: &InstanceState) {
+        if self.config.run_tmpfs {
+            let emptied = self.changer.empty_run(instance);
+            self.journal.step(
+                "empty /run",
+                emptied.is_ok(),
+                match emptied {
+                    Ok(removed) => json!({ "removed": removed }),
+                    Err(error) => json!({ "why": incus_words(&error) }),
+                },
+            );
+        }
+    }
+
     fn started(&self, instance: &mut InstanceState) -> Result<(), Failure> {
         self.changer
             .change(instance, StateAction::Start)
@@ -1237,6 +1279,7 @@ impl Run<'_> {
         self.journal
             .step("rebuild", true, json!({ "digest": self.digest }));
         self.edge_root();
+        self.run_emptied(instance);
         self.started(instance)?;
         self.journal.step("start", true, json!({}));
         self.healthy()?;
@@ -1377,11 +1420,13 @@ impl Run<'_> {
                     .map_err(|error| Failure::of("restore", &error))?;
                 self.journal
                     .step("restore", true, json!({ "snapshot": snapshot }));
+                self.run_emptied(instance);
             }
             Back::OldImage => match self.rebuild_from(instance, &self.config.source) {
                 Ok(()) => {
                     self.journal.step("rebuild back", true, json!({}));
                     self.edge_root();
+                    self.run_emptied(instance);
                 }
                 Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
                     root_kept = true;
