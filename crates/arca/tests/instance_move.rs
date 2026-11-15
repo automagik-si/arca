@@ -2908,3 +2908,94 @@ fn the_copys_creation_records_the_sources_autostart() {
         .expect("the created line");
     assert_eq!(created["sourceAutostart"], "true", "{created}");
 }
+
+/// R7-1: the next start that records a verified copy as moved sets boot.autostart only on the copy the move recorded:
+/// another instance of the name on the target (another uuid) is left alone, and the result says the copy's was not set.
+#[test]
+fn the_recovery_moved_path_leaves_a_target_instance_of_another_uuid_alone() {
+    let rig = Rig::new(vec![web()], 100);
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let theirs = copy_on_target(&rig, "web", "Running");
+    assert_ne!(theirs, OTHER_UUID);
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": OTHER_UUID, "sourceAutostart": "true" }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+            json!({ "event": "cutover", "step": "started" }),
+            json!({ "event": "verify", "ok": true, "checks": [], "downtimeMs": 1234 }),
+        ],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "moved", "{status}");
+    let on_target = writer(&rig.target)
+        .get("/1.0/instances/web?project=shop")
+        .expect("the target's web");
+    assert_eq!(on_target["config"]["volatile.uuid"], theirs.as_str());
+    assert_eq!(
+        on_target["config"]["boot.autostart"],
+        Value::Null,
+        "{on_target}"
+    );
+    let line = result_line(&rig, "web");
+    assert_eq!(line["copyAutostartSet"], false, "{line}");
+    assert!(
+        line["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be set back on the copy on node-b"),
+        "{line}"
+    );
+}
+
+/// R6-2: a profile's boot.autostart true on a stopped source counts: the copy-started recovery ending turns it off.
+#[test]
+fn a_profiles_autostart_on_a_stopped_source_is_turned_off() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source.add_profile(
+        "shop",
+        json!({ "name": "default", "description": "", "config": { "boot.autostart": "true" }, "devices": {} }),
+    );
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let before = writer(&rig.source)
+        .get("/1.0/instances/web?project=shop")
+        .expect("the source");
+    assert_eq!(
+        before["expanded_config"]["boot.autostart"], "true",
+        "{before}"
+    );
+    assert_eq!(before["config"]["boot.autostart"], Value::Null, "{before}");
+    copy_started(&rig);
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(source_autostart(&rig), "false");
+    assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+}
+
+/// R6-2: a source whose boot.autostart is last-state or false is left alone by a failed ending.
+#[test]
+fn a_last_state_or_false_autostart_is_left_alone() {
+    for value in ["last-state", "false"] {
+        let rig = Rig::new(vec![web()], 100);
+        rig.source
+            .set_instance_config("shop", "web", "boot.autostart", value);
+        writer(&rig.source)
+            .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+            .expect("stopped");
+        copy_started(&rig);
+        rig.moves.recover();
+        let status = rig.wait("mv-0123456789ab");
+        assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+        assert_eq!(source_autostart(&rig), value);
+        assert_eq!(autostart_writes(&rig), 0, "{value}");
+        assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+    }
+}
