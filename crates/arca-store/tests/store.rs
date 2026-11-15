@@ -700,3 +700,84 @@ mod size_estimate {
         assert!(bytes < 128 * 1_048_576, "{bytes} bytes is over 128 MB");
     }
 }
+
+mod writes {
+    use super::*;
+
+    /// The series count of the measured one-host node (see "Sizing" in OPERATING.md).
+    const SERIES_COUNT: usize = 125;
+    /// The sampler's tick.
+    const TICK: u64 = 5_000;
+
+    /// The bytes this thread has handed to `write` and `pwrite` so far. SQLite writes on the thread that calls it, so the
+    /// count is the store's own writes, whatever other tests do meanwhile.
+    fn thread_wchar() -> u64 {
+        let io = fs::read_to_string("/proc/thread-self/io").expect("this thread's I/O counters");
+        io.lines()
+            .find_map(|line| line.strip_prefix("wchar: "))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("the wchar line")
+    }
+
+    /// One hour of the server's ticks: a tick every 5 s with the node's 125 points and no alert event, and the rollup at the
+    /// first tick of each minute, as the alert engine runs them. A second connection's `data_version` moves once for every
+    /// commit another connection makes to the file, so it counts the store's commits from outside the store; with
+    /// `synchronous=FULL` each commit is one fsync of the WAL. The raw 5-second points stay in memory, so the hour commits
+    /// once a minute: the minute's rollup.
+    #[test]
+    fn an_hour_of_ticks_commits_once_a_minute() {
+        let dir = StateDir::new("writes");
+        let base = 1_000 * DAY;
+        let mut store = Store::open(dir.path(), base).expect("open").store;
+        store.rollup(base).expect("the start's rollup");
+        let reader = rusqlite::Connection::open_with_flags(
+            dir.path().join(arca_store::DB_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("a second connection");
+        let data_version = || -> i64 {
+            reader
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .expect("data_version")
+        };
+        let points: Vec<Point> = (0..SERIES_COUNT)
+            .map(|i| Point {
+                name: format!("arca_bench_{i}"),
+                labels: pool("default"),
+                kind: SeriesKind::Gauge,
+                value: i as f64,
+            })
+            .collect();
+
+        let mut seen = data_version();
+        let mut commits = 0u64;
+        let mut count = |now: i64| {
+            if now != seen {
+                commits += 1;
+                seen = now;
+            }
+        };
+        let written_before = thread_wchar();
+        let mut rolled_minute = base / MINUTE;
+        for k in 1..=HOUR / TICK {
+            let at = base + k * TICK;
+            store.commit_tick(at, &points, &[]).expect("the tick");
+            count(data_version());
+            if at / MINUTE != rolled_minute {
+                rolled_minute = at / MINUTE;
+                store.rollup(at).expect("the minute's rollup");
+                count(data_version());
+            }
+        }
+        let written = thread_wchar() - written_before;
+        println!(
+            "writes: {SERIES_COUNT} series, one hour of 5 s ticks: {commits} commits, {written} bytes written ({:.1} MiB)",
+            written as f64 / 1_048_576.0
+        );
+        assert!(
+            commits <= 60,
+            "{commits} commits in an hour: the raw points reached the file"
+        );
+        assert!(commits >= 60, "{commits} commits: a minute's rollup did not commit");
+    }
+}
