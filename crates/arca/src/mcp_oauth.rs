@@ -231,7 +231,11 @@ struct Pending {
     redirect_uri: String,
     redirect_given: bool,
     state: Option<String>,
+    /// The highest level the client asked: the most the owner may grant.
     scope: Scope,
+    /// The level the owner picked on the consent page, from viewer up to `scope`. It starts as the lowest level the
+    /// client asked, and it is what the passkey statement binds and the code, device answer and grant carry.
+    picked: Scope,
     tools: Option<Vec<String>>,
     approvals: bool,
     resource: String,
@@ -854,6 +858,7 @@ impl OAuth {
                 return back(OAuthError::new("invalid_scope", why));
             }
         };
+        let picked = least_level(param("scope").unwrap_or_default());
         if inner.pending.len() >= PENDING_MAX {
             return back(OAuthError::new(
                 "temporarily_unavailable",
@@ -867,6 +872,7 @@ impl OAuth {
             redirect_given,
             state,
             scope,
+            picked,
             tools,
             approvals,
             resource,
@@ -888,7 +894,7 @@ impl OAuth {
             "client": client.id,
             "name": client.name,
             "redirectUri": pending.redirect_uri,
-            "scope": scope_text(pending.scope, pending.tools.as_deref(), pending.approvals),
+            "scope": scope_text(pending.picked, pending.tools.as_deref(), pending.approvals),
             "resource": pending.resource,
             "codeChallenge": pending.challenge,
         });
@@ -899,7 +905,10 @@ impl OAuth {
         bound
     }
 
-    fn begin(&self, id: &str) -> Result<Value, Refusal> {
+    /// Mints the statement the owner's passkey signs for consent request `id`. `pick` is the level the owner picked on the
+    /// page; it must lie between viewer and the highest level the client asked, since more than asked is never granted.
+    /// Without one, the request keeps the level it holds (the lowest asked, until the owner picks).
+    fn begin(&self, id: &str, pick: Option<&str>) -> Result<Value, Refusal> {
         let now = self.now();
         let (lines, host) = self.owner_lines()?;
         let mut inner = self.lock();
@@ -916,6 +925,17 @@ impl OAuth {
             .iter_mut()
             .find(|pending| pending.id == id)
             .ok_or_else(gone)?;
+        if let Some(word) = pick {
+            pending.picked = level(word)
+                .filter(|picked| *picked <= pending.scope)
+                .ok_or_else(|| {
+                    refused(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_scope",
+                        "pick a level no higher than the app asked for",
+                    )
+                })?;
+        }
         let digest = params_digest(&Self::bound(pending, &client)).map_err(|_| internal())?;
         let statement = canonical_json(&json!({
             "host": host,
@@ -975,7 +995,7 @@ impl OAuth {
                 inner.pending.retain(|kept| kept.id != pending.id);
                 let device = inner.devices.get_mut(device_hash).ok_or_else(gone)?;
                 device.answer = DeviceAnswer::Approved {
-                    scope: pending.scope,
+                    scope: pending.picked,
                     tools: pending.tools.clone(),
                     resource: pending.resource.clone(),
                     key: key.clone(),
@@ -983,7 +1003,7 @@ impl OAuth {
                     approved_at: now,
                 };
             }
-            let scope = scope_text(pending.scope, pending.tools.as_deref(), pending.approvals);
+            let scope = scope_text(pending.picked, pending.tools.as_deref(), pending.approvals);
             self.journal(
                 now,
                 "granted",
@@ -1010,7 +1030,7 @@ impl OAuth {
                     client_id: client.id.clone(),
                     redirect_uri: pending.redirect_uri.clone(),
                     redirect_given: pending.redirect_given,
-                    scope: pending.scope,
+                    scope: pending.picked,
                     tools: pending.tools.clone(),
                     approvals: pending.approvals,
                     resource: pending.resource.clone(),
@@ -1021,7 +1041,7 @@ impl OAuth {
                 },
             );
         }
-        let scope = scope_text(pending.scope, pending.tools.as_deref(), pending.approvals);
+        let scope = scope_text(pending.picked, pending.tools.as_deref(), pending.approvals);
         self.journal(
             now,
             "granted",
@@ -1336,6 +1356,7 @@ impl OAuth {
         };
         let (scope, tools, approvals) = parse_scope(param("scope").unwrap_or_default())
             .map_err(|why| OAuthError::new("invalid_scope", why))?;
+        let picked = least_level(param("scope").unwrap_or_default());
         if inner.pending.len() >= PENDING_MAX || inner.devices.len() >= DEVICES_MAX {
             return Err(OAuthError::new(
                 "temporarily_unavailable",
@@ -1363,6 +1384,7 @@ impl OAuth {
             redirect_given: false,
             state: None,
             scope,
+            picked,
             tools,
             resource,
             challenge: String::new(),
@@ -2131,6 +2153,14 @@ fn parse_scope(text: &str) -> Result<(Scope, Option<Vec<String>>, bool), String>
     Ok((scope, (!tools.is_empty()).then_some(tools), approvals))
 }
 
+/// The lowest level a scope request names, viewer when it names none: what the consent page offers by default.
+fn least_level(text: &str) -> Scope {
+    text.split_ascii_whitespace()
+        .filter_map(level)
+        .min()
+        .unwrap_or(Scope::Viewer)
+}
+
 /// Until when a grant with `approvals` is live in `stored` at `now`: the latest refresh expiry among them, or zero.
 fn session_until(stored: &Stored, now: u64) -> u64 {
     stored
@@ -2625,7 +2655,10 @@ fn page_body(body: &[u8]) -> Result<Value, Refusal> {
 async fn consent_begin(State(oauth): State<Arc<OAuth>>, body: Bytes) -> Response {
     let outcome = tokio::task::spawn_blocking(move || {
         let args = page_body(&body)?;
-        oauth.begin(args["id"].as_str().unwrap_or_default())
+        oauth.begin(
+            args["id"].as_str().unwrap_or_default(),
+            args["scope"].as_str(),
+        )
     })
     .await;
     answer(outcome)
@@ -2842,6 +2875,26 @@ stay open for it instead of lapsing after 15 minutes.</p></div>"
     } else {
         ""
     };
+    // The owner picks what to grant, from viewer up to the most the client asked; the lowest it asked is checked.
+    let pick = if pending.scope > Scope::Viewer {
+        let options: String = LEVELS
+            .into_iter()
+            .filter(|level| *level <= pending.scope)
+            .map(|level| {
+                format!(
+                    "<label><input type=\"radio\" name=\"scope\" value=\"{value}\"{checked}> <strong>{value}</strong>: {words}</label>",
+                    value = level.as_str(),
+                    checked = if level == pending.picked { " checked" } else { "" },
+                    words = scope_words(level),
+                )
+            })
+            .collect();
+        format!(
+            "<fieldset id=\"pick\"><legend>Grant it</legend>{options}<p class=\"hint\">Pick the least it needs. It never gets more than it asked for.</p></fieldset>"
+        )
+    } else {
+        String::new()
+    };
     let tools = pending
         .tools
         .as_ref()
@@ -2859,7 +2912,7 @@ stay open for it instead of lapsing after 15 minutes.</p></div>"
 <h1>Connect <span id=\"client-name\">{name}</span> to Arca?</h1>{shared_note}{device_note}\
 <dl><dt>App</dt><dd><strong>{name}</strong></dd>{answers}\
 <dt>It asks to</dt><dd><strong id=\"scope\">{scope}</strong>: {words}</dd>\
-<dt>For</dt><dd>{resource}</dd></dl>{tools}{approvals}\
+<dt>For</dt><dd>{resource}</dd></dl>{pick}{tools}{approvals}\
 <p>Your passkey signs you in and approves this in one step. You can disconnect the app any time on the approval page.</p>\
 <div class=\"actions\"><button id=\"approve\" type=\"button\">Approve with passkey</button>\
 <button id=\"deny\" type=\"button\" class=\"secondary\">Don't allow</button></div>\

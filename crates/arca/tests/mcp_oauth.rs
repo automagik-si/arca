@@ -349,7 +349,16 @@ impl Rig {
 
     /// Begins and approves the consent request `id` with `key`; the page's answer.
     fn approve_with(&self, key: &SoftPasskey, id: &str) -> Reply {
-        let begun = self.page_post("/oauth/authorize/begin", json!({ "id": id }));
+        self.approve_picking(key, id, None)
+    }
+
+    /// The owner approves request `id` with the passkey, having picked `pick` on the page (the default when none).
+    fn approve_picking(&self, key: &SoftPasskey, id: &str, pick: Option<&str>) -> Reply {
+        let mut body = json!({ "id": id });
+        if let Some(pick) = pick {
+            body["scope"] = json!(pick);
+        }
+        let begun = self.page_post("/oauth/authorize/begin", body);
         assert_eq!(begun.status, 200, "begin: {}", begun.text());
         let statement = begun.json()["statement"]
             .as_str()
@@ -364,9 +373,20 @@ impl Rig {
 
     /// The whole flow for `client` at `scope`: consent, passkey, code. The code.
     fn code(&self, key: &SoftPasskey, client: &str, scope: &str) -> String {
+        self.code_picking(key, client, scope, None)
+    }
+
+    /// The whole flow for `client` asking `scope`, the owner picking `pick` on the page: the code.
+    fn code_picking(
+        &self,
+        key: &SoftPasskey,
+        client: &str,
+        scope: &str,
+        pick: Option<&str>,
+    ) -> String {
         let page = self.authorize(client, &[("scope", Some(scope))]);
         let id = Rig::request_id(&page);
-        let approved = self.approve_with(key, &id);
+        let approved = self.approve_picking(key, &id, pick);
         assert_eq!(approved.status, 200, "approve: {}", approved.text());
         let redirect = approved.json()["redirect"]
             .as_str()
@@ -657,7 +677,15 @@ fn the_full_flow_registers_asks_the_owner_and_the_issued_token_calls_mcp_with_it
 #[test]
 fn an_operator_grant_sees_operator_verbs_and_a_tool_list_narrows_it() {
     let (rig, key) = Rig::new("oauth-operator");
-    let (_, operator, _) = rig.connected(&key, "Desktop", "viewer operator");
+    // The client asks viewer and operator; the owner picks operator on the page.
+    let client = rig.client("Desktop");
+    let code = rig.code_picking(&key, &client, "viewer operator", Some("operator"));
+    let reply = rig.exchange(&client, &code);
+    assert_eq!(reply.json()["scope"], json!("operator"), "{}", reply.text());
+    let operator = reply.json()["access_token"]
+        .as_str()
+        .expect("access")
+        .to_string();
     let tools = rig.tools(&operator);
     assert!(tools.iter().any(|tool| tool == "token_list"));
     assert!(tools.len() > rig.tools(&rig.viewer).len());
@@ -2456,4 +2484,160 @@ fn a_device_grant_with_approvals_is_the_owners_session_as_the_code_flows_is() {
         rig.oauth.session(&session),
         Session::StepUp { .. }
     ));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The owner picks the scope: from viewer up to the highest the client asked, the lowest asked by default.
+
+/// The scope radio buttons a consent page offers: each value, and whether it is the one checked.
+fn offered(page: &str) -> Vec<(String, bool)> {
+    page.split("<input type=\"radio\" name=\"scope\" value=\"")
+        .skip(1)
+        .map(|rest| {
+            let value = rest.split('"').next().unwrap_or_default().to_string();
+            let tag = rest.split('>').next().unwrap_or_default();
+            (value, tag.contains(" checked"))
+        })
+        .collect()
+}
+
+#[test]
+fn a_client_asking_every_scope_gets_viewer_when_the_owner_leaves_the_default() {
+    let (rig, key) = Rig::new("oauth-pick-default");
+    let client = rig.client("Claude Code");
+    let page = rig.authorize(&client, &[("scope", Some("viewer doctor operator"))]);
+    assert_eq!(
+        offered(&page.text()),
+        vec![
+            ("viewer".to_string(), true),
+            ("doctor".to_string(), false),
+            ("operator".to_string(), false)
+        ],
+        "{}",
+        page.text()
+    );
+    let code = rig.code(&key, &client, "viewer doctor operator");
+    let reply = rig.exchange(&client, &code);
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(reply.json()["scope"], json!("viewer"));
+    let access = reply.json()["access_token"]
+        .as_str()
+        .expect("access")
+        .to_string();
+    assert_eq!(rig.tools(&access), rig.tools(&rig.viewer));
+    // The grant carries viewer too: a refresh cannot widen it to what the client first asked.
+    let refresh = reply.json()["refresh_token"]
+        .as_str()
+        .expect("refresh")
+        .to_string();
+    let wider = rig.refresh(&client, &refresh, Some("operator"));
+    assert_eq!(wider.status, 400, "{}", wider.text());
+    assert_eq!(error_of(&wider), "invalid_scope");
+    let granted = rig
+        .journal()
+        .lines()
+        .find(|line| line.contains("\"event\":\"granted\""))
+        .expect("a granted line")
+        .to_string();
+    assert!(granted.contains("\"scope\":\"viewer\""), "{granted}");
+}
+
+#[test]
+fn the_lowest_scope_asked_is_the_default_and_viewer_is_always_offered() {
+    let (rig, key) = Rig::new("oauth-pick-lowest");
+    let client = rig.client("Ops tool");
+    let page = rig.authorize(&client, &[("scope", Some("operator doctor"))]);
+    assert_eq!(
+        offered(&page.text()),
+        vec![
+            ("viewer".to_string(), false),
+            ("doctor".to_string(), true),
+            ("operator".to_string(), false)
+        ],
+        "{}",
+        page.text()
+    );
+    // A client that asks viewer alone has nothing to pick.
+    let page = rig.authorize(&client, &[("scope", Some("viewer"))]);
+    assert!(offered(&page.text()).is_empty(), "{}", page.text());
+    let code = rig.code(&key, &client, "operator");
+    assert_eq!(
+        rig.exchange(&client, &code).json()["scope"],
+        json!("operator")
+    );
+}
+
+#[test]
+fn the_owner_picks_a_scope_the_passkey_binds_and_never_more_than_asked() {
+    let (rig, key) = Rig::new("oauth-pick-binds");
+    let client = rig.client("Picked");
+    let page = rig.authorize(&client, &[("scope", Some("viewer doctor approvals"))]);
+    let id = Rig::request_id(&page);
+    // More than the client asked is never granted, whatever the page sends.
+    for above in ["operator", "admin"] {
+        let refused = rig.page_post(
+            "/oauth/authorize/begin",
+            json!({ "id": id, "scope": above }),
+        );
+        assert_eq!(refused.status, 400, "{above}: {}", refused.text());
+    }
+    // The passkey binds the level picked, below the most the client asked.
+    let page = rig.authorize(
+        &client,
+        &[("scope", Some("viewer doctor operator approvals"))],
+    );
+    let id = Rig::request_id(&page);
+    let begun = rig.page_post(
+        "/oauth/authorize/begin",
+        json!({ "id": id, "scope": "doctor" }),
+    );
+    assert_eq!(begun.status, 200, "{}", begun.text());
+    let statement: Value =
+        serde_json::from_str(begun.json()["statement"].as_str().expect("a statement"))
+            .expect("json");
+    let bound = json!({
+        "request": id, "client": client, "name": "Picked", "redirectUri": REDIRECT,
+        "scope": "doctor approvals", "resource": format!("{ORIGIN}/mcp"), "codeChallenge": challenge_of(VERIFIER),
+    });
+    assert_eq!(
+        statement["paramsDigest"],
+        json!(arca_kernel::canon::params_digest(&bound).expect("digest"))
+    );
+    let code = rig.code_picking(
+        &key,
+        &client,
+        "viewer doctor operator approvals",
+        Some("doctor"),
+    );
+    let reply = rig.exchange(&client, &code);
+    assert_eq!(
+        reply.json()["scope"],
+        json!("doctor approvals"),
+        "{}",
+        reply.text()
+    );
+}
+
+#[test]
+fn a_device_flow_gets_the_scope_the_owner_picks() {
+    let (rig, key) = Rig::new("oauth-pick-device");
+    let client = rig.device_client("Agent");
+    for (pick, granted) in [(None, "viewer"), (Some("operator"), "operator")] {
+        let device = rig.device_code(&client, "viewer doctor operator");
+        let page = rig.get(&on_origin(
+            device["verification_uri_complete"]
+                .as_str()
+                .expect("a link"),
+        ));
+        assert_eq!(offered(&page.text()).len(), 3, "{}", page.text());
+        let approved = rig.approve_picking(&key, &Rig::request_id(&page), pick);
+        assert_eq!(approved.status, 200, "{}", approved.text());
+        rig.advance(5_000);
+        let reply = rig.poll(
+            &client,
+            device["device_code"].as_str().expect("a device code"),
+        );
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        assert_eq!(reply.json()["scope"], json!(granted), "{pick:?}");
+    }
 }
