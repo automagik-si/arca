@@ -409,6 +409,22 @@ fn a_viewer_calling_a_write_verb_is_refused_403_and_the_call_exits_4() {
 }
 
 #[test]
+fn plan_renew_refuses_a_viewer_and_a_doctor_and_answers_an_operator() {
+    let node = start_node("plan-renew");
+    for token in [&node.viewer, &node.doctor] {
+        let out = call(&node, token, "plan_renew", &["--args", "{}"]);
+        assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.stdout.is_empty(), "a refused call prints no result");
+    }
+    let out = call(&node, &node.operator, "plan_renew", &["--args", "{}"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout_json(&out),
+        json!({ "renewed": [], "notRenewed": [] })
+    );
+}
+
+#[test]
 fn a_doctor_calling_token_list_is_refused_403_and_the_call_exits_4() {
     let node = start_node("doctor-operator");
     let out = call(&node, &node.doctor, "token_list", &["--args", "{}"]);

@@ -3416,6 +3416,121 @@
       "x-arca-writes": true
     },
     {
+      "name": "plan_renew",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "notRenewed": {
+              "items": {
+                "properties": {
+                  "entry": {
+                    "type": "string"
+                  },
+                  "plan": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "type": "string"
+                  },
+                  "why": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "plan",
+                  "entry",
+                  "why"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "renewed": {
+              "items": {
+                "properties": {
+                  "createdAt": {
+                    "type": "integer"
+                  },
+                  "entry": {
+                    "type": "string"
+                  },
+                  "expiresAt": {
+                    "type": "integer"
+                  },
+                  "objects": {
+                    "items": {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "project",
+                            "instance",
+                            "network",
+                            "acl",
+                            "profile",
+                            "volume",
+                            "zone",
+                            "forward",
+                            "bucket"
+                          ],
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "project": {
+                          "type": "string"
+                        },
+                        "uuid": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "project",
+                        "name",
+                        "uuid"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "plan": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "plan",
+                  "entry",
+                  "objects",
+                  "createdAt",
+                  "expiresAt"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "renewed",
+            "notRenewed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Makes again each waiting delete plan whose fifteen minutes ran out without an approval, from what the journal still holds, so plan_list shows it and the owner can be asked again. The same objects keep the same plan id; only its creation time is now. A plan still inside its fifteen minutes keeps its age. A declined entry, an entry the desired state carries again, one with nothing left to delete, and every plan while an earlier effect is unresolved are not renewed, each with why. Nothing is written to Incus, the journal or the desired state.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "operator",
+      "x-arca-writes": true
+    },
+    {
       "name": "approval_submit",
       "params": [
         {

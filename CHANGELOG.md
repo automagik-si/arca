@@ -7,6 +7,13 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A delete plan nobody approved within its fifteen minutes can be shown to the owner again without a restart: the new
+operator verb `plan_renew` puts each lapsed plan back with fifteen new minutes and the same id, from what the journal still
+holds, and says why for each one it leaves (a declined entry, an entry the desired state carries again, nothing left to
+delete, or an earlier effect still unresolved). It sends nothing to Incus and writes no journal line. Until now a failed
+create that had already made its data volume left that volume, and the network rule held for it, with no card to approve
+once the plan lapsed.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and

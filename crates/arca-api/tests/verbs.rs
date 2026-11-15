@@ -41,6 +41,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "plan_list",
             "action_propose",
             "plan_decline",
+            "plan_renew",
             "approval_submit",
             "action_approve",
             "peer_keys_sync",
@@ -131,6 +132,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("plan_list", VerbClass::L, Scope::Viewer, false, false),
         ("action_propose", VerbClass::L, Scope::Viewer, false, false),
         ("plan_decline", VerbClass::L, Scope::Doctor, true, false),
+        ("plan_renew", VerbClass::L, Scope::Operator, true, false),
         ("approval_submit", VerbClass::L, Scope::Doctor, true, true),
         ("action_approve", VerbClass::L, Scope::Doctor, true, true),
         ("peer_keys_sync", VerbClass::L, Scope::Doctor, true, false),
@@ -492,6 +494,39 @@ fn plan_verb_schemas_equal_their_table_rows() {
             &["plan", "retained"]
         )
     );
+
+    // plan_renew takes nothing and answers with each plan it made again and each lapsed plan it did not, with why.
+    let renew = verb("plan_renew").expect("present");
+    assert_eq!((renew.params)(), closed_with(json!({}), &[]));
+    assert_eq!(
+        (renew.result)(),
+        open(
+            json!({
+                "renewed": { "type": "array", "items": open(
+                    json!({
+                        "plan": hex64(),
+                        "entry": { "type": "string" },
+                        "objects": { "type": "array", "items": obj.clone() },
+                        "createdAt": { "type": "integer" },
+                        "expiresAt": { "type": "integer" },
+                    }),
+                    &["plan", "entry", "objects", "createdAt", "expiresAt"]
+                ) },
+                "notRenewed": { "type": "array", "items": open(
+                    json!({
+                        "plan": hex64(),
+                        "entry": { "type": "string" },
+                        "why": { "type": "string" },
+                    }),
+                    &["plan", "entry", "why"]
+                ) },
+            }),
+            &["renewed", "notRenewed"]
+        )
+    );
+    assert!(!may_call(Scope::Viewer, renew));
+    assert!(!may_call(Scope::Doctor, renew));
+    assert!(may_call(Scope::Operator, renew));
 
     let submit = verb("approval_submit").expect("present");
     assert_eq!(

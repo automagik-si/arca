@@ -41,6 +41,22 @@ pub const PLAN_TTL_MS: u64 = 15 * 60 * 1000;
 /// Why a step does not run while an earlier effect is unresolved. The text names the rule and no value.
 const BLOCKED_WHY: &str = "an earlier effect is unresolved; the step does not run";
 
+/// Why a lapsed plan is not made again while an earlier effect is unresolved.
+const RENEW_BLOCKED_WHY: &str =
+    "an earlier effect is unresolved; no plan is made again until it is settled";
+
+/// Why a lapsed plan of an entry retained after a declined plan is not made again.
+const RENEW_RETAINED_WHY: &str =
+    "the entry's objects are retained after a declined plan; the owner is not asked again";
+
+/// Why a lapsed plan of an entry the desired state carries again is withdrawn instead.
+const RENEW_CARRIED_WHY: &str =
+    "the desired state carries the entry again; its plan is withdrawn";
+
+/// Why a lapsed plan with nothing left to delete is withdrawn instead.
+const RENEW_NOTHING_WHY: &str =
+    "the journal holds nothing of the entry's left to delete; its plan is withdrawn";
+
 /// The compiled-in plugins, keyed by id. A plugin is added once, as its erased form, so the reconciler holds every plugin
 /// through one object-safe type.
 #[derive(Default)]
@@ -98,6 +114,22 @@ pub struct PlanRun {
     pub partial: bool,
 }
 
+/// What [`Reconciler::renew_lapsed`] did: the lapsed plans it made again, and each lapsed plan it did not, with why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Renewal {
+    /// The plans made again now. A plan over the same objects keeps its digest, so its id is the one it had.
+    pub renewed: Vec<DeletePlan>,
+    /// The lapsed plans that were not made again.
+    pub not_renewed: Vec<NotRenewed>,
+}
+
+/// A lapsed plan that was not made again, as it was, and why in plain words. The text names the rule and no value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotRenewed {
+    pub plan: DeletePlan,
+    pub why: String,
+}
+
 /// A removed entry's delete plan that the owner has not yet approved, with the plugin that owned the entry.
 #[derive(Debug, Clone)]
 struct Pending {
@@ -131,6 +163,9 @@ pub struct Reconciler<S: JournalStore> {
     /// removal takes the entry out, and a failed apply never puts it in, so the same config is retried.
     converged: BTreeMap<EntryId, Entry>,
     pending: Vec<Pending>,
+    /// The entries the last applied document carries, suspended ones included. A lapsed plan is made again only for an entry
+    /// that is not here.
+    carried: BTreeSet<EntryId>,
     /// What the last resolution settled.
     resolution: Resolution,
 }
@@ -264,6 +299,7 @@ impl<S: JournalStore> Reconciler<S> {
             applied_by: BTreeMap::new(),
             converged,
             pending: Vec::new(),
+            carried: BTreeSet::new(),
             resolution: Resolution::default(),
         };
         reconciler.rebuild_applied_by();
@@ -304,6 +340,7 @@ impl<S: JournalStore> Reconciler<S> {
         // An entry the desired state carries again is no longer being removed, so its pending plan is withdrawn.
         self.pending
             .retain(|pending| !carried.contains(&pending.plan.entry));
+        self.carried = carried.clone();
         let mut outcomes = Vec::new();
         for entry in &doc.document.entries {
             // A suspended entry keeps its objects: it is neither applied nor removed.
@@ -525,6 +562,67 @@ impl<S: JournalStore> Reconciler<S> {
             .into_iter()
             .filter(|object| declined.plan.objects.contains(object))
             .collect()
+    }
+
+    /// Makes again, at `now_ms`, each pending plan older than [`PLAN_TTL_MS`], so the owner can be asked about it again without
+    /// a reconcile. The removal is worked out again from the journal alone and put in place as [`Reconciler::reconcile`] puts
+    /// a plan in place; the same objects give the same digest, so the plan keeps its id and only its creation time is now. A
+    /// plan still inside its fifteen minutes is left exactly as it is. A lapsed plan is not made again for an entry the
+    /// desired state carries again or that has nothing left to delete (that plan is withdrawn, as a reconcile withdraws it),
+    /// for an entry retained after a declined plan, or while an earlier effect is unresolved; each says why.
+    ///
+    /// Nothing is written: no class-A revert, no delete and no journal record, and the desired state does not change. A
+    /// renewed plan runs only under an approval made for it after this call, with the same checks as any plan.
+    pub fn renew_lapsed(&mut self, now_ms: u64) -> Renewal {
+        let lapsed: Vec<DeletePlan> = self
+            .pending
+            .iter()
+            .filter(|pending| now_ms.saturating_sub(pending.plan.created_ms) > PLAN_TTL_MS)
+            .map(|pending| pending.plan.clone())
+            .collect();
+        let mut renewal = Renewal::default();
+        if self.blocked() {
+            renewal.not_renewed = lapsed
+                .into_iter()
+                .map(|plan| NotRenewed {
+                    plan,
+                    why: RENEW_BLOCKED_WHY.to_string(),
+                })
+                .collect();
+            return renewal;
+        }
+        for old in lapsed {
+            let id = old.entry.clone();
+            let why = if self.carried.contains(&id) {
+                self.pending.retain(|pending| pending.plan.entry != id);
+                RENEW_CARRIED_WHY.to_string()
+            } else {
+                match self.retained.holds(&id) {
+                    Ok(true) => RENEW_RETAINED_WHY.to_string(),
+                    Err(refusal) => refusal.to_string(),
+                    Ok(false) => match removal(&self.journal, &id, now_ms).plan {
+                        None => {
+                            self.pending.retain(|pending| pending.plan.entry != id);
+                            RENEW_NOTHING_WHY.to_string()
+                        }
+                        Some(plan) => {
+                            let mut outcomes = Vec::new();
+                            self.plan_removal(&id, plan, &mut outcomes);
+                            match outcomes.pop() {
+                                Some(Outcome::AwaitingApproval { plan }) => {
+                                    renewal.renewed.push(plan);
+                                    continue;
+                                }
+                                Some(Outcome::Failed { why, .. }) => why,
+                                _ => "the plan was not put in place".to_string(),
+                            }
+                        }
+                    },
+                }
+            };
+            renewal.not_renewed.push(NotRenewed { plan: old, why });
+        }
+        renewal
     }
 
     /// The delete plans waiting for an approval.

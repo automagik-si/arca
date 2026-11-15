@@ -1419,6 +1419,13 @@ pub fn plan_handlers_served(
             }) as Arc<dyn ToolHandler>,
         ),
         (
+            "plan_renew",
+            Arc::new(PlanRenew {
+                kernel: Arc::clone(&kernel),
+                clock: Arc::clone(&clock),
+            }) as Arc<dyn ToolHandler>,
+        ),
+        (
             "approval_submit",
             Arc::new(ApprovalSubmit {
                 kernel: Arc::clone(&kernel),
@@ -2225,6 +2232,46 @@ pub(crate) fn decline_plan(kernel: &mut Kernel, args: &Value) -> Result<Value, C
             false => Err(no_such_plan()),
             true => Ok(json!({ "plan": id, "retained": [] })),
         },
+    }
+}
+
+/// `plan_renew`: makes again each waiting delete plan whose fifteen minutes ran out, so `plan_list` shows it again. It takes no
+/// argument, and it writes nothing to Incus, the journal or the desired state.
+struct PlanRenew {
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+}
+
+impl ToolHandler for PlanRenew {
+    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let now = (self.clock)();
+        let mut kernel = lock(&self.kernel)?;
+        let renewal = kernel.renew_lapsed(now);
+        let renewed = renewal
+            .renewed
+            .iter()
+            .map(|plan| {
+                Ok(json!({
+                    "plan": plan.digest.to_hex(),
+                    "entry": plan.entry.0,
+                    "objects": objects_json(&plan.objects)?,
+                    "createdAt": plan.created_ms,
+                    "expiresAt": plan.created_ms.saturating_add(PLAN_TTL_MS),
+                }))
+            })
+            .collect::<Result<Vec<Value>, CallError>>()?;
+        let not_renewed: Vec<Value> = renewal
+            .not_renewed
+            .iter()
+            .map(|lapsed| {
+                json!({
+                    "plan": lapsed.plan.digest.to_hex(),
+                    "entry": lapsed.plan.entry.0,
+                    "why": lapsed.why,
+                })
+            })
+            .collect();
+        Ok(json!({ "renewed": renewed, "notRenewed": not_renewed }))
     }
 }
 

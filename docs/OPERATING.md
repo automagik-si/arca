@@ -1788,8 +1788,8 @@ shows `follow` for a service that can.
 | Caller | Result |
 |--------|--------|
 | no `Authorization`, a malformed bearer or an unknown token | 401 |
-| a `doctor` calling `token_list` | 403 |
-| a `viewer` calling `token_list`, or any verb that writes (`plan_decline`, `approval_submit`) | 403 |
+| a `doctor` calling `token_list` or `plan_renew` | 403 |
+| a `viewer` calling `token_list`, or any verb that writes (`plan_decline`, `plan_renew`, `approval_submit`) | 403 |
 | any request carrying an `Origin` header | 403, before the body is read |
 | a call the caller may make | 200, with the verb's result or a JSON-RPC error |
 
@@ -1892,7 +1892,7 @@ does, so it can be up to 59 seconds over. The third chat's bare 429 has no body.
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol versions `2026-07-28` and `2025-11-25`) on the
 unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
-`action_propose`, `plan_decline`, `approval_submit`, `action_approve`, `peer_keys_sync`, the Postgres and ontology verbs, `service_create`, `service_list` and
+`action_propose`, `plan_decline`, `plan_renew`, `approval_submit`, `action_approve`, `peer_keys_sync`, the Postgres and ontology verbs, `service_create`, `service_list` and
 `service_status`, `gpu_attach` and `gpu_detach`, `storage_list`, `storage_add`, `snapshot_create`, `snapshot_list` and
 `snapshot_delete`, `instance_start`, `instance_stop` and `instance_restart`, and `instance_move_preflight`.
 
@@ -2163,6 +2163,9 @@ them would change nothing a user sees. They move to `2026-07-28` before `2025-11
   only.
 - `plan_decline` retains a waiting delete plan's objects, or declines a waiting action proposal. A decline is final and
   survives a restart.
+- `plan_renew` is an operator verb with no arguments: it makes each lapsed delete plan again with fifteen new minutes and the
+  same id, so `plan_list` shows it again, and says why for each one it leaves. It sends nothing to Incus and writes no
+  journal line. See the section on delete plans.
 - `approval_submit` checks an owner's approval for a waiting delete plan and, when it holds, deletes the plan's objects once.
   Action proposals are approved and run by the approval page, which can reach the gated verb's handler.
 - `action_approve` takes `{plan: "<act-id>", approval}`, checks the owner's passkey approval for a waiting action proposal
@@ -2793,8 +2796,25 @@ file that is a link or is not owned by that user. Each refusal is a config or ru
 
 A removal of a desired entry whose objects are class B (deleted by an Incus delete) does not delete them. It waits as a delete
 plan until an owner approves it. A plan lapses fifteen minutes after it was made. `plan_list` leaves a lapsed plan out, and an
-approval for it is refused as `Expired`. A restart, or a new proposal while the removal still waits, makes a fresh plan with a new
-creation time and fifteen new minutes.
+approval for it is refused as `Expired`. Nothing is deleted and nothing is reverted when a plan lapses: the objects stay where
+they are, the journal still holds them, and the kernel keeps the lapsed plan without showing it. A restart, or a new proposal
+while the removal still waits, makes a fresh plan with a new creation time and fifteen new minutes.
+
+To ask the owner again without a restart or an unrelated change, an operator calls `plan_renew` (no arguments). For each lapsed
+plan whose entry the desired state still does not carry, it works the removal out again from the journal and puts the plan back
+with a creation time of now and fifteen new minutes, so `plan_list` and the approval page show it again. The same objects give
+the same plan id, so a card for it reads as the same plan. A plan still inside its fifteen minutes keeps its age. It answers
+`renewed` (each plan's `plan`, `entry`, `objects`, `createdAt` and `expiresAt`) and `notRenewed` (each lapsed plan it left,
+with `plan`, `entry` and `why`): an entry declined earlier is never asked about again; an entry the desired state carries again,
+or one the journal holds nothing left to delete of, has its plan withdrawn; and while an earlier effect is unresolved nothing is
+renewed. `plan_renew` sends nothing to Incus, writes no journal line and changes no desired state. Everything else about the
+plan stays: the statement comes from `plan_list`, an approval must be made after the renewal, and the run checks the live
+objects as for any plan. `plan_list` itself never renews.
+
+```
+arca call plan_renew --config /etc/arca/node.json --token-file "$HOME/.config/arca/operator-1.secret" --args '{}'
+{"notRenewed":[],"renewed":[{"createdAt":1793362620000,"entry":"svc-nats","expiresAt":1793363520000,"objects":[{"kind":"volume","name":"nats-data","project":"arca-services","uuid":null}],"plan":"<64 hex digits>"}]}
+```
 
 Kernel instances start on create unless the body sets `start: false`; removal force-stops a running instance and waits for that operation before DELETE.
 
