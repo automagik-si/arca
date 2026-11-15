@@ -14,8 +14,8 @@
 //! lookup never refuses anything: a miss or a failure is only "version unknown" on the card.
 //!
 //! The version is a label: it is no argument of the proposal, so the owner's approval binds the digest and the args
-//! digest is the same with or without the lookup. A tag can move, so the card says the name is the tag the registry
-//! gave the digest when the proposal was made.
+//! digest is the same with or without the lookup. A tag can move, and the map answering may be up to [`MAX_AGE_MS`]
+//! old, so the card says the name is the tag the registry gave the digest at most ten minutes before the proposal.
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -92,7 +92,7 @@ pub fn version_words(image: &str, digest: &str, version: Option<&str>) -> Option
 fn words(label: &str, digest: &str, version: Option<&str>) -> String {
     match version.filter(|tag| version_tag_ok(tag)) {
         Some(tag) => format!(
-            "{label} {tag} ({digest}). The name is the tag {HOST} gave this digest when this was proposed."
+            "{label} {tag} ({digest}). The name is the tag {HOST} gave this digest at most ten minutes before this was proposed."
         ),
         None => format!("{digest} (version unknown)"),
     }
@@ -364,6 +364,16 @@ struct GhcrRound {
     base: String,
     repository: String,
     token: String,
+}
+
+/// A round that ends leaves its runtime without waiting: a request the deadline gave up on may still hold a thread of
+/// the blocking pool, as a resolver that hangs does, and dropping the runtime would wait for it.
+impl Drop for GhcrRound {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 /// What one request answered: its status, the headers the lookup reads, and at most [`ANSWER_MAX`] bytes of body.

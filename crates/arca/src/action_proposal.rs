@@ -1580,16 +1580,21 @@ fn loaded_words(
     loaded_rows(action, args, stored_summary, stored_details)
 }
 
-/// Whether `row` is a `Version` row for this proposal: a create or an update that names a digest, with the words
-/// [`crate::image_version`] writes for that digest.
+/// Whether `row` is a `Version` row for this proposal, with the words [`crate::image_version`] writes for its digest: a
+/// create's is the one its image names (asked for, or its template's pin) or else the one it asks for, an update's the
+/// one it names.
 fn version_row_fits(action: ActionKind, args: &Value, row: &ActionDetail) -> bool {
-    matches!(
-        action,
-        ActionKind::ServiceCreate | ActionKind::ServiceUpdate
-    ) && row.label == crate::image_version::ROW_LABEL
-        && args["digest"]
+    let digest = match action {
+        ActionKind::ServiceCreate => args["image"]
             .as_str()
-            .is_some_and(|digest| crate::image_version::row_fits(&row.value, digest))
+            .and_then(|image| image.split_once('@'))
+            .map(|(_, digest)| digest)
+            .or_else(|| args["digest"].as_str()),
+        ActionKind::ServiceUpdate => args["digest"].as_str(),
+        _ => None,
+    };
+    row.label == crate::image_version::ROW_LABEL
+        && digest.is_some_and(|digest| crate::image_version::row_fits(&row.value, digest))
 }
 
 fn loaded_rows(
@@ -1805,8 +1810,7 @@ impl ActionProposalStore {
         self.propose_labelled(action, args, now, gpu_product, uses, None)
     }
 
-    /// The same, with the card's `Version` row for a create or an update that names a digest
-    /// ([`crate::image_version`]): a label read when the proposal is made, kept with the proposal's rows and no part of
+    /// The same, with the card's `Version` row for a create or an update at a digest ([`crate::image_version`]): a label read when the proposal is made, kept with the proposal's rows and no part of
     /// its arguments, so the args digest the owner signs is the same with it or without it.
     pub fn propose_labelled(
         &mut self,
