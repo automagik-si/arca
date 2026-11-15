@@ -29,4 +29,13 @@ install -d -m 0755 /usr/local/lib/arca-image
 install -m 0755 /tmp/arca-image/invoke-tests-record.sh /usr/local/lib/arca-image/invoke-tests-record.sh
 : >/usr/local/lib/arca-image/test-failures.log
 chmod 0666 /usr/local/lib/arca-image/test-failures.log
+# Ubuntu 26.04 keeps /tmp in memory (half the machine's); GitHub's toolset unpacks gigabytes there and only turns it off
+# (configure-environment.sh masks tmp.mount) for after the reboot near the end. Put /tmp on the disk now, the way it
+# ends up in GitHub's image. Last here: the files build.sh put in /tmp are already installed.
+if [ "$(findmnt -n -o FSTYPE /tmp 2>/dev/null)" = tmpfs ]; then
+  systemctl mask tmp.mount
+  umount -l /tmp
+  chmod 1777 /tmp
+  echo "prepare: /tmp moved from memory to the disk"
+fi
 echo "prepare: ready (root on $root_fs, $(df -h --output=size / | tail -1 | tr -d ' ') disk, $(nproc) CPUs)"
