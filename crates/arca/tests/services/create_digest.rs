@@ -3,7 +3,7 @@
 //! fake registry. No network: the registry is a fake that counts what it is asked.
 use super::*;
 use arca::handlers::{UpdateOptions, service_handlers_updating};
-use arca::image_version::{Page, RegistryRound, TagRegistry, VersionLookup};
+use arca::image_version::{Page, RegistryRound, TagRegistry, Unanswered, VersionLookup};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
 
@@ -19,7 +19,10 @@ fn index_digest() -> String {
 /// The digests of the per-platform manifests the index lists: none of them may reach Incus.
 fn platform_digests() -> Vec<String> {
     let index: Value = serde_json::from_str(INDEX_FIXTURE).expect("the fixture is JSON");
-    assert_eq!(index["mediaType"], "application/vnd.oci.image.index.v1+json");
+    assert_eq!(
+        index["mediaType"],
+        "application/vnd.oci.image.index.v1+json"
+    );
     let digests: Vec<String> = index["manifests"]
         .as_array()
         .expect("manifests")
@@ -141,19 +144,19 @@ impl TagRegistry for Shared {
         &'a self,
         repository: &str,
         _wait: Duration,
-    ) -> Result<Box<dyn RegistryRound + 'a>, ()> {
+    ) -> Result<Box<dyn RegistryRound + 'a>, Unanswered> {
         assert_eq!(repository, OMNI_REPOSITORY);
         self.0.opens.fetch_add(1, Ordering::SeqCst);
         self.0.requests.fetch_add(1, Ordering::SeqCst);
         if self.0.refuse {
-            return Err(());
+            return Err(Unanswered);
         }
         Ok(Box::new(Round(&self.0)))
     }
 }
 
 impl RegistryRound for Round<'_> {
-    fn tags(&mut self, _last: Option<&str>, _wait: Duration) -> Result<Page, ()> {
+    fn tags(&mut self, _last: Option<&str>, _wait: Duration) -> Result<Page, Unanswered> {
         self.0.requests.fetch_add(1, Ordering::SeqCst);
         Ok(Page {
             tags: self.0.tags.iter().map(|(tag, _)| tag.clone()).collect(),
@@ -161,14 +164,14 @@ impl RegistryRound for Round<'_> {
         })
     }
 
-    fn digest(&mut self, tag: &str, _wait: Duration) -> Result<String, ()> {
+    fn digest(&mut self, tag: &str, _wait: Duration) -> Result<String, Unanswered> {
         self.0.requests.fetch_add(1, Ordering::SeqCst);
         self.0
             .tags
             .iter()
             .find(|(known, _)| known == tag)
             .map(|(_, digest)| digest.clone())
-            .ok_or(())
+            .ok_or(Unanswered)
     }
 }
 
@@ -278,7 +281,10 @@ fn an_index_digest_reaches_incus_untouched_at_create_and_at_update() {
         .expect("update");
     assert_eq!(moved["updated"], true);
     assert_eq!(rig.fake.rebuilds(PROJECT, "omni"), vec!["registry"]);
-    assert_eq!(recorded_alias(&rig, "omni"), format!("{OMNI_REPOSITORY}@{index}"));
+    assert_eq!(
+        recorded_alias(&rig, "omni"),
+        format!("{OMNI_REPOSITORY}@{index}")
+    );
     sent_index_only(&rig);
 }
 
@@ -304,7 +310,11 @@ fn a_digest_of_any_other_shape_is_an_invalid_argument_and_creates_nothing() {
             "{digest}: {result:?}"
         );
         assert_eq!(rig.fake.writes().len(), writes, "{digest}");
-        assert!(rig.entries().iter().all(|entry| entry.id.0 != "service-omni"));
+        assert!(
+            rig.entries()
+                .iter()
+                .all(|entry| entry.id.0 != "service-omni")
+        );
         // A proposal of it is refused the same way, and no card is recorded.
         let registry = FakeRegistry::new(&[]);
         let plans = plans(&rig, &versions(&registry, &Arc::new(AtomicU64::new(0))));
@@ -317,7 +327,13 @@ fn a_digest_of_any_other_shape_is_an_invalid_argument_and_creates_nothing() {
             .is_err(),
             "{digest}"
         );
-        assert!(rig.kernel.lock().expect("kernel").action_proposals().is_empty());
+        assert!(
+            rig.kernel
+                .lock()
+                .expect("kernel")
+                .action_proposals()
+                .is_empty()
+        );
     }
 }
 
@@ -349,7 +365,10 @@ fn a_proposed_create_at_a_digest_binds_it_and_its_card_names_the_version() {
     let rig = omni_node(Some(&key));
     let index = index_digest();
     let registry = FakeRegistry::new(&[("v2.261024.2", &index), ("v2.261023.1", DIGEST)]);
-    let plans = plans(&rig, &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))));
+    let plans = plans(
+        &rig,
+        &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))),
+    );
     let proposed = propose(
         &plans,
         "service_create",
@@ -357,6 +376,7 @@ fn a_proposed_create_at_a_digest_binds_it_and_its_card_names_the_version() {
     )
     .expect("proposed");
     assert_eq!(proposed["args"]["digest"], index);
+    assert_eq!(row(&proposed, "Digest").as_deref(), Some(index.as_str()));
     assert_eq!(
         proposed["args"]["image"],
         format!("ghcr.io/automagik-si/omni-api@{index}")
@@ -370,7 +390,10 @@ fn a_proposed_create_at_a_digest_binds_it_and_its_card_names_the_version() {
         version.starts_with(&format!("Omni v2.261024.2 ({index})")),
         "{version}"
     );
-    assert!(version.contains("ghcr.io gave this digest when this was proposed"), "{version}");
+    assert!(
+        version.contains("ghcr.io gave this digest when this was proposed"),
+        "{version}"
+    );
     // The version is a label: it is no argument, so the approval binds the digest alone.
     assert!(proposed["args"].get("version").is_none());
 
@@ -401,7 +424,10 @@ fn a_proposed_create_at_a_digest_binds_it_and_its_card_names_the_version() {
     )
     .run(&approved.action, &approved.args, &approved.grant)
     .expect("the approved create runs");
-    assert_eq!(recorded_alias(&rig, "omni"), format!("{OMNI_REPOSITORY}@{index}"));
+    assert_eq!(
+        recorded_alias(&rig, "omni"),
+        format!("{OMNI_REPOSITORY}@{index}")
+    );
 }
 
 #[test]
@@ -416,7 +442,10 @@ fn a_miss_or_a_registry_failure_says_version_unknown_and_the_proposal_still_succ
         FakeRegistry::new(&[("v2.261024.2", &index)]),
     ] {
         let rig = omni_node(None);
-        let plans = plans(&rig, &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))));
+        let plans = plans(
+            &rig,
+            &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))),
+        );
         let proposed = propose(&plans, "service_create", args.clone()).expect("proposed");
         digests.push(proposed["argsDigest"].clone());
         if registry.refuse || registry.tags.iter().all(|(_, digest)| *digest != index) {
@@ -424,14 +453,20 @@ fn a_miss_or_a_registry_failure_says_version_unknown_and_the_proposal_still_succ
         }
     }
     // The args digest the owner signs is the same whatever the registry answered.
-    assert!(digests.windows(2).all(|pair| pair[0] == pair[1]), "{digests:?}");
+    assert!(
+        digests.windows(2).all(|pair| pair[0] == pair[1]),
+        "{digests:?}"
+    );
 }
 
 #[test]
 fn a_create_without_a_digest_asks_no_registry_and_its_card_has_no_version_row() {
     let rig = omni_node(None);
     let registry = FakeRegistry::new(&[("v2.261024.2", DIGEST)]);
-    let plans = plans(&rig, &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))));
+    let plans = plans(
+        &rig,
+        &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))),
+    );
     let proposed = propose(
         &plans,
         "service_create",
@@ -500,7 +535,11 @@ fn proposals_for_several_digests_share_one_lookup_round_and_a_repeat_asks_nothin
         row(&unknown, "Version").as_deref(),
         Some(format!("{missing} (version unknown)").as_str())
     );
-    assert_eq!(registry.asked(), after_one, "one round answered every proposal");
+    assert_eq!(
+        registry.asked(),
+        after_one,
+        "one round answered every proposal"
+    );
 }
 
 #[test]
@@ -513,10 +552,16 @@ fn an_update_proposal_for_an_image_that_is_not_omnis_asks_no_registry() {
             "ports": [8080], "env": {}, "publishable": false
         }),
     );
-    rig.call("service_create", json!({ "name": "app", "template": "app" }))
-        .expect("create");
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("create");
     let registry = FakeRegistry::new(&[("v2.261024.2", DIGEST)]);
-    let plans = plans(&rig, &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))));
+    let plans = plans(
+        &rig,
+        &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))),
+    );
     let proposed = propose(
         &plans,
         "service_update",

@@ -58,9 +58,9 @@ pub fn version_tag_ok(tag: &str) -> bool {
     let groups: Vec<&str> = rest.split('.').collect();
     tag.len() <= 32
         && (1..=4).contains(&groups.len())
-        && groups
-            .iter()
-            .all(|group| (1..=9).contains(&group.len()) && group.bytes().all(|b| b.is_ascii_digit()))
+        && groups.iter().all(|group| {
+            (1..=9).contains(&group.len()) && group.bytes().all(|b| b.is_ascii_digit())
+        })
 }
 
 /// The numbers of a version tag, for ordering: newest is the largest, compared group by group.
@@ -112,6 +112,10 @@ pub fn row_fits(value: &str, digest: &str) -> bool {
     })
 }
 
+/// A registry request that gave no usable answer. It carries nothing of what the registry said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unanswered;
+
 /// One page of a repository's tags.
 pub struct Page {
     pub tags: Vec<String>,
@@ -127,15 +131,15 @@ pub trait TagRegistry: Send + Sync {
         &'a self,
         repository: &str,
         wait: Duration,
-    ) -> Result<Box<dyn RegistryRound + 'a>, ()>;
+    ) -> Result<Box<dyn RegistryRound + 'a>, Unanswered>;
 }
 
 /// One round of requests on one repository.
 pub trait RegistryRound {
     /// The page of tags after `last`, in the registry's order.
-    fn tags(&mut self, last: Option<&str>, wait: Duration) -> Result<Page, ()>;
+    fn tags(&mut self, last: Option<&str>, wait: Duration) -> Result<Page, Unanswered>;
     /// The digest the manifest of `tag` has, as the registry names it (an index's own digest for a multi-arch image).
-    fn digest(&mut self, tag: &str, wait: Duration) -> Result<String, ()>;
+    fn digest(&mut self, tag: &str, wait: Duration) -> Result<String, Unanswered>;
 }
 
 /// A monotonic clock in milliseconds.
@@ -144,11 +148,11 @@ pub type Millis = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// One round: the digest of each of the newest version tags, as `digest -> tag` (the newest tag of a digest wins).
 /// Every request is given what is left of the one deadline, and none starts after it. A failure of the token or of the
 /// tags gives an empty map; a failed HEAD leaves only its tag out.
-pub fn round(registry: &dyn TagRegistry, repository: &str, clock: &dyn Fn() -> u64) -> BTreeMap<String, String> {
-    // RED: no round is made yet.
-    if repository.len() < usize::MAX {
-        return BTreeMap::new();
-    }
+pub fn round(
+    registry: &dyn TagRegistry,
+    repository: &str,
+    clock: &dyn Fn() -> u64,
+) -> BTreeMap<String, String> {
     let deadline = clock().saturating_add(DEADLINE_MS);
     let left = || {
         let left = deadline.saturating_sub(clock());
@@ -260,7 +264,10 @@ impl VersionLookup {
         if let Some(known) = answer(self.seen(image, digest)) {
             return Some(known);
         }
-        let _one = self.refreshing.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = self
+            .refreshing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // Another proposal may have refreshed the map while this one waited.
         if let Some(known) = answer(self.seen(image, digest)) {
             return Some(known);
@@ -278,7 +285,13 @@ impl VersionLookup {
         self.known
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(image.to_string(), Known { at: (self.clock)(), digests });
+            .insert(
+                image.to_string(),
+                Known {
+                    at: (self.clock)(),
+                    digests,
+                },
+            );
         Some(tag)
     }
 
@@ -300,11 +313,11 @@ impl TagRegistry for Ghcr {
         &'a self,
         repository: &str,
         wait: Duration,
-    ) -> Result<Box<dyn RegistryRound + 'a>, ()> {
+    ) -> Result<Box<dyn RegistryRound + 'a>, Unanswered> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|_| ())?;
+            .map_err(|_| Unanswered)?;
         let roots = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
@@ -312,7 +325,7 @@ impl TagRegistry for Ghcr {
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
-        .map_err(|_| ())?
+        .map_err(|_| Unanswered)?
         .with_root_certificates(roots)
         .with_no_client_auth();
         let client = reqwest::Client::builder()
@@ -320,7 +333,7 @@ impl TagRegistry for Ghcr {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("arca/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|_| ())?;
+            .map_err(|_| Unanswered)?;
         let mut round = GhcrRound {
             runtime,
             client,
@@ -330,10 +343,10 @@ impl TagRegistry for Ghcr {
         let url = format!("https://{HOST}/token?scope=repository:{repository}:pull&service={HOST}");
         let (status, _, body) = round.send(reqwest::Method::GET, &url, None, wait)?;
         if status != 200 {
-            return Err(());
+            return Err(Unanswered);
         }
         let token = serde_json::from_slice::<serde_json::Value>(&body)
-            .map_err(|_| ())?
+            .map_err(|_| Unanswered)?
             .get("token")
             .and_then(serde_json::Value::as_str)
             .filter(|token| {
@@ -343,7 +356,7 @@ impl TagRegistry for Ghcr {
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
             })
-            .ok_or(())?
+            .ok_or(Unanswered)?
             .to_string();
         round.token = token;
         Ok(Box::new(round))
@@ -367,7 +380,7 @@ impl GhcrRound {
         url: &str,
         accept: Option<&str>,
         wait: Duration,
-    ) -> Result<Answered, ()> {
+    ) -> Result<Answered, Unanswered> {
         let mut request = self.client.request(method, url).timeout(wait);
         if !self.token.is_empty() {
             request = request.header("authorization", format!("Bearer {}", self.token));
@@ -377,36 +390,39 @@ impl GhcrRound {
         }
         self.runtime.block_on(async {
             tokio::time::timeout(wait, async {
-                let mut response = request.send().await.map_err(|_| ())?;
+                let mut response = request.send().await.map_err(|_| Unanswered)?;
                 let status = response.status().as_u16();
                 let headers = response.headers().clone();
                 let mut body = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+                while let Some(chunk) = response.chunk().await.map_err(|_| Unanswered)? {
                     if body.len() + chunk.len() > ANSWER_MAX {
-                        return Err(());
+                        return Err(Unanswered);
                     }
                     body.extend_from_slice(&chunk);
                 }
                 Ok((status, headers, body))
             })
             .await
-            .map_err(|_| ())?
+            .map_err(|_| Unanswered)?
         })
     }
 }
 
 impl RegistryRound for GhcrRound {
-    fn tags(&mut self, last: Option<&str>, wait: Duration) -> Result<Page, ()> {
-        let mut url = format!("https://{HOST}/v2/{}/tags/list?n={PAGE_SIZE}", self.repository);
+    fn tags(&mut self, last: Option<&str>, wait: Duration) -> Result<Page, Unanswered> {
+        let mut url = format!(
+            "https://{HOST}/v2/{}/tags/list?n={PAGE_SIZE}",
+            self.repository
+        );
         if let Some(last) = last.filter(|tag| tag_grammar_ok(tag)) {
             url.push_str(&format!("&last={last}"));
         }
         let (status, headers, body) =
             self.send(reqwest::Method::GET, &url, Some("application/json"), wait)?;
         if status != 200 {
-            return Err(());
+            return Err(Unanswered);
         }
-        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| ())?;
+        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| Unanswered)?;
         let tags = value
             .get("tags")
             .and_then(serde_json::Value::as_array)
@@ -417,29 +433,29 @@ impl RegistryRound for GhcrRound {
                     .collect()
             })
             .unwrap_or_default();
-        let more = headers
-            .get_all("link")
-            .iter()
-            .any(|link| link.to_str().is_ok_and(|link| link.contains("rel=\"next\"")));
+        let more = headers.get_all("link").iter().any(|link| {
+            link.to_str()
+                .is_ok_and(|link| link.contains("rel=\"next\""))
+        });
         Ok(Page { tags, more })
     }
 
-    fn digest(&mut self, tag: &str, wait: Duration) -> Result<String, ()> {
+    fn digest(&mut self, tag: &str, wait: Duration) -> Result<String, Unanswered> {
         if !version_tag_ok(tag) {
-            return Err(());
+            return Err(Unanswered);
         }
         let url = format!("https://{HOST}/v2/{}/manifests/{tag}", self.repository);
         let accept = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
         let (status, headers, _) = self.send(reqwest::Method::HEAD, &url, Some(accept), wait)?;
         if status != 200 {
-            return Err(());
+            return Err(Unanswered);
         }
         headers
             .get("docker-content-digest")
             .and_then(|value| value.to_str().ok())
             .filter(|digest| crate::handlers::service_digest_ok(digest))
             .map(str::to_string)
-            .ok_or(())
+            .ok_or(Unanswered)
     }
 }
 
@@ -448,7 +464,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-    const DIGEST_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST_A: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn digest_of(n: usize) -> String {
         format!("sha256:{n:064x}")
@@ -502,21 +519,24 @@ mod tests {
             &'a self,
             _repository: &str,
             _wait: Duration,
-        ) -> Result<Box<dyn RegistryRound + 'a>, ()> {
+        ) -> Result<Box<dyn RegistryRound + 'a>, Unanswered> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             if self.fail_open {
-                return Err(());
+                return Err(Unanswered);
             }
             Ok(Box::new(FakeRound(self)))
         }
     }
 
     impl RegistryRound for FakeRound<'_> {
-        fn tags(&mut self, last: Option<&str>, _wait: Duration) -> Result<Page, ()> {
+        fn tags(&mut self, last: Option<&str>, _wait: Duration) -> Result<Page, Unanswered> {
             let fake = self.0;
             fake.pages.fetch_add(1, Ordering::SeqCst);
             let start = last.map_or(0, |last| {
-                fake.tags.iter().position(|tag| tag == last).map_or(fake.tags.len(), |at| at + 1)
+                fake.tags
+                    .iter()
+                    .position(|tag| tag == last)
+                    .map_or(fake.tags.len(), |at| at + 1)
             });
             let end = (start + fake.page).min(fake.tags.len());
             Ok(Page {
@@ -525,12 +545,15 @@ mod tests {
             })
         }
 
-        fn digest(&mut self, tag: &str, wait: Duration) -> Result<String, ()> {
+        fn digest(&mut self, tag: &str, wait: Duration) -> Result<String, Unanswered> {
             let fake = self.0;
-            assert!(wait > Duration::ZERO, "no request starts after the deadline");
+            assert!(
+                wait > Duration::ZERO,
+                "no request starts after the deadline"
+            );
             fake.heads.fetch_add(1, Ordering::SeqCst);
             fake.clock.fetch_add(fake.step, Ordering::SeqCst);
-            fake.digests.get(tag).cloned().ok_or(())
+            fake.digests.get(tag).cloned().ok_or(Unanswered)
         }
     }
 
@@ -548,8 +571,16 @@ mod tests {
             assert!(version_tag_ok(good), "{good}");
         }
         for bad in [
-            "latest", "2.261024.2", "v", "v2..1", "v2.1-rc1", "V2.1", "v1.2.3.4.5", "v2.261024.2\n",
-            "v1234567890.1", "v2.<b>",
+            "latest",
+            "2.261024.2",
+            "v",
+            "v2..1",
+            "v2.1-rc1",
+            "V2.1",
+            "v1.2.3.4.5",
+            "v2.261024.2\n",
+            "v1234567890.1",
+            "v2.<b>",
         ] {
             assert!(!version_tag_ok(bad), "{bad}");
         }
@@ -559,7 +590,9 @@ mod tests {
     fn the_card_names_the_version_on_a_match_and_says_unknown_otherwise() {
         assert_eq!(
             version_words(OMNI_IMAGE, DIGEST_A, Some("v2.261024.2")).expect("omni"),
-            format!("Omni v2.261024.2 ({DIGEST_A}). The name is the tag ghcr.io gave this digest when this was proposed.")
+            format!(
+                "Omni v2.261024.2 ({DIGEST_A}). The name is the tag ghcr.io gave this digest when this was proposed."
+            )
         );
         assert_eq!(
             version_words(OMNI_IMAGE, DIGEST_A, None).expect("omni"),
@@ -585,53 +618,86 @@ mod tests {
     fn the_newest_fifty_by_number_are_asked_across_pages() {
         let clock = Arc::new(AtomicU64::new(0));
         // 120 versions, alphabetical order puts v2.99 before v2.100: newest is decided by the numbers.
-        let pairs: Vec<(String, String)> =
-            (1..=120).map(|n| (format!("v2.{n}"), digest_of(n))).collect();
-        let mut with_noise: Vec<(&str, String)> =
-            pairs.iter().map(|(tag, digest)| (tag.as_str(), digest.clone())).collect();
+        let pairs: Vec<(String, String)> = (1..=120)
+            .map(|n| (format!("v2.{n}"), digest_of(n)))
+            .collect();
+        let mut with_noise: Vec<(&str, String)> = pairs
+            .iter()
+            .map(|(tag, digest)| (tag.as_str(), digest.clone()))
+            .collect();
         with_noise.push(("latest", digest_of(120)));
         with_noise.push(("sha-abc", digest_of(999)));
         let mut fake = Fake::new(&clock, &with_noise);
         fake.page = 40;
         let fake = Arc::new(fake);
-        let found = round(&Arc::clone(&fake), "automagik-si/omni-api", &|| clock.load(Ordering::SeqCst));
+        let found = round(&Arc::clone(&fake), "automagik-si/omni-api", &|| {
+            clock.load(Ordering::SeqCst)
+        });
         assert_eq!(fake.heads.load(Ordering::SeqCst), NEWEST, "the cap");
-        assert_eq!(fake.pages.load(Ordering::SeqCst), 4, "every page of 122 tags, 40 a page");
-        assert_eq!(found.get(&digest_of(120)).map(String::as_str), Some("v2.120"));
+        assert_eq!(
+            fake.pages.load(Ordering::SeqCst),
+            4,
+            "every page of 122 tags, 40 a page"
+        );
+        assert_eq!(
+            found.get(&digest_of(120)).map(String::as_str),
+            Some("v2.120")
+        );
         assert_eq!(found.get(&digest_of(71)).map(String::as_str), Some("v2.71"));
-        assert_eq!(found.get(&digest_of(70)), None, "the 51st newest is not asked");
-        assert_eq!(found.get(&digest_of(999)), None, "a tag of another shape is never asked");
+        assert_eq!(
+            found.get(&digest_of(70)),
+            None,
+            "the 51st newest is not asked"
+        );
+        assert_eq!(
+            found.get(&digest_of(999)),
+            None,
+            "a tag of another shape is never asked"
+        );
     }
 
     #[test]
     fn the_pages_read_are_bounded() {
         let clock = Arc::new(AtomicU64::new(0));
-        let pairs: Vec<(String, String)> =
-            (1..=100).map(|n| (format!("v1.{n}"), digest_of(n))).collect();
-        let pairs: Vec<(&str, String)> =
-            pairs.iter().map(|(tag, digest)| (tag.as_str(), digest.clone())).collect();
+        let pairs: Vec<(String, String)> = (1..=100)
+            .map(|n| (format!("v1.{n}"), digest_of(n)))
+            .collect();
+        let pairs: Vec<(&str, String)> = pairs
+            .iter()
+            .map(|(tag, digest)| (tag.as_str(), digest.clone()))
+            .collect();
         let mut fake = Fake::new(&clock, &pairs);
         fake.page = 10;
         let fake = Arc::new(fake);
-        round(&Arc::clone(&fake), "automagik-si/omni-api", &|| clock.load(Ordering::SeqCst));
+        round(&Arc::clone(&fake), "automagik-si/omni-api", &|| {
+            clock.load(Ordering::SeqCst)
+        });
         assert_eq!(fake.pages.load(Ordering::SeqCst), MAX_PAGES);
     }
 
     #[test]
     fn the_round_stops_at_its_one_deadline() {
         let clock = Arc::new(AtomicU64::new(0));
-        let pairs: Vec<(String, String)> =
-            (1..=50).map(|n| (format!("v3.{n}"), digest_of(n))).collect();
-        let pairs: Vec<(&str, String)> =
-            pairs.iter().map(|(tag, digest)| (tag.as_str(), digest.clone())).collect();
+        let pairs: Vec<(String, String)> = (1..=50)
+            .map(|n| (format!("v3.{n}"), digest_of(n)))
+            .collect();
+        let pairs: Vec<(&str, String)> = pairs
+            .iter()
+            .map(|(tag, digest)| (tag.as_str(), digest.clone()))
+            .collect();
         let mut fake = Fake::new(&clock, &pairs);
         // Each HEAD takes a second of the five: the sixth never starts.
         fake.step = 1_000;
         let fake = Arc::new(fake);
-        let found = round(&Arc::clone(&fake), "automagik-si/omni-api", &|| clock.load(Ordering::SeqCst));
+        let found = round(&Arc::clone(&fake), "automagik-si/omni-api", &|| {
+            clock.load(Ordering::SeqCst)
+        });
         assert_eq!(fake.heads.load(Ordering::SeqCst), 5);
         assert_eq!(found.len(), 5);
-        assert!(found.contains_key(&digest_of(50)), "the newest are asked first");
+        assert!(
+            found.contains_key(&digest_of(50)),
+            "the newest are asked first"
+        );
     }
 
     #[test]
@@ -639,8 +705,10 @@ mod tests {
         let clock = Arc::new(AtomicU64::new(1_000_000));
         let pairs: Vec<(String, String)> =
             (1..=5).map(|n| (format!("v2.{n}"), digest_of(n))).collect();
-        let pairs: Vec<(&str, String)> =
-            pairs.iter().map(|(tag, digest)| (tag.as_str(), digest.clone())).collect();
+        let pairs: Vec<(&str, String)> = pairs
+            .iter()
+            .map(|(tag, digest)| (tag.as_str(), digest.clone()))
+            .collect();
         let fake = Arc::new(Fake::new(&clock, &pairs));
         let versions = lookup(&fake, &clock);
         for n in 1..=5 {
@@ -654,7 +722,10 @@ mod tests {
         let after_one = fake.requests();
         assert_eq!(after_one, 1 + 1 + 5);
         // A second proposal for the same digest asks nothing.
-        assert_eq!(versions.version(OMNI_IMAGE, &digest_of(3)), Some(Some("v2.3".into())));
+        assert_eq!(
+            versions.version(OMNI_IMAGE, &digest_of(3)),
+            Some(Some("v2.3".into()))
+        );
         assert_eq!(fake.requests(), after_one);
     }
 
@@ -663,7 +734,10 @@ mod tests {
         let clock = Arc::new(AtomicU64::new(1_000_000));
         let fake = Arc::new(Fake::new(&clock, &[("v2.1", digest_of(1))]));
         let versions = lookup(&fake, &clock);
-        assert_eq!(versions.version(OMNI_IMAGE, &digest_of(1)), Some(Some("v2.1".into())));
+        assert_eq!(
+            versions.version(OMNI_IMAGE, &digest_of(1)),
+            Some(Some("v2.1".into()))
+        );
         let after_one = fake.requests();
         // Fresh: a miss is "unknown" and asks nothing.
         clock.fetch_add(MISS_REFRESH_MS - 1, Ordering::SeqCst);
@@ -678,7 +752,10 @@ mod tests {
         assert_eq!(fake.requests(), after_two);
         // Past ten minutes even a named digest is asked again.
         clock.fetch_add(MAX_AGE_MS, Ordering::SeqCst);
-        assert_eq!(versions.version(OMNI_IMAGE, &digest_of(1)), Some(Some("v2.1".into())));
+        assert_eq!(
+            versions.version(OMNI_IMAGE, &digest_of(1)),
+            Some(Some("v2.1".into()))
+        );
         assert_eq!(fake.opens.load(Ordering::SeqCst), 3);
     }
 
@@ -699,8 +776,14 @@ mod tests {
         let clock = Arc::new(AtomicU64::new(0));
         let fake = Arc::new(Fake::new(&clock, &[("v2.1", digest_of(1))]));
         let versions = lookup(&fake, &clock);
-        assert_eq!(versions.version("registry.example/app", &digest_of(1)), None);
-        assert_eq!(versions.version("ghcr.io/automagik-si/other", &digest_of(1)), None);
+        assert_eq!(
+            versions.version("registry.example/app", &digest_of(1)),
+            None
+        );
+        assert_eq!(
+            versions.version("ghcr.io/automagik-si/other", &digest_of(1)),
+            None
+        );
         assert_eq!(fake.requests(), 0);
     }
 }

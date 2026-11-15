@@ -282,6 +282,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
         match action {
             ActionKind::ServiceCreate => json!({
                 "name": "nats", "template": "nats", "bridge": "br0", "mac": "02:aa:bb:00:00:01",
+                "digest": format!("sha256:{}", "3".repeat(64)),
                 "tenant": "abcdefgh", "deploy": "d1", "start": false,
                 "settings": { "url": "https://git.example/example-org" },
                 "kernelAccess": { "port": 7461 },
@@ -730,6 +731,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (ActionKind::ServiceCreate, "destinations") => "Private network",
                 (_, "templateDigest") => "Template content",
                 (ActionKind::ServiceCreate, "registry") => "Registry",
+                (ActionKind::ServiceCreate, "digest") => "Digest",
                 (ActionKind::ServiceCreate, "rawLxc") => arca::action_proposal::RAW_LXC_LABEL,
                 _ => panic!("{action:?} field {field} has no owner label"),
             };

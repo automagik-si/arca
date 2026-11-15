@@ -7346,6 +7346,8 @@ impl ServiceHandler {
                 "privatePort",
                 "destinations",
                 "settings",
+                // Another build of the template's own image, by digest (`service_update::template_at`).
+                "digest",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
                 // What a proposal is given when it is made: the image the template names and the fingerprint of
@@ -8123,8 +8125,7 @@ impl ServiceHandler {
                 // A call that names a digest makes the service from that build of the template's own image, by the
                 // rule service_update moves one by: the source, the record and the image the call is held to are
                 // all at that digest.
-                let template =
-                    service_update::template_at(&content.template, args.get("digest"))?;
+                let template = service_update::template_at(&content.template, args.get("digest"))?;
                 // A call that states the `raw.lxc` lines (a proposal fills them in for the card) states exactly the
                 // template's: it can only refuse, never widen.
                 if let Some(stated) = args.get("rawLxc")

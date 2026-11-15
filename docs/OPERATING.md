@@ -1658,6 +1658,21 @@ never taken away, so the answer is `rolled_back` with the old root kept. A proje
 snapshot instead, and the record still names the old image either way. The update rebuilds from the project's own copy,
 never from an alias alone; a rebuild from an image the store no longer holds fails before it takes the old root away.
 
+#### Moving Omni to a new build, or creating one at a chosen build
+
+Omni builds `ghcr.io/automagik-si/omni-api:v<version>` when its team asks for a build, each one multi-arch (amd64 and
+arm64) and attested, and announces its version and digest. Any of them can run on Arca: move a service with
+`service_update {name, digest}` and the digest Omni announced, or create one at that build with
+`service_create {name, template: "omni-api", digest}`. A create without `digest` starts at the digest the template
+pins, as before. Either way the digest must be `sha256:` and 64 lower-case hex digits and the repository stays the
+template's, by the same rule; a create's digest is in the owner's card, the approval and the service's record, as an
+update's is. The digest is passed to Incus as it is: Omni's digest names an image index, and each node pulls its own
+architecture from it, so the image's fingerprint in Incus differs from node to node and from the digest. When either
+is proposed with `action_propose`, the card's `Version` row names the build (`Omni v2.261024.2 (sha256:...)`), read
+once from ghcr.io's tags when the proposal is made; it is a label, not part of what the owner approves, and says
+`version unknown` when no tag among the newest 50 names the digest or ghcr.io does not answer within 5 seconds. Nothing
+is refused for it.
+
 #### A service that keeps its data inside the container
 
 An update replaces the root disk, so it would erase everything a service keeps there. `service_update` therefore

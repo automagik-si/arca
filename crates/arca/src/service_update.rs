@@ -178,11 +178,6 @@ pub(super) fn template_at(
     template: &crate::service::Template,
     digest: Option<&Value>,
 ) -> Result<crate::service::Template, CallError> {
-    // RED: the digest is not applied yet.
-    #[allow(unreachable_code)]
-    if digest.is_some() || digest.is_none() {
-        return Ok(template.clone());
-    }
     let Some(digest) = digest else {
         return Ok(template.clone());
     };
@@ -212,7 +207,11 @@ pub(super) fn template_at(
 
 /// The image (`<registry>/<repository>`) of the OCI service a `service_update` proposal names, for the card's version
 /// lookup. `None` for any other service, or a name no service has.
-pub(super) fn proposed_image(cfg: &NodeConfig, entries: &[Entry], payload: &Value) -> Option<String> {
+pub(super) fn proposed_image(
+    cfg: &NodeConfig,
+    entries: &[Entry],
+    payload: &Value,
+) -> Option<String> {
     let name = payload["name"].as_str()?;
     let scope = tenants::tenant_arg(cfg, payload, entries).ok()?;
     let scoped = tenants::scoped_entries(entries, scope.as_ref());
