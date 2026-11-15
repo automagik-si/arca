@@ -199,3 +199,82 @@ fn a_templates_own_raw_lxc_lines_are_kept_beside_the_memory_run() {
     assert_eq!(config["raw.lxc"], "lxc.no_new_privs=1\nlxc.sched.core=0");
     assert_eq!(config[service::RUN_TMPFS_KEY], "true");
 }
+
+/// What a non-root image keeps under `/run`: a root directory with a file in it, and its user's own directory, as the
+/// Postgres image keeps `/run/autopg` for its user (uid 1000).
+const NON_ROOT_RUN: [&str; 3] = ["/run/lock/", "/run/lock/.keep", "/run/autopg/"];
+
+#[test]
+fn a_run_with_an_entry_that_is_not_roots_is_left_on_the_disk_as_the_image_has_it() {
+    for owned in ["/run/autopg/", "/run/lock/.keep"] {
+        let rig = Rig::new();
+        rig.fake.set_image_run(&NON_ROOT_RUN);
+        rig.fake.set_image_run_owner(owned, 1000);
+        rig.template("app", template("app"));
+        let from = rig.fake.service_requests().len();
+        let made = rig
+            .call(
+                "service_create",
+                json!({ "name": "app", "template": "app" }),
+            )
+            .expect("the create goes on");
+        assert_eq!(made["run"], "disk", "{owned}: {made}");
+        assert!(
+            made["runNote"]
+                .as_str()
+                .is_some_and(|note| note.contains("not root's")),
+            "{made}"
+        );
+        // Read whole before anything is removed: nothing is, not even root's own entries.
+        let deletes = rig.fake.service_requests()[from..]
+            .iter()
+            .filter(|request| request.method == "DELETE" && request.path.contains("/files?"))
+            .count();
+        assert_eq!(deletes, 0, "{owned}");
+        assert_eq!(rig.fake.run_on_disk(PROJECT, "app"), {
+            let mut kept = NON_ROOT_RUN.to_vec();
+            kept.sort_unstable();
+            kept
+        });
+        assert_eq!(instance(&rig, "app")["status"], "Running");
+        assert!(!rig.fake.run_in_memory(PROJECT, "app"));
+    }
+}
+
+#[test]
+fn the_shipped_database_template_keeps_its_images_run() {
+    // A pool for its data volume.
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+    );
+    arca::cmd_templates::install_into(&rig.dir.join("templates"), false).expect("install");
+    let template = service::load_template(&rig.dir.join("templates"), service::DATABASE_TEMPLATE)
+        .expect("it loads");
+    assert!(!template.run_tmpfs && !template.memory_run());
+    // Even an image /run of root's alone is kept: the template opts out.
+    rig.fake.set_image_run(&IMAGE_RUN);
+    let made = rig
+        .call(
+            "service_create",
+            json!({ "name": "db", "template": service::DATABASE_TEMPLATE }),
+        )
+        .expect("create");
+    assert!(made.get("run").is_none(), "{made}");
+    let config = instance(&rig, "db")["config"].clone();
+    assert!(config.get(service::RUN_TMPFS_KEY).is_none(), "{config}");
+    assert!(!rig.service_config("db").run_tmpfs);
+    let (create, states) = create_and_states(&rig, "db");
+    assert_eq!(create["start"], true, "created as it always was");
+    assert!(states.is_empty());
+    let mut kept = IMAGE_RUN.to_vec();
+    kept.sort_unstable();
+    assert_eq!(rig.fake.run_on_disk(PROJECT, "db"), kept);
+}

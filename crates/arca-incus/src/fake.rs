@@ -265,6 +265,8 @@ struct Store {
     /// What a container's image keeps under `/run`, put on its root at every create and rebuild: absolute paths, a
     /// directory's ending in `/`. Empty unless a test sets it with [`FakeIncus::set_image_run`].
     image_run: Vec<String>,
+    /// The owner of an entry of `image_run` that is not root's, by its path in the same form.
+    image_run_owners: BTreeMap<String, u32>,
     /// What each container's root disk holds under `/run`, by project and name, in the same form.
     run_disk: BTreeMap<(String, String), BTreeSet<String>>,
     /// The running containers Incus gave a memory `/run`, by project and name: Incus mounts one on an OCI container's
@@ -426,6 +428,7 @@ impl Shared {
             live: BTreeMap::new(),
             disk_usage: BTreeMap::new(),
             image_run: Vec::new(),
+            image_run_owners: BTreeMap::new(),
             run_disk: BTreeMap::new(),
             run_memory: BTreeSet::new(),
         };
@@ -553,6 +556,14 @@ impl FakeIncus {
     /// `/run/lock` is, and Incus then mounts no memory `/run` on it at its start.
     pub fn set_image_run(&self, paths: &[&str]) {
         lock(&self.shared.store).image_run = paths.iter().map(|path| path.to_string()).collect();
+    }
+
+    /// Makes one entry of the image's `/run` (a path in the form of [`FakeIncus::set_image_run`]) the user `uid`'s, as
+    /// a non-root image's own directory there is. Every other entry is root's.
+    pub fn set_image_run_owner(&self, path: &str, uid: u32) {
+        lock(&self.shared.store)
+            .image_run_owners
+            .insert(path.to_string(), uid);
     }
 
     /// What the root disk of the container `name` in `project` holds under `/run` now, in the form of
@@ -4153,14 +4164,19 @@ fn file_headers(shared: &Shared, request: &Request, status: u16) -> String {
         ),
         None => {
             let store = lock(&shared.store);
+            let owner = |form: &str| store.image_run_owners.get(form).copied().unwrap_or(0);
             match run_on_disk_entry(&store, &service, project, name, &path) {
                 Some(RunEntry::Directory(_)) => {
-                    "X-Incus-type: directory\r\nX-Incus-mode: 0755\r\nX-Incus-uid: 0\r\nX-Incus-gid: 0\r\n"
-                        .to_string()
+                    let uid = owner(&format!("{path}/"));
+                    format!(
+                        "X-Incus-type: directory\r\nX-Incus-mode: 0755\r\nX-Incus-uid: {uid}\r\nX-Incus-gid: {uid}\r\n"
+                    )
                 }
                 Some(RunEntry::File) => {
-                    "X-Incus-type: file\r\nX-Incus-mode: 0644\r\nX-Incus-uid: 0\r\nX-Incus-gid: 0\r\n"
-                        .to_string()
+                    let uid = owner(&path);
+                    format!(
+                        "X-Incus-type: file\r\nX-Incus-mode: 0644\r\nX-Incus-uid: {uid}\r\nX-Incus-gid: {uid}\r\n"
+                    )
                 }
                 None => String::new(),
             }

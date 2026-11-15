@@ -1010,25 +1010,34 @@ holds nothing under `/run`, and mounts nothing when the image ships files there 
 `/run` was then a directory on the container's disk. Arca empties `/run` on the root disk while the container is stopped,
 and Incus's own rule does the rest: the create makes the container stopped, removes what the image keeps under `/run`,
 then starts it as the call asked; `service_update` does the same after each rebuild (and after putting an old version
-back); `service_reconfigure` does it for a service made before (below). The image's own files under `/run` are not
-needed by the services Arca runs and are not kept: `/run` holds only what the service writes there after its start.
+back); `service_reconfigure` does it for a service made before (below). Some images need what they ship in `/run`: an
+image that runs as a user other than root and keeps that user's directory there (a socket directory made at its build)
+cannot make it again in a memory `/run`, which is root's with mode 0755. So Arca reads the whole of `/run` first, and
+when any entry there is not owned by the container's root it removes nothing: `/run` is left on the disk as the image
+has it, and the answer says `run: "disk"` with `runNote`. Otherwise the image's files under `/run` are removed and `/run`
+holds only what the service writes there after its start. Arca's own database template, `postgres-autopg`, says
+`"runTmpfs": false`: its image keeps its socket directory, `/var/run/autopg`, for its user. A template whose image needs
+root-owned files in `/run` says `"runTmpfs": false` too.
 Nothing is loosened for it: no `raw.lxc`, no host-path disk, and no project restriction changes, so it works the same in
 the node's own project and in a tenant's. What this mount does not have: `nosuid` and `nodev` (Incus sets only
-`mode=755`), and a size limit of its own. What a service writes in `/run` counts in its memory, so the template's
-`limits.memory` bounds it. The instance carries `user.arca.runtmpfs=true` as its mark, and the record keeps
+`mode=755`), and a size limit of its own. What a service writes in `/run` counts in its memory: when the template sets
+`limits.memory`, that bounds it; a template that sets none leaves it bounded only by the kernel's default for a tmpfs,
+half of the host's memory. The instance carries `user.arca.runtmpfs=true` as its mark, and the record keeps
 `runTmpfs: true`.
 
 The create's answer, `service_update`'s and `service_reconfigure`'s say where `/run` is: `run: "memory"` or `run:
-"disk"` with `runNote` when Arca could not remove what the image keeps there (more than 256 entries, a `/run` that is
-not a directory, a removal Incus refused): the service is then created and runs as it did before this change, with
+"disk"` with `runNote` when Arca left `/run` on the disk (an entry there that is not root's) or could not remove what
+the image keeps there (more than 256 entries, a `/run` that is not a directory, a removal Incus refused): the service is then created and runs as it did before this change, with
 `/run` on its disk, and nothing is refused for it. For a stopped service it is read from Incus (the root holds nothing
 under `/run`, so its next start mounts a memory one). A running container's mount table cannot be read through Incus's
 files API, so for a running service it is what Arca saw when it emptied that container's `/run`, just before the start.
 `run: "unknown"` means Incus could not be read, or Arca has not emptied the running container since its daemon began.
 
 A service made before this change keeps the `/run` it has. `service_reconfigure` shows `/run becomes memory, restart
-once` on its card for it, and an approved card stops the service, removes what the image keeps under `/run`, and starts
-it again (a stopped service has it from its next start). A template that turns `runTmpfs` off shows on the card that
+once` on its card for it, and an approved card stops the service, removes what the image keeps under `/run` (unless an
+entry there is not root's, as above: then nothing is removed and the answer says `run: "disk"`), and starts it again (a
+stopped service has it from its next start). The template default is on, so every card for such a service carries this
+row, whatever else it changes, until its template says `"runTmpfs": false`. A template that turns `runTmpfs` off shows on the card that
 Arca no longer keeps `/run` in memory, and the service is restarted once: the image's files that were removed come back
 with the next `service_update` to a new digest, which gives the container a new root, and until then Incus still mounts
 a memory `/run`, since the disk holds nothing there.

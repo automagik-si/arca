@@ -316,7 +316,7 @@ pub(super) fn state_changer_for(
 }
 
 /// Why a service that keeps `/run` in memory has it on its disk, as its answer says it.
-pub(super) const RUN_ON_DISK: &str = "/run stays on the container's disk: Arca could not empty the files its image keeps in /run, and Incus mounts a memory /run only on an empty one. A secret staged under /run touches the disk";
+pub(super) const RUN_ON_DISK: &str = "/run stays on the container's disk, as its image has it: an entry there is not root's (a directory a non-root image keeps for its own user, which it needs), or Arca could not remove what the image keeps there, and Incus mounts a memory /run only on an empty one. A secret staged under /run touches the disk";
 
 /// Says in the answer of a service that keeps `/run` in memory where its container's `/run` is, read from Incus:
 /// `run: "memory"` (for a stopped one, from its next start), or `run: "disk"` with `runNote` saying why, or

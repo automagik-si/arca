@@ -36,73 +36,76 @@ enum Found {
     Other,
 }
 
+/// What an emptying refuses when an entry under `/run` is not root's: a non-root image made it at its build (a socket
+/// directory of its user, say), and its user cannot make it again under a memory `/run`, which is root's with mode 0755.
+pub const NOT_ROOTS: &str =
+    "an entry under /run is not root's, so its image needs it there: /run is left on the disk";
+
 /// Empties `/run` on the root disk of the container `name` in `project`, which must be stopped (the caller's check): every
 /// entry under it is removed, a directory after what it holds, and `/run` itself stays. Returns how many entries were
-/// removed. A container with no `/run` has nothing to remove. A `/run` that is not a directory, more than
-/// [`RUN_ENTRIES_MAX`] entries, a name that cannot be one entry's, and any refused request are errors, and what was
-/// removed by then stays removed.
+/// removed. A container with no `/run` has nothing to remove.
+///
+/// The whole of `/run` is read before anything is removed, and nothing is removed when an entry there is not owned by
+/// the container's root ([`NOT_ROOTS`]): an image that runs as another user and keeps its own directory in `/run` needs
+/// it. A `/run` that is not a directory, more than [`RUN_ENTRIES_MAX`] entries or [`RUN_DEPTH_MAX`] levels, a name that
+/// cannot be one entry's, and any refused request are errors too. Only a removal can fail once removals began, and what
+/// was removed by then stays removed.
 pub(crate) fn empty_run(send: &Send<'_>, project: &str, name: &str) -> Result<usize, IncusError> {
     if !plain_name(project) || !plain_name(name) {
         return Err(refused("the project or instance name is not plain"));
     }
-    let names = match look(send, project, name, "/run")? {
+    let names = match look(send, project, name, "/run")?.0 {
         Found::Missing => return Ok(0),
         Found::Directory(names) => names,
         Found::Other => return Err(refused("/run is not a directory")),
     };
-    let mut removed = 0;
+    let mut order = Vec::new();
     for entry in names {
-        remove(
-            send,
-            project,
-            name,
-            &format!("/run/{entry}"),
-            0,
-            &mut removed,
-        )?;
+        scan(send, project, name, &format!("/run/{entry}"), 0, &mut order)?;
     }
-    Ok(removed)
+    for path in &order {
+        delete(send, project, name, path)?;
+    }
+    Ok(order.len())
 }
 
-/// Removes `path` and, for a directory, everything in it first. Incus removes a file, a link or an empty directory in
-/// one request and refuses a directory that holds something, which is then listed and emptied.
-fn remove(
+/// Reads `path` and, for a directory, everything in it, and adds each to `order` after what it holds, so removing in
+/// that order removes a directory once it is empty. Refuses an entry that is not root's, and a link is one entry: its
+/// target is never read.
+fn scan(
     send: &Send<'_>,
     project: &str,
     name: &str,
     path: &str,
     depth: usize,
-    removed: &mut usize,
+    order: &mut Vec<String>,
 ) -> Result<(), IncusError> {
-    if *removed >= RUN_ENTRIES_MAX {
+    if order.len() >= RUN_ENTRIES_MAX {
         return Err(refused("/run holds more entries than Arca removes"));
     }
-    let first = match delete(send, project, name, path) {
-        Ok(()) => {
-            *removed += 1;
-            return Ok(());
+    let (found, uid) = look(send, project, name, path)?;
+    if matches!(found, Found::Missing) {
+        return Ok(());
+    }
+    if uid != Some(0) {
+        return Err(refused(NOT_ROOTS));
+    }
+    if let Found::Directory(names) = found {
+        if depth >= RUN_DEPTH_MAX {
+            return Err(refused("/run is nested deeper than Arca walks"));
         }
-        Err(error @ IncusError::Status { .. }) => error,
-        Err(error) => return Err(error),
-    };
-    let Found::Directory(names) = look(send, project, name, path)? else {
-        return Err(first);
-    };
-    if depth >= RUN_DEPTH_MAX {
-        return Err(refused("/run is nested deeper than Arca walks"));
+        for entry in names {
+            scan(
+                send,
+                project,
+                name,
+                &format!("{path}/{entry}"),
+                depth + 1,
+                order,
+            )?;
+        }
     }
-    for entry in names {
-        remove(
-            send,
-            project,
-            name,
-            &format!("{path}/{entry}"),
-            depth + 1,
-            removed,
-        )?;
-    }
-    delete(send, project, name, path)?;
-    *removed += 1;
+    order.push(path.to_string());
     Ok(())
 }
 
@@ -110,17 +113,31 @@ fn delete(send: &Send<'_>, project: &str, name: &str, path: &str) -> Result<(), 
     checked_envelope(send("DELETE", &files_url(project, name, path))?).map(|_| ())
 }
 
-/// What is at `path`: Incus answers a directory with the list of its names and says its type in a header.
-fn look(send: &Send<'_>, project: &str, name: &str, path: &str) -> Result<Found, IncusError> {
+/// What is at `path`, and its owner as the container sees it (Incus says it in a header, `0` for the container's root).
+/// Incus answers a directory with the list of its names and says the type in a header; a file or a link it answers with
+/// its bytes or its target, which are not read.
+fn look(
+    send: &Send<'_>,
+    project: &str,
+    name: &str,
+    path: &str,
+) -> Result<(Found, Option<u32>), IncusError> {
     let framed = send("GET", &files_url(project, name, path))?;
     if framed.status == 404 {
-        return Ok(Found::Missing);
+        return Ok((Found::Missing, None));
     }
+    let uid = framed
+        .header("x-incus-uid")
+        .and_then(|uid| uid.trim().parse::<u32>().ok());
     let directory = framed.header("x-incus-type") == Some("directory");
-    let envelope = checked_envelope(framed)?;
     if !directory {
-        return Ok(Found::Other);
+        if !(200..300).contains(&framed.status) {
+            checked_envelope(framed)?;
+            return Err(refused("Incus refused a read under /run"));
+        }
+        return Ok((Found::Other, uid));
     }
+    let envelope = checked_envelope(framed)?;
     let names = envelope["metadata"]
         .as_array()
         .ok_or_else(|| IncusError::Decode("a directory listing is not a list".into()))?
@@ -133,7 +150,7 @@ fn look(send: &Send<'_>, project: &str, name: &str, path: &str) -> Result<Found,
                 .ok_or_else(|| refused("a name under /run is not one entry's"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Found::Directory(names))
+    Ok((Found::Directory(names), uid))
 }
 
 /// Whether `entry` names one entry of a directory: not empty, not `.` or `..`, no `/`, no control character, and short.
@@ -166,7 +183,7 @@ pub(crate) fn run_is_empty(send: &Send<'_>, project: &str, name: &str) -> Result
     if !plain_name(project) || !plain_name(name) {
         return Err(refused("the project or instance name is not plain"));
     }
-    Ok(match look(send, project, name, "/run")? {
+    Ok(match look(send, project, name, "/run")?.0 {
         Found::Missing => true,
         Found::Directory(names) => names.is_empty(),
         Found::Other => false,

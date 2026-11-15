@@ -148,6 +148,11 @@ pub const EARLIER: &[(&str, &str)] = &[
         "postgres-autopg.json",
         "c72e64e193b0cbd0c9e486e2b894f84da3515509e3e3c1ff0cd3dbb00d9e2a0d",
     ),
+    // 0.23.0 to 0.29.0: before it said runTmpfs: false, which keeps the socket directory its image makes in /run.
+    (
+        "postgres-autopg.json",
+        "94b4e58c4f37f4387a973257067268e28e7cb5e6a63cec9146a74938ebed8868",
+    ),
     // 0.1.0-alpha.7 to 0.22.0: before it kept JetStream's files on a data volume.
     (
         "nats.json",

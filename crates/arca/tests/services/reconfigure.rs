@@ -834,3 +834,33 @@ fn a_reconfigure_to_a_memory_run_keeps_the_templates_raw_lxc_lines() {
         vec!["lxc.sched.core=0".to_string()]
     );
 }
+
+#[test]
+fn a_database_service_never_gets_the_run_row() {
+    let key = common::SkKey::from_seed(54);
+    let rig = node(&key);
+    // Its image keeps its user's socket directory in /run: a memory /run, root's, would stop it.
+    rig.fake.set_image_run(&["/run/lock/", "/run/autopg/"]);
+    rig.fake.set_image_run_owner("/run/autopg/", 1000);
+    arca::cmd_templates::install_into(&rig.dir.join("templates"), false).expect("install");
+    let made = rig
+        .call(
+            "service_create",
+            json!({ "name": "db", "template": service::DATABASE_TEMPLATE }),
+        )
+        .expect("create");
+    assert!(made.get("run").is_none(), "{made}");
+    assert!(!rig.service_config("db").run_tmpfs);
+    let proposed = propose(&rig, json!({ "name": "db" })).expect("proposed");
+    assert!(
+        proposed["args"]["changes"].get("runTmpfs").is_none(),
+        "{proposed}"
+    );
+    assert_eq!(
+        row(&proposed["details"], arca::action_proposal::RUN_TMPFS_LABEL),
+        None
+    );
+    let mut kept = rig.fake.run_on_disk(PROJECT, "db");
+    kept.sort_unstable();
+    assert_eq!(kept, vec!["/run/autopg/", "/run/lock/"]);
+}

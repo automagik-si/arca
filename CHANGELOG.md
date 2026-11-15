@@ -12,9 +12,11 @@ longer touches the disk. Incus mounts a tmpfs on an OCI container's `/run` only 
 Arca now empties the image's `/run` on the root disk before the first start, after each `service_update` rebuild, and in
 a `service_reconfigure` of a service made before (its card says `/run becomes memory, restart once`). No project
 restriction is loosened and it works in tenants too. The mount has `mode=755` but neither `nosuid` nor `nodev`, and no
-size of its own: the service's memory limit bounds it. A template says `"runTmpfs": false` for an image that needs its
-own files in `/run`. The answers say `run: "memory"`, or `run: "disk"` with the reason when the image's files could not
-be removed, in which case the service runs as before.
+size of its own: the service's memory limit bounds it when the template sets `limits.memory`. Arca leaves `/run` on the
+disk, untouched, when an entry there is not root's (a non-root image's own directory, which it needs), and
+`postgres-autopg` says `"runTmpfs": false`, since its image keeps its socket directory there. A template says
+`"runTmpfs": false` for any other image that needs its own files in `/run`. The answers say `run: "memory"`, or
+`run: "disk"` with the reason when `/run` was left on the disk, in which case the service runs as before.
 
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
