@@ -187,6 +187,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "arca-janitor"
+version = "0.29.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arca-kernel"
 version = "0.29.0"
 dependencies = [

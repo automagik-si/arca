@@ -1,0 +1,12 @@
+# The nightly clean at 04:30 local time, give or take 20 minutes. Not enabled by anything:
+# `systemctl --user enable --now janitor-nightly.timer` once janitor.service runs.
+[Unit]
+Description=arca-janitor nightly clean at 04:30
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
