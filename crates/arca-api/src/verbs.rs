@@ -422,7 +422,7 @@ static VERBS: [Verb; 82] = [
     },
     Verb {
         name: "service_reconfigure",
-        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
+        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -4766,13 +4766,14 @@ fn service_reconfigure_params() -> Value {
             "changes": {
                 "additionalProperties": false,
                 "properties": {
+                    "entrypoint": { "type": "object" },
                     "environment": { "items": { "type": "object" }, "type": "array" },
                     "noNewPrivileges": { "type": "object" },
                     "ports": { "type": "object" },
                     "rawLxc": { "type": "object" },
                     "secrets": { "items": { "type": "object" }, "type": "array" }
                 },
-                "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc and noNewPrivileges ({from, to} each). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
+                "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
                 "type": "object"
             },
             "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
@@ -4793,7 +4794,7 @@ fn service_reconfigure_result() -> Value {
             "message": { "type": "string" },
             "readBack": {
                 "additionalProperties": false,
-                "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc) that differ. Never a value.",
+                "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc, or oci.entrypoint) that differ. Never a value.",
                 "properties": {
                     "differs": { "items": { "type": "string" }, "type": "array" },
                     "matches": { "type": "boolean" }
