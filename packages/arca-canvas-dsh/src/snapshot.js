@@ -1,5 +1,5 @@
 import { hostname } from 'node:os';
-import { snapshotError } from './arca-client.js';
+import { ArcaError, snapshotError } from './arca-client.js';
 
 const JOURNAL_PAGE_LIMIT = 500;
 const JOURNAL_MAX_PAGES = 50;
@@ -25,6 +25,8 @@ export function emptySnapshot(config = {}) {
     services: [],
     servicesKnown: false,
     metrics: null,
+    osUpdate: null,
+    osUpdateRead: 'pending',
     alerts: [],
     plans: [],
     journal: [],
@@ -176,7 +178,7 @@ export async function collectSnapshot(client, config = {}, state = {}) {
       return `${tool}: ${snapshotError(error)}`;
     }
   };
-  const errors = await Promise.all([
+  const [errors] = await Promise.all([Promise.all([
     read('machine', 'arca_status', () => client.call('arca_status')),
     read('instances', 'watch_report', async () => {
       const projects = rows((await client.call('watch_report')).projects);
@@ -201,9 +203,25 @@ export async function collectSnapshot(client, config = {}, state = {}) {
       snapshot.journalPending = journalState.pending === true;
       return records;
     }),
-  ]);
+  ]), readOsUpdate(client, snapshot)]);
   snapshot.error = errors.filter(Boolean).join(' ') || null;
   return snapshot;
+}
+
+// os_update is the node's OS update state, its own read beside arca_status and node_metrics: node_metrics is the host
+// metrics domain and its incus-osd reading is not part of the serialized sample, and the update state changes on a slower
+// cadence with its own contract. It never joins snapshot.error: an older kernel without the verb answers an MCP error
+// ('missing': the node does not report update state), and any other failure is 'failed' for this poll only.
+async function readOsUpdate(client, snapshot) {
+  try {
+    const value = await client.call('os_update');
+    if (!value || typeof value !== 'object' || typeof value.known !== 'boolean') throw new ArcaError('json');
+    snapshot.osUpdate = value;
+    snapshot.osUpdateRead = 'ok';
+  } catch (error) {
+    snapshot.osUpdate = null;
+    snapshot.osUpdateRead = error instanceof ArcaError && error.code === 'rpc' ? 'missing' : 'failed';
+  }
 }
 
 const PHONE_STATUS_LIMIT = 2;

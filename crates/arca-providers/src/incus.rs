@@ -1649,8 +1649,13 @@ pub fn host_addresses_value(networks: &[(IpAddr, Option<u8>)]) -> Value {
 }
 
 /// Every address of the host's own interfaces with its prefix length, as Incus lists them: the listing of
-/// `/1.0/networks?recursion=1`, then the state of each listed interface. Only those two GETs are sent, and an address of
+/// `/1.0/networks?recursion=1`, then the state of each listed interface. Only those GETs are sent, and an address of
 /// another family is skipped. The length is `None` when Incus gave no `netmask` that is one.
+///
+/// On IncusOS the host's physical interfaces are not in `/1.0/networks`, which lists only the networks Incus manages:
+/// incus-osd holds them, and answers their addresses in `/os/1.0/system/network` (see [`os_interfaces`]). So when the
+/// listing has rows and every one is managed, that path is read too; a host that lists its own interfaces, as any other
+/// Incus does, is never asked it.
 pub fn host_networks(read: &dyn IncusRead) -> Result<Vec<(IpAddr, Option<u8>)>, EffectRefusal> {
     let listing = read
         .get("/1.0/networks?recursion=1")
@@ -1659,6 +1664,10 @@ pub fn host_networks(read: &dyn IncusRead) -> Result<Vec<(IpAddr, Option<u8>)>, 
         .as_array()
         .ok_or_else(|| EffectRefusal::Provider("the Incus answer is not a list".to_string()))?;
     let mut found = Vec::new();
+    let only_managed = !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| row.get("managed").and_then(Value::as_bool) == Some(true));
     for row in rows {
         let name = row
             .get("name")
@@ -1693,7 +1702,69 @@ pub fn host_networks(read: &dyn IncusRead) -> Result<Vec<(IpAddr, Option<u8>)>, 
             found.push((ip, length));
         }
     }
+    if only_managed && let Ok(os) = read.get("/os/1.0/system/network") {
+        for one in os_interfaces(&os) {
+            if !found.iter().any(|(ip, _)| *ip == one.0) {
+                found.push(one);
+            }
+        }
+    }
     Ok(found)
+}
+
+/// The addresses incus-osd answers for the host's interfaces in `/os/1.0/system/network`: each address of
+/// `state.interfaces.<name>.addresses`, with the prefix length the interface's configured address gives
+/// (`config.interfaces[].addresses`, as `a.b.c.d/len`) when one matches, and `None` otherwise. A row that is not an IP
+/// address is skipped.
+pub fn os_interfaces(os: &Value) -> Vec<(IpAddr, Option<u8>)> {
+    let mut lengths: Vec<(IpAddr, u8)> = Vec::new();
+    for interface in os
+        .pointer("/config/interfaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for text in interface
+            .get("addresses")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if let Some((ip, length)) = text.split_once('/')
+                && let (Ok(ip), Ok(length)) = (ip.parse::<IpAddr>(), length.parse::<u8>())
+                && length <= if ip.is_ipv4() { 32 } else { 128 }
+            {
+                lengths.push((ip, length));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for (_, interface) in os
+        .pointer("/state/interfaces")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        for ip in interface
+            .get("addresses")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(|text| text.split('/').next()?.parse::<IpAddr>().ok())
+        {
+            if found.iter().any(|(seen, _)| *seen == ip) {
+                continue;
+            }
+            let length = lengths
+                .iter()
+                .find(|(configured, _)| *configured == ip)
+                .map(|(_, length)| *length);
+            found.push((ip, length));
+        }
+    }
+    found
 }
 
 /// The settled outcome of a tombstone Incus refused with a 4xx other than 412. A 4xx is Incus's refusal of the request, so the

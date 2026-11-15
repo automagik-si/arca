@@ -3,15 +3,26 @@
 //! The security document carries live recovery keys in `state.drive_recovery_keys` and `state.pool_recovery_keys`. This module
 //! reads four fields and nothing else. Each body is a local value that is dropped when the read returns, so no key, certificate,
 //! public key or other field reaches a reading, an error, a log or a metric. The update status text is classified into a kind
-//! and the text itself is never stored or formatted.
+//! and the text itself is never stored or formatted; the one exception is the version a completed `… has been updated to
+//! version V` status names, kept only when it is a plain version token.
+//!
+//! The same update read also gives [`OsUpdate`], the plain update state the `os_update` verb serves: the version, channel,
+//! check frequency, automatic flag, check and update times, the health versions, and the OS's own error kind and trust
+//! fields, passed through as the OS classified them. The raw `last_error` text is never read.
 
 use arca_incus::IncusRead;
+use serde::Serialize;
 use serde_json::Value;
 
 /// The security document, with Secure Boot and TPM state. Its body also holds recovery keys, which this module never reads.
 pub const SECURITY_PATH: &str = "/os/1.0/system/security";
 /// The update document: the last check time and the status text.
 pub const UPDATE_PATH: &str = "/os/1.0/system/update";
+/// The OS document, whose `environment.os_version` is the version when the update document's health has none.
+pub const OS_PATH: &str = "/os/1.0";
+
+/// The error kinds incus-osd's update check reports in `state.last_error_kind`. Any other text is not passed on.
+const ERROR_KINDS: [&str; 5] = ["network", "parse", "signature", "trust", "other"];
 
 /// With no successful check for this long, in milliseconds, the update is failed (14 days).
 pub const STALE_CHECK_MS: u64 = 14 * 24 * 60 * 60 * 1000;
@@ -41,14 +52,92 @@ pub struct OsdReading {
     pub last_success_ms: Option<u64>,
 }
 
-/// What the sampler carries from one update read to the next: the latest classified result and the last success time. A read
-/// whose status is in progress, skipped or unrecognised keeps both.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What the sampler carries from one update read to the next: the latest classified result, the last success time, and the
+/// last update a completed status named. A read whose status is in progress, skipped or unrecognised keeps all three.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateMemory {
     /// `Some(true)` after a failed check, `Some(false)` after a completed one, `None` before either.
     failed: Option<bool>,
     /// The check time read alongside the newest completed status.
     last_success_ms: Option<u64>,
+    /// The version the newest `… has been updated to version V` status named, with the check time read alongside it.
+    updated: Option<(String, Option<u64>)>,
+}
+
+/// The update state of one node as the `os_update` verb serves it, in camelCase with `null` for what is unknown. `known` is
+/// false when the update document could not be read, as on a plain Incus that answers 404: never an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OsUpdate {
+    pub known: bool,
+    /// Epoch milliseconds of the read.
+    pub as_of: u64,
+    /// `state.health.current_version`, or `environment.os_version` of `/os/1.0` when the health has none.
+    pub version: Option<String>,
+    pub channel: Option<String>,
+    /// `config.check_frequency` verbatim, such as `6h` or `never`.
+    pub check_frequency: Option<String>,
+    /// Whether automatic updates are on: `!config.auto_updates_off`, which incus-osd omits when false.
+    pub automatic: Option<bool>,
+    /// `state.last_check`, when it is a usable time.
+    pub last_check_at: Option<u64>,
+    /// The check time of the newest check this kernel saw complete.
+    pub last_success_at: Option<u64>,
+    /// The version the newest completed `… has been updated to version V` status named.
+    pub last_updated_version: Option<String>,
+    /// The check time read alongside that status.
+    pub last_updated_at: Option<u64>,
+    pub needs_reboot: Option<bool>,
+    pub pending_version: Option<String>,
+    pub previous_version: Option<String>,
+    pub good_version: Option<String>,
+    /// `state.health.last_result`, verbatim.
+    pub last_result: Option<String>,
+    /// `state.health.last_reason`, verbatim.
+    pub last_reason: Option<String>,
+    /// `state.last_error_kind` as the OS classified it: one of network, parse, signature, trust or other. `null` when absent,
+    /// empty or any other text; the kernel never classifies an error itself.
+    pub last_error_kind: Option<String>,
+    /// The update CA trust fields, `null` when the OS reports none of them.
+    pub trust: Option<UpdateTrust>,
+}
+
+/// The update CA trust fields of the update document, passed through. A fingerprint is kept only in its SHA-256 form (hex
+/// pairs joined by colons).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTrust {
+    pub embedded_ca_fingerprint: Option<String>,
+    pub presented_ca_fingerprint: Option<String>,
+    /// Consecutive checks whose update server key was not trusted.
+    pub failures: Option<u64>,
+    pub escalated: Option<bool>,
+}
+
+impl OsUpdate {
+    /// The state of a node whose update document could not be read at `at`: every field `null`.
+    pub fn unknown(at: u64) -> Self {
+        OsUpdate {
+            known: false,
+            as_of: at,
+            version: None,
+            channel: None,
+            check_frequency: None,
+            automatic: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_updated_version: None,
+            last_updated_at: None,
+            needs_reboot: None,
+            pending_version: None,
+            previous_version: None,
+            good_version: None,
+            last_result: None,
+            last_reason: None,
+            last_error_kind: None,
+            trust: None,
+        }
+    }
 }
 
 /// What one update status says about the check it describes, by the exact texts incus-osd writes (`internal/update/update.go`).
@@ -76,22 +165,134 @@ fn classify(status: &str) -> StatusKind {
     }
 }
 
-/// Reads the security and update documents at `at`, carrying the update result in `memory`. `None` when either GET fails, as a
-/// plain Incus answers 404, so an unreachable or unlike host is unknown and never a reading of `false`. A failed read leaves
-/// `memory` as it was.
+/// Reads the security and update documents at `at`, carrying the update result in `memory`. The reading is `None` when either
+/// GET fails, as a plain Incus answers 404, so an unreachable or unlike host is unknown and never a reading of `false`. A failed
+/// read leaves `memory` as it was. The update state comes from the same update GET, after the reading has advanced `memory`;
+/// `/os/1.0` is asked only when the update document's health names no version.
 pub fn read<R: IncusRead>(
     incus: &R,
     at: u64,
     memory: &mut UpdateMemory,
     uptime_ms: Option<u64>,
-) -> Option<OsdReading> {
+) -> (Option<OsdReading>, OsUpdate) {
     // Both GETs are sent even when the first fails, so one tick never hides which document an Incus lacks.
     let security = incus.get(SECURITY_PATH);
     let update = incus.get(UPDATE_PATH);
-    let (Ok(security), Ok(update)) = (security, update) else {
-        return None;
+    let reading = match (&security, &update) {
+        (Ok(security), Ok(update)) => from_documents(security, update, at, memory, uptime_ms),
+        _ => None,
     };
-    from_documents(&security, &update, at, memory, uptime_ms)
+    let state = match &update {
+        Ok(update) => {
+            let os = text_at(update, "/state/health/current_version")
+                .is_none()
+                .then(|| incus.get(OS_PATH).ok())
+                .flatten();
+            update_state(update, os.as_ref(), at, memory)
+        }
+        Err(_) => OsUpdate::unknown(at),
+    };
+    (reading, state)
+}
+
+/// The update state the update document and, when given, the `/os/1.0` document say at `at`, with the success and update
+/// times `memory` carries. A body that is not an object is not known.
+pub fn update_state(
+    update: &Value,
+    os: Option<&Value>,
+    at: u64,
+    memory: &UpdateMemory,
+) -> OsUpdate {
+    if !update.is_object() {
+        return OsUpdate::unknown(at);
+    }
+    let version = text_at(update, "/state/health/current_version")
+        .or_else(|| os.and_then(|os| text_at(os, "/environment/os_version")));
+    let automatic = update
+        .pointer("/config")
+        .filter(|config| config.is_object())
+        .map(|config| {
+            !config
+                .get("auto_updates_off")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        });
+    let last_error_kind = text_at(update, "/state/last_error_kind")
+        .filter(|kind| ERROR_KINDS.contains(&kind.as_str()));
+    let embedded = fingerprint_at(update, "/state/embedded_ca_fingerprint");
+    let presented = fingerprint_at(update, "/state/presented_ca_fingerprint");
+    let failures = update
+        .pointer("/state/trust_failures")
+        .and_then(Value::as_u64);
+    let escalated = update
+        .pointer("/state/trust_escalated")
+        .and_then(Value::as_bool);
+    let trust =
+        (embedded.is_some() || presented.is_some() || failures.is_some() || escalated.is_some())
+            .then_some(UpdateTrust {
+                embedded_ca_fingerprint: embedded,
+                presented_ca_fingerprint: presented,
+                failures,
+                escalated,
+            });
+    let (last_updated_version, last_updated_at) = match &memory.updated {
+        Some((version, at)) => (Some(version.clone()), *at),
+        None => (None, None),
+    };
+    OsUpdate {
+        known: true,
+        as_of: at,
+        version,
+        channel: text_at(update, "/config/channel"),
+        check_frequency: text_at(update, "/config/check_frequency"),
+        automatic,
+        last_check_at: check_time(update),
+        last_success_at: memory.last_success_ms,
+        last_updated_version,
+        last_updated_at,
+        needs_reboot: update
+            .pointer("/state/needs_reboot")
+            .and_then(Value::as_bool),
+        pending_version: text_at(update, "/state/health/pending_version"),
+        previous_version: text_at(update, "/state/health/previous_version"),
+        good_version: text_at(update, "/state/health/good_version"),
+        last_result: text_at(update, "/state/health/last_result"),
+        last_reason: text_at(update, "/state/health/last_reason"),
+        last_error_kind,
+        trust,
+    }
+}
+
+/// The non-empty string at `pointer`. incus-osd omits or empties a field it has no value for, so both are `None`.
+fn text_at(document: &Value, pointer: &str) -> Option<String> {
+    document
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// The SHA-256 fingerprint at `pointer`, as hex pairs joined by colons. Any other text is `None`.
+fn fingerprint_at(document: &Value, pointer: &str) -> Option<String> {
+    text_at(document, pointer).filter(|text| {
+        text.len() <= 95
+            && text
+                .split(':')
+                .all(|pair| pair.len() == 2 && pair.bytes().all(|b| b.is_ascii_hexdigit()))
+    })
+}
+
+/// The version a `… has been updated to version V` status names, when it is a plain version token of at most 64 letters,
+/// digits, dots, dashes, pluses and underscores. Any other text, and every other status, is `None`, so no other status text is
+/// kept.
+fn updated_version(status: &str) -> Option<String> {
+    let (_, version) = status.split_once(" has been updated to version ")?;
+    let plain = !version.is_empty()
+        && version.len() <= 64
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'));
+    plain.then(|| version.to_string())
 }
 
 /// The reading the two bodies give at `at`, given what `memory` carries from earlier reads. Each field is taken by its JSON path,
@@ -105,7 +306,8 @@ pub fn from_documents(
 ) -> Option<OsdReading> {
     let secure_boot = security.pointer("/state/secure_boot_enabled")?.as_bool()?;
     let tpm_ok = security.pointer("/state/tpm_status")?.as_str()? == "ok";
-    let kind = classify(update.pointer("/state/status")?.as_str()?);
+    let status = update.pointer("/state/status")?.as_str()?;
+    let kind = classify(status);
     let last_check_ms = check_time(update);
     match kind {
         StatusKind::Failure => memory.failed = Some(true),
@@ -114,6 +316,9 @@ pub fn from_documents(
             // A completed status without a usable time keeps the earlier success time rather than guessing one.
             if last_check_ms.is_some() {
                 memory.last_success_ms = last_check_ms;
+            }
+            if let Some(version) = updated_version(status) {
+                memory.updated = Some((version, last_check_ms));
             }
         }
         StatusKind::Carry => {}
@@ -615,6 +820,297 @@ mod tests {
             None
         );
         assert_eq!(memory, UpdateMemory::default());
+    }
+
+    /// A fake Incus serving the update document, and `/os/1.0` when given. Any other path, and both when `update` is `None`,
+    /// answers 404 as a plain Incus does. It records every path asked.
+    struct Fake {
+        update: Option<Value>,
+        os: Option<Value>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Fake {
+        fn new(update: Option<Value>, os: Option<Value>) -> Self {
+            Fake {
+                update,
+                os,
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl IncusRead for Fake {
+        fn get(&self, path: &str) -> Result<Value, arca_incus::IncusError> {
+            self.asked
+                .lock()
+                .expect("not poisoned")
+                .push(path.to_string());
+            let found = match path {
+                SECURITY_PATH if self.update.is_some() => Some(security(true, "ok")),
+                UPDATE_PATH => self.update.clone(),
+                OS_PATH => self.os.clone(),
+                _ => None,
+            };
+            found.ok_or(arca_incus::IncusError::Status {
+                code: 404,
+                message: "not found".to_string(),
+            })
+        }
+
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, arca_incus::IncusError> {
+            self.get(path)
+        }
+    }
+
+    /// A full Arca OS update document, with the trust fields of the OS's trust-status branch.
+    fn arca_update(status: &str) -> Value {
+        json!({
+            "config": { "auto_reboot": false, "channel": "stable", "check_frequency": "6h" },
+            "state": {
+                "last_check": "2026-11-01T10:00:00Z",
+                "status": status,
+                "needs_reboot": true,
+                "health": {
+                    "current_version": "202611010000",
+                    "previous_version": "202610150000",
+                    "good_version": "202610150000",
+                    "pending_version": "202611080000",
+                    "last_result": "baking",
+                    "last_reason": "waiting for the bake time",
+                },
+                "last_error_kind": "trust",
+                "last_error": "FAKE-INTERNAL-ERROR-TEXT x509 unknown authority",
+                "embedded_ca_fingerprint": "AA:BB:CC:DD",
+                "presented_ca_fingerprint": "11:22:33:44",
+                "trust_failures": 3,
+                "trust_escalated": true,
+            },
+        })
+    }
+
+    #[test]
+    fn the_update_state_maps_the_documents_fields() {
+        let incus = Fake::new(Some(arca_update("OS update check completed")), None);
+        let (reading, state) = read(&incus, AT, &mut UpdateMemory::default(), None);
+        assert!(reading.is_some());
+        assert!(state.known);
+        assert_eq!(state.as_of, AT);
+        assert_eq!(state.version.as_deref(), Some("202611010000"));
+        assert_eq!(state.channel.as_deref(), Some("stable"));
+        assert_eq!(state.check_frequency.as_deref(), Some("6h"));
+        assert_eq!(
+            state.automatic,
+            Some(true),
+            "auto_updates_off is omitted when false"
+        );
+        assert_eq!(state.last_check_at, Some(AT));
+        assert_eq!(state.last_success_at, Some(AT));
+        assert_eq!(state.needs_reboot, Some(true));
+        assert_eq!(state.pending_version.as_deref(), Some("202611080000"));
+        assert_eq!(state.previous_version.as_deref(), Some("202610150000"));
+        assert_eq!(state.good_version.as_deref(), Some("202610150000"));
+        assert_eq!(state.last_result.as_deref(), Some("baking"));
+        assert_eq!(
+            state.last_reason.as_deref(),
+            Some("waiting for the bake time")
+        );
+        assert!(
+            !incus
+                .asked
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .any(|path| path == OS_PATH),
+            "the health names the version, so /os/1.0 is not asked"
+        );
+    }
+
+    #[test]
+    fn automatic_updates_off_is_read_from_the_config() {
+        let mut doc = arca_update("OS update check completed");
+        doc["config"]["auto_updates_off"] = json!(true);
+        let state = update_state(&doc, None, AT, &UpdateMemory::default());
+        assert_eq!(state.automatic, Some(false));
+        doc["config"]
+            .as_object_mut()
+            .expect("the config object")
+            .remove("auto_updates_off");
+        let state = update_state(&doc, None, AT, &UpdateMemory::default());
+        assert_eq!(
+            state.automatic,
+            Some(true),
+            "omitted means off is false: on by default"
+        );
+        let state = update_state(&json!({ "state": {} }), None, AT, &UpdateMemory::default());
+        assert_eq!(state.automatic, None, "no config object: unknown, not on");
+    }
+
+    #[test]
+    fn the_version_falls_back_to_the_os_document() {
+        let mut doc = arca_update("OS update check completed");
+        doc["state"]["health"]
+            .as_object_mut()
+            .expect("the health object")
+            .remove("current_version");
+        let os = json!({ "environment": { "os_name": "Arca OS", "os_version": "202610010000" } });
+        let incus = Fake::new(Some(doc.clone()), Some(os));
+        let (_, state) = read(&incus, AT, &mut UpdateMemory::default(), None);
+        assert_eq!(state.version.as_deref(), Some("202610010000"));
+        assert!(
+            incus
+                .asked
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .any(|path| path == OS_PATH)
+        );
+        // Without either version the field is null, and a failed /os/1.0 read is not a failed update read.
+        let incus = Fake::new(Some(doc), None);
+        let (_, state) = read(&incus, AT, &mut UpdateMemory::default(), None);
+        assert!(state.known);
+        assert_eq!(state.version, None);
+    }
+
+    #[test]
+    fn the_error_kind_and_trust_fields_pass_through_unchanged() {
+        let state = update_state(
+            &arca_update("Failed to check for OS updates"),
+            None,
+            AT,
+            &UpdateMemory::default(),
+        );
+        assert_eq!(state.last_error_kind.as_deref(), Some("trust"));
+        assert_eq!(
+            state.trust,
+            Some(UpdateTrust {
+                embedded_ca_fingerprint: Some("AA:BB:CC:DD".to_string()),
+                presented_ca_fingerprint: Some("11:22:33:44".to_string()),
+                failures: Some(3),
+                escalated: Some(true),
+            })
+        );
+        for kind in ERROR_KINDS {
+            let mut doc = arca_update("Failed to check for OS updates");
+            doc["state"]["last_error_kind"] = json!(kind);
+            let state = update_state(&doc, None, AT, &UpdateMemory::default());
+            assert_eq!(state.last_error_kind.as_deref(), Some(kind));
+        }
+    }
+
+    #[test]
+    fn absent_error_and_trust_fields_are_null_and_never_derived() {
+        // An OS before the trust-status fields: a failed status still gives no kind, as the kernel never classifies.
+        let doc = update("Failed to check for OS updates", "2026-11-01T10:00:00Z");
+        let state = update_state(&doc, None, AT, &UpdateMemory::default());
+        assert!(state.known);
+        assert_eq!(state.last_error_kind, None);
+        assert_eq!(state.trust, None);
+        let mut doc = arca_update("Failed to check for OS updates");
+        doc["state"]["last_error_kind"] = json!("");
+        doc["state"]["embedded_ca_fingerprint"] = json!("not a fingerprint");
+        let state = update_state(&doc, None, AT, &UpdateMemory::default());
+        assert_eq!(state.last_error_kind, None, "an empty kind is no kind");
+        assert_eq!(
+            state.trust.and_then(|trust| trust.embedded_ca_fingerprint),
+            None,
+            "only a SHA-256 fingerprint is passed on"
+        );
+    }
+
+    #[test]
+    fn a_plain_incus_or_a_failed_read_is_not_known() {
+        let incus = Fake::new(None, None);
+        let (reading, state) = read(&incus, AT, &mut UpdateMemory::default(), None);
+        assert_eq!(reading, None);
+        assert_eq!(state, OsUpdate::unknown(AT));
+        assert!(!state.known);
+        let state = update_state(&json!("not a document"), None, AT, &UpdateMemory::default());
+        assert!(!state.known);
+    }
+
+    #[test]
+    fn an_updated_status_names_the_last_update_with_its_check_time() {
+        let mut memory = UpdateMemory::default();
+        let incus = Fake::new(
+            Some(arca_update(
+                "Arca OS has been updated to version 202611010000",
+            )),
+            None,
+        );
+        let (_, state) = read(&incus, AT, &mut memory, None);
+        assert_eq!(state.last_updated_version.as_deref(), Some("202611010000"));
+        assert_eq!(state.last_updated_at, Some(AT));
+        // A later plain completed check keeps the last update.
+        let mut later = arca_update("OS update check completed");
+        later["state"]["last_check"] = json!("2026-11-02T10:00:00Z");
+        let incus = Fake::new(Some(later), None);
+        let (_, state) = read(&incus, AT + DAY, &mut memory, None);
+        assert_eq!(state.last_updated_version.as_deref(), Some("202611010000"));
+        assert_eq!(state.last_updated_at, Some(AT));
+        assert_eq!(state.last_success_at, Some(AT + DAY));
+        // A status naming anything but a plain version token is not kept.
+        assert_eq!(
+            updated_version("X has been updated to version 1.2 and more"),
+            None
+        );
+        assert_eq!(updated_version("OS update check completed"), None);
+    }
+
+    #[test]
+    fn no_raw_error_text_reaches_the_update_state() {
+        let mut memory = UpdateMemory::default();
+        let incus = Fake::new(Some(arca_update("Failed to check for OS updates")), None);
+        let (_, state) = read(&incus, AT, &mut memory, None);
+        let shown = [
+            format!("{state:?}"),
+            format!("{memory:?}"),
+            serde_json::to_string(&state).expect("the state serializes"),
+        ];
+        for shown in shown {
+            assert!(
+                !shown.contains("FAKE-INTERNAL-ERROR-TEXT"),
+                "the raw last_error was kept"
+            );
+            assert!(!shown.contains("x509"), "the raw last_error was kept");
+            assert!(!shown.contains("Failed to"), "the status text was kept");
+            assert!(!shown.contains(FAKE_KEY), "a fake key was shown");
+        }
+    }
+
+    #[test]
+    fn the_update_state_serializes_in_camel_case_with_nulls() {
+        let value = serde_json::to_value(OsUpdate::unknown(AT)).expect("the state serializes");
+        assert_eq!(value["known"], json!(false));
+        assert_eq!(value["asOf"], json!(AT));
+        for key in [
+            "version",
+            "channel",
+            "checkFrequency",
+            "automatic",
+            "lastCheckAt",
+            "lastSuccessAt",
+            "lastUpdatedVersion",
+            "lastUpdatedAt",
+            "needsReboot",
+            "pendingVersion",
+            "previousVersion",
+            "goodVersion",
+            "lastResult",
+            "lastReason",
+            "lastErrorKind",
+            "trust",
+        ] {
+            assert_eq!(
+                value.get(key),
+                Some(&Value::Null),
+                "{key} is present and null"
+            );
+        }
     }
 
     #[test]

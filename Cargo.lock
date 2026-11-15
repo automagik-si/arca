@@ -117,16 +117,20 @@ dependencies = [
  "iroh-tickets",
  "p256",
  "regex",
+ "reqwest",
+ "rsa",
  "rusqlite",
  "rustix",
  "rustls",
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "serde_urlencoded",
  "sha2 0.11.1",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -229,6 +233,7 @@ version = "0.29.0"
 dependencies = [
  "arca-api",
  "arca-incus",
+ "rustix",
  "serde",
  "serde_json",
 ]

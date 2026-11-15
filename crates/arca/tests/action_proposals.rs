@@ -292,11 +292,26 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "image": format!("images:debian/13 running {TEST_PG_IMAGE}"),
                 "templateDigest": "ab".repeat(32),
                 "registry": "https://registry.example",
+                "rawLxc": ["lxc.no_new_privs=1", "lxc.mount.entry=/srv srv none bind 0 0"],
             }),
             ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
             ActionKind::ServiceUpdate => json!({
                 "name": "nats", "tenant": "abcdefgh", "timeoutSeconds": 120, "eraseData": true,
                 "digest": format!("sha256:{}", "2".repeat(64)),
+            }),
+            ActionKind::ServiceReconfigure => json!({
+                "name": "nats", "tenant": "abcdefgh",
+                "changes": {
+                    "environment": [
+                        { "key": "OLD", "change": "removed" },
+                        { "key": "MODE", "change": "changed", "value": "two", "was": "one" },
+                        { "key": "TOKEN", "change": "added", "secrets": ["TOKEN"] },
+                        { "key": "DATABASE_URL", "change": "changed", "link": "pg" }
+                    ],
+                    "secrets": [{ "name": "TOKEN", "change": "declared" }],
+                    "ports": { "from": [4222], "to": [4222, 8222] },
+                    "rawLxc": { "from": [], "to": ["lxc.sched.core=0"] }
+                },
             }),
             ActionKind::ServiceUnpublish
             | ActionKind::ServiceImport
@@ -344,11 +359,17 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "links": [{ "to": "nats", "port": 4222 }],
                 "destinations": [{ "address": "10.20.30.40", "port": 443 }],
                 "registry": "https://registry.example",
+                "internet": true,
                 "triggers": [{ "timer": { "everySeconds": 30 } }],
                 "limits": { "seconds": 60, "memory": "128MiB", "cpu": 1 },
             }),
             ActionKind::FunctionRemove => json!({ "name": "relay" }),
             ActionKind::HostNetworkRestore => json!({}),
+            ActionKind::RouteAdd => json!({
+                "hostname": "app.example.com", "instance": "web", "project": "default",
+                "port": 8080, "reach": "private",
+            }),
+            ActionKind::RouteRemove => json!({ "hostname": "app.example.com" }),
             ActionKind::InstanceMove => json!({
                 "plan": "ab".repeat(32),
                 "instances": [{ "project": "shop", "name": "web" }],
@@ -494,6 +515,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     "secrets" => ("Secrets", "DATABASE_URL: each run is given these by name"),
                     "links" => ("Services on this node", "nats on tcp port 4222"),
                     "destinations" => ("Private network", "10.20.30.40 on tcp port 443"),
+                    "internet" => (
+                        "Internet",
+                        "Yes: it can open connections to any public address",
+                    ),
                     "triggers" => ("Runs", "every 30 seconds"),
                     "concurrency" => ("Runs", "one run at a time"),
                     "limits" => ("Limits", "at most 60 seconds, 128MiB of memory and 1 CPU"),
@@ -506,7 +531,6 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 assert!(row(label).contains(holds), "{label}: {}", row(label));
             }
             assert_eq!(row("Command argument 1"), "--once");
-            assert!(row("Internet").starts_with("No:"));
             continue;
         }
         if action == ActionKind::ServiceUpdate {
@@ -544,6 +568,37 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             );
             continue;
         }
+        if matches!(action, ActionKind::RouteAdd | ActionKind::RouteRemove) {
+            // Every argument is on the card, with the edge that serves it and the reach in words.
+            let shown: Vec<(&str, &str)> = details
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(shown[0], ("Address", "https://app.example.com"));
+            if action == ActionKind::RouteAdd {
+                assert_eq!(shown[1], ("Instance", "web"));
+                assert_eq!(shown[2], ("Project", "default"));
+                assert_eq!(shown[3], ("Port", "8080"));
+                assert_eq!(shown[4].0, "Reach");
+                assert!(shown[4].1.contains("tailnet") && shown[4].1.contains("403"));
+                assert_eq!(shown[5].0, "Edge");
+                for field in action.params_schema()["properties"]
+                    .as_object()
+                    .expect("properties")
+                    .keys()
+                {
+                    assert!(
+                        ["hostname", "instance", "project", "port", "reach"]
+                            .contains(&field.as_str()),
+                        "route_add field {field} is not on the card"
+                    );
+                }
+            } else {
+                assert_eq!(shown[1].0, "Edge");
+                assert!(shown[2].1.contains("not touched"));
+            }
+            continue;
+        }
         if action == ActionKind::FunctionRemove {
             let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
             assert_eq!(labels, ["Function", "Effect"]);
@@ -569,6 +624,43 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     ("Disk", "100GiB"),
                 ]
             );
+            continue;
+        }
+        if action == ActionKind::ServiceReconfigure {
+            // Every change the approval binds has its row; a secret and a link's value by name only.
+            let shown: Vec<(&str, &str)> = details
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(
+                shown,
+                [
+                    ("Name", "nats"),
+                    (
+                        "Changes",
+                        "environment values 1 added, 2 changed, 1 removed; 1 secret; its ports; its low-level container settings"
+                    ),
+                    ("Env OLD", "removed"),
+                    ("Env MODE", "changed: two (was: one)"),
+                    (
+                        "Env TOKEN",
+                        "added: holds the secret TOKEN (value not shown)"
+                    ),
+                    (
+                        "Env DATABASE_URL",
+                        "changed: from the link to pg (value not shown)"
+                    ),
+                    ("Secret TOKEN", "added: secret, value set separately"),
+                    ("Ports", "4222, 8222 (was: 4222)"),
+                    (
+                        "Low-level container settings (raw.lxc)",
+                        "lxc.sched.core=0 (was: none)"
+                    ),
+                    ("Effect", shown[9].1),
+                    ("Tenant", "abcdefgh"),
+                ]
+            );
+            assert!(shown[9].1.contains("restarts it once"));
             continue;
         }
         // With no plan read from the move journal, a move's card names the plan, the target and each instance.
@@ -670,6 +762,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (ActionKind::ServiceCreate, "destinations") => "Private network",
                 (_, "templateDigest") => "Template content",
                 (ActionKind::ServiceCreate, "registry") => "Registry",
+                (ActionKind::ServiceCreate, "rawLxc") => arca::action_proposal::RAW_LXC_LABEL,
                 _ => panic!("{action:?} field {field} has no owner label"),
             };
             let row = details
@@ -688,6 +781,26 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     row.value
                 );
                 seen += 1;
+                continue;
+            }
+            // The container's raw.lxc is shown whole, and a line that may loosen its isolation says so in words.
+            if field == "rawLxc" {
+                assert_eq!(
+                    row.value,
+                    "lxc.no_new_privs=1, lxc.mount.entry=/srv srv none bind 0 0"
+                );
+                let isolation: Vec<&str> = details
+                    .iter()
+                    .filter(|row| row.label == "Isolation")
+                    .map(|row| row.value.as_str())
+                    .collect();
+                assert_eq!(
+                    isolation,
+                    [
+                        "This line may loosen the container's isolation: lxc.mount.entry=/srv srv none bind 0 0"
+                    ]
+                );
+                seen += 1 + isolation.len();
                 continue;
             }
             // The fields that are not strings are shown in words.
@@ -2097,7 +2210,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(all.len(), 26);
+    assert_eq!(all.len(), 29);
     assert_eq!(
         failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
         format!(

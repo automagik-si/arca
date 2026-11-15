@@ -24,6 +24,7 @@ pub enum ArcaAction {
     ServiceCreate,
     ServiceRemove,
     ServiceUpdate,
+    ServiceReconfigure,
     ServiceImport,
     ServiceRelease,
     ServicePublish,
@@ -51,6 +52,11 @@ pub enum ArcaAction {
     HostNetworkRestore,
     InstanceMove,
     InstanceMoveFinish,
+    /// The owner lets an MCP client act on this node with the scope it asked for (OAuth, `crate::mcp_oauth` in `arca`).
+    /// The target is the client's id; the approval changes nothing in the kernel and is spent at the consent page.
+    McpAuthorize,
+    RouteAdd,
+    RouteRemove,
 }
 
 impl ArcaAction {
@@ -66,6 +72,7 @@ impl ArcaAction {
             Self::ServiceCreate => "service_create",
             Self::ServiceRemove => "service_remove",
             Self::ServiceUpdate => "service_update",
+            Self::ServiceReconfigure => "service_reconfigure",
             Self::ServiceImport => "service_import",
             Self::ServiceRelease => "service_release",
             Self::ServicePublish => "service_publish",
@@ -91,6 +98,9 @@ impl ArcaAction {
             Self::HostNetworkRestore => "host_network_restore",
             Self::InstanceMove => "instance_move",
             Self::InstanceMoveFinish => "instance_move_finish",
+            Self::McpAuthorize => "mcp_authorize",
+            Self::RouteAdd => "route_add",
+            Self::RouteRemove => "route_remove",
         }
     }
 
@@ -106,6 +116,7 @@ impl ArcaAction {
             "service_create" => Some(Self::ServiceCreate),
             "service_remove" => Some(Self::ServiceRemove),
             "service_update" => Some(Self::ServiceUpdate),
+            "service_reconfigure" => Some(Self::ServiceReconfigure),
             "service_import" => Some(Self::ServiceImport),
             "service_release" => Some(Self::ServiceRelease),
             "service_publish" => Some(Self::ServicePublish),
@@ -131,6 +142,9 @@ impl ArcaAction {
             "host_network_restore" => Some(Self::HostNetworkRestore),
             "instance_move" => Some(Self::InstanceMove),
             "instance_move_finish" => Some(Self::InstanceMoveFinish),
+            "mcp_authorize" => Some(Self::McpAuthorize),
+            "route_add" => Some(Self::RouteAdd),
+            "route_remove" => Some(Self::RouteRemove),
             _ => None,
         }
     }

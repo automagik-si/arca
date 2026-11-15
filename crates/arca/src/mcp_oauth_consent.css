@@ -1,0 +1,50 @@
+/* The MCP consent page: the approval page's tokens, one card. */
+:root {
+  color-scheme: light dark;
+  --arca-bg: #f4f4f7;
+  --arca-surface: #ffffff;
+  --arca-ink: #0c0d11;
+  --arca-muted: #5d6170;
+  --arca-line: rgba(12, 13, 17, .12);
+  --arca-accent: #5b54f9;
+  --arca-on-accent: #ffffff;
+  --arca-ok-ink: #0e7a3c;
+  --arca-warn-ink: #9a5b00;
+  --arca-warn-soft: rgba(224, 138, 0, .1);
+  --arca-bad: #d4343a;
+  --arca-font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --arca-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --arca-bg: #0b0b0f;
+    --arca-surface: #15161c;
+    --arca-ink: #f1f2f6;
+    --arca-muted: #a4a9b7;
+    --arca-line: rgba(255, 255, 255, .13);
+    --arca-accent: #8b85ff;
+    --arca-on-accent: #0c0d11;
+    --arca-ok-ink: #4ade80;
+    --arca-warn-ink: #f5b14c;
+    --arca-warn-soft: rgba(245, 177, 76, .12);
+    --arca-bad: #ff6b70;
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--arca-bg); color: var(--arca-ink); font: 15px/1.5 var(--arca-font); }
+main { max-width: 34rem; margin: 48px auto; padding: 28px 16px; background: var(--arca-surface); border: 1px solid var(--arca-line); border-radius: 14px; }
+h1 { font-size: 22px; line-height: 1.25; margin: 0 0 16px; overflow-wrap: anywhere; }
+p { margin: 0 0 12px; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 0 0 16px; }
+dt { color: var(--arca-muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+#redirect-host { font-family: var(--arca-mono); font-size: 16px; }
+code { font-family: var(--arca-mono); }
+.warn { background: var(--arca-warn-soft); color: var(--arca-warn-ink); padding: 8px 12px; border-radius: 8px; font-weight: 600; }
+.actions { display: flex; gap: 12px; flex-wrap: wrap; margin: 20px 0 12px; }
+button { font: inherit; padding: 10px 18px; border-radius: 999px; border: 1px solid transparent; background: var(--arca-accent); color: var(--arca-on-accent); cursor: pointer; }
+button.secondary { background: transparent; color: var(--arca-ink); border-color: var(--arca-line); }
+button:disabled { opacity: .5; cursor: default; }
+#status[data-tone="ok"] { color: var(--arca-ok-ink); }
+#status[data-tone="bad"] { color: var(--arca-bad); }
+@media (max-width: 480px) { main { margin: 0; border-radius: 0; border-width: 0; } dl { grid-template-columns: 1fr; gap: 2px; } dt { margin-top: 8px; } }

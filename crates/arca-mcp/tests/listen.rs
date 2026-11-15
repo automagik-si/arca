@@ -276,7 +276,12 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "registry_list",
             "instance_move_preflight",
             "instance_move_plan",
-            "instance_move_status"
+            "instance_move_status",
+            "github_connect_status",
+            "github_bindings",
+            "github_audit",
+            "os_update",
+            "route_list"
         ]
     );
 }

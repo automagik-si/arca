@@ -43,9 +43,9 @@ use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
     ActionExecutor, ActionSlot, AlertsExport, AlertsHandler, AlertsPublished, ApprovalStatus,
-    Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, Published,
-    SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
-    plan_handlers_served, spawn_watcher,
+    Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, OsUpdateHandler,
+    OsUpdatePublished, Published, SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler,
+    WatchHandler, new_sampler, now_ms, plan_handlers_served, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -286,6 +286,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let published = Published::default();
+    let os_update = OsUpdatePublished::default();
     let alerts = AlertsPublished::default();
     let targets = CheckTargets {
         incus: cfg.incus.socket.clone(),
@@ -297,7 +298,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
         .with_checks(targets)
         .with_watch(Arc::clone(&watch))
-        .with_host_network(cfg.host_network.status.clone());
+        .with_host_network(cfg.host_network.status.clone())
+        .with_os_update(os_update.clone());
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let reader = Arc::new(Mutex::new(reader));
@@ -356,6 +358,12 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             "node_metrics",
             Arc::new(MetricsHandler {
                 published: published.clone(),
+            }),
+        )
+        .handle(
+            "os_update",
+            Arc::new(OsUpdateHandler {
+                published: os_update,
             }),
         )
         .handle("watch_report", watch)
@@ -648,6 +656,26 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 Failure::Runtime(format!("the approval requests cannot be opened: {e}"))
             })?,
     );
+    // The GitHub signer: its store is `<stateDir>/github`, and a node that only looks has none of its verbs.
+    let github_signer = if kernel_mode {
+        let signer = crate::github_signer::Signer::open(
+            &cfg.state_dir,
+            crate::github_api::Endpoints::github(),
+            clock.clone(),
+        )
+        .map_err(|e| {
+            Failure::Runtime(format!(
+                "the GitHub signer cannot be opened: {}",
+                e.message()
+            ))
+        })?;
+        for (verb, handler) in crate::github_handlers::handlers(&signer) {
+            server = server.handle(verb, handler);
+        }
+        Some(signer)
+    } else {
+        None
+    };
     for (verb, handler) in crate::approval_requests::handlers(
         Arc::clone(&kernel),
         clock.clone(),
@@ -672,6 +700,37 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             clock: clock.clone(),
             actions: actions.clone(),
         }));
+    }
+    // MCP authorization: with an approval page, the page is the OAuth authorization server for `<origin>/mcp`, and the MCP
+    // door also accepts the short-lived tokens it issues (see `crate::mcp_oauth`). The stored tokens work as before.
+    let page_gate = door
+        .clone()
+        .filter(|door| door.twin().is_some())
+        .map(|door| {
+            let gate: crate::approve_page::PageGate = Arc::new(move || door.page_refusal());
+            gate
+        });
+    let oauth = match &cfg.approval_origin {
+        Some(origin) => Some(Arc::new(
+            crate::mcp_oauth::OAuth::open(
+                origin,
+                &crate::approve_page::rp_id_of(origin),
+                Arc::clone(&kernel),
+                clock.clone(),
+                &cfg.state_dir,
+            )
+            .map_err(|e| {
+                Failure::Runtime(format!("the MCP authorization store cannot be opened: {e}"))
+            })?
+            .with_gate(page_gate),
+        )),
+        None => None,
+    };
+    if let Some(oauth) = &oauth {
+        server = server.oauth(
+            Arc::clone(oauth) as Arc<dyn arca_mcp::IssuedTokens>,
+            oauth.resource_metadata_url(),
+        );
     }
     let router = server.router();
     let linked_hosts = cfg
@@ -713,6 +772,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Some(syncer) => page.with_peer_sync(syncer.clone()),
             None => page,
         };
+        let page = match &github_signer {
+            Some(signer) => page.with_github(signer.clone()),
+            None => page,
+        };
         // The exact line, with the config's whole path, is for the page of this machine alone, which only this
         // machine's accounts can load. A page under any other origin may be public: it keeps the line with a
         // placeholder, and shows nobody the node user's name or where its files are.
@@ -730,8 +793,19 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The services socket serves the MCP routes alone: a service with kernel access connects to it, and it never
     // carries the approval page, whose routes need no token. It is taken here, before the page is merged anywhere.
     let services_router = router.clone();
+    // The push intake goes wherever the page goes: a person's service reaches it at the page's own origin. So does the
+    // MCP authorization server, whose issuer is the page's origin.
     let with_page = |trust_forwarded_for: bool| match &page {
-        Some(page) => router.clone().merge(page.router(trust_forwarded_for)),
+        Some(page) => {
+            let mut merged = router.clone().merge(page.router(trust_forwarded_for));
+            if let Some(signer) = &github_signer {
+                merged = merged.merge(crate::github_page::intake_router(signer.clone()));
+            }
+            if let Some(oauth) = &oauth {
+                merged = merged.merge(oauth.router());
+            }
+            merged
+        }
         None => router.clone(),
     };
     // Where the page is served depends on its origin. An https page is reached through the tailnet listener or a
@@ -745,9 +819,12 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         (router.clone(), with_page(false), with_page(true))
     };
     // The unix socket carries the page as before, and alone carries the setup code for a terminal of the node's user.
-    let router = match &page {
-        Some(page) => with_page(false).merge(page.local_router()),
-        None => router,
+    let router = match (&page, &oauth) {
+        (Some(page), Some(oauth)) => with_page(false)
+            .merge(page.local_router())
+            .merge(oauth.local_router()),
+        (Some(page), None) => with_page(false).merge(page.local_router()),
+        _ => router,
     };
 
     let pid_path = cfg.state_dir.join(SERVE_PID_FILE);

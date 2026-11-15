@@ -1,0 +1,17 @@
+{
+  "name": "arca-edge",
+  "description": "This node's edge: Caddy 2.11.9 with the Cloudflare DNS module (caddybuilds/caddy-cloudflare by digest). It serves the node's routes (route_add): https names passed to instances of this node, certificates by Cloudflare DNS challenge. Arca writes its whole Caddyfile and reloads it. Listens on 443 of one address in kernel.serviceListenAddresses; the port device sends the PROXY header. Set CLOUDFLARE_API_TOKEN (Zone DNS Edit) with service_secret_set. Its create runs only from an approved proposal.",
+  "kind": "oci",
+  "image": "docker.io/caddybuilds/caddy-cloudflare",
+  "digest": "sha256:17505a5e55432764957953787b065f400a1f1a0c280c3b4da2c99ce4746708d6",
+  "entrypoint": ["/bin/sh", "-ec", { "file": "arca-edge.sh" }, "arca-edge"],
+  "ports": [443],
+  "data": { "path": "/data", "uid": 0, "gid": 0, "size": "1GiB" },
+  "env": { "CLOUDFLARE_API_TOKEN": "{{secret:CLOUDFLARE_API_TOKEN}}" },
+  "secrets": ["CLOUDFLARE_API_TOKEN"],
+  "limits": { "cpu": "2", "memory": "512MiB" },
+  "autostart": true,
+  "privatePort": { "port": 443 },
+  "edge": true,
+  "publishable": false
+}

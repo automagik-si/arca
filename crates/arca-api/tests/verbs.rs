@@ -57,6 +57,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "service_logs",
             "service_remove",
             "service_update",
+            "service_reconfigure",
             "service_import",
             "service_release",
             "service_connect",
@@ -106,6 +107,18 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "instance_move",
             "instance_move_status",
             "instance_move_finish",
+            "github_oauth_app_set",
+            "github_connect",
+            "github_connect_status",
+            "github_bindings",
+            "github_audit",
+            "github_runner_mint",
+            "github_mint_job",
+            "github_disconnect",
+            "os_update",
+            "route_add",
+            "route_remove",
+            "route_list",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -137,6 +150,13 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("service_logs", VerbClass::L, Scope::Viewer, false, false),
         ("service_remove", VerbClass::L, Scope::Doctor, true, true),
         ("service_update", VerbClass::L, Scope::Doctor, true, true),
+        (
+            "service_reconfigure",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            true,
+        ),
         ("service_import", VerbClass::L, Scope::Doctor, true, true),
         ("service_release", VerbClass::L, Scope::Doctor, true, true),
         ("gpu_attach", VerbClass::L, Scope::Doctor, true, false),
@@ -221,6 +241,47 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
             true,
             true,
         ),
+        (
+            "github_oauth_app_set",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            false,
+        ),
+        ("github_connect", VerbClass::L, Scope::Operator, true, false),
+        (
+            "github_connect_status",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
+        ),
+        ("github_bindings", VerbClass::L, Scope::Viewer, false, false),
+        ("github_audit", VerbClass::L, Scope::Viewer, false, false),
+        (
+            "github_runner_mint",
+            VerbClass::L,
+            Scope::Operator,
+            true,
+            false,
+        ),
+        (
+            "github_mint_job",
+            VerbClass::L,
+            Scope::Operator,
+            true,
+            false,
+        ),
+        (
+            "github_disconnect",
+            VerbClass::L,
+            Scope::Operator,
+            true,
+            true,
+        ),
+        ("route_add", VerbClass::L, Scope::Doctor, true, false),
+        ("route_remove", VerbClass::L, Scope::Doctor, true, false),
+        ("route_list", VerbClass::L, Scope::Viewer, false, false),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -321,6 +382,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "service_create",
         "service_remove",
         "service_update",
+        "service_reconfigure",
         "service_import",
         "service_release",
         "service_publish",
@@ -344,6 +406,8 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "host_network_restore",
         "instance_move",
         "instance_move_finish",
+        "route_add",
+        "route_remove",
     ];
     let action_proposal = open(
         json!({
@@ -1439,6 +1503,7 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "postgres_delete",
             "service_remove",
             "service_update",
+            "service_reconfigure",
             "service_import",
             "service_release",
             "gpu_detach",
@@ -1452,6 +1517,7 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "function_remove",
             "instance_move",
             "instance_move_finish",
+            "github_disconnect",
         ]
     );
     for v in verbs() {
@@ -1664,7 +1730,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 26);
+    assert_eq!(actions.len(), 29);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));

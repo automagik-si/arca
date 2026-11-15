@@ -973,6 +973,26 @@ apply the key. For an image whose setuid helpers break under the key, moving the
 the service then runs the new image before it takes the key. With no difference, an update to the digest the service
 already runs is the no-op it always was.
 
+A container template may also declare `rawLxc`, a list of extra LXC lines its instance's `raw.lxc` carries beside
+`lxc.no_new_privs=1`, for example `"rawLxc": ["lxc.sched.core=0"]`. Each is `lxc.<key>=<value>` on one line (the key of
+lower-case letters, digits, dots and underscores, at most 256 bytes, at most 16 lines); anything else is refused when
+the template is read. The create writes `raw.lxc` as `lxc.no_new_privs=1` when the template sets `noNewPrivileges`, then
+each declared line in order, and marks the value it wrote in `user.arca.rawlxc`. Every reconcile keeps exactly that
+value: a declared line survives it, and a line nobody declared is replaced, as `raw.lxc` was replaced before. When the
+record declares no line and does not set `noNewPrivileges`, the reconcile removes `raw.lxc` only when it is exactly
+`lxc.no_new_privs=1` or exactly what the mark says Arca wrote, and removes the mark; any other `raw.lxc` is left as it
+is, as before. A service whose template declares no `rawLxc` carries no mark and is created and reconciled as it always
+was. `rawLxc` needs the same step on the node as `noNewPrivileges` (`restricted.containers.lowlevel=allow`), a tenant's
+service and a virtual-machine template are refused it the same way, and the record keeps the lines as `rawLxc`. The
+create's card has a `Low-level container settings (raw.lxc)` row with the container's `raw.lxc` lines whole (the
+proposal fills `rawLxc` in from the template; a call that states it must state exactly the template's), and so does a
+reconfigure's card when they change. Incus applies `raw.lxc` last, so a line can replace what Incus set for the
+container (its root, its AppArmor profile, its namespaces and network, a mount, a hook, a limit). On both cards, every
+line therefore gets an `Isolation` row of its own, in plain words and naming the line, `This line may loosen the
+container's isolation: <line>`, except the few lines Arca knows are harmless: any `lxc.sched.core` line and
+`lxc.no_new_privs=1`. Nothing is refused for it: the owner decides on the card. An existing service takes new lines with `service_reconfigure` (see "Reconfiguring a service from its
+template").
+
 If the owner later sets `restricted.containers.lowlevel` back to `block`, Incus refuses every later write of the
 instance config of a service that has the key, since the whole config is checked: a secret, a link or an environment
 change then fails for that service. Dropping the key still works, through the update above.
@@ -1670,6 +1690,50 @@ version wrote, a migration for example, which the old version may not read. A vi
 adopted service are refused. Where a snapshot was taken it stays, named in the answer, for you to delete or restore
 by hand.
 
+### Reconfiguring a service from its template
+
+`service_reconfigure` takes `{name, tenant?}` through `action_propose` and makes a container service what its CURRENT
+template says, behind one owner card, without a rebuild: the image and the data volume are not touched. Install the
+changed template first (`arca templates install`), then propose `{"action": "service_reconfigure", "args": {"name":
+"web"}}`; any viewer may propose it, as every action, and only the owner's approval runs it. It is a destructive verb
+and takes the optional `confirm`. The node renders the service again from the installed template and works out the
+difference from its record, which it writes into the proposal as `changes`:
+
+- `environment`: one row per key that changes, removed first, then changed, then added, each in key order. A value the
+  template gives with no secret in it is shown, with what it was when the record held it as plain text (`changed: two
+  (was: one)`). A value that holds a secret is shown by its key and the secrets' names (`holds the secret API_KEY
+  (value not shown)`); a value a link gives (what `service_connect` handed the service) is shown by the link, never by
+  value, and is rendered again from the provider's template now. A key the template no longer gives is removed; one
+  whose secret is not set yet is removed with the secret named, and comes back once the value is set.
+- `secrets`: a secret the template declares that the service does not hold is shown as `added: secret, value set
+  separately` (set it afterwards with `service_secret_set`, which renders the keys that use it), or, when the template
+  says `generate`, as made by Arca now. A secret the service holds that the template no longer declares is removed
+  from the record; its file stays. A secret's value never appears on the card, in the answer or in the journal.
+- `ports`, `rawLxc` and `noNewPrivileges`: `{from, to}` when the template says otherwise; `rawLxc` is the container's
+  `raw.lxc` lines whole, `lxc.no_new_privs=1` among them when it is set. A tenant's service keeps its low-level
+  container settings.
+
+The card shows the service, a row counting the changes (`environment values 43 added, 2 changed, 1 removed; 4
+secrets; its low-level container settings`), one row for each environment key and secret that changes, the ports and
+the low-level settings, and what happens: the service is restarted once if it runs. The approval binds `changes`. When
+the approved call runs, it works the difference out again and refuses, changing nothing, when it is not the one on the
+card ("the service or its template changed since the owner's card was made: propose it again"), so what is applied is
+exactly what the owner approved. A call without an approved card is refused the same way, naming `action_propose`.
+
+The run then, once each: makes the secrets the template generates, saves the record (the node writes the instance's
+environment, `raw.lxc`, `user.arca.ports` and the ACL from it), restarts the service if it runs, and reads the
+instance's config back. The answer carries `reconfigured`, the `changes` it applied, `restarted`, `running`, and
+`readBack: {matches, differs}`, where `differs` names the keys (or `raw.lxc`) whose value Incus holds is not what was
+applied, never a value. A write the node refuses, or a restart that fails, puts the old record back and starts the
+service again, and the answer says so. Each step is a line in `service-updates.jsonl` with key and secret names only.
+A card whose only difference is a secret whose value is set separately writes nothing and restarts nothing. A secret
+the run generates is shown as generated on the card and in the answer, and is applied on the first approval. The
+record is read again under the node's write gate right before it is written: when a link, a secret, a port or the
+low-level settings changed since the plan was made (a `service_connect` or `service_secret_set` meanwhile), nothing is
+written and the call says to propose it again. A virtual
+machine, a function and an adopted service are refused. `service_reconfigure` and `service_update` of one service never
+run at once.
+
 ### A service that follows Automagik's releases
 
 A service made from the `automagik-server` template follows Automagik's releases by default, so it stays easy to
@@ -1907,7 +1971,70 @@ What this is not: a client's `accept` is the client's answer. A hook of the clie
 can answer a form with no dialog) can give it with no person at the keyboard, so the admin token is a standing right to
 approve, held by whoever holds the token and its client. Keep it to the one terminal that should have it, and `arca
 token mint --replace` when it moves. Step-up authorization (a `403 insufficient_scope` that sends the person to the
-authorization server) would put the approval where the server can tell a person approved; it is not built here.
+authorization server) puts the approval where the server can tell a person approved; it is built for apps connected by
+their URL (next section), and never grants `admin`.
+
+### Connecting an app by its URL (MCP authorization)
+
+A node with an approval page (`approvalOrigin`) is also the OAuth 2.1 authorization server of its own MCP door, as the MCP
+specification's authorization chapter asks (revision 2025-11-25; 2026-07-28 keeps it). An MCP client such as Claude Code
+or Claude Desktop is given only the URL, `<approvalOrigin>/mcp`. Nobody copies a token.
+
+```text
+claude mcp add --transport http arca https://arca.example.com/mcp
+```
+
+In Claude Desktop, add a custom connector with the same URL. Then, in the client, connect (Claude Code: `/mcp`, pick
+`arca`, Authenticate). The browser opens Arca's consent page, which shows:
+
+- the app's name, as the app registered it, and a warning when another app registered the same name;
+- the host its answer goes to (`127.0.0.1` for an app on the computer you are using);
+- the scope it asks for, in words: `viewer` looks, `doctor` also creates, changes, starts and stops (what erases
+  still waits for your passkey), `operator` also lists tokens and settles plans.
+
+**Approve with passkey** signs you in and approves in one tap: the passkey signs a statement (action `mcp_authorize`, the
+app's client id, a digest of the whole request) that the kernel checks as it checks every approval, owner passkeys only,
+and spends once. **Don't allow** sends the app `access_denied`. A request that is wrong before you see it (no PKCE, a
+foreign `resource`, `admin`) is answered on the page itself while the app has never been approved, and sent back to the
+app only once you approved it before, so the page's address never becomes a link to a stranger's site.
+
+The app then holds an access token for one hour and a refresh token for thirty days. Each refresh token works once and is
+replaced at each refresh; one used a second time ends the grant, since someone holds a copy. A refresh may narrow the scope
+and never widen it past what you approved. Narrowing applies to the whole grant, its live tokens included, until a
+refresh that names no scope puts back what you approved. A token that is
+expired or revoked is answered `401` with `error="invalid_token"`. An app asks for `viewer` first; when it calls a verb above its scope, the door answers `403` with
+`WWW-Authenticate: Bearer error="insufficient_scope", scope="<scope the verb needs>"`, and the app asks you again for that
+scope. `admin` is never granted to an app: the admin token stays a stored one.
+
+The approval page lists the connected apps under **Connected apps**, each with the most it may do across its approvals
+and when it was last used, and **Disconnect**. On the node's own terminal:
+
+```text
+arca oauth list [--config <file>]
+arca oauth revoke <client id> [--config <file>]
+```
+
+Both act at once: the app's tokens stop working, and it must be approved again. Stored tokens (`arca token mint`) work
+exactly as before, beside the apps.
+
+What the node serves, all on `approvalOrigin`:
+
+| Path | What |
+| --- | --- |
+| `GET /.well-known/oauth-protected-resource/mcp` (and without `/mcp`) | RFC 9728 metadata: the resource `<origin>/mcp`, this issuer, the scopes |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata: `code` with PKCE `S256` only, public clients (`none`), the RFC 9207 `iss` |
+| `POST /oauth/register` | RFC 7591 registration: redirect URIs are exact, and `https`, or `http` on `127.0.0.1`, `[::1]` or `localhost` |
+| `GET /oauth/authorize` | the consent page; `resource` (RFC 8707) must be `<origin>/mcp` |
+| `POST /oauth/token` | `authorization_code` with the PKCE verifier, `refresh_token` with rotation |
+| `POST /oauth/revoke` | RFC 7009: an access token alone, or a refresh token and its grant; `503` when the revocation could not be saved (the grant has ended, and the journal says `"saved":false`); the retry saves it before it answers `200` |
+
+Files in the state directory: `mcp-oauth.json` (the apps and their grants, with only the SHA-256 of each token, mode 0600)
+and `mcp-oauth-journal.jsonl` (each registration, grant, denial and revocation, and each refresh token or code used twice;
+never a token). Consent requests (ten minutes) and codes (one minute, one use) are kept in memory only.
+
+The node must be reached at `approvalOrigin` by the app too: the reverse proxy or the tailnet listener that serves the
+page serves these routes and `/mcp` under the same name. A page at `http://localhost:<port>` serves an app on the same
+machine.
 
 ### Protocol versions
 
@@ -2142,6 +2269,33 @@ newest successful read, so a late failure does not label averaged figures. A win
 the failure reason. The failure and provenance fields are additions: `cpu.coresKnown`, `memory.usedBytes`, `cpu.reason`,
 `load.reason` and `memory.reason`. Every field the earlier schema carried keeps its name and meaning, and a local node's
 figures do not change.
+
+## OS update state: `os_update`
+
+`os_update` is a viewer read of the node's Arca OS update state. The sampler reads incus-osd's update document,
+`GET /os/1.0/system/update`, with the Secure Boot and TPM reading every 5 minutes, and the verb answers from that reading:
+it sends no request of its own. When the document's health names no current version, the same read also asks `GET /os/1.0`
+for `environment.os_version`. `node_metrics` stays the host metrics domain; the update state changes on a slower cadence
+and has its own contract.
+
+| Field | From |
+|---|---|
+| `known` | `false` when the update document could not be read: a plain Incus that answers 404, a failed read, or before the first read. Never an error. |
+| `asOf` | When the read ran, epoch milliseconds. |
+| `version` | `state.health.current_version`, else `environment.os_version` of `/os/1.0`. |
+| `channel`, `checkFrequency` | `config.channel` and `config.check_frequency`, verbatim (`6h`, `never`). |
+| `automatic` | `!config.auto_updates_off` (incus-osd omits the field when it is false). |
+| `lastCheckAt` | `state.last_check`, when it is a usable RFC 3339 time. |
+| `lastSuccessAt` | The check time of the newest check this kernel saw complete (the same memory the update alert uses). |
+| `lastUpdatedVersion`, `lastUpdatedAt` | The version a completed `… has been updated to version V` status named, kept only when it is a plain version token, and the check time read with it. |
+| `needsReboot`, `pendingVersion`, `previousVersion`, `goodVersion`, `lastResult`, `lastReason` | `state.needs_reboot` and `state.health.*`, verbatim. |
+| `lastErrorKind` | `state.last_error_kind` as the OS classified it: `network`, `parse`, `signature`, `trust` or `other`; `null` when absent or empty. The kernel never classifies an error. |
+| `trust` | `embeddedCaFingerprint`, `presentedCaFingerprint` (SHA-256, hex pairs joined by colons), `failures` and `escalated` from `state.embedded_ca_fingerprint`, `state.presented_ca_fingerprint`, `state.trust_failures` and `state.trust_escalated`; `null` when the OS reports none of them. |
+
+Every field is present, and `null` when unknown. The raw `state.last_error` text is never read, and the status text is not
+kept beyond the version token. `lastResult` and `lastReason` are the OS's own words, so the verb is marked `untrusted`.
+The canvas's Fleet view reads this verb on every configured host. The update server's newest version for a channel is not
+in the update document, so the view compares a node with the newest version reported on the fleet's own nodes.
 
 ## Starting, stopping and restarting instances
 
@@ -2770,9 +2924,10 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-four gated
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-seven gated
 service, database, GPU, storage, snapshot, instance, function or tenant verbs: `service_create`, `service_remove`,
 `service_update` (see [Updating a service to a new image digest](#updating-a-service-to-a-new-image-digest)),
+`service_reconfigure` (see [Reconfiguring a service from its template](#reconfiguring-a-service-from-its-template)),
 `service_import`, `service_release`
 (see [Importing a service another manager created](#importing-a-service-another-manager-created)), `service_publish`,
 `service_unpublish`,
@@ -2781,8 +2936,10 @@ service, database, GPU, storage, snapshot, instance, function or tenant verbs: `
 `instance_stop` or
 `instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)).
 `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and
-`deploy_remove` (see [Tenants](#tenants)), are proposed the same way. The canvas Doctor proposes twenty-two of them
-(not `service_update` and not `host_network_restore`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
+`deploy_remove` (see [Tenants](#tenants)), and `route_add` and `route_remove` (see
+[Routes](#routes-names-for-your-instances-served-by-the-nodes-edge)), are proposed the same way. The canvas Doctor
+proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`, `route_add` or
+`route_remove`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
 came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a
 function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against
 that verb's own parameter schema, with
@@ -2793,7 +2950,7 @@ before its first call. The union sits inside `args`, never at the top of the inp
 one. `x-arca-by: "action"` tells the door to hold `args` to the branch `action` names, so a refusal is in that branch's
 own words (`/args: missing required field name`), not "matches none". A field the kernel fills in when the proposal is
 made (a GPU verb's `project`, `kind` and `uuid`; `storage_add`'s disk facts; the snapshot verbs' `name`, `kind`, pools
-and folder facts) takes any value in its branch and says so: the kernel removes or replaces what was sent, as it did
+and folder facts; `service_reconfigure`'s `changes`) takes any value in its branch and says so: the kernel removes or replaces what was sent, as it did
 before the branches. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses the image the node's `postgres-autopg`
 template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is
@@ -4800,6 +4957,91 @@ managed network has created the bridge:
 `firewall-cmd --zone=trusted --change-interface=arcak-svcbr --permanent` and `firewall-cmd --reload`. Arca cannot do
 it: it holds no rights over the host firewall.
 
+## Routes: names for your instances, served by the node's edge
+
+A route gives an instance of this node a name a person types, for example `https://app.example.com`. Each node has one
+**edge**, a Caddy container made from the shipped `arca-edge` template, and every route of the node is a site on it. The
+edge gets each name its own certificate by the ACME DNS challenge through Cloudflare, so the name never has to be on the
+internet. Arca writes the edge's whole config from the routes: nothing in it is edited by hand, and the next route change
+replaces it.
+
+A route is kept in the edge's own desired-state record, so it is signed node state like the rest of the service:
+
+| Field | What it is |
+|-------|------------|
+| `hostname` | The name, lowercase, at least two labels, no wildcard. One route per name. |
+| `instance`, `project` | The Incus instance that answers, in any project of this node: an Arca service, or an instance Arca only knows (such as one in `default`). `project` defaults to the service project. |
+| `port` | The instance's tcp port. The edge speaks plain HTTP to it. |
+| `reach` | `private` (the default): only the local networks and the tailnet (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10) get through, every other address gets 403. `public`: no address filter. |
+| `address` | The instance's own IPv4 address, read from Incus when the route is added: the edge connects there. |
+
+### The edge
+
+1. **The address it listens on.** The template listens on port 443 of one host address that the node's config names
+   in `kernel.serviceListenAddresses`, as [A service port on one host address](#a-service-port-on-one-host-address)
+   explains, for example the node's own LAN address `198.51.100.7`. Its create therefore runs only from a proposal the
+   owner approves: `action_propose` with `{"action": "service_create", "args": {"name": "edge", "template":
+   "arca-edge"}}`.
+2. **Its Cloudflare token.** `service_secret_set` with `{"name": "edge", "key": "CLOUDFLARE_API_TOKEN", "value":
+   "<token>"}`. The token needs Zone, DNS, Edit on each zone whose names the edge serves. It is kept like every
+   template secret (a private file, and the container's environment).
+3. **Start it.** `instance_start` with `{"project": "arcak-svc", "instance": "edge"}`. Certificates are kept in its
+   data volume (`/data`), so an update keeps them.
+
+The edge's port device sends the PROXY protocol header (`proxy_protocol` on the Incus proxy device, set only for an
+edge), and Caddy reads each client's own address from it. Without it every visitor would come from the device's
+loopback and a private route could not tell the local network from the internet. The edge speaks HTTP/1.1 and HTTP/2
+(the device carries tcp, not the UDP of HTTP/3).
+
+### `route_add`, `route_remove`, `route_list`
+
+- **`route_add`** `{"hostname": "app.example.com", "instance": "web", "project": "default", "port": 8080}` (and
+  `"reach": "public"` for a name with no address filter). Arca reads the instance's address, records the route in the
+  edge's record, opens that address and port in the edge's firewall rules, writes the edge's Caddyfile and reloads
+  Caddy. A name that already has a route is pointed at the new instance and port: that is how a route is moved by hand.
+  It runs from a proposal the owner approves (its card names the address, the instance, the port, the reach in words and
+  the edge that serves it), or directly for a `doctor` token, as `service_connect` does.
+- **`route_remove`** `{"hostname": "app.example.com"}`: the site leaves the edge's config, Caddy is reloaded and the
+  edge's rules no longer open the instance's port for it. The instance is not touched. A name with no route still has
+  the config written again and reloaded (`removed: false`), so a remove the edge did not take is retried by removing
+  again.
+- **`route_list`** `{}` (viewer): every route, and the edge with the address a person reaches it on.
+
+The answer of a write says `applied` (the edge took the new config: it was written into the edge, and reloaded when the
+edge runs) and `reloaded` (Caddy reloaded it). An edge that is stopped gets the file and reads it when it starts. A
+config Caddy refuses keeps the old one serving, and the old one is put back in its file, so a restart serves it too: the
+change stays recorded, the answer says why, and the same call again, or the next route change, writes it once more.
+
+Once Caddy takes a config, the edge keeps a copy on its data volume (`/data/Caddyfile`). An update of the edge rebuilds
+its root from the new image, and a re-created edge starts from the image too; either way the template's entrypoint puts
+the kept copy back before Caddy starts, so the routes come back with the edge.
+
+What the edge reaches:
+
+- **An instance outside Arca's projects** keeps its own firewall. Arca never writes in `default`: allow tcp to the
+  route's port from the edge's address (`route_list` shows it under `edge.ipv4`) in that instance's own ACL. Traffic
+  between two Incus bridges keeps its source address, so the instance sees the edge's own address, not its bridge's
+  gateway.
+- **An Arca service of this node** is reached through a link from the edge: run `service_connect` with `{"from":
+  "edge", "to": "<service>"}` first, and use the port the link opens (the service's first port).
+- An application that checks where requests come from (Home Assistant's `trusted_proxies`, for example) names the
+  edge's address. The client's own address reaches it in `X-Forwarded-For`.
+
+### Names
+
+The name must lead the person's machine to the edge. For a private route, point the name's `A` record at the address
+the edge listens on (a LAN address, or a tailnet address), not proxied by Cloudflare; the certificate comes by the DNS
+challenge whatever the record says. Until Arca writes these records itself, add them in the Cloudflare dashboard. To
+check a route before the record moves, ask the edge directly:
+
+```sh
+curl --resolve app.example.com:443:198.51.100.7 https://app.example.com/
+```
+
+A public name through a Cloudflare Tunnel ([Publishing a service through a Cloudflare
+Tunnel](#publishing-a-service-through-a-cloudflare-tunnel)) still points the tunnel's route at the service itself;
+routing the tunnel through the edge is a later step.
+
 ## Publishing a service through a Cloudflare Tunnel
 
 A Cloudflare Tunnel puts one of your services on the public internet under your own domain, for example
@@ -5166,7 +5408,10 @@ since it is where the pool's credential will be used.
 | `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
 | `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
 | `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. Never below the number of classes: a create with less is refused ("A place for every class" below). |
-| `allowDefaultRunnerGroup` | no | `true` lets the pool start on the organisation's default runner group. Leave it out. |
+| `aptPackages` | yes | The Ubuntu packages added to the runner image, which the machine builds once ("The runner image's packages" below). The default is `["libatomic1", "build-essential", "zstd", "wget", "skopeo", "xz-utils", "zip", "rsync", "gh"]`. Given at create, it replaces the whole list, so name the defaults too when you add one; `[]` runs the runner image as it is. |
+| `registration` | yes | `jit` (the default): a just-in-time runner per job, registered with the pool's App or token. `registration-token`: no GitHub credential at all; each slot is registered once with a registration token and keeps its runner between jobs ("Without a GitHub credential" below). |
+| `runnerGroup` | yes | With `registration-token`, the runner group's name as GitHub shows it (config.sh names a group by name). Required for an organisation. |
+| `allowDefaultRunnerGroup` | no | `true` lets a `jit` pool start on the organisation's default runner group (the registration-token mode does not read it; it takes the default group with a warning). Leave it out. |
 | `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |
 | `dockerCache`, `dependencyCache` | no | The disk the Docker layer caches and the dependency caches may use, over all slots. |
 | `runnerImage`, `dockerImage` | no | The runner's and the Docker daemon's public images, pinned by digest. |
@@ -5264,6 +5509,62 @@ boot failed has no pool; remove it with `service_remove` and create it again onc
 that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]`, or
 `[self-hosted, linux, x64, arca-large]` for a large slot.
 
+### Without a GitHub credential: a registration token
+
+Some organisations do not allow an App or a token that can register runners anywhere in the organisation. For them the
+pool has a second mode, `registration` set to `registration-token`, in which it holds no GitHub credential at all:
+
+1. Create the pool with `"registration": "registration-token"` and `"runnerGroup": "<the group's name>"` (for
+   example `{"registration": "registration-token", "runnerGroup": "arca-pool"}` beside `url` and `classes`).
+   `runnerGroupId` is not used in this mode.
+2. An organisation owner opens "Settings", "Actions", "Runners", "New self-hosted runner" and copies the token in
+   the `./config.sh --token` line. It lasts one hour and can only register runners.
+3. `service_secret_set` with `{"name": "ci-pool", "key": "GITHUB_REGISTRATION_TOKEN", "value": "<the token>"}`, then
+   `instance_start`. On a pool that runs, the same token written as `/etc/arca-secrets/GITHUB_REGISTRATION_TOKEN`
+   inside the machine (root's, mode 0600) is picked up within seconds, with no restart.
+
+What the pool does with it:
+
+- Each slot without a registration runs the runner's own `config.sh --unattended --replace` once, with the group,
+  the class's labels (GitHub adds `self-hosted`, `linux` and `x64` itself) and the name
+  `<pool>-<the pool's id>-<slot>`, and not `--ephemeral`. The pool's id keeps two pools of one name in one
+  organisation from taking each other's runners (`--replace` replaces a runner of the same name). The token reaches config.sh as a file on `/run` that its container reads into
+  `ACTIONS_RUNNER_INPUT_TOKEN`: it is on no command line, in no log and in no record of Docker's.
+- The runner's registration (`.runner`, `.credentials`, `.credentials_rsaparams`) is kept per slot in
+  `/var/lib/arca-runner-pool/registered/<slot>`, a folder only root enters (0700; the files 0600). Each runner has its
+  own credential, which can do nothing but connect that one runner.
+- The token is deleted once every slot is registered, or an hour after the pool first saw it, when GitHub no longer
+  takes it. Arca keeps the secret's value and writes it into the machine again at every start: the same token written
+  again is as old as it was and is deleted without being tried, so the stored value need not be cleared. A slot that
+  has its registration starts without one, also after a restart of the controller or of the machine. A refused token
+  is said in `service_logs` with config.sh's own last lines (`config.sh did not register the runner ...`), and the
+  slot tries again with backoff until the token is deleted; its whole output is in
+  `/var/log/arca-runner-pool/register-<slot>.log` inside the machine.
+- The pool asks GitHub's API nothing in this mode: it does not read the runner group, does not take stale runners
+  off, and does not retire an idle runner to give its place to another class. So give every slot a place
+  (`maxSlots` at least the number of slots): a persistent runner keeps its place.
+- When GitHub no longer has a slot's registration (the runner was removed on GitHub, the pool was off for more than
+  14 days, after which GitHub drops a persistent runner, or another runner took its name), its runner says so as it
+  starts. The slot then clears its registration and says in `service_logs`: `GitHub no longer has the registration of
+  its runner ...`. To bring it back, drop a new token: `service_secret_set` of `GITHUB_REGISTRATION_TOKEN`, then
+  `instance_start`. Nothing is done inside the machine. Slots that still have their registration keep running.
+- `runnerGroup` can be the organisation's default group (`Default`), for an organisation that has no other: the pool
+  then says a `WARNING` at its start and in every status block, because every repository that group admits can send
+  jobs to these persistent runners. A group limited to selected repositories is safer. (The `jit` mode refuses the
+  default group unless the template sets `allowDefaultRunnerGroup`.)
+- A token put in at the same moment as a start, before the pool has found that GitHub dropped a slot's registration,
+  can be deleted as unneeded while every slot still looks registered. If a slot then waits for a token, run
+  `instance_start` again within the token's hour: Arca writes the stored token again and the slot registers with it.
+
+**This mode keeps per-slot state between jobs.** The slot's runner is persistent: it takes job after job in the same
+container, beside the same Docker daemon, with the same work directory (`_work`), the same Docker layer cache, the
+same tool cache and the same files any job left in the runner's home. The slot is not cleaned per job; only the two
+cache budgets are checked after each job, as in the other mode. A job can therefore see what an earlier job on that
+slot left, and can leave something for a later one: use it only for repositories that trust each other. Each job is
+still recorded in `jobs.tsv` with its name, result and seconds, but its memory peak is the slot's since its runner
+started (a slice's peak cannot be set back while it runs), and its CPU time is the slot's since the job began. This
+mode is a bridge until each job runs in a fresh machine of its own; the `jit` mode stays as it was.
+
 ### Who can reach what
 
 - **A job can reach the pool's credential.** Jobs get Docker, and the Docker daemon of a slot runs privileged inside
@@ -5273,7 +5574,8 @@ that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]
 - **So the runner group is the wall.** Everyone who can get a workflow run in a repository the runner group admits
   (by pushing a branch there, or through an approved pull request) can, in effect, hold the credential, and what the
   credential can do is in the table of step 2. Admit only repositories where you would trust every person with write
-  access that far. That is why the pool refuses the default runner group and why public repositories stay off.
+  access that far. That is why the `jit` mode refuses the default runner group (the registration-token mode takes it with a
+  warning) and why public repositories stay off.
 - **Nothing beyond the virtual machine.** A job that takes over the virtual machine has the virtual machine: its own
   disk, and the network it is on. It does not have the machine Arca runs on, Arca's other services or Arca's secrets.
 
@@ -5349,8 +5651,30 @@ neither has been measured on the pool itself.
 ### What to know
 
 - **One job per runner.** A runner is registered for one job (GitHub calls it just-in-time and ephemeral), runs in a
-  container made from the runner's public image, and is removed with everything in it. The next job gets a new
+  container made from the pool's runner image (the runner's public image with `aptPackages` added), and is removed
+  with everything in it. The next job gets a new
   registration and a new container, so no job finds another's files, processes or installed packages.
+- **The runner image's packages.** The runner's public image is Ubuntu 24.04 with git, curl, jq, unzip, python3,
+  Docker's client and a passwordless `sudo`, and less than GitHub's own `ubuntu-latest`: no C compiler, no `make`, no
+  `libatomic1` (pnpm and other Node.js-based tools stop with `libatomic.so.1` missing), no `zstd` (`actions/cache`
+  then falls back to gzip, which is another cache version, so no cache saved with zstd restores), no `wget`, no
+  `skopeo`, no `xz-utils` (`tar -xJf` fails), no `zip`, no `rsync` and no `gh`. So before it begins any slot the controller builds one image on the machine: `FROM` the pinned runner
+  image, then `apt-get install --no-install-recommends` of `aptPackages` (by default `libatomic1`, `build-essential`,
+  which is `make`, `gcc` and `g++`, `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, all from Ubuntu's
+  own archive, `skopeo` and `gh` from its universe component; Ubuntu's `gh` is older than GitHub's own apt repository,
+  which a list of package names cannot add). It is named `arca-runner-pool-<the pool's id>:<a digest of what it is built from>`, kept on the
+  machine's disk, and every runner starts from it; a controller that finds it built builds nothing. Node.js is not in
+  the list: a workflow sets up the version it wants with `actions/setup-node`, and the runner carries its own for
+  JavaScript actions only, off the `PATH`, so a workflow that runs `node` or `npm ci` without `actions/setup-node`
+  stops with "command not found" here, where `ubuntu-latest` has both (Ubuntu 24.04's own `nodejs` is 18, past its
+  end of life). Playwright's system libraries are not in it either: `npx playwright install --with-deps` installs
+  them in the job (the image's `sudo` needs no password), at the cost of a download per job. A build that fails (a mirror that cannot be reached, a name that is not a package) is said in
+  `service_logs`, with the image, the step and the package manager's last lines; no runner starts until a build
+  succeeds; while it keeps failing it is tried again after a minute, then two, four and so on, up to five minutes,
+  and each failed attempt's stopped container is removed. Docker's whole output is in
+  `/var/log/arca-runner-pool/runner-image-build.log` inside the machine. The packages come from Ubuntu's archive on
+  the day of the build, so two machines built on different days can differ in their versions; the runner image
+  underneath is the pinned one.
 - **Admission by memory.** A slot starts only while there is memory for its whole size: memory that no other slot has
   reserved, and memory the machine has free at that moment. A slot's memory is a hard limit with no swap, so a job that
   passes it is stopped by the kernel and no other slot pays for it. CPU is different: each slot has a ceiling of its
@@ -5374,8 +5698,14 @@ neither has been measured on the pool itself.
   the new value into the virtual machine, and the controller uses it for the next token. To retire a credential a job
   may have taken, delete the App's key (or the token) on GitHub: that, not Arca, makes it worthless.
 - **Stopping and restarting.** `instance_stop` and `instance_restart` need your approval. Runners that are idle are
-  taken off GitHub first; a job that is running is lost and GitHub reports it as failed. After the machine Arca runs
-  on restarts, the pool starts by itself.
+  taken off GitHub first; a job that is running is lost and GitHub reports it as failed, because the machine's
+  Docker stops with it. After the machine Arca runs on restarts, the pool starts by itself. An orderly stop or
+  restart of the controller service alone, inside a running machine, leaves a runner at its job to finish it: the
+  controller leaves it running, the controller that starts next watches it to its end and records its job, and only
+  then is its slot given a new runner, from the runner image of that controller. That is for an orderly stop only.
+  A crash, an out-of-memory kill or a stop of the machine can lose a running job: a controller that dies before it
+  writes the note leaves the next one nothing to adopt, and a stopped machine takes its Docker with it, so GitHub
+  reports the job as failed.
 - **Pins, and what you are trusting.** The runner is `ghcr.io/actions/actions-runner` 2.338.2 and the slot's daemon is
   `docker` 29.9.3-dind, both by digest: the bytes are fixed. The virtual machine is `images:debian/13/cloud`, the
   public Debian 13 image with cloud-init (which runs the first boot and grows the disk), named by its alias and not by
@@ -5404,6 +5734,157 @@ neither has been measured on the pool itself.
   it, with no filter from Arca, and so does every job in it: a job can then reach the other hosts of that network.
   Use the service network for a pool unless you have a reason not to. A GitHub Enterprise host or a package mirror on
   a private address cannot be reached from the service network.
+
+## Connecting GitHub from the approval page
+
+The steps above have you make the credential by hand. The approval page makes it for you instead (what still has to be
+wired to a pool is under "Not done yet" below): open
+`/approve/github` on the same address as the approval page and sign in with your passkey. The page offers three ways to
+connect an organisation. Each one ends in a *connection* (a "binding" in the verbs) that holds the organisation, the
+runner group, and the label sets you chose. You choose the label names; Arca does not add a prefix.
+
+Every credential GitHub hands over goes into the kernel's GitHub store, `<stateDir>/github/` (folder 0700, files 0600),
+and stays in the kernel process: the App's key, the sign-in grant, GitHub's tokens and the OAuth App's secret are never
+copied to a host, a runner or an assistant. One thing does leave: `github_runner_mint` answers one runner's
+just-in-time configuration, which is that runner's credential for one job, to **any caller with an `operator`
+token**, an assistant included. Whoever holds such a token can therefore make a runner in the connection's runner
+group and receive the jobs, and the secrets, of the repositories that group admits. Give operator tokens only to what
+you trust with those jobs (see "Not done yet" below).
+
+### What GitHub's permissions force
+
+GitHub has no permission for "one runner group". Whatever registers a runner can do everything GitHub puts under that
+permission:
+
+- **Organisation "Self-hosted runners": read and write** (the App mode). It covers registering runners with any
+  labels in any runner group, creating, changing and deleting runner groups, and removing runners. Whoever holds it can
+  make a runner that receives other repositories' jobs, and the secrets those jobs are given. It cannot read code.
+  Only an organisation **owner** can install an App that asks for it; when anyone else clicks, GitHub turns the click
+  into a request to the owners.
+- **Repository "Administration": read and write** is what a runner for one repository needs. It also covers the
+  repository's settings, collaborators, branch protection, deploy keys and deleting the repository. Arca does not ask
+  for it.
+- **OAuth scope `admin:org`** (the device-code mode) is the whole organisation administration of the person who
+  approves it. Arca uses it once and deletes it (below), but for those seconds it is that much.
+
+The push mode asks GitHub for nothing: you make the runner configurations yourself and send them to Arca.
+
+### Mode 1: connect with a code (device flow)
+
+The quickest. It needs a GitHub OAuth App that you, the operator, registered once (GitHub: your organisation's
+"Settings", "Developer settings", "OAuth Apps", "New OAuth App"; any homepage and callback address; tick "Enable Device
+Flow"). Give its client ID and a client secret to Arca once with `github_oauth_app_set` (`doctor` scope). The secret is
+kept in the store and never shown again.
+
+On the page, fill in the organisation, a runner group name (left empty, the organisation's default group is used, with a
+warning), the labels, and how many runners (1 to 50). Arca shows an eight-character code and the GitHub address
+(`github.com/login/device`). The person opens it, types the code, and approves. If the organisation restricts OAuth
+Apps, GitHub's screen shows a "Grant" (or "Request") button next to the organisation: an owner must press it on that
+same screen, or Arca's next step is refused and the page says so.
+
+Arca then uses the grant once, step by step, each step shown on the page and written to the audit log:
+
+1. asks GitHub for a runner registration token for the organisation;
+2. reads the runner groups, and creates the named group if it is missing (open to the organisation's private
+   repositories; change that on GitHub);
+3. registers each runner in that group with its own key pair, generated in the kernel. The private key never leaves
+   the store;
+4. deletes the grant (`DELETE /applications/{client_id}/grant`), whether the steps before it worked or not. Only
+   GitHub's 204 counts as deleted. Any other answer, a 404 included (GitHub's answer when it does not take the OAuth
+   App's client ID and secret, for example after the secret was rotated on GitHub and not in Arca), is shown as "NOT
+   deleted" with GitHub's status, and the person is sent to `https://github.com/settings/applications` to revoke Arca
+   by hand. The flow still ends Done when the runners were registered, and says the grant is still in place.
+
+What it leaves behind are **persistent** runners, each with its own credential. Know this: a persistent runner's
+credential works until the runner is removed on GitHub. A job that can read it can take it away and keep asking for
+jobs as that runner. Use this mode for repositories whose workflows you trust, and remove the runners on GitHub when
+you stop.
+
+### Mode 2: a GitHub App made for you (manifest flow)
+
+The page posts an App manifest to GitHub. The person sees GitHub's own "Create GitHub App" screen with everything
+filled in, presses Create, then picks the repositories on the install screen. The App asks for organisation
+"Self-hosted runners: read and write" and nothing else, has no webhook, and is private to the organisation. GitHub
+hands its private key to Arca's callback, which writes it to the store.
+
+After the install, Arca makes a runner group called `Arca runners` open to exactly the repositories picked (or adopts
+the group of that name if one exists). When GitHub's plan has no runner groups, it falls back to the default group and
+says so. Every runner is then minted just in time, one per job: `github_runner_mint` (or the signer's in-process call,
+`Signer::mint`) returns one ephemeral runner configuration and writes who asked, when, the labels, the runner group and,
+once known, the job. A runner for a scale set is minted only when GitHub says the scale set is in the connection's own
+runner group; another group's scale set is refused (`ScaleSetOutsideGroup`) and the refusal logs the group it is in.
+
+### Mode 3: you push the configurations (push mode)
+
+For those who will not give Arca any GitHub permission. The page makes a connection and shows an intake token once.
+Your own automation makes just-in-time runner configurations with GitHub's API
+(`POST /orgs/{org}/actions/runners/generate-jitconfig`) with your own credential, and sends each to Arca:
+
+```
+curl -X POST https://arca.example.com/github/intake/<connection> \
+  -H "Authorization: Bearer <intake token>" -H "Content-Type: application/json" \
+  -d '{"encodedJitConfig": "<from GitHub>", "labels": ["linux", "x64"]}'
+```
+
+Arca keeps each configuration for 24 hours (at most 1000 waiting) and gives each to one job. When none is waiting, a
+mint answers `Empty` and the pool waits.
+
+### Not done yet
+
+- **Device-code runners stay offline.** Their files (`.runner`, `.credentials`, `.credentials_rsaparams`) are in the
+  store and `Signer::runner_files` reads them, but no host and no pool template reads them yet. The runners are
+  registered on GitHub and stay offline until that is wired.
+- **The pool is not wired yet.** The runner pool's template does not call `Signer::mint` yet; until it does, App and
+  push connections mint only through `github_runner_mint`.
+- **Who may mint.** Any `operator` token may call `github_runner_mint` and receive a runner's credential (above). To
+  harden: the verb only for a token whose tool list names it, or the in-process call only.
+- **A restart while registering.** A kernel restart while a device-code connection is registering loses the flow
+  before the grant is deleted. Revoke Arca at `https://github.com/settings/applications` if a connection never reached
+  Done.
+- **Disconnect asks no confirmation on the page**, and `github_mint_job` takes any mint id.
+
+### Workflows
+
+So that a workflow keeps working when the pool is off, let a repository variable pick the runner:
+
+```yaml
+runs-on: ${{ vars.ARCA_RUNNER || 'ubuntu-latest' }}
+```
+
+Set `ARCA_RUNNER` on the repository or organisation to the label you chose. Unset it and the jobs go back to GitHub's
+own runners.
+
+### Disconnecting
+
+The page's "Disconnect" (or `github_disconnect`) ends a connection, and the audit log records it:
+
+- **App**: Arca uninstalls the App from the organisation and deletes its private key from the store. The App itself
+  stays on GitHub until you delete it; the page links to its "Advanced" settings, where "Delete GitHub App" is.
+  Uninstalling or deleting the App on GitHub yourself works too: the next mint finds out and marks the connection
+  revoked. A suspended installation marks it suspended until you lift it.
+- **Push**: the intake token and the waiting configurations are deleted.
+- **Device code**: the runners' credentials are deleted from the store, so they go offline. Remove them on GitHub
+  ("Settings", "Actions", "Runners") to clear them from the list.
+
+### The audit log
+
+`<stateDir>/github/audit.jsonl`, one JSON line per event, read with `github_audit` (optionally for one connection).
+It records every flow start, grant, runner registration, grant deletion, mint (minted or refused, with the reason),
+job attachment and disconnect, with the caller and the time. It holds no credential. It is rotated at 8 MiB to
+`audit.jsonl.1`.
+
+### Verbs
+
+| Verb | Scope | What it does |
+|------|-------|--------------|
+| `github_oauth_app_set` | doctor | Stores the OAuth App's client ID and secret for the device-code mode |
+| `github_connect` | operator | Starts a device-code connection; answers the code and the address |
+| `github_connect_status` | viewer | The steps of one device-code connection so far |
+| `github_bindings` | viewer | The connections, without credentials |
+| `github_audit` | viewer | The audit log |
+| `github_runner_mint` | operator | One just-in-time runner configuration for a connection's labels |
+| `github_mint_job` | operator | Records which job a minted runner took |
+| `github_disconnect` | operator | Ends a connection (above); destructive, so `confirm: false` refuses it |
 
 ## A pool of GitLab runners
 
@@ -5744,7 +6225,7 @@ A kernel-mode node with the managed service network (`kernel.serviceCidr`) runs 
 
 | Verb | Who runs it | What it does |
 |------|-------------|--------------|
-| `function_create {name, image, digest, triggers, command?, env?, secrets?, links?, limits?}` | only an approved action proposal | Creates the function, stopped. Its timer runs it from then on. |
+| `function_create {name, image, digest, triggers, command?, env?, secrets?, links?, internet?, limits?}` | only an approved action proposal | Creates the function, stopped. Its timer runs it from then on. |
 | `function_remove {name}` | only an approved action proposal | Stops the run that is going, deletes the function with its secrets. Its lines in the run log are kept. |
 | `function_secret_set {name, key, value}` | a `doctor` token | Sets one of the secrets the definition names. Write-only. |
 | `function_list` | a `viewer` token | Every function, with its definition, which secrets are set, whether a run is going, and its newest run. |
@@ -5780,6 +6261,7 @@ action_propose { "action": "function_create", "args": {
 | `env` | Plain values by name, at most 32, each at most 160 characters. The card shows each whole. |
 | `secrets` | Names only, at most 16. See below. |
 | `links` | Services of this node the function may reach, each on one tcp port that service declares. At most 8. |
+| `internet` | Optional, `true` or `false` (the default). `true` lets its runs open connections to every public address, as a service can; see below. |
 | `triggers` | Exactly one, a timer: `everySeconds` from 10 to 86400. |
 | `limits` | `seconds` 1 to 900 (default 60), `memory` a size of at least 8MiB (default 128MiB), `cpu` 1 to 64 (default 1). |
 
@@ -5800,13 +6282,20 @@ and a default that rejects both ways:
 - a **private address** outside the node's services is opened exactly as a service's is: the node's config names it for
   the function's name (`kernel.serviceDestinations`), the proposal fills it in, and the card's `Private network` row
   shows it ([A service that may reach one private address](#a-service-that-may-reach-one-private-address));
-- **nothing else.** A service's rules end with one that lets everything else out to the internet. A function's do not:
-  it can open no connection to a public address. There is no setting for it in this build.
+- the **internet**, only when the definition says `"internet": true`. The rules then end with one allow of every
+  address outside the service network. The rejects before it are a service's: every private range, the node's own
+  addresses, and every service of this node but the linked ones stay closed. The card's `Internet` row says `Yes` and
+  that a run can send there whatever its program and its secrets hold. It is for a program whose work is a public API
+  (the CI analysis reads `api.github.com`): its host names change their addresses, so no rule can name them one by one;
+- **nothing else.** Without `internet`, a function's rules have no rule that lets everything else out: it can open no
+  connection to a public address.
 
-**One way out stays open, and the card says so.** The service network's own DNS answers a function, as it answers
-every instance there, and it asks the internet's name servers for a name it does not know. So a program can still
-send a little data out in the names it looks up, to whoever runs the name server of a domain. The `Internet` row of
-the card says this in the owner's words. Closing it is not in this build.
+**Without `internet`, one way out stays open, and the card says so.** The service network's own DNS answers a
+function, as it answers every instance there, and it asks the internet's name servers for a name it does not know. So
+a program can still send a little data out in the names it looks up, to whoever runs the name server of a domain. The
+`Internet` row of the card says this in the owner's words. Closing it is not in this build. With `internet: true`
+the row says instead that the function can reach any public address and send there whatever its program and secrets
+hold, which covers this too.
 
 ### Secrets by name
 
@@ -6360,6 +6849,21 @@ The approval's audit line names the passkey and how it signed
 A spend, by either kind of key, with or without a request, is recorded as one line in `approval-nonces.jsonl` (its
 time and nonce). The spend's line names no key and no signers file, so which key approved is read from the approval's
 audit line, and an SSH spend has none.
+
+### The GitHub signer
+
+`cargo test -p arca --test github_signer` runs the GitHub connections against a fake GitHub (`tests/github/fake.rs`):
+the OAuth device flow, the REST calls, the Actions service's registration calls, the App calls (checking every App JWT
+against the App's key) and the scale-set calls, on one loopback server that checks every credential it is given. It
+covers the device-code connection end to end (polling that asks again when GitHub is busy and obeys `slow_down`; the
+grant used once, then deleted on success and on every failure, and a deletion GitHub does not confirm said plainly; the
+runners registered with their own keys in the chosen, the default or a new group; both registration flows; an
+organisation that restricts OAuth Apps; a declined sign-in; a refused runner), the manifest flow (one permission, the
+state checked, the key stored 0600, Arca's runner group made or adopted, the default group when the plan has none), the
+mint for the organisation and for a scale set of the connection's own group with its tokens kept (another group's
+scale set refused), an App suspended, uninstalled or deleted on GitHub, disconnecting, the push intake (its token, its
+labels, its HTTP route refusing browsers) and the audit log. The tests also check that no credential is in any file
+outside the private store's credential folders.
 
 ## Continuous integration
 

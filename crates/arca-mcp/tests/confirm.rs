@@ -57,6 +57,12 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             "confirm is false: nothing was updated and no approval was spent",
         ),
         (
+            "service_reconfigure",
+            json!({ "name": "pg", "approval": "x.y" }),
+            json!({ "reconfigured": true, "service": "pg", "changes": {}, "restarted": true, "message": "reconfigured" }),
+            "confirm is false: nothing was reconfigured and no approval was spent",
+        ),
+        (
             "service_import",
             json!({ "name": "db1", "approval": "0123456789abcdef" }),
             json!({
@@ -148,6 +154,16 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             json!({ "move": "mv-abababababab", "approval": "0123456789abcdef" }),
             json!({ "move": "mv-abababababab", "deleted": ["shop/web"], "kept": [], "message": "finished" }),
             "confirm is false: nothing was deleted and no approval was spent",
+        ),
+        (
+            "github_disconnect",
+            json!({ "binding": "gh-0123456789abcdef" }),
+            json!({
+                "id": "gh-0123456789abcdef", "mode": "push", "account": "acme", "status": "revoked",
+                "why": "Disconnected in Arca.", "labelSets": [["linux"]], "runners": [],
+                "createdBy": "page:x", "createdAt": 1, "updatedAt": 2
+            }),
+            "confirm is false: nothing was disconnected",
         ),
     ]
 }
@@ -259,7 +275,14 @@ fn confirm_true_runs_the_call_and_the_handler_never_sees_confirm() {
         for arguments in [args.clone(), with(&args, json!(true))] {
             let reply = fx.tool_call(name, arguments);
             assert_eq!(reply["result"]["isError"], json!(false), "{name}: {reply}");
-            assert_eq!(reply["result"]["structuredContent"], result, "{name}");
+            // An untrusted verb's answer carries the untrusted marker beside the result.
+            let mut shown = reply["result"]["structuredContent"].clone();
+            if verb(name).expect("in the table").untrusted
+                && let Some(object) = shown.as_object_mut()
+            {
+                object.remove("untrusted");
+            }
+            assert_eq!(shown, result, "{name}");
             assert_eq!(
                 fx.take_calls(),
                 vec![(name.to_string(), args.clone())],
