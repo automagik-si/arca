@@ -280,15 +280,20 @@ mod tests {
 
     use std::cell::RefCell;
 
+    /// One path of a test root: its names when it is a directory (`None`: a file), and its owner's uid.
+    type Entry<'a> = (&'a str, Option<&'a [&'a str]>, Option<u32>);
+    /// The same, owned.
+    type Kept = (Option<Vec<String>>, Option<u32>);
+
     /// A container root as the files API answers it: each path is a directory (its names), a file, or not there, with
     /// its owner's uid (`None`: no `X-Incus-uid` header). The requests sent are kept as "METHOD path".
     struct Root {
-        entries: BTreeMap<String, (Option<Vec<String>>, Option<u32>)>,
+        entries: BTreeMap<String, Kept>,
         sent: RefCell<Vec<String>>,
     }
 
     impl Root {
-        fn new(entries: &[(&str, Option<&[&str]>, Option<u32>)]) -> Self {
+        fn new(entries: &[Entry<'_>]) -> Self {
             Self {
                 entries: entries
                     .iter()
@@ -418,7 +423,8 @@ mod tests {
             path.push_str("/d");
         }
         entries.push((path, None));
-        let owned: Vec<(&str, Option<Vec<&str>>, Option<u32>)> = entries
+        type Named<'a> = (&'a str, Option<Vec<&'a str>>, Option<u32>);
+        let owned: Vec<Named<'_>> = entries
             .iter()
             .map(|(path, names)| {
                 (
@@ -430,7 +436,7 @@ mod tests {
                 )
             })
             .collect();
-        let refs: Vec<(&str, Option<&[&str]>, Option<u32>)> = owned
+        let refs: Vec<Entry<'_>> = owned
             .iter()
             .map(|(path, names, uid)| (*path, names.as_deref(), *uid))
             .collect();
@@ -440,7 +446,7 @@ mod tests {
         assert!(root.deletes().is_empty());
 
         // One level less is walked whole and emptied.
-        let shallow: Vec<(&str, Option<&[&str]>, Option<u32>)> = refs
+        let shallow: Vec<Entry<'_>> = refs
             .iter()
             .filter(|(path, _, _)| path.matches("/d").count() <= RUN_DEPTH_MAX)
             .map(|(path, names, uid)| {

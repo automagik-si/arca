@@ -2806,7 +2806,7 @@
                 ],
                 "properties": {
                   "changes": {
-                    "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                    "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges, runTmpfs (whether /run is memory) and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "confirm": {
                     "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
@@ -6958,7 +6958,7 @@
           "required": false,
           "schema": {
             "additionalProperties": false,
-            "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference.",
+            "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges, runTmpfs (whether /run is memory) and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference.",
             "properties": {
               "entrypoint": {
                 "type": "object"
@@ -6976,6 +6976,9 @@
                 "type": "object"
               },
               "rawLxc": {
+                "type": "object"
+              },
+              "runTmpfs": {
                 "type": "object"
               },
               "secrets": {
