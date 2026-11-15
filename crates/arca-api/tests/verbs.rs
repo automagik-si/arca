@@ -1211,6 +1211,62 @@ fn gpu_section() -> Value {
     )
 }
 
+/// The power block: every source with a figure or a reason, the measured sum and what it leaves out.
+fn power() -> Value {
+    let sum = || json!({ "type": ["number", "null"] });
+    let text = || json!({ "type": ["string", "null"] });
+    let mut schema = open(
+        json!({
+            "cpu": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "packages": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "zone": { "type": "string" },
+                                "name": { "type": "string" },
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["zone", "name", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "packages"]
+            ),
+            "gpu": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "cards": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "pci": text(),
+                                "card": text(),
+                                "source": { "type": "string", "enum": ["nvidia-smi", "hwmon"] },
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["pci", "card", "source", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "cards"]
+            ),
+            "measuredPowerW": sum(),
+            "notIncluded": { "type": "array", "items": { "type": "string" } }
+        }),
+        &["cpu", "gpu", "measuredPowerW", "notIncluded"],
+    );
+    schema["description"] = json!(
+        "measuredPowerW sums the CPU packages (when every package has a figure) and each GPU with a figure. It is not the machine's power at the wall: notIncluded names what it leaves out."
+    );
+    schema
+}
+
 fn host_sample() -> Value {
     json!({
         "type": "object",
@@ -1221,7 +1277,10 @@ fn host_sample() -> Value {
                     "usedPct": { "type": ["number", "null"] },
                     "cores": { "type": "integer" },
                     "coresKnown": { "type": "boolean" },
-                    "reason": { "type": ["string", "null"] }
+                    "reason": { "type": ["string", "null"] },
+                    "threads": { "type": ["integer", "null"] },
+                    "physicalCores": { "type": ["integer", "null"] },
+                    "busyThreads": { "type": ["number", "null"] }
                 }),
                 &["usedPct", "cores", "coresKnown", "reason"]
             ),
@@ -1306,7 +1365,28 @@ fn host_sample() -> Value {
                     &["project", "name", "why"]
                 ),
                 "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read."
-            }
+            },
+            "power": power(),
+            "instanceCpu": open(
+                json!({
+                    "instances": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "project": { "type": "string" },
+                                "name": { "type": "string" },
+                                "busyThreads": { "type": ["number", "null"] },
+                                "reason": { "type": ["string", "null"] }
+                            }),
+                            &["project", "name", "busyThreads", "reason"]
+                        )
+                    },
+                    "omitted": { "type": "integer" },
+                    "omittedBusyThreads": { "type": "number" },
+                    "reason": { "type": ["string", "null"] }
+                }),
+                &["instances", "omitted", "omittedBusyThreads", "reason"]
+            )
         },
         "required": [
             "at", "cpu", "load", "memory", "psi", "cpuTempC", "gpuBusyPct", "gpu", "pools", "network", "projects",

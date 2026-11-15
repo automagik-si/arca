@@ -2185,9 +2185,12 @@ sample ring and its rate counters, so the window mean and the next rate cover on
 
 - **Local daemon.** The sample is this machine's: `cpu.cores` and `cpu.usedPct`, the `load` averages,
   `memory.totalBytes`, `memory.availableBytes` and `memory.usedBytes`, PSI, CPU temperature, GPU busy, swap and NIC rates come
-  from the node's `/proc` and `/sys` trees. This is the reading the sampler has always taken.
+  from the node's `/proc` and `/sys` trees. This is the reading the sampler has always taken. `cpu.threads`,
+  `cpu.physicalCores`, `cpu.busyThreads` and the `power` block come from the same trees; see "CPU counts and power".
 - **Remote Incus.** The host totals come from the node's own Incus, `GET /1.0/resources`: `cpu.cores` is `cpu.total`
-  (threads), `memory.totalBytes` is `memory.total`, and `memory.usedBytes` is `memory.used`.
+  (threads), and so is `cpu.threads`; `cpu.physicalCores` counts the `cores` each entry of `cpu.sockets` lists (`null` when
+  the document lists none); `memory.totalBytes` is `memory.total`, and `memory.usedBytes` is `memory.used`.
+  `cpu.busyThreads` is `null`, and the `power` block's `cpu.reason` and `gpu.reason` say `not available for a remote host`.
   `memory.availableBytes` is `memory.total - memory.used`. `cpu.coresKnown` is `true`. No local `/proc` or `/sys` reading is
   reported: `cpu.usedPct`, every `load` average, PSI, CPU temperature, GPU busy, swap and NIC rates are `null`. `cpu.reason`
   and `load.reason` say `not available for a remote host`. Once the mode is settled remote, PSI and CPU temperature are
@@ -2220,6 +2223,72 @@ memory are left out of that sample's export, and the sample's `instancesNotRead`
 figure` (the figure it did answer is kept), or `the tick's time for state reads was spent`.
 Incus's own text is never shown. In `mean`, `instancesNotRead` is the newest sample's. No alert reads an instance's CPU or
 memory, so a machine that was not read changes no alert.
+
+`instanceCpu` turns those CPU seconds into **threads in use**: for each running instance, the change of its CPU seconds
+since its previous read, over the time between the two reads (1.0 is one thread busy the whole time). Each read is timed
+when its answer came, the sample's time plus how far into the tick's state reads it landed, so a read late in a slow tick
+is not measured against the wrong interval. A row is `{project, name, busyThreads, reason}`. A row with no figure says
+why: `only one reading so far; a rate needs two` (the first read of the instance, or of a run after it was seen stopped),
+`it started or restarted since its previous reading` (its `last_used_at` changed), `it was replaced since its previous
+reading` (its `created_at` changed: deleted and made again under the same name), `its CPU time went backwards`, `its CPU
+time was not read in this sample` (it is in `instancesNotRead`), or `the figure was more than the host's threads` (above
+the host's thread count by more than 5 percent). A figure is therefore never negative and never larger than the machine.
+An instance that is not running has no row, and its previous read is forgotten. An instance whose state was not read
+keeps its previous read, so its next figure covers the time since that read.
+
+The list is bounded so the answer stays small on a node with many instances: at most 50 rows, those with a figure first,
+largest first, then those without one by project and name. `omitted` counts the running instances past the cap and
+`omittedBusyThreads` sums their figures, so the threads still add up. When the instance list itself could not be read the
+rows are empty and `instanceCpu.reason` says `the instance list could not be read`. Every sample of the hour-long ring
+holds its own list, which is what bounds the ring's memory too. Remote nodes are measured the same way: the CPU seconds
+come from Incus, not from local files.
+
+### CPU counts and power
+
+`cpu.cores` counts logical CPUs, despite its name: the numbered `cpu` lines of `/proc/stat`, so a 12-core, 24-thread
+machine says 24. It keeps that meaning. The additions tell the counts apart:
+
+| Field | Meaning |
+|-------|---------|
+| `cpu.threads` | the logical CPUs (threads), the same count as `cores`; `null` when it is not known |
+| `cpu.physicalCores` | the physical cores: the distinct `core_cpus_list` (or `thread_siblings_list`) of the online CPUs under `/sys/devices/system/cpu/cpu<N>/topology`, per package; `null` when the host gives no topology |
+| `cpu.busyThreads` | how many threads were busy since the previous sample: `usedPct` of `threads`, as a count; `null` on the first sample |
+
+The `power` block measures what this machine can measure of its own power, and says what it cannot:
+
+- **CPU packages.** Each top-level powercap zone named `package-<N>` under `/sys/class/powercap` is one package. Its
+  power is the change of its `energy_uj` counter between two samples over the time between them, in watts. The counter
+  wraps at the zone's `max_energy_range_uj`, and a wrap is read through. A sub-domain (`intel-rapl:0:0`, `core`,
+  `uncore`) is part of its package and is never added on top of it; a `dram` zone is memory and a `psys` zone is the whole
+  platform, so neither counts; a package that two interfaces show (`intel-rapl` and `intel-rapl-mmio`) is read once.
+  `power.cpu.packages` lists each package with `zone`, `name`, `powerW` and `reason`, and `power.cpu.powerW` is their sum
+  only when every package has a figure: a part of the CPU is not the CPU.
+- **GPUs.** An NVIDIA card's figure is the `power.draw` its telemetry already reads (see "GPUs"). Any other DRM card
+  whose driver exposes hwmon is read from `power1_input` (or `power1_average`) in microwatts; amdgpu does, for
+  integrated and discrete cards. A connector (`card1-DP-1`) is not a card. `power.gpu.cards` lists each with `pci`,
+  `card` (the DRM name, for hwmon), `source` (`nvidia-smi` or `hwmon`), `powerW` and `reason`. A card is a reading at the
+  sample, so it has a figure from the first sample.
+- **The sum.** `power.measuredPowerW` adds the CPU packages' sum (when it is known) and every GPU that has a figure;
+  `null` when nothing was measured. `power.notIncluded` says in words what it leaves out: always `memory`, `disks`,
+  `fans` and `the power supply's own loss`, then `the CPU packages` when they have no summed figure, and `the GPU <pci>`
+  for each card without one. It is never the machine's power at the wall.
+
+A source without a figure carries a reason in plain words:
+
+| Reason | When |
+|--------|------|
+| `no CPU power counter on this machine` | no package zone exists, as in most virtual machines |
+| `no GPU power counter on this machine` | no card with a power reading exists |
+| `the counter <file> is there, and this process may not read it: most kernels let only root read it` | the file exists and reading it is refused. Since 2020 most kernels make the package counters readable by root only; Arca does not change that, and a kernel not run as root reports this |
+| `the counter <file> could not be read` | the file exists and did not read as a number |
+| `only one sample so far; a rate needs two` | the first sample of a package |
+| `the counter went backwards and the range it wraps at is not known` | the counter is lower than before and `max_energy_range_uj` is missing |
+| `this card's driver gives no power counter` | the card has a hwmon without a power file |
+| `nvidia-smi gave no power figure for this card` | the telemetry was read without `power.draw` |
+
+An NVIDIA card without telemetry carries its telemetry reason instead (for example `nvidia-smi is not installed`).
+The files are named as on the host, such as `/sys/class/powercap/intel-rapl:0/energy_uj`. A switch between the local
+and remote modes forgets the previous counters, so no rate spans two machines.
 
 ### GPUs
 
@@ -2268,6 +2337,15 @@ disappearance until it has been seen once.
 
 `node_metrics`' `mean` averages each card's numbers over the window, keyed by PCI address, and carries the newest process
 list. A card whose telemetry was never measurable has a `null` telemetry and a reason, not a zero.
+
+In `mean`, `cpu.threads` is the newest known sample's, `cpu.physicalCores` the newest sample's that has one, and
+`cpu.busyThreads` the average over the samples that hold it. Each power figure (a package, a card, a sum and
+`measuredPowerW`) is averaged over the samples that hold it, so `measuredPowerW` can differ from the sum of the averaged
+parts when a source was missing in part of the window; the packages and cards listed are the newest sample's, a reason
+is kept only when the mean has no figure, and `notIncluded` is worked out from the mean's figures. `instanceCpu` lists
+the newest sample's rows, each averaged over the window's samples that hold a figure for it and sorted again; its
+`omitted`, `omittedBusyThreads` and `reason` are the newest sample's, so an instance that stopped during the window is
+not in the mean.
 
 A mean over a window that holds both successful and failed reads averages the successful ones and takes its reason from the
 newest successful read, so a late failure does not label averaged figures. A window with no successful read is `null` with
@@ -4245,7 +4323,10 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | Metric | Type | Labels besides `node` | Meaning |
 |--------|------|-----------------------|---------|
 | `arca_node_cpu_used_ratio` | gauge | | the share of all CPUs busy since the previous sample, 0 to 1 |
-| `arca_node_cpu_cores` | gauge | | the number of CPUs |
+| `arca_node_cpu_cores` | gauge | | the number of logical CPUs, despite the name (`cpu.cores`) |
+| `arca_node_cpu_threads` | gauge | | the logical CPUs (`cpu.threads`) |
+| `arca_node_cpu_physical_cores` | gauge | | the physical cores (`cpu.physicalCores`) |
+| `arca_node_cpu_busy_threads` | gauge | | the threads busy since the previous sample, as a count |
 | `arca_node_load` | gauge | `window` (`15m`, `1m`, `5m`) | the load average |
 | `arca_node_memory_total_bytes` | gauge | | the memory of the node |
 | `arca_node_memory_available_bytes` | gauge | | the memory available to start applications |
@@ -4254,6 +4335,10 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_node_psi_avg10_ratio` | gauge | `resource` (`memory`, `cpu`), `kind` (`some`, `full`) | the share of time tasks stalled, averaged over 10 seconds, 0 to 1 |
 | `arca_node_cpu_temperature_celsius` | gauge | | the CPU temperature |
 | `arca_node_gpu_busy_ratio` | gauge | | the share of time the GPU is busy, 0 to 1 |
+| `arca_node_cpu_package_power_watts` | gauge | `package` (`package-0`, ...) | a CPU package's power since the previous sample, from its powercap counter |
+| `arca_node_cpu_power_watts` | gauge | | the packages' power summed, written only when every package has a figure |
+| `arca_node_gpu_power_watts` | gauge | `gpu` (the PCI address, or the DRM card name), `source` (`nvidia-smi`, `hwmon`) | a GPU's power |
+| `arca_node_power_measured_watts` | gauge | | the sum of what was measured; not the power at the wall (see "CPU counts and power") |
 | `arca_node_network_receive_bytes_total` | counter | | the bytes the physical NICs received |
 | `arca_node_network_transmit_bytes_total` | counter | | the bytes the physical NICs sent |
 | `arca_pool_size_bytes` | gauge | `pool` | the size of a storage pool |
@@ -4265,6 +4350,7 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_instance_running` | gauge | `project`, `incus_instance`, `type` (`container`, `vm`) | 1 when an instance runs |
 | `arca_instance_starts_total` | counter | `project`, `incus_instance` | the starts of an instance since the server started |
 | `arca_instance_cpu_seconds_total` | counter | `project`, `incus_instance` | the CPU time an instance has used, from its own live state; absent for a sample that did not read it (see "Instances" under "Host metrics") |
+| `arca_instance_cpu_busy_threads` | gauge | `project`, `incus_instance` | the threads an instance had busy since its previous read; only the rows of the sample's capped `instanceCpu` list that have a figure |
 | `arca_instance_memory_used_bytes` | gauge | `project`, `incus_instance` | the memory an instance uses, read as the CPU time is |
 | `arca_latency_seconds` | gauge | `target` (`gateway`, `internet`, `relay`) | the TCP connect time to a probe target |
 | `arca_secureboot_enabled` | gauge | | 1 when Secure Boot is enabled |

@@ -33,8 +33,9 @@ use arca_mcp::{
     CallError, Caller, GetHandler, GetReply, Server, TokenStore, ToolHandler, mint, serve_unix,
 };
 use arca_metrics::{
-    Cpu, DriveReading, DrivesReading, HostSample, InstanceKind, InstanceReading, LatencyReading,
-    Load, Memory, NicCounters, OsdReading, Pool, ProbeTarget, ProjectCount, Psi, Readings,
+    Cpu, CpuPower, DriveReading, DrivesReading, GpuCardPower, GpuPower, HostSample, InstanceCpu,
+    InstanceKind, InstanceReading, InstanceThreads, LatencyReading, Load, Memory, NicCounters,
+    OsdReading, PackagePower, Pool, Power, ProbeTarget, ProjectCount, Psi, Readings,
 };
 use arca_store::{AlertEvent, DB_FILE, EventState, ResolveReason, Store};
 use common::{NOW, Scratch, caller};
@@ -176,6 +177,9 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
             cores: 4,
             cores_known: true,
             reason: None,
+            threads: Some(4),
+            physical_cores: Some(2),
+            busy_threads: Some(0.5),
         },
         load: Load {
             one: Some(0.5),
@@ -208,6 +212,26 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         network: None,
         projects: Vec::new(),
         instances_not_read: Vec::new(),
+        power: scenario_power(),
+        instance_cpu: InstanceCpu {
+            instances: vec![
+                InstanceThreads {
+                    project: "proj1".to_string(),
+                    name: "vm1".to_string(),
+                    busy_threads: Some(1.5),
+                    reason: None,
+                },
+                InstanceThreads {
+                    project: "proj1".to_string(),
+                    name: "db1".to_string(),
+                    busy_threads: Some(0.25),
+                    reason: None,
+                },
+            ],
+            omitted: 0,
+            omitted_busy_threads: 0.0,
+            reason: None,
+        },
     };
     let readings = Readings {
         pools: Some(sample.pools.clone()),
@@ -254,6 +278,53 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         }),
     };
     (sample, readings)
+}
+
+/// The power of the scenario: two CPU packages at 10 W and 5 W, one NVIDIA card at 42.5 W and an amdgpu card whose power
+/// file could not be read, which has no series.
+fn scenario_power() -> Power {
+    Power {
+        cpu: CpuPower {
+            power_w: Some(15.0),
+            reason: None,
+            packages: vec![
+                PackagePower {
+                    zone: "intel-rapl:0".to_string(),
+                    name: "package-0".to_string(),
+                    power_w: Some(10.0),
+                    reason: None,
+                },
+                PackagePower {
+                    zone: "intel-rapl:1".to_string(),
+                    name: "package-1".to_string(),
+                    power_w: Some(5.0),
+                    reason: None,
+                },
+            ],
+        },
+        gpu: GpuPower {
+            power_w: None,
+            reason: Some("the counter could not be read".to_string()),
+            cards: vec![
+                GpuCardPower {
+                    pci: Some("0000:01:00.0".to_string()),
+                    card: None,
+                    source: "nvidia-smi".to_string(),
+                    power_w: Some(42.5),
+                    reason: None,
+                },
+                GpuCardPower {
+                    pci: Some("0000:c6:00.0".to_string()),
+                    card: Some("card1".to_string()),
+                    source: "hwmon".to_string(),
+                    power_w: None,
+                    reason: Some("the counter could not be read".to_string()),
+                },
+            ],
+        },
+        measured_power_w: Some(57.5),
+        not_included: vec!["memory".to_string(), "the GPU 0000:c6:00.0".to_string()],
+    }
 }
 
 /// The instances of the scenario: a running container that has started twice, a stopped container that has started once, and a

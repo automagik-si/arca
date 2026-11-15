@@ -8,10 +8,12 @@ pub mod gpu;
 mod incus;
 mod mode;
 mod osd;
+pub mod power;
 pub mod probe;
 mod procfs;
 mod sample;
 mod smart;
+pub mod usage;
 
 pub use gpu::{
     FakeNvidia, GpuCard, GpuCardSample, GpuInventory, GpuOwner, GpuProcess, GpuSection,
@@ -29,6 +31,10 @@ pub use mode::{
     choose_host_mode_within,
 };
 pub use osd::{OsUpdate, OsdReading, UpdateTrust};
+pub use power::{
+    CpuPower, GpuCardPower, GpuPower, NO_CPU_COUNTER, NO_GPU_COUNTER, NOT_INCLUDED, PackagePower,
+    Power,
+};
 pub use probe::ProbeTarget;
 pub use sample::{
     Cpu, DEFAULT_MINUTES, HostSample, LatencyReading, Load, MODE_PROBE_EVERY_MS, Memory,
@@ -36,3 +42,4 @@ pub use sample::{
     REMOTE_HOST_REASON, RESOURCES_REASON, Readings, Sampler, SamplerConfig, mean, node_metrics,
 };
 pub use smart::{DriveReading, DrivesReading};
+pub use usage::{INSTANCE_CPU_MAX, InstanceCpu, InstanceThreads};

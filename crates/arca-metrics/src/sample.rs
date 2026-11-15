@@ -19,9 +19,11 @@ use crate::gpu::{
 use crate::incus::{self, InstanceReading};
 use crate::mode::{HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode_within};
 use crate::osd::{self, OsUpdate, OsdReading, UpdateMemory};
+use crate::power::{self, PackageCounter, Power};
 use crate::probe::{self, ProbeTarget};
 use crate::procfs::{self, CpuTotals, NicTotals};
 use crate::smart::{self, DrivesReading};
+use crate::usage::{self, CpuBefore, InstanceCpu, Seen};
 
 /// The window `node_metrics` reads when the caller names no minutes.
 pub const DEFAULT_MINUTES: u32 = 1;
@@ -128,6 +130,12 @@ pub struct HostSample {
     /// sample's.
     #[serde(default)]
     pub instances_not_read: Vec<NotRead>,
+    /// The CPU packages' and the GPUs' power, and the sum of what was measured. See [`Power`].
+    #[serde(default)]
+    pub power: Power,
+    /// Each running instance's CPU in threads in use since its previous read, bounded. See [`InstanceCpu`].
+    #[serde(default)]
+    pub instance_cpu: InstanceCpu,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,8 +143,10 @@ pub struct HostSample {
 pub struct Cpu {
     /// The share of all CPUs busy since the previous sample, in percent.
     pub used_pct: Option<f64>,
-    /// The logical CPUs of the managed host. It is 0 only when `cores_known` is false: the schema keeps it an integer, so
-    /// a consumer must read `cores_known` before showing a core count.
+    /// The logical CPUs (threads) of the managed host, despite its name: the numbered `cpu` lines of `/proc/stat` locally,
+    /// Incus's `cpu.total` remotely. A 12-core, 24-thread host says 24. It is 0 only when `cores_known` is false: the
+    /// schema keeps it an integer, so a consumer must read `cores_known` before showing a count. [`Cpu::threads`] and
+    /// [`Cpu::physical_cores`] say the two counts apart.
     pub cores: u64,
     /// Whether `cores` is a real count. False when the host total could not be read; `cores` is then 0 as a placeholder.
     pub cores_known: bool,
@@ -144,6 +154,16 @@ pub struct Cpu {
     /// `Some("not available for a remote host")` on a remote host, and `Some("the Incus resources read failed")` when the
     /// host totals could not be read.
     pub reason: Option<String>,
+    /// The logical CPUs (threads), the same count as `cores`, or `None` when it is not known.
+    #[serde(default)]
+    pub threads: Option<u64>,
+    /// The physical cores: the distinct sibling lists of the CPU topology locally, the cores Incus lists per socket
+    /// remotely. `None` when the host does not tell.
+    #[serde(default)]
+    pub physical_cores: Option<u64>,
+    /// How many threads were busy since the previous sample: `used_pct` of `threads`, as a count.
+    #[serde(default)]
+    pub busy_threads: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -347,6 +367,13 @@ pub struct Sampler<R: IncusRead> {
     /// The deadline of one state read, and the time a tick gives them all.
     state_deadline: Duration,
     state_budget: Duration,
+    /// The package energy counters the previous local sample read, with its time. `None` before the first local sample.
+    energy_before: Option<(u64, Vec<PackageCounter>)>,
+    /// Each running instance's previous CPU read, by project and name.
+    cpu_before: BTreeMap<(String, String), CpuBefore>,
+    /// How long after the start of the newest tick's state reads each instance's read answered, in milliseconds, on the
+    /// monotonic clock. A read time is the sample time plus this, so a read late in a slow tick is timed when it happened.
+    read_offsets: BTreeMap<(String, String), u64>,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -382,6 +409,9 @@ impl<R: IncusRead> Sampler<R> {
             not_read: Vec::new(),
             state_deadline: incus::STATE_DEADLINE,
             state_budget: incus::STATE_BUDGET,
+            energy_before: None,
+            cpu_before: BTreeMap::new(),
+            read_offsets: BTreeMap::new(),
         }
     }
 
@@ -418,6 +448,8 @@ impl<R: IncusRead> Sampler<R> {
             )
         });
         let began = Instant::now();
+        let clock_began = self.clock.now_ms();
+        self.read_offsets.clear();
         let mut not_read = Vec::new();
         for index in order {
             let instance = &mut instances[index];
@@ -439,6 +471,10 @@ impl<R: IncusRead> Sampler<R> {
             if outcome != Err(incus::BUDGET_SPENT) {
                 self.state_tried.insert(key(instance), tick);
             }
+            self.read_offsets.insert(
+                key(instance),
+                self.clock.now_ms().saturating_sub(clock_began),
+            );
             match outcome {
                 Ok((Some(cpu_seconds), Some(memory_bytes))) => {
                     instance.cpu_seconds = Some(cpu_seconds);
@@ -509,7 +545,18 @@ impl<R: IncusRead> Sampler<R> {
         let previous = self.previous;
         let host = read_host(&self.cfg, &self.incus, previous, now_ms);
         let pools = incus::read_pools(&self.incus, &self.cfg.pools);
+        let mut identities: BTreeMap<(String, String), (Option<String>, Option<String>)> =
+            BTreeMap::new();
         let instances = incus::read_instances(&self.incus).map(|listed| {
+            identities = listed
+                .iter()
+                .map(|row| {
+                    (
+                        (row.reading.project.clone(), row.reading.name.clone()),
+                        (row.created.clone(), row.last_used.clone()),
+                    )
+                })
+                .collect();
             let mut instances = self.count_starts(listed, now_ms);
             self.read_usages(&mut instances);
             instances
@@ -519,6 +566,30 @@ impl<R: IncusRead> Sampler<R> {
         }
         let projects = instances.as_deref().map(incus::project_counts);
         let gpu = self.read_gpu(instances.as_deref());
+        let power = self.read_power(&gpu, now_ms);
+        let instance_cpu = match instances.as_deref() {
+            Some(listed) => {
+                let seen = listed
+                    .iter()
+                    .map(|instance| {
+                        let key = (instance.project.clone(), instance.name.clone());
+                        let (created, last_used) = identities.remove(&key).unwrap_or_default();
+                        Seen {
+                            read_at_ms: now_ms
+                                .saturating_add(self.read_offsets.get(&key).copied().unwrap_or(0)),
+                            project: instance.project.clone(),
+                            name: instance.name.clone(),
+                            running: instance.running,
+                            cpu_seconds: instance.cpu_seconds,
+                            created,
+                            last_used,
+                        }
+                    })
+                    .collect();
+                usage::measure(&mut self.cpu_before, seen, host.cpu.threads)
+            }
+            None => usage::list_failed(),
+        };
         let latency = if self.probe_due(now_ms) {
             Some(self.probe_round(now_ms))
         } else {
@@ -570,6 +641,8 @@ impl<R: IncusRead> Sampler<R> {
             network: host.network,
             projects: projects.clone().unwrap_or_default(),
             instances_not_read: self.not_read.clone(),
+            power,
+            instance_cpu,
         };
         self.readings = Readings {
             pools,
@@ -596,6 +669,25 @@ impl<R: IncusRead> Sampler<R> {
         self.ring
             .back()
             .expect("the sample just pushed is in the ring")
+    }
+
+    /// The power block of this sample. A local host reads its package counters, measured against the previous sample's,
+    /// and its GPUs; a remote host has no local reading.
+    fn read_power(&mut self, gpu: &GpuSection, now_ms: u64) -> Power {
+        if !self.cfg.incus_local {
+            self.energy_before = None;
+            return power::remote();
+        }
+        let packages = power::read_packages(&self.cfg.sys_root);
+        let cpu = power::cpu_power(
+            self.energy_before
+                .as_ref()
+                .map(|(at, counters)| (*at, counters.as_slice())),
+            &packages,
+            now_ms,
+        );
+        self.energy_before = Some((now_ms, packages));
+        power::assemble(cpu, power::gpu_power(&self.cfg.sys_root, gpu))
     }
 
     /// Reads the GPU inventory through Incus and, on a local host only, the newest telemetry and process attribution.
@@ -780,6 +872,7 @@ impl<R: IncusRead> Sampler<R> {
         if was_local != self.cfg.incus_local {
             self.ring.clear();
             self.previous = None;
+            self.energy_before = None;
         }
         if let Some(shared) = &self.mode_choice {
             *shared.lock().unwrap_or_else(PoisonError::into_inner) = choice;
@@ -938,15 +1031,20 @@ fn read_host<R: IncusRead>(
     if cfg.incus_local {
         let cpu = procfs::read_cpu(&cfg.proc_root);
         let nic = procfs::read_nic_totals(&cfg.proc_root, &cfg.sys_root);
+        let used = previous
+            .and_then(|before| before.cpu)
+            .zip(cpu.totals)
+            .and_then(|(before, now)| used_pct(before, now));
+        let threads = (cpu.cores > 0).then_some(cpu.cores);
         return HostReadings {
             cpu: Cpu {
-                used_pct: previous
-                    .and_then(|before| before.cpu)
-                    .zip(cpu.totals)
-                    .and_then(|(before, now)| used_pct(before, now)),
+                used_pct: used,
                 cores: cpu.cores,
                 cores_known: cpu.cores > 0,
                 reason: None,
+                threads,
+                physical_cores: procfs::read_physical_cores(&cfg.sys_root),
+                busy_threads: busy_threads(used, threads),
             },
             load: procfs::read_load(&cfg.proc_root),
             memory: procfs::read_memory(&cfg.proc_root),
@@ -966,6 +1064,9 @@ fn read_host<R: IncusRead>(
                 cores: totals.cpu_threads,
                 cores_known: true,
                 reason: load_reason.clone(),
+                threads: Some(totals.cpu_threads),
+                physical_cores: totals.cpu_cores,
+                busy_threads: None,
             },
             load: Load {
                 one: None,
@@ -1002,6 +1103,9 @@ fn read_host<R: IncusRead>(
                 cores: 0,
                 cores_known: false,
                 reason: Some(RESOURCES_REASON.to_string()),
+                threads: None,
+                physical_cores: None,
+                busy_threads: None,
             },
             load: Load {
                 one: None,
@@ -1071,6 +1175,9 @@ pub fn mean(samples: &[HostSample]) -> Option<HostSample> {
                 |sample| sample.cpu.cores_known || sample.cpu.used_pct.is_some(),
                 |sample| sample.cpu.reason.clone(),
             ),
+            threads: known_cores.and_then(|sample| sample.cpu.threads),
+            physical_cores: samples.iter().rev().find_map(|s| s.cpu.physical_cores),
+            busy_threads: average(samples.iter().filter_map(|s| s.cpu.busy_threads)),
         },
         load: Load {
             one: average(samples.iter().filter_map(|s| s.load.one)),
@@ -1121,6 +1228,12 @@ pub fn mean(samples: &[HostSample]) -> Option<HostSample> {
         network: mean_network(samples),
         projects: mean_projects(samples),
         instances_not_read: last.instances_not_read.clone(),
+        power: power::mean_power(&samples.iter().map(|s| &s.power).collect::<Vec<_>>())
+            .unwrap_or_else(|| last.power.clone()),
+        instance_cpu: usage::mean_instance_cpu(
+            &samples.iter().map(|s| &s.instance_cpu).collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|| last.instance_cpu.clone()),
     })
 }
 
@@ -1196,6 +1309,13 @@ fn used_pct(before: CpuTotals, now: CpuTotals) -> Option<f64> {
     let busy = now.busy.saturating_sub(before.busy) as f64;
     let total = (now.total - before.total) as f64;
     Some(100.0 * busy / total)
+}
+
+/// `used_pct` of `threads`, as a count of busy threads.
+fn busy_threads(used_pct: Option<f64>, threads: Option<u64>) -> Option<f64> {
+    used_pct
+        .zip(threads)
+        .map(|(pct, threads)| pct / 100.0 * threads as f64)
 }
 
 /// The byte rates since the previous sample. A counter that moved backwards reads as zero. `None` unless both readings

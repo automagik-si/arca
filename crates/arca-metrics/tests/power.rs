@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arca_incus::{IncusError, IncusRead};
 use arca_metrics::gpu::{GpuTelemetry, NvidiaReading};
 use arca_metrics::{
-    FakeNvidia, HostSample, INSTANCE_CPU_MAX, InstanceThreads, NO_CPU_COUNTER, NO_GPU_COUNTER,
-    NOT_INCLUDED, REMOTE_HOST_REASON, Sampler, SamplerConfig, mean, power, usage,
+    FakeNvidia, HostSample, INSTANCE_CPU_MAX, InstanceThreads, MonotonicClock, NO_CPU_COUNTER,
+    NO_GPU_COUNTER, NOT_INCLUDED, REMOTE_HOST_REASON, Sampler, SamplerConfig, mean, power, usage,
 };
 use serde_json::{Value, json};
 
@@ -102,7 +102,11 @@ fn set_energy(root: &Path, dir: &str, energy_uj: u64) {
 fn topology(root: &Path) {
     for (cpu, siblings) in [(0, "0,2"), (1, "1,3"), (2, "0,2"), (3, "1,3")] {
         let base = format!("sys/devices/system/cpu/cpu{cpu}/topology");
-        write(root, &format!("{base}/core_cpus_list"), &format!("{siblings}\n"));
+        write(
+            root,
+            &format!("{base}/core_cpus_list"),
+            &format!("{siblings}\n"),
+        );
         write(root, &format!("{base}/physical_package_id"), "0\n");
     }
 }
@@ -149,7 +153,10 @@ impl IncusRead for Scripted {
             return script.resources.clone().map_or_else(refuse, Ok);
         }
         if path == LISTED {
-            return script.rows.clone().map_or_else(refuse, |rows| Ok(Value::Array(rows)));
+            return script
+                .rows
+                .clone()
+                .map_or_else(refuse, |rows| Ok(Value::Array(rows)));
         }
         if let Some(rest) = path.strip_prefix("/1.0/instances/")
             && let Some((name, _)) = rest.split_once("/state?")
@@ -177,6 +184,15 @@ fn stopped(name: &str, created: &str, last_used: &str) -> Value {
     row
 }
 
+/// A clock that never moves, so every state read answers at its sample's own time and a figure is exact.
+struct Frozen;
+
+impl MonotonicClock for Frozen {
+    fn now_ms(&self) -> u64 {
+        0
+    }
+}
+
 fn sampler<R: IncusRead>(root: &Path, incus: R, local: bool) -> Sampler<R> {
     Sampler::new(
         SamplerConfig {
@@ -191,6 +207,7 @@ fn sampler<R: IncusRead>(root: &Path, incus: R, local: bool) -> Sampler<R> {
         incus,
     )
     .with_nvidia(Arc::new(FakeNvidia::missing()))
+    .with_clock(Arc::new(Frozen))
 }
 
 fn tree(tag: &str) -> Scratch {
@@ -219,7 +236,11 @@ mod cpu_counts {
 
         let first = sampler.sample(1_000).clone();
         assert_eq!(first.cpu.threads, Some(4), "four numbered CPU lines");
-        assert_eq!(first.cpu.physical_cores, Some(2), "two distinct sibling lists");
+        assert_eq!(
+            first.cpu.physical_cores,
+            Some(2),
+            "two distinct sibling lists"
+        );
         assert_eq!(first.cpu.busy_threads, None, "no rate on the first sample");
         assert_eq!(first.cpu.cores, 4, "cores still counts the logical CPUs");
 
@@ -269,7 +290,11 @@ mod cpu_counts {
         let sample = sampler.sample(1_000).clone();
         assert_eq!(sample.cpu.cores, 8);
         assert_eq!(sample.cpu.threads, Some(8));
-        assert_eq!(sample.cpu.physical_cores, Some(4), "two sockets of two cores");
+        assert_eq!(
+            sample.cpu.physical_cores,
+            Some(4),
+            "two sockets of two cores"
+        );
         assert_eq!(sample.cpu.busy_threads, None);
     }
 }
@@ -299,7 +324,13 @@ mod cpu_power {
     #[test]
     fn the_first_sample_has_no_rate_and_says_it_is_the_only_one() {
         let scratch = tree("first");
-        zone(scratch.path(), "intel-rapl:0", "package-0", 1_000_000, Some(262_143_328_850));
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            1_000_000,
+            Some(262_143_328_850),
+        );
         let mut sampler = sampler(scratch.path(), Scripted::default(), true);
         let first = sampler.sample(1_000).clone();
 
@@ -316,8 +347,20 @@ mod cpu_power {
     #[test]
     fn two_packages_give_one_figure_each_and_their_sum() {
         let scratch = tree("two-packages");
-        zone(scratch.path(), "intel-rapl:0", "package-0", 1_000_000, Some(262_143_328_850));
-        zone(scratch.path(), "intel-rapl:1", "package-1", 1_000_000, Some(262_143_328_850));
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            1_000_000,
+            Some(262_143_328_850),
+        );
+        zone(
+            scratch.path(),
+            "intel-rapl:1",
+            "package-1",
+            1_000_000,
+            Some(262_143_328_850),
+        );
         let mut sampler = sampler(scratch.path(), Scripted::default(), true);
         sampler.sample(1_000);
         // 50 J and 25 J over five seconds: 10 W and 5 W.
@@ -332,7 +375,10 @@ mod cpu_power {
             .iter()
             .map(|package| (package.name.as_str(), package.power_w))
             .collect();
-        assert_eq!(figures, vec![("package-0", Some(10.0)), ("package-1", Some(5.0))]);
+        assert_eq!(
+            figures,
+            vec![("package-0", Some(10.0)), ("package-1", Some(5.0))]
+        );
         assert_eq!(sample.power.cpu.power_w, Some(15.0));
         assert_eq!(sample.power.cpu.reason, None);
         assert_eq!(sample.power.measured_power_w, Some(15.0));
@@ -344,13 +390,37 @@ mod cpu_power {
     #[test]
     fn a_sub_domain_another_interface_and_the_memory_zone_are_not_added_to_the_package() {
         let scratch = tree("sub-domain");
-        zone(scratch.path(), "intel-rapl:0", "package-0", 1_000_000, Some(262_143_328_850));
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            1_000_000,
+            Some(262_143_328_850),
+        );
         // The core sub-domain moves too, and is part of package-0 already.
-        zone(scratch.path(), "intel-rapl:0:0", "core", 1_000_000, Some(262_143_328_850));
+        zone(
+            scratch.path(),
+            "intel-rapl:0:0",
+            "core",
+            1_000_000,
+            Some(262_143_328_850),
+        );
         // The MMIO interface reads the same package a second way.
-        zone(scratch.path(), "intel-rapl-mmio:0", "package-0", 1_000_000, Some(262_143_328_850));
+        zone(
+            scratch.path(),
+            "intel-rapl-mmio:0",
+            "package-0",
+            1_000_000,
+            Some(262_143_328_850),
+        );
         // A memory zone is memory, which the sum never holds.
-        zone(scratch.path(), "intel-rapl:1", "dram", 1_000_000, Some(262_143_328_850));
+        zone(
+            scratch.path(),
+            "intel-rapl:1",
+            "dram",
+            1_000_000,
+            Some(262_143_328_850),
+        );
         // The control type directory has no counter of its own.
         fs::create_dir_all(scratch.path().join("sys/class/powercap/intel-rapl")).expect("a dir");
         let mut sampler = sampler(scratch.path(), Scripted::default(), true);
@@ -378,7 +448,13 @@ mod cpu_power {
         let scratch = tree("wrap");
         let range = 262_143_328_850u64;
         // 10 J before the wrap and 40 J after it: 50 J over five seconds is 10 W.
-        zone(scratch.path(), "intel-rapl:0", "package-0", range - 10_000_000, Some(range));
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            range - 10_000_000,
+            Some(range),
+        );
         let mut sampler = sampler(scratch.path(), Scripted::default(), true);
         sampler.sample(1_000);
         set_energy(scratch.path(), "intel-rapl:0", 40_000_000);
@@ -390,7 +466,13 @@ mod cpu_power {
     #[test]
     fn a_counter_that_goes_back_with_no_known_range_has_no_figure() {
         let scratch = tree("back");
-        zone(scratch.path(), "intel-rapl:0", "package-0", 90_000_000, None);
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            90_000_000,
+            None,
+        );
         let mut sampler = sampler(scratch.path(), Scripted::default(), true);
         sampler.sample(1_000);
         set_energy(scratch.path(), "intel-rapl:0", 40_000_000);
@@ -406,8 +488,16 @@ mod cpu_power {
         use std::os::unix::fs::PermissionsExt as _;
 
         let scratch = tree("refused");
-        zone(scratch.path(), "intel-rapl:0", "package-0", 1_000_000, Some(262_143_328_850));
-        let counter = scratch.path().join("sys/class/powercap/intel-rapl:0/energy_uj");
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            1_000_000,
+            Some(262_143_328_850),
+        );
+        let counter = scratch
+            .path()
+            .join("sys/class/powercap/intel-rapl:0/energy_uj");
         fs::set_permissions(&counter, fs::Permissions::from_mode(0o000)).expect("chmod");
         if fs::read(&counter).is_ok() {
             // Root reads a file whatever its mode; the unit test of the error kinds covers this case there.
@@ -436,7 +526,13 @@ mod cpu_power {
     #[test]
     fn a_remote_host_reports_no_local_power() {
         let scratch = Scratch::new("remote-power");
-        zone(scratch.path(), "intel-rapl:0", "package-0", 1_000_000, Some(262_143_328_850));
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            1_000_000,
+            Some(262_143_328_850),
+        );
         let incus = Scripted::default();
         incus.resources(json!({
             "cpu": { "total": 4 },
@@ -459,13 +555,14 @@ mod gpu_power {
     fn amdgpu(root: &Path, microwatts: &str) {
         let device = "sys/devices/pci0000:00/0000:c6:00.0";
         write(root, &format!("{device}/hwmon/hwmon9/name"), "amdgpu\n");
-        write(root, &format!("{device}/hwmon/hwmon9/power1_input"), microwatts);
+        write(
+            root,
+            &format!("{device}/hwmon/hwmon9/power1_input"),
+            microwatts,
+        );
         fs::create_dir_all(root.join("sys/class/drm/card1")).expect("a dir");
-        std::os::unix::fs::symlink(
-            root.join(device),
-            root.join("sys/class/drm/card1/device"),
-        )
-        .expect("the device link");
+        std::os::unix::fs::symlink(root.join(device), root.join("sys/class/drm/card1/device"))
+            .expect("the device link");
         // A connector is not a card.
         fs::create_dir_all(root.join("sys/class/drm/card1-DP-1")).expect("a dir");
     }
@@ -580,7 +677,13 @@ mod power_mean {
     #[test]
     fn the_mean_averages_each_package_over_the_samples_that_hold_it() {
         let scratch = tree("mean");
-        zone(scratch.path(), "intel-rapl:0", "package-0", 0, Some(262_143_328_850));
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            0,
+            Some(262_143_328_850),
+        );
         let mut sampler = sampler(scratch.path(), Scripted::default(), true);
         sampler.sample(1_000);
         // 50 J in five seconds is 10 W, then 100 J is 20 W.
@@ -593,7 +696,10 @@ mod power_mean {
         assert_eq!(averaged.power.cpu.packages[0].power_w, Some(15.0));
         assert_eq!(averaged.power.cpu.packages[0].reason, None);
         assert_eq!(averaged.power.cpu.power_w, Some(15.0));
-        assert_eq!(averaged.power.cpu.reason, None, "the newest known reading has none");
+        assert_eq!(
+            averaged.power.cpu.reason, None,
+            "the newest known reading has none"
+        );
         assert_eq!(averaged.power.measured_power_w, Some(15.0));
     }
 }
@@ -634,7 +740,13 @@ mod instance_cpu {
                 ("b1".to_string(), None, first_reading),
             ]
         );
-        assert!(first.instance_cpu.instances.iter().all(|e| e.project == "apps"));
+        assert!(
+            first
+                .instance_cpu
+                .instances
+                .iter()
+                .all(|e| e.project == "apps")
+        );
 
         // a1 used 2.5 s more in five seconds, half a thread; b1 used 5 s more, one thread.
         incus.cpu("a1", 4.5);
@@ -706,7 +818,11 @@ mod instance_cpu {
         let sample = sampler.sample(6_000).clone();
         assert_eq!(
             figures(&sample),
-            vec![("a1".to_string(), None, Some(usage::CPU_WENT_BACK.to_string()))]
+            vec![(
+                "a1".to_string(),
+                None,
+                Some(usage::CPU_WENT_BACK.to_string())
+            )]
         );
     }
 
@@ -756,7 +872,11 @@ mod instance_cpu {
             figures(&back),
             vec![
                 ("a1".to_string(), Some(1.0), None),
-                ("b1".to_string(), None, Some(usage::FIRST_READING.to_string())),
+                (
+                    "b1".to_string(),
+                    None,
+                    Some(usage::FIRST_READING.to_string())
+                ),
             ]
         );
     }
@@ -817,7 +937,11 @@ mod instance_cpu {
 
         let listed = &sample.instance_cpu.instances;
         assert_eq!(listed.len(), INSTANCE_CPU_MAX);
-        assert_eq!(listed[0].name, format!("i{:03}", count - 1), "the largest first");
+        assert_eq!(
+            listed[0].name,
+            format!("i{:03}", count - 1),
+            "the largest first"
+        );
         assert_eq!(sample.instance_cpu.omitted, 10);
         // The ten smallest, i000 to i009: (0 + 1 + ... + 9) / 100 = 0.45 threads.
         let omitted = sample.instance_cpu.omitted_busy_threads;
@@ -838,6 +962,9 @@ mod instance_cpu {
         incus.cpu("a1", 10.0);
         sampler.sample(11_000);
         let averaged = mean(&sampler.history(1)).expect("a mean");
-        assert_eq!(figures(&averaged), vec![("a1".to_string(), Some(1.0), None)]);
+        assert_eq!(
+            figures(&averaged),
+            vec![("a1".to_string(), Some(1.0), None)]
+        );
     }
 }

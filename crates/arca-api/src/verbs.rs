@@ -3066,6 +3066,9 @@ fn host_sample() -> Value {
                 ("cores", true, int()),
                 ("coresKnown", true, boolean()),
                 ("reason", true, nullable(string())),
+                ("threads", false, nullable(int())),
+                ("physicalCores", false, nullable(int())),
+                ("busyThreads", false, nullable(num())),
             ]),
         ),
         (
@@ -3130,6 +3133,78 @@ fn host_sample() -> Value {
             ])),
         ),
         ("instancesNotRead", true, instances_not_read()),
+        ("power", false, power()),
+        ("instanceCpu", false, instance_cpu()),
+    ])
+}
+
+/// The power block of a host sample: the CPU packages' power from their energy counters, the GPUs' power, and the sum of
+/// what was measured with the words for what it leaves out. A source with no figure carries a reason, never a zero.
+fn power() -> Value {
+    let mut schema = result(vec![
+        (
+            "cpu",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                (
+                    "packages",
+                    true,
+                    array(result(vec![
+                        ("zone", true, string()),
+                        ("name", true, string()),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        (
+            "gpu",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                (
+                    "cards",
+                    true,
+                    array(result(vec![
+                        ("pci", true, nullable(string())),
+                        ("card", true, nullable(string())),
+                        ("source", true, one_of(&["nvidia-smi", "hwmon"])),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        ("measuredPowerW", true, nullable(num())),
+        ("notIncluded", true, array(string())),
+    ]);
+    schema["description"] = json!(
+        "measuredPowerW sums the CPU packages (when every package has a figure) and each GPU with a figure. It is not the machine's power at the wall: notIncluded names what it leaves out."
+    );
+    schema
+}
+
+/// Each running instance's CPU in threads in use since its previous read: at most 50 rows, the largest first, and a count
+/// and a sum of the rest.
+fn instance_cpu() -> Value {
+    result(vec![
+        (
+            "instances",
+            true,
+            array(result(vec![
+                ("project", true, string()),
+                ("name", true, string()),
+                ("busyThreads", true, nullable(num())),
+                ("reason", true, nullable(string())),
+            ])),
+        ),
+        ("omitted", true, int()),
+        ("omittedBusyThreads", true, num()),
+        ("reason", true, nullable(string())),
     ])
 }
 

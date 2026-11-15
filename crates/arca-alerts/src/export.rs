@@ -19,6 +19,9 @@ use crate::eval::{
 
 pub const CPU_USED: &str = "arca_node_cpu_used_ratio";
 pub const CPU_CORES: &str = "arca_node_cpu_cores";
+pub const CPU_THREADS: &str = "arca_node_cpu_threads";
+pub const CPU_PHYSICAL_CORES: &str = "arca_node_cpu_physical_cores";
+pub const CPU_BUSY_THREADS: &str = "arca_node_cpu_busy_threads";
 pub const LOAD: &str = "arca_node_load";
 pub const MEMORY_TOTAL: &str = "arca_node_memory_total_bytes";
 pub const MEMORY_AVAILABLE: &str = "arca_node_memory_available_bytes";
@@ -27,6 +30,10 @@ pub const SWAP_FREE: &str = "arca_node_swap_free_bytes";
 pub const PSI: &str = "arca_node_psi_avg10_ratio";
 pub const CPU_TEMPERATURE: &str = "arca_node_cpu_temperature_celsius";
 pub const GPU_BUSY: &str = "arca_node_gpu_busy_ratio";
+pub const CPU_PACKAGE_POWER: &str = "arca_node_cpu_package_power_watts";
+pub const CPU_POWER: &str = "arca_node_cpu_power_watts";
+pub const GPU_POWER: &str = "arca_node_gpu_power_watts";
+pub const POWER_MEASURED: &str = "arca_node_power_measured_watts";
 pub const NETWORK_RECEIVE: &str = "arca_node_network_receive_bytes_total";
 pub const NETWORK_TRANSMIT: &str = "arca_node_network_transmit_bytes_total";
 pub const POOL_SIZE: &str = "arca_pool_size_bytes";
@@ -38,6 +45,7 @@ pub const DRIFT_ENTRIES: &str = "arca_drift_entries";
 pub const INSTANCE_RUNNING: &str = "arca_instance_running";
 pub const INSTANCE_STARTS: &str = "arca_instance_starts_total";
 pub const INSTANCE_CPU: &str = "arca_instance_cpu_seconds_total";
+pub const INSTANCE_CPU_BUSY: &str = "arca_instance_cpu_busy_threads";
 pub const INSTANCE_MEMORY: &str = "arca_instance_memory_used_bytes";
 pub const LATENCY: &str = "arca_latency_seconds";
 pub const SECURE_BOOT: &str = "arca_secureboot_enabled";
@@ -63,7 +71,7 @@ struct Family {
 }
 
 /// The families `/metrics` renders, in the export contract's order. A new family goes in its place in this order.
-const FAMILIES: [Family; 32] = [
+const FAMILIES: [Family; 40] = [
     Family {
         name: CPU_USED,
         kind: "gauge",
@@ -74,6 +82,24 @@ const FAMILIES: [Family; 32] = [
         name: CPU_CORES,
         kind: "gauge",
         help: "The number of CPUs.",
+        labels: &[],
+    },
+    Family {
+        name: CPU_THREADS,
+        kind: "gauge",
+        help: "The logical CPUs (threads).",
+        labels: &[],
+    },
+    Family {
+        name: CPU_PHYSICAL_CORES,
+        kind: "gauge",
+        help: "The physical CPU cores.",
+        labels: &[],
+    },
+    Family {
+        name: CPU_BUSY_THREADS,
+        kind: "gauge",
+        help: "The threads busy since the previous sample, as a count.",
         labels: &[],
     },
     Family {
@@ -122,6 +148,30 @@ const FAMILIES: [Family; 32] = [
         name: GPU_BUSY,
         kind: "gauge",
         help: "The share of time the GPU is busy, from 0 to 1.",
+        labels: &[],
+    },
+    Family {
+        name: CPU_PACKAGE_POWER,
+        kind: "gauge",
+        help: "A CPU package's power since the previous sample, in watts, from its powercap energy counter.",
+        labels: &["package"],
+    },
+    Family {
+        name: CPU_POWER,
+        kind: "gauge",
+        help: "The CPU packages' power summed, in watts, when every package has a figure.",
+        labels: &[],
+    },
+    Family {
+        name: GPU_POWER,
+        kind: "gauge",
+        help: "A GPU's power, in watts.",
+        labels: &["gpu", "source"],
+    },
+    Family {
+        name: POWER_MEASURED,
+        kind: "gauge",
+        help: "The sum of the CPU and GPU power measured, in watts; not the power at the wall: memory, disks, fans and the power supply's own loss are not in it.",
         labels: &[],
     },
     Family {
@@ -188,6 +238,12 @@ const FAMILIES: [Family; 32] = [
         name: INSTANCE_CPU,
         kind: "counter",
         help: "The CPU time an instance has used, in seconds.",
+        labels: &["project", "incus_instance"],
+    },
+    Family {
+        name: INSTANCE_CPU_BUSY,
+        kind: "gauge",
+        help: "The threads an instance had busy between its previous read and this one, as a count.",
         labels: &["project", "incus_instance"],
     },
     Family {
@@ -280,6 +336,14 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
     // `cpu.cores` is 0 when `/proc/stat` cannot be read, which is no reading.
     let cores = (sample.cpu.cores > 0).then_some(sample.cpu.cores as f64);
     push(&mut out, CPU_CORES, SeriesKind::Gauge, &[], cores);
+    let cpu = &sample.cpu;
+    for (name, value) in [
+        (CPU_THREADS, cpu.threads.map(|n| n as f64)),
+        (CPU_PHYSICAL_CORES, cpu.physical_cores.map(|n| n as f64)),
+        (CPU_BUSY_THREADS, cpu.busy_threads),
+    ] {
+        push(&mut out, name, SeriesKind::Gauge, &[], value);
+    }
     for (window, value) in [
         ("1m", sample.load.one),
         ("5m", sample.load.five),
@@ -336,6 +400,42 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
         SeriesKind::Gauge,
         &[],
         sample.gpu_busy_pct.map(|pct| pct / 100.0),
+    );
+    let power = &sample.power;
+    for package in &power.cpu.packages {
+        let labels = [("package", package.name.as_str())];
+        push(
+            &mut out,
+            CPU_PACKAGE_POWER,
+            SeriesKind::Gauge,
+            &labels,
+            package.power_w,
+        );
+    }
+    push(
+        &mut out,
+        CPU_POWER,
+        SeriesKind::Gauge,
+        &[],
+        power.cpu.power_w,
+    );
+    for card in &power.gpu.cards {
+        let gpu = card.pci.as_deref().or(card.card.as_deref()).unwrap_or("");
+        let labels = [("gpu", gpu), ("source", card.source.as_str())];
+        push(
+            &mut out,
+            GPU_POWER,
+            SeriesKind::Gauge,
+            &labels,
+            card.power_w,
+        );
+    }
+    push(
+        &mut out,
+        POWER_MEASURED,
+        SeriesKind::Gauge,
+        &[],
+        power.measured_power_w,
     );
     if let Some(nic) = readings.nic {
         push(
@@ -421,6 +521,20 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
             SeriesKind::Gauge,
             &labels,
             instance.memory_bytes.map(|bytes| bytes as f64),
+        );
+    }
+    // The threads in use come from the sample's bounded list, so an instance past its cap, or with no figure, has no series.
+    for row in &sample.instance_cpu.instances {
+        let labels = [
+            ("project", row.project.as_str()),
+            ("incus_instance", row.name.as_str()),
+        ];
+        push(
+            &mut out,
+            INSTANCE_CPU_BUSY,
+            SeriesKind::Gauge,
+            &labels,
+            row.busy_threads,
         );
     }
     // A probe round is read only while it is no older than its source's maximum age, and each target is a point only when its
