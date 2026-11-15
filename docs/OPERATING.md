@@ -2369,7 +2369,10 @@ uuid this move did not record is left alone and named. A custom volume's copy is
 is read back here. The source is started again only when this move stopped it and the copy is read back gone or stopped;
 a target that cannot be read leaves the source stopped. The source's own volumes are never touched. A clean rollback is
 `rolled_back` with the reason; anything else (the source not read back, a copy kept, a target not read) is `failed` with
-what was left and why, and the move's phase is `needs_owner`. The next instance of a batch still moves. A verified
+what was left and why, and the move's phase is `needs_owner`. When such a failure leaves the source stopped here while
+a copy may still run on the target (not removed, or not read), the source's `boot.autostart` is turned off, as for a
+verified source, so a restart of this host does not start it beside the copy (`autostartOff` in the result line; when
+that fails, the reason says so). The next instance of a batch still moves. A verified
 instance's source stays on this host, stopped: to go back, stop the copy on the target and start the source, until the
 move is finished. The proposal's late result is `MoveVerified`, `MovePartlyRolledBack`, `MoveRolledBack`, or
 `MoveNeedsOwner` when any instance is `failed` or kept its `boot.autostart`.
@@ -2378,7 +2381,7 @@ move is finished. The proposal's late result is `MoveVerified`, `MovePartlyRolle
 kernel mode each instance without a result is settled: one whose checks passed (a `verify` line with `ok`) is recorded as
 `moved` and nothing is deleted; one whose copy had been started is left as it stands, with the source stopped, and is
 `failed` for the owner (the copy may have served writes; the reason says how to keep one of them, and no other move
-takes the instance while that copy may run); any other is rolled back as above, with the reason "the kernel
+takes the instance while that copy may run), with the source's `boot.autostart` turned off as above; any other is rolled back as above, with the reason "the kernel
 stopped during the move". The move ends `interrupted`, and the proposal gets its late result.
 
 **Progress.** `instance_move_status` (viewer, read-only) answers one move (`{"move": "mv-…"}`) or the latest 20: its
