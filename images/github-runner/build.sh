@@ -213,6 +213,11 @@ for _ in $(seq 60); do
   sleep 5
 done
 [ -n "$ip" ] || { say "$vm has no address"; exit 1; }
+# GitHub's template reboots the machine and Packer reconnects to the same address: pin it, so a new lease cannot move it.
+nic=$(incus query "/1.0/instances/$vm?project=$PROJECT" | jq -r '[.expanded_devices | to_entries[] | select(.value.type == "nic") | .key][0]')
+incus config device override "$vm" "$nic" ipv4.address="$ip" --project "$PROJECT" 2>/dev/null ||
+  incus config device set "$vm" "$nic" ipv4.address="$ip" --project "$PROJECT" 2>/dev/null ||
+  say "could not pin $ip on $vm (it may move after GitHub's reboot)"
 push_files() {
   local f
   in_vm -- mkdir -p /tmp/arca-image
