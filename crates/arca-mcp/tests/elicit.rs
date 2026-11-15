@@ -60,13 +60,14 @@ struct Approver {
 }
 
 impl TerminalApprover for Approver {
-    fn pending(&self, verb: &str, result: &Value) -> Option<PendingPlan> {
+    fn pending(&self, verb: &str, result: &Value, _caller: &Caller) -> Option<PendingPlan> {
         (verb == "action_propose" && result["kind"] == "action").then(|| PendingPlan {
             id: result["id"].as_str().unwrap_or_default().to_string(),
             message: format!(
                 "Approve this plan? {}",
                 result["summary"].as_str().unwrap_or("")
             ),
+            created_at: result["createdAt"].as_u64().unwrap_or_default(),
         })
     }
 

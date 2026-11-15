@@ -51,7 +51,8 @@ pub const ISSUED_PREFIX: &str = "oauth:";
 
 /// Tokens an OAuth authorization server issued for this MCP server (MCP authorization, 2025-11-25). The server asks it
 /// about a bearer the static store does not know. An implementation answers only for a live token whose audience is this
-/// server, and names the caller `oauth:<client id>` ([`ISSUED_PREFIX`]), so a static token's id is never shadowed.
+/// server, and names the caller with [`ISSUED_PREFIX`] (Arca's: `oauth:<client id>/<grant id>`, one id per grant), so a
+/// static token's id is never shadowed.
 pub trait IssuedTokens: Send + Sync {
     /// The caller a bearer authenticates as, or `None`.
     fn lookup(&self, bearer: &str) -> Option<Caller>;

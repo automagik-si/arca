@@ -21,13 +21,20 @@
 //!   token works once, and a refresh token used again after its rotation revokes the grant. A token request may narrow
 //!   the scope and never widen it.
 //! - `POST /oauth/revoke` (RFC 7009): an access token alone, or a refresh token and its whole grant.
+//! - `GET /oauth/step-up?grant=<id>`: the page where one passkey tap (action `mcp_authorize`, target the client id,
+//!   `paramsDigest` over the grant) confirms the owner's signed-in session again for [`STEP_UP_MS`]; its
+//!   `POST /oauth/step-up/begin` and `.../approve` work as the consent page's.
 //! - `GET /approve/oauth/clients` and `POST /approve/oauth/revoke`: the owner's list of connected clients and its revoke.
 //! - On the unix socket alone, `POST /local/oauth/clients` and `POST /local/oauth/revoke`, behind the setup code's
 //!   proof file: what `arca oauth list` and `arca oauth revoke` call.
 //!
 //! Scopes are `viewer`, `doctor` and `operator`, the levels a stored token has; the highest one asked wins, and none asked
-//! means `viewer`. `tool:<verb>` narrows a grant to the verbs it names. `admin` is never granted here. An access token
-//! lives one hour and a refresh token thirty days; a code lives sixty seconds.
+//! means `viewer`. `tool:<verb>` narrows a grant to the verbs it names. `admin` is never granted here. `approvals` makes
+//! the grant the owner's own signed-in session: its client is asked, by elicitation, to approve the plans that wait for
+//! the owner (`owner_approval_pending`, and the plan an `action_propose` answers), while the passkey that approved it is
+//! less than [`STEP_UP_MS`] old or was confirmed again on the step-up page; plans that delete or erase keep their passkey
+//! card. While a grant with `approvals` is live, the waiting action plans stay open past their fifteen minutes. An access
+//! token lives one hour and a refresh token thirty days; a code lives sixty seconds.
 //!
 //! Tokens are opaque: `arca_at_` or `arca_rt_` and 43 base64url characters (256 random bits). The state directory keeps
 //! only their SHA-256, in `mcp-oauth.json` (mode 0600, written whole and renamed). Codes and consent requests live in
@@ -39,6 +46,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arca_api::Scope;
@@ -76,6 +84,11 @@ pub const CODE_TTL_MS: u64 = 60 * 1000;
 pub const REQUEST_TTL_MS: u64 = 10 * 60 * 1000;
 /// How long a begun statement waits for its passkey.
 pub const BEGUN_MAX_MS: u64 = 120 * 1000;
+/// How long the owner's passkey counts for a session with `approvals`: from the consent, then from each step-up.
+pub const STEP_UP_MS: u64 = 12 * 60 * 60 * 1000;
+/// The scope word that makes a grant the owner's signed-in session, which is asked to approve.
+pub const APPROVALS: &str = "approvals";
+pub const STEP_UP_PATH: &str = "/oauth/step-up";
 /// The paths of the endpoints, under the issuer.
 pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const TOKEN_PATH: &str = "/oauth/token";
@@ -152,6 +165,15 @@ struct Grant {
     /// written before it was kept; `scope` and `tools` stand in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approved: Option<Approved>,
+    /// Whether the owner approved this client as their signed-in session, which is asked to approve plans.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    approvals: bool,
+    /// Until when (unix ms) the owner's passkey counts for that session: the consent's, or the last step-up's.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    stepped_up_until: u64,
+    /// A prefix of the fingerprint of the passkey of the last step-up, when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step_key: Option<String>,
 }
 
 /// The scope and tool list the owner's passkey approved for a grant.
@@ -160,6 +182,10 @@ struct Approved {
     scope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<String>>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -178,6 +204,7 @@ struct Pending {
     state: Option<String>,
     scope: Scope,
     tools: Option<Vec<String>>,
+    approvals: bool,
     resource: String,
     challenge: String,
     created: u64,
@@ -193,10 +220,12 @@ struct Code {
     redirect_given: bool,
     scope: Scope,
     tools: Option<Vec<String>>,
+    approvals: bool,
     resource: String,
     challenge: String,
     expires: u64,
     key: String,
+    approved_at: u64,
 }
 
 #[derive(Default)]
@@ -211,6 +240,8 @@ struct Inner {
     /// Whether a revocation ended a grant in memory that the store on disk does not have yet: the next revocation
     /// request saves it before anything else.
     unsaved: bool,
+    /// The step-up statements begun, by grant id: the statement and when it was begun.
+    step_ups: HashMap<String, (String, u64)>,
 }
 
 /// The authorization server: the page origin it issues for, the resource it issues tokens to, the kernel whose owner
@@ -225,6 +256,20 @@ pub struct OAuth {
     inner: Mutex<Inner>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
     gate: Option<PageGate>,
+    /// Until when (unix ms) a grant with `approvals` is live: the latest refresh expiry among them, zero with none. The
+    /// kernel reads it to hold waiting proposals open.
+    session_until: Arc<AtomicU64>,
+}
+
+/// What the owner's signed-in session may do for one caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Session {
+    /// The caller is the owner's signed-in session and may be asked: `key` is the passkey that last confirmed it.
+    Ready { key: String },
+    /// The caller is the owner's signed-in session, but its passkey is too old: one tap at `url` confirms it again.
+    StepUp { url: String },
+    /// The caller is not the owner's signed-in session.
+    None,
 }
 
 /// An OAuth error answer: the RFC 6749 code and a sentence.
@@ -325,6 +370,7 @@ impl OAuth {
         state_dir: &Path,
     ) -> io::Result<OAuth> {
         let stored = read_store(&state_dir.join(STORE_FILE))?;
+        let session_until = Arc::new(AtomicU64::new(session_until(&stored, clock())));
         Ok(OAuth {
             origin: origin.to_string(),
             rp_id: rp_id.to_string(),
@@ -338,7 +384,60 @@ impl OAuth {
             }),
             log: Arc::new(|line| eprintln!("{line}")),
             gate: None,
+            session_until,
         })
+    }
+
+    /// Until when the owner's signed-in session is connected (unix ms; zero when it is not), kept current as grants change.
+    pub fn owner_session(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.session_until)
+    }
+
+    /// The step-up page of grant `grant`.
+    pub fn step_up_url(&self, grant: &str) -> String {
+        format!(
+            "{}{STEP_UP_PATH}?grant={}",
+            self.origin,
+            percent_encode(grant)
+        )
+    }
+
+    /// What `caller` may do as the owner's signed-in session: an issued token of a live grant with `approvals`, of a
+    /// client that is not revoked, is it; it may be asked while its passkey is less than [`STEP_UP_MS`] old.
+    pub fn session(&self, caller: &Caller) -> Session {
+        let Some(grant_id) = caller
+            .token_id
+            .strip_prefix(ISSUED_PREFIX)
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, grant)| grant)
+        else {
+            return Session::None;
+        };
+        let now = self.now();
+        let inner = self.lock();
+        let Some(grant) = inner.stored.grants.iter().find(|grant| {
+            grant.id == grant_id
+                && grant.approvals
+                && grant.revoked_at.is_none()
+                && grant
+                    .refresh
+                    .as_ref()
+                    .is_some_and(|token| now < token.expires)
+        }) else {
+            return Session::None;
+        };
+        if Self::client(&inner, &grant.client_id).is_none() {
+            return Session::None;
+        }
+        if now < grant.stepped_up_until {
+            Session::Ready {
+                key: grant.step_key.clone().unwrap_or_else(|| grant.key.clone()),
+            }
+        } else {
+            Session::StepUp {
+                url: self.step_up_url(&grant.id),
+            }
+        }
     }
 
     /// Replaces the log sink.
@@ -378,6 +477,8 @@ impl OAuth {
         let temp = self
             .state_dir
             .join(format!("{STORE_FILE}.tmp-{}", std::process::id()));
+        self.session_until
+            .store(session_until(&inner.stored, self.now()), Ordering::SeqCst);
         let bytes = serde_json::to_vec(&inner.stored).map_err(io::Error::other)?;
         let _ = fs::remove_file(&temp);
         let mut file = OpenOptions::new()
@@ -655,7 +756,7 @@ impl OAuth {
                 ));
             }
         };
-        let (scope, tools) = match parse_scope(param("scope").unwrap_or_default()) {
+        let (scope, tools, approvals) = match parse_scope(param("scope").unwrap_or_default()) {
             Ok(parsed) => parsed,
             Err(why) => {
                 return back(OAuthError::new("invalid_scope", why));
@@ -675,6 +776,7 @@ impl OAuth {
             state,
             scope,
             tools,
+            approvals,
             resource,
             challenge,
             created: now,
@@ -693,7 +795,7 @@ impl OAuth {
             "client": client.id,
             "name": client.name,
             "redirectUri": pending.redirect_uri,
-            "scope": scope_text(pending.scope, pending.tools.as_deref()),
+            "scope": scope_text(pending.scope, pending.tools.as_deref(), pending.approvals),
             "resource": pending.resource,
             "codeChallenge": pending.challenge,
         })
@@ -701,28 +803,7 @@ impl OAuth {
 
     fn begin(&self, id: &str) -> Result<Value, Refusal> {
         let now = self.now();
-        let kernel = self.kernel.lock().map_err(|_| internal())?;
-        if let Some(refusal) = kernel.owner_passkey_refusal() {
-            return Err(refused(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "passkeys_refused",
-                refusal.to_string(),
-            ));
-        }
-        let lines: Vec<_> = kernel
-            .owner_passkey_lines()
-            .into_iter()
-            .filter(|line| line.rp_id == self.rp_id)
-            .collect();
-        if lines.is_empty() {
-            return Err(refused(
-                StatusCode::CONFLICT,
-                "no_passkey",
-                "no passkey is set up for this page: add one on the approval page first",
-            ));
-        }
-        let host = kernel.host().to_string();
-        drop(kernel);
+        let (lines, host) = self.owner_lines()?;
         let mut inner = self.lock();
         Self::sweep(&mut inner, now);
         let client = {
@@ -752,17 +833,7 @@ impl OAuth {
             challenge_for(ARCA_NAMESPACE, statement.as_bytes()).map_err(|_| internal())?;
         pending.statement = Some(statement.clone());
         pending.begun_at = Some(now);
-        Ok(json!({
-            "id": id,
-            "statement": statement,
-            "challenge": URL_SAFE_NO_PAD.encode(challenge),
-            "rpId": self.rp_id,
-            "allowCredentials": lines
-                .iter()
-                .map(|line| json!({ "id": URL_SAFE_NO_PAD.encode(&line.credential_id) }))
-                .collect::<Vec<_>>(),
-            "timeoutMs": BEGUN_MAX_MS,
-        }))
+        Ok(Self::begun(id, &statement, &challenge, &self.rp_id, &lines))
     }
 
     fn approve(&self, id: &str, statement: &str, proof: &Value) -> Result<Value, Refusal> {
@@ -790,47 +861,13 @@ impl OAuth {
                 "this approval is out of date: tap Approve again",
             ));
         }
-        let proof_bytes = canonical_json(proof)
-            .ok()
-            .filter(|bytes| parse_proof(bytes.as_bytes()).is_ok())
-            .ok_or_else(|| {
-                refused(
-                    StatusCode::BAD_REQUEST,
-                    "bad_proof",
-                    "the passkey's answer is not a proof",
-                )
-            })?;
-        let approval = format!(
-            "{}.{}",
-            STANDARD.encode(statement),
-            STANDARD.encode(&proof_bytes)
-        );
-        let args = Self::bound(&pending, &client);
-        let key = {
-            let mut kernel = self.kernel.lock().map_err(|_| internal())?;
-            let check = kernel
-                .preview_approval(ArcaAction::McpAuthorize, &client.id, &args, &approval, now)
-                .and_then(|spent| {
-                    kernel
-                        .check_approval(ArcaAction::McpAuthorize, &client.id, &args, &approval, now)
-                        .map(|()| spent)
-                });
-            match check {
-                Ok(spent) => spent.key.chars().take(24).collect::<String>(),
-                Err(refusal) => {
-                    (self.log)(&format!(
-                        "arca: MCP authorization of {}: the passkey was refused: {}",
-                        client.id,
-                        crate::handlers::refusal_code(&refusal)
-                    ));
-                    return Err(refused(
-                        StatusCode::FORBIDDEN,
-                        "assertion_refused",
-                        refusal.to_string(),
-                    ));
-                }
-            }
-        };
+        let key = self.spend(
+            &client.id,
+            &Self::bound(&pending, &client),
+            statement,
+            proof,
+            now,
+        )?;
         let code = secret(CODE_PREFIX);
         {
             let mut inner = self.lock();
@@ -846,14 +883,16 @@ impl OAuth {
                     redirect_given: pending.redirect_given,
                     scope: pending.scope,
                     tools: pending.tools.clone(),
+                    approvals: pending.approvals,
                     resource: pending.resource.clone(),
                     challenge: pending.challenge.clone(),
                     expires: now + CODE_TTL_MS,
                     key: key.clone(),
+                    approved_at: now,
                 },
             );
         }
-        let scope = scope_text(pending.scope, pending.tools.as_deref());
+        let scope = scope_text(pending.scope, pending.tools.as_deref(), pending.approvals);
         self.journal(
             now,
             "granted",
@@ -882,7 +921,7 @@ impl OAuth {
         self.journal(
             now,
             "denied",
-            json!({ "client": pending.client_id, "scope": scope_text(pending.scope, pending.tools.as_deref()) }),
+            json!({ "client": pending.client_id, "scope": scope_text(pending.scope, pending.tools.as_deref(), pending.approvals) }),
         );
         Ok(json!({
             "redirect": with_params(&pending.redirect_uri, &[
@@ -892,6 +931,231 @@ impl OAuth {
                 ("iss", Some(self.origin.as_str())),
             ]),
         }))
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Step-up: the owner's passkey confirms the signed-in session again
+
+    /// The live grant with `approvals` named `id`, and its client.
+    fn session_grant(inner: &Inner, id: &str, now: u64) -> Result<(Grant, Client), Refusal> {
+        let grant = inner
+            .stored
+            .grants
+            .iter()
+            .find(|grant| {
+                grant.id == id
+                    && grant.approvals
+                    && grant.revoked_at.is_none()
+                    && grant
+                        .refresh
+                        .as_ref()
+                        .is_some_and(|token| now < token.expires)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                refused(
+                    StatusCode::NOT_FOUND,
+                    "gone",
+                    "this session is no longer connected: connect the app again",
+                )
+            })?;
+        let client = Self::client(inner, &grant.client_id)
+            .cloned()
+            .ok_or_else(gone)?;
+        Ok((grant, client))
+    }
+
+    /// The arguments a step-up statement binds: the grant, its client and that it is a step-up.
+    fn step_up_bound(grant: &Grant, client: &Client) -> Value {
+        json!({ "stepUp": grant.id, "client": client.id, "name": client.name })
+    }
+
+    fn step_up_begin(&self, id: &str) -> Result<Value, Refusal> {
+        let now = self.now();
+        let (lines, host) = self.owner_lines()?;
+        let mut inner = self.lock();
+        let (grant, client) = Self::session_grant(&inner, id, now)?;
+        let digest =
+            params_digest(&Self::step_up_bound(&grant, &client)).map_err(|_| internal())?;
+        let statement = canonical_json(&json!({
+            "host": host,
+            "action": ArcaAction::McpAuthorize.as_str(),
+            "target": client.id,
+            "paramsDigest": digest,
+            "issuedAt": iso_utc(now),
+            "expiresAt": iso_utc(now.saturating_add(TTL_MAX_MS.min(BEGUN_MAX_MS * 2))),
+            "nonce": random_hex(16),
+        }))
+        .map_err(|_| internal())?;
+        let challenge =
+            challenge_for(ARCA_NAMESPACE, statement.as_bytes()).map_err(|_| internal())?;
+        inner
+            .step_ups
+            .retain(|_, (_, begun)| now.saturating_sub(*begun) <= BEGUN_MAX_MS);
+        inner
+            .step_ups
+            .insert(grant.id.clone(), (statement.clone(), now));
+        Ok(Self::begun(id, &statement, &challenge, &self.rp_id, &lines))
+    }
+
+    fn step_up_approve(&self, id: &str, statement: &str, proof: &Value) -> Result<Value, Refusal> {
+        let now = self.now();
+        let (grant, client, begun) = {
+            let inner = self.lock();
+            let (grant, client) = Self::session_grant(&inner, id, now)?;
+            (grant, client, inner.step_ups.get(id).cloned())
+        };
+        let Some((begun, begun_at)) = begun else {
+            return Err(refused(
+                StatusCode::CONFLICT,
+                "not_begun",
+                "tap Confirm again",
+            ));
+        };
+        if now.saturating_sub(begun_at) > BEGUN_MAX_MS || begun != statement {
+            return Err(refused(
+                StatusCode::CONFLICT,
+                "stale",
+                "this confirmation is out of date: tap Confirm again",
+            ));
+        }
+        let key = self.spend(
+            &client.id,
+            &Self::step_up_bound(&grant, &client),
+            statement,
+            proof,
+            now,
+        )?;
+        let client_name = {
+            let mut inner = self.lock();
+            inner.step_ups.remove(id);
+            let Some(kept) = inner
+                .stored
+                .grants
+                .iter_mut()
+                .find(|kept| kept.id == grant.id && kept.revoked_at.is_none())
+            else {
+                return Err(gone());
+            };
+            let before = kept.clone();
+            kept.stepped_up_until = now.saturating_add(STEP_UP_MS);
+            kept.step_key = Some(key.clone());
+            if self.persist(&inner).is_err() {
+                if let Some(kept) = inner
+                    .stored
+                    .grants
+                    .iter_mut()
+                    .find(|kept| kept.id == grant.id)
+                {
+                    *kept = before;
+                }
+                return Err(internal());
+            }
+            client.name.clone()
+        };
+        self.journal(
+            now,
+            "stepped_up",
+            json!({ "client": client.id, "name": client_name, "grant": grant.id, "until": iso_utc(now.saturating_add(STEP_UP_MS)), "by": format!("passkey {key}") }),
+        );
+        Ok(
+            json!({ "confirmedUntil": iso_utc(now.saturating_add(STEP_UP_MS)), "name": client_name }),
+        )
+    }
+
+    /// The owner's passkey lines for this page's relying party and the kernel's host name, or why none can sign.
+    fn owner_lines(&self) -> Result<(Vec<arca_approval::PasskeyLine>, String), Refusal> {
+        let kernel = self.kernel.lock().map_err(|_| internal())?;
+        if let Some(refusal) = kernel.owner_passkey_refusal() {
+            return Err(refused(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "passkeys_refused",
+                refusal.to_string(),
+            ));
+        }
+        let lines: Vec<_> = kernel
+            .owner_passkey_lines()
+            .into_iter()
+            .filter(|line| line.rp_id == self.rp_id)
+            .collect();
+        if lines.is_empty() {
+            return Err(refused(
+                StatusCode::CONFLICT,
+                "no_passkey",
+                "no passkey is set up for this page: add one on the approval page first",
+            ));
+        }
+        Ok((lines, kernel.host().to_string()))
+    }
+
+    /// What a begin answers: the statement, its WebAuthn challenge and the passkeys that may sign it.
+    fn begun(
+        id: &str,
+        statement: &str,
+        challenge: &[u8],
+        rp_id: &str,
+        lines: &[arca_approval::PasskeyLine],
+    ) -> Value {
+        json!({
+            "id": id,
+            "statement": statement,
+            "challenge": URL_SAFE_NO_PAD.encode(challenge),
+            "rpId": rp_id,
+            "allowCredentials": lines
+                .iter()
+                .map(|line| json!({ "id": URL_SAFE_NO_PAD.encode(&line.credential_id) }))
+                .collect::<Vec<_>>(),
+            "timeoutMs": BEGUN_MAX_MS,
+        })
+    }
+
+    /// Checks the owner's passkey proof over `statement` for an `mcp_authorize` of `client` binding `args`, and spends it
+    /// (nonce and sign count) with the kernel's own check. Answers a prefix of the passkey's fingerprint.
+    fn spend(
+        &self,
+        client: &str,
+        args: &Value,
+        statement: &str,
+        proof: &Value,
+        now: u64,
+    ) -> Result<String, Refusal> {
+        let proof_bytes = canonical_json(proof)
+            .ok()
+            .filter(|bytes| parse_proof(bytes.as_bytes()).is_ok())
+            .ok_or_else(|| {
+                refused(
+                    StatusCode::BAD_REQUEST,
+                    "bad_proof",
+                    "the passkey's answer is not a proof",
+                )
+            })?;
+        let approval = format!(
+            "{}.{}",
+            STANDARD.encode(statement),
+            STANDARD.encode(&proof_bytes)
+        );
+        let mut kernel = self.kernel.lock().map_err(|_| internal())?;
+        let check = kernel
+            .preview_approval(ArcaAction::McpAuthorize, client, args, &approval, now)
+            .and_then(|spent| {
+                kernel
+                    .check_approval(ArcaAction::McpAuthorize, client, args, &approval, now)
+                    .map(|()| spent)
+            });
+        match check {
+            Ok(spent) => Ok(spent.key.chars().take(24).collect::<String>()),
+            Err(refusal) => {
+                (self.log)(&format!(
+                    "arca: MCP authorization of {client}: the passkey was refused: {}",
+                    crate::handlers::refusal_code(&refusal)
+                ));
+                Err(refused(
+                    StatusCode::FORBIDDEN,
+                    "assertion_refused",
+                    refusal.to_string(),
+                ))
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -990,6 +1254,14 @@ impl OAuth {
                 scope: code.scope.as_str().to_string(),
                 tools: code.tools.clone(),
             }),
+            approvals: code.approvals,
+            // The consent's passkey counts for the session from the moment it approved.
+            stepped_up_until: if code.approvals {
+                code.approved_at.saturating_add(STEP_UP_MS)
+            } else {
+                0
+            },
+            step_key: None,
         };
         inner
             .used_codes
@@ -1073,8 +1345,14 @@ impl OAuth {
         let (scope, tools) = match param("scope") {
             None => (granted, granted_tools),
             Some(asked) => {
-                let (scope, tools) =
+                let (scope, tools, approvals) =
                     parse_scope(asked).map_err(|why| OAuthError::new("invalid_scope", why))?;
+                if approvals && !grant.approvals {
+                    return Err(OAuthError::new(
+                        "invalid_scope",
+                        "the owner did not approve approvals; a refresh cannot ask for it",
+                    ));
+                }
                 if scope > granted {
                     return Err(OAuthError::new(
                         "invalid_scope",
@@ -1212,7 +1490,8 @@ impl OAuth {
                     .map(|grant| {
                         let (scope, tools) = approved_scope(grant);
                         json!({
-                            "scope": scope_text(level(&scope).unwrap_or(Scope::Viewer), tools.as_deref()),
+                            "scope": scope_text(level(&scope).unwrap_or(Scope::Viewer), tools.as_deref(), grant.approvals),
+                            "approvals": grant.approvals,
                             "approvedAt": iso_utc(grant.approved_at),
                             "lastUsedAt": inner.last_used.get(&grant.id).map(|at| iso_utc(*at)),
                             "expiresAt": grant.refresh.as_ref().map(|token| iso_utc(token.expires)),
@@ -1224,8 +1503,9 @@ impl OAuth {
                     "name": client.name,
                     "scope": most.map(|grant| {
                         let (scope, tools) = approved_scope(grant);
-                        scope_text(level(&scope).unwrap_or(Scope::Viewer), tools.as_deref())
+                        scope_text(level(&scope).unwrap_or(Scope::Viewer), tools.as_deref(), false)
                     }),
+                    "approvals": live.iter().any(|grant| grant.approvals),
                     "lastUsedAt": last_used,
                     "nameShared": Self::name_shared(&inner, client),
                     "redirectHosts": client.redirect_uris.iter().map(|uri| redirect_host(uri)).collect::<Vec<_>>(),
@@ -1304,6 +1584,9 @@ impl OAuth {
             .route("/oauth/authorize/begin", post(consent_begin))
             .route("/oauth/authorize/approve", post(consent_approve))
             .route("/oauth/authorize/deny", post(consent_deny))
+            .route(STEP_UP_PATH, get(step_up_page))
+            .route("/oauth/step-up/begin", post(step_up_begin))
+            .route("/oauth/step-up/approve", post(step_up_approve))
             .route("/oauth/consent.js", get(consent_js))
             .route("/oauth/consent.css", get(consent_css))
             .route("/approve/oauth/clients", get(owner_clients))
@@ -1357,7 +1640,7 @@ impl IssuedTokens for OAuth {
         let scope = level(&grant.scope)?;
         inner.last_used.insert(grant.id.clone(), now);
         Some(Caller {
-            token_id: format!("{ISSUED_PREFIX}{}", grant.client_id),
+            token_id: format!("{ISSUED_PREFIX}{}/{}", grant.client_id, grant.id),
             scope,
             tools: grant.tools.clone(),
         })
@@ -1392,7 +1675,7 @@ fn token_answer(access: &str, refresh: &str, grant: &Grant) -> Value {
         "token_type": "Bearer",
         "expires_in": ACCESS_TTL_MS / 1000,
         "refresh_token": refresh,
-        "scope": scope_text(level(&grant.scope).unwrap_or(Scope::Viewer), grant.tools.as_deref()),
+        "scope": scope_text(level(&grant.scope).unwrap_or(Scope::Viewer), grant.tools.as_deref(), grant.approvals),
     })
 }
 
@@ -1437,13 +1720,17 @@ fn level(word: &str) -> Option<Scope> {
     LEVELS.into_iter().find(|scope| scope.as_str() == word)
 }
 
-/// A scope request: the highest level it names (viewer when none) and the tools it names, if any. `admin` and an
-/// unknown tool are refused; other words are ignored, so a client that adds its own words is not refused for them.
-fn parse_scope(text: &str) -> Result<(Scope, Option<Vec<String>>), String> {
+/// A scope request: the highest level it names (viewer when none), the tools it names, if any, and whether it names
+/// `approvals`. `admin` and an unknown tool are refused; other words are ignored, so a client that adds its own words is
+/// not refused for them.
+fn parse_scope(text: &str) -> Result<(Scope, Option<Vec<String>>, bool), String> {
     let mut scope = Scope::Viewer;
     let mut tools: Vec<String> = Vec::new();
+    let mut approvals = false;
     for word in text.split_ascii_whitespace() {
-        if word == Scope::Admin.as_str() {
+        if word == APPROVALS {
+            approvals = true;
+        } else if word == Scope::Admin.as_str() {
             return Err("admin is never granted to an app: ask for operator or less".to_string());
         }
         if let Some(found) = level(word) {
@@ -1457,12 +1744,34 @@ fn parse_scope(text: &str) -> Result<(Scope, Option<Vec<String>>), String> {
             }
         }
     }
-    Ok((scope, (!tools.is_empty()).then_some(tools)))
+    Ok((scope, (!tools.is_empty()).then_some(tools), approvals))
+}
+
+/// Until when a grant with `approvals` is live in `stored` at `now`: the latest refresh expiry among them, or zero.
+fn session_until(stored: &Stored, now: u64) -> u64 {
+    stored
+        .grants
+        .iter()
+        .filter(|grant| grant.approvals && grant.revoked_at.is_none())
+        .filter(|grant| {
+            stored
+                .clients
+                .iter()
+                .any(|client| client.id == grant.client_id && client.revoked_at.is_none())
+        })
+        .filter_map(|grant| grant.refresh.as_ref().map(|token| token.expires))
+        .filter(|expires| now < *expires)
+        .max()
+        .unwrap_or(0)
 }
 
 /// A scope as the token answer and the consent page write it.
-fn scope_text(scope: Scope, tools: Option<&[String]>) -> String {
+fn scope_text(scope: Scope, tools: Option<&[String]>, approvals: bool) -> String {
     let mut text = scope.as_str().to_string();
+    if approvals {
+        text.push(' ');
+        text.push_str(APPROVALS);
+    }
     for tool in tools.unwrap_or_default() {
         text.push_str(" tool:");
         text.push_str(tool);
@@ -1741,7 +2050,7 @@ async fn resource_metadata(State(oauth): State<Arc<OAuth>>) -> Response {
     Json(json!({
         "resource": oauth.resource,
         "authorization_servers": [oauth.origin],
-        "scopes_supported": LEVELS.iter().map(|scope| scope.as_str()).collect::<Vec<_>>(),
+        "scopes_supported": LEVELS.iter().map(|scope| scope.as_str()).chain([APPROVALS]).collect::<Vec<_>>(),
         "bearer_methods_supported": ["header"],
         "resource_name": "Arca",
     }))
@@ -1762,7 +2071,7 @@ async fn server_metadata(State(oauth): State<Arc<OAuth>>) -> Response {
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "revocation_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": LEVELS.iter().map(|scope| scope.as_str()).collect::<Vec<_>>(),
+        "scopes_supported": LEVELS.iter().map(|scope| scope.as_str()).chain([APPROVALS]).collect::<Vec<_>>(),
         "authorization_response_iss_parameter_supported": true,
     }))
     .into_response()
@@ -1891,6 +2200,46 @@ async fn consent_deny(State(oauth): State<Arc<OAuth>>, body: Bytes) -> Response 
     answer(outcome)
 }
 
+async fn step_up_page(
+    State(oauth): State<Arc<OAuth>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let now = oauth.now();
+    let id = query.get("grant").map(String::as_str).unwrap_or_default();
+    let found = {
+        let inner = oauth.lock();
+        OAuth::session_grant(&inner, id, now)
+    };
+    match found {
+        Ok((grant, client)) => html(StatusCode::OK, step_up_page_html(&grant, &client)),
+        Err(refusal) => html(
+            StatusCode::NOT_FOUND,
+            notice_page("Nothing to confirm", &refusal.message),
+        ),
+    }
+}
+
+async fn step_up_begin(State(oauth): State<Arc<OAuth>>, body: Bytes) -> Response {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let args = page_body(&body)?;
+        oauth.step_up_begin(args["id"].as_str().unwrap_or_default())
+    })
+    .await;
+    answer(outcome)
+}
+
+async fn step_up_approve(State(oauth): State<Arc<OAuth>>, body: Bytes) -> Response {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let args = page_body(&body)?;
+        let (Some(statement), Some(proof)) = (args["statement"].as_str(), args.get("proof")) else {
+            return Err(Refusal::bare(StatusCode::BAD_REQUEST));
+        };
+        oauth.step_up_approve(args["id"].as_str().unwrap_or_default(), statement, proof)
+    })
+    .await;
+    answer(outcome)
+}
+
 fn answer(outcome: Result<Result<Value, Refusal>, tokio::task::JoinError>) -> Response {
     match outcome {
         Ok(Ok(value)) => Json(value).into_response(),
@@ -2013,6 +2362,15 @@ fn consent_page(oauth: &OAuth, pending: &Pending, client: &Client, shared: bool)
     } else {
         ""
     };
+    let approvals = if pending.approvals {
+        "<div class=\"approvals\" id=\"approvals\"><p><strong>It also asks to be your signed-in session for approvals.</strong> \
+When a plan waits for you, whoever made it, this app asks you yes or no in its own window, and yes runs it. \
+Your passkey here counts for 12 hours; after that the app sends you to Arca's page to confirm it is you with one tap. \
+Plans that delete or erase still wait for your passkey on the approval page. While this app is connected, waiting plans \
+stay open for it instead of lapsing after 15 minutes.</p></div>"
+    } else {
+        ""
+    };
     let tools = pending
         .tools
         .as_ref()
@@ -2026,12 +2384,12 @@ fn consent_page(oauth: &OAuth, pending: &Pending, client: &Client, shared: bool)
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
 <title>Connect an app to Arca</title><link rel=\"stylesheet\" href=\"/oauth/consent.css\"></head>\
-<body><main data-request=\"{id}\">\
+<body><main data-request=\"{id}\" data-begin=\"/oauth/authorize/begin\" data-approve=\"/oauth/authorize/approve\">\
 <h1>Connect <span id=\"client-name\">{name}</span> to Arca?</h1>{shared_note}\
 <dl><dt>App</dt><dd><strong>{name}</strong></dd>\
 <dt>Answers go to</dt><dd><strong id=\"redirect-host\">{host}</strong> ({where_text})</dd>\
 <dt>It asks to</dt><dd><strong id=\"scope\">{scope}</strong>: {words}</dd>\
-<dt>For</dt><dd>{resource}</dd></dl>{tools}\
+<dt>For</dt><dd>{resource}</dd></dl>{tools}{approvals}\
 <p>Your passkey signs you in and approves this in one step. You can disconnect the app any time on the approval page.</p>\
 <div class=\"actions\"><button id=\"approve\" type=\"button\">Approve with passkey</button>\
 <button id=\"deny\" type=\"button\" class=\"secondary\">Don't allow</button></div>\
@@ -2040,9 +2398,25 @@ fn consent_page(oauth: &OAuth, pending: &Pending, client: &Client, shared: bool)
         name = escape_html(&client.name),
         host = escape_html(&host),
         where_text = escape_html(&where_text),
-        scope = pending.scope.as_str(),
+        scope = scope_text(pending.scope, None, pending.approvals),
         words = scope_words(pending.scope),
         resource = escape_html(&oauth.resource),
+    )
+}
+
+/// The step-up page: one passkey tap confirms the owner's signed-in session in `client` for the next 12 hours.
+fn step_up_page_html(grant: &Grant, client: &Client) -> String {
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Confirm it is you</title><link rel=\"stylesheet\" href=\"/oauth/consent.css\"></head>\
+<body><main data-request=\"{id}\" data-begin=\"/oauth/step-up/begin\" data-approve=\"/oauth/step-up/approve\">\
+<h1>Confirm it is you in <span id=\"client-name\">{name}</span></h1>\
+<p>Plans are waiting for your approval. One tap of your passkey lets <strong>{name}</strong> ask you about them, \
+yes or no, for the next 12 hours. Plans that delete or erase still wait for your passkey on the approval page.</p>\
+<div class=\"actions\"><button id=\"approve\" type=\"button\">Confirm with passkey</button></div>\
+<p id=\"status\" role=\"status\"></p></main><script src=\"/oauth/consent.js\"></script></body></html>\n",
+        id = escape_html(&grant.id),
+        name = escape_html(&client.name),
     )
 }
 

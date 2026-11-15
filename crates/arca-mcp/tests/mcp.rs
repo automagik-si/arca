@@ -457,6 +457,7 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "service_status",
             "service_logs",
             "owner_approval_list",
+            "owner_approval_pending",
             "storage_list",
             "snapshot_list",
             "tenant_list",
@@ -552,7 +553,8 @@ fn owner_approval_request_and_status_are_a_doctors_and_the_list_is_a_viewers_too
     let listed = |token: &str| -> Vec<String> {
         names_of(&fx.call(token, "tools/list", json!({})))
             .into_iter()
-            .filter(|n| n.starts_with("owner_approval_"))
+            // The request verbs; `owner_approval_pending` lists plans as well, and has its own tests.
+            .filter(|n| n.starts_with("owner_approval_") && *n != "owner_approval_pending")
             .collect()
     };
     let all = [

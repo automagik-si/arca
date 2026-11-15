@@ -1021,12 +1021,17 @@ fn the_admin_tokens_terminal_approval_runs_a_stop_once_and_the_journal_names_it(
         kernel: Arc::clone(&rig.kernel),
         clock: Arc::new(|| NOW),
         actions: rig.executor.clone(),
+        oauth: None,
     };
     let shown_at = proposal["createdAt"].as_u64().expect("a creation time");
     // Only a waiting action proposal is asked about, and the question has the card's what, where and when.
-    assert!(approver.pending("arca_status", &proposal).is_none());
+    assert!(
+        approver
+            .pending("arca_status", &proposal, &terminal_admin())
+            .is_none()
+    );
     let plan = approver
-        .pending("action_propose", &proposal)
+        .pending("action_propose", &proposal, &terminal_admin())
         .expect("a waiting proposal");
     assert_eq!(plan.id, proposal["id"].as_str().expect("an id"));
     assert!(
@@ -1134,6 +1139,7 @@ fn a_terminal_yes_runs_nothing_when_the_card_decided_the_shown_proposal_first() 
             kernel: Arc::clone(&rig.kernel),
             clock: Arc::new(|| NOW),
             actions: rig.executor.clone(),
+            oauth: None,
         };
         let admin = Caller {
             token_id: "admin-1".to_string(),
@@ -1180,5 +1186,14 @@ fn a_terminal_yes_runs_nothing_when_the_card_decided_the_shown_proposal_first() 
                 .any(|plan| plan["id"] == again["id"]),
             "{decided}: the new proposal still waits"
         );
+    }
+}
+
+/// The node's admin token, as the terminal approval sees it.
+fn terminal_admin() -> Caller {
+    Caller {
+        token_id: "admin-1".to_string(),
+        scope: Scope::Admin,
+        tools: None,
     }
 }

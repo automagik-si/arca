@@ -34,6 +34,10 @@ use serde_json::{Value, json};
 pub const ACTION_PROPOSALS_FILE: &str = "action-proposals.jsonl";
 /// How many unexpired action proposals may wait at once. A ninth is refused.
 pub const MAX_WAITING: usize = 8;
+
+/// How long after it was made a proposal may be held open for the owner's signed-in session: a day. After that it lapses
+/// as any other, after its last fifteen minutes, so undecided plans never keep the queue full for good.
+pub const HOLD_MAX_MS: u64 = 24 * 60 * 60 * 1000;
 /// How many accepted proposals one token may make in [`PROPOSAL_RATE_WINDOW_MS`].
 pub const PROPOSAL_RATE_MAX: usize = 30;
 /// The per-token proposal window: ten minutes.
@@ -232,6 +236,21 @@ impl ActionKind {
             return "If the service does not come back healthy, Arca puts the old setting back by itself. To go back after a good change, change the setting in the template and ask your assistant to update the service to the digest it already runs.";
         }
         self.undo_words()
+    }
+
+    /// Whether the action deletes or erases something that cannot be brought back. Such a plan keeps the owner's passkey
+    /// card: the owner's signed-in session lists it but never approves it.
+    pub fn erases(self, args: &Value) -> bool {
+        match self {
+            Self::ServiceRemove
+            | Self::SnapshotDelete
+            | Self::TenantRemove
+            | Self::DeployRemove
+            | Self::FunctionRemove
+            | Self::StorageAdd => true,
+            Self::ServiceUpdate => args.get("eraseData").and_then(Value::as_bool) == Some(true),
+            _ => false,
+        }
     }
 
     /// Whether the card says what the action takes of the node: a create from a template does.
@@ -1512,7 +1531,20 @@ pub struct ActionProposal {
 }
 
 impl ActionProposal {
-    /// Whether the proposal's fifteen minutes have run.
+    /// Whether the owner's signed-in session may approve it: an action that deletes or erases keeps the passkey card, so
+    /// it is neither asked there nor held open for it.
+    pub fn for_session(&self) -> bool {
+        ActionKind::from_name(&self.action).is_some_and(|kind| !kind.erases(&self.args))
+    }
+
+    /// Whether the owner's signed-in session still holds it open at `now`: one it may approve, less than
+    /// [`HOLD_MAX_MS`] old once another [`PLAN_TTL_MS`] is counted.
+    pub fn held(&self, now: u64) -> bool {
+        self.for_session()
+            && now.saturating_add(PLAN_TTL_MS) < self.created_ms.saturating_add(HOLD_MAX_MS)
+    }
+
+    /// Whether the proposal's fifteen minutes have run (moved forward while the owner's signed-in session is connected).
     pub fn expired(&self, now: u64) -> bool {
         now > self.expires_at
     }
@@ -1780,6 +1812,32 @@ impl ActionProposalStore {
         Ok(proposal)
     }
 
+    /// Keeps every waiting proposal the owner's signed-in session may approve ([`ActionProposal::for_session`]) open for
+    /// another [`PLAN_TTL_MS`] from `now` once less than half of it is left, never past [`HOLD_MAX_MS`] after it was made:
+    /// that session is connected and will be asked. The journal is rewritten only when one moved. Answers how
+    /// many moved.
+    pub fn hold(&mut self, now: u64) -> usize {
+        let mut moved = 0;
+        for proposal in &mut self.waiting {
+            // Never past a day after it was made: then it lapses as any other.
+            let until = now
+                .saturating_add(PLAN_TTL_MS)
+                .min(proposal.created_ms.saturating_add(HOLD_MAX_MS));
+            if proposal.for_session()
+                && !proposal.expired(now)
+                && proposal.expires_at.saturating_sub(now) < PLAN_TTL_MS / 2
+                && until > proposal.expires_at
+            {
+                proposal.expires_at = until;
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.compact();
+        }
+        moved
+    }
+
     /// Journals an approval and retires the proposal. The caller has already checked its proof.
     pub fn approve(&mut self, id: &str) -> io::Result<Option<ActionProposal>> {
         self.approve_noting(id, None)
@@ -1798,6 +1856,11 @@ impl ActionProposalStore {
     /// Journals a decline and retires the proposal.
     pub fn decline(&mut self, id: &str) -> io::Result<Option<ActionProposal>> {
         self.retire(id, "declined")
+    }
+
+    /// [`ActionProposalStore::decline`], with `note` kept in the journal line: who declined it, when not on the page.
+    pub fn decline_noting(&mut self, id: &str, note: &str) -> io::Result<Option<ActionProposal>> {
+        self.retire_noting(id, "declined", Some(note))
     }
 
     fn retire(&mut self, id: &str, event: &str) -> io::Result<Option<ActionProposal>> {

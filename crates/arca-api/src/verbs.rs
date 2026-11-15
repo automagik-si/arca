@@ -78,12 +78,17 @@ impl Verb {
     /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
     /// `owner_approval_status` hands its requester an approval string, so it is not advertised read-only either (droidd's
     /// `readOnly: false`), and its minimum scope keeps it off viewers.
+    /// `owner_approval_pending` asks the owner's signed-in session about each plan, and a yes approves and runs it.
     pub fn read_only_hint(&self) -> bool {
-        !self.writes && !matches!(self.name, "action_propose" | "owner_approval_status")
+        !self.writes
+            && !matches!(
+                self.name,
+                "action_propose" | "owner_approval_status" | "owner_approval_pending"
+            )
     }
 }
 
-static VERBS: [Verb; 82] = [
+static VERBS: [Verb; 83] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -648,6 +653,20 @@ static VERBS: [Verb; 82] = [
         cut: no_cut,
         params: owner_approval_list_params,
         result: owner_approval_list_result,
+    },
+    Verb {
+        name: "owner_approval_pending",
+        summary: "Everything waiting for the owner, whoever made it (a worker's plans too): action plans, delete plans and owner approval requests, with the approval page. In the owner's own signed-in session (an app connected with the approvals scope) whose client declared elicitation, it also asks the owner yes or no for each plan that can be approved there, and answers what was decided; plans that delete or erase, and approval requests, keep the passkey card. The requesters' words are untrusted.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_owner_approval_pending,
+        cut: no_cut,
+        params: owner_approval_pending_params,
+        result: owner_approval_pending_result,
     },
     Verb {
         name: "enroll_confirm",
@@ -3564,10 +3583,14 @@ fn action_proposal() -> Value {
         ("expiresAt", true, int()),
         ("statement", false, string()),
         ("host", false, string()),
-        // Set on the answer of an action_propose that the admin token approved in the terminal.
+        // Set while the owner's signed-in session is connected: the proposal stays open for it instead of lapsing.
+        ("heldForSession", false, boolean()),
+        // Set on the answer of an action_propose approved in the terminal (the admin token's or the owner's session's).
         ("approvedIn", false, string()),
         ("approvedBy", false, string()),
         ("approval", false, json!({ "type": "object" })),
+        // Set on the answer of an action_propose the owner's signed-in session said no to: the plan is declined.
+        ("declinedIn", false, string()),
     ])
 }
 
@@ -5600,6 +5623,91 @@ fn owner_approval_list_result() -> Value {
     })
 }
 
+fn owner_approval_pending_params() -> Value {
+    json!({"additionalProperties": false, "properties": {}, "type": "object"})
+}
+fn owner_approval_pending_result() -> Value {
+    // The card's rows as plan_list gives them: no cap on their number or length, so any card a plan has fits.
+    let row = json!({"additionalProperties": false, "properties": {"label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label", "value"], "type": "object"});
+    let plan = json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": {"maxLength": 128, "type": "string"},
+            "kind": {"description": "action: an action plan; delete: a delete plan of the reconciler; request: an owner approval request.", "enum": ["action", "delete", "request"], "type": "string"},
+            "action": {"maxLength": 64, "type": "string"},
+            "summary": {"type": "string"},
+            "details": {"items": row, "type": "array"},
+            "createdAt": {"description": "Unix milliseconds.", "minimum": 0, "type": "integer"},
+            "expiresAt": {"description": "Unix milliseconds, or an ISO time for a request.", "type": ["integer", "string"]},
+            "askedHere": {"description": "Whether the owner's signed-in session is asked about it.", "type": "boolean"},
+            "heldForSession": {"description": "Whether it stays open past its fifteen minutes because the owner's signed-in session is connected.", "type": "boolean"},
+            "why": {"description": "Why it is not asked here, when it is not.", "maxLength": 300, "type": "string"}
+        },
+        "required": ["id", "kind", "summary", "createdAt", "askedHere"],
+        "type": "object"
+    });
+    let decision = json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": {"maxLength": 128, "type": "string"},
+            "decision": {"description": "approved: approved and run; refused: approved but not run, with why; declined: the owner said no, and the plan is declined; left: not decided, still waiting on its card.", "enum": ["approved", "refused", "declined", "left"], "type": "string"},
+            "result": {"description": "What the run answered."},
+            "message": {"maxLength": 2000, "type": "string"}
+        },
+        "required": ["id", "decision"],
+        "type": "object"
+    });
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "plans": {"items": plan, "maxItems": 100, "type": "array"},
+            "session": {"description": "asks: this session is asked about each plan; step-up: it is asked once the owner confirms with a passkey at stepUp; none: it is never asked (it lists only).", "enum": ["asks", "step-up", "none"], "type": "string"},
+            "stepUp": {"description": "The page where one passkey tap lets this session be asked for the next 12 hours.", "maxLength": 600, "type": "string"},
+            "page": {"description": "The approval page, where every card waits.", "maxLength": 600, "type": "string"},
+            "decisions": {"items": decision, "maxItems": 100, "type": "array"}
+        },
+        "required": ["plans", "session"],
+        "type": "object"
+    })
+}
+
+pub fn summary_owner_approval_pending(v: &Value) -> String {
+    let plans = v["plans"].as_array().map_or(&[][..], Vec::as_slice);
+    let asked = plans.iter().filter(|p| p["askedHere"] == true).count();
+    let mut text = format!(
+        "{} plan(s) and request(s) wait for the owner; {asked} can be approved in this session.",
+        plans.len()
+    );
+    if let Some(decisions) = v["decisions"].as_array() {
+        let count = |what: &str| decisions.iter().filter(|d| d["decision"] == what).count();
+        text.push_str(&format!(
+            " Asked here: {} approved and run, {} refused, {} declined, {} left waiting on their cards.",
+            count("approved"),
+            count("refused"),
+            count("declined"),
+            count("left")
+        ));
+    }
+    match v["session"].as_str() {
+        Some("step-up") => {
+            if let Some(url) = v["stepUp"].as_str() {
+                text.push_str(&format!(
+                    " Confirm with your passkey at {url} so this session can ask you."
+                ));
+            }
+        }
+        Some("none") => {
+            text.push_str(" This session is not asked: approve them on the approval page.")
+        }
+        _ => {}
+    }
+    if let Some(page) = v["page"].as_str()
+        && plans.iter().any(|p| p["askedHere"] != true)
+    {
+        text.push_str(&format!(" The others wait on {page}."));
+    }
+    text
+}
 pub fn summary_owner_approval_request(v: &Value) -> String {
     let page = v["dashboard"]
         .as_str()

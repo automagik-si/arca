@@ -1796,6 +1796,8 @@ shows `follow` for a service that can.
 `tools/list` shows a caller only the verbs it may call.
 
 `action_propose` records a durable proposal, so its MCP annotation advertises `readOnlyHint: false` even though it changes no desired state.
+`owner_approval_pending` asks the owner's signed-in session about each plan, and a yes approves and runs it, so it
+advertises `readOnlyHint: false` too, although it needs only `viewer`.
 
 #### The OpenRPC method flags
 
@@ -2031,6 +2033,7 @@ What the node serves, all on `approvalOrigin`:
 | `POST /oauth/register` | RFC 7591 registration: redirect URIs are exact, and `https`, or `http` on `127.0.0.1`, `[::1]` or `localhost` |
 | `GET /oauth/authorize` | the consent page; `resource` (RFC 8707) must be `<origin>/mcp` |
 | `POST /oauth/token` | `authorization_code` with the PKCE verifier, `refresh_token` with rotation |
+| `GET /oauth/step-up?grant=<id>` | the step-up page of a session with `approvals`: one tap of the owner's passkey (`POST /oauth/step-up/begin`, then `/approve`) |
 | `POST /oauth/revoke` | RFC 7009: an access token alone, or a refresh token and its grant; `503` when the revocation could not be saved (the grant has ended, and the journal says `"saved":false`); the retry saves it before it answers `200` |
 
 Files in the state directory: `mcp-oauth.json` (the apps and their grants, with only the SHA-256 of each token, mode 0600)
@@ -2040,6 +2043,40 @@ never a token). Consent requests (ten minutes) and codes (one minute, one use) a
 The node must be reached at `approvalOrigin` by the app too: the reverse proxy or the tailnet listener that serves the
 page serves these routes and `/mcp` under the same name. A page at `http://localhost:<port>` serves an app on the same
 machine.
+
+### Approving in your own signed-in session
+
+An app connected by its URL can also be the owner's signed-in session for approvals: the plans waiting for the owner come
+to the owner in that app's own conversation, with no page to find. The app asks for the scope word `approvals` beside its
+level (`viewer approvals`); the consent page says so in its own block, and the passkey tap that approves the app also
+confirms it is the owner. A refresh cannot add `approvals` to a grant that was approved without it.
+
+- **The passkey counts for 12 hours**, from the consent and then from each step-up. After that the session is asked to
+  confirm again: the door sends a URL-mode elicitation (`2025-11-25`: an `elicitation/create` on the call's stream, then
+  `notifications/elicitation/complete` once confirmed; `2026-07-28`: `input_required` with a URL request) to
+  `/oauth/step-up?grant=<id>`, where one tap of the passkey confirms it for another 12 hours (journal: `stepped_up`).
+- **`owner_approval_pending`** (a `viewer` verb, no arguments) lists everything waiting for the owner: action plans,
+  delete plans and approval requests, whoever made them. Each row says whether this session is asked about it
+  (`askedHere`) and, if not, `why`; the answer also names the page (`page`). In a session that may be asked, the door then
+  asks yes or no about each action plan, one question per plan (`2025-11-25`: one `elicitation/create` after another on the
+  call's stream; `2026-07-28`: one `inputRequests` entry per plan, keyed by its id). A `yes` approves and runs it as the card's approval would; a `no`
+  declines it, as **Decline** on the card does; a decline, a cancel or no answer leaves it waiting on its card. The
+  answer's `decisions` says what each plan did (`approved`, `refused`, `declined`, `left`). The same holds for the one
+  question an `action_propose` answer asks in the session: a `no` declines that plan, and the answer says `declinedIn`.
+- **Plans that delete or erase keep the passkey card.** A delete plan, an approval request and an action that erases
+  (`service_remove`, `snapshot_delete`, `tenant_remove`, `deploy_remove`, `function_remove`, `storage_add`, and
+  `service_update` with `eraseData`) are listed with the page link and never asked in the session.
+- **Waiting plans stay open, for up to a day.** While a grant with `approvals` is live, the action plans the session may
+  approve do not lapse after their fifteen minutes: the node moves their expiry forward each minute, and their card on the
+  approval page says **Waiting for your signed-in session**. The card still approves as before. A plan is held at most 24
+  hours after it was made, then lapses as any other, so plans nobody decides never keep the node's eight waiting places
+  full. Once no such grant is live (revoked, disconnected, or its refresh token expired), they lapse after their last
+  fifteen minutes.
+
+Every approval and decline is journalled as the session and the passkey that confirmed it: `action-proposals.jsonl` says
+`approved in the owner's signed-in session oauth:<client id>/<grant id> (passkey <key>)`, or `declined in …`. A session's `accept` is still an answer of
+the client, as in the terminal path above; what it adds is that a passkey of the owner confirmed that client within the
+last 12 hours, and **Disconnect** ends it at once. Calls of the admin token are asked as before.
 
 ### Protocol versions
 
