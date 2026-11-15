@@ -232,7 +232,7 @@ test('arca_propose stays the only write-shaped tool of the terminal Doctor', asy
   const client = {
     async call(verb, input) {
       calls.push(verb);
-      if (verb === 'action_propose') return { id: 'p-1', summary: 'A change', state: 'waiting' };
+      if (verb === 'action_propose') return { id: 'act-0123456789ab', summary: 'A change', state: 'waiting' };
       if (verb === 'arca_status') return { approval: { linkedHosts: ['beta'] } };
       return {};
     },

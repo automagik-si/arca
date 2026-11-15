@@ -570,6 +570,52 @@ credential; it appears in no page asset, SSE frame, snapshot or log line. Messag
 bodies are never logged either. A model credential failure becomes the safe
 `error` event.
 
+## Doctor in a terminal (dsh-tui)
+
+The same Doctor runs in dsh-tui, and so in a Herdr bot, as a DSH agent preset.
+The `arca-canvas-dsh/doctor` entry opens its session from `src/doctor-session.js`, the
+module the canvas chat uses. It gets the same prompt, the same 15 reads plus
+`arca_propose`, the same allow-list, pre-execute denial and guard, and the same model.
+It changes nothing: a change is still a proposal the owner approves with the passkey.
+
+Use a dsh-tui profile with this package installed, but not as a bundle (the bundle
+adds the canvas web row). Its `package.json`:
+
+```json
+{
+  "private": true,
+  "dependencies": {
+    "@deepseek-harness-tui/dsh-tui": "0.19.0",
+    "arca-canvas-dsh": "github:automagik-si/arca#<commit>&path:/packages/arca-canvas-dsh"
+  },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-harness-tui/dsh-tui"] } }
+}
+```
+
+If `dsh plugin add` puts `arca-canvas-dsh` under `bundles`, take it out there. Copy
+`doctor.patch.yml` into the profile's `cordis.patch.yml` and give the Doctor the
+canvas row's own config block. The schema is the same, so one block serves both:
+
+```yaml
+        plugins:
+          - name: arca-canvas-dsh/doctor
+            config:
+              hosts:
+                - { name: <host>, address: <address>, socketPath: /path/to/arca.sock, viewerTokenPath: /path/to/arca-viewer.token }
+              approvalUrl: <approval page URL>
+```
+
+Run it with the DeepSeek key in the environment:
+
+```sh
+DSH_TUI_PRESET=arca-doctor dsh --profile <profile>
+```
+
+The session is titled `Doctor`, and `deepseek-flash` is recorded as its model. The
+canvas's per-turn and daily budgets belong to the web chat, not to the session, so
+a terminal turn runs under dsh-tui's own output limit. If the preset cannot load,
+dsh-tui logs a warning and opens an ordinary session without the Doctor's tools.
+
 ## Develop
 
 ```sh
