@@ -2664,9 +2664,12 @@ The proposal keeps the description cut down to what Arca reads: the VM's id, nam
 security group rules, and of the context only the network keys, the SSH keys, the host name and the user data. Every
 other context key is kept by name with no value, so a `PASSWORD`, `CRYPTED_PASSWORD` or `START_SCRIPT` never reaches the
 proposals file, the `action_propose` answer or `plan_list`; the rest of the template (a VNC password, notes, history) is
-left out whole. Viewers of `plan_list` see that reduced description, user data and SSH keys included. The user data
-rests in `action-proposals.jsonl` until the proposal is run or lapses, and after the run Incus keeps it in the VM's
-`cloud-init.user-data`; `userData: false` leaves it out of the seed but not out of the proposal.
+left out whole. The user data is kept too, because the run seeds the VM with it, but it is never shown: `plan_list`,
+the approval page (and a linked page host that reads it) and the `action_propose` answer show the description with
+`USER_DATA` as an empty element, and `argsDigest` is still the digest of what the proposal keeps. The user data stays in
+`action-proposals.jsonl` (mode 0600) until the next compaction after the proposal is run, declined or lapses, and after
+the run Incus keeps it in the VM's `cloud-init.user-data`; `userData: false` leaves it out of the seed but not out of the
+proposals file.
 
 The imported VM carries no `user.arcakernel.entry`: Arca's instance verbs (`instance_start`, `instance_stop`) do not
 act on it yet.

@@ -316,15 +316,105 @@ fn a_proposal_keeps_no_context_secret_in_the_journal_the_answer_or_plan_list() {
         );
     }
     // The run prepares the stored args again: the same args, so the approval binds the same digest.
-    let stored = &answers[0]["args"];
+    let stored = rig
+        .kernel
+        .lock()
+        .expect("the kernel lock")
+        .action_proposals()[0]
+        .args
+        .clone();
     let again = ActionKind::InstanceImport
-        .prepare(stored, None)
+        .prepare(&stored, None)
         .expect("prepared");
-    assert_eq!(&again, stored);
+    assert_eq!(again, stored);
     assert_eq!(
         ActionKind::InstanceImport
             .prepare(&again, None)
             .expect("prepared"),
         again
     );
+}
+
+/// One GET to the approval page's router, served on a unix socket as `serve` serves it, with no bearer and no origin.
+fn page_get(rig: &Rig, path: &str) -> String {
+    use std::io::{Read as _, Write as _};
+    // A short directory of its own: the server binds through a staging directory beside the socket, and a unix socket
+    // path is at most 107 bytes.
+    let short = std::env::temp_dir().join(format!("ii{}", std::process::id()));
+    std::fs::create_dir_all(&short).expect("a socket directory");
+    let socket = short.join("p");
+    let router = arca::approve_page::router(
+        "http://localhost:7443".to_string(),
+        Arc::clone(&rig.kernel),
+        Arc::new(|| NOW),
+        rig._scratch.dir.clone(),
+    );
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let served = socket.clone();
+    runtime.spawn(async move {
+        let _ = arca_mcp::serve_unix(router, &served).await;
+    });
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(std::time::Instant::now() < until, "the page started");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).expect("the page answers");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("sent");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).expect("answered");
+    let _ = std::fs::remove_dir_all(&short);
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    answer
+}
+
+#[test]
+fn the_user_data_is_shown_nowhere_and_still_seeds_the_vm() {
+    let key = SkKey::from_seed(45);
+    let rig = rig("import-userdata", &key);
+    let user_data = "I2Nsb3VkLWNvbmZpZwp0aW1lem9uZTogVVRDCg==";
+    assert!(UEFI.contains(user_data), "the fixture holds the user data");
+    let proposal = rig
+        .propose("instance_import", import_args())
+        .expect("proposed");
+    let listed = call_verb(&rig.handlers, "plan_list", json!({})).expect("listed");
+    let page = page_get(&rig, "/approve/plans");
+    for (place, text) in [
+        ("the propose answer", proposal.to_string()),
+        ("plan_list", listed.to_string()),
+        ("/approve/plans", page.clone()),
+    ] {
+        assert!(!text.contains(user_data), "the user data in {place}");
+        assert!(
+            text.contains("<USER_DATA/>"),
+            "{place} names the user data key"
+        );
+    }
+    // What is shown is not what is bound: the digest is the stored arguments', and the approval of it runs.
+    let stored = rig
+        .kernel
+        .lock()
+        .expect("the kernel lock")
+        .action_proposals()[0]
+        .args
+        .clone();
+    assert!(
+        stored["source"]
+            .as_str()
+            .expect("a source")
+            .contains(user_data)
+    );
+    assert_eq!(listed["plans"][0]["argsDigest"], proposal["argsDigest"]);
+    assert!(page.contains(proposal["argsDigest"].as_str().expect("a digest")));
+    rig.approve_and_run(&key, &proposal, 'd')
+        .expect("the import runs");
+    let vm = get(&rig.fake, "/1.0/instances/web-1?project=people").expect("the VM exists");
+    let seeded = vm["config"]["cloud-init.user-data"]
+        .as_str()
+        .expect("the seed's user data");
+    assert!(seeded.contains("timezone: UTC"), "{seeded}");
 }

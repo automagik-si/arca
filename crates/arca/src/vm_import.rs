@@ -238,6 +238,19 @@ pub fn check_proposal(node: &NodeConfig, args: &Value) -> Result<(), CallError> 
         })
 }
 
+/// A proposal's arguments as anyone who lists it sees them: `plan_list`, the approval page (and the linked page hosts that
+/// read it) and the `action_propose` answer. An import's description is shown without its user data, which can hold a
+/// password; the proposal keeps, binds and runs the arguments as they were stored, so the digest is unchanged.
+pub fn shown_args(action: &str, args: &Value) -> Value {
+    let mut shown = args.clone();
+    if action == ActionKind::InstanceImport.as_str()
+        && let Some(source) = args.get("source").and_then(Value::as_str)
+    {
+        shown["source"] = Value::String(arca_vmimport::reduce_shown(source).unwrap_or_default());
+    }
+    shown
+}
+
 /// `instance_import` and `instance_import_undo`, each run only from an approved proposal.
 struct ImportHandler {
     action: ActionKind,

@@ -444,35 +444,141 @@ fn context_value_kept(key: &str) -> bool {
     }
 }
 
-/// Element text as XML: plain when it holds nothing XML reads, else a CDATA section, else character references. A
-/// carriage return is always a reference, because a reader turns a literal one into a line feed.
-fn push_text(out: &mut String, text: &str) {
-    if !text.contains(['&', '<', '>', '\r']) {
-        out.push_str(text);
-    } else if !text.contains("]]>") && !text.contains('\r') {
-        out.push_str("<![CDATA[");
-        out.push_str(text);
-        out.push_str("]]>");
-    } else {
-        for c in text.chars() {
-            match c {
-                '&' => out.push_str("&amp;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                '\r' => out.push_str("&#13;"),
-                c => out.push(c),
-            }
-        }
+/// How [`push_text`] writes one character.
+#[derive(Clone, Copy)]
+enum Write {
+    /// As itself, outside a CDATA section.
+    Plain,
+    /// As a reference, outside a CDATA section.
+    Reference,
+    /// Opens a CDATA section and writes it there.
+    Open,
+    /// As itself, inside the open CDATA section.
+    Inside,
+    /// Closes the CDATA section and writes it as itself.
+    ClosePlain,
+    /// Closes the CDATA section and writes it as a reference.
+    CloseReference,
+}
+
+/// The shortest reference XML has for a character that needs one.
+fn reference(c: char) -> &'static str {
+    match c {
+        '&' => "&amp;",
+        '<' => "&lt;",
+        '>' => "&gt;",
+        _ => "&#13;",
     }
 }
 
-fn push_node(out: &mut String, parent: &str, node: &Node) {
+/// Element text as the shortest XML that reads back as it, so a reduced text is never longer than the source, which had
+/// to write the same characters some valid way.
+///
+/// Outside a CDATA section `&` and `<` need a reference, and so does the `>` of a `]]>`; inside one, `]]>` cannot occur.
+/// A carriage return is a reference anywhere, because a reader turns a literal one into a line feed. Opening a section
+/// costs 9 bytes and closing it 3. The cheapest way through the text is found over six states: outside or inside a
+/// section, each after zero, one, or two or more `]`.
+fn push_text(out: &mut String, text: &str) {
+    if !text.contains(['&', '<', '>', '\r']) {
+        out.push_str(text);
+        return;
+    }
+    const OPEN: usize = 9;
+    const CLOSE: usize = 3;
+    const NONE: usize = usize::MAX;
+    let chars: Vec<char> = text.chars().collect();
+    // States 0..3: outside, after k `]`; 3..6: inside, after k `]`.
+    let mut cost = [0, NONE, NONE, NONE, NONE, NONE];
+    let mut back: Vec<[(usize, Write); 6]> = Vec::with_capacity(chars.len());
+    for &c in &chars {
+        let width = c.len_utf8();
+        let after = |k: usize| if c == ']' { (k + 1).min(2) } else { 0 };
+        let mut next = [NONE; 6];
+        let mut from = [(0, Write::Plain); 6];
+        let mut offer = |state: usize, total: usize, step: (usize, Write)| {
+            if total < next[state] {
+                next[state] = total;
+                from[state] = step;
+            }
+        };
+        let plain_ok = |k: usize| !matches!(c, '&' | '<' | '\r') && !(c == '>' && k == 2);
+        let inside_ok = |k: usize| c != '\r' && !(c == '>' && k == 2);
+        let needs_reference = matches!(c, '&' | '<' | '>' | '\r');
+        for (state, &paid) in cost.iter().enumerate() {
+            if paid == NONE {
+                continue;
+            }
+            if state < 3 {
+                let k = state;
+                if plain_ok(k) {
+                    offer(after(k), paid + width, (state, Write::Plain));
+                }
+                if needs_reference {
+                    offer(0, paid + reference(c).len(), (state, Write::Reference));
+                }
+                if inside_ok(0) {
+                    offer(3 + after(0), paid + OPEN + width, (state, Write::Open));
+                }
+            } else {
+                let k = state - 3;
+                if inside_ok(k) {
+                    offer(3 + after(k), paid + width, (state, Write::Inside));
+                }
+                if plain_ok(0) {
+                    offer(after(0), paid + CLOSE + width, (state, Write::ClosePlain));
+                }
+                if needs_reference {
+                    offer(
+                        0,
+                        paid + CLOSE + reference(c).len(),
+                        (state, Write::CloseReference),
+                    );
+                }
+            }
+        }
+        cost = next;
+        back.push(from);
+    }
+    let finish = |state: usize| cost[state].saturating_add(if state >= 3 { CLOSE } else { 0 });
+    let mut state = (0..6).min_by_key(|&state| finish(state)).unwrap_or(0);
+    let last = state;
+    let mut steps = Vec::with_capacity(chars.len());
+    for from in back.iter().rev() {
+        let (previous, write) = from[state];
+        steps.push(write);
+        state = previous;
+    }
+    for (c, write) in chars.iter().zip(steps.iter().rev()) {
+        match write {
+            Write::Plain | Write::Inside => out.push(*c),
+            Write::Reference => out.push_str(reference(*c)),
+            Write::Open => {
+                out.push_str("<![CDATA[");
+                out.push(*c);
+            }
+            Write::ClosePlain => {
+                out.push_str("]]>");
+                out.push(*c);
+            }
+            Write::CloseReference => {
+                out.push_str("]]>");
+                out.push_str(reference(*c));
+            }
+        }
+    }
+    if last >= 3 {
+        out.push_str("]]>");
+    }
+}
+
+fn push_node(out: &mut String, parent: &str, node: &Node, user_data: bool) {
     if parent == "CONTEXT" {
         if !plain(&node.name, 64, b"_") {
             return;
         }
         let text = node.text.trim();
-        if context_value_kept(&node.name) && !text.is_empty() {
+        let hidden = !user_data && matches!(node.name.as_str(), "USER_DATA" | "USERDATA");
+        if context_value_kept(&node.name) && !text.is_empty() && !hidden {
             out.push_str(&format!("<{}>", node.name));
             push_text(out, text);
             out.push_str(&format!("</{}>", node.name));
@@ -490,7 +596,7 @@ fn push_node(out: &mut String, parent: &str, node: &Node) {
         "TEMPLATE" | "OS" | "DISK" | "NIC" | "SECURITY_GROUP_RULE" | "CONTEXT"
     ) {
         for child in &node.children {
-            push_node(out, &node.name, child);
+            push_node(out, &node.name, child, user_data);
         }
     } else {
         push_text(out, node.text.trim());
@@ -503,9 +609,21 @@ fn push_node(out: &mut String, parent: &str, node: &Node) {
 /// Every element `parse` reads is kept, in its order, with its text; every other element is left out, with its text
 /// (a VNC password, the template's own notes, the outside hypervisor's history). A context key the seed does not
 /// carry stays as an empty element, so the card can still name it, but its value is gone: `PASSWORD`,
-/// `CRYPTED_PASSWORD` and `START_SCRIPT_BASE64` never reach a proposal. `parse` reads the reduced text as it read the
+/// `CRYPTED_PASSWORD` and `START_SCRIPT_BASE64` never reach a proposal. The reduced text is never longer than the
+/// whole one, so a description under the size limit stays under it. `parse` reads the reduced text as it read the
 /// whole, but for the digest, and the reduction of a reduced text is the same text.
 pub fn reduce(xml: &str) -> Result<String, ParseError> {
+    reduce_to(xml, true)
+}
+
+/// The reduced description as it is shown to anyone who lists a proposal: [`reduce`]'s text with the user data left
+/// out too (`USER_DATA` and `USERDATA` as empty elements). The proposal keeps, binds and runs the text [`reduce`] gives;
+/// this one is only shown.
+pub fn reduce_shown(xml: &str) -> Result<String, ParseError> {
+    reduce_to(xml, false)
+}
+
+fn reduce_to(xml: &str, user_data: bool) -> Result<String, ParseError> {
     if xml.len() > MAX_SOURCE_BYTES {
         return refuse(format!(
             "the description is longer than {MAX_SOURCE_BYTES} bytes"
@@ -514,7 +632,7 @@ pub fn reduce(xml: &str) -> Result<String, ParseError> {
     let vm = tree(xml)?;
     let mut out = String::from("<VM>");
     for child in &vm.children {
-        push_node(&mut out, "VM", child);
+        push_node(&mut out, "VM", child, user_data);
     }
     out.push_str("</VM>");
     Ok(out)

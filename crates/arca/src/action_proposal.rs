@@ -11,7 +11,9 @@
 //! every proposed record against its action's own validation and the kernel's configured image, keeps only the waiting,
 //! unexpired proposals and rewrites it atomically. A file that cannot be read, holds a line that fails validation, or is too
 //! large is quarantined as `<name>.bad-<ts>` and the kernel starts with no proposals: this file can never stop a start. The
-//! file holds no approval string, proof or secret.
+//! file holds no approval string or proof. It holds what a proposal binds, and one action binds a secret: an
+//! `instance_import` keeps the source's cloud-init user data, which the run puts in the VM's seed. It stays in this file,
+//! which is mode 0600, until the next compaction after the proposal is run, declined or lapses. No listing shows it.
 //!
 //! Appending keeps the journal bounded as well: once the file passes [`MAX_COMPACT_BYTES`] it is compacted to the waiting set
 //! before the call returns. A stale temporary file from a compaction that a crash interrupted is removed when the kernel next

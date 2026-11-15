@@ -8,7 +8,7 @@ use std::net::Ipv4Addr;
 use arca_vmimport::source::{Bus, DiskKind, Firmware, Protocol};
 use arca_vmimport::{
     FakeCopy, Held, IMPORT_KEY, ImportIncus, Place, Plan, PoolInfo, Probe, parse, plan_of, reduce,
-    run, undo,
+    reduce_shown, run, undo,
 };
 use serde_json::{Value, json};
 
@@ -433,6 +433,82 @@ fn the_reduced_description_reads_the_same_holds_no_secret_and_reduces_to_itself(
         uefi.contains("I2Nsb3VkLWNvbmZpZwp0aW1lem9uZTogVVRDCg=="),
         "the seed's user data stays"
     );
+}
+
+/// The BIOS fixture with its user data element replaced by `element`.
+fn with_user_data(element: &str) -> String {
+    let start = BIOS.find("<USER_DATA>").expect("the fixture's user data");
+    let end = BIOS.find("</USER_DATA>").expect("its end") + "</USER_DATA>".len();
+    format!("{}{element}{}", &BIOS[..start], &BIOS[end..])
+}
+
+#[test]
+fn the_reduction_never_makes_a_description_longer() {
+    // Review 2's growth case: many `&` in one CDATA section beside a `]]>`, which references once made five times longer.
+    let ampersands = with_user_data(&format!(
+        "<USER_DATA><![CDATA[#cloud-config\n{}]]]]><![CDATA[>{}]]></USER_DATA>",
+        "a&b<c>".repeat(1_800),
+        "&".repeat(2_000)
+    ));
+    // Many carriage returns, each one a reference between short runs of text.
+    let returns = with_user_data(&format!(
+        "<USER_DATA>#cloud-config{}</USER_DATA>",
+        "x&#13;&amp;".repeat(3_000)
+    ));
+    // Both kinds at once, references and CDATA mixed the way a hand-written description might.
+    let mixed = with_user_data(&format!(
+        "<USER_DATA>#cloud-config{}</USER_DATA>",
+        "&#13;<![CDATA[&<&<&<]]>a&amp;&lt;]]&gt;".repeat(900)
+    ));
+    for xml in [ampersands, returns, mixed] {
+        let reduced = reduce(&xml).expect("reduced");
+        assert!(
+            reduced.len() <= xml.len(),
+            "{} bytes grew to {}",
+            xml.len(),
+            reduced.len()
+        );
+        assert_eq!(reduce(&reduced).expect("reduced again"), reduced);
+        let (mut whole, mut cut) = (parse(&xml).expect("read"), parse(&reduced).expect("read"));
+        whole.digest.clear();
+        cut.digest.clear();
+        assert_eq!(cut.context.user_data, whole.context.user_data);
+        assert_eq!(cut, whole);
+        let mut proposal = args(&xml);
+        proposal["source"] = json!(reduced);
+        assert!(
+            plan_of(&proposal).is_ok(),
+            "the reduced description still makes a plan"
+        );
+    }
+    for xml in [BIOS, UEFI, CLONE, NO_NIC] {
+        assert!(reduce(xml).expect("reduced").len() <= xml.len());
+    }
+}
+
+#[test]
+fn the_shown_description_leaves_out_the_user_data_and_nothing_else() {
+    for xml in [BIOS, UEFI] {
+        let kept = reduce(xml).expect("reduced");
+        let shown = reduce_shown(xml).expect("shown");
+        let user_data = parse(xml)
+            .expect("read")
+            .context
+            .user_data
+            .expect("the fixture's user data");
+        assert!(
+            !shown.contains(user_data.lines().last().expect("a line")),
+            "{shown}"
+        );
+        assert!(shown.contains("<USER_DATA/>") && !shown.contains("I2Nsb3Vk"));
+        let (mut from_kept, mut from_shown) =
+            (parse(&kept).expect("read"), parse(&shown).expect("read"));
+        assert!(from_shown.context.user_data.is_none());
+        from_kept.context.user_data = None;
+        from_kept.digest.clear();
+        from_shown.digest.clear();
+        assert_eq!(from_shown, from_kept);
+    }
 }
 
 #[test]
