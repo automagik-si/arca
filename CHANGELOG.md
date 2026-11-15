@@ -7,6 +7,18 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The approval page approves every card in one sitting. It reads what is waiting again every minute while it is in view
+and when it comes back into view (never under a card being approved), so a card's ten-minute statement no longer goes
+stale on an open page, and a card proposed after the page loaded shows up by itself. A card refused `Expired` anyway is
+renewed and asks for one more tap. Each card's passkey challenge is computed when the list loads, so a tap goes straight
+to the passkey prompt; in Safari a later tap could bring no prompt at all before. What went wrong with a card is said on
+that card. Decline on a linked machine's card now declines it there, not on the page's own machine. A linked machine's
+delete plans are listed and approved through the relay (`approval_submit`); its relay token needs `approval_submit` on
+its list of tools, and the card says so when it is missing. A relayed approval waits as long as its action can run (a
+`service_update` with `timeoutSeconds` 300 waits 780 seconds, not 180), and an `Unreachable` answer reads the list
+again. Each approval or decline from the page writes one log line with its outcome code: `approved`, `refused <code>`,
+`unreachable` or `declined`.
+
 ## 0.32.0 (2026-11-16)
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the

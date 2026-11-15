@@ -1462,7 +1462,13 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' },
     });
     if (!response.ok) throw new Error(`The approval list answered ${response.status}.`);
-    return parseApprovalPlans(await response.json());
+    const parsed = parseApprovalPlans(await response.json());
+    // Each card's challenge is computed now, so a tap goes straight to the passkey: Safari carries the tap into the
+    // passkey prompt only when nothing is awaited before it.
+    await Promise.all([...parsed.plans.values()].map(async (plan) => {
+      try { plan.challenge = await approvalChallenge(plan.statement); } catch { /* computed at the tap instead */ }
+    }));
+    return parsed;
   }
 
   async function refreshApprovals() {
@@ -1481,6 +1487,8 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       approvals.fetchStartedAt = Date.now();
       try {
         const next = await readApprovalPlans();
+        // The trusted passkeys are read once, with the first list, and not at the first tap.
+        if (!approvals.credentialIds) loadCredentialIds().catch(() => {});
         const now = Date.now();
         for (const [id, plan] of next.plans) {
           const card = approvals.cards.get(id);
@@ -1697,22 +1705,28 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     return approvals.credentialIds;
   }
 
-  async function passkeyProof(statement) {
+  // The challenge the passkey signs for `statement`.
+  async function approvalChallenge(statement) {
+    return new Uint8Array(await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(`${APPROVAL_DOMAIN}\n${APPROVAL_NAMESPACE}\n${statement}`),
+    ));
+  }
+
+  // The passkey's proof over `statement`. With the passkeys read at startup and the card's `challenge` computed when the
+  // list loaded, nothing is awaited before credentials.get.
+  async function passkeyProof(statement, challenge) {
     if (!navigator.credentials || typeof navigator.credentials.get !== 'function') {
       throw new Error('This browser cannot use passkeys.');
     }
     if (typeof crypto?.subtle?.digest !== 'function') {
       throw new Error("Passkeys can't be used at this page's address.");
     }
-    const allowCredentials = await loadCredentialIds();
+    const allowCredentials = approvals.credentialIds || await loadCredentialIds();
     if (!allowCredentials.length) throw new Error('No passkey is set up for this Arca.');
-    const challenge = new Uint8Array(await crypto.subtle.digest(
-      'SHA-256',
-      new TextEncoder().encode(`${APPROVAL_DOMAIN}\n${APPROVAL_NAMESPACE}\n${statement}`),
-    ));
     const credential = await navigator.credentials.get({
       publicKey: {
-        challenge,
+        challenge: challenge || await approvalChallenge(statement),
         rpId: location.hostname,
         userVerification: 'required',
         timeout: 60000,
@@ -1753,7 +1767,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     card.note = '';
     updatePanel();
     try {
-      const proof = await passkeyProof(plan.statement);
+      const proof = await passkeyProof(plan.statement, plan.challenge);
       const statementBytes = new TextEncoder().encode(plan.statement);
       const proofBytes = new TextEncoder().encode(JSON.stringify(proof));
       const approval = `${b64(statementBytes)}.${b64(proofBytes)}`;

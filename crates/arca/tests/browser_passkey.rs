@@ -1029,6 +1029,221 @@ fn g10_from_the_installers_node_arca_init_then_the_first_passkey_and_the_first_a
     first_passkey_and_first_approved_change("browser-init", true, false);
 }
 
+/// The 2026-11-15 sitting, in a real browser: two cards approved one after the other in one page load both reach the server
+/// and both run, each tap reaches `navigator.credentials.get` before the click handler returns (nothing is awaited first,
+/// so Safari keeps the tap's gesture), and a card proposed after the page loaded shows up within one refresh, without a
+/// reload.
+#[test]
+#[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
+fn two_approvals_in_one_page_load_both_reach_the_server_and_a_later_card_shows_up_by_itself() {
+    let chrome_binary = std::env::var(CHROME_ENV).unwrap_or_else(|_| DEFAULT_CHROME.to_string());
+    let scratch = Scratch::new("browser-two");
+    let state = scratch.at("state");
+    private_dir(&state);
+    let hash_dir = scratch.at("tokens");
+    private_dir(&hash_dir);
+    let secret_file = scratch.at("viewer.secret");
+    run(
+        arca()
+            .args([
+                "token",
+                "mint",
+                "--scope",
+                "viewer",
+                "--id",
+                "assistant-1",
+                "--hash-dir",
+            ])
+            .arg(&hash_dir)
+            .arg("--out")
+            .arg(&secret_file),
+        "token mint",
+    );
+    let viewer = fs::read_to_string(&secret_file)
+        .expect("the secret")
+        .trim_end()
+        .to_string();
+    let fake = FakeIncus::start(
+        &scratch.0,
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+    )
+    .expect("the fake Incus");
+    fake.add_profile(
+        "default",
+        json!({ "name": "default", "config": {},
+                "devices": { "root": { "type": "disk", "pool": "default", "path": "/" } } }),
+    );
+    let templates = state.join("templates");
+    private_dir(&templates);
+    fs::write(
+        templates.join("nats.json"),
+        json!({
+            "name": "nats", "kind": "oci", "image": "docker.io/library/nats",
+            "digest": format!("sha256:{}", "a".repeat(64)),
+            "ports": [4222], "env": {}, "publishable": false
+        })
+        .to_string(),
+    )
+    .expect("the template");
+    let bin = scratch.at("bin");
+    private_dir(&bin);
+    let notify = bin.join("notify-send");
+    fs::write(&notify, "#!/bin/sh\nexit 1\n").expect("the stub desktop");
+    fs::set_permissions(&notify, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let origin = format!("http://localhost:{port}");
+    let socket = scratch.at("arca.sock");
+    let config = scratch.at("node.json");
+    fs::write(
+        &config,
+        json!({
+            "stateDir": state.display().to_string(),
+            "incus": { "socket": fake.socket().display().to_string(), "pools": [] },
+            "listen": { "unix": socket.display().to_string(), "loopback": format!("127.0.0.1:{port}") },
+            "tokens": { "hashDir": hash_dir.display().to_string() },
+            "approvalOrigin": origin,
+            "approvalHost": "node1",
+            "kernel": {
+                "projects": [arca_netproject::PROJECT], "scratch": false, "droiddProjects": ["droid"],
+                "reservedCidrs": [], "serviceCidr": "192.0.2.0/24"
+            }
+        })
+        .to_string(),
+    )
+    .expect("the config");
+    let mut serve = Serve::start(&config, &bin, scratch.at("serve.log"));
+    serve.wait_for(&socket);
+    let propose = |id: u64, name: &str| {
+        result(
+            &mcp(
+                &socket,
+                &viewer,
+                id,
+                "action_propose",
+                json!({ "action": "service_create", "args": { "name": name, "template": "nats" } }),
+            ),
+            "action_propose",
+        );
+    };
+    propose(1, "nats");
+    propose(2, "natsb");
+
+    let mut chrome = Chrome::launch(
+        &chrome_binary,
+        &scratch.at("chrome"),
+        "AAAA",
+        &scratch.at("chrome.log"),
+    );
+    chrome.page("WebAuthn.enable", json!({ "enableUI": false }));
+    chrome.page(
+        "Emulation.setFocusEmulationEnabled",
+        json!({ "enabled": true }),
+    );
+    chrome.authenticator("internal");
+    chrome.page(
+        "Page.navigate",
+        json!({ "url": format!("{origin}/approve") }),
+    );
+    let wait_for = |chrome: &mut Chrome, js: &str, what: &str, within: Duration| {
+        let deadline = Instant::now() + within;
+        while chrome.eval(js) != json!(true) {
+            assert!(
+                Instant::now() < deadline,
+                "{what}; server log:\n{}",
+                serve.log_text()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for(
+        &mut chrome,
+        "document.readyState === 'complete' && document.querySelectorAll('#plans article.action').length === 2",
+        "the page loads with both cards",
+        WAIT,
+    );
+
+    // The first passkey, with the terminal's setup code.
+    let out = arca()
+        .args(["setup-code", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run arca setup-code");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed: Value = serde_json::from_slice(&out.stdout).expect("JSON on stdout");
+    let code = printed["code"].as_str().expect("a code").to_string();
+    chrome.eval(&format!(
+        "document.getElementById('setup-code').value = {code:?}; document.getElementById('passkey-label').value = 'This computer'; true"
+    ));
+    chrome.click("#register");
+    chrome.status_ok("Passkey trusted.", &serve);
+    wait_for(
+        &mut chrome,
+        "[...document.querySelectorAll('#plans button.approve')].every((b) => b.textContent === 'Approve')",
+        "with a passkey trusted, the cards' buttons approve",
+        WAIT,
+    );
+
+    // From here the page is never loaded again: this mark would be gone. Every passkey request records whether it came
+    // inside the click, before the handler returned.
+    chrome.eval(
+        "(() => { window.__sameLoad = true; window.__inTap = false; window.__getsInTap = []; \
+         const get = navigator.credentials.get.bind(navigator.credentials); \
+         navigator.credentials.get = (options) => { window.__getsInTap.push(window.__inTap); return get(options); }; \
+         return true; })()",
+    );
+    let tap = |chrome: &mut Chrome, name: &str| {
+        let tapped = chrome.eval(&format!(
+            "(() => {{ const card = [...document.querySelectorAll('#plans article.action')] \
+               .find((c) => c.querySelector('h3').textContent.includes('service {name} from')); \
+             const button = card && card.querySelector('button.approve'); \
+             if (!button || button.disabled) return false; \
+             window.__inTap = true; button.click(); window.__inTap = false; return true; }})()"
+        ));
+        assert_eq!(tapped, json!(true), "the card for {name} is on the page");
+    };
+
+    tap(&mut chrome, "nats");
+    chrome.status_ok("Approved. Done: create the service nats ", &serve);
+    tap(&mut chrome, "natsb");
+    chrome.status_ok("Approved. Done: create the service natsb ", &serve);
+    assert!(instance_exists(&fake, "nats"), "the first approval ran");
+    assert!(
+        instance_exists(&fake, "natsb"),
+        "the second approval in the same load ran"
+    );
+    assert_eq!(
+        chrome.eval("[window.__sameLoad === true, JSON.stringify(window.__getsInTap)]"),
+        json!([true, "[true,true]"]),
+        "one page load, and each tap reached the passkey before its click handler returned"
+    );
+
+    // A card proposed after the page loaded shows up by itself within one refresh (60 s), with no reload.
+    propose(3, "natsc");
+    wait_for(
+        &mut chrome,
+        "window.__sameLoad === true && [...document.querySelectorAll('#plans article.action h3')].some((h) => h.textContent.includes('service natsc from'))",
+        "the later card shows up within one refresh",
+        Duration::from_secs(75),
+    );
+
+    drop(chrome);
+    assert_eq!(serve.terminate(), Some(0), "serve exits 0 on SIGTERM");
+}
+
 /// What a device that makes only RSA keys leaves of a page's `pubKeyCredParams`: RS256 (-257). It runs in the loaded page
 /// before the passkey is saved, and records the algorithms the page offered in `window.__arcaOfferedAlgs`.
 const RS256_ONLY_DEVICE: &str = r#"(() => {

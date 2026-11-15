@@ -6008,7 +6008,10 @@ mod service_reconfigure;
 mod service_update;
 #[path = "service_wiring.rs"]
 mod service_wiring;
-pub use service_update::{Probe as UpdateProbe, UpdateOptions, digest_ok as service_digest_ok};
+pub use service_update::{
+    DEFAULT_HEALTH_SECONDS, MAX_HEALTH_SECONDS, Probe as UpdateProbe, UpdateOptions,
+    digest_ok as service_digest_ok,
+};
 #[path = "tenants.rs"]
 mod tenants;
 pub use tenants::{SnapshotListInTenant, spawn_front_sync, sync_front, tenant_handlers};

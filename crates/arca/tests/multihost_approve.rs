@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use arca::approve_page::{Page, SetupCodeDisplay};
 use arca::config::LinkedHost;
+use arca::desired_store::EntryChange;
 use arca::handlers::{
     ActionExecutor, ActionSlot, ApprovalStatus, Clock, StatusHandler, action_statement,
     plan_handlers_with,
@@ -30,6 +31,7 @@ use arca_approval::{
     PasskeyVerifier, STATE_PASSKEYS_FILE, SshSigVerifier, parse_passkeys,
 };
 use arca_kernel::canon::{Digest, canonical_json, params_digest};
+use arca_kernel::desired::EntryId;
 use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, mint_with_tools, serve_unix};
 use arca_metrics::{HostMode, HostModeChoice};
 use common::*;
@@ -77,7 +79,11 @@ struct Pair {
     _alpha_scratch: Scratch,
     _beta_scratch: Scratch,
     _alpha_fake: arca_incus::FakeIncus,
-    _beta_fake: arca_incus::FakeIncus,
+    beta_fake: arca_incus::FakeIncus,
+    /// The one clock both kernels and the page read.
+    clock: Arc<AtomicU64>,
+    /// The lines the page logged.
+    log: Arc<Mutex<Vec<String>>>,
     alpha: Arc<Mutex<Kernel>>,
     beta: Arc<Mutex<Kernel>>,
     alpha_socket: PathBuf,
@@ -117,8 +123,16 @@ fn write_mode(path: &Path, text: &str, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("the mode is set");
 }
 
+/// The verbs the page's relay token on beta admits, as the operating guide mints it for actions.
+const ACTION_TOOLS: [&str; 3] = ["plan_list", "action_approve", "plan_decline"];
+
 impl Pair {
     fn new(tag: &str, trust: BetaTrust) -> (Pair, SoftPasskey) {
+        Pair::with_tools(tag, trust, &ACTION_TOOLS)
+    }
+
+    /// A pair whose relay token on beta admits `tools`.
+    fn with_tools(tag: &str, trust: BetaTrust, tools: &[&str]) -> (Pair, SoftPasskey) {
         let alpha_scratch = Scratch::new(&format!("{tag}-alpha"));
         let beta_scratch = Scratch::new(&format!("{tag}-beta"));
         let alpha_fake = start_fake(&alpha_scratch);
@@ -182,14 +196,10 @@ impl Pair {
             .expect("beta opens"),
         ));
 
-        // Beta's MCP door, with a doctor token limited to the three relayed verbs.
+        // Beta's MCP door, with a doctor token limited to the relayed verbs.
         let tokens_dir = beta_scratch.path("tokens");
         private_dir(&tokens_dir);
-        let tools = [
-            "plan_list".to_string(),
-            "action_approve".to_string(),
-            "plan_decline".to_string(),
-        ];
+        let tools: Vec<String> = tools.iter().map(|tool| tool.to_string()).collect();
         let (secret, hash) = mint_with_tools(Scope::Doctor, Some(&tools));
         write_mode(&tokens_dir.join("relay.hash"), &hash, 0o400);
         let token_file = alpha_scratch.path("beta-relay.secret");
@@ -214,6 +224,7 @@ impl Pair {
         let alpha_state = alpha_scratch.path("state");
         private_dir(&alpha_state);
         let alpha_runs = Arc::new(AtomicU64::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let alpha_clock = Arc::clone(&clock);
         let alpha_clock: Clock = Arc::new(move || alpha_clock.load(Ordering::SeqCst));
         let page = Page::new(
@@ -224,6 +235,10 @@ impl Pair {
             Arc::new(NoDisplay),
         )
         .with_actions(executor(&alpha_runs))
+        .with_log({
+            let log = Arc::clone(&log);
+            Arc::new(move |line: &str| log.lock().expect("the log").push(line.to_string()))
+        })
         .with_linked_hosts(vec![LinkedHost {
             name: "beta".to_string(),
             socket: beta_socket.clone(),
@@ -259,7 +274,9 @@ impl Pair {
             _alpha_scratch: alpha_scratch,
             _beta_scratch: beta_scratch,
             _alpha_fake: alpha_fake,
-            _beta_fake: beta_fake,
+            beta_fake,
+            clock,
+            log,
             alpha,
             beta,
             alpha_socket,
@@ -274,18 +291,60 @@ impl Pair {
     }
 
     fn propose(kernel: &Arc<Mutex<Kernel>>) -> String {
+        Pair::propose_named(kernel, "nats")
+    }
+
+    /// A bound `service_create` of `name` proposed on `kernel`.
+    fn propose_named(kernel: &Arc<Mutex<Kernel>>, name: &str) -> String {
         kernel
             .lock()
             .expect("the kernel lock")
             .propose_action(
                 arca::action_proposal::ActionKind::ServiceCreate,
                 // Bound, as the node binds a create when it is proposed: an unbound one is never approved.
-                json!({ "name": "nats", "template": "nats", "templateDigest": "ab".repeat(32) }),
+                json!({ "name": name, "template": "nats", "templateDigest": "ab".repeat(32) }),
                 NOW,
                 None,
             )
             .expect("a proposal")
             .id
+    }
+
+    /// A delete plan waiting on beta: a toy entry applied, then removed. Its digest.
+    fn beta_delete_plan(&self) -> String {
+        let mut kernel = self.beta.lock().expect("the kernel lock");
+        kernel
+            .propose(vec![EntryChange::Put(toy_entry("t1"))], NOW)
+            .expect("applied");
+        kernel
+            .propose(
+                vec![EntryChange::Remove(EntryId("toy-scratch".to_string()))],
+                NOW + 1_000,
+            )
+            .expect("removed");
+        kernel
+            .pending_plans()
+            .first()
+            .expect("a waiting delete plan")
+            .digest
+            .to_hex()
+    }
+
+    /// The row the page lists for linked delete plan `plan`.
+    fn delete_row(&self, plan: &str) -> Option<Value> {
+        self.plans()["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .find(|row| row["plan"] == json!(plan) && row["linkedHost"] == json!("beta"))
+            .cloned()
+    }
+
+    fn statement_of(&self, id: &str) -> String {
+        self.row(id, Some("beta")).expect("beta's row")["statement"]
+            .as_str()
+            .expect("a statement")
+            .to_string()
     }
 
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
@@ -1245,5 +1304,144 @@ fn a_write_that_names_a_node_is_refused_here_and_relays_nothing() {
     assert!(
         Pair::waiting(&fleet.pair.beta, &id),
         "beta's plan still waits"
+    );
+}
+
+/// The 2026-11-15 sitting: the owner approves one card, then another whose statement the page listed more than ten minutes
+/// earlier. Beta refuses that one as `Expired`, and the same card read again approves at once.
+#[test]
+fn a_second_card_signed_over_a_stale_statement_is_expired_and_approves_after_a_relist() {
+    let (pair, owner) = Pair::new("mh-two-cards", BetaTrust::AlphaFile);
+    let first = Pair::propose_named(&pair.beta, "nats");
+    let second = Pair::propose_named(&pair.beta, "redis");
+    let first_statement = pair.statement_of(&first);
+    let stale = pair.statement_of(&second);
+
+    let (status, answer) = pair.request(
+        "POST",
+        "/approve/approve",
+        Some(json!({ "plan": first, "approval": approval(&owner, &first_statement), "host": "beta" })),
+    );
+    assert_eq!(status, 200, "{answer}");
+
+    // Eleven minutes on: the proposal (fifteen) still waits, the statement (ten) does not.
+    pair.clock.store(NOW + 11 * 60_000, Ordering::SeqCst);
+    let (status, answer) = pair.request(
+        "POST",
+        "/approve/approve",
+        Some(json!({ "plan": second, "approval": approval(&owner, &stale), "host": "beta" })),
+    );
+    assert_eq!(status, 403, "{answer}");
+    assert_eq!(answer["refusal"], json!("Expired"));
+    assert!(Pair::waiting(&pair.beta, &second), "nothing was spent");
+
+    let fresh = pair.statement_of(&second);
+    assert_ne!(fresh, stale, "the re-list mints a fresh statement");
+    let (status, answer) = pair.request(
+        "POST",
+        "/approve/approve",
+        Some(json!({ "plan": second, "approval": approval(&owner, &fresh), "host": "beta" })),
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(pair.beta_runs.load(Ordering::SeqCst), 2, "both cards ran");
+    assert!(!Pair::waiting(&pair.beta, &second));
+
+    // One line per approval, with its outcome code alone: never the statement, the nonce or the proof.
+    let lines: Vec<String> = pair
+        .log
+        .lock()
+        .expect("the log")
+        .iter()
+        .filter(|line| line.starts_with("arca: approval of "))
+        .cloned()
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            format!("arca: approval of {first} on beta: approved"),
+            format!("arca: approval of {second} on beta: refused Expired"),
+            format!("arca: approval of {second} on beta: approved"),
+        ]
+    );
+    let nonce = serde_json::from_str::<Value>(&fresh).expect("the statement")["nonce"]
+        .as_str()
+        .expect("a nonce")
+        .to_string();
+    for line in pair.log.lock().expect("the log").iter() {
+        assert!(
+            !line.contains(&nonce) && !line.contains("webauthn"),
+            "{line}"
+        );
+    }
+}
+
+/// A linked kernel's delete plan is listed with its host and a statement for that host, and the owner's approval is
+/// relayed to its `approval_submit`, which deletes there once.
+#[test]
+fn a_linked_delete_plan_is_listed_and_approved_through_the_relay() {
+    let mut tools = ACTION_TOOLS.to_vec();
+    tools.push("approval_submit");
+    let (pair, owner) = Pair::with_tools("mh-delete", BetaTrust::AlphaFile, &tools);
+    let plan = pair.beta_delete_plan();
+    let row = pair
+        .delete_row(&plan)
+        .expect("beta's delete plan, labelled");
+    assert!(
+        row.get("relayNote").is_none(),
+        "the token admits approval_submit: {row}"
+    );
+    let statement = row["statement"].as_str().expect("a statement");
+    let parsed: Value = serde_json::from_str(statement).expect("the statement");
+    assert_eq!(
+        parsed["host"],
+        json!(BETA_HOST),
+        "the statement names the target's host"
+    );
+    assert_eq!(parsed["action"], json!("delete"));
+
+    let (status, answer) = pair.request(
+        "POST",
+        "/approve/approve",
+        Some(json!({ "plan": plan, "approval": approval(&owner, statement), "host": "beta" })),
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["plan"], json!(plan));
+    assert_eq!(answer["host"], json!("beta"));
+    assert_eq!(
+        deletes_for(&pair.beta_fake, "toy-box-t1"),
+        1,
+        "beta deleted once"
+    );
+    assert!(pair.delete_row(&plan).is_none(), "the plan is gone");
+    assert!(pair.alpha.lock().expect("alpha").pending_plans().is_empty());
+}
+
+/// With the action-only relay token, a linked delete plan is still listed, and its card says what the owner changes on the
+/// linked host; an approval sent anyway is refused by that host's door as the token, with the same words.
+#[test]
+fn a_linked_delete_plan_says_what_to_change_when_the_token_does_not_admit_approval_submit() {
+    let (pair, owner) = Pair::new("mh-delete-token", BetaTrust::AlphaFile);
+    let plan = pair.beta_delete_plan();
+    let row = pair
+        .delete_row(&plan)
+        .expect("beta's delete plan, labelled");
+    let note = row["relayNote"].as_str().expect("a note on the card");
+    assert!(
+        note.contains("approval_submit") && note.contains("beta") && note.contains("list of tools"),
+        "{note}"
+    );
+    let statement = row["statement"].as_str().expect("a statement");
+    let (status, answer) = pair.request(
+        "POST",
+        "/approve/approve",
+        Some(json!({ "plan": plan, "approval": approval(&owner, statement), "host": "beta" })),
+    );
+    assert_eq!(status, 502, "{answer}");
+    assert_eq!(answer["refusal"], json!("LinkToken"));
+    assert_eq!(answer["message"], json!(note));
+    assert_eq!(
+        deletes_for(&pair.beta_fake, "toy-box-t1"),
+        0,
+        "nothing deleted"
     );
 }

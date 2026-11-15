@@ -1638,4 +1638,14 @@ fn the_approval_page_renders_the_passkey_list_card_and_posts_a_linked_rows_host(
         )
     );
     assert!(html.contains("{ plan: id, approval, host: plan.linkedHost }"));
+    // A linked card's decline names its host too, or the page host would look for the id in its own kernel.
+    let decline = html
+        .split("async function decline(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("the decline");
+    assert!(
+        decline.contains("plan.linkedHost ? { plan: id, host: plan.linkedHost } : { plan: id }"),
+        "{decline}"
+    );
 }
