@@ -473,10 +473,17 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
       return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     };
     window.__arcaPasskey = { calls: [], inClick: false };
-    // Whether a passkey request came inside a click, before its handlers returned: anything awaited first (a digest, a
-    // fetch) lets the click end, and Safari then drops the gesture.
-    window.addEventListener('click', () => { window.__arcaPasskey.inClick = true; }, true);
-    window.addEventListener('click', () => { window.__arcaPasskey.inClick = false; });
+    // Whether a passkey request came inside a click listener, before it returned: anything awaited first (a digest, a
+    // fetch, even a promise already settled) runs after the listener, and Safari then drops the gesture. Every click
+    // listener is wrapped so the mark covers its own run and nothing after it.
+    const listen = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function (type, listener, options) {
+      if (type !== 'click' || typeof listener !== 'function') return listen.call(this, type, listener, options);
+      return listen.call(this, type, function (event) {
+        window.__arcaPasskey.inClick = true;
+        try { return listener.call(this, event); } finally { window.__arcaPasskey.inClick = false; }
+      }, options);
+    };
     Object.defineProperty(navigator, 'credentials', {
       configurable: true,
       value: {
