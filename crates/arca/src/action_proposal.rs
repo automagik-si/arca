@@ -510,6 +510,10 @@ impl ActionKind {
         let rows = match self {
             Self::ServiceCreate => {
                 let mut rows = vec![row("Name", text("name")), row("Template", text("template"))];
+                // A create at another build of the template's own image names its digest, as an update does.
+                if args.get("digest").is_some() {
+                    rows.push(row("Digest", text("digest")));
+                }
                 // Only a virtual machine on a host bridge names these.
                 if args.get("bridge").is_some() {
                     rows.push(row("Host bridge", text("bridge")));
@@ -1562,6 +1566,38 @@ fn loaded_words(
     stored_summary: &str,
     stored_details: &[ActionDetail],
 ) -> (String, Vec<ActionDetail>) {
+    // The card's `Version` row closes it when the proposal named one: a label read from the registry when it was made,
+    // kept when it is a row [`crate::image_version`] writes for this proposal's digest, and dropped otherwise.
+    if let Some((last, rest)) = stored_details.split_last()
+        && last.label == crate::image_version::ROW_LABEL
+    {
+        let (summary, mut details) = loaded_rows(action, args, stored_summary, rest);
+        if version_row_fits(action, args, last) {
+            details.push(last.clone());
+        }
+        return (summary, details);
+    }
+    loaded_rows(action, args, stored_summary, stored_details)
+}
+
+/// Whether `row` is a `Version` row for this proposal: a create or an update that names a digest, with the words
+/// [`crate::image_version`] writes for that digest.
+fn version_row_fits(action: ActionKind, args: &Value, row: &ActionDetail) -> bool {
+    matches!(
+        action,
+        ActionKind::ServiceCreate | ActionKind::ServiceUpdate
+    ) && row.label == crate::image_version::ROW_LABEL
+        && args["digest"]
+            .as_str()
+            .is_some_and(|digest| crate::image_version::row_fits(&row.value, digest))
+}
+
+fn loaded_rows(
+    action: ActionKind,
+    args: &Value,
+    stored_summary: &str,
+    stored_details: &[ActionDetail],
+) -> (String, Vec<ActionDetail>) {
     // The parts of a deploy's removal were read from the desired state when it was proposed, and are not in its
     // arguments either: the journal's own rows are kept when they are the rows this action writes for these arguments.
     if action == ActionKind::DeployRemove {
@@ -1766,6 +1802,21 @@ impl ActionProposalStore {
         gpu_product: Option<&str>,
         uses: Option<String>,
     ) -> Result<ActionProposal, ProposeError> {
+        self.propose_labelled(action, args, now, gpu_product, uses, None)
+    }
+
+    /// The same, with the card's `Version` row for a create or an update that names a digest
+    /// ([`crate::image_version`]): a label read when the proposal is made, kept with the proposal's rows and no part of
+    /// its arguments, so the args digest the owner signs is the same with it or without it.
+    pub fn propose_labelled(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now: u64,
+        gpu_product: Option<&str>,
+        uses: Option<String>,
+        version: Option<ActionDetail>,
+    ) -> Result<ActionProposal, ProposeError> {
         self.waiting.retain(|proposal| !proposal.expired(now));
         let digest = action_args_digest(action.as_str(), &args).ok_or_else(|| {
             ProposeError::Store(io::Error::other("arguments do not canonicalize"))
@@ -1788,7 +1839,11 @@ impl ActionProposalStore {
             id,
             action: action.as_str().to_string(),
             summary: action.summary_with(&args, gpu_product),
-            details: action.details_with_gpu(&args, gpu_product),
+            details: {
+                let mut details = action.details_with_gpu(&args, gpu_product);
+                details.extend(version.filter(|row| version_row_fits(action, &args, row)));
+                details
+            },
             uses: uses
                 .filter(|_| action.says_uses())
                 .map(|words| shown(&words, USES_MAX)),
@@ -3144,6 +3199,83 @@ mod tests {
         let undo = ActionKind::StorageAdd.undo_words();
         assert!(!undo.contains("A disk that was erased"), "{undo}");
         assert!(undo.starts_with("If a disk was erased for it"), "{undo}");
+    }
+
+    /// The card's `Version` row is a label kept with the proposal: it survives the journal when it is the row Arca writes
+    /// for the proposal's digest, a planted one is dropped, and the args digest is the same with it or without it.
+    #[test]
+    fn a_version_row_is_kept_through_the_journal_and_a_planted_one_is_dropped() {
+        let digest = format!("sha256:{}", "e".repeat(64));
+        let mut args = create_args("omni");
+        args["digest"] = json!(digest);
+        let row = ActionDetail {
+            label: crate::image_version::ROW_LABEL.to_string(),
+            value: crate::image_version::version_words(
+                crate::image_version::OMNI_IMAGE,
+                &digest,
+                Some("v2.261024.2"),
+            )
+            .expect("Omni's image is looked up"),
+        };
+        let dir = Temp::new("version-row");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let proposed = store
+            .propose_labelled(
+                ActionKind::ServiceCreate,
+                args.clone(),
+                1_000,
+                None,
+                None,
+                Some(row.clone()),
+            )
+            .expect("proposed");
+        assert_eq!(proposed.details.last(), Some(&row));
+        assert_eq!(
+            Some(proposed.args_digest.clone()),
+            action_args_digest("service_create", &args)
+        );
+        let reopened = ActionProposalStore::open(&dir.0, 1_001, None);
+        assert_eq!(reopened.waiting()[0].details.last(), Some(&row));
+
+        for planted in [
+            "Omni v9.9.9 (sha256:0000) planted words",
+            "Omni latest (also planted)",
+        ] {
+            let other = Temp::new("version-row-planted");
+            let mut line: Value =
+                serde_json::from_str(&proposed_line("service_create", &args, 1_000)).expect("JSON");
+            line["proposal"]["details"]
+                .as_array_mut()
+                .expect("details")
+                .push(json!({ "label": crate::image_version::ROW_LABEL, "value": planted }));
+            write_journal(&other.0, &format!("{line}\n"));
+            let reopened = ActionProposalStore::open(&other.0, 1_001, None);
+            assert_eq!(reopened.waiting().len(), 1);
+            assert!(
+                reopened.waiting()[0]
+                    .details
+                    .iter()
+                    .all(|row| row.label != crate::image_version::ROW_LABEL),
+                "{planted}"
+            );
+        }
+        // A row given to a proposal that names no digest is not kept either.
+        let plain = store
+            .propose_labelled(
+                ActionKind::ServiceCreate,
+                create_args("plain"),
+                1_000,
+                None,
+                None,
+                Some(row),
+            )
+            .expect("proposed");
+        assert!(
+            plain
+                .details
+                .iter()
+                .all(|row| row.label != crate::image_version::ROW_LABEL)
+        );
     }
 
     /// A proposal keeps what its create uses through the journal, so the card says it after the kernel opens again.
