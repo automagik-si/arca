@@ -1136,10 +1136,15 @@ fn copy_on_target(rig: &Rig, name: &str, status: &str) -> String {
 
 /// Journals a move of `web` that a stopped kernel left after the lines `steps` (each without move, project and name).
 fn interrupted(rig: &Rig, id: &str, steps: Vec<Value>) {
+    interrupted_to(rig, id, "node-b", steps);
+}
+
+/// [`interrupted`], to the linked host `target` (or to a host that is no longer linked).
+fn interrupted_to(rig: &Rig, id: &str, target: &str, steps: Vec<Value>) {
     let journal = rig.moves.journal();
     journal
         .append(&json!({
-            "event": "begin", "at": NOW, "move": id, "plan": "ab".repeat(32), "target": "node-b",
+            "event": "begin", "at": NOW, "move": id, "plan": "ab".repeat(32), "target": target,
             "proposal": null, "instances": [{
                 "project": "shop", "name": "web", "uuid": WEB_UUID, "roundsTotal": 3,
                 "bytesTotal": 2 * MIB, "needed": 3 * MIB, "targetPool": "default", "volumes": [],
@@ -2418,6 +2423,11 @@ fn a_source_left_beside_a_started_copy_by_recovery_has_autostart_off() {
     assert_eq!(status["instances"][0]["result"], "failed", "{status}");
     assert_eq!(source_autostart(&rig), "false");
     assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+    // R6-2: the reason says it was turned off, and how to come back.
+    let reason = status["instances"][0]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(reason.contains("boot.autostart was true"), "{reason}");
 }
 
 /// R5-1 (B): a rollback that cannot read the target leaves the source stopped, and turns its boot.autostart off.
@@ -2500,4 +2510,317 @@ fn a_failed_move_whose_source_keeps_autostart_says_so() {
         "{one}"
     );
     assert_eq!(result_line(&rig, "web")["autostartOff"], false);
+}
+
+/// The writes the source received that carried `boot.autostart` to the instance `web`.
+fn autostart_writes(rig: &Rig) -> usize {
+    rig.source
+        .writes()
+        .into_iter()
+        .filter(|w| w.path.starts_with("/1.0/instances/web"))
+        .filter(|w| w.config_keys.iter().any(|k| k == "boot.autostart"))
+        .count()
+}
+
+const OTHER_UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+/// The recovery fixture whose copy was started: the copy runs on node-b.
+fn copy_started(rig: &Rig) {
+    let uuid = copy_on_target(rig, "web", "Running");
+    interrupted(
+        rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+        ],
+    );
+}
+
+fn copy_autostart(rig: &Rig) -> Value {
+    writer(&rig.target)
+        .get("/1.0/instances/web?project=shop")
+        .expect("the copy")["config"]["boot.autostart"]
+        .clone()
+}
+
+/// R6-1: a copy a failed move leaves on a target it could not read is created with boot.autostart false, so a restart
+/// of the target's Incus does not start it beside the running source.
+#[test]
+fn a_copy_left_on_an_unreadable_target_does_not_start_by_itself() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let second = held(&rig, 1);
+    rig.target.fail_reads("/1.0/instances/web", 50, 500);
+    rig.source
+        .fail_operation(&second, "the link to the target dropped");
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(rollback_line(&rig, "web")["targetRemoved"], false);
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Running")
+    );
+    let copy = (0..100)
+        .find_map(|_| {
+            writer(&rig.target)
+                .get("/1.0/instances/web?project=shop")
+                .ok()
+        })
+        .expect("the copy is still on the target");
+    assert_eq!(copy["status"], "Stopped", "{copy}");
+    assert_eq!(copy["config"]["boot.autostart"], "false", "{copy}");
+}
+
+/// R6-1: once verified, the copy takes the source's own boot.autostart: true stays true, unset stays unset.
+#[test]
+fn a_verified_copy_takes_the_sources_autostart() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    assert_eq!(copy_autostart(&rig), "true");
+    let rig = Rig::new(vec![web()], 100);
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    assert_eq!(copy_autostart(&rig), Value::Null);
+}
+
+/// R6-1 and R6-6: the next start that records a verified copy as moved gives the copy the source's boot.autostart,
+/// turns the source's off, and says so when that fails.
+#[test]
+fn a_verified_copy_the_next_start_records_takes_the_sources_autostart() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Running");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+            json!({ "event": "cutover", "step": "started" }),
+            json!({ "event": "verify", "ok": true, "checks": [], "downtimeMs": 1234 }),
+        ],
+    );
+    rig.source.set_reject_patch("/1.0/instances/web");
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "moved", "{status}");
+    assert_eq!(copy_autostart(&rig), "true");
+    let line = result_line(&rig, "web");
+    assert_eq!(line["autostartOff"], false, "{line}");
+    assert!(
+        line["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("boot.autostart"),
+        "{line}"
+    );
+}
+
+/// R6-2: a failed ending leaves an unset boot.autostart unset: Incus then restores the last state, stopped.
+#[test]
+fn a_failed_ending_leaves_an_unset_autostart_unset() {
+    let rig = Rig::new(vec![web()], 100);
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    copy_started(&rig);
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(source_autostart(&rig), Value::Null);
+    assert_eq!(autostart_writes(&rig), 0);
+    assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+}
+
+/// R6-3: a recovery whose target is no longer linked leaves a running source's boot.autostart alone: the move never
+/// stopped it.
+#[test]
+fn a_recovery_to_an_unlinked_target_leaves_a_running_source_alone() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    interrupted_to(
+        &rig,
+        "mv-0123456789ab",
+        "node-gone",
+        vec![json!({ "event": "created", "targetUuid": OTHER_UUID })],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Running")
+    );
+    assert_eq!(source_autostart(&rig), "true");
+    assert_eq!(autostart_writes(&rig), 0);
+}
+
+/// R6-4: the recovery's copy-started ending leaves another instance of the name (another uuid) alone.
+#[test]
+fn the_recovery_copy_started_ending_leaves_another_uuid_alone() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    rig.source
+        .set_instance_config("shop", "web", "volatile.uuid", OTHER_UUID);
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    copy_started(&rig);
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(source_autostart(&rig), "true");
+    assert_eq!(autostart_writes(&rig), 0);
+    assert_eq!(result_line(&rig, "web")["autostartOff"], Value::Null);
+}
+
+/// R6-4: the recovery's copy-started ending sends nothing to a source that is gone.
+#[test]
+fn the_recovery_copy_started_ending_leaves_a_gone_source_alone() {
+    let rig = Rig::new(vec![api()], 100);
+    copy_started(&rig);
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(autostart_writes(&rig), 0);
+    let line = result_line(&rig, "web");
+    assert_eq!(line["autostartOff"], Value::Null, "{line}");
+    assert!(
+        !line["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("boot.autostart could not be turned off"),
+        "{line}"
+    );
+}
+
+/// R6-4: the recovery's rollback that cannot read the target sends nothing to a gone source.
+#[test]
+fn the_recovery_rollback_leaves_a_gone_source_alone() {
+    let rig = Rig::new(vec![api()], 100);
+    let uuid = copy_on_target(&rig, "web", "Stopped");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+        ],
+    );
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(autostart_writes(&rig), 0);
+    assert_eq!(result_line(&rig, "web")["autostartOff"], Value::Null);
+}
+
+/// R6-4: a rollback that cannot read the target leaves alone a source swapped for another uuid during the last round.
+#[test]
+fn a_rollback_leaves_a_source_of_another_uuid_alone() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let last = held(&rig, 1);
+    rig.source
+        .set_instance_config("shop", "web", "volatile.uuid", OTHER_UUID);
+    rig.target.refuse_start("shop", "web");
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    rig.source.release_operation(&last);
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(rollback_line(&rig, "web")["sourceIntact"], false);
+    assert_eq!(source_autostart(&rig), "true");
+    assert_eq!(autostart_writes(&rig), 0);
+    assert_eq!(result_line(&rig, "web")["autostartOff"], Value::Null);
+}
+
+/// R6-4: when turning it off fails at the next start, both recovery endings say so.
+#[test]
+fn the_recovery_endings_say_when_autostart_stays_on() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    copy_started(&rig);
+    rig.source.set_reject_patch("/1.0/instances/web");
+    rig.moves.recover();
+    rig.wait("mv-0123456789ab");
+    let line = result_line(&rig, "web");
+    assert_eq!(line["autostartOff"], false, "{line}");
+    assert!(
+        line["reason"]
+            .as_str()
+            .unwrap()
+            .contains("boot.autostart could not be turned off"),
+        "{line}"
+    );
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Stopped");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+        ],
+    );
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    rig.source.set_reject_patch("/1.0/instances/web");
+    rig.moves.recover();
+    rig.wait("mv-0123456789ab");
+    let line = result_line(&rig, "web");
+    assert_eq!(line["autostartOff"], false, "{line}");
+    assert!(
+        line["reason"]
+            .as_str()
+            .unwrap()
+            .contains("boot.autostart could not be turned off"),
+        "{line}"
+    );
+}
+
+/// R6-4: a failed rollback that removed the copy leaves the source's boot.autostart alone: no copy can run beside it.
+#[test]
+fn a_failed_rollback_that_removed_the_copy_leaves_autostart_alone() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    rig.target.refuse_start("shop", "web");
+    rig.source.refuse_start("shop", "web");
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(rollback_line(&rig, "web")["targetRemoved"], true);
+    assert_eq!(rollback_line(&rig, "web")["sourceRunning"], false);
+    assert_eq!(source_autostart(&rig), "true");
+    assert_eq!(autostart_writes(&rig), 0);
+    assert_eq!(result_line(&rig, "web")["autostartOff"], Value::Null);
 }
