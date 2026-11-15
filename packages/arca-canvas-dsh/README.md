@@ -570,6 +570,79 @@ credential; it appears in no page asset, SSE frame, snapshot or log line. Messag
 bodies are never logged either. A model credential failure becomes the safe
 `error` event.
 
+## Doctor in a terminal (dsh-tui)
+
+The same Doctor runs in dsh-tui, and so in a Herdr bot, as a DSH agent preset.
+The `arca-canvas-dsh/doctor` entry opens its session from `src/doctor-session.js`, the
+module the canvas chat uses. It gets the same prompt, the same 15 reads plus
+`arca_propose`, the same allow-list, pre-execute denial and guard, and the same model.
+It changes nothing: a change is still a proposal the owner approves with the passkey.
+
+Use a dsh-tui profile with this package installed, but not as a bundle (the bundle
+adds the canvas web row). Its `package.json`:
+
+```json
+{
+  "private": true,
+  "dependencies": {
+    "@deepseek-harness-tui/dsh-tui": "0.19.0",
+    "arca-canvas-dsh": "github:automagik-si/arca#<commit>&path:/packages/arca-canvas-dsh"
+  },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-harness-tui/dsh-tui"] } }
+}
+```
+
+If `dsh plugin add` puts `arca-canvas-dsh` under `bundles`, take it out there. Copy
+`doctor.patch.yml` into the profile's `cordis.patch.yml` and give the Doctor the
+canvas row's own config block. The schema is the same, so one block serves both:
+
+```yaml
+        plugins:
+          - name: arca-canvas-dsh/doctor
+            config:
+              hosts:
+                - { name: <host>, address: <address>, socketPath: /path/to/arca.sock, viewerTokenPath: /path/to/arca-viewer.token }
+              approvalUrl: <approval page URL>
+```
+
+Start it with the launcher, with the DeepSeek key in the environment:
+
+```sh
+arca-doctor --profile <profile>
+# or, from the profile: node <profile dir>/node_modules/arca-canvas-dsh/doctor-launch.js --profile <profile>
+```
+
+The launcher reads the profile's composed config first. It starts dsh-tui on the
+`arca-doctor` preset only when exactly one such preset is switched on and its
+`arca-canvas-dsh/doctor` plugin is switched on too. Otherwise it exits non-zero and says
+why. Use it for a bot. dsh-tui itself treats an unknown `DSH_TUI_PRESET` as no preset.
+In dsh-tui 0.19.0 such a session has almost no tools, but it is not the Doctor either:
+no Doctor prompt, no fences and no model pin.
+`--patch <file>` is passed through, and `--check` reads the profile and exits.
+
+Either way into the preset gets the Doctor's fences: a session started on it, and a
+blank session switched with `/preset arca-doctor`. If the fences cannot be installed,
+a new session is not opened, and a switched session refuses every tool call. A preset
+that cannot be composed fails the boot.
+
+The session is titled `Doctor`, and `deepseek-flash` is recorded as its model. The
+canvas's limits apply to each terminal session:
+
+- every model request asks for at most 64k output tokens;
+- a turn stops at 40 tool calls, past 64k output tokens, or after 9 minutes;
+- the daily token budget (`dailyTokenBudget`, default 1,000,000) is counted in
+  `arca-doctor-terminal.json`, beside `chatStatePath` when that is set, else in
+  `$DSH_HOME/storages`. Doctors sharing that file count into it under a lock file. Once
+  the budget is spent, the next step is refused until the next day.
+
+`chatEnabled: false` keeps the terminal Doctor from starting.
+
+The fences bound the model, not the terminal. Anyone who can type into the bot's
+terminal is an operator: `!command` runs a shell, `/preset` switches the session away
+from the Doctor, and `/model` picks another model. Give that terminal only to people
+you would give a shell. In a terminal, the owner approves a proposal on the canvas card
+or on the approval page.
+
 ## Develop
 
 ```sh
@@ -585,6 +658,9 @@ One test runs against a real DSH and is skipped unless it is given one:
 ```sh
 ARCA_REAL_DSH_PROOF=/path/to/dsh npx -y node@24.11.0 --test test/real-host.test.js
 ```
+
+`test/doctor-preset-real-dsh.test.js` runs the terminal Doctor on a real DSH. It uses
+`ARCA_REAL_DSH_PROOF`, else `dsh` on PATH, and is skipped without either.
 
 `pnpm` must be beside that `dsh` or on `PATH`. The test installs this package's
 shipped files into a profile in a temporary home, starts the harness on a free

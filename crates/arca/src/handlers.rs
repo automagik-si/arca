@@ -1246,18 +1246,26 @@ impl ToolHandler for JournalListHandler {
     }
 }
 
-/// `token_list`: the id, scope and optional tool list of each live token. No secret and no digest.
+/// `token_list`: the id, scope and optional tool list of each live token. No secret and no digest. The stored tokens come
+/// first, by id, then the ones the node holds in memory only, each with `stored: false`; the console's says `console: true`.
 pub struct TokenListHandler {
     pub tokens: TokenStore,
 }
 
 impl ToolHandler for TokenListHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let held = self
+            .tokens
+            .held_ids()
+            .into_iter()
+            .map(|token| (token, false));
         let tokens: Vec<Value> = self
             .tokens
             .ids()
             .into_iter()
-            .map(|(id, scope, tools)| {
+            .map(|token| (token, true))
+            .chain(held)
+            .map(|((id, scope, tools), stored)| {
                 // An admin token lists as the operator it is above, and says so: the scope enum is a released result.
                 let shown = scope.min(Scope::Operator);
                 let mut token = json!({ "id": id, "scope": shown.as_str() });
@@ -1266,6 +1274,12 @@ impl ToolHandler for TokenListHandler {
                 }
                 if let Some(tools) = tools {
                     token["tools"] = json!(tools);
+                }
+                if !stored {
+                    token["stored"] = json!(false);
+                    if id == crate::console::CONSOLE_TOKEN_ID {
+                        token["console"] = json!(true);
+                    }
                 }
                 token
             })

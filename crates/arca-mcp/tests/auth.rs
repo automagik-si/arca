@@ -585,3 +585,64 @@ fn a_file_named_for_approved_actions_is_left_out_and_every_other_token_still_loa
     assert!(store.lookup(&again).is_none());
     assert!(store.lookup(&good).is_some());
 }
+
+// Tokens the node holds in memory and never stores (the console's).
+
+#[test]
+fn a_held_token_authenticates_with_its_scope_and_list_and_is_listed_apart_from_the_stored_ones() {
+    let scratch = Scratch::new("held");
+    mint_into(scratch.path(), "a-viewer", Scope::Viewer);
+    let store = TokenStore::load(scratch.path()).expect("loads");
+    let tools = vec!["node_metrics".to_string(), "arca_status".to_string()];
+    let secret = store.hold("node:console", Scope::Viewer, tools.clone());
+    assert_eq!(
+        store.lookup(&secret),
+        Some(Caller {
+            token_id: "node:console".into(),
+            scope: Scope::Viewer,
+            tools: Some(tools.clone()),
+        })
+    );
+    assert_eq!(
+        store.ids(),
+        vec![("a-viewer".to_string(), Scope::Viewer, None)],
+        "ids are the stored tokens alone"
+    );
+    assert_eq!(
+        store.held_ids(),
+        vec![("node:console".to_string(), Scope::Viewer, Some(tools))]
+    );
+    assert!(
+        fs::read_dir(scratch.path()).expect("read").all(|item| !item
+            .expect("item")
+            .file_name()
+            .to_string_lossy()
+            .contains("console")),
+        "nothing is written to the token directory"
+    );
+}
+
+#[test]
+fn a_reload_keeps_a_held_token_and_a_new_store_does_not_know_it() {
+    let scratch = Scratch::new("held-reload");
+    let store = TokenStore::load(scratch.path()).expect("loads");
+    let secret = store.hold("node:console", Scope::Viewer, vec!["node_metrics".into()]);
+    mint_into(scratch.path(), "v-new", Scope::Viewer);
+    assert_eq!(store.reload(scratch.path()).expect("reload"), 1);
+    assert!(store.lookup(&secret).is_some(), "the reload kept it");
+    let restarted = TokenStore::load(scratch.path()).expect("loads");
+    assert_eq!(
+        restarted.lookup(&secret),
+        None,
+        "a new start does not know it"
+    );
+    assert!(restarted.held_ids().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "node:")]
+fn a_held_token_needs_an_id_no_hash_file_can_have() {
+    let scratch = Scratch::new("held-id");
+    let store = TokenStore::load(scratch.path()).expect("loads");
+    store.hold("console", Scope::Viewer, vec![]);
+}

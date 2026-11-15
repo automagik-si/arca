@@ -21,8 +21,8 @@ pub mod tools;
 pub mod version;
 
 pub use auth::{
-    Caller, ISSUED_PREFIX, IssuedTokens, TokenStore, TokenStoreError, admin_token_ids, mint,
-    mint_with_tools,
+    Caller, HELD_PREFIX, ISSUED_PREFIX, IssuedTokens, TokenStore, TokenStoreError, admin_token_ids,
+    mint, mint_with_tools,
 };
 pub use elicit::{Asking, PendingPlan, TerminalApprover};
 pub use http::{
@@ -30,5 +30,5 @@ pub use http::{
     serve_loopback, serve_loopback_with, serve_proxy, serve_services, serve_tailnet, serve_unix,
     serve_unix_bound, services_path_ok, tailnet_addr_ok,
 };
-pub use tools::{CallError, ToolHandler};
+pub use tools::{CallError, LinkedNodes, ToolHandler};
 pub use version::{PROTOCOL_VERSION, STATELESS_PROTOCOL_VERSION, SUPPORTED_VERSIONS};

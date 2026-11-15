@@ -7,6 +7,23 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+One MCP door reaches the whole fleet: every read the door serves, and `action_propose`, take an optional `node`, the
+name of one of `approval.linkedHosts` (`arca_status` lists them). The caller is checked on this kernel first, as for a
+call of its own; the call then runs on that node with its linked token, and its answer comes back as the node gave it,
+with `linkedNode` naming it (every field the node wrote is kept, so the answer fits the tool's own schema). A proposal made this way waits on that node, and this kernel's approval page shows it with the
+machine named on the card. A name that is not linked is an invalid argument listing the linked names; a node that does
+not answer is refused `Unreachable`, and one that refuses the token `LinkToken`. Without `node` nothing changes. The
+linked kernel's token must admit the relayed verbs: the page's three-verb token does not. OPERATING.md ("Asking a linked
+node") gives the one `--tools` line to mint it with; never mint it without `--tools`.
+
+A node can make a token for the machine's own console: with `console.tokenFile` in the config, `serve` makes one viewer
+token at each start, limited to `node_metrics`, `arca_status`, `alerts_list` and `service_list`, holds it in memory only
+and writes it to that file at mode 0400. A reload keeps it, a restart replaces it, and a stop removes the file. The start
+is refused when the file's directory is open to group or others or not the node user's, or when a link or another file is
+at its path. `token_list` shows it as the console's (`console: true`, `stored: false`), `arca status --security` counts it
+among the tokens that only look, and `token revoke` of it says to remove the key instead. A `403` to a `tools/call` with a stored
+token now carries one line that names the refused verb; a GET route's `403` stays bare. See "The console's token" in docs/OPERATING.md.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and

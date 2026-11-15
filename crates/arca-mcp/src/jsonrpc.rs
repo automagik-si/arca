@@ -9,7 +9,7 @@
 //! method without an id is refused as an invalid request, so a write never runs with no answer to its caller. An `id` is
 //! a string or a number; a `null` id is invalid.
 
-use arca_api::verbs::{NOT_CONFIRMED, take_confirm};
+use arca_api::verbs::{LINKED_NODE, NODE, NOT_CONFIRMED, take_confirm};
 use std::sync::Arc;
 
 use arca_api::{Verb, conforms, may_call};
@@ -285,6 +285,19 @@ async fn call_tool(
             Some(json!({ "refusal": NOT_CONFIRMED })),
         )));
     }
+    // A call that names a linked node is relayed to it, here, after the caller's own scope and tool list were checked
+    // above: the linked node's token never widens what this caller may call. Nothing below runs for it, so this kernel's
+    // terminal is never asked about a plan that waits on another node.
+    if verb.takes_node()
+        && let Some(node) = arguments
+            .as_object_mut()
+            .and_then(|fields| fields.remove(NODE))
+    {
+        let node = node.as_str().unwrap_or_default().to_string();
+        return Ok(Some(
+            relay_to_node(server, id, verb.name, node, arguments).await,
+        ));
+    }
     let Some(handler) = server.handlers.get(name).cloned() else {
         return Ok(Some(error_reply(id, unknown_tool, "not_found", None)));
     };
@@ -557,6 +570,81 @@ async fn call_tool(
         }
         Err(other) => Err(other),
     }
+}
+
+/// One call relayed to the linked node `node`: that node's reply as it wrote it, with [`LINKED_NODE`] naming it in a
+/// result's structured content or in a refusal's `data`, and a last text block naming it on a tool result that carries no
+/// structured content. Every field the node wrote is left as it wrote it, so the answer still fits the tool's own
+/// `outputSchema`. A name that is not linked is an invalid argument; a node that cannot be asked is a refusal that names
+/// it.
+async fn relay_to_node(
+    server: &Arc<Server>,
+    id: Value,
+    verb: &'static str,
+    node: String,
+    arguments: Value,
+) -> Value {
+    let Some(linked) = server.linked.clone() else {
+        return result_reply(
+            id,
+            invalid_arguments(&format!(
+                "/{NODE}: this kernel has no linked nodes; leave {NODE} out to ask this kernel"
+            )),
+        );
+    };
+    let asked = node.clone();
+    let outcome = tokio::task::spawn_blocking(move || linked.relay(&asked, verb, arguments)).await;
+    match outcome {
+        Ok(Ok(reply)) => relayed_reply(id, &node, reply),
+        Ok(Err(CallError::Invalid(why))) => result_reply(id, invalid_arguments(&why)),
+        Ok(Err(refused)) if refused.refusal().is_some() => {
+            let message = refused.refusal().map_or("", |(_, message)| message);
+            let mut data = refused.refusal_data().unwrap_or_else(|| json!({}));
+            data[LINKED_NODE] = json!(node);
+            error_reply(id, REFUSED, message, Some(data))
+        }
+        Ok(Err(other)) => {
+            (server.log)(&internal_line(
+                verb,
+                &format!("the relay to a linked node failed ({other:?})"),
+            ));
+            result_reply(id, tool_failure("internal", "the tool failed"))
+        }
+        Err(_) => {
+            (server.log)(&internal_line(
+                verb,
+                "the relay to a linked node was stopped before it answered",
+            ));
+            result_reply(id, tool_failure("internal", "the tool failed"))
+        }
+    }
+}
+
+/// A linked node's JSON-RPC `reply` under this request's `id`, with [`LINKED_NODE`] added (see [`relay_to_node`]).
+fn relayed_reply(id: Value, node: &str, mut reply: Value) -> Value {
+    if let Some(error) = reply.get_mut("error").filter(|error| error.is_object()) {
+        let code = error["code"].as_i64().unwrap_or(REFUSED);
+        let message = error["message"].as_str().unwrap_or_default().to_string();
+        let mut data = match error.get_mut("data").map(Value::take) {
+            Some(Value::Object(data)) => data,
+            _ => serde_json::Map::new(),
+        };
+        data.insert(LINKED_NODE.to_string(), json!(node));
+        return error_reply(id, code, &message, Some(Value::Object(data)));
+    }
+    let mut result = reply
+        .get_mut("result")
+        .map(Value::take)
+        .unwrap_or_else(|| json!({}));
+    if let Some(structured) = result
+        .get_mut("structuredContent")
+        .and_then(Value::as_object_mut)
+    {
+        structured.insert(LINKED_NODE.to_string(), json!(node));
+    } else if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+        content.push(json!({ "type": "text", "text": format!("{LINKED_NODE}: {node}") }));
+    }
+    result_reply(id, result)
 }
 
 /// The unix time in seconds.
