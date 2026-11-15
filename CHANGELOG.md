@@ -25,6 +25,14 @@ each runner keeps its own registration in a root-only folder, the token is delet
 the pool holds no GitHub credential. This mode keeps each slot's container, work directory and caches between jobs: a
 bridge until each job has a machine of its own. The `jit` mode is unchanged.
 
+`service_update` takes `withTemplate: true`: the same rebuild also makes the service what its current template says,
+as `service_reconfigure` would (environment, links' values, secrets, ports, `rawLxc`, no-new-privileges, entrypoint),
+behind one owner card and with one restart. The card shows the new digest and every setting that changes, secrets by
+name only, and the approval binds both; an edit of the template after the proposal needs a new card. If the new
+version does not come back healthy, Arca puts back the old image and the old record, its entrypoint among them: a
+service that ran its image's own entrypoint runs it again. A reconcile now marks an entrypoint it writes
+(`user.arca.entrypoint`) and takes off only a marked one. Without the flag an update is unchanged.
+
 `service_reconfigure` makes a running container service what its current template says (environment values, the
 secrets it declares, ports, links' values, `rawLxc` and `noNewPrivileges`) behind one owner card that shows the exact
 difference key by key, secrets by name only; then it restarts the service once and reads its config back. Templates may

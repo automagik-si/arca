@@ -39,6 +39,30 @@ enum Kind {
 }
 
 /// The service as its template says now, and how that differs from its record.
+/// The verb a template's difference is applied by, which its words name.
+#[derive(Clone, Copy)]
+pub(super) enum Doing {
+    Reconfigure,
+    /// `service_update` with `withTemplate`: the difference goes in with the new image, in the same restart.
+    Update,
+}
+
+impl Doing {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Reconfigure => "reconfigure",
+            Self::Update => "update",
+        }
+    }
+
+    fn done(self) -> &'static str {
+        match self {
+            Self::Reconfigure => "reconfigured",
+            Self::Update => "updated",
+        }
+    }
+}
+
 pub(super) struct Plan {
     /// The record as it will be. Its environment holds each value as it is, not yet behind a reference.
     next: ServiceConfig,
@@ -49,7 +73,7 @@ pub(super) struct Plan {
     /// The difference, as the card shows it and the approval binds it.
     pub(super) changes: Value,
     /// Whether the record changes: false when the only difference is a secret whose value is set separately.
-    writes: bool,
+    pub(super) writes: bool,
 }
 
 /// The names of the secrets `pattern` holds, in order, each once.
@@ -150,18 +174,20 @@ fn current_values(
 /// `made` names the secrets this run has just generated: they are shown as generated, as the card showed them, and
 /// rendered with the values now in their files.
 pub(super) fn plan(
+    doing: Doing,
     node: &NodeConfig,
     entries: &[Entry],
     config: &ServiceConfig,
     made: &BTreeSet<String>,
 ) -> Result<Plan, CallError> {
     let name = &config.name;
+    let verb = doing.verb();
     let template =
         crate::service::load_template(&node.state_dir.join("templates"), &config.template)
             .map_err(service_template_error)?;
     if template.is_vm() {
         return Err(service_refused(format!(
-            "reconfigure service {name}: its template {} is now a virtual machine's, and a container is not made one by a reconfigure. Nothing was changed",
+            "{verb} service {name}: its template {} is now a virtual machine's, and a container is not made one by a reconfigure. Nothing was changed",
             config.template
         )));
     }
@@ -395,7 +421,7 @@ fn entrypoint_words(entrypoint: Option<&str>) -> String {
 const ENTRYPOINT_SHOWN: usize = 160;
 
 /// The names in `changes`, for the journal: each key and secret with what happens to it, and never a value.
-fn names_of(changes: &Value) -> Value {
+pub(super) fn names_of(changes: &Value) -> Value {
     let rows = |section: &str, field: &str| -> Vec<String> {
         changes[section]
             .as_array()
@@ -446,11 +472,189 @@ pub(super) fn check_proposal(
     if config.adopted || config.function.is_some() || config.vm.is_some() {
         return Ok(payload);
     }
-    payload["changes"] = plan(node, &scoped, &config, &BTreeSet::new())?.changes;
+    payload["changes"] = plan(Doing::Reconfigure, node, &scoped, &config, &BTreeSet::new())?.changes;
     Ok(payload)
 }
 
+/// A plan ready to be written: the record as it will be, each hidden value behind a reference.
+pub(super) struct Ready {
+    pub(super) next: ServiceConfig,
+    /// The environment as applied, each value as it is: what the config read back is compared with, by key.
+    pub(super) applied: BTreeMap<String, String>,
+    /// The words a refusal from here on ends with: the secrets this run made stay for the next card.
+    pub(super) kept: String,
+}
+
+/// What a write of the planned record came to.
+pub(super) enum Written {
+    Done,
+    /// The record changed since the plan was made (a link or a secret set meanwhile): it was left as it is, and is
+    /// never put back, since that would undo the change made meanwhile. `saved` is whether the node saved it.
+    Stale { saved: bool },
+    /// The node refused it, in these words. The node saves the record before it writes the instance, so the new
+    /// record may be saved: it has to be put back.
+    Refused(String),
+}
+
+/// The fields a plan writes into a record, from `from`.
+fn fields(record: &mut ServiceConfig, from: &ServiceConfig) {
+    record.environment = from.environment.clone();
+    record.environment_patch = from.environment_patch.clone();
+    record.secret_refs = from.secret_refs.clone();
+    record.ports = from.ports.clone();
+    record.links = from.links.clone();
+    record.raw_lxc = from.raw_lxc.clone();
+    record.no_new_privileges = from.no_new_privileges;
+    // An entrypoint is set, never taken off: putting back a record that named none leaves the one the
+    // instance now carries in the record too, so the two stay alike.
+    if from.entrypoint.is_some() {
+        record.entrypoint = from.entrypoint.clone();
+    }
+}
+
+/// What of a record a plan was made from: a record that differs here changed since.
+fn planned(record: &ServiceConfig) -> Option<Value> {
+    serde_json::to_value((
+        &record.environment,
+        &record.links,
+        &record.secret_refs,
+        &record.ports,
+        &record.raw_lxc,
+        record.no_new_privileges,
+        &record.entrypoint,
+    ))
+    .ok()
+}
+
+/// The keys of the instance's config, read back as `state`, whose value is not what was applied: by key, never by
+/// value. `applied` is the environment as applied, `old` the record before, `next` the record written.
+pub(super) fn read_back_differs(
+    state: &arca_incus::InstanceState,
+    applied: &BTreeMap<String, String>,
+    old: &ServiceConfig,
+    next: &ServiceConfig,
+) -> Vec<String> {
+    let mut differs: Vec<String> = Vec::new();
+    for (key, value) in applied {
+        if state.own_config.get(&format!("environment.{key}")) != Some(value) {
+            differs.push(key.clone());
+        }
+    }
+    for key in old.environment.keys() {
+        if !applied.contains_key(key) && state.own_config.contains_key(&format!("environment.{key}")) {
+            differs.push(key.clone());
+        }
+    }
+    if state.own_config.get("raw.lxc").cloned() != crate::service::raw_lxc_value(next) {
+        differs.push("raw.lxc".to_string());
+    }
+    if next.entrypoint.is_some() && state.own_config.get("oci.entrypoint") != next.entrypoint.as_ref() {
+        differs.push("oci.entrypoint".to_string());
+    }
+    differs
+}
+
 impl ServiceHandler {
+    /// Makes the secrets the template generates, as a create makes them, works the plan out again with them, and puts
+    /// each value that holds a secret or comes from a link behind a reference. A plan that moved since `first` is
+    /// refused, ending the journal: by then the secrets made are files on the node, and the refusal names them.
+    pub(super) fn ready_plan(
+        &self,
+        doing: Doing,
+        entries: &[Entry],
+        config: &ServiceConfig,
+        first: &Plan,
+        journal: &Journal,
+    ) -> Result<Ready, CallError> {
+        let name = &config.name;
+        let owner = config.entry_id();
+        let secrets_dir = self.cfg.state_dir.join("secrets");
+        for (key, prefix) in &first.generate {
+            crate::service::generate_secret(&secrets_dir, &owner, key, prefix)
+                .map_err(service_template_error)?;
+        }
+        let generated: BTreeSet<String> =
+            first.generate.iter().map(|(key, _)| key.clone()).collect();
+        // By now the secrets made above are files on the node, so a refusal from here on says the service was not
+        // changed, and names those secrets, which stay for the next card.
+        let kept = if generated.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " The secrets Arca made for it ({}) are kept for the next card.",
+                generated.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        let made = plan(doing, &self.cfg, entries, config, &generated)?;
+        if made.changes != first.changes || !made.generate.is_empty() {
+            journal.step("end", false, json!({ "why": "the plan moved" }));
+            return Err(service_refused(format!(
+                "{} service {name}: the service changed while it was {}: propose it again. The service was not changed.{kept}",
+                doing.verb(),
+                doing.done(),
+            )));
+        }
+        let applied = made.next.environment.clone();
+        let mut next = made.next;
+        for key in &made.hidden {
+            if let Some(value) = next.environment.get(key).cloned() {
+                next.environment
+                    .insert(key.clone(), self.store_value(&owner, &value)?);
+            }
+        }
+        Ok(Ready {
+            next,
+            applied,
+            kept,
+        })
+    }
+
+    /// Writes `next`'s planned fields into the service's record, under the node's write gate, only while the record is
+    /// still the one the plan was made from (`config`): a link, a secret or a port that changed since is never
+    /// overwritten by a difference the card did not show.
+    pub(super) fn write_plan(
+        &self,
+        entry_id: &str,
+        config: &ServiceConfig,
+        next: &ServiceConfig,
+    ) -> Written {
+        let mut stale = false;
+        let written = self.amend(entry_id, &config.name, |record| {
+            if planned(record) == planned(config) {
+                fields(record, next);
+            } else {
+                stale = true;
+            }
+        });
+        if stale {
+            return Written::Stale {
+                saved: written.is_ok(),
+            };
+        }
+        match written {
+            Ok(_) => Written::Done,
+            Err(CallError::Refused { message, .. } | CallError::Invalid(message)) => {
+                Written::Refused(message)
+            }
+            Err(_) => Written::Refused("the node did not apply it".to_string()),
+        }
+    }
+
+    /// Puts the planned fields of `old` back into the service's record; its environment applies whole. Whether that
+    /// worked. A record that named no entrypoint keeps the one the plan set, unless `exactly`: then it names none
+    /// again, and the node takes the entrypoint it wrote off the instance ([`crate::service::ENTRYPOINT_KEY`]).
+    pub(super) fn put_plan_back(&self, entry_id: &str, old: &ServiceConfig, exactly: bool) -> bool {
+        let mut old = old.clone();
+        old.environment_patch = None;
+        self.amend(entry_id, &old.name.clone(), |record| {
+            fields(record, &old);
+            if exactly {
+                record.entrypoint = old.entrypoint.clone();
+            }
+        })
+        .is_ok()
+    }
+
     /// `service_reconfigure`: makes the service `name` what its template says now, exactly as the approved card
     /// showed. `entries` are the ones the call may see, a tenant's when it names one. Only an approved proposal runs it.
     pub(super) fn call_reconfigure(
@@ -486,7 +690,7 @@ impl ServiceHandler {
         }
         let _claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
             .ok_or_else(|| said("another update of this service is running"))?;
-        let first = plan(&self.cfg, entries, &config, &BTreeSet::new())?;
+        let first = plan(Doing::Reconfigure, &self.cfg, entries, &config, &BTreeSet::new())?;
         if args.get("changes") != Some(&first.changes) {
             return Err(said(
                 "the service or its template changed since the owner's card was made, so the card no longer says what would be applied: propose it again",
@@ -522,114 +726,43 @@ impl ServiceHandler {
         journal
             .line("begin", true, names_of(&first.changes))
             .map_err(|_| said("the update journal could not be written"))?;
-        // The secrets the template makes are made now, as a create makes them, and the values rendered again with them.
-        let owner = config.entry_id();
-        let secrets_dir = self.cfg.state_dir.join("secrets");
-        for (key, prefix) in &first.generate {
-            crate::service::generate_secret(&secrets_dir, &owner, key, prefix)
-                .map_err(service_template_error)?;
-        }
-        let generated: BTreeSet<String> =
-            first.generate.iter().map(|(key, _)| key.clone()).collect();
-        // By now the secrets made above are files on the node, so a refusal from here on says the service was not
-        // changed, and names those secrets, which stay for the next card.
-        let kept = if generated.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " The secrets Arca made for it ({}) are kept for the next card.",
-                generated.iter().cloned().collect::<Vec<_>>().join(", ")
-            )
-        };
-        let made = plan(&self.cfg, entries, &config, &generated)?;
-        if made.changes != first.changes || !made.generate.is_empty() {
-            journal.step("end", false, json!({ "why": "the plan moved" }));
-            return Err(service_refused(format!(
-                "reconfigure service {name}: the service changed while it was reconfigured: propose it again. The service was not changed.{kept}"
-            )));
-        }
-        let applied = made.next.environment.clone();
-        let mut next = made.next;
-        for key in &made.hidden {
-            if let Some(value) = next.environment.get(key).cloned() {
-                next.environment
-                    .insert(key.clone(), self.store_value(&owner, &value)?);
-            }
-        }
-        let fields = |record: &mut ServiceConfig, from: &ServiceConfig| {
-            record.environment = from.environment.clone();
-            record.environment_patch = from.environment_patch.clone();
-            record.secret_refs = from.secret_refs.clone();
-            record.ports = from.ports.clone();
-            record.links = from.links.clone();
-            record.raw_lxc = from.raw_lxc.clone();
-            record.no_new_privileges = from.no_new_privileges;
-            // An entrypoint is set, never taken off: putting back a record that named none leaves the one the
-            // instance now carries in the record too, so the two stay alike.
-            if from.entrypoint.is_some() {
-                record.entrypoint = from.entrypoint.clone();
-            }
-        };
+        let Ready {
+            next,
+            applied,
+            kept,
+        } = self.ready_plan(Doing::Reconfigure, entries, &config, &first, &journal)?;
         // The node saves the record before it writes the instance, so a refused write leaves the new record saved:
         // it is put back, and the answer says whether that worked. The old record's environment applies whole.
-        let mut old = config.clone();
-        old.environment_patch = None;
-        let put_back = || {
-            self.amend(&entry.id.0, &name, |record| fields(record, &old))
-                .is_ok()
-        };
-        // The record is read again under the node's write gate right before it is written: a link, a secret or a
-        // port that changed since the plan was made is never overwritten by a difference the card did not show.
-        let planned = |record: &ServiceConfig| {
-            serde_json::to_value((
-                &record.environment,
-                &record.links,
-                &record.secret_refs,
-                &record.ports,
-                &record.raw_lxc,
-                record.no_new_privileges,
-                &record.entrypoint,
-            ))
-            .ok()
-        };
-        let mut stale = false;
-        let written = self.amend(&entry.id.0, &name, |record| {
-            if planned(record) == planned(&config) {
-                fields(record, &next);
-            } else {
-                stale = true;
+        let put_back = || self.put_plan_back(&entry.id.0, &config, false);
+        match self.write_plan(&entry.id.0, &config, &next) {
+            Written::Done => {}
+            // A stale record was left as it is, so it is never put back, even when the node refused to save it:
+            // putting the old record back would undo the change made meanwhile.
+            Written::Stale { saved } => {
+                journal.step(
+                    "end",
+                    false,
+                    json!({ "why": "the record changed since the plan", "saved": saved }),
+                );
+                return Err(service_refused(format!(
+                    "reconfigure service {name}: its record changed since the card was made (a link or a secret was set meanwhile): propose it again. The service was not changed.{kept}"
+                )));
             }
-        });
-        // A stale record was left as it is, so it is never put back, even when the node refused to save it: putting
-        // the old record back would undo the change made meanwhile.
-        if stale {
-            journal.step(
-                "end",
-                false,
-                json!({ "why": "the record changed since the plan", "saved": written.is_ok() }),
-            );
-            return Err(service_refused(format!(
-                "reconfigure service {name}: its record changed since the card was made (a link or a secret was set meanwhile): propose it again. The service was not changed.{kept}"
-            )));
-        }
-        if let Err(error) = written {
-            let why = match &error {
-                CallError::Refused { message, .. } | CallError::Invalid(message) => message.clone(),
-                _ => "the node did not apply it".to_string(),
-            };
-            let restored = put_back();
-            journal.step("apply", false, json!({ "restored": restored }));
-            return Err(service_refused(format!(
-                "reconfigure service {name}: the change was not applied: {why}. {}",
-                if restored {
-                    format!(
-                        "The service's record is as it was, and the service was not changed.{kept}"
-                    )
-                } else {
-                    "The service's record could not be put back: service_status shows what it says"
-                        .to_string()
-                }
-            )));
+            Written::Refused(why) => {
+                let restored = put_back();
+                journal.step("apply", false, json!({ "restored": restored }));
+                return Err(service_refused(format!(
+                    "reconfigure service {name}: the change was not applied: {why}. {}",
+                    if restored {
+                        format!(
+                            "The service's record is as it was, and the service was not changed.{kept}"
+                        )
+                    } else {
+                        "The service's record could not be put back: service_status shows what it says"
+                            .to_string()
+                    }
+                )));
+            }
         }
         journal.step("apply", true, json!({}));
         let was_running = seen.is_running();
@@ -668,31 +801,10 @@ impl ServiceHandler {
         // The config read back, against what was applied: by key, never by value.
         let read = changer.read(&config.project, &config.instance);
         let (running, differs) = match &read {
-            Ok(state) => {
-                let mut differs: Vec<String> = Vec::new();
-                for (key, value) in &applied {
-                    if state.own_config.get(&format!("environment.{key}")) != Some(value) {
-                        differs.push(key.clone());
-                    }
-                }
-                for key in config.environment.keys() {
-                    if !applied.contains_key(key)
-                        && state.own_config.contains_key(&format!("environment.{key}"))
-                    {
-                        differs.push(key.clone());
-                    }
-                }
-                if state.own_config.get("raw.lxc").cloned() != crate::service::raw_lxc_value(&next)
-                {
-                    differs.push("raw.lxc".to_string());
-                }
-                if next.entrypoint.is_some()
-                    && state.own_config.get("oci.entrypoint") != next.entrypoint.as_ref()
-                {
-                    differs.push("oci.entrypoint".to_string());
-                }
-                (state.is_running(), differs)
-            }
+            Ok(state) => (
+                state.is_running(),
+                read_back_differs(state, &applied, &config, &next),
+            ),
             Err(_) => (false, vec!["(the instance could not be read)".to_string()]),
         };
         journal.step(

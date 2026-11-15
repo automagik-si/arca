@@ -1603,7 +1603,8 @@ record is refused.
 
 ### Updating a service to a new image digest
 
-`service_update` takes `{name, digest, timeoutSeconds?, eraseData?, tenant?}` (or `{name, follow}`, see below) and
+`service_update` takes `{name, digest, timeoutSeconds?, eraseData?, withTemplate?, tenant?}` (or `{name, follow}`, see
+below) and
 moves a running container service made from an image by digest (today `automagik-server`) or from a local image
 pinned by fingerprint (a template's `local:<alias>` beside a `digest`, see "A local image may be pinned") to another
 digest, or fingerprint, in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor`
@@ -1657,6 +1658,51 @@ rollback after a failed start or health check answers `rollback_failed`; after a
 never taken away, so the answer is `rolled_back` with the old root kept. A project that allows snapshots restores the
 snapshot instead, and the record still names the old image either way. The update rebuilds from the project's own copy,
 never from an alias alone; a rebuild from an image the store no longer holds fails before it takes the old root away.
+
+#### A new image and its template in one restart (`withTemplate`)
+
+A new image often comes with a new start command or new environment in its template. Without `withTemplate` the update
+keeps the service's recorded settings, and the template's go in afterwards with `service_reconfigure`: two cards and
+two restarts. With `withTemplate: true` one card does both, with one restart:
+
+```json
+{"action": "service_update", "args": {"name": "web", "digest": "sha256:…", "withTemplate": true}}
+```
+
+Install the changed template first (`arca templates install`), then propose it with `action_propose`; only the owner's
+approval runs it, and a direct call is refused with "Nothing was changed". When the proposal is made, the node works
+out what `service_reconfigure` would apply from the CURRENT template (environment, links' values, declared secrets,
+ports, `rawLxc`, no-new-privileges, entrypoint; see "Reconfiguring a service from its template") and writes it into
+the proposal as `changes`, so the card shows the digest, a `Template changes` row counting them, one row per key,
+secret, port list, low-level setting and entrypoint that changes (secrets by name only), and the summary says it is one
+restart. The approval binds the digest and `changes` together. What a caller sends as `changes` is never kept. When
+the approved call runs it works the difference out again and changes nothing unless it is the one on the card ("the
+service or its template changed since the owner's card was made ... propose it again"): an edit of the template after
+the proposal needs a new card.
+
+The run is the update above with one more step. After the rebuild, while the instance is stopped, the node makes the
+secrets the template generates, saves the record with the template's settings (the node writes the instance's
+environment, `raw.lxc`, ports and `oci.entrypoint` from it) and then starts the service once: one stop and one start for
+the image and the settings together. The record is read again under the node's write gate right before it is written:
+a link or a secret set since the card was made fails the step, and the update is rolled back. After the health check
+the new digest is recorded and the config is read back; the answer adds `changes` and `readBack: {matches, differs}`,
+as `service_reconfigure`'s does. The journal has `apply` after `rebuild`, and `read back` before `end`, with key and
+secret names only.
+
+A failure after the settings were written puts back both: the old record exactly (its environment, ports, secrets,
+links, low-level settings and its entrypoint) first, then the old root (the snapshot, or a rebuild from the old digest),
+then the old version is started, and the refusal (`rolled_back`) says the old settings are back. A record that named
+no entrypoint (the image's own ran) names none again, and the node takes the template's `oci.entrypoint` off the
+instance, so the image's own command runs again. It takes off only an entrypoint it wrote itself: when a reconcile
+writes `oci.entrypoint` it marks the value in `user.arca.entrypoint`, and a record that names no entrypoint leaves any
+other entrypoint where it is. A service whose entrypoint was never changed by a reconcile has no mark and is reconciled
+as before.
+
+`withTemplate` goes with a digest the service does not run yet (for the digest it runs, `service_reconfigure` applies
+the template alone, and the update says so), and not with `follow` or `noNewPrivileges` (the template's
+no-new-privileges is among the changes, and goes in with the image instead of needing an update of its own). A template
+that is now a virtual machine's is refused when the proposal is made. `eraseData` goes with it as without it. Without
+`withTemplate`, or with `false`, the update is exactly as above.
 
 #### A service that keeps its data inside the container
 
@@ -2835,7 +2881,7 @@ before its first call. The union sits inside `args`, never at the top of the inp
 one. `x-arca-by: "action"` tells the door to hold `args` to the branch `action` names, so a refusal is in that branch's
 own words (`/args: missing required field name`), not "matches none". A field the kernel fills in when the proposal is
 made (a GPU verb's `project`, `kind` and `uuid`; `storage_add`'s disk facts; the snapshot verbs' `name`, `kind`, pools
-and folder facts; `service_reconfigure`'s `changes`) takes any value in its branch and says so: the kernel removes or replaces what was sent, as it did
+and folder facts; `service_reconfigure`'s and `service_update`'s `changes`) takes any value in its branch and says so: the kernel removes or replaces what was sent, as it did
 before the branches. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses the image the node's `postgres-autopg`
 template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is
