@@ -163,6 +163,11 @@ pub const EARLIER: &[(&str, &str)] = &[
         "omni-api.json",
         "f198fee6283e93753dfc140b788759bce8eb78bc417386c979d9445c8b4a45b3",
     ),
+    // 0.23.0 to 0.29.0: before its description said that a create or an update may name any build of its image.
+    (
+        "omni-api.json",
+        "3e4c94586ec70774e27cb8b82254c491b40238f3bf749521975a8eafcab809a2",
+    ),
     // 0.1.0-alpha.7 to 0.12.0.
     (
         "postgres-autopg.sh",

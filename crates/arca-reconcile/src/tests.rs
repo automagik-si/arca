@@ -176,8 +176,8 @@ fn open(stub: &Stub, key: &NodeKey) -> Reconciler<MemJournal> {
 }
 
 /// Journals an applied effect of `class` on `object` for `entry`, the way a plugin's effect would be journalled.
-fn record(
-    r: &mut Reconciler<MemJournal>,
+fn record<S: JournalStore>(
+    r: &mut Reconciler<S>,
     entry: &str,
     class: EffectClass,
     object: ObjectRef,
@@ -207,7 +207,7 @@ fn record(
 }
 
 /// The entry `entry` as an applied one: the reconciler knows its plugin, so a removal can plan its class-B objects.
-fn known(r: &mut Reconciler<MemJournal>, entry: &str) {
+fn known<S: JournalStore>(r: &mut Reconciler<S>, entry: &str) {
     r.applied_by
         .insert(EntryId(entry.to_string()), PluginId(DUMMY.to_string()));
 }
@@ -493,5 +493,265 @@ fn an_unchanged_applied_entry_is_not_applied_again_and_a_changed_one_is() {
         vec![Outcome::Applied {
             entry: EntryId("e1".to_string())
         }]
+    );
+}
+
+/// An in-memory journal that counts every line appended to it, so a test can show a call wrote nothing.
+#[derive(Clone, Default)]
+struct Counting {
+    inner: MemJournal,
+    appended: Arc<Mutex<usize>>,
+}
+
+impl Counting {
+    fn appended(&self) -> usize {
+        *self.appended.lock().expect("the count is readable")
+    }
+}
+
+impl JournalStore for Counting {
+    fn append(&mut self, record: &EffectRecord) -> Result<(), KernelError> {
+        *self.appended.lock().expect("the count is writable") += 1;
+        self.inner.append(record)
+    }
+
+    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
+        self.inner.load()
+    }
+}
+
+/// The reconciler over a counting journal, with the retained set the test can reach.
+fn open_counting(stub: &Stub, key: &NodeKey, store: &Counting) -> Reconciler<Counting> {
+    let mut plugins = PluginSet::new();
+    plugins.add::<Dummy>().expect("the dummy plugin is valid");
+    let journal = Journal::open(store.clone()).expect("an empty journal opens");
+    Reconciler::open(
+        DesiredStateGate::new(key.public(), None),
+        journal,
+        plugins,
+        Box::new(stub.clone()),
+        RetainedSet::empty(),
+        NOW,
+    )
+    .expect("an empty journal opens the reconciler")
+}
+
+/// One minute after a plan made at `NOW` has lapsed.
+const LAPSED: u64 = NOW + PLAN_TTL_MS + 60_000;
+
+/// The entry `e1`, applied with one class-B instance `box-x` and one class-A ACL, then removed at `NOW`: its plan waits.
+fn removed_e1<S: JournalStore>(r: &mut Reconciler<S>, key: &NodeKey) -> (DeletePlan, u64) {
+    known(r, "e1");
+    record(r, "e1", EffectClass::A, object("acl-x", IncusKind::Acl));
+    let instance = record(
+        r,
+        "e1",
+        EffectClass::B,
+        object("box-x", IncusKind::Instance),
+    );
+    let plan = awaiting(&r.reconcile(&signed(key, 1, None, vec![]), NOW));
+    (plan, instance)
+}
+
+#[test]
+fn a_lapsed_plan_is_renewed_with_the_same_id_made_now_and_its_run_deletes() {
+    let key = NodeKey::generate();
+    let stub = Stub::new(&[]);
+    let mut r = open(&stub, &key);
+    let (plan, _) = removed_e1(&mut r, &key);
+    assert_eq!(
+        r.run_plan_authorized(&plan.digest, LAPSED),
+        Err(ApprovalRefusal::Expired),
+        "the lapsed plan does not run"
+    );
+
+    let renewal = r.renew_lapsed(LAPSED);
+
+    assert!(renewal.not_renewed.is_empty(), "{renewal:?}");
+    assert_eq!(
+        renewal.renewed,
+        vec![DeletePlan {
+            created_ms: LAPSED,
+            ..plan.clone()
+        }],
+        "the same entry and objects, so the same id, made now"
+    );
+    assert_eq!(r.pending_plans(), renewal.renewed);
+    let run = r
+        .run_plan_authorized(&plan.digest, LAPSED)
+        .expect("the renewed plan runs");
+    assert_eq!(run.deleted, vec![object("box-x", IncusKind::Instance)]);
+    assert!(!run.partial);
+    assert!(r.pending_plans().is_empty(), "a full run retires its plan");
+}
+
+#[test]
+fn a_plan_inside_its_fifteen_minutes_keeps_its_creation_time() {
+    let key = NodeKey::generate();
+    let stub = Stub::new(&[]);
+    let mut r = open(&stub, &key);
+    let (plan, _) = removed_e1(&mut r, &key);
+
+    let renewal = r.renew_lapsed(NOW + PLAN_TTL_MS);
+
+    assert!(renewal.renewed.is_empty(), "{renewal:?}");
+    assert!(renewal.not_renewed.is_empty(), "{renewal:?}");
+    assert_eq!(r.pending_plans(), vec![plan], "its age does not restart");
+}
+
+#[test]
+fn a_declined_entry_is_never_renewed() {
+    let key = NodeKey::generate();
+    let stub = Stub::new(&[]);
+    let mut r = open(&stub, &key);
+    let (plan, _) = removed_e1(&mut r, &key);
+    assert_eq!(
+        r.decline(&plan.digest),
+        vec![object("box-x", IncusKind::Instance)]
+    );
+
+    let renewal = r.renew_lapsed(LAPSED);
+
+    assert!(renewal.renewed.is_empty(), "{renewal:?}");
+    assert!(r.pending_plans().is_empty(), "no plan comes back for it");
+}
+
+#[test]
+fn a_lapsed_plan_whose_entry_is_retained_meanwhile_is_not_renewed_and_says_why() {
+    let key = NodeKey::generate();
+    let stub = Stub::new(&[]);
+    let mut r = open(&stub, &key);
+    let (plan, _) = removed_e1(&mut r, &key);
+    // The set is shared with the provider, so an entry can be retained while its plan still waits.
+    r.retained
+        .retain(
+            EntryId("e1".to_string()),
+            PluginId(DUMMY.to_string()),
+            plan.digest.clone(),
+        )
+        .expect("the set is writable");
+
+    let renewal = r.renew_lapsed(LAPSED);
+
+    assert!(renewal.renewed.is_empty(), "{renewal:?}");
+    assert_eq!(renewal.not_renewed.len(), 1, "{renewal:?}");
+    assert_eq!(renewal.not_renewed[0].plan, plan);
+    assert!(
+        renewal.not_renewed[0].why.contains("declined"),
+        "{renewal:?}"
+    );
+    assert_eq!(
+        r.pending_plans(),
+        vec![plan],
+        "the lapsed plan is left as it was"
+    );
+}
+
+/// The reconcile that carries the entry again withdraws its plan, so a renewal finds nothing of it. This pins that guarantee;
+/// the `carried` branch in `renew_lapsed` is a defensive backstop this sequence does not reach.
+#[test]
+fn an_entry_the_desired_state_carries_again_is_not_renewed() {
+    let key = NodeKey::generate();
+    let stub = Stub::new(&[]);
+    let mut r = open(&stub, &key);
+    let doc1 = signed(&key, 1, None, vec![]);
+    known(&mut r, "e1");
+    record(
+        &mut r,
+        "e1",
+        EffectClass::B,
+        object("box-x", IncusKind::Instance),
+    );
+    awaiting(&r.reconcile(&doc1, NOW));
+    let doc2 = signed(
+        &key,
+        2,
+        Some(doc1.document.digest()),
+        vec![dummy_entry("e1", json!({}))],
+    );
+    r.reconcile(&doc2, LAPSED);
+    assert!(
+        r.pending_plans().is_empty(),
+        "the plan is withdrawn as today"
+    );
+
+    let renewal = r.renew_lapsed(LAPSED);
+
+    assert!(renewal.renewed.is_empty(), "{renewal:?}");
+    assert!(renewal.not_renewed.is_empty(), "{renewal:?}");
+    assert!(r.pending_plans().is_empty());
+}
+
+#[test]
+fn an_entry_whose_objects_are_all_gone_leaves_no_plan() {
+    let key = NodeKey::generate();
+    let stub = Stub::new(&[]);
+    let mut r = open(&stub, &key);
+    let (plan, instance) = removed_e1(&mut r, &key);
+    // The instance's record is settled outside a run, so the journal holds nothing of the entry's to delete.
+    r.journal.reverted(instance);
+
+    let renewal = r.renew_lapsed(LAPSED);
+
+    assert!(renewal.renewed.is_empty(), "{renewal:?}");
+    assert_eq!(renewal.not_renewed.len(), 1, "{renewal:?}");
+    assert_eq!(renewal.not_renewed[0].plan, plan);
+    assert!(r.pending_plans().is_empty(), "no plan is left for it");
+}
+
+#[test]
+fn an_unresolved_intent_renews_nothing_and_says_why() {
+    let key = NodeKey::generate();
+    let stub = Stub::new(&[]);
+    let mut r = open(&stub, &key);
+    let (plan, _) = removed_e1(&mut r, &key);
+    r.journal
+        .intend(
+            &EntryId("e9".to_string()),
+            EffectClass::A,
+            Digest::of(b"other"),
+            object("acl-stray", IncusKind::Acl),
+            None,
+            NOW,
+        )
+        .expect("the intent is journalled");
+
+    let renewal = r.renew_lapsed(LAPSED);
+
+    assert!(renewal.renewed.is_empty(), "{renewal:?}");
+    assert_eq!(renewal.not_renewed.len(), 1, "{renewal:?}");
+    assert_eq!(renewal.not_renewed[0].plan, plan);
+    assert!(
+        renewal.not_renewed[0].why.contains("unresolved"),
+        "{renewal:?}"
+    );
+    assert_eq!(
+        r.pending_plans(),
+        vec![plan],
+        "the lapsed plan is left as it was"
+    );
+}
+
+#[test]
+fn a_renewal_writes_nothing_to_the_provider_or_the_journal() {
+    let key = NodeKey::generate();
+    let stub = Stub::new(&[]);
+    let store = Counting::default();
+    let mut r = open_counting(&stub, &key, &store);
+    let (plan, _) = removed_e1(&mut r, &key);
+    let asked = stub.asked();
+    let appended = store.appended();
+    let live = r.journal.live(&EntryId("e1".to_string()));
+
+    let renewal = r.renew_lapsed(LAPSED);
+
+    assert_eq!(renewal.renewed.len(), 1, "{renewal:?}");
+    assert_eq!(renewal.renewed[0].digest, plan.digest);
+    assert_eq!(stub.asked(), asked, "no retirement was asked for");
+    assert_eq!(store.appended(), appended, "no journal line was written");
+    assert_eq!(
+        r.journal.live(&EntryId("e1".to_string())),
+        live,
+        "no record of the entry moved"
     );
 }

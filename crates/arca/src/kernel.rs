@@ -19,7 +19,7 @@ use arca_kernel::journal::{DeletePlan, FileJournal, Journal};
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::Provider;
 use arca_providers::incus::{RetainedSet, TenantProjects};
-use arca_reconcile::{Outcome, PlanRun, PluginSet, Reconciler};
+use arca_reconcile::{Outcome, PlanRun, PluginSet, Reconciler, Renewal};
 use serde_json::{Value, json};
 
 use crate::action_proposal::{
@@ -345,6 +345,20 @@ impl Kernel {
     ) -> Result<ActionProposal, ProposeError> {
         self.action_proposals
             .propose_using(action, args, now_ms, gpu_product, uses)
+    }
+
+    /// The same, with the card's `Version` row ([`ActionProposalStore::propose_labelled`]).
+    pub fn propose_action_labelled(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now_ms: u64,
+        gpu_product: Option<&str>,
+        uses: Option<String>,
+        version: Option<crate::action_proposal::ActionDetail>,
+    ) -> Result<ActionProposal, ProposeError> {
+        self.action_proposals
+            .propose_labelled(action, args, now_ms, gpu_product, uses, version)
     }
 
     /// Declines one waiting action proposal, whatever its age. Returns whether one waited under `id`.
@@ -888,6 +902,14 @@ impl Kernel {
         }
         self.save()?;
         Ok(Some(objects))
+    }
+
+    /// Makes again each waiting delete plan older than fifteen minutes whose entry is still being removed, so the owner can be
+    /// asked again without a restart or an unrelated change (see [`Reconciler::renew_lapsed`]). It is called under the
+    /// kernel's own lock, as [`Kernel::decline`] and [`Kernel::approve`] are. Nothing is written to Incus, the journal or the
+    /// desired state, and the pending plans are in memory only, so nothing is saved.
+    pub fn renew_lapsed(&mut self, now_ms: u64) -> Renewal {
+        self.reconciler.renew_lapsed(now_ms)
     }
 
     /// Checks an owner approval for a service action without a delete plan and spends it.

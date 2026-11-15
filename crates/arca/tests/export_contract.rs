@@ -33,8 +33,10 @@ use arca_mcp::{
     CallError, Caller, GetHandler, GetReply, Server, TokenStore, ToolHandler, mint, serve_unix,
 };
 use arca_metrics::{
-    Cpu, DriveReading, DrivesReading, HostSample, InstanceKind, InstanceReading, LatencyReading,
-    Load, Memory, NicCounters, OsdReading, Pool, ProbeTarget, ProjectCount, Psi, Readings,
+    ChipPower, ChipSensor, Cpu, CpuPower, DriveReading, DrivesReading, GpuCardPower, GpuPower,
+    HostSample, InstanceCpu, InstanceKind, InstanceReading, InstanceThreads, LatencyReading, Load,
+    Memory, NicCounters, OsdReading, PackagePower, Pool, Power, ProbeTarget, ProjectCount, Psi,
+    Readings,
 };
 use arca_store::{AlertEvent, DB_FILE, EventState, ResolveReason, Store};
 use common::{NOW, Scratch, caller};
@@ -176,6 +178,9 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
             cores: 4,
             cores_known: true,
             reason: None,
+            threads: Some(4),
+            physical_cores: Some(2),
+            busy_threads: Some(0.5),
         },
         load: Load {
             one: Some(0.5),
@@ -208,6 +213,26 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         network: None,
         projects: Vec::new(),
         instances_not_read: Vec::new(),
+        power: scenario_power(),
+        instance_cpu: InstanceCpu {
+            instances: vec![
+                InstanceThreads {
+                    project: "proj1".to_string(),
+                    name: "vm1".to_string(),
+                    busy_threads: Some(1.5),
+                    reason: None,
+                },
+                InstanceThreads {
+                    project: "proj1".to_string(),
+                    name: "db1".to_string(),
+                    busy_threads: Some(0.25),
+                    reason: None,
+                },
+            ],
+            omitted: 0,
+            omitted_busy_threads: 0.0,
+            reason: None,
+        },
     };
     let readings = Readings {
         pools: Some(sample.pools.clone()),
@@ -254,6 +279,53 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         }),
     };
     (sample, readings)
+}
+
+/// The power of the scenario, an integrated chip read as root: one CPU package at 10 W, which the whole-chip sensor (PPT,
+/// 30 W) holds, so it is measured and not added; and one discrete NVIDIA card at 42.5 W. The sum is 30 + 42.5 = 72.5 W.
+fn scenario_power() -> Power {
+    Power {
+        cpu: CpuPower {
+            power_w: Some(10.0),
+            reason: None,
+            added: false,
+            packages: vec![PackagePower {
+                zone: "intel-rapl:0".to_string(),
+                name: "package-0".to_string(),
+                power_w: Some(10.0),
+                reason: None,
+            }],
+        },
+        gpu: GpuPower {
+            power_w: Some(42.5),
+            reason: None,
+            cards: vec![GpuCardPower {
+                pci: Some("0000:01:00.0".to_string()),
+                card: None,
+                source: "nvidia-smi".to_string(),
+                basis: None,
+                power_w: Some(42.5),
+                reason: None,
+            }],
+        },
+        chip: ChipPower {
+            power_w: Some(30.0),
+            reason: None,
+            added: true,
+            sensors: vec![ChipSensor {
+                pci: Some("0000:c6:00.0".to_string()),
+                card: Some("card1".to_string()),
+                label: Some("PPT".to_string()),
+                whole_chip: true,
+                basis: "the amdgpu hwmon shows in1 (vddnb)".to_string(),
+                power_w: Some(30.0),
+                reason: None,
+            }],
+        },
+        measured_power_w: Some(72.5),
+        not_added: vec!["the CPU packages".to_string()],
+        not_included: vec!["memory".to_string()],
+    }
 }
 
 /// The instances of the scenario: a running container that has started twice, a stopped container that has started once, and a

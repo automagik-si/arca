@@ -187,7 +187,7 @@ refused without the value being echoed back.
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
 | `approval.trustOwnerKeysFrom` | no | Absolute paths of other kernels' owner passkeys files on this machine, which this kernel also trusts, read-only, for action approvals only (never to change its own passkeys). See "Approving on another kernel of this machine". |
 | `approval.origins` | with `trustOwnerKeysFrom` | The page origins (`approvalOrigin` form) a passkey from those files may answer from. A line for any other origin is not trusted. |
-| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>", "incusSocket": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. The optional `incusSocket` is that host's Incus socket on this machine (local, or forwarded to a path here); `instance_move_preflight` reads the host through it, with GETs only. |
+| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>", "incusSocket": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. The optional `incusSocket` is that host's Incus socket on this machine (local, or forwarded to a path here); `instance_move_preflight` reads the host through it, with GETs only, and an approved `instance_move` writes through it (the copy it receives, its start, and its removal on a rollback). |
 
 The config is refused, with exit 2, when:
 
@@ -1676,7 +1676,8 @@ record is refused.
 
 ### Updating a service to a new image digest
 
-`service_update` takes `{name, digest, timeoutSeconds?, eraseData?, tenant?}` (or `{name, follow}`, see below) and
+`service_update` takes `{name, digest, timeoutSeconds?, eraseData?, withTemplate?, tenant?}` (or `{name, follow}`, see
+below) and
 moves a running container service made from an image by digest (today `automagik-server`) or from a local image
 pinned by fingerprint (a template's `local:<alias>` beside a `digest`, see "A local image may be pinned") to another
 digest, or fingerprint, in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor`
@@ -1730,6 +1731,73 @@ rollback after a failed start or health check answers `rollback_failed`; after a
 never taken away, so the answer is `rolled_back` with the old root kept. A project that allows snapshots restores the
 snapshot instead, and the record still names the old image either way. The update rebuilds from the project's own copy,
 never from an alias alone; a rebuild from an image the store no longer holds fails before it takes the old root away.
+
+#### Moving Omni to a new build, or creating one at a chosen build
+
+Omni builds `ghcr.io/automagik-si/omni-api:v<version>` when its team asks for a build, each one multi-arch (amd64 and
+arm64) and attested, and announces its version and digest. Any of them can run on Arca: move a service with
+`service_update {name, digest}` and the digest Omni announced, or create one at that build with
+`service_create {name, template: "omni-api", digest}`. A create without `digest` starts at the digest the template
+pins, as before. Either way the digest must be `sha256:` and 64 lower-case hex digits and the repository stays the
+template's, by the same rule; a create's digest is in the owner's card, the approval and the service's record, as an
+update's is. The digest is passed to Incus as it is: Omni's digest names an image index, and each node pulls its own
+architecture from it, so the image's fingerprint in Incus differs from node to node and from the digest. When either
+is proposed with `action_propose`, a create without `digest` too, the card's `Version` row names the build
+(`Omni v2.261024.2 (sha256:...)`). The name comes from ghcr.io's tags as the node last read them, at most ten minutes
+before the proposal: one map of the newest 50 version tags and their digests, read again when it is ten minutes old,
+or when a digest it does not name is proposed and it is over a minute old. A tag that moved inside those ten minutes can
+still be shown for the digest it named before; the row is a label, not part of what the owner approves, and the approval binds the
+digest. It says `version unknown` when the map names no tag for the digest or ghcr.io does not answer within 5
+seconds. Nothing is refused for it.
+
+#### A new image and its template in one restart (`withTemplate`)
+
+A new image often comes with a new start command or new environment in its template. Without `withTemplate` the update
+keeps the service's recorded settings, and the template's go in afterwards with `service_reconfigure`: two cards and
+two restarts. With `withTemplate: true` one card does both, with one restart:
+
+```json
+{"action": "service_update", "args": {"name": "web", "digest": "sha256:…", "withTemplate": true}}
+```
+
+Install the changed template first (`arca templates install`), then propose it with `action_propose`; only the owner's
+approval runs it, and a direct call is refused with "Nothing was changed". When the proposal is made, the node works
+out what `service_reconfigure` would apply from the CURRENT template (environment, links' values, declared secrets,
+ports, `rawLxc`, no-new-privileges, entrypoint; see "Reconfiguring a service from its template") and writes it into
+the proposal as `changes`, so the card shows the digest, a `Template changes` row counting them, one row per key,
+secret, port list, low-level setting and entrypoint that changes (secrets by name only), and the summary says it is one
+restart. The approval binds the digest and `changes` together. What a caller sends as `changes` is never kept. When
+the approved call runs it works the difference out again and changes nothing unless it is the one on the card ("the
+service or its template changed since the owner's card was made ... propose it again"): an edit of the template after
+the proposal needs a new card.
+
+The run is the update above with one more step. Before anything is stopped, the node makes the secrets the template
+generates and puts each secret's and link's value behind a reference; a plan that moved meanwhile is refused with
+nothing changed. After the rebuild, while the instance is stopped, it saves the record with the template's settings
+(the node writes the instance's environment, `raw.lxc`, ports and `oci.entrypoint` from it) and then starts the service
+once: one stop and one start for the image and the settings together. The health check looks at the port the new
+version listens on, the first of the template's ports: through the lan or private port's proxy as before, at the
+service's address when that port is its droidd port, and otherwise by checking that the instance stays running. It
+never looks at a port the template has moved away from. The record is read again under the node's write gate right before it is written:
+a link or a secret set since the card was made fails the step, and the update is rolled back. After the health check
+the new digest is recorded and the config is read back; the answer adds `changes` and `readBack: {matches, differs}`,
+as `service_reconfigure`'s does. The journal has `apply` after `rebuild`, and `read back` before `end`, with key and
+secret names only.
+
+A failure after the settings were written puts back both: the old record exactly (its environment, ports, secrets,
+links, low-level settings and its entrypoint) first, then the old root (the snapshot, or a rebuild from the old digest),
+then the old version is started, and the refusal (`rolled_back`) says the old settings are back. A record that named
+no entrypoint (the image's own ran) names none again, and the node takes the template's `oci.entrypoint` off the
+instance, so the image's own command runs again. It takes off only an entrypoint it wrote itself: when a reconcile
+writes `oci.entrypoint` it marks the value in `user.arca.entrypoint`, and a record that names no entrypoint leaves any
+other entrypoint where it is. A service whose entrypoint was never changed by a reconcile has no mark and is reconciled
+as before.
+
+`withTemplate` goes with a digest the service does not run yet (for the digest it runs, `service_reconfigure` applies
+the template alone, and the update says so), and not with `follow` or `noNewPrivileges` (the template's
+no-new-privileges is among the changes, and goes in with the image instead of needing an update of its own). A template
+that is now a virtual machine's is refused when the proposal is made. `eraseData` goes with it as without it. Without
+`withTemplate`, or with `false`, the update is exactly as above.
 
 #### A service that keeps its data inside the container
 
@@ -1861,8 +1929,8 @@ shows `follow` for a service that can.
 | Caller | Result |
 |--------|--------|
 | no `Authorization`, a malformed bearer or an unknown token | 401 |
-| a `doctor` calling `token_list` | 403 |
-| a `viewer` calling `token_list`, or any verb that writes (`plan_decline`, `approval_submit`) | 403 |
+| a `doctor` calling `token_list` or `plan_renew` | 403 |
+| a `viewer` calling `token_list`, or any verb that writes (`plan_decline`, `plan_renew`, `approval_submit`) | 403 |
 | any request carrying an `Origin` header | 403, before the body is read |
 | a call the caller may make | 200, with the verb's result or a JSON-RPC error |
 
@@ -1965,9 +2033,10 @@ does, so it can be up to 59 seconds over. The third chat's bare 429 has no body.
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol versions `2026-07-28` and `2025-11-25`) on the
 unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
-`action_propose`, `plan_decline`, `approval_submit`, `action_approve`, `peer_keys_sync`, the Postgres and ontology verbs, `service_create`, `service_list` and
+`action_propose`, `plan_decline`, `plan_renew`, `approval_submit`, `action_approve`, `peer_keys_sync`, the Postgres and ontology verbs, `service_create`, `service_list` and
 `service_status`, `gpu_attach` and `gpu_detach`, `storage_list`, `storage_add`, `snapshot_create`, `snapshot_list` and
-`snapshot_delete`, `instance_start`, `instance_stop` and `instance_restart`, and `instance_move_preflight`.
+`snapshot_delete`, `instance_start`, `instance_stop` and `instance_restart`, `instance_move_preflight`, and the move verbs
+`instance_move_plan`, `instance_move`, `instance_move_status` and `instance_move_finish`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
@@ -2307,6 +2376,9 @@ them would change nothing a user sees. They move to `2026-07-28` before `2025-11
   only.
 - `plan_decline` retains a waiting delete plan's objects, or declines a waiting action proposal. A decline is final and
   survives a restart.
+- `plan_renew` is an operator verb with no arguments: it makes each lapsed delete plan again with fifteen new minutes and the
+  same id, so `plan_list` shows it again, and says why for each one it leaves. It sends nothing to Incus and writes no
+  journal line. See the section on delete plans.
 - `approval_submit` checks an owner's approval for a waiting delete plan and, when it holds, deletes the plan's objects once.
   Action proposals are approved and run by the approval page, which can reach the gated verb's handler.
 - `action_approve` takes `{plan: "<act-id>", approval}`, checks the owner's passkey approval for a waiting action proposal
@@ -2366,9 +2438,12 @@ sample ring and its rate counters, so the window mean and the next rate cover on
 
 - **Local daemon.** The sample is this machine's: `cpu.cores` and `cpu.usedPct`, the `load` averages,
   `memory.totalBytes`, `memory.availableBytes` and `memory.usedBytes`, PSI, CPU temperature, GPU busy, swap and NIC rates come
-  from the node's `/proc` and `/sys` trees. This is the reading the sampler has always taken.
+  from the node's `/proc` and `/sys` trees. This is the reading the sampler has always taken. `cpu.threads`,
+  `cpu.physicalCores`, `cpu.busyThreads` and the `power` block come from the same trees; see "CPU counts and power".
 - **Remote Incus.** The host totals come from the node's own Incus, `GET /1.0/resources`: `cpu.cores` is `cpu.total`
-  (threads), `memory.totalBytes` is `memory.total`, and `memory.usedBytes` is `memory.used`.
+  (threads), and so is `cpu.threads`; `cpu.physicalCores` counts the `cores` each entry of `cpu.sockets` lists (`null` when
+  the document lists none); `memory.totalBytes` is `memory.total`, and `memory.usedBytes` is `memory.used`.
+  `cpu.busyThreads` is `null`, and the `power` block's `cpu.reason` and `gpu.reason` say `not available for a remote host`.
   `memory.availableBytes` is `memory.total - memory.used`. `cpu.coresKnown` is `true`. No local `/proc` or `/sys` reading is
   reported: `cpu.usedPct`, every `load` average, PSI, CPU temperature, GPU busy, swap and NIC rates are `null`. `cpu.reason`
   and `load.reason` say `not available for a remote host`. Once the mode is settled remote, PSI and CPU temperature are
@@ -2401,6 +2476,107 @@ memory are left out of that sample's export, and the sample's `instancesNotRead`
 figure` (the figure it did answer is kept), or `the tick's time for state reads was spent`.
 Incus's own text is never shown. In `mean`, `instancesNotRead` is the newest sample's. No alert reads an instance's CPU or
 memory, so a machine that was not read changes no alert.
+
+`instanceCpu` turns those CPU seconds into **threads in use**: for each running instance, the change of its CPU seconds
+since its previous read, over the time between the two reads (1.0 is one thread busy the whole time). Each read is timed
+when its answer came, the sample's time plus how far into the tick's state reads it landed, so a read late in a slow tick
+is not measured against the wrong interval. A row is `{project, name, busyThreads, reason}`. A row with no figure says
+why: `only one reading so far; a rate needs two` (the first read of the instance, or of a run after it was seen stopped),
+`it started or restarted since its previous reading` (its `last_used_at` changed), `it was replaced since its previous
+reading` (its `created_at` changed: deleted and made again under the same name), `its CPU time went backwards`, `its CPU
+time was not read in this sample` (it is in `instancesNotRead`), or `the figure was more than the host's threads` (above
+the host's thread count by more than 5 percent). A figure is therefore never negative and never larger than the machine.
+An instance that is not running has no row, and its previous read is forgotten. An instance whose state was not read
+keeps its previous read, so its next figure covers the time since that read.
+
+The list is bounded so the answer stays small on a node with many instances: at most 50 rows, those with a figure first,
+largest first, then those without one by project and name. `omitted` counts the running instances past the cap and
+`omittedBusyThreads` sums their figures, so the threads still add up. When the instance list itself could not be read the
+rows are empty and `instanceCpu.reason` says `the instance list could not be read`. Every sample of the hour-long ring
+holds its own list, which is what bounds the ring's memory too. Remote nodes are measured the same way: the CPU seconds
+come from Incus, not from local files.
+
+### CPU counts and power
+
+`cpu.cores` counts logical CPUs, despite its name: the numbered `cpu` lines of `/proc/stat`, so a 12-core, 24-thread
+machine says 24. It keeps that meaning. The additions tell the counts apart:
+
+| Field | Meaning |
+|-------|---------|
+| `cpu.threads` | the logical CPUs (threads), the same count as `cores`; `null` when it is not known |
+| `cpu.physicalCores` | the physical cores: the distinct `core_cpus_list` (or `thread_siblings_list`) of the online CPUs under `/sys/devices/system/cpu/cpu<N>/topology`, per package; `null` when the host gives no topology |
+| `cpu.busyThreads` | how many threads were busy since the previous sample: `usedPct` of `threads`, as a count; `null` on the first sample |
+
+The `power` block measures what this machine can measure of its own power, and says what it cannot:
+
+- **CPU packages** (`power.cpu`). Each top-level powercap zone named `package-<N>` under `/sys/class/powercap` is one
+  package. Its power is the change of its `energy_uj` counter between two samples over the time between them, in watts.
+  The counter wraps at the zone's `max_energy_range_uj`, and a wrap is read through. A sub-domain (`intel-rapl:0:0`,
+  `core`, `uncore`) is part of its package and is never added on top of it; a `dram` zone is memory and a `psys` zone is
+  the whole platform, so neither counts; a package that two interfaces show (`intel-rapl` and `intel-rapl-mmio`) is read
+  once. `power.cpu.packages` lists each package with `zone`, `name`, `powerW` and `reason`, and `power.cpu.powerW` is their
+  sum only when every package has a figure: a part of the CPU is not the CPU.
+- **Discrete GPUs** (`power.gpu`). An NVIDIA card's figure is the `power.draw` its telemetry already reads (see "GPUs").
+  A DRM card whose hwmon gives `power1_input` (or `power1_average`, in microwatts) is here only when that sensor is the
+  card's own (see below). `power.gpu.cards` lists each with `pci`, `card` (the DRM name, for hwmon), `source`
+  (`nvidia-smi` or `hwmon`), `basis` (for hwmon, why the sensor is the card's own), `powerW` and `reason`. A card is a
+  reading at the sample, so it has a figure from the first sample. When the only GPU is integrated, `power.gpu.reason`
+  says `the integrated GPU is measured with the whole chip, in the chip sensors`. When the only GPU sensor is one Arca
+  cannot classify (see below), it says `the GPU's sensor is listed in the chip sensors and not counted as a GPU: this
+  machine does not tell whether it includes the CPU`.
+- **Whole-chip sensors** (`power.chip`). On an APU, amdgpu's hwmon power is the whole chip's: the kernel's amdgpu hwmon
+  documentation says `power1_input` is "power used by the SoC" and "on APUs this includes the CPU". Such a sensor is never
+  listed as a GPU. `power.chip.sensors` lists each with `pci`, `card`, `label` (such as `PPT`), `wholeChip`, `basis`,
+  `powerW` and `reason`; `power.chip.powerW` is the sum of the `wholeChip` sensors when each has a figure.
+
+**How a sensor is classified.** The label decides nothing: amdgpu labels the sensor `PPT` on an APU and on a discrete
+card alike. What decides is what the driver shows beside it, by its own visibility rules (`hwmon_attributes_visible` and
+`default_attr_update` in the kernel's `drivers/gpu/drm/amd/pm/amdgpu_pm.c`):
+
+| What sysfs shows | What the driver's rule says | The sensor is |
+|------------------|-----------------------------|---------------|
+| `in1_input` or `in1_label` (vddnb) in the hwmon | shown only on an APU (and not on a multi-die part) | the whole chip (`wholeChip: true`) |
+| fan controls (`fan1_input`, `pwm1`, ...) in the hwmon | hidden on every APU | the card's own (`power.gpu`) |
+| `pcie_bw` on the device | hidden on every APU ("PCIe Perf counters won't work on APU nodes") | the card's own (`power.gpu`) |
+| none of these, or signs both ways | no certain answer: a multi-die APU shows none of them, and so may a discrete card without fan control or PCIe counters | not certain (`wholeChip: false`), never added |
+
+A hwmon sensor of a driver other than amdgpu is read as the card's own.
+
+**What the sum holds.** `power.measuredPowerW` holds each part once:
+
+1. every discrete GPU's own figure;
+2. for the CPU, the whole-chip sensors when each of them has a figure, because they hold the CPU packages and, besides,
+   the integrated GPU and the rest of the chip; only when they have no figure, the CPU packages' sum. `power.chip.added`
+   and `power.cpu.added` say which one the sum holds;
+3. never a sensor that is not certain (`wholeChip: false`): it may include the CPU.
+
+So a figure is never counted twice; at worst one is left out, and the block says so. `power.notAdded` names what was
+measured and not added because it overlaps, for example `the CPU packages: measured, not added, because the whole-chip
+sensor at 0000:c6:00.0 holds them`, or a sensor this machine does not classify. `power.notIncluded` names what the sum
+does not hold: always `memory`, `disks`, `fans` and `the power supply's own loss`; `the CPU packages` only when neither
+they nor a whole-chip sensor are added; `the integrated GPU and the rest of the chip at <pci>` when a whole-chip sensor
+has no figure; `the device at <pci>, whose sensor is not added` for a sensor that is not certain; and `the GPU <pci>` for a
+discrete card without a figure. It never names a part the sum holds. The sum is never the machine's power at the wall.
+
+A source without a figure carries a reason in plain words:
+
+| Reason | When |
+|--------|------|
+| `no CPU power counter on this machine` | no package zone exists, as in most virtual machines |
+| `no GPU power counter on this machine` | no discrete card with a power reading, and no chip sensor, exists |
+| `the integrated GPU is measured with the whole chip, in the chip sensors` | `power.gpu.reason` when no discrete card exists and a whole-chip sensor does |
+| `the GPU's sensor is listed in the chip sensors and not counted as a GPU: this machine does not tell whether it includes the CPU` | `power.gpu.reason` when no discrete card exists and the only chip sensors are ones Arca cannot classify |
+| `no whole-chip power sensor on this machine` | `power.chip.reason` when no chip sensor exists |
+| `the counter <file> is there, and this process may not read it: most kernels let only root read it` | the file exists and reading it is refused. Since 2020 most kernels make the package counters readable by root only; Arca does not change that, and a kernel not run as root reports this |
+| `the counter <file> could not be read` | the file exists and did not read as a number |
+| `only one sample so far; a rate needs two` | the first sample of a package |
+| `the counter went backwards and the range it wraps at is not known` | the counter is lower than before and `max_energy_range_uj` is missing |
+| `this card's driver gives no power counter` | the card has a hwmon without a power file |
+| `nvidia-smi gave no power figure for this card` | the telemetry was read without `power.draw` |
+
+An NVIDIA card without telemetry carries its telemetry reason instead (for example `nvidia-smi is not installed`).
+The files are named as on the host, such as `/sys/class/powercap/intel-rapl:0/energy_uj`. A switch between the local
+and remote modes forgets the previous counters, so no rate spans two machines.
 
 ### GPUs
 
@@ -2449,6 +2625,15 @@ disappearance until it has been seen once.
 
 `node_metrics`' `mean` averages each card's numbers over the window, keyed by PCI address, and carries the newest process
 list. A card whose telemetry was never measurable has a `null` telemetry and a reason, not a zero.
+
+In `mean`, `cpu.threads` is the newest known sample's, `cpu.physicalCores` the newest sample's that has one, and
+`cpu.busyThreads` the average over the samples that hold it. Each power figure (a package, a card, a chip sensor and
+each section's sum) is averaged over the samples that hold it; the packages, cards and sensors listed are the newest
+sample's, and a reason is kept only when the mean has no figure. `measuredPowerW`, `notAdded` and `notIncluded` are then
+worked out from those means by the same rule as one sample's, so they agree with each other. `instanceCpu` lists
+the newest sample's rows, each averaged over the window's samples that hold a figure for it and sorted again; its
+`omitted`, `omittedBusyThreads` and `reason` are the newest sample's, so an instance that stopped during the window is
+not in the mean.
 
 A mean over a window that holds both successful and failed reads averages the successful ones and takes its reason from the
 newest successful read, so a late failure does not label averaged figures. A window with no successful read is `null` with
@@ -2673,6 +2858,172 @@ proposals file.
 
 The imported VM carries no `user.arcakernel.entry`: Arca's instance verbs (`instance_start`, `instance_stop`) do not
 act on it yet.
+
+## Moving containers to a linked host: `instance_move`
+
+A move takes containers from this node to a linked host with one owner card. The owner approves once; Incus does the
+copy; the kernel orchestrates the rounds, journals them, measures the downtime, and rolls back what fails. The source is
+never deleted by the move: the owner finishes a verified move with a second card, whenever they choose.
+
+One rule holds on every path: no path deletes the only copy of an instance, and no path leaves the source and its copy
+both running. A rollback and a finish act only on objects whose uuid the move recorded, after reading the other side back.
+
+**What it needs.** The target is a linked host (`approval.linkedHosts`) with an `incusSocket`: the move writes to the
+target's Incus through that socket, so the owner decides by configuring it. The target's Incus listens on the network
+(`core.https_address`; its server document names the address and its certificate), and this host's Incus can reach that
+address: Incus on this host pushes each container and custom volume to it. A relay through the kernel is the fallback the
+plan names; it is not built yet, so a target that does not listen blocks the plan and says so.
+
+**1. The plan.** `instance_move_plan` (viewer) takes 1 to 50 `{project, name}` references (each may name a `spotCheck`
+file, `/etc/hostname` when it does not), the `target`, and `rounds` (1 to 5 copy rounds while the container runs, 2 when
+absent). It runs the whole `instance_move_preflight` again. Any no-go blocks the whole plan, with the preflight's own
+reasons per instance in `blocked`: remove or fix those and plan again. Beyond the preflight, the plan blocks a virtual
+machine (`virtual machines are not movable yet`: this build moves containers only), an ephemeral container (Incus deletes
+it when it stops, so the cutover would delete the source: make it non-ephemeral first), a host folder (Incus does not copy
+it: move its data into a custom volume first), a spot-check file that cannot be read in the container now (a check that
+could never compare would always pass), and a name the target already holds, instance or custom volume (a move never
+replaces one). A custom volume the target lacks is not a no-go here, unlike in the preflight: the move takes it
+along, in the same rounds.
+
+When every instance passes, the plan is frozen, one private file in `instance-move-plans/` in the state directory, and
+named by its `digest`, a SHA-256 over the canonical plan without its times. The plan names this node and the target, the
+credential (the target's `incusSocket`), the transport (`push`, every address the target listens on in its order, the
+SHA-256 of its certificate, `relay` as the unavailable fallback), and, per instance, its `volatile.uuid`, a digest of its
+devices and one of its own config without the volatile keys, its profiles, its measured bytes (root, snapshots, custom volumes,
+host folders) and the bytes it needs with 10% headroom, its target pool, its custom volumes, the rounds in order, the
+cutover (stop the source, send the last round, read the source back stopped, start the copy), the checks, and an
+estimated downtime: 30 s for the stop, start and checks, plus the whole measured size at 50 MiB/s, because the last round
+resends the whole volume today (see the known limit below). It is an estimate; the move measures the real one. A plan
+expires an hour after it is first made: planning the same source again answers the same digest and the same expiry, never
+a renewed one. A changed uuid, device, config, profile or size gives another digest. Plan files are pruned a day after
+they expire. An instance is not a go while a copy of it that an earlier move recorded (its `targetUuid`) may still run:
+a second move would leave two copies running. That is a copy left by a `moved` move, or by a `failed` one (the copy
+started, or not deleted); a copy whose rollback journaled it removed (`targetRemoved` in the `rollback` line, as every
+`rolled_back` result has) holds nothing and is not read. The plan reads each other copy on its move's target: read gone
+(or another instance of the name) or `Stopped`, it holds nothing; read running, or on a target that cannot be read, it
+holds the instance, and the reason names the move, the target and what was read. A target that is gone for good, or no
+longer linked, holds such an instance until it can be read again. The reason says what to do: finish that move
+(`finish move mv-…`) while it may still be finished, or stop or delete the copy on that target once you have kept what it
+holds (after a verified move, the copy is the instance that has served since the cutover). Another instance of the same
+name (another uuid) here is not held.
+
+```
+arca call instance_move_plan '{"instances":[{"project":"shop","name":"web","spotCheck":"/srv/data/orders.db"}],"target":"node-b"}'
+```
+
+**2. The card.** `action_propose` with the action `instance_move` and the arguments `{plan: <digest>, instances, target}`,
+the instances in the plan's own order. The node refuses a card for a digest it never planned (`NoSuchPlan`), an expired
+plan (`PlanExpired`), other instances or another target (`PlanMismatch`), a plan that already ran (`AlreadyRun`), and a
+plan for an instance with a copy that may still run, read on its target again now (`AlreadyMoved` while that move may
+still be finished, `CopyMayRun` otherwise; also when the plan was made before that move ran, or the copy was started
+again since). The
+card shows the digest and the target, then a row per instance (what it needs on which pool, the rounds, the estimated
+downtime, its custom volumes), the transport, the credential, the rollback promise, and that the source is kept. A batch
+is one card. The owner's passkey approves the card's arguments, digest included; the grant it arms is spent by one run.
+
+**3. The run.** The approved `instance_move` (doctor) checks the plan is still the approved one before it spends the
+grant, that no other move that has not ended holds one of its instances (`InstanceMoving`; a move a stopped kernel
+left holds them until the next start settles it), and, reading the targets again, that no copy an earlier move made of
+one may still run (`AlreadyMoved` or `CopyMayRun`), then reads everything again: a plan that is no longer a go, or whose
+instances changed since the card (uuid, type, devices, config, profiles, custom volumes, target pool, the target's
+addresses or certificate, or a size past the approved headroom) is refused with `PlanChanged` and nothing moves. With
+other moves running to the same target, their pending bytes are counted against its pool (`TargetFull`). The plan and the
+`begin` line are journaled before anything moves; a journal that cannot be written refuses the move
+(`JournalUnwritable`). The answer comes at once (`phase: copying`, the move id `mv-<12 hex>`); the run
+goes on in the background, one instance after the other:
+
+- the copy rounds while the container runs: each custom volume, then the container, are created on the target as a
+  migration (`push` mode) and pushed by this host's Incus; the first round copies everything with its snapshots, each next
+  one is an Incus refresh, which today resends the whole volume (see the known limit below). These rounds ask Incus not to freeze the container (`allow_inconsistent`), so it keeps
+  serving: on dir, lvm and zfs block volumes their copy may be inconsistent, which the last round corrects. Each of the
+  target's addresses is tried in order with the same receiving operation, as Incus's own client does, and the one that
+  answered is used first for the rest. As each object lands in the first round, its uuid on the target is journaled
+  (`created`): that line is what a rollback may delete, and the run stops without it. Before each round the target pool's
+  free space is read again: a target that filled up fails the round. Each round is journaled with its bytes, rate and time.
+- the cutover: the source's status is read now, not at the begin. A running source is stopped (gracefully for a
+  minute, then forced) and a stopped one is left as it is; any other status (`Frozen`: Incus freezes a container for a
+  snapshot on some pools) fails the instance there, before anything is stopped or started, and it is rolled back as below,
+  which deletes only the copy this move made. The last round is sent consistently, with the source stopped. Then the
+  source is read again: only when it reads `Stopped` is the copy started on the target; anything that started it in the
+  meantime fails the instance, with the copy never started.
+- the checks: the copy runs, and still runs after the other checks; each network card that had a global address on the
+  source has one again (waiting up to a minute); each TCP proxy that listens on every address (`0.0.0.0` or `::`) and
+  answered on this host just before the stop answers on the target's address (a proxy on one address is named as not
+  probed); a container has no guest agent (not applicable); each custom volume is on the target and attached; the
+  spot-check file reads the same on both sides: the source's as read after the stop, or, when that read fails (a stopped
+  container's custom volumes are not mounted), as read just before it. When neither read worked, the check fails.
+- the downtime is measured from the stop to the passed checks, and is in the `result` line and the status.
+- the copy is created with `boot.autostart` false, whatever the source's, so a copy a failed move leaves on the target
+  does not start by itself on a restart of that host beside the source. Once verified, the copy takes the source's own
+  value, as its creation recorded it (`true` stays `true`, unset stays unset; `copyAutostartSet` in the result line).
+- a verified source is kept, stopped, with `boot.autostart` off, so a reboot of this host does not start it next to its
+  copy (`autostartOff` in the result line). When turning it off, or setting the copy's, fails, the instance is still
+  `moved`, but its reason says so (set `boot.autostart` by hand, or finish the move), and the proposal's late result is
+  `MoveNeedsOwner`.
+
+**Failure and rollback.** Any failure before the checks pass rolls that instance back, under the rule above. A failed
+push first waits (up to a minute) for the target's receiving operation to end, and a delete Incus answers as busy is
+tried again for 30 s. Then the source is read back: only when it is here with the plan's `volatile.uuid` is the copy on
+the target deleted (stopped first when it runs), and only that copy: an instance or custom volume on the target whose
+uuid this move did not record is left alone and named. A custom volume's copy is deleted only while the source's volume
+is read back here. The source is started again only when this move stopped it and the copy is read back gone or stopped;
+a target that cannot be read leaves the source stopped. The source's own volumes are never touched. A clean rollback is
+`rolled_back` with the reason; anything else (the source not read back, a copy kept, a target not read) is `failed` with
+what was left and why, and the move's phase is `needs_owner`. When such a failure leaves the source stopped here while
+a copy may still run on the target (not removed, or not read), a source `boot.autostart` that reads true (a profile's
+counts) is turned off, so a restart of this host does not start it beside the copy, and the reason says so (set it back
+to true once you keep the source). Unset or `last-state` restores the last state, stopped, and is left as it is. A
+source that is gone, or another instance of the name, is left alone (`autostartOff` in the result line: true when a
+restart keeps the source stopped, null when nothing of the plan's was there; when turning it off fails, the reason says
+so). The next instance of a batch still moves. A verified
+instance's source stays on this host, stopped: to go back, stop the copy on the target and start the source, until the
+move is finished. The proposal's late result is `MoveVerified`, `MovePartlyRolledBack`, `MoveRolledBack`, or
+`MoveNeedsOwner` when any instance is `failed` or kept its `boot.autostart`.
+
+**A stopped kernel.** A move the kernel left unfinished (a `begin` with no `end`) is not resumed. On the next start in
+kernel mode each instance without a result is settled: one whose checks passed (a `verify` line with `ok`) is recorded as
+`moved` and nothing is deleted (its copy takes the source's `boot.autostart`, only when the target's instance of the
+name reads the uuid the move recorded, and the source's is turned off, as at the end of a run, with the same reason and
+late result when either is not done); one whose copy had been started is left as it stands, with the source stopped, and is
+`failed` for the owner (the copy may have served writes; the reason says how to keep one of them, and no other move
+takes the instance while that copy may run), with the source's `boot.autostart` kept off as above; any other is rolled back as above, with the reason "the kernel
+stopped during the move". The move ends `interrupted`, and the proposal gets its late result.
+
+**Progress.** `instance_move_status` (viewer, read-only) answers one move (`{"move": "mv-…"}`) or the latest 20: its
+phase (`running`, `moved`, `partly_moved`, `rolled_back`, `needs_owner`, `finished`, or `interrupted` when no run of this
+process holds it), and per instance the phase (`waiting`, `copying`, `cutover`, `verifying`, `rolling_back`, then the
+result), rounds done and total, bytes moved (during a round, the figure Incus writes in the operation's `fs_progress`,
+such as `web: 1.20GB (3.00MB/s)`: decimal units, rounded to two decimals, counted per stream, so an estimate) and the
+measured total, the rate Incus reports, the
+elapsed time, the time left (only during the first round, from the rate; `null` when it cannot be said), the downtime
+once moved, the reason and the checks. `finish` says whether a finish is offered and what it would delete.
+
+**4. Finishing.** `instance_move_finish` is a card of its own (`action_propose` with `{move}`), offered only after the
+move ended with at least one verified instance, never on a timer and never by itself. Its card lists each source
+instance and custom volume it deletes. Approved, it first reads each copy back on the target: a source is deleted only
+when its copy is there with the uuid this move recorded, the source here is the moved instance (its uuid) and it is not
+running (any status but `Stopped`, so a frozen one too); a custom volume only when its copy is read back on the target and
+no instance here uses it. Anything else is kept and named in `kept`. The moved copies on the target are not touched. A
+finish runs once; a source it kept may be moved again once its copy reads gone or stopped on the target (see the plan).
+
+**The journal.** `instance-moves.jsonl` in the state directory (0600), append-only JSON lines: `plan` (written with the
+`begin` of the move that runs it, not when planning), `begin`, `round`, `created`, `cutover`, `verify`, `result`,
+`rollback`, `end` and `finish`. It holds no secret: no websocket secret and no certificate, only the certificate's
+SHA-256. It is read line by line with no size cap; a torn last line is skipped, and the next append starts on a new line;
+a line over 8 MiB is skipped and said on the log.
+
+**What the tests prove, and a real run.** The tests run two fake Incus daemons linked so that a push lands on the target.
+`crates/arca/tests/instance_move_live.rs` (ignored by default) runs the same verbs, card and grant against two live Incus
+daemons. Run between two Incus 7.6 hosts on btrfs, it moved a running container with a 300 MB data file: three rounds,
+the progress read live from `fs_progress`, all six checks passed (the proxy port probed at the target's address), about
+16 s of measured downtime, and the source kept stopped with `boot.autostart` off. A copy forced to fail its network check
+was stopped and deleted on the target, and the source ran again with its uuid and address.
+
+**Known limit: refresh rounds are not deltas yet.** Without a snapshot the two hosts share, Incus's refresh of a btrfs
+container sends the whole volume again: in the run above each round sent the full 0.6 to 0.7 GB, so the last round, after
+the stop, takes as long as the first and the downtime is that of a full copy: the rounds do not shorten it yet. The plan
+and the card estimate the downtime that way (the whole size at 50 MiB/s). A move
+that takes a snapshot before each round, so Incus can send only the difference, is the next step.
 
 ## Snapshot storage and snapshots
 
@@ -3008,8 +3359,26 @@ file that is a link or is not owned by that user. Each refusal is a config or ru
 
 A removal of a desired entry whose objects are class B (deleted by an Incus delete) does not delete them. It waits as a delete
 plan until an owner approves it. A plan lapses fifteen minutes after it was made. `plan_list` leaves a lapsed plan out, and an
-approval for it is refused as `Expired`. A restart, or a new proposal while the removal still waits, makes a fresh plan with a new
-creation time and fifteen new minutes.
+approval for it is refused as `Expired`. Nothing is deleted and nothing is reverted when a plan lapses: the objects stay where
+they are, the journal still holds them, and the kernel keeps the lapsed plan without showing it. A restart, or a new proposal
+while the removal still waits, makes a fresh plan with a new creation time and fifteen new minutes.
+
+To ask the owner again without a restart or an unrelated change, an operator calls `plan_renew` (no arguments). For each lapsed
+plan whose entry the desired state still does not carry, it works the removal out again from the journal and puts the plan back
+with a creation time of now and fifteen new minutes, so `plan_list` and the approval page show it again. The same objects give
+the same plan id, so a card for it reads as the same plan. A plan still inside its fifteen minutes keeps its age. It answers
+`renewed` (each plan's `plan`, `entry`, `objects`, `createdAt` and `expiresAt`) and `notRenewed` (each lapsed plan it left,
+with `plan`, `entry` and `why`): an entry declined earlier is never asked about again; an entry the desired state carries again,
+or one the journal holds nothing left to delete of, has its plan withdrawn; and while an earlier effect is unresolved nothing is
+renewed. `plan_renew` sends nothing to Incus, writes no journal line and changes no desired state. Everything else about the
+plan stays: the statement comes from `plan_list`, and the run checks the live objects as for any plan. The renewed plan keeps its
+id, so an approval the owner signed for the plan before it lapsed, and never spent, still runs it within that approval's own
+ten minutes; after those, a new approval is needed. `plan_list` itself never renews.
+
+```
+arca call plan_renew --config /etc/arca/node.json --token-file "$HOME/.config/arca/operator-1.secret" --args '{}'
+{"notRenewed":[],"renewed":[{"createdAt":1793362560000,"entry":"service-nats","expiresAt":1793363460000,"objects":[{"kind":"volume","name":"nats-data","project":"arcak-svc","uuid":null}],"plan":"405ae7aa22557eccc77be27748ec6175faec7a38949f49f2865541f6fc42d25b"}]}
+```
 
 Kernel instances start on create unless the body sets `start: false`; removal force-stops a running instance and waits for that operation before DELETE.
 
@@ -3024,7 +3393,7 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-seven gated
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twenty-nine gated
 service, database, GPU, storage, snapshot, instance, function or tenant verbs: `service_create`, `service_remove`,
 `service_update` (see [Updating a service to a new image digest](#updating-a-service-to-a-new-image-digest)),
 `service_reconfigure` (see [Reconfiguring a service from its template](#reconfiguring-a-service-from-its-template)),
@@ -3037,9 +3406,10 @@ service, database, GPU, storage, snapshot, instance, function or tenant verbs: `
 `instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)).
 `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and
 `deploy_remove` (see [Tenants](#tenants)), and `route_add` and `route_remove` (see
-[Routes](#routes-names-for-your-instances-served-by-the-nodes-edge)), are proposed the same way. The canvas Doctor
-proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`, `route_add` or
-`route_remove`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
+[Routes](#routes-names-for-your-instances-served-by-the-nodes-edge)), and `instance_move` and `instance_move_finish`
+(see [Moving containers to a linked host](#moving-containers-to-a-linked-host-instance_move)), are proposed the same
+way. The canvas Doctor proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`,
+`route_add`, `route_remove`, `instance_move` or `instance_move_finish`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
 came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a
 function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against
 that verb's own parameter schema, with
@@ -3050,7 +3420,7 @@ before its first call. The union sits inside `args`, never at the top of the inp
 one. `x-arca-by: "action"` tells the door to hold `args` to the branch `action` names, so a refusal is in that branch's
 own words (`/args: missing required field name`), not "matches none". A field the kernel fills in when the proposal is
 made (a GPU verb's `project`, `kind` and `uuid`; `storage_add`'s disk facts; the snapshot verbs' `name`, `kind`, pools
-and folder facts; `service_reconfigure`'s `changes`) takes any value in its branch and says so: the kernel removes or replaces what was sent, as it did
+and folder facts; `service_reconfigure`'s and `service_update`'s `changes`) takes any value in its branch and says so: the kernel removes or replaces what was sent, as it did
 before the branches. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses the image the node's `postgres-autopg`
 template names, or `kernel.postgresImage` on a node whose config sets it, and an explicit image that differs is
@@ -4500,7 +4870,10 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | Metric | Type | Labels besides `node` | Meaning |
 |--------|------|-----------------------|---------|
 | `arca_node_cpu_used_ratio` | gauge | | the share of all CPUs busy since the previous sample, 0 to 1 |
-| `arca_node_cpu_cores` | gauge | | the number of CPUs |
+| `arca_node_cpu_cores` | gauge | | the number of logical CPUs, despite the name (`cpu.cores`) |
+| `arca_node_cpu_threads` | gauge | | the logical CPUs (`cpu.threads`) |
+| `arca_node_cpu_physical_cores` | gauge | | the physical cores (`cpu.physicalCores`) |
+| `arca_node_cpu_busy_threads` | gauge | | the threads busy since the previous sample, as a count |
 | `arca_node_load` | gauge | `window` (`15m`, `1m`, `5m`) | the load average |
 | `arca_node_memory_total_bytes` | gauge | | the memory of the node |
 | `arca_node_memory_available_bytes` | gauge | | the memory available to start applications |
@@ -4509,6 +4882,11 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_node_psi_avg10_ratio` | gauge | `resource` (`memory`, `cpu`), `kind` (`some`, `full`) | the share of time tasks stalled, averaged over 10 seconds, 0 to 1 |
 | `arca_node_cpu_temperature_celsius` | gauge | | the CPU temperature |
 | `arca_node_gpu_busy_ratio` | gauge | | the share of time the GPU is busy, 0 to 1 |
+| `arca_node_cpu_package_power_watts` | gauge | `package` (`package-0`, ...) | a CPU package's power since the previous sample, from its powercap counter |
+| `arca_node_cpu_power_watts` | gauge | | the packages' power summed, written only when every package has a figure |
+| `arca_node_gpu_power_watts` | gauge | `gpu` (the PCI address, or the DRM card name), `source` (`nvidia-smi`, `hwmon`) | a discrete GPU's own power |
+| `arca_node_chip_power_watts` | gauge | `chip` (the PCI address, or the DRM card name), `label` (such as `PPT`), `whole_chip` (`true`, `false`) | a whole-chip sensor: the CPU, its integrated GPU and the rest of the chip; `false` when the driver does not tell |
+| `arca_node_power_measured_watts` | gauge | | the sum of what was measured, each part once; not the power at the wall (see "CPU counts and power") |
 | `arca_node_network_receive_bytes_total` | counter | | the bytes the physical NICs received |
 | `arca_node_network_transmit_bytes_total` | counter | | the bytes the physical NICs sent |
 | `arca_pool_size_bytes` | gauge | `pool` | the size of a storage pool |
@@ -4520,6 +4898,7 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_instance_running` | gauge | `project`, `incus_instance`, `type` (`container`, `vm`) | 1 when an instance runs |
 | `arca_instance_starts_total` | counter | `project`, `incus_instance` | the starts of an instance since the server started |
 | `arca_instance_cpu_seconds_total` | counter | `project`, `incus_instance` | the CPU time an instance has used, from its own live state; absent for a sample that did not read it (see "Instances" under "Host metrics") |
+| `arca_instance_cpu_busy_threads` | gauge | `project`, `incus_instance` | the threads an instance had busy since its previous read; only the rows of the sample's capped `instanceCpu` list that have a figure |
 | `arca_instance_memory_used_bytes` | gauge | `project`, `incus_instance` | the memory an instance uses, read as the CPU time is |
 | `arca_latency_seconds` | gauge | `target` (`gateway`, `internet`, `relay`) | the TCP connect time to a probe target |
 | `arca_secureboot_enabled` | gauge | | 1 when Secure Boot is enabled |

@@ -1,0 +1,22 @@
+# arca-janitor's job runner, as a systemd user service. Not installed by anything: copy it to
+# ~/.config/systemd/user/, then `systemctl --user daemon-reload && systemctl --user enable --now janitor.service`.
+[Unit]
+Description=arca-janitor job runner (polite cleanup jobs over a unix socket)
+Documentation=https://github.com/automagik-si/arca/tree/dev/crates/arca-janitor
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/arca-janitor serve --foreground
+# Everything the daemon runs is background work: lowest CPU and IO priority. The daemon reads them back at start
+# and refuses heavy jobs if they did not take.
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+# Config: cleanup.conf and cleanup.<host>.conf in this folder.
+Environment=JANITOR_CONFIG_DIR=%h/.config/janitor
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

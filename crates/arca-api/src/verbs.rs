@@ -77,13 +77,17 @@ impl Verb {
     /// Whether the MCP door advertises `readOnlyHint`. A verb that records a durable proposal is not read-only even
     /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
     /// `owner_approval_status` hands its requester an approval string, so it is not advertised read-only either (droidd's
-    /// `readOnly: false`), and its minimum scope keeps it off viewers.
+    /// `readOnly: false`), and its minimum scope keeps it off viewers. `instance_move_plan` keeps a frozen plan in a file of
+    /// its own, as `action_propose` records a proposal.
     /// `owner_approval_pending` asks the owner's signed-in session about each plan, and a yes approves and runs it.
     pub fn read_only_hint(&self) -> bool {
         !self.writes
             && !matches!(
                 self.name,
-                "action_propose" | "owner_approval_status" | "owner_approval_pending"
+                "action_propose"
+                    | "owner_approval_status"
+                    | "instance_move_plan"
+                    | "owner_approval_pending"
             )
     }
 
@@ -104,7 +108,7 @@ pub const LINKED_NODE: &str = "linkedNode";
 
 /// The verbs that take [`NODE`]: every read the MCP door serves, and `action_propose`. Not the three `owner_approval_*`
 /// reads: their rows are the calling token's own requests, and a relayed call is the linked token's, never the caller's.
-pub const NODE_VERBS: [&str; 28] = [
+pub const NODE_VERBS: [&str; 30] = [
     "arca_status",
     "node_metrics",
     "watch_report",
@@ -128,6 +132,8 @@ pub const NODE_VERBS: [&str; 28] = [
     "function_runs",
     "registry_list",
     "instance_move_preflight",
+    "instance_move_plan",
+    "instance_move_status",
     "github_connect_status",
     "github_bindings",
     "github_audit",
@@ -158,7 +164,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 85] = [
+static VERBS: [Verb; 90] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -270,6 +276,20 @@ static VERBS: [Verb; 85] = [
         cut: no_cut,
         params: plan_decline_params,
         result: plan_decline_result,
+    },
+    Verb {
+        name: "plan_renew",
+        summary: "Makes again each waiting delete plan whose fifteen minutes ran out without an approval, from what the journal still holds, so plan_list shows it and the owner can be asked again. The same objects keep the same plan id; only its creation time is now. A plan still inside its fifteen minutes keeps its age. A declined entry, an entry the desired state carries again, one with nothing left to delete, and every plan while an earlier effect is unresolved are not renewed, each with why. Nothing is written to Incus, the journal or the desired state.",
+        class: VerbClass::L,
+        min_scope: Scope::Operator,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_renew,
+        cut: no_cut,
+        params: plan_renew_params,
+        result: plan_renew_result,
     },
     Verb {
         name: "approval_submit",
@@ -483,7 +503,7 @@ static VERBS: [Verb; 85] = [
     },
     Verb {
         name: "service_update",
-        summary: "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another digest or fingerprint in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new image (data volume, config, secrets and firewall rules are kept), started, and checked within timeoutSeconds (120 by default). On any failure the old version is put back. A local image must already be in the service project's image store. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose.",
+        summary: "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another one (or, with follow, say whether the node moves an Automagik server by itself): stopped, root rebuilt from the new image (data volume, config, secrets and firewall rules kept), started, checked within timeoutSeconds (120 by default); on any failure the old version is put back. A local image must already be in the project's image store. A service keeping its data on its root is refused unless eraseData. withTemplate also applies what its CURRENT template says, as service_reconfigure would, in the same restart. eraseData and withTemplate need an owner card (action_propose).",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -1157,6 +1177,62 @@ static VERBS: [Verb; 85] = [
         cut: no_cut,
         params: on_node!(instance_move_preflight_params),
         result: instance_move_preflight_result,
+    },
+    Verb {
+        name: "instance_move_plan",
+        summary: "Freeze the plan of a move of containers to a linked host, for the owner's one card. It runs instance_move_preflight again: any no-go blocks the plan with its reasons, and a virtual machine is not movable yet. An ephemeral container or an unreadable spot-check file blocks it too. When all pass it keeps the plan and answers its digest: source, target and credential, each instance's uuid and measured bytes, the copy rounds and cutover, the checks, the transport (Incus pushes from this host) and the rollback promise. The plan expires an hour after it is first made, never renewed; a changed source gives another digest. Nothing is stopped, copied or created.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_move_plan,
+        cut: no_cut,
+        params: on_node!(instance_move_plan_params),
+        result: instance_move_plan_result,
+    },
+    Verb {
+        name: "instance_move",
+        summary: "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, ran, is not the approved one, or whose instances changed, another move holds, or have an earlier copy that may run. Per instance, Incus pushes it and its volumes in rounds while it runs, stops it, sends the last round (the whole volume today), starts the copy once the source reads Stopped, and checks it; downtime runs from the stop to the passed checks. A failure rolls that instance back, never deleting the only copy or leaving both running: only the recorded copy is removed, once the source is read back. The source is kept, stopped, until instance_move_finish.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_move,
+        cut: no_cut,
+        params: instance_move_params,
+        result: instance_move_result,
+    },
+    Verb {
+        name: "instance_move_status",
+        summary: "How a move stands, read-only: its phase, and per instance the rounds done of the total, the bytes moved of the measured bytes, the rate, the time it has taken and the time left, the measured downtime and the checks once it ends, and whether it can be finished. A figure Incus has not given yet is null. Without a move id, the recent moves.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_move_status,
+        cut: no_cut,
+        params: on_node!(instance_move_status_params),
+        result: instance_move_status_result,
+    },
+    Verb {
+        name: "instance_move_finish",
+        summary: "Finish a verified move, once the owner has approved it as an action proposal: delete each moved source instance on this host and the custom volumes it took with it, each only once its copy is read back on the target. It is offered only after the move's checks passed, never on a timer and never by itself; a source that runs again, or a volume another instance uses, is kept and named. instance_move_status shows what it would delete.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_move_finish,
+        cut: no_cut,
+        params: instance_move_finish_params,
+        result: instance_move_finish_result,
     },
     Verb {
         name: "github_oauth_app_set",
@@ -1983,6 +2059,242 @@ fn github_audit_result() -> Value {
             json!({ "type": "object", "properties": { "at": { "type": "integer" }, "atText": { "type": "string" }, "kind": { "type": "string" } }, "required": ["at", "atText", "kind"] }),
         ),
     )])
+}
+
+/// A move's id: `mv-` and twelve lowercase hex digits.
+fn move_id_schema() -> Value {
+    json!({
+        "description": "The move's id, as instance_move answered it: mv- and twelve hex digits.",
+        "maxLength": 15,
+        "minLength": 15,
+        "pattern": "^mv-[0-9a-f]{12}$",
+        "type": "string"
+    })
+}
+
+fn move_project_schema() -> Value {
+    json!({
+        "description": "The Incus project the instance is in, on this node.",
+        "maxLength": 63,
+        "minLength": 1,
+        "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+        "type": "string"
+    })
+}
+
+fn move_target_schema() -> Value {
+    json!({
+        "description": "The target node: the name of one of this kernel's linked hosts (approval.linkedHosts). The move writes to its Incus through that host's incusSocket.",
+        "maxLength": 253,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+        "type": "string"
+    })
+}
+
+/// The instances a move names, `{project, name}` each, 1 to 50.
+fn move_instances_schema() -> Value {
+    json!({
+        "description": "The instances, in the plan's order: 1 to 50 {project, name} references; an empty list is refused.",
+        "items": params(vec![
+            ("project", true, move_project_schema()),
+            ("name", true, instance_name_schema()),
+        ]),
+        "maxItems": 50,
+        "type": "array"
+    })
+}
+
+fn instance_move_plan_params() -> Value {
+    let reference = params(vec![
+        ("project", true, move_project_schema()),
+        ("name", true, instance_name_schema()),
+        (
+            "spotCheck",
+            false,
+            json!({
+                "description": "A file inside the instance, best one on its data volume, read on both sides after the move and compared. Absent: /etc/hostname.",
+                "maxLength": 1024,
+                "minLength": 2,
+                "pattern": "^/[A-Za-z0-9._/-]+$",
+                "type": "string"
+            }),
+        ),
+    ]);
+    params(vec![
+        (
+            "instances",
+            true,
+            json!({
+                "description": "The containers to move, in the order they move: 1 to 50 references. A batch is one plan and one card.",
+                "items": reference,
+                "maxItems": 50,
+                "type": "array"
+            }),
+        ),
+        ("target", true, move_target_schema()),
+        (
+            "rounds",
+            false,
+            json!({
+                "description": "The copy rounds while the instance runs, before the stop: the first is a full copy, each later one a refresh. Absent: 2.",
+                "maximum": 5,
+                "minimum": 1,
+                "type": "integer"
+            }),
+        ),
+    ])
+}
+
+fn instance_move_plan_result() -> Value {
+    result(vec![
+        ("go", true, boolean()),
+        ("digest", true, nullable(string())),
+        ("expiresAt", true, nullable(int())),
+        ("target", true, string()),
+        ("plan", true, json!({ "type": ["object", "null"] })),
+        (
+            "blocked",
+            true,
+            array(result(vec![
+                ("project", true, string()),
+                ("name", true, string()),
+                ("reasons", true, array(string())),
+            ])),
+        ),
+        ("preflight", true, json!({ "type": "object" })),
+        ("message", true, string()),
+    ])
+}
+
+/// A short line for `instance_move_plan`.
+pub fn summary_move_plan(v: &Value) -> String {
+    v["message"].as_str().unwrap_or("planned").to_string()
+}
+
+fn instance_move_params() -> Value {
+    with_confirm(params(vec![
+        (
+            "plan",
+            true,
+            json!({
+                "description": "The digest instance_move_plan answered: 64 lowercase hex digits.",
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+            }),
+        ),
+        ("instances", true, move_instances_schema()),
+        ("target", true, move_target_schema()),
+        ("approval", true, approval_schema()),
+    ]))
+}
+
+fn instance_move_result() -> Value {
+    result(vec![
+        ("move", true, string()),
+        ("plan", true, string()),
+        ("target", true, string()),
+        ("phase", true, string()),
+        (
+            "instances",
+            true,
+            array(result(vec![
+                ("project", true, string()),
+                ("name", true, string()),
+            ])),
+        ),
+        ("message", true, string()),
+    ])
+}
+
+/// A short line for `instance_move`.
+pub fn summary_move(v: &Value) -> String {
+    v["message"].as_str().unwrap_or("moving").to_string()
+}
+
+fn instance_move_status_params() -> Value {
+    params(vec![("move", false, move_id_schema())])
+}
+
+fn instance_move_status_result() -> Value {
+    let instance = result(vec![
+        ("project", true, string()),
+        ("name", true, string()),
+        ("phase", true, string()),
+        (
+            "result",
+            true,
+            nullable_enum(&["moved", "rolled_back", "failed", "finished"]),
+        ),
+        ("roundsDone", true, at_least(0)),
+        ("roundsTotal", true, at_least(0)),
+        ("bytesMoved", true, nullable(int())),
+        ("bytesTotal", true, nullable(int())),
+        ("rateBytesPerSecond", true, nullable(int())),
+        ("elapsedMs", true, at_least(0)),
+        ("timeLeftMs", true, nullable(int())),
+        ("downtimeMs", true, nullable(int())),
+        ("reason", true, nullable(string())),
+        ("checks", true, array(json!({ "type": "object" }))),
+    ]);
+    let one = result(vec![
+        ("move", true, string()),
+        ("plan", true, string()),
+        ("target", true, string()),
+        ("phase", true, string()),
+        ("startedAt", true, int()),
+        ("endedAt", true, nullable(int())),
+        ("interrupted", true, boolean()),
+        ("instances", true, array(instance)),
+        (
+            "finish",
+            true,
+            result(vec![
+                ("available", true, boolean()),
+                ("reason", true, string()),
+                ("deletes", true, array(string())),
+            ]),
+        ),
+    ]);
+    result(vec![("moves", true, array(one))])
+}
+
+/// A short line for `instance_move_status`.
+pub fn summary_move_status(v: &Value) -> String {
+    let moves = v["moves"].as_array().map_or(&[][..], Vec::as_slice);
+    match moves {
+        [] => "no move".to_string(),
+        [one] => format!(
+            "move {} to {}: {}",
+            one["move"].as_str().unwrap_or("?"),
+            one["target"].as_str().unwrap_or("?"),
+            one["phase"].as_str().unwrap_or("?")
+        ),
+        many => format!("{} moves", many.len()),
+    }
+}
+
+fn instance_move_finish_params() -> Value {
+    with_confirm(params(vec![
+        ("move", true, move_id_schema()),
+        ("approval", true, approval_schema()),
+    ]))
+}
+
+fn instance_move_finish_result() -> Value {
+    result(vec![
+        ("move", true, string()),
+        ("deleted", true, array(string())),
+        ("kept", true, array(string())),
+        ("message", true, string()),
+    ])
+}
+
+/// A short line for `instance_move_finish`.
+pub fn summary_move_finish(v: &Value) -> String {
+    v["message"].as_str().unwrap_or("finished").to_string()
 }
 
 /// The checks of every `instance_move_preflight` row, in the order each row lists them.
@@ -2923,6 +3235,15 @@ pub fn summary_decline(v: &Value) -> String {
     )
 }
 
+/// A short line for a successful `plan_renew`.
+pub fn summary_renew(v: &Value) -> String {
+    format!(
+        "{} lapsed plan(s) renewed; {} not renewed",
+        v["renewed"].as_array().map_or(0, Vec::len),
+        v["notRenewed"].as_array().map_or(0, Vec::len)
+    )
+}
+
 /// A short line for a successful `approval_submit`.
 pub fn summary_approval(v: &Value) -> String {
     format!(
@@ -3079,6 +3400,7 @@ fn not_confirmed(name: &str) -> String {
         "function_remove" => "nothing was removed",
         "github_disconnect" => "nothing was disconnected",
         "instance_import_undo" => "nothing was removed",
+        "instance_move" => "nothing was moved",
         _ => "nothing was deleted",
     };
     let spent = if matches!(
@@ -3345,6 +3667,9 @@ fn host_sample() -> Value {
                 ("cores", true, int()),
                 ("coresKnown", true, boolean()),
                 ("reason", true, nullable(string())),
+                ("threads", false, nullable(int())),
+                ("physicalCores", false, nullable(int())),
+                ("busyThreads", false, nullable(num())),
             ]),
         ),
         (
@@ -3409,6 +3734,103 @@ fn host_sample() -> Value {
             ])),
         ),
         ("instancesNotRead", true, instances_not_read()),
+        ("power", false, power()),
+        ("instanceCpu", false, instance_cpu()),
+    ])
+}
+
+/// The power block of a host sample: the CPU packages' power from their energy counters, the GPUs' power, and the sum of
+/// what was measured with the words for what it leaves out. A source with no figure carries a reason, never a zero.
+fn power() -> Value {
+    let mut schema = result(vec![
+        (
+            "cpu",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                ("added", true, boolean()),
+                (
+                    "packages",
+                    true,
+                    array(result(vec![
+                        ("zone", true, string()),
+                        ("name", true, string()),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        (
+            "gpu",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                (
+                    "cards",
+                    true,
+                    array(result(vec![
+                        ("pci", true, nullable(string())),
+                        ("card", true, nullable(string())),
+                        ("source", true, one_of(&["nvidia-smi", "hwmon"])),
+                        ("basis", true, nullable(string())),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        (
+            "chip",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                ("added", true, boolean()),
+                (
+                    "sensors",
+                    true,
+                    array(result(vec![
+                        ("pci", true, nullable(string())),
+                        ("card", true, nullable(string())),
+                        ("label", true, nullable(string())),
+                        ("wholeChip", true, boolean()),
+                        ("basis", true, string()),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        ("measuredPowerW", true, nullable(num())),
+        ("notAdded", true, array(string())),
+        ("notIncluded", true, array(string())),
+    ]);
+    schema["description"] = json!(
+        "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall."
+    );
+    schema
+}
+
+/// Each running instance's CPU in threads in use since its previous read: at most 50 rows, the largest first, and a count
+/// and a sum of the rest.
+fn instance_cpu() -> Value {
+    result(vec![
+        (
+            "instances",
+            true,
+            array(result(vec![
+                ("project", true, string()),
+                ("name", true, string()),
+                ("busyThreads", true, nullable(num())),
+                ("reason", true, nullable(string())),
+            ])),
+        ),
+        ("omitted", true, int()),
+        ("omittedBusyThreads", true, num()),
+        ("reason", true, nullable(string())),
     ])
 }
 
@@ -3597,7 +4019,7 @@ fn plan_list_result() -> Value {
 }
 
 /// The twenty-nine verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 29] = [
+const ACTION_NAMES: [&str; 31] = [
     "service_create",
     "service_remove",
     "service_update",
@@ -3623,6 +4045,8 @@ const ACTION_NAMES: [&str; 29] = [
     "function_create",
     "function_remove",
     "host_network_restore",
+    "instance_move",
+    "instance_move_finish",
     "route_add",
     "route_remove",
     "instance_import",
@@ -3650,8 +4074,9 @@ fn action_propose_params() -> Value {
 /// removed or overwritten before the action's own check runs (the GPU verbs from the instance, storage_add from the
 /// disk survey, the snapshot verbs from the source or the snapshot). A branch takes any value for them, as the door did
 /// before it held `args` to a branch, and says so.
-pub const KERNEL_FILLED: [(&str, &[&str]); 6] = [
+pub const KERNEL_FILLED: [(&str, &[&str]); 7] = [
     ("service_reconfigure", &["changes"]),
+    ("service_update", &["changes"]),
     ("gpu_attach", &["project", "kind", "uuid"]),
     ("gpu_detach", &["project", "kind", "uuid"]),
     (
@@ -3700,7 +4125,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 29] = [
+const ACTION_EXAMPLES: [(&str, &str); 31] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
@@ -3744,6 +4169,11 @@ const ACTION_EXAMPLES: [(&str, &str); 29] = [
     ),
     ("function_remove", r#"{"name":"relay"}"#),
     ("host_network_restore", r#"{}"#),
+    (
+        "instance_move",
+        r#"{"plan":"0000000000000000000000000000000000000000000000000000000000000000","instances":[{"project":"shop","name":"web"}],"target":"node-b"}"#,
+    ),
+    ("instance_move_finish", r#"{"move":"mv-000000000000"}"#),
     (
         "route_add",
         r#"{"hostname":"app.example.com","instance":"web","port":8080}"#,
@@ -3910,6 +4340,38 @@ fn plan_decline_result() -> Value {
     result(vec![
         ("plan", true, plan_ref()),
         ("retained", true, array(object_ref())),
+    ])
+}
+
+fn plan_renew_params() -> Value {
+    params(vec![])
+}
+
+fn plan_renew_result() -> Value {
+    result(vec![
+        ("renewed", true, array(renewed_plan())),
+        ("notRenewed", true, array(lapsed_plan())),
+    ])
+}
+
+/// A plan `plan_renew` made again: its id, entry and objects, and its new creation time and expiry. The statement the owner
+/// signs comes from `plan_list`.
+fn renewed_plan() -> Value {
+    result(vec![
+        ("plan", true, hex64()),
+        ("entry", true, string()),
+        ("objects", true, array(object_ref())),
+        ("createdAt", true, int()),
+        ("expiresAt", true, int()),
+    ])
+}
+
+/// A lapsed plan `plan_renew` did not make again, and why in plain words.
+fn lapsed_plan() -> Value {
+    result(vec![
+        ("plan", true, hex64()),
+        ("entry", true, string()),
+        ("why", true, string()),
     ])
 }
 
@@ -4690,6 +5152,11 @@ fn service_create_params_base() -> Value {
                 "minLength": 1,
                 "type": "string"
             },
+            "digest": {
+                "description": "Only for a template of an OCI image by digest: create the service from this build of the template's own image instead of the digest the template pins: sha256: and 64 lower-case hex digits, the service keeping the template's repository, as service_update moves one. A multi-arch index digest is passed to Incus as it is, so each node pulls its own architecture. Left out, the template's own digest. A proposal's card shows the image at this digest (and, for Omni's image, the version the registry's tag names it by when it is proposed), and the approval binds it.",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+            },
             "templateDigest": {
                 "description": "Filled in by the node when a create is proposed: SHA-256, in hex, of the template's file and of each script it names, as the node holds them then. The create runs only while the template on the node is still exactly that one. A caller leaves it out; one that states it must state the node's own.",
                 "pattern": "^[0-9a-f]{64}$",
@@ -5035,6 +5502,8 @@ pub fn summary_service_update(v: &Value) -> String {
         "Service already runs that image.".to_string()
     } else if v.get("noNewPrivileges").is_some() {
         "Service's no-new-privileges setting changed.".to_string()
+    } else if v.get("changes").is_some() {
+        "Service updated and made what its template says.".to_string()
     } else {
         "Service updated.".to_string()
     }
@@ -5058,24 +5527,44 @@ fn service_reconfigure_params() -> Value {
                 "minLength": 1,
                 "type": "string"
             },
-            "changes": {
-                "additionalProperties": false,
-                "properties": {
-                    "entrypoint": { "type": "object" },
-                    "environment": { "items": { "type": "object" }, "type": "array" },
-                    "noNewPrivileges": { "type": "object" },
-                    "ports": { "type": "object" },
-                    "rawLxc": { "type": "object" },
-                    "secrets": { "items": { "type": "object" }, "type": "array" }
-                },
-                "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
-                "type": "object"
-            },
+            "changes": template_changes_schema("A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference."),
             "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
         },
         "required": ["name", "approval"],
         "type": "object"
     })))
+}
+
+/// The difference between a service and its template now, as `service_reconfigure` and `service_update` with
+/// `withTemplate` carry it; `who` says who fills it in.
+fn template_changes_schema(who: &str) -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "entrypoint": { "type": "object" },
+            "environment": { "items": { "type": "object" }, "type": "array" },
+            "noNewPrivileges": { "type": "object" },
+            "ports": { "type": "object" },
+            "rawLxc": { "type": "object" },
+            "secrets": { "items": { "type": "object" }, "type": "array" }
+        },
+        "description": format!("The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({{from, to}} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). {who}"),
+        "type": "object"
+    })
+}
+
+/// The config read back after the start, against what a template's difference applied.
+fn read_back_schema() -> Value {
+    json!({
+        "additionalProperties": false,
+        "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc, or oci.entrypoint) that differ. Never a value.",
+        "properties": {
+            "differs": { "items": { "type": "string" }, "type": "array" },
+            "matches": { "type": "boolean" }
+        },
+        "required": ["matches", "differs"],
+        "type": "object"
+    })
 }
 
 fn service_reconfigure_result() -> Value {
@@ -5087,16 +5576,7 @@ fn service_reconfigure_result() -> Value {
                 "type": "object"
             },
             "message": { "type": "string" },
-            "readBack": {
-                "additionalProperties": false,
-                "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc, or oci.entrypoint) that differ. Never a value.",
-                "properties": {
-                    "differs": { "items": { "type": "string" }, "type": "array" },
-                    "matches": { "type": "boolean" }
-                },
-                "required": ["matches", "differs"],
-                "type": "object"
-            },
+            "readBack": read_back_schema(),
             "reconfigured": {
                 "description": "False when nothing was written: the service already was what its template says, or the only difference is a secret whose value is set separately.",
                 "type": "boolean"
@@ -5125,11 +5605,12 @@ fn service_update_params_base() -> Value {
         "additionalProperties": false,
         "properties": {
             "approval": {
-                "description": "Only with eraseData: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data; this verb is not called with an approval of its own.",
+                "description": "Only with eraseData or withTemplate: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data, or shows every setting its template changes; this verb is not called with an approval of its own.",
                 "maxLength": 16384,
                 "minLength": 1,
                 "type": "string"
             },
+            "changes": template_changes_schema("Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference."),
             "digest": {
                 "description": "The image to move to: sha256: and 64 lower-case hex digits. For an OCI image, the digest, and the service keeps its image's repository; for a service made from a local image pinned by fingerprint, the new image's fingerprint. Give it, or follow, not both.",
                 "pattern": "^sha256:[0-9a-f]{64}$",
@@ -5153,6 +5634,10 @@ fn service_update_params_base() -> Value {
                 "maximum": 900,
                 "minimum": 1,
                 "type": "integer"
+            },
+            "withTemplate": {
+                "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
+                "type": "boolean"
             }
         },
         "required": ["name"],
@@ -5164,6 +5649,10 @@ fn service_update_result() -> Value {
     json!({
         "additionalProperties": false,
         "properties": {
+            "changes": {
+                "description": "Present with withTemplate: the template's difference that was applied with the new image, as the owner's card showed it. No secret value is in it.",
+                "type": "object"
+            },
             "digest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
             "follow": {
                 "description": "Present when the call set whether the service follows Automagik's releases: what it set.",
@@ -5174,6 +5663,7 @@ fn service_update_result() -> Value {
                 "description": "Present when the call changed whether the service runs with no-new-privileges, to match its template: what it set. The service was restarted when it ran, and its image and data were not touched.",
                 "type": "boolean"
             },
+            "readBack": read_back_schema(),
             "restarted": {
                 "description": "Present with noNewPrivileges: whether the service was restarted for it (true when it was running).",
                 "type": "boolean"

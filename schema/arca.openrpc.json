@@ -296,15 +296,33 @@
                 },
                 "cpu": {
                   "properties": {
+                    "busyThreads": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
                     "cores": {
                       "type": "integer"
                     },
                     "coresKnown": {
                       "type": "boolean"
                     },
+                    "physicalCores": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "reason": {
                       "type": [
                         "string",
+                        "null"
+                      ]
+                    },
+                    "threads": {
+                      "type": [
+                        "integer",
                         "null"
                       ]
                     },
@@ -553,6 +571,61 @@
                     "null"
                   ]
                 },
+                "instanceCpu": {
+                  "properties": {
+                    "instances": {
+                      "items": {
+                        "properties": {
+                          "busyThreads": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "project": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "project",
+                          "name",
+                          "busyThreads",
+                          "reason"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "omitted": {
+                      "type": "integer"
+                    },
+                    "omittedBusyThreads": {
+                      "type": "number"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "instances",
+                    "omitted",
+                    "omittedBusyThreads",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
                 "instancesNotRead": {
                   "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read.",
                   "items": {
@@ -720,6 +793,250 @@
                     "type": "object"
                   },
                   "type": "array"
+                },
+                "power": {
+                  "description": "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall.",
+                  "properties": {
+                    "chip": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sensors": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": "string"
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "label": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "wholeChip": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "label",
+                              "wholeChip",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "sensors"
+                      ],
+                      "type": "object"
+                    },
+                    "cpu": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "packages": {
+                          "items": {
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "zone": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "zone",
+                              "name",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "packages"
+                      ],
+                      "type": "object"
+                    },
+                    "gpu": {
+                      "properties": {
+                        "cards": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "source": {
+                                "enum": [
+                                  "nvidia-smi",
+                                  "hwmon"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "source",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "cards"
+                      ],
+                      "type": "object"
+                    },
+                    "measuredPowerW": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "notAdded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "notIncluded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "cpu",
+                    "gpu",
+                    "chip",
+                    "measuredPowerW",
+                    "notAdded",
+                    "notIncluded"
+                  ],
+                  "type": "object"
                 },
                 "projects": {
                   "items": {
@@ -798,15 +1115,33 @@
                 },
                 "cpu": {
                   "properties": {
+                    "busyThreads": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
                     "cores": {
                       "type": "integer"
                     },
                     "coresKnown": {
                       "type": "boolean"
                     },
+                    "physicalCores": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "reason": {
                       "type": [
                         "string",
+                        "null"
+                      ]
+                    },
+                    "threads": {
+                      "type": [
+                        "integer",
                         "null"
                       ]
                     },
@@ -1055,6 +1390,61 @@
                     "null"
                   ]
                 },
+                "instanceCpu": {
+                  "properties": {
+                    "instances": {
+                      "items": {
+                        "properties": {
+                          "busyThreads": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "project": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "project",
+                          "name",
+                          "busyThreads",
+                          "reason"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "omitted": {
+                      "type": "integer"
+                    },
+                    "omittedBusyThreads": {
+                      "type": "number"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "instances",
+                    "omitted",
+                    "omittedBusyThreads",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
                 "instancesNotRead": {
                   "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read.",
                   "items": {
@@ -1222,6 +1612,250 @@
                     "type": "object"
                   },
                   "type": "array"
+                },
+                "power": {
+                  "description": "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall.",
+                  "properties": {
+                    "chip": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sensors": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": "string"
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "label": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "wholeChip": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "label",
+                              "wholeChip",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "sensors"
+                      ],
+                      "type": "object"
+                    },
+                    "cpu": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "packages": {
+                          "items": {
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "zone": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "zone",
+                              "name",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "packages"
+                      ],
+                      "type": "object"
+                    },
+                    "gpu": {
+                      "properties": {
+                        "cards": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "source": {
+                                "enum": [
+                                  "nvidia-smi",
+                                  "hwmon"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "source",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "cards"
+                      ],
+                      "type": "object"
+                    },
+                    "measuredPowerW": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "notAdded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "notIncluded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "cpu",
+                    "gpu",
+                    "chip",
+                    "measuredPowerW",
+                    "notAdded",
+                    "notIncluded"
+                  ],
+                  "type": "object"
                 },
                 "projects": {
                   "items": {
@@ -1838,6 +2472,8 @@
                           "function_create",
                           "function_remove",
                           "host_network_restore",
+                          "instance_move",
+                          "instance_move_finish",
                           "route_add",
                           "route_remove",
                           "instance_import",
@@ -1976,6 +2612,8 @@
               "function_create",
               "function_remove",
               "host_network_restore",
+              "instance_move",
+              "instance_move_finish",
               "route_add",
               "route_remove",
               "instance_import",
@@ -2032,6 +2670,11 @@
                     },
                     "maxItems": 4,
                     "type": "array"
+                  },
+                  "digest": {
+                    "description": "Only for a template of an OCI image by digest: create the service from this build of the template's own image instead of the digest the template pins: sha256: and 64 lower-case hex digits, the service keeping the template's repository, as service_update moves one. A multi-arch index digest is passed to Incus as it is, so each node pulls its own architecture. Left out, the template's own digest. A proposal's card shows the image at this digest (and, for Omni's image, the version the registry's tag names it by when it is proposed), and the approval binds it.",
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "type": "string"
                   },
                   "image": {
                     "description": "Filled in by the node when a create is proposed: the image the template names, <image>@sha256:<digest> when it gives a digest and the bare name when it gives none; a virtual machine that names a version adds \" running <version>\". The owner's card shows it and the approval binds it. A caller leaves it out; one that states it must state the node's own.",
@@ -2158,7 +2801,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The args of service_update: Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another digest or fingerprint in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new image (data volume, config, secrets and firewall rules are kept), started, and checked within timeoutSeconds (120 by default). On any failure the old version is put back. A local image must already be in the service project's image store. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose. Example: {\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"name\":\"nats\"}",
+                "description": "The args of service_update: Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another one (or, with follow, say whether the node moves an Automagik server by itself): stopped, root rebuilt from the new image (data volume, config, secrets and firewall rules kept), started, checked within timeoutSeconds (120 by default); on any failure the old version is put back. A local image must already be in the project's image store. A service keeping its data on its root is refused unless eraseData. withTemplate also applies what its CURRENT template says, as service_reconfigure would, in the same restart. eraseData and withTemplate need an owner card (action_propose). Example: {\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"name\":\"nats\"}",
                 "examples": [
                   {
                     "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -2166,6 +2809,9 @@
                   }
                 ],
                 "properties": {
+                  "changes": {
+                    "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                  },
                   "confirm": {
                     "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
                     "type": "boolean"
@@ -2202,6 +2848,10 @@
                     "maximum": 900,
                     "minimum": 1,
                     "type": "integer"
+                  },
+                  "withTemplate": {
+                    "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -3198,6 +3848,105 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The args of instance_move: Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, ran, is not the approved one, or whose instances changed, another move holds, or have an earlier copy that may run. Per instance, Incus pushes it and its volumes in rounds while it runs, stops it, sends the last round (the whole volume today), starts the copy once the source reads Stopped, and checks it; downtime runs from the stop to the passed checks. A failure rolls that instance back, never deleting the only copy or leaving both running: only the recorded copy is removed, once the source is read back. The source is kept, stopped, until instance_move_finish. Example: {\"instances\":[{\"name\":\"web\",\"project\":\"shop\"}],\"plan\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"target\":\"node-b\"}",
+                "examples": [
+                  {
+                    "instances": [
+                      {
+                        "name": "web",
+                        "project": "shop"
+                      }
+                    ],
+                    "plan": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "target": "node-b"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "instances": {
+                    "description": "The instances, in the plan's order: 1 to 50 {project, name} references; an empty list is refused.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "name": {
+                          "description": "The Incus instance name.",
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                          "type": "string"
+                        },
+                        "project": {
+                          "description": "The Incus project the instance is in, on this node.",
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "project",
+                        "name"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 50,
+                    "type": "array"
+                  },
+                  "plan": {
+                    "description": "The digest instance_move_plan answered: 64 lowercase hex digits.",
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "target": {
+                    "description": "The target node: the name of one of this kernel's linked hosts (approval.linkedHosts). The move writes to its Incus through that host's incusSocket.",
+                    "maxLength": 253,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "plan",
+                  "instances",
+                  "target"
+                ],
+                "title": "instance_move",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of instance_move_finish: Finish a verified move, once the owner has approved it as an action proposal: delete each moved source instance on this host and the custom volumes it took with it, each only once its copy is read back on the target. It is offered only after the move's checks passed, never on a timer and never by itself; a source that runs again, or a volume another instance uses, is kept and named. instance_move_status shows what it would delete. Example: {\"move\":\"mv-000000000000\"}",
+                "examples": [
+                  {
+                    "move": "mv-000000000000"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "move": {
+                    "description": "The move's id, as instance_move answered it: mv- and twelve hex digits.",
+                    "maxLength": 15,
+                    "minLength": 15,
+                    "pattern": "^mv-[0-9a-f]{12}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "move"
+                ],
+                "title": "instance_move_finish",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The args of route_add: Serve https://<hostname> from this node's edge (the arca-edge service) to an instance of this node, in any project, on one tcp port, with a certificate by the Cloudflare DNS challenge. reach private (default) answers only the local networks and the tailnet, others get 403; public has no filter. The instance's address is read from Incus now and the edge's firewall opens it; an Arca service needs a link from the edge (service_connect). A hostname that has a route is re-pointed. The route is kept in the edge's desired state, its config is written and Caddy reloaded; a refused reload keeps the old config and the answer says so. From an approved proposal or a doctor token. Example: {\"hostname\":\"app.example.com\",\"instance\":\"web\",\"port\":8080}",
                 "examples": [
                   {
@@ -3432,6 +4181,8 @@
                 "function_create",
                 "function_remove",
                 "host_network_restore",
+                "instance_move",
+                "instance_move_finish",
                 "route_add",
                 "route_remove",
                 "instance_import",
@@ -3619,6 +4370,121 @@
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "plan_renew",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "notRenewed": {
+              "items": {
+                "properties": {
+                  "entry": {
+                    "type": "string"
+                  },
+                  "plan": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "type": "string"
+                  },
+                  "why": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "plan",
+                  "entry",
+                  "why"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "renewed": {
+              "items": {
+                "properties": {
+                  "createdAt": {
+                    "type": "integer"
+                  },
+                  "entry": {
+                    "type": "string"
+                  },
+                  "expiresAt": {
+                    "type": "integer"
+                  },
+                  "objects": {
+                    "items": {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "project",
+                            "instance",
+                            "network",
+                            "acl",
+                            "profile",
+                            "volume",
+                            "zone",
+                            "forward",
+                            "bucket"
+                          ],
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "project": {
+                          "type": "string"
+                        },
+                        "uuid": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "project",
+                        "name",
+                        "uuid"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "plan": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "plan",
+                  "entry",
+                  "objects",
+                  "createdAt",
+                  "expiresAt"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "renewed",
+            "notRenewed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Makes again each waiting delete plan whose fifteen minutes ran out without an approval, from what the journal still holds, so plan_list shows it and the owner can be asked again. The same objects keep the same plan id; only its creation time is now. A plan still inside its fifteen minutes keeps its age. A declined entry, an entry the desired state carries again, one with nothing left to delete, and every plan while an earlier effect is unresolved are not renewed, each with why. Nothing is written to Incus, the journal or the desired state.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "operator",
       "x-arca-writes": true
     },
     {
@@ -3820,6 +4686,8 @@
                 "function_create",
                 "function_remove",
                 "host_network_restore",
+                "instance_move",
+                "instance_move_finish",
                 "route_add",
                 "route_remove",
                 "instance_import",
@@ -4896,6 +5764,15 @@
             },
             "maxItems": 4,
             "type": "array"
+          }
+        },
+        {
+          "name": "digest",
+          "required": false,
+          "schema": {
+            "description": "Only for a template of an OCI image by digest: create the service from this build of the template's own image instead of the digest the template pins: sha256: and 64 lower-case hex digits, the service keeping the template's repository, as service_update moves one. A multi-arch index digest is passed to Incus as it is, so each node pulls its own architecture. Left out, the template's own digest. A proposal's card shows the image at this digest (and, for Omni's image, the version the registry's tag names it by when it is proposed), and the approval binds it.",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
           }
         },
         {
@@ -6177,10 +7054,45 @@
           "name": "approval",
           "required": false,
           "schema": {
-            "description": "Only with eraseData: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data; this verb is not called with an approval of its own.",
+            "description": "Only with eraseData or withTemplate: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data, or shows every setting its template changes; this verb is not called with an approval of its own.",
             "maxLength": 16384,
             "minLength": 1,
             "type": "string"
+          }
+        },
+        {
+          "name": "changes",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference.",
+            "properties": {
+              "entrypoint": {
+                "type": "object"
+              },
+              "environment": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "noNewPrivileges": {
+                "type": "object"
+              },
+              "ports": {
+                "type": "object"
+              },
+              "rawLxc": {
+                "type": "object"
+              },
+              "secrets": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
           }
         },
         {
@@ -6242,6 +7154,14 @@
             "minimum": 1,
             "type": "integer"
           }
+        },
+        {
+          "name": "withTemplate",
+          "required": false,
+          "schema": {
+            "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
+            "type": "boolean"
+          }
         }
       ],
       "result": {
@@ -6249,6 +7169,10 @@
         "schema": {
           "additionalProperties": false,
           "properties": {
+            "changes": {
+              "description": "Present with withTemplate: the template's difference that was applied with the new image, as the owner's card showed it. No secret value is in it.",
+              "type": "object"
+            },
             "digest": {
               "pattern": "^sha256:[0-9a-f]{64}$",
               "type": "string"
@@ -6263,6 +7187,26 @@
             "noNewPrivileges": {
               "description": "Present when the call changed whether the service runs with no-new-privileges, to match its template: what it set. The service was restarted when it ran, and its image and data were not touched.",
               "type": "boolean"
+            },
+            "readBack": {
+              "additionalProperties": false,
+              "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc, or oci.entrypoint) that differ. Never a value.",
+              "properties": {
+                "differs": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "matches": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "matches",
+                "differs"
+              ],
+              "type": "object"
             },
             "restarted": {
               "description": "Present with noNewPrivileges: whether the service was restarted for it (true when it was running).",
@@ -6291,7 +7235,7 @@
           "type": "object"
         }
       },
-      "summary": "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another digest or fingerprint in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new image (data volume, config, secrets and firewall rules are kept), started, and checked within timeoutSeconds (120 by default). On any failure the old version is put back. A local image must already be in the service project's image store. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose.",
+      "summary": "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another one (or, with follow, say whether the node moves an Automagik server by itself): stopped, root rebuilt from the new image (data volume, config, secrets and firewall rules kept), started, checked within timeoutSeconds (120 by default); on any failure the old version is put back. A local image must already be in the project's image store. A service keeping its data on its root is refused unless eraseData. withTemplate also applies what its CURRENT template says, as service_reconfigure would, in the same restart. eraseData and withTemplate need an owner card (action_propose).",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -12072,6 +13016,579 @@
       "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
+    },
+    {
+      "name": "instance_move_plan",
+      "params": [
+        {
+          "name": "instances",
+          "required": true,
+          "schema": {
+            "description": "The containers to move, in the order they move: 1 to 50 references. A batch is one plan and one card.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "description": "The Incus instance name.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                  "type": "string"
+                },
+                "project": {
+                  "description": "The Incus project the instance is in, on this node.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                  "type": "string"
+                },
+                "spotCheck": {
+                  "description": "A file inside the instance, best one on its data volume, read on both sides after the move and compared. Absent: /etc/hostname.",
+                  "maxLength": 1024,
+                  "minLength": 2,
+                  "pattern": "^/[A-Za-z0-9._/-]+$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "project",
+                "name"
+              ],
+              "type": "object"
+            },
+            "maxItems": 50,
+            "type": "array"
+          }
+        },
+        {
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "The target node: the name of one of this kernel's linked hosts (approval.linkedHosts). The move writes to its Incus through that host's incusSocket.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "rounds",
+          "required": false,
+          "schema": {
+            "description": "The copy rounds while the instance runs, before the stop: the first is a full copy, each later one a refresh. Absent: 2.",
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "blocked": {
+              "items": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  },
+                  "reasons": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "project",
+                  "name",
+                  "reasons"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "digest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expiresAt": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "go": {
+              "type": "boolean"
+            },
+            "message": {
+              "type": "string"
+            },
+            "plan": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "preflight": {
+              "type": "object"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "go",
+            "digest",
+            "expiresAt",
+            "target",
+            "plan",
+            "blocked",
+            "preflight",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Freeze the plan of a move of containers to a linked host, for the owner's one card. It runs instance_move_preflight again: any no-go blocks the plan with its reasons, and a virtual machine is not movable yet. An ephemeral container or an unreadable spot-check file blocks it too. When all pass it keeps the plan and answers its digest: source, target and credential, each instance's uuid and measured bytes, the copy rounds and cutover, the checks, the transport (Incus pushes from this host) and the rollback promise. The plan expires an hour after it is first made, never renewed; a changed source gives another digest. Nothing is stopped, copied or created.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "instance_move",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "instances",
+          "required": true,
+          "schema": {
+            "description": "The instances, in the plan's order: 1 to 50 {project, name} references; an empty list is refused.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "description": "The Incus instance name.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+                  "type": "string"
+                },
+                "project": {
+                  "description": "The Incus project the instance is in, on this node.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "project",
+                "name"
+              ],
+              "type": "object"
+            },
+            "maxItems": 50,
+            "type": "array"
+          }
+        },
+        {
+          "name": "plan",
+          "required": true,
+          "schema": {
+            "description": "The digest instance_move_plan answered: 64 lowercase hex digits.",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "The target node: the name of one of this kernel's linked hosts (approval.linkedHosts). The move writes to its Incus through that host's incusSocket.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "instances": {
+              "items": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project",
+                  "name"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "message": {
+              "type": "string"
+            },
+            "move": {
+              "type": "string"
+            },
+            "phase": {
+              "type": "string"
+            },
+            "plan": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "move",
+            "plan",
+            "target",
+            "phase",
+            "instances",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, ran, is not the approved one, or whose instances changed, another move holds, or have an earlier copy that may run. Per instance, Incus pushes it and its volumes in rounds while it runs, stops it, sends the last round (the whole volume today), starts the copy once the source reads Stopped, and checks it; downtime runs from the stop to the passed checks. A failure rolls that instance back, never deleting the only copy or leaving both running: only the recorded copy is removed, once the source is read back. The source is kept, stopped, until instance_move_finish.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "instance_move_status",
+      "params": [
+        {
+          "name": "move",
+          "required": false,
+          "schema": {
+            "description": "The move's id, as instance_move answered it: mv- and twelve hex digits.",
+            "maxLength": 15,
+            "minLength": 15,
+            "pattern": "^mv-[0-9a-f]{12}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "moves": {
+              "items": {
+                "properties": {
+                  "endedAt": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "finish": {
+                    "properties": {
+                      "available": {
+                        "type": "boolean"
+                      },
+                      "deletes": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "reason": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "available",
+                      "reason",
+                      "deletes"
+                    ],
+                    "type": "object"
+                  },
+                  "instances": {
+                    "items": {
+                      "properties": {
+                        "bytesMoved": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "bytesTotal": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "checks": {
+                          "items": {
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "downtimeMs": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "elapsedMs": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "phase": {
+                          "type": "string"
+                        },
+                        "project": {
+                          "type": "string"
+                        },
+                        "rateBytesPerSecond": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "result": {
+                          "anyOf": [
+                            {
+                              "enum": [
+                                "moved",
+                                "rolled_back",
+                                "failed",
+                                "finished"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "roundsDone": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "roundsTotal": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "timeLeftMs": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "project",
+                        "name",
+                        "phase",
+                        "result",
+                        "roundsDone",
+                        "roundsTotal",
+                        "bytesMoved",
+                        "bytesTotal",
+                        "rateBytesPerSecond",
+                        "elapsedMs",
+                        "timeLeftMs",
+                        "downtimeMs",
+                        "reason",
+                        "checks"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "interrupted": {
+                    "type": "boolean"
+                  },
+                  "move": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "type": "string"
+                  },
+                  "plan": {
+                    "type": "string"
+                  },
+                  "startedAt": {
+                    "type": "integer"
+                  },
+                  "target": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "move",
+                  "plan",
+                  "target",
+                  "phase",
+                  "startedAt",
+                  "endedAt",
+                  "interrupted",
+                  "instances",
+                  "finish"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "moves"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "How a move stands, read-only: its phase, and per instance the rounds done of the total, the bytes moved of the measured bytes, the rate, the time it has taken and the time left, the measured downtime and the checks once it ends, and whether it can be finished. A figure Incus has not given yet is null. Without a move id, the recent moves.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "instance_move_finish",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "move",
+          "required": true,
+          "schema": {
+            "description": "The move's id, as instance_move answered it: mv- and twelve hex digits.",
+            "maxLength": 15,
+            "minLength": 15,
+            "pattern": "^mv-[0-9a-f]{12}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "deleted": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kept": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "message": {
+              "type": "string"
+            },
+            "move": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "move",
+            "deleted",
+            "kept",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Finish a verified move, once the owner has approved it as an action proposal: delete each moved source instance on this host and the custom volumes it took with it, each only once its copy is read back on the target. It is offered only after the move's checks passed, never on a timer and never by itself; a source that runs again, or a volume another instance uses, is kept and named. instance_move_status shows what it would delete.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
     },
     {
       "name": "github_oauth_app_set",

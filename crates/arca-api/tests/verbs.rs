@@ -41,6 +41,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "plan_list",
             "action_propose",
             "plan_decline",
+            "plan_renew",
             "approval_submit",
             "action_approve",
             "peer_keys_sync",
@@ -104,6 +105,10 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "registry_secret_remove",
             "host_network_restore",
             "instance_move_preflight",
+            "instance_move_plan",
+            "instance_move",
+            "instance_move_status",
+            "instance_move_finish",
             "github_oauth_app_set",
             "github_connect",
             "github_connect_status",
@@ -133,6 +138,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("plan_list", VerbClass::L, Scope::Viewer, false, false),
         ("action_propose", VerbClass::L, Scope::Viewer, false, false),
         ("plan_decline", VerbClass::L, Scope::Doctor, true, false),
+        ("plan_renew", VerbClass::L, Scope::Operator, true, false),
         ("approval_submit", VerbClass::L, Scope::Doctor, true, true),
         ("action_approve", VerbClass::L, Scope::Doctor, true, true),
         ("peer_keys_sync", VerbClass::L, Scope::Doctor, true, false),
@@ -217,6 +223,28 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
             Scope::Viewer,
             false,
             false,
+        ),
+        (
+            "instance_move_plan",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
+        ),
+        ("instance_move", VerbClass::L, Scope::Doctor, true, true),
+        (
+            "instance_move_status",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
+        ),
+        (
+            "instance_move_finish",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            true,
         ),
         (
             "github_oauth_app_set",
@@ -389,6 +417,8 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "function_create",
         "function_remove",
         "host_network_restore",
+        "instance_move",
+        "instance_move_finish",
         "route_add",
         "route_remove",
         "instance_import",
@@ -504,6 +534,39 @@ fn plan_verb_schemas_equal_their_table_rows() {
             &["plan", "retained"]
         )
     );
+
+    // plan_renew takes nothing and answers with each plan it made again and each lapsed plan it did not, with why.
+    let renew = verb("plan_renew").expect("present");
+    assert_eq!((renew.params)(), closed_with(json!({}), &[]));
+    assert_eq!(
+        (renew.result)(),
+        open(
+            json!({
+                "renewed": { "type": "array", "items": open(
+                    json!({
+                        "plan": hex64(),
+                        "entry": { "type": "string" },
+                        "objects": { "type": "array", "items": obj.clone() },
+                        "createdAt": { "type": "integer" },
+                        "expiresAt": { "type": "integer" },
+                    }),
+                    &["plan", "entry", "objects", "createdAt", "expiresAt"]
+                ) },
+                "notRenewed": { "type": "array", "items": open(
+                    json!({
+                        "plan": hex64(),
+                        "entry": { "type": "string" },
+                        "why": { "type": "string" },
+                    }),
+                    &["plan", "entry", "why"]
+                ) },
+            }),
+            &["renewed", "notRenewed"]
+        )
+    );
+    assert!(!may_call(Scope::Viewer, renew));
+    assert!(!may_call(Scope::Doctor, renew));
+    assert!(may_call(Scope::Operator, renew));
 
     let submit = verb("approval_submit").expect("present");
     assert_eq!(
@@ -1238,6 +1301,95 @@ fn gpu_section() -> Value {
     )
 }
 
+/// The power block: every source with a figure or a reason, the measured sum and what it leaves out.
+fn power() -> Value {
+    let sum = || json!({ "type": ["number", "null"] });
+    let text = || json!({ "type": ["string", "null"] });
+    let mut schema = open(
+        json!({
+            "cpu": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "added": { "type": "boolean" },
+                    "packages": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "zone": { "type": "string" },
+                                "name": { "type": "string" },
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["zone", "name", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "added", "packages"]
+            ),
+            "gpu": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "cards": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "pci": text(),
+                                "card": text(),
+                                "source": { "type": "string", "enum": ["nvidia-smi", "hwmon"] },
+                                "basis": text(),
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["pci", "card", "source", "basis", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "cards"]
+            ),
+            "chip": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "added": { "type": "boolean" },
+                    "sensors": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "pci": text(),
+                                "card": text(),
+                                "label": text(),
+                                "wholeChip": { "type": "boolean" },
+                                "basis": { "type": "string" },
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["pci", "card", "label", "wholeChip", "basis", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "added", "sensors"]
+            ),
+            "measuredPowerW": sum(),
+            "notAdded": { "type": "array", "items": { "type": "string" } },
+            "notIncluded": { "type": "array", "items": { "type": "string" } }
+        }),
+        &[
+            "cpu",
+            "gpu",
+            "chip",
+            "measuredPowerW",
+            "notAdded",
+            "notIncluded",
+        ],
+    );
+    schema["description"] = json!(
+        "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall."
+    );
+    schema
+}
+
 fn host_sample() -> Value {
     json!({
         "type": "object",
@@ -1248,7 +1400,10 @@ fn host_sample() -> Value {
                     "usedPct": { "type": ["number", "null"] },
                     "cores": { "type": "integer" },
                     "coresKnown": { "type": "boolean" },
-                    "reason": { "type": ["string", "null"] }
+                    "reason": { "type": ["string", "null"] },
+                    "threads": { "type": ["integer", "null"] },
+                    "physicalCores": { "type": ["integer", "null"] },
+                    "busyThreads": { "type": ["number", "null"] }
                 }),
                 &["usedPct", "cores", "coresKnown", "reason"]
             ),
@@ -1333,7 +1488,28 @@ fn host_sample() -> Value {
                     &["project", "name", "why"]
                 ),
                 "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read."
-            }
+            },
+            "power": power(),
+            "instanceCpu": open(
+                json!({
+                    "instances": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "project": { "type": "string" },
+                                "name": { "type": "string" },
+                                "busyThreads": { "type": ["number", "null"] },
+                                "reason": { "type": ["string", "null"] }
+                            }),
+                            &["project", "name", "busyThreads", "reason"]
+                        )
+                    },
+                    "omitted": { "type": "integer" },
+                    "omittedBusyThreads": { "type": "number" },
+                    "reason": { "type": ["string", "null"] }
+                }),
+                &["instances", "omitted", "omittedBusyThreads", "reason"]
+            )
         },
         "required": [
             "at", "cpu", "load", "memory", "psi", "cpuTempC", "gpuBusyPct", "gpu", "pools", "network", "projects",
@@ -1514,6 +1690,8 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "deploy_rollback",
             "deploy_remove",
             "function_remove",
+            "instance_move",
+            "instance_move_finish",
             "github_disconnect",
             "instance_import_undo",
         ]
@@ -1728,7 +1906,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 29);
+    assert_eq!(actions.len(), 31);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));

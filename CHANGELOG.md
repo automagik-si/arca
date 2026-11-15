@@ -13,6 +13,15 @@ security groups as an Incus network ACL, a cloud-init seed from its context, a f
 Ceph pool (read-only) into the Incus Ceph pool, and a read-back after the start. `instance_import_undo` stops and
 removes an imported VM; the source is never written. A node needs `kernel.instanceImport` for either.
 
+`action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
+`service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`
+row, the node asks anonymously over HTTPS for a pull token, the repository's tags (at most 5 pages) and the digests of
+the newest 50 version tags. Nothing else is sent, no redirect is followed, and one round ends within 5 seconds. The
+answer is kept as one map for at most ten minutes, so a node asks at most once a minute when unnamed digests are
+proposed, and otherwise once every ten minutes. A node that cannot reach ghcr.io shows `version unknown` and refuses
+nothing; a node with an egress allowlist that should name versions must allow `ghcr.io:443`, which Incus already uses
+to pull the image.
+
 One MCP door reaches the whole fleet: every read the door serves, and `action_propose`, take an optional `node`, the
 name of one of `approval.linkedHosts` (`arca_status` lists them). The caller is checked on this kernel first, as for a
 call of its own; the call then runs on that node with its linked token, and its answer comes back as the node gave it,
@@ -38,6 +47,33 @@ changes. A crash or a power loss now loses at most the raw samples of the minute
 empty after a start until it fills again, and a read of it says so in words. A store from an earlier release has its raw
 rows read into the ring at the first open and deleted from the file at the first rollup.
 
+`node_metrics` and `arca metrics --json` say what the machine's compute and power are, as additions; no field a client
+reads today changes. `cpu.threads`, `cpu.physicalCores` and `cpu.busyThreads` tell the logical CPUs, the physical cores
+and how many threads were busy apart: `cpu.cores` keeps counting logical CPUs, so a 12-core, 24-thread machine still
+says 24 there. A new `power` block gives each CPU package's power in watts from its powercap energy counter (a rate
+between two samples, through the counter's wrap), their sum, each discrete GPU's own power (an NVIDIA card's
+`power.draw`, or a discrete card's hwmon `power1_input`), and the whole-chip sensors in `power.chip`: on an APU, amdgpu's
+`PPT` sensor holds the CPU and the integrated GPU, so it is never listed as a GPU. Arca tells the two apart by what the
+driver shows beside the sensor (the vddnb voltage only on an APU; fan controls or `pcie_bw` only on a discrete card); a
+sensor it cannot classify is never added. `measuredPowerW` holds each part once: the whole-chip sensors when they have a
+figure, otherwise the CPU packages, and never both. `notAdded` names what was measured and left out because it overlaps,
+and `notIncluded` what the sum does not hold: memory, disks, fans, the power supply's own loss, and any part without a
+figure. It is not the power at the wall. A source without a figure says why in words: no counter on this machine, the counter is there
+and this process may not read it (most kernels let only root read the package counters; the file is named), or only
+one sample so far. A new `instanceCpu` block gives each running instance's CPU as threads in use since its previous
+read, with its project and name: at most 50 rows, the largest first, and a count and a sum of the rest. An instance
+that started, restarted or was replaced between two reads has no figure for that sample, never a negative or a huge
+one. `/metrics` gains `arca_node_cpu_threads`, `arca_node_cpu_physical_cores`, `arca_node_cpu_busy_threads`,
+`arca_node_cpu_package_power_watts`, `arca_node_cpu_power_watts`, `arca_node_gpu_power_watts`,
+`arca_node_chip_power_watts`, `arca_node_power_measured_watts` and `arca_instance_cpu_busy_threads`.
+
+A delete plan nobody approved within its fifteen minutes can be shown to the owner again without a restart: the new
+operator verb `plan_renew` puts each lapsed plan back with fifteen new minutes and the same id, from what the journal still
+holds, and says why for each one it leaves (a declined entry, an entry the desired state carries again, nothing left to
+delete, or an earlier effect still unresolved). It sends nothing to Incus and writes no journal line. Until now a failed
+create that had already made its data volume left that volume, and the network rule held for it, with no card to approve
+once the plan lapsed.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and
@@ -55,6 +91,14 @@ one-hour registration token (the secret `GITHUB_REGISTRATION_TOKEN`) registers e
 each runner keeps its own registration in a root-only folder, the token is deleted once every slot is registered, and
 the pool holds no GitHub credential. This mode keeps each slot's container, work directory and caches between jobs: a
 bridge until each job has a machine of its own. The `jit` mode is unchanged.
+
+`service_update` takes `withTemplate: true`: the same rebuild also makes the service what its current template says,
+as `service_reconfigure` would (environment, links' values, secrets, ports, `rawLxc`, no-new-privileges, entrypoint),
+behind one owner card and with one restart. The card shows the new digest and every setting that changes, secrets by
+name only, and the approval binds both; an edit of the template after the proposal needs a new card. If the new
+version does not come back healthy, Arca puts back the old image and the old record, its entrypoint among them: a
+service that ran its image's own entrypoint runs it again. A reconcile now marks an entrypoint it writes
+(`user.arca.entrypoint`) and takes off only a marked one. Without the flag an update is unchanged.
 
 `service_reconfigure` makes a running container service what its current template says (environment values, the
 secrets it declares, ports, links' values, `rawLxc` and `noNewPrivileges`) behind one owner card that shows the exact
