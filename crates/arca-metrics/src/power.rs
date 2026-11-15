@@ -35,6 +35,9 @@ pub const NO_GPU_COUNTER: &str = "no GPU power counter on this machine";
 pub const GPU_IN_CHIP: &str =
     "the integrated GPU is measured with the whole chip, in the chip sensors";
 
+/// Why the GPUs have no figure of their own: a GPU's sensor is listed in `chip`, not certain to be the card's alone.
+pub const GPU_NOT_CLASSIFIED: &str = "the GPU's sensor is listed in the chip sensors and not counted as a GPU: this machine does not tell whether it includes the CPU";
+
 /// Why `chip` has no figure: no whole-chip sensor exists here.
 pub const NO_CHIP_SENSOR: &str = "no whole-chip power sensor on this machine";
 
@@ -126,7 +129,7 @@ impl Default for Power {
                 added: false,
                 packages: Vec::new(),
             },
-            gpu_total(Vec::new(), false),
+            gpu_total(Vec::new(), NO_GPU_COUNTER),
             chip_total(Vec::new()),
         )
     }
@@ -444,18 +447,23 @@ pub(crate) fn devices(sys_root: &Path, section: &GpuSection) -> (GpuPower, ChipP
     }
     cards.sort_by(|a, b| (&a.pci, &a.card).cmp(&(&b.pci, &b.card)));
     let chip = chip_total(sensors);
-    let in_chip = chip.sensors.iter().any(|sensor| sensor.whole_chip);
-    (gpu_total(cards, in_chip), chip)
+    let no_card = if chip.sensors.iter().any(|sensor| sensor.whole_chip) {
+        GPU_IN_CHIP
+    } else if chip.sensors.is_empty() {
+        NO_GPU_COUNTER
+    } else {
+        GPU_NOT_CLASSIFIED
+    };
+    (gpu_total(cards, no_card), chip)
 }
 
 /// The GPU block of `cards`: their sum when every card has a figure, and the reason otherwise. With no card, the reason
-/// says whether an integrated GPU is measured in a whole-chip sensor.
-fn gpu_total(cards: Vec<GpuCardPower>, in_chip: bool) -> GpuPower {
+/// is `no_card`: whether a GPU is measured in the chip sensors, certain or not, or there is no counter at all.
+fn gpu_total(cards: Vec<GpuCardPower>, no_card: &str) -> GpuPower {
     if cards.is_empty() {
-        let reason = if in_chip { GPU_IN_CHIP } else { NO_GPU_COUNTER };
         return GpuPower {
             power_w: None,
-            reason: Some(reason.to_string()),
+            reason: Some(no_card.to_string()),
             cards,
         };
     }
@@ -824,7 +832,9 @@ mod tests {
     #[test]
     fn an_amdgpu_sensor_is_told_by_the_signs_the_driver_shows_and_otherwise_is_not_certain() {
         let root = std::env::temp_dir().join(format!("arca-classify-{}", std::process::id()));
-        let cases: [(&str, &[&str], &[&str], SensorScope, &str); 6] = [
+        // A tag, the hwmon's sign files, the device's sign files, and the expected scope and basis.
+        type Case<'a> = (&'a str, &'a [&'a str], &'a [&'a str], SensorScope, &'a str);
+        let cases: [Case; 6] = [
             (
                 "apu",
                 &["in1_input", "in1_label"],

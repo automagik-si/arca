@@ -2347,7 +2347,9 @@ The `power` block measures what this machine can measure of its own power, and s
   card's own (see below). `power.gpu.cards` lists each with `pci`, `card` (the DRM name, for hwmon), `source`
   (`nvidia-smi` or `hwmon`), `basis` (for hwmon, why the sensor is the card's own), `powerW` and `reason`. A card is a
   reading at the sample, so it has a figure from the first sample. When the only GPU is integrated, `power.gpu.reason`
-  says `the integrated GPU is measured with the whole chip, in the chip sensors`.
+  says `the integrated GPU is measured with the whole chip, in the chip sensors`. When the only GPU sensor is one Arca
+  cannot classify (see below), it says `the GPU's sensor is listed in the chip sensors and not counted as a GPU: this
+  machine does not tell whether it includes the CPU`.
 - **Whole-chip sensors** (`power.chip`). On an APU, amdgpu's hwmon power is the whole chip's: the kernel's amdgpu hwmon
   documentation says `power1_input` is "power used by the SoC" and "on APUs this includes the CPU". Such a sensor is never
   listed as a GPU. `power.chip.sensors` lists each with `pci`, `card`, `label` (such as `PPT`), `wholeChip`, `basis`,
@@ -2387,7 +2389,9 @@ A source without a figure carries a reason in plain words:
 | Reason | When |
 |--------|------|
 | `no CPU power counter on this machine` | no package zone exists, as in most virtual machines |
-| `no GPU power counter on this machine` | no discrete card with a power reading, and no whole-chip sensor, exists |
+| `no GPU power counter on this machine` | no discrete card with a power reading, and no chip sensor, exists |
+| `the integrated GPU is measured with the whole chip, in the chip sensors` | `power.gpu.reason` when no discrete card exists and a whole-chip sensor does |
+| `the GPU's sensor is listed in the chip sensors and not counted as a GPU: this machine does not tell whether it includes the CPU` | `power.gpu.reason` when no discrete card exists and the only chip sensors are ones Arca cannot classify |
 | `no whole-chip power sensor on this machine` | `power.chip.reason` when no chip sensor exists |
 | `the counter <file> is there, and this process may not read it: most kernels let only root read it` | the file exists and reading it is refused. Since 2020 most kernels make the package counters readable by root only; Arca does not change that, and a kernel not run as root reports this |
 | `the counter <file> could not be read` | the file exists and did not read as a number |
