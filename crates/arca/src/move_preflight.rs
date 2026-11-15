@@ -22,6 +22,9 @@ use serde_json::{Map, Value, json};
 
 use crate::config::{NodeConfig, host_name_ok};
 
+/// The size Incus gives a block volume that neither the volume nor its pool sizes (`DefaultBlockSize`).
+const INCUS_DEFAULT_BLOCK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 /// The most instances one call checks.
 pub const MAX_INSTANCES: usize = 50;
 /// The checks of every row, in the order each row lists them: the verb table's own list.
@@ -1084,11 +1087,8 @@ impl Run<'_> {
                             "volume.size",
                         )
                     })
-                    .ok_or_else(|| {
-                        format!(
-                            "{what} of the virtual machine {label} has no size Incus names (its own size or the pool's volume.size)"
-                        )
-                    })?
+                    // Neither names one: Incus made the volume at its own default.
+                    .unwrap_or(INCUS_DEFAULT_BLOCK_BYTES)
                 } else {
                     self.measure_volume(&volume_path, volume_pool, false, &what)?
                 };
@@ -1160,6 +1160,15 @@ impl Run<'_> {
         if let Some(bytes) = root {
             return Ok((bytes, "its root disk device's size"));
         }
+        // The pool's volume.size before the volume state's total: Incus makes the disk at the pool's default, but answers
+        // the state's total from the root device's size or its own 10 GiB default, never from the pool.
+        if let Some(bytes) = configured(
+            self.source
+                .opt(&format!("/1.0/storage-pools/{}", seg(pool))),
+            "volume.size",
+        ) {
+            return Ok((bytes, "the pool's volume.size"));
+        }
         let total = self
             .source
             .opt(&format!("{volume}/state{query}"))
@@ -1167,13 +1176,6 @@ impl Run<'_> {
             .filter(|bytes| *bytes > 0);
         if let Some(bytes) = total {
             return Ok((bytes, "the size its volume's state reports"));
-        }
-        if let Some(bytes) = configured(
-            self.source
-                .opt(&format!("/1.0/storage-pools/{}", seg(pool))),
-            "volume.size",
-        ) {
-            return Ok((bytes, "the pool's volume.size"));
         }
         Err(format!(
             "{label} is a virtual machine whose disk on pool {pool} has no size Incus names (its volume, its root disk device, its volume's state and the pool's volume.size say none)"

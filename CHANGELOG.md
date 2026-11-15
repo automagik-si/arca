@@ -9,17 +9,20 @@ Write under this comment only what a reader needs beyond those lines; the releas
 
 `instance_move` now moves a stopped virtual machine, where every virtual machine was refused before. It stays stopped:
 nothing starts or stops it here, its copy is made once and started on the target, and the move counts only once the
-copy's guest answers (its Incus agent, or an address on a network card); otherwise the copy is deleted and the source is
-left as it was. A virtual machine that runs is still refused, with the words to stop it first. When the linked host's
-entry names its Ceph cluster (`approval.linkedHosts[].ceph`: `cluster`, and optionally `client` and `readClient`) and
-the machine's pools are Ceph on both hosts, the disks go by `rbd export-diff | rbd import-diff` from this node into an
-empty machine Incus makes there at the source's exact size, between two Ceph clusters in either direction, reading the
-source's cluster only; otherwise Incus pushes it, as before for a container. The preflight now sizes a virtual
-machine's Ceph, zfs or lvm disk from what Incus says (its volume's size, its root device's, its volume state's or the
-pool's `volume.size`), counted whole, where it said the disk could not be measured. The card names both nodes, the
-disk's size, that the machine stays stopped, and for a copy by Ceph each side's cluster, pool and client.
-OPERATING.md ("Stopped virtual machines") says what a copy by Ceph needs on the node. Not yet run between two real Ceph
-clusters.
+copy's guest answers: its Incus agent, or one of its addresses answering a TCP connection from this node (an address
+Incus lists for a guest that never booted does not count). Otherwise the copy is deleted and the source is left as it
+was. A virtual machine that runs is still refused, with the words to stop it first. When the linked host's entry names
+its Ceph cluster (`approval.linkedHosts[].ceph`: `cluster`, and optionally `client` and `readClient`) and every pool the
+machine uses is Ceph on both hosts, its disks and its config image (UEFI variables, TPM state) go by `rbd export-diff |
+rbd import-diff` from this node into an empty machine Incus makes there at the source's exact size, between two Ceph
+clusters in either direction, reading the source's cluster only; a source started and stopped again during the copy
+makes the copy roll back. Otherwise Incus pushes it, as before for a container. The moved copy keeps its cloud-init
+instance id, so cloud-init does not run its first-boot steps again (containers too). The preflight now sizes a virtual
+machine's Ceph, zfs or lvm disk from what Incus says (its volume's size, its root device's, the pool's `volume.size`,
+else its volume state's), counted whole, where it said the disk could not be measured. The card names both nodes, the
+disk's size, that the machine stays stopped, its own rollback promise, and for a copy by Ceph each side's cluster, pool
+and client; the finish card says the source's snapshots go with it. OPERATING.md ("Stopped virtual machines") says what
+a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
 
 ## 0.30.0 (2026-11-15)
 

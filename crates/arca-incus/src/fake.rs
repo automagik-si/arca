@@ -10,7 +10,7 @@
 //!
 //! The `recursion=2` instance listing is the `recursion=1` rows, each with a `state` object. A running instance's `state` holds
 //! `cpu.usage` (nanoseconds) and `memory.usage` (bytes), set by [`FakeIncus::set_instance_usage`] and zero until a test sets them.
-//! A running instance's cards are in its `state` only when [`FakeIncus::set_live_network`] set them. A stopped instance's `state` is `null`. [`FakeIncus::set_last_used`] sets an instance's `last_used_at`, as a start does.
+//! A running instance's cards are in its `state` only when [`FakeIncus::set_live_network`] set them. A stopped instance's `state` is `null`. [`FakeIncus::set_last_used`] sets an instance's `last_used_at`, as a start does (a start through the fake sets it too).
 //!
 //! Operations: the listing groups every operation the fake holds by its status in lower case, as Incus does. A held operation
 //! ([`FakeIncus::hold_operation`], [`FakeIncus::hold_create`]) stays running (status code 103) and names its object in
@@ -272,6 +272,9 @@ struct Store {
     disk_usage: BTreeMap<(String, String), u64>,
     /// The instances, by project and name, whose guest has no Incus agent: a running one reports `processes: -1`.
     agentless: std::collections::BTreeSet<(String, String)>,
+    /// The virtual machines, by project and name, whose Incus agent answers: a running one reports one process. Every
+    /// other running virtual machine reports `processes: -1`, as Incus does without the agent.
+    agents: std::collections::BTreeSet<(String, String)>,
 }
 
 /// One DHCP lease: the network, the MAC that holds it and its address, and whether a device's `ipv4.address` pinned it.
@@ -348,6 +351,9 @@ enum Route {
     OsNetwork,
     PoolResources(String),
     PoolObject(String),
+    /// A virtual machine's volume state, by its instance: Incus answers its total from the root device's size, else its own
+    /// 10 GiB default, never from the pool's `volume.size`.
+    VmVolumeState(Address),
     NetworkLeases(String),
     InstanceState(Address),
     InstanceRebuild(Address),
@@ -436,6 +442,7 @@ impl Shared {
             live: BTreeMap::new(),
             disk_usage: BTreeMap::new(),
             agentless: std::collections::BTreeSet::new(),
+            agents: std::collections::BTreeSet::new(),
         };
         for index in 0..store.objects.len() {
             store.expand(index, false);
@@ -856,12 +863,24 @@ impl FakeIncus {
     }
 
     /// The instance `name` in `project`, held now or made later (a move's copy), has no Incus agent in its guest: running,
-    /// its `state` reports `processes: -1`, as Incus does for a virtual machine whose agent does not answer. Every other
-    /// running instance reports one process. It records no write.
+    /// its `state` reports `processes: -1`, as Incus does for a virtual machine whose agent does not answer, and each card
+    /// on a network also reports the address Incus derives from its MAC (EUI-64, in `fd42:4242:4242:4242::/64`), as it does
+    /// on a managed bridge with IPv6 whether or not the guest booted. A running virtual machine is so unless [`Self::agent`]
+    /// named it; a running container reports one process unless this names it. It records no write.
     pub fn agentless(&self, project: &str, name: &str) {
-        lock(&self.shared.store)
-            .agentless
-            .insert((project.to_string(), name.to_string()));
+        let mut store = lock(&self.shared.store);
+        let key = (project.to_string(), name.to_string());
+        store.agents.remove(&key);
+        store.agentless.insert(key);
+    }
+
+    /// The virtual machine `name` in `project`, held now or made later (a move's copy), has an Incus agent that answers:
+    /// running, its `state` reports one process. It records no write.
+    pub fn agent(&self, project: &str, name: &str) {
+        let mut store = lock(&self.shared.store);
+        let key = (project.to_string(), name.to_string());
+        store.agentless.remove(&key);
+        store.agents.insert(key);
     }
 
     /// Sets the network cards the running instance `name` in `project` reports in its live state, as a guest's agent does:
@@ -1505,6 +1524,14 @@ fn parse(target: &str) -> Option<Route> {
         ["storage-pools", pool, "resources"] if query.is_empty() => {
             Route::PoolResources((*pool).to_string())
         }
+        [
+            "storage-pools",
+            _,
+            "volumes",
+            "virtual-machine",
+            name,
+            "state",
+        ] => Route::VmVolumeState(address("instance", "", name)),
         ["storage-pools", pool, "volumes", "custom"] => {
             Route::Collection(address("volume", pool, ""))
         }
@@ -1650,6 +1677,25 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                 .map(|(name, _)| json!({ "name": name }))
                 .collect(),
         )),
+        ("GET", Route::VmVolumeState(address)) => {
+            let Some(index) = store.find(&address) else {
+                return (404, String::new(), error_envelope(404, "not found"));
+            };
+            let body = &store.objects[index].body;
+            let root = body
+                .get("expanded_devices")
+                .or_else(|| body.get("devices"))
+                .and_then(Value::as_object)
+                .and_then(|devices| {
+                    devices.values().find(|device| {
+                        device.get("type").and_then(Value::as_str) == Some("disk")
+                            && device.get("path").and_then(Value::as_str) == Some("/")
+                    })
+                })
+                .and_then(|device| device.get("size")?.as_str())
+                .and_then(size_bytes);
+            sync(json!({ "usage": { "used": 0, "total": root.unwrap_or(10 << 30) } }))
+        }
         ("GET", Route::PoolResources(pool)) => {
             match store.pools.iter().find(|(name, _)| *name == pool) {
                 Some((_, resources)) => sync(resources.clone()),
@@ -3245,6 +3291,13 @@ impl Store {
     /// Starts the instance at `index`. Each NIC on a network gets its MAC (a new one is kept in `volatile.<dev>.hwaddr`) and
     /// its IPv4: a device's `ipv4.address` pins its lease, and a MAC without a lease is leased a free address.
     fn start(&mut self, index: usize, seed: u64) {
+        // Incus records when the instance last started, at every start.
+        if let Some(body) = self.objects[index].body.as_object_mut() {
+            body.insert(
+                "last_used_at".to_string(),
+                json!(format!("2000-01-01T00:00:00.{seed:09}Z")),
+            );
+        }
         // Incus records that the instance has run, as it does at every start.
         if let Some(config) = self.objects[index]
             .body
@@ -3565,6 +3618,55 @@ fn nic_mac(body: &Value, name: &str, device: &Map<String, Value>) -> Option<Stri
 }
 
 /// An instance's state: its status and, while it runs, each NIC's MAC and the IPv4 its device pins or its MAC leases.
+/// A size as Incus writes one: plain bytes, or a number with `B`, `KiB`, `MiB`, `GiB` or `TiB`.
+fn size_bytes(text: &str) -> Option<u64> {
+    let digits = text.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &text[digits.len()..];
+    let shift = match unit {
+        "" | "B" => 0,
+        "KiB" => 10,
+        "MiB" => 20,
+        "GiB" => 30,
+        "TiB" => 40,
+        _ => return None,
+    };
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
+/// The EUI-64 address of `mac` in the /64 `prefix` (four groups), as Incus derives it on a bridge with SLAAC.
+fn eui64(prefix: &str, mac: &str) -> Option<String> {
+    let bytes: Vec<u8> = mac
+        .split(':')
+        .map(|part| u8::from_str_radix(part, 16).ok())
+        .collect::<Option<_>>()?;
+    let [a, b, c, d, e, f] = bytes[..] else {
+        return None;
+    };
+    Some(format!(
+        "{prefix}:{:x}:{:x}:{:x}:{:x}",
+        u16::from_be_bytes([a ^ 0x02, b]),
+        u16::from_be_bytes([c, 0xff]),
+        u16::from_be_bytes([0xfe, d]),
+        u16::from_be_bytes([e, f])
+    ))
+}
+
+/// The processes a held instance's state counts: none when it is stopped; for a running virtual machine one when its agent
+/// answers ([`FakeIncus::agent`]), else `-1`; for a running container one, unless [`FakeIncus::agentless`] named it.
+fn processes_of(store: &Store, index: usize) -> i64 {
+    let object = &store.objects[index];
+    let key = (object.project.clone(), object.name.clone());
+    if text_of(&object.body, "status") != "Running" {
+        0
+    } else if text_of(&object.body, "type") == "virtual-machine" {
+        if store.agents.contains(&key) { 1 } else { -1 }
+    } else if store.agentless.contains(&key) {
+        -1
+    } else {
+        1
+    }
+}
+
 fn instance_state(store: &Store, address: &Address) -> Answer {
     let Some(index) = store.find(address) else {
         return (404, String::new(), error_envelope(404, "not found"));
@@ -3586,10 +3688,18 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
                     .find(|lease| lease.hwaddr == mac)
                     .map(|lease| lease.address.clone())
             });
-        let addresses: Vec<Value> = address
+        let mut addresses: Vec<Value> = address
             .into_iter()
             .map(|address| json!({ "family": "inet", "address": address, "netmask": "24", "scope": "global" }))
             .collect();
+        // Without a guest agent Incus still lists, for a card on a managed bridge with IPv6, the address it derives from
+        // the card's MAC (EUI-64), whether or not the guest booted.
+        if processes_of(store, index) < 0
+            && device.contains_key("network")
+            && let Some(derived) = eui64("fd42:4242:4242:4242", &mac)
+        {
+            addresses.push(json!({ "family": "inet6", "address": derived, "netmask": "64", "scope": "global" }));
+        }
         network.insert(
             name,
             json!({ "hwaddr": mac, "addresses": addresses, "state": "up", "type": "broadcast" }),
@@ -3607,16 +3717,7 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
         .copied()
         .filter(|_| running)
         .unwrap_or((0, 0));
-    let processes: i64 = if !running {
-        0
-    } else if store
-        .agentless
-        .contains(&(object.project.clone(), object.name.clone()))
-    {
-        -1
-    } else {
-        1
-    };
+    let processes = processes_of(store, index);
     let mut state = json!({
         "status": status,
         "status_code": if running { 103 } else { 102 },

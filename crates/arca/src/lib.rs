@@ -53,7 +53,6 @@ pub mod lifecycle;
 pub mod linked;
 pub mod mcp_oauth;
 pub mod move_preflight;
-pub mod move_rbd;
 pub mod omni;
 mod passkey_change;
 pub mod peer_sync;

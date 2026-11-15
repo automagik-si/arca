@@ -148,13 +148,16 @@ fn names_ok(names: &[&str]) -> Result<(), IncusError> {
 }
 
 /// The config a moved instance takes: its own keys, without the volatile ones Incus keeps for one host (its uuid, its
-/// last state, its id map), but with the MAC addresses, so its cards keep their addresses.
+/// last state, its id map), but with the MAC addresses, so its cards keep their addresses, and with its cloud-init
+/// instance id, so cloud-init in the guest sees the same instance and does not run its per-instance steps again (new SSH
+/// host keys, `runcmd`).
 pub fn moved_config(config: &Map<String, Value>) -> Map<String, Value> {
     config
         .iter()
         .filter(|(key, _)| {
             !key.starts_with("volatile.")
                 || (key.ends_with(".hwaddr") && key.matches('.').count() == 2)
+                || key.as_str() == "volatile.cloud-init.instance-id"
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
@@ -703,14 +706,23 @@ mod tests {
     }
 
     #[test]
-    fn a_moved_config_keeps_its_own_keys_and_mac_addresses_only() {
+    fn a_moved_config_keeps_its_own_keys_mac_addresses_and_cloud_init_id_only() {
         let config = json!({
             "limits.cpu": "2", "user.note": "x", "volatile.uuid": "u", "volatile.eth0.hwaddr": "00:16:3e:00:00:01",
-            "volatile.last_state.power": "RUNNING", "volatile.idmap.current": "[]", "volatile.eth0.host_name": "veth1"
+            "volatile.last_state.power": "RUNNING", "volatile.idmap.current": "[]", "volatile.eth0.host_name": "veth1",
+            "volatile.cloud-init.instance-id": "c1"
         });
         let kept = moved_config(config.as_object().expect("object"));
         let keys: Vec<&str> = kept.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["limits.cpu", "user.note", "volatile.eth0.hwaddr"]);
+        assert_eq!(
+            keys,
+            [
+                "limits.cpu",
+                "user.note",
+                "volatile.cloud-init.instance-id",
+                "volatile.eth0.hwaddr"
+            ]
+        );
     }
 
     #[test]

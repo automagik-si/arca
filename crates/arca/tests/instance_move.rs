@@ -19,7 +19,6 @@ use arca::config::NodeConfig;
 use arca::handlers::{ActionExecutor, ActionSlot, Clock, plan_handlers_served};
 use arca::instance_move::{Moves, handlers as move_handlers};
 use arca::kernel::Kernel;
-use arca::move_rbd::Runner;
 use arca_api::{Scope, conforms, verb};
 use arca_incus::{FakeIncus, FakeState, PushPlan};
 use arca_kernel::canon::Digest;
@@ -27,6 +26,7 @@ use arca_kernel::identity::NodeKey;
 use arca_mcp::{CallError, Caller, ToolHandler};
 use arca_providers::incus::{Family, IncusProvider};
 use arca_reconcile::PluginSet;
+use arca_vmimport::Runner;
 use common::{HOST, NOW, Scratch, SkKey, approve_statement, verifier_for};
 use serde_json::{Value, json};
 
@@ -153,6 +153,16 @@ impl Rig {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("state")).expect("state");
+        let vms: Vec<(String, String)> = instances
+            .iter()
+            .filter(|one| one["type"] == "virtual-machine")
+            .map(|one| {
+                (
+                    one["project"].as_str().unwrap_or("shop").to_string(),
+                    one["name"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
         let names: Vec<(String, String)> = instances
             .iter()
             .map(|one| {
@@ -173,6 +183,10 @@ impl Rig {
             );
         }
         let target = host(&dir.join("target"), Vec::new(), target_mib, true);
+        // A virtual machine's copy boots and its Incus agent answers, unless a test says otherwise.
+        for (project, name) in &vms {
+            target.agent(project, name);
+        }
         source.link_migration(&target);
         let third = host(&dir.join("third"), Vec::new(), target_mib, true);
         fs::create_dir_all(dir.join("kernel")).expect("kernel dir");
@@ -548,14 +562,18 @@ fn a_no_go_blocks_the_plan_with_the_preflight_reasons() {
     assert!(!rig.journal().iter().any(|line| line["event"] == "plan"));
 }
 
+type Hook = Box<dyn Fn() + Send + Sync>;
+
 /// `rbd` as this node would run it, recorded: each image's size and watchers by `<cluster>:<pool>/<image>`, every
-/// command line in order, and a copy that may be told to fail.
+/// command line in order, a copy that may be told to fail, and what happens elsewhere during the copy.
 #[derive(Default)]
 struct CephFake {
     sizes: Mutex<HashMap<String, u64>>,
     watchers: Mutex<HashMap<String, Vec<String>>>,
     calls: Mutex<Vec<Vec<String>>>,
     fail_copy: Mutex<Option<String>>,
+    /// Runs once, at the first copy, before it.
+    during_copy: Mutex<Option<Hook>>,
 }
 
 impl CephFake {
@@ -605,6 +623,9 @@ impl Runner for CephFake {
     }
 
     fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String> {
+        if let Some(hook) = self.during_copy.lock().unwrap().take() {
+            hook();
+        }
         let mut calls = self.calls.lock().unwrap();
         calls.push(first.to_vec());
         calls.push(second.to_vec());
@@ -616,6 +637,18 @@ impl Runner for CephFake {
 }
 
 const GIB: u64 = 1024 * MIB;
+/// The size of a virtual machine's config image (its UEFI variables and TPM state) in these tests.
+const CONFIG: u64 = 100 * MIB;
+
+/// Gives `db`'s disk (1 GiB) and its config image on `cluster`, in the OSD pool `osd`, as Incus names them.
+fn vm_images(ceph: &CephFake, cluster: &str, osd: &str) {
+    ceph.image(
+        cluster,
+        &format!("{osd}/virtual-machine_shop_db.block"),
+        GIB,
+    );
+    ceph.image(cluster, &format!("{osd}/virtual-machine_shop_db"), CONFIG);
+}
 
 /// A stopped virtual machine `db` of the project `shop` on pool `default`, its root disk 1 GiB.
 fn vm() -> Value {
@@ -757,6 +790,18 @@ fn a_stopped_virtual_machine_on_one_cluster_moves_by_one_incus_push() {
         rows.iter()
             .any(|(label, _)| label == "Stopped virtual machines")
     );
+    // Its rollback promise is a stopped machine's: nothing starts the source.
+    let rollback = &rows
+        .iter()
+        .find(|(label, _)| label == "Rollback")
+        .unwrap()
+        .1;
+    assert!(
+        rollback.contains("The source stays stopped throughout: the move never starts it"),
+        "{rollback}"
+    );
+    assert!(!rollback.contains("starts the source again"), "{rollback}");
+    assert!(!rollback.contains("keeps running"), "{rollback}");
 }
 
 /// Two Ceph clusters, either way: node-b names its cluster, so the machine and its block volume are made empty there by
@@ -779,11 +824,7 @@ fn a_stopped_virtual_machine_moves_between_two_ceph_clusters_either_way() {
         let source_osd = format!("incus-{here}");
         let target_osd = format!("incus-{there}");
         for (cluster, osd) in [("ceph", &source_osd), (there, &target_osd)] {
-            ceph.image(
-                cluster,
-                &format!("{osd}/virtual-machine_shop_db.block"),
-                GIB,
-            );
+            vm_images(&ceph, cluster, osd);
             ceph.image(cluster, &format!("{osd}/custom_db-data.block"), 512 * MIB);
         }
         let (status, plan) = move_db(&rig);
@@ -807,6 +848,9 @@ fn a_stopped_virtual_machine_moves_between_two_ceph_clusters_either_way() {
                 "info",
                 "status",
                 "info",
+                "status",
+                "info",
+                "export-diff",
                 "export-diff",
                 "export-diff"
             ],
@@ -814,8 +858,30 @@ fn a_stopped_virtual_machine_moves_between_two_ceph_clusters_either_way() {
         );
         assert_eq!(
             ceph.on(there),
-            ["info", "import-diff", "info", "import-diff"],
+            [
+                "info",
+                "import-diff",
+                "info",
+                "import-diff",
+                "info",
+                "import-diff"
+            ],
             "{here} -> {there}"
+        );
+        // The volume, then the machine's config image (UEFI variables, TPM state), then its disk.
+        let exported: Vec<String> = ceph
+            .calls()
+            .into_iter()
+            .filter(|argv| argv[6] == "export-diff")
+            .map(|argv| argv[7].clone())
+            .collect();
+        assert_eq!(
+            exported,
+            [
+                format!("{source_osd}/custom_db-data.block"),
+                format!("{source_osd}/virtual-machine_shop_db"),
+                format!("{source_osd}/virtual-machine_shop_db.block"),
+            ]
         );
         let calls = ceph.calls();
         let export = calls.iter().find(|argv| argv[6] == "export-diff").unwrap();
@@ -908,6 +974,23 @@ fn a_stopped_virtual_machine_moves_between_two_ceph_clusters_either_way() {
             .1;
         assert!(transport.starts_with("no Incus push"), "{transport}");
         assert!(rows[0].1.contains("copied by Ceph (rbd)"), "{}", rows[0].1);
+        assert!(
+            rows[0]
+                .1
+                .contains("with its config image (its UEFI variables and TPM state)"),
+            "{}",
+            rows[0].1
+        );
+        assert!(
+            transport.contains("its empty custom volumes, to start it, to set its boot.autostart"),
+            "{transport}"
+        );
+        // The finish card says the source's snapshots, which a copy by Ceph left behind, go with it.
+        let deletes = status["finish"]["deletes"].to_string();
+        assert!(
+            deletes.contains("with its snapshots: they were not copied"),
+            "{deletes}"
+        );
     }
 }
 
@@ -922,8 +1005,8 @@ fn a_failed_ceph_copy_rolls_back_and_leaves_the_source_untouched() {
         Arc::clone(&ceph),
     );
     ceph_pools(&rig, "east", "west");
-    ceph.image("ceph", "incus-east/virtual-machine_shop_db.block", GIB);
-    ceph.image("west", "incus-west/virtual-machine_shop_db.block", GIB);
+    vm_images(&ceph, "ceph", "incus-east");
+    vm_images(&ceph, "west", "incus-west");
     *ceph.fail_copy.lock().unwrap() = Some("rbd failed: import-diff: connection reset".to_string());
     let (status, _) = move_db(&rig);
     let one = &status["instances"][0];
@@ -944,7 +1027,10 @@ fn a_failed_ceph_copy_rolls_back_and_leaves_the_source_untouched() {
         Some("Stopped")
     );
     assert!(rig.source.writes().is_empty(), "{:?}", rig.source.writes());
-    assert_eq!(ceph.on("ceph"), ["status", "info", "export-diff"]);
+    assert_eq!(
+        ceph.on("ceph"),
+        ["status", "info", "status", "info", "export-diff"]
+    );
     // The link's own client writes node-b's pool.
     let import = ceph
         .calls()
@@ -960,7 +1046,7 @@ fn a_virtual_machine_whose_disk_is_held_open_is_not_copied() {
     let ceph = Arc::new(CephFake::default());
     let rig = Rig::with_ceph(vec![vm()], json!({ "cluster": "west" }), Arc::clone(&ceph));
     ceph_pools(&rig, "east", "west");
-    ceph.image("ceph", "incus-east/virtual-machine_shop_db.block", GIB);
+    vm_images(&ceph, "ceph", "incus-east");
     ceph.watchers.lock().unwrap().insert(
         "ceph:incus-east/virtual-machine_shop_db.block".to_string(),
         vec!["192.0.2.77:0/3".to_string()],
@@ -975,7 +1061,7 @@ fn a_virtual_machine_whose_disk_is_held_open_is_not_copied() {
             .contains("is held open by 192.0.2.77:0/3"),
         "{one}"
     );
-    assert_eq!(ceph.on("ceph"), ["status"]);
+    assert_eq!(ceph.on("ceph"), ["status", "info", "status"]);
     assert!(ceph.on("west").is_empty());
     assert!(!rig.target.holds("instance", "shop", "db"));
     assert!(rig.source.writes().is_empty(), "{:?}", rig.source.writes());
@@ -990,8 +1076,8 @@ fn a_virtual_machine_copy_whose_guest_does_not_answer_is_rolled_back() {
     let ceph = Arc::new(CephFake::default());
     let rig = Rig::with_ceph(vec![quiet], json!({ "cluster": "west" }), Arc::clone(&ceph));
     ceph_pools(&rig, "east", "west");
-    ceph.image("ceph", "incus-east/virtual-machine_shop_db.block", GIB);
-    ceph.image("west", "incus-west/virtual-machine_shop_db.block", GIB);
+    vm_images(&ceph, "ceph", "incus-east");
+    vm_images(&ceph, "west", "incus-west");
     rig.target.agentless("shop", "db");
     let (status, _) = move_db(&rig);
     let one = &status["instances"][0];
@@ -1009,6 +1095,227 @@ fn a_virtual_machine_copy_whose_guest_does_not_answer_is_rolled_back() {
         Some("Stopped")
     );
     assert!(rig.source.writes().is_empty(), "{:?}", rig.source.writes());
+}
+
+/// `db` as `vm()`, its card taking its address from a lease, not from its device.
+fn vm_on_lease() -> Value {
+    let mut db = vm();
+    db["devices"]["eth0"] = json!({ "type": "nic", "network": "arcabr0" });
+    db
+}
+
+/// A ready rig moving `db` (or `machine`) by Ceph from the cluster east to west, every image of the source's size.
+fn ceph_rig(machine: Value) -> (Rig, Arc<CephFake>) {
+    let ceph = Arc::new(CephFake::default());
+    let rig = Rig::with_ceph(
+        vec![machine],
+        json!({ "cluster": "west" }),
+        Arc::clone(&ceph),
+    );
+    ceph_pools(&rig, "east", "west");
+    vm_images(&ceph, "ceph", "incus-east");
+    vm_images(&ceph, "west", "incus-west");
+    (rig, ceph)
+}
+
+/// H1: without its agent, Incus lists for a guest that never booted the address it derives from the card's MAC (and its
+/// leases): those are not an answer. Only an address that answers a connection from this node is.
+#[test]
+fn a_guest_that_never_booted_is_not_counted_by_the_addresses_incus_lists_for_it() {
+    // The fake lists them as Incus does: the device's address and the EUI-64 one, with no agent.
+    let mut running = vm();
+    running["status"] = json!("Running");
+    let probe = Rig::new(vec![running], 100);
+    probe.source.agentless("shop", "db");
+    let state = writer(&probe.source)
+        .get("/1.0/instances/db/state?project=shop")
+        .expect("state");
+    assert_eq!(state["processes"], -1);
+    let listed = state["network"]["eth0"]["addresses"].to_string();
+    assert!(listed.contains("192.0.2.59"), "{listed}");
+    assert!(
+        listed.contains("fd42:4242:4242:4242:216:3eff:fe00:9"),
+        "{listed}"
+    );
+    // The copy lists both and answers on neither: it is rolled back.
+    let (rig, _ceph) = ceph_rig(vm());
+    rig.target.agentless("shop", "db");
+    let (status, _) = move_db(&rig);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{one}");
+    let reason = one["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("none of its addresses answered a connection from this node"),
+        "{reason}"
+    );
+    assert!(!rig.target.holds("instance", "shop", "db"));
+    assert_eq!(
+        rig.source.instance_status("shop", "db").as_deref(),
+        Some("Stopped")
+    );
+}
+
+/// A guest without the agent answers when one of its addresses takes a connection from this node, accepted or refused:
+/// here its lease is this node's loopback, which always answers.
+#[test]
+fn a_guest_without_the_agent_answers_by_an_address_that_takes_a_connection() {
+    let (rig, _ceph) = ceph_rig(vm_on_lease());
+    rig.target.agentless("shop", "db");
+    rig.target
+        .set_lease("arcabr0", "00:16:3e:00:00:09", "127.0.0.1");
+    let (status, _) = move_db(&rig);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "moved", "{one}");
+    let agent = one["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "guestAgent")
+        .unwrap();
+    assert_eq!(
+        agent["detail"],
+        "the guest answers: eth0's address 127.0.0.1 answers a connection from this node (port 22)"
+    );
+}
+
+/// M3: a source started and stopped again while its images were read leaves a torn copy, though it reads stopped at
+/// the end: its `last_used_at` moved, and the copy is rolled back.
+#[test]
+fn a_source_started_and_stopped_during_a_ceph_copy_rolls_the_copy_back() {
+    let (rig, ceph) = ceph_rig(vm());
+    let socket = rig.source.socket().to_path_buf();
+    *ceph.during_copy.lock().unwrap() = Some(Box::new(move || {
+        let source = arca_incus::MoveWriter::new(socket.clone());
+        source
+            .set_state("shop", "db", "start", false, Duration::from_secs(5))
+            .expect("started");
+        source
+            .set_state("shop", "db", "stop", true, Duration::from_secs(5))
+            .expect("stopped");
+    }));
+    let (status, _) = move_db(&rig);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{one}");
+    assert!(
+        one["reason"]
+            .as_str()
+            .unwrap()
+            .contains("was started here while it was copied"),
+        "{one}"
+    );
+    assert!(!rig.target.holds("instance", "shop", "db"));
+    assert_eq!(
+        rig.source.instance_status("shop", "db").as_deref(),
+        Some("Stopped")
+    );
+}
+
+/// Two sides that name one OSD pool of one cluster: Incus would make the copy's images beside the source's own.
+#[test]
+fn a_ceph_copy_into_the_sources_own_osd_pool_is_refused() {
+    let ceph = Arc::new(CephFake::default());
+    let rig = Rig::with_ceph(vec![vm()], json!({ "cluster": "ceph" }), Arc::clone(&ceph));
+    ceph_pools(&rig, "east", "east");
+    let answer = rig.plan(&["db"]);
+    assert_eq!(answer["go"], false, "{answer}");
+    let reasons = answer["blocked"][0]["reasons"].to_string();
+    assert!(
+        reasons.contains("name one OSD pool, incus-east, of one Ceph cluster, ceph"),
+        "{reasons}"
+    );
+    assert!(ceph.calls().is_empty());
+}
+
+/// An ISO volume cannot be made empty by Incus: such a machine goes by the Incus push, not refused.
+#[test]
+fn a_virtual_machine_with_an_iso_volume_goes_by_the_incus_push() {
+    let ceph = Arc::new(CephFake::default());
+    let rig = Rig::with_ceph(
+        vec![vm_with_volume()],
+        json!({ "cluster": "west" }),
+        Arc::clone(&ceph),
+    );
+    ceph_pools(&rig, "east", "west");
+    rig.source.add_volume(
+        "default",
+        "default",
+        "db-data",
+        json!({ "content_type": "iso", "config": { "size": "512MiB" } }),
+    );
+    let answer = rig.plan(&["db"]);
+    assert_eq!(answer["go"], true, "{answer}");
+    assert_eq!(answer["plan"]["instances"][0]["copy"], "incus");
+}
+
+/// An image Incus made at another size than the source's is not written: the copy stops there and is rolled back.
+#[test]
+fn a_made_image_of_another_size_is_not_copied_into() {
+    let (rig, ceph) = ceph_rig(vm());
+    ceph.image("west", "incus-west/virtual-machine_shop_db.block", 2 * GIB);
+    let (status, _) = move_db(&rig);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{one}");
+    assert!(
+        one["reason"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was copied into it"),
+        "{one}"
+    );
+    let imported: Vec<String> = ceph
+        .calls()
+        .into_iter()
+        .filter(|argv| argv[6] == "import-diff")
+        .map(|argv| argv[8].clone())
+        .collect();
+    assert_eq!(
+        imported,
+        ["incus-west/virtual-machine_shop_db"],
+        "only the config image"
+    );
+    assert!(!rig.target.holds("instance", "shop", "db"));
+}
+
+/// A machine started after its plan is not copied: the run reads it stopped first.
+#[test]
+fn a_virtual_machine_started_after_its_plan_is_not_moved() {
+    let (rig, ceph) = ceph_rig(vm());
+    let plan = rig.plan(&["db"]);
+    assert_eq!(plan["go"], true, "{plan}");
+    let proposal = rig.propose_move(&plan).expect("proposed");
+    rig.source.set_instance_status("shop", "db", "Running");
+    if let Ok(started) = rig.approve(&proposal) {
+        let status = rig.wait(started["move"].as_str().unwrap());
+        assert_ne!(status["instances"][0]["result"], "moved", "{status}");
+    }
+    assert!(ceph.on("west").is_empty(), "{:?}", ceph.calls());
+    assert!(!rig.target.holds("instance", "shop", "db"));
+}
+
+/// A failed copy of a machine with a custom volume deletes the volume the move made on node-b; the source's volume is
+/// kept and only read.
+#[test]
+fn a_failed_ceph_copy_deletes_the_volume_it_made_and_keeps_the_sources() {
+    let (rig, ceph) = ceph_rig(vm_with_volume());
+    rig.source.add_volume(
+        "default",
+        "default",
+        "db-data",
+        json!({ "content_type": "block", "config": { "size": "512MiB" } }),
+    );
+    ceph.image("ceph", "incus-east/custom_db-data.block", 512 * MIB);
+    ceph.image("west", "incus-west/custom_db-data.block", 512 * MIB);
+    *ceph.fail_copy.lock().unwrap() = Some("rbd failed: import-diff: no space left".to_string());
+    let (status, _) = move_db(&rig);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "rolled_back", "{one}");
+    assert!(!rig.target.holds("volume", "default", "db-data"));
+    assert!(rig.source.holds("volume", "default", "db-data"));
+    assert!(rig.source.writes().is_empty(), "{:?}", rig.source.writes());
+    assert_eq!(
+        ceph.on("ceph").last().map(String::as_str),
+        Some("export-diff")
+    );
 }
 
 #[test]

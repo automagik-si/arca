@@ -942,7 +942,7 @@ fn check_approval(approval: &ApprovalConfig) -> Result<(), ConfigError> {
                 .chain(ceph.read_client.iter());
             if !names
                 .into_iter()
-                .all(|name| crate::move_rbd::ceph_name_ok(name))
+                .all(|name| arca_vmimport::source::ceph_name_ok(name))
             {
                 return Err(ConfigError::Approval(
                     "a linked host's ceph cluster, client and readClient are plain Ceph names: letters, digits, dots, underscores and hyphens",

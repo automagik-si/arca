@@ -1144,14 +1144,48 @@ fn virtual_machine(size: Option<&str>) -> Value {
 }
 
 /// A virtual machine's block disk cannot be walked: its size is the one Incus gives it (its root device's, else the
-/// pool's `volume.size`), counted whole, and a disk with no size Incus names is not measured. Nothing is written.
+/// pool's `volume.size`, else the volume state's total, which Incus answers from its own 10 GiB default), counted whole.
+/// Nothing is written.
 #[test]
 fn a_virtual_machines_block_disk_is_sized_from_incus_and_counted_whole() {
-    for (driver, size, pool_size, expect) in [
-        ("ceph", Some("3GiB"), None, Some(3 * 1024 * MIB)),
-        ("zfs", Some("2147483648"), None, Some(2 * 1024 * MIB)),
-        ("lvm", None, Some("512MiB"), Some(512 * MIB)),
-        ("ceph", None, None, None),
+    for (driver, size, pool_size, bytes, how) in [
+        (
+            "ceph",
+            Some("3GiB"),
+            None,
+            3 * 1024 * MIB,
+            "its root disk device's size",
+        ),
+        (
+            "zfs",
+            Some("2147483648"),
+            None,
+            2 * 1024 * MIB,
+            "its root disk device's size",
+        ),
+        (
+            "lvm",
+            None,
+            Some("512MiB"),
+            512 * MIB,
+            "the pool's volume.size",
+        ),
+        // The pool's volume.size, not the state's total: Incus made the disk at the pool's size, and answers the state's
+        // total from its own default.
+        (
+            "ceph",
+            None,
+            Some("50GiB"),
+            50 * 1024 * MIB,
+            "the pool's volume.size",
+        ),
+        (
+            "ceph",
+            None,
+            None,
+            10 * 1024 * MIB,
+            "the size its volume's state reports",
+        ),
     ] {
         let mut source = Host::new(false, "203.0.113.10");
         source.instances = vec![virtual_machine(size)];
@@ -1165,34 +1199,58 @@ fn a_virtual_machines_block_disk_is_sized_from_incus_and_counted_whole() {
         }
         let answer = rig.preflight(&["db"]);
         let size_check = check(&answer["rows"][0], "size");
-        match expect {
-            Some(bytes) => {
-                assert_eq!(size_check["ok"], true, "{driver}: {size_check:#}");
-                assert_eq!(size_check["measure"]["method"], "incus");
-                assert_eq!(size_check["measure"]["instanceBytes"], bytes);
-                assert_eq!(size_check["measure"]["neededBytes"], bytes + bytes / 10);
-                let detail = size_check["detail"].as_str().unwrap();
-                assert!(
-                    detail.contains(&format!(
-                        "from the sizes Incus gives: the virtual machine's {driver} disk"
-                    )),
-                    "{detail}"
-                );
-                assert!(
-                    size_check["risks"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|risk| risk.as_str().unwrap().contains("counted at its whole size")),
-                    "{size_check:#}"
-                );
-            }
-            None => {
-                assert_eq!(size_check["ok"], false, "{size_check:#}");
-                let why = size_check["measure"]["notMeasured"].as_str().unwrap();
-                assert!(why.contains("has no size Incus names"), "{why}");
-            }
-        }
+        assert_eq!(size_check["ok"], true, "{driver}: {size_check:#}");
+        assert_eq!(size_check["measure"]["method"], "incus");
+        assert_eq!(
+            size_check["measure"]["instanceBytes"], bytes,
+            "{driver} {pool_size:?}"
+        );
+        assert_eq!(size_check["measure"]["neededBytes"], bytes + bytes / 10);
+        let detail = size_check["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(&format!(
+                "from the sizes Incus gives: the virtual machine's {driver} disk"
+            )),
+            "{detail}"
+        );
+        assert!(detail.contains(how), "{how}: {detail}");
+        assert!(
+            size_check["risks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|risk| risk.as_str().unwrap().contains("counted at its whole size")),
+            "{size_check:#}"
+        );
         rig.assert_only_reads();
     }
+}
+
+/// A stopped virtual machine's custom volume on a block pool that neither the volume nor the pool sizes is counted at
+/// Incus's own default, the size Incus made it, instead of blocking the plan.
+#[test]
+fn a_virtual_machines_unsized_custom_volume_counts_at_incus_default() {
+    let mut db = virtual_machine(Some("1GiB"));
+    db["devices"]["data"] = json!({ "type": "disk", "pool": "default", "source": "db-data" });
+    let mut source = Host::new(false, "203.0.113.10");
+    source.instances = vec![db];
+    source.pools = vec![("default", "ceph", 0, 100 * 1024 * MIB)];
+    let mut target = Host::new(false, "203.0.113.20");
+    target.pools = vec![("default", "ceph", 0, 100 * 1024 * MIB)];
+    let rig = Rig::new(source, target);
+    rig.source.add_volume(
+        "default",
+        "default",
+        "db-data",
+        json!({ "content_type": "block", "config": {} }),
+    );
+    let answer = rig.preflight(&["db"]);
+    let size_check = check(&answer["rows"][0], "size");
+    assert_eq!(size_check["ok"], true, "{size_check:#}");
+    assert_eq!(
+        size_check["measure"]["volumeBytes"],
+        10 * 1024 * MIB,
+        "{size_check:#}"
+    );
+    rig.assert_only_reads();
 }

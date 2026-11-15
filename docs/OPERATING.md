@@ -2969,31 +2969,45 @@ or stops it, and its copy on the target is started only once every disk is copie
 
 - `incus`: Incus on this host pushes it once, consistent, with its snapshots and custom volumes, as a container's last
   round. The target must listen on the network, as for a container. This is the way when the linked host names no Ceph
-  cluster, or when the machine's pool is not a Ceph pool on both hosts.
-- `ceph`: the linked host's entry names its Ceph cluster (`approval.linkedHosts[].ceph`), and the machine's pool here
-  and its target pool there are Ceph pools: two Ceph clusters, in either direction. Incus on the target makes the
+  cluster, when a pool the machine uses (its root's or a custom volume's) is not a Ceph pool on both hosts, or when it
+  has an ISO volume (Incus cannot make an empty one).
+- `ceph`: the linked host's entry names its Ceph cluster (`approval.linkedHosts[].ceph`), and every pool the machine
+  uses is a Ceph pool here and there: two Ceph clusters, in either direction. Incus on the target makes the
   machine and each custom volume empty, at the source image's exact size (the root disk gets that size on the copy's own
   root device), and this machine copies each image with `rbd export-diff <source> - | rbd import-diff - <target>`, two
   processes and a pipe. The target does not need to listen. The plan's `ceph` names, per Incus pool, the cluster, client
   and OSD pool of each side, and the card's `Ceph` row shows them. Before anything is made, each source image is read:
   one that anyone holds open (a machine that runs somewhere) fails the move with nothing made; its size is read too. The
-  image Incus made is read back at that size before the copy writes it. The source's cluster is only read (`rbd status`,
-  `rbd info`, `rbd export-diff`). Snapshots are not copied. The copy gets a fresh UEFI variable store: a guest that boots
-  only from an NVRAM boot entry, with no fallback boot file (`EFI/BOOT/BOOTX64.EFI`), does not come up and is rolled
-  back. Two sides that name one OSD pool of one Ceph cluster are refused (Incus would make the copy's image beside the
-  source's).
+  image Incus made is read back at that size before the copy writes it. Besides its disk, the machine's config image
+  (`virtual-machine_<project>_<name>`, with `qemu.nvram`, its UEFI variables, and each `tpm` device's state) is copied
+  the same way, so a guest that boots from its own NVRAM entry, or keeps a secret sealed to its TPM, finds them on the
+  copy. The source's `last_used_at` is read before the first image and again after the last: a source started and
+  stopped again during the copy makes the copy torn, and it is rolled back. When `rbd info` reads the disk at another
+  size than the plan measured from Incus, a `sized` line in the journal says so, and the copy takes rbd's. The source's
+  cluster is only read (`rbd status`, `rbd info`, `rbd export-diff`). Snapshots are not copied: they stay with the
+  source, and finishing the move deletes them with it, which the finish card says. Two sides that name one OSD pool of
+  one Ceph cluster are refused (Incus would make the copy's images beside the source's).
+
+  A move by `incus` on Ceph pools is not read-only on the source cluster: Incus makes and deletes a temporary RBD
+  snapshot (`migration-send-<uuid>`) on the source image for its own migration, as it does for a container.
 
 The preflight sizes a virtual machine's block disk (Ceph, zfs or lvm) from Incus, not by walking: its volume's `size`,
-else its root disk device's `size`, else its volume state's total, else the pool's `volume.size`; a disk with none of
+else its root disk device's `size`, else the pool's `volume.size`, else its volume state's total (Incus answers that one
+from the root device's size or its own 10 GiB default, never from the pool, so it comes last); a disk with none of
 these is not measured, and the plan says so. The size is the whole disk, the most its copy can take; each snapshot is
-counted at that size too. A stopped machine's custom volume on a block driver is sized the same way (its own `size`, else
-the pool's `volume.size`).
+counted at that size too. A stopped machine's custom volume on a block driver is sized from its own `size`, else the
+pool's `volume.size`, else Incus's 10 GiB default, which is the size Incus made it.
 
 The checks are the copy's: it runs, and still runs after them; its guest answers, by its Incus agent (its state counts
-processes) or an address on one of its network cards, waited for five times the checks' wait (five minutes by default),
+processes) or by one of its addresses answering a TCP connection to port 22 from this node (accepted, or refused by the
+guest's own stack), waited for five times the checks' wait (five minutes by default),
 since a machine boots slower than a container starts; and each custom volume is attached. A stopped machine's files
-cannot be read, so the spot-check stands on the guest's answer, and there is no network card or proxy to compare. A copy
-whose guest does not answer is deleted, and the source is left as it was: never started, stopped or written. A verified
+cannot be read, so the spot-check stands on the guest's answer, and there is no network card or proxy to compare. An
+address Incus lists is not an answer by itself: without the agent Incus still lists the address it derives from the
+card's MAC on an IPv6 bridge, the MAC's DHCP leases and OVN's address, for a guest that never booted. A machine without
+the Incus agent whose addresses this node cannot reach (a NAT bridge on the target, a firewall that drops) does not
+answer, and its copy is rolled back. A copy whose guest does not answer is deleted, and the source is left as it was:
+never started, stopped or written. A verified
 source is kept, stopped, with `boot.autostart` off, and `instance_move_finish` deletes it as a container's.
 
 What a copy by Ceph needs on this machine: the `rbd` command; the target cluster's config at

@@ -38,20 +38,24 @@
 //! fixed in the plan (`copy`):
 //!
 //! - `incus`: Incus on this host pushes it, with its snapshots and custom volumes, as it pushes a container's last round.
-//!   This needs the target to listen on the network, and is the way whenever the linked host names no Ceph cluster, or the
-//!   machine's pool is not Ceph on both sides (one Ceph cluster, or none).
-//! - `ceph`: the linked host names its Ceph cluster as this node reaches it (`approval.linkedHosts[].ceph`), and the
-//!   machine's pool here and its pool there are both Ceph pools: two clusters, either way (see [`crate::move_rbd`]). The
-//!   plan freezes, per Incus pool, the cluster, client and OSD pool each side is read or written with. The run reads every
-//!   source image first (who holds it open: anyone does, and nothing is made; and its size), then, per custom volume and
-//!   then for the machine, asks Incus on the target to make it empty at the source's exact size, journals its uuid, reads
-//!   the image Incus made back at that size, and copies with `rbd export-diff | rbd import-diff`. The source's cluster is
-//!   only read. Snapshots are not copied, and the machine gets a fresh UEFI variable store: a guest that boots only from
-//!   an NVRAM entry, with no fallback boot file, does not come up, fails its checks and is rolled back. Two sides naming
-//!   one OSD pool of one cluster are refused: Incus would make the copy's image beside the source's own.
+//!   This needs the target to listen on the network, and is the way whenever the linked host names no Ceph cluster, or a
+//!   pool the machine uses is not Ceph on both sides, or it has an ISO volume (Incus cannot make an empty one).
+//! - `ceph`: the linked host names its Ceph cluster as this node reaches it (`approval.linkedHosts[].ceph`), and every
+//!   pool the machine uses is a Ceph pool here and there: two clusters, either way (see the `rbd` module below). The plan
+//!   freezes, per Incus pool, the cluster, client and OSD pool each side is read or written with. The run reads the
+//!   source's `last_used_at`, then every source image (who holds it open: anyone does, and nothing is made; and its
+//!   size), then, per custom volume and then for the machine, asks Incus on the target to make it empty at the source's
+//!   exact size, journals its uuid, reads the image Incus made back at that size, and copies with `rbd export-diff | rbd
+//!   import-diff`: the machine's config image (`qemu.nvram`, its UEFI variables, and each TPM's state) and then its
+//!   disk. A source whose `last_used_at` moved during the copy was started and stopped again: the copy may be torn and
+//!   is rolled back. The source's cluster is only read. Snapshots are not copied. Two sides naming one OSD pool of one
+//!   cluster are refused: Incus would make the copy's images beside the source's own.
 //!
-//! The copy then starts on the target once the source still reads Stopped, and counts only when its guest answers: its
-//! Incus agent, or an address on one of its network cards, within five times the checks' wait. A stopped machine's files
+//! The copy then starts on the target once the source still reads Stopped, and counts only when its guest answers:
+//! its Incus agent (processes counted), or one of its addresses answering a TCP connection from this node, accepted or
+//! refused, within five times the checks' wait. An address Incus lists is not an answer by itself: without the agent
+//! Incus still lists the one it derives from the card's MAC, the MAC's leases and OVN's, for a guest that never
+//! booted. A stopped machine's files
 //! cannot be read, so the spot-check stands on that answer. The source is never deleted by the move; on a failure the
 //! copy is deleted as for a container, and the source, never started, stopped or written, stays as it was.
 //!
@@ -80,7 +84,8 @@ use crate::config::{LinkedCeph, NodeConfig, host_name_ok};
 use crate::handlers::Clock;
 use crate::kernel::Kernel;
 use crate::move_preflight::{MovePreflightHandler, human, instance_ok, project_ok, seg};
-use crate::move_rbd::{self, ProcessRunner, RbdImage, Runner};
+use arca_vmimport::{ProcessRunner, Runner};
+use rbd::RbdImage;
 
 /// The move journal's file name in the state directory.
 pub const MOVES_FILE: &str = "instance-moves.jsonl";
@@ -96,6 +101,21 @@ pub const DEFAULT_ROUNDS: u64 = 2;
 pub const DEFAULT_SPOT_CHECK: &str = "/etc/hostname";
 /// What every card and plan promises about a failure.
 pub const ROLLBACK_PROMISE: &str = "If anything fails before the moved copy passes its checks, Arca removes the copy it made on the target and starts the source again, but only after reading the source back as the same instance, and only once the copy is gone or stopped: it never deletes the only copy and never leaves both running. The source keeps running while it is copied, its volumes are never touched, and it is never deleted unless you finish the move.";
+
+/// The rollback promise for a stopped virtual machine, which the move never starts or writes.
+pub const VM_ROLLBACK_PROMISE: &str = "If anything fails before the moved copy passes its checks, Arca deletes the copy it made on the target (the machine and the volumes it made, by the uuid it recorded), but only after reading the source back as the same instance. The source stays stopped throughout: the move never starts it, never writes its disks or volumes, and never deletes it unless you finish the move.";
+
+/// The rollback promise a plan of `instances` shows: the containers', the stopped virtual machines', or both.
+fn rollback_promise(instances: &[Value]) -> String {
+    let vms = instances.iter().filter(|one| is_vm(one)).count();
+    match vms {
+        0 => ROLLBACK_PROMISE.to_string(),
+        n if n == instances.len() => VM_ROLLBACK_PROMISE.to_string(),
+        _ => format!(
+            "Containers: {ROLLBACK_PROMISE} Stopped virtual machines: {VM_ROLLBACK_PROMISE}"
+        ),
+    }
+}
 /// The longest journal line this build reads; a longer one is skipped.
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// How long a graceful stop of the source may take before it is forced.
@@ -677,7 +697,7 @@ fn verify_of(vm: bool, spot_check: &str) -> Value {
     if vm {
         return json!([
             "the copy runs, and still runs after the checks",
-            "its guest answers: its Incus agent, or an address on one of its network cards",
+            "its guest answers: its Incus agent, or one of its addresses answering a connection from this node",
             "each custom volume is attached",
         ]);
     }
@@ -695,7 +715,7 @@ fn verify_of(vm: bool, spot_check: &str) -> Value {
 fn vm_row(instance: &Value, source: &str, target: &str) -> (String, String) {
     let volumes = instance["volumes"].as_array().map_or(0, Vec::len);
     let how = if instance["copy"] == "ceph" {
-        "by Ceph (rbd), disk by disk, without its snapshots"
+        "by Ceph (rbd), disk by disk, with its config image (its UEFI variables and TPM state) and without its snapshots, which stay with the source"
     } else {
         "by an Incus push from this node, with its snapshots"
     };
@@ -771,12 +791,12 @@ fn ceph_side(writer: &MoveWriter, pool: &str) -> Option<(String, String, String)
     ))
 }
 
-/// How a stopped virtual machine is copied: by Ceph when the linked host names its Ceph cluster (`linked`) and the
-/// machine's pool here and its target pool there are both Ceph pools, by an Incus push otherwise (`Ok(Null)`). By Ceph,
-/// answers the facts per Incus pool here (its root's, and each custom volume's): the target pool, and the cluster, client
-/// and OSD pool each side is read or written with. The reasons a copy by Ceph cannot be made are the errors: a custom
-/// volume on a pool that is not Ceph on both hosts, or two sides that name one OSD pool of one cluster (Incus making the
-/// copy's image there would meet the source's own).
+/// How a stopped virtual machine is copied: by Ceph when the linked host names its Ceph cluster (`linked`) and every
+/// pool the machine uses, its root's and each custom volume's, is a Ceph pool here and there; by an Incus push otherwise
+/// (`Ok(Null)`), which also takes a custom volume on another driver and an ISO volume (Incus cannot make an empty one).
+/// By Ceph, answers the facts per Incus pool here: the target pool, and the cluster, client and OSD pool each side is
+/// read or written with. The one error is data safety: two sides that name one OSD pool of one cluster, where Incus
+/// making the copy's images would meet the source's own.
 fn ceph_plan(
     source: &MoveWriter,
     dest: Option<&MoveWriter>,
@@ -794,19 +814,30 @@ fn ceph_plan(
     let mut pools = vec![(root_pool.to_string(), root_target.to_string())];
     for volume in volumes {
         let pool = volume["pool"].as_str().unwrap_or_default().to_string();
+        let iso = source
+            .get(&volume_path(
+                &pool,
+                volume["name"].as_str().unwrap_or_default(),
+                volume["project"].as_str().unwrap_or("default"),
+            ))
+            .is_ok_and(|doc| doc["content_type"] == "iso");
+        if iso {
+            return Ok(Value::Null);
+        }
         if !pools.iter().any(|(here, _)| *here == pool) {
             pools.push((pool.clone(), pool));
         }
     }
+    let mut sides = Vec::new();
+    for (here, there) in pools {
+        match (ceph_side(source, &here), ceph_side(dest, &there)) {
+            (Some(from), Some(to)) => sides.push((here, there, from, to)),
+            _ => return Ok(Value::Null),
+        }
+    }
     let mut plan = Map::new();
     let mut reasons = Vec::new();
-    for (here, there) in pools {
-        let (Some(from), Some(to)) = (ceph_side(source, &here), ceph_side(dest, &there)) else {
-            reasons.push(format!(
-                "the custom volume pool {here} is not a Ceph pool on both this node and {target_name}: a virtual machine copied by Ceph takes Ceph images only"
-            ));
-            continue;
-        };
+    for (here, there, from, to) in sides {
         let (from_pool, from_client, from_cluster) = from;
         let (to_pool, to_client, _) = to;
         let from = json!({
@@ -1528,7 +1559,7 @@ impl Moves {
             "transport": transport,
             "rounds": rounds,
             "instances": instances,
-            "rollback": ROLLBACK_PROMISE,
+            "rollback": rollback_promise(&instances),
         });
         let digest = digest_of(&plan);
         let now = self.now();
@@ -1586,7 +1617,7 @@ impl Moves {
             "Transport".to_string(),
             match plan["transport"]["mode"].as_str() {
                 _ if !pushes => format!(
-                    "no Incus push: this node copies each disk by Ceph, and writes to {target}'s Incus only to make the empty virtual machine and to start it"
+                    "no Incus push: this node copies each disk by Ceph; it writes to {target}'s Incus to make the empty virtual machine and its empty custom volumes, to start it, to set its boot.autostart, and on a rollback to delete what it made"
                 ),
                 Some("push") => format!(
                     "Incus on this host pushes to {target}'s Incus at {}",
@@ -1609,7 +1640,12 @@ impl Moves {
             "Credential".to_string(),
             plan["credential"].as_str().unwrap_or_default().to_string(),
         ));
-        rows.push(("Rollback".to_string(), ROLLBACK_PROMISE.to_string()));
+        rows.push((
+            "Rollback".to_string(),
+            plan["rollback"]
+                .as_str()
+                .map_or_else(|| ROLLBACK_PROMISE.to_string(), str::to_string),
+        ));
         if instances.iter().any(|one| is_vm(one)) {
             rows.push((
                 "Stopped virtual machines".to_string(),
@@ -2296,7 +2332,14 @@ impl Moves {
                 image: name,
             })
         };
-        // What to copy: each custom volume, then the machine's own disk, with its source image.
+        let what = format!("the virtual machine {project}/{name}");
+        // The source as it is before anything is read: a start between here and the copy's end changes `last_used_at`.
+        let doc = source
+            .get(&instance_path(project, name))
+            .map_err(|error| format!("{what} could not be read here: {error}"))?;
+        let used_before = doc["last_used_at"].clone();
+        // What to copy: each custom volume, then the machine's config image (its UEFI variables and TPM state), then its
+        // own disk, each with its source image.
         let mut volumes = Vec::new();
         for volume in one["volumes"].as_array().into_iter().flatten() {
             let pool = volume["pool"].as_str().unwrap_or_default();
@@ -2310,23 +2353,28 @@ impl Moves {
             let from = image(
                 pool,
                 "from",
-                move_rbd::incus_image("custom", here, volume_name, block),
+                rbd::incus_image("custom", here, volume_name, block),
             )?;
             volumes.push((volume, doc, block, from, what));
         }
         let root_pool = one["sourcePool"].as_str().unwrap_or_default();
+        let config = image(
+            root_pool,
+            "from",
+            rbd::incus_image("virtual-machine", project, name, false),
+        )?;
         let root = image(
             root_pool,
             "from",
-            move_rbd::incus_image("virtual-machine", project, name, true),
+            rbd::incus_image("virtual-machine", project, name, true),
         )?;
         let mut sizes = Vec::new();
         for from in volumes
             .iter()
             .map(|(_, _, _, from, _)| from)
-            .chain(std::iter::once(&root))
+            .chain([&config, &root])
         {
-            let held = move_rbd::watchers(runner, from)
+            let held = rbd::watchers(runner, from)
                 .map_err(|why| format!("who holds {} could not be read: {why}", from.spec()))?;
             if !held.is_empty() {
                 return Err(format!(
@@ -2336,10 +2384,19 @@ impl Moves {
                 ));
             }
             sizes.push(
-                move_rbd::size(runner, from).map_err(|why| {
+                rbd::size(runner, from).map_err(|why| {
                     format!("the size of {} could not be read: {why}", from.spec())
                 })?,
             );
+        }
+        let planned = one["bytes"]["instance"].as_u64();
+        let root_bytes = sizes.last().copied().unwrap_or(0);
+        if planned.is_some_and(|planned| planned != root_bytes) {
+            self.note(json!({
+                "event": "sized", "at": self.now(), "move": id, "project": project, "name": name,
+                "plannedBytes": planned, "rbdBytes": root_bytes,
+                "detail": format!("{what}'s disk reads {root_bytes} bytes with rbd info, not the {} bytes the plan measured from Incus; the copy uses rbd's", planned.unwrap_or(0)),
+            }));
         }
         let mut moved = 0u64;
         for ((volume, doc, block, from, what), bytes) in volumes.iter().zip(&sizes) {
@@ -2352,16 +2409,12 @@ impl Moves {
             let to = image(
                 pool,
                 "to",
-                move_rbd::incus_image("custom", there, volume_name, *block),
+                rbd::incus_image("custom", there, volume_name, *block),
             )?;
             self.copy_image(from, &to, *bytes, what)?;
             moved += bytes;
             self.set_live(id, project, name, |progress| progress.done = moved);
         }
-        let what = format!("the virtual machine {project}/{name}");
-        let doc = source
-            .get(&instance_path(project, name))
-            .map_err(|error| format!("{what} could not be read here: {error}"))?;
         made.source_autostart = Some(
             doc["config"]["boot.autostart"]
                 .as_str()
@@ -2375,24 +2428,47 @@ impl Moves {
             .find(|(_, device)| is_root(device))
             .map(|(device_name, device)| (device_name.clone(), device.clone()))
             .ok_or_else(|| format!("{what} has no root disk device"))?;
-        let bytes = sizes.last().copied().unwrap_or(0);
+        let config_bytes = sizes[sizes.len() - 2];
         let target_pool = ceph[root_pool]["targetPool"].as_str().unwrap_or(root_pool);
         dest.create_empty_vm(
             project,
             name,
             &doc,
             (&root_device, &root_disk),
-            (target_pool, bytes),
+            (target_pool, root_bytes),
         )
         .map_err(|error| format!("the target did not make {what}: {error}"))?;
         self.record(id, one, dest, made, None)?;
+        let to_config = image(
+            root_pool,
+            "to",
+            rbd::incus_image("virtual-machine", project, name, false),
+        )?;
+        self.copy_image(
+            &config,
+            &to_config,
+            config_bytes,
+            &format!("{what}'s config image (UEFI variables, TPM state)"),
+        )?;
+        moved += config_bytes;
         let to = image(
             root_pool,
             "to",
-            move_rbd::incus_image("virtual-machine", project, name, true),
+            rbd::incus_image("virtual-machine", project, name, true),
         )?;
-        self.copy_image(&root, &to, bytes, &format!("{what}'s disk"))?;
-        moved += bytes;
+        self.copy_image(&root, &to, root_bytes, &format!("{what}'s disk"))?;
+        moved += root_bytes;
+        // A start and a stop of the source while it was read leave a torn copy, though it reads stopped now.
+        let after = source
+            .get(&instance_path(project, name))
+            .map_err(|error| format!("{what} could not be read here after the copy: {error}"))?;
+        if after["last_used_at"] != used_before {
+            return Err(format!(
+                "{what} was started here while it was copied (its last start moved from {} to {}): the copy may be torn, so it is not used",
+                used_before.as_str().unwrap_or("never"),
+                after["last_used_at"].as_str().unwrap_or("unknown")
+            ));
+        }
         let elapsed = started.elapsed().as_millis() as u64;
         let rate = (elapsed > 0).then(|| moved.saturating_mul(1000) / elapsed.max(1));
         self.note(json!({
@@ -2412,7 +2488,7 @@ impl Moves {
         what: &str,
     ) -> Result<(), String> {
         let runner = self.ceph.as_ref();
-        let made = move_rbd::size(runner, to).map_err(|why| {
+        let made = rbd::size(runner, to).map_err(|why| {
             format!(
                 "the image {} Incus made for {what} could not be read: {why}",
                 to.spec()
@@ -2424,7 +2500,7 @@ impl Moves {
                 to.spec()
             ));
         }
-        move_rbd::copy(runner, from, to).map_err(|why| {
+        rbd::copy(runner, from, to).map_err(|why| {
             format!(
                 "the copy of {what} from {} into {} failed: {why}",
                 from.spec(),
@@ -2880,8 +2956,10 @@ impl Moves {
                 format!("port(s) {} answered here before the stop and do not answer on {target_host}{unprobed}", closed.join(", "))
             },
         }));
-        // A container has no guest agent. A virtual machine's guest must answer: its Incus agent, or an address on one of
-        // its cards (Incus reads a machine's leases without the agent), given five times the checks' wait to boot.
+        // A container has no guest agent. A virtual machine's guest must answer, given five times the checks' wait to
+        // boot: its Incus agent (processes counted), or one of its addresses answering a TCP connection from this node,
+        // accepted or refused. An address alone proves nothing: without the agent Incus still lists the address it derives
+        // from the card's MAC on an IPv6 bridge, the MAC's leases and OVN's address, for a guest that never booted.
         let vm = is_vm(one);
         if vm {
             let answer_until = Instant::now() + self.verify_wait * VM_ANSWER_FACTOR;
@@ -2890,13 +2968,13 @@ impl Moves {
                 if let Ok(state) = dest.get(&state_path) {
                     if state["processes"].as_i64().is_some_and(|count| count > 0) {
                         answered = Some("its Incus agent answers".to_string());
-                    } else if let Some(card) = state["network"]
-                        .as_object()
+                    } else if let Some((card, address)) = global_addresses(&state)
                         .into_iter()
-                        .flat_map(|cards| cards.keys())
-                        .find(|card| card.as_str() != "lo" && has_global_address(&state, card))
+                        .find(|(_, address)| guest_answers(address))
                     {
-                        answered = Some(format!("{card} has an address"));
+                        answered = Some(format!(
+                            "{card}'s address {address} answers a connection from this node (port {GUEST_PROBE_PORT})"
+                        ));
                     }
                 }
                 if answered.is_some() || Instant::now() >= answer_until {
@@ -2909,7 +2987,7 @@ impl Moves {
                 "detail": match answered {
                     Some(how) => format!("the guest answers: {how}"),
                     None => format!(
-                        "the guest did not answer within {} s: no Incus agent, and no address on any network card",
+                        "the guest did not answer within {} s: no Incus agent, and none of its addresses answered a connection from this node (port {GUEST_PROBE_PORT}); an address Incus lists without the agent does not count",
                         (self.verify_wait * VM_ANSWER_FACTOR).as_secs()
                     ),
                 },
@@ -3325,6 +3403,42 @@ fn nics_with_addresses(source: &MoveWriter, project: &str, name: &str) -> Vec<St
     out
 }
 
+/// The port a virtual machine's address is asked on when its Incus agent does not answer.
+const GUEST_PROBE_PORT: u16 = 22;
+
+/// Every global address on an instance's cards but `lo`, with its card, in card order.
+fn global_addresses(state: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (card, value) in state["network"].as_object().into_iter().flatten() {
+        if card == "lo" {
+            continue;
+        }
+        for address in value["addresses"].as_array().into_iter().flatten() {
+            if let Some(text) = address["address"].as_str().filter(|a| !a.is_empty())
+                && address["scope"] == "global"
+            {
+                out.push((card.clone(), text.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Whether the guest behind `address` answers a TCP connection from this node: accepted, or refused by its own stack.
+/// A timeout or an unreachable network is no answer.
+fn guest_answers(address: &str) -> bool {
+    let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match TcpStream::connect_timeout(
+        &SocketAddr::new(ip, GUEST_PROBE_PORT),
+        Duration::from_millis(800),
+    ) {
+        Ok(_) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::ConnectionRefused,
+    }
+}
+
 fn has_global_address(state: &Value, card: &str) -> bool {
     state["network"][card]["addresses"]
         .as_array()
@@ -3554,6 +3668,8 @@ struct InstanceRecord {
     created_volumes: Vec<Value>,
     stopped_source: bool,
     copy_started: bool,
+    /// The copy went by Ceph: the source's snapshots were not copied and live only on the source.
+    by_ceph: bool,
     verified: bool,
     verify_downtime: Option<u64>,
     phase: String,
@@ -3627,6 +3743,7 @@ fn fold(lines: &[Value]) -> BTreeMap<String, MoveRecord> {
                 instance.bytes_moved += line["bytes"].as_u64().unwrap_or(0);
                 instance.last_rate = line["rateBytesPerSecond"].as_u64().or(instance.last_rate);
                 instance.phase = "copying".to_string();
+                instance.by_ceph |= line["copy"] == "ceph";
             }
             Some("created") => {
                 if let Some(uuid) = line["targetUuid"].as_str() {
@@ -3702,10 +3819,17 @@ impl MoveRecord {
         }
         let mut deletes = Vec::new();
         for one in &moved {
-            deletes.push(format!(
-                "the source instance {}/{} on this host",
-                one.project, one.name
-            ));
+            deletes.push(if one.by_ceph {
+                format!(
+                    "the source instance {}/{} on this host, with its snapshots: they were not copied (a copy by Ceph takes none), so they are gone with it",
+                    one.project, one.name
+                )
+            } else {
+                format!(
+                    "the source instance {}/{} on this host, with its snapshots",
+                    one.project, one.name
+                )
+            });
             for volume in one.volumes.as_array().into_iter().flatten() {
                 deletes.push(format!(
                     "its custom volume {}/{} (project {}) on this host",
@@ -4258,6 +4382,232 @@ pub fn handlers(moves: Arc<Moves>) -> Vec<(&'static str, Arc<dyn ToolHandler>)> 
             Arc::new(MoveFinishHandler { moves }) as Arc<dyn ToolHandler>,
         ),
     ]
+}
+
+/// The `rbd` command lines of a stopped virtual machine's copy between two Ceph clusters.
+///
+/// Each side names its own cluster (`--cluster <name>` reads `/etc/ceph/<name>.conf` and the client's keyring beside it)
+/// and its own client, so the same code runs whichever way the move goes. The source is only read: `rbd status`, `rbd
+/// info` and `rbd export-diff`. The copy is `rbd export-diff <source> - | rbd import-diff - <target>`, run by
+/// `arca_vmimport`'s [`Runner`]: two processes and a pipe, never a shell; the bytes stream from the reader to the writer.
+// TODO(PR 201): once `arca_vmimport::copy` has `PipeFailure` and side-named errors, map them here, and fold
+// `incus_image` into `arca_vmimport::incus_rbd_image` with the content type.
+mod rbd {
+    use arca_vmimport::Runner;
+    use arca_vmimport::source::ceph_name_ok;
+    use serde_json::Value;
+
+    /// One Ceph image, with the cluster and the client that reach it from this node.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RbdImage {
+        /// The cluster, by the name of its config file here (`/etc/ceph/<cluster>.conf`).
+        pub cluster: String,
+        /// The Ceph client, without its `client.` prefix.
+        pub client: String,
+        /// The OSD pool.
+        pub pool: String,
+        pub image: String,
+    }
+
+    impl RbdImage {
+        pub fn spec(&self) -> String {
+            format!("{}/{}", self.pool, self.image)
+        }
+
+        fn names_ok(&self) -> Result<(), String> {
+            match [&self.cluster, &self.client, &self.pool, &self.image]
+                .into_iter()
+                .find(|name| !ceph_name_ok(name))
+            {
+                Some(name) => Err(format!("{name:?} is not a Ceph name")),
+                None => Ok(()),
+            }
+        }
+
+        fn argv(&self, rest: &[&str]) -> Vec<String> {
+            [
+                "rbd",
+                "--cluster",
+                &self.cluster,
+                "--id",
+                &self.client,
+                "--no-progress",
+            ]
+            .iter()
+            .chain(rest)
+            .map(|part| (*part).to_string())
+            .collect()
+        }
+    }
+
+    /// The Ceph image Incus keeps a volume in: `virtual-machine_<project>_<name>` for a virtual machine's config volume
+    /// (its UEFI variables and TPM state), with `.block` for its disk; `custom_<project>_<name>` for a custom volume,
+    /// with `.block` for a block one. The project prefix is left out in the `default` project.
+    pub fn incus_image(kind: &str, project: &str, name: &str, block: bool) -> String {
+        let volume = if project == "default" {
+            name.to_string()
+        } else {
+            format!("{project}_{name}")
+        };
+        let suffix = if block { ".block" } else { "" };
+        format!("{kind}_{volume}{suffix}")
+    }
+
+    /// Who holds `image` open, by address. Empty when no one does.
+    pub fn watchers(runner: &dyn Runner, image: &RbdImage) -> Result<Vec<String>, String> {
+        image.names_ok()?;
+        let out = runner.output(&image.argv(&["status", "--format", "json", &image.spec()]))?;
+        let status: Value =
+            serde_json::from_str(&out).map_err(|_| "rbd status did not answer JSON".to_string())?;
+        Ok(status["watchers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|watcher| {
+                watcher["address"]
+                    .as_str()
+                    .unwrap_or("an unnamed client")
+                    .to_string()
+            })
+            .collect())
+    }
+
+    /// The size of `image`, in bytes.
+    pub fn size(runner: &dyn Runner, image: &RbdImage) -> Result<u64, String> {
+        image.names_ok()?;
+        let out = runner.output(&image.argv(&["info", "--format", "json", &image.spec()]))?;
+        let info: Value =
+            serde_json::from_str(&out).map_err(|_| "rbd info did not answer JSON".to_string())?;
+        info["size"]
+            .as_u64()
+            .ok_or_else(|| "rbd info names no size".to_string())
+    }
+
+    /// Copies every byte `source` holds into `target`, which exists and has the source's size.
+    pub fn copy(runner: &dyn Runner, source: &RbdImage, target: &RbdImage) -> Result<(), String> {
+        source.names_ok()?;
+        target.names_ok()?;
+        runner.pipe(
+            &source.argv(&["export-diff", &source.spec(), "-"]),
+            &target.argv(&["import-diff", "-", &target.spec()]),
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            calls: Mutex<Vec<Vec<String>>>,
+            answer: String,
+        }
+
+        impl Runner for Recorder {
+            fn output(&self, argv: &[String]) -> Result<String, String> {
+                self.calls.lock().expect("calls").push(argv.to_vec());
+                Ok(self.answer.clone())
+            }
+            fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String> {
+                let mut calls = self.calls.lock().expect("calls");
+                calls.push(first.to_vec());
+                calls.push(second.to_vec());
+                Ok(())
+            }
+        }
+
+        fn image(cluster: &str, client: &str, pool: &str) -> RbdImage {
+            RbdImage {
+                cluster: cluster.into(),
+                client: client.into(),
+                pool: pool.into(),
+                image: incus_image("virtual-machine", "shop", "db", true),
+            }
+        }
+
+        #[test]
+        fn each_side_names_its_own_cluster_and_client() {
+            let runner = Recorder::default();
+            let from = image("east", "incus-east", "osd-east");
+            let to = image("west", "incus-west", "osd-west");
+            copy(&runner, &from, &to).expect("copied");
+            let calls = runner.calls.lock().expect("calls").clone();
+            assert_eq!(
+                calls[0],
+                [
+                    "rbd",
+                    "--cluster",
+                    "east",
+                    "--id",
+                    "incus-east",
+                    "--no-progress",
+                    "export-diff",
+                    "osd-east/virtual-machine_shop_db.block",
+                    "-"
+                ]
+            );
+            assert_eq!(
+                calls[1],
+                [
+                    "rbd",
+                    "--cluster",
+                    "west",
+                    "--id",
+                    "incus-west",
+                    "--no-progress",
+                    "import-diff",
+                    "-",
+                    "osd-west/virtual-machine_shop_db.block"
+                ]
+            );
+        }
+
+        #[test]
+        fn watchers_and_size_are_read_from_rbd_json() {
+            let runner = Recorder {
+                answer: r#"{"watchers":[{"address":"192.0.2.9:0/1"}],"size":2147483648}"#.into(),
+                ..Recorder::default()
+            };
+            let from = image("east", "incus-east", "osd-east");
+            assert_eq!(watchers(&runner, &from).expect("read"), ["192.0.2.9:0/1"]);
+            assert_eq!(size(&runner, &from).expect("read"), 2_147_483_648);
+            let calls = runner.calls.lock().expect("calls").clone();
+            assert_eq!(calls[0][6..], ["status", "--format", "json", &from.spec()]);
+            assert_eq!(calls[1][6], "info");
+        }
+
+        #[test]
+        fn a_name_that_is_not_a_ceph_name_runs_nothing() {
+            let runner = Recorder::default();
+            let mut bad = image("east", "incus-east", "osd-east");
+            bad.image = "--help".into();
+            assert!(copy(&runner, &bad, &image("west", "w", "p")).is_err());
+            bad.image = "a b".into();
+            assert!(size(&runner, &bad).is_err());
+            assert!(runner.calls.lock().expect("calls").is_empty());
+        }
+
+        #[test]
+        fn incus_names_its_images_by_kind_project_and_name() {
+            assert_eq!(
+                incus_image("virtual-machine", "default", "db", true),
+                "virtual-machine_db.block"
+            );
+            assert_eq!(
+                incus_image("virtual-machine", "shop", "db", false),
+                "virtual-machine_shop_db"
+            );
+            assert_eq!(
+                incus_image("custom", "shop", "data", false),
+                "custom_shop_data"
+            );
+            assert_eq!(
+                incus_image("custom", "shop", "raw", true),
+                "custom_shop_raw.block"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
