@@ -825,8 +825,13 @@ impl<A: Access, L: Launcher> Pool<A, L> {
                             "machine {name}: its runner could not be watched ({watch_failures} in a row), still waiting: {error}"
                         ));
                     }
+                    // Given up, the runner is taken off GitHub first, as an idle one past its age is: GitHub keeps
+                    // one it has just handed a job, and that runner is watched on.
                     if !busy && watch_failures >= WATCH_FAILURES_MAX {
-                        return Err(format!("the runner could not be watched: {error}"));
+                        if self.retire(name).await {
+                            return Err(format!("the runner could not be watched: {error}"));
+                        }
+                        watch_failures = 0;
                     }
                     tokio::time::sleep(self.timing.watch_retry).await;
                 }
