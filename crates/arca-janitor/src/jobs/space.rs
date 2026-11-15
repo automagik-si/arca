@@ -171,12 +171,28 @@ mod tests {
     fn sizes_add_up_to_the_root_and_stop_at_the_depth() {
         let t = crate::testutil::TempDir::new("space");
         fs::create_dir_all(t.path().join("a/b/c")).unwrap();
-        fs::write(t.path().join("a/b/c/big"), vec![1u8; 200_000]).unwrap();
+        // Bytes that do not compress, and the disk use the filesystem reports for them before the scan: ZFS, say,
+        // compresses and counts a new file's blocks only once its transaction group is written.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let noise: Vec<u8> = (0..200_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let big = t.path().join("a/b/c/big");
+        fs::write(&big, noise).unwrap();
         fs::write(t.path().join("small"), vec![1u8; 10]).unwrap();
+        let big_use = fs::metadata(&big).unwrap().blocks() * 512;
         let snap = scan(t.path(), 2, None).unwrap();
         let a = snap.dirs[&t.path().join("a")];
         let ab = snap.dirs[&t.path().join("a/b")];
-        assert!(a >= 200_000 && ab >= 200_000 && a >= ab);
+        assert!(
+            big_use > 0 && ab >= big_use && a >= ab,
+            "{big_use} {ab} {a}"
+        );
         assert!(
             !snap.dirs.contains_key(&t.path().join("a/b/c")),
             "deeper than 2"

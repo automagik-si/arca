@@ -5,7 +5,8 @@
 //!   apply keeps its folder, and an item that vanished or was swapped for a link is skipped, not failed.
 //! - A removal never follows a link on the way to its target.
 //! - Stale scratch holding git work that exists nowhere else is never moved to the trash, including work in
-//!   repositories and worktrees nested inside a clean one, and in bare repositories.
+//!   repositories and worktrees nested inside a clean one, in bare repositories and the worktrees kept in their
+//!   folders. A repository whose own config sets a filter command is kept, and the command is never run.
 //!
 //! The mount cases are in `mounts.rs`, which reports them as ignored where user namespaces are not available.
 
@@ -381,6 +382,71 @@ fn stale_scratch_with_git_work_found_nowhere_else_is_never_moved() {
             "main:only-in-bare",
         ],
     );
+    // Bare clones that track their remote (`clone --bare`, the standard fetch refspec, fetched), with worktrees kept
+    // inside their folders.
+    let tracking_bare = |rel: &str| -> PathBuf {
+        let b = scratch.join(rel);
+        let parent = b.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        git(
+            parent,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                remote.to_str().unwrap(),
+                b.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        git(
+            &b,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        git(&b, &["fetch", "-q", "origin"]);
+        b
+    };
+    // At the top, with an edit and a new file in the worktree.
+    let b = tracking_bare("bare-wt-top");
+    git(&b, &["worktree", "add", "-q", "wt-main", "main"]);
+    fs::write(b.join("wt-main/README"), "edited").unwrap();
+    fs::write(b.join("wt-main/new.txt"), "new").unwrap();
+    // Nested in a plain folder, with an edit.
+    let b = tracking_bare("bare-holder/proj.git");
+    git(&b, &["worktree", "add", "-q", "main", "main"]);
+    fs::write(b.join("main/README"), "edited").unwrap();
+    // The same, clean: may go.
+    let b = tracking_bare("bare-clean");
+    git(&b, &["worktree", "add", "-q", "w", "main"]);
+    // A worktree under a name a bare repository uses for its own folders, which the walk does not enter: found
+    // through the worktree list.
+    let b = tracking_bare("bare-odd");
+    git(&b, &["worktree", "add", "-q", "modules", "main"]);
+    fs::write(b.join("modules/README"), "edited").unwrap();
+    // An unrelated repository kept in a bare repository's folder, with a commit no remote has: found by the walk.
+    let b = tracking_bare("bare-inner");
+    repo(&b.join("tools"));
+    // The same, one level down in a plain folder: the walk goes on inside a bare repository it finds.
+    let b = tracking_bare("bare-deep/x.git");
+    repo(&b.join("tools"));
+    // A repository whose own config sets a filter command, which `git status` would run: kept, never run.
+    let r = pushed_repo("filtered", "");
+    fs::write(r.join(".gitattributes"), "* filter=x\n").unwrap();
+    git(&r, &["add", ".gitattributes"]);
+    git(&r, &["commit", "-q", "-m", "attributes"]);
+    git(&r, &["push", "-q", "origin", "main:filtered"]);
+    let marker = t.path().join("filter-ran");
+    git(
+        &r,
+        &[
+            "config",
+            "filter.x.clean",
+            &format!("touch {}; cat", marker.display()),
+        ],
+    );
     age_tree(&home, 30);
 
     let plan = plan_only(&config(&home), "stale-scratch");
@@ -392,7 +458,7 @@ fn stale_scratch_with_git_work_found_nowhere_else_is_never_moved() {
     planned.sort();
     assert_eq!(
         planned,
-        vec!["nested-clean", "plain", "pushed"],
+        vec!["bare-clean", "nested-clean", "plain", "pushed"],
         "{:?}",
         plan.skipped
     );
@@ -409,6 +475,12 @@ fn stale_scratch_with_git_work_found_nowhere_else_is_never_moved() {
         ("tagged", "not pushed"),
         ("outside-wt", "worktree"),
         ("bare.git", "not pushed"),
+        ("bare-wt-top", "not committed in"),
+        ("bare-holder", "not committed in"),
+        ("bare-odd", "not committed in"),
+        ("bare-inner", "not pushed in"),
+        ("bare-deep", "not pushed in"),
+        ("filtered", "filter"),
     ] {
         assert!(
             plan.skipped
@@ -418,4 +490,5 @@ fn stale_scratch_with_git_work_found_nowhere_else_is_never_moved() {
             plan.skipped
         );
     }
+    assert!(!marker.exists(), "the repository's filter command was run");
 }
