@@ -102,7 +102,7 @@ if incus info "$vm" --project "$PROJECT" >/dev/null 2>&1; then
   say "the machine $vm already exists in project $PROJECT (a build was kept or is running): delete it first"
   exit 1
 fi
-waited=0
+waited=0 said=-600
 while :; do
   idle=$(cpu_idle) mem=$(mem_available) pf=$(pool_free) rf=$(root_free)
   why=''
@@ -121,7 +121,10 @@ while :; do
     say "the gate stayed closed for $waited s:$why giving up"
     exit 3
   fi
-  [ $((waited % 600)) -eq 0 ] && say "waiting for the gate:$why"
+  if [ $((waited - said)) -ge 600 ]; then
+    say "waiting for the gate:$why"
+    said=$waited
+  fi
   sleep 55
   waited=$(( $(date +%s) - t_start ))
 done
