@@ -35,6 +35,20 @@ export const DOCTOR_PERSONA = 'You are the Arca Doctor, a friendly helper in the
 export const DOCTOR_DENIAL = 'The Doctor may only read or propose: that tool is not available.';
 // A read result is cut to this many characters before the model sees it.
 export const RESULT_CHARS = 16_000;
+// The Doctor's limits, the same for the canvas and the terminal: tool calls and output tokens per turn (the output
+// cap is also each model request's maxTokens), the turn's time, and the daily token budget's default.
+export const DOCTOR_LIMITS = Object.freeze({
+  toolCallsPerTurn: 40,
+  outputTokensPerTurn: 64_000,
+  turnMs: 9 * 60 * 1000,
+  dailyTokenBudget: 1_000_000,
+});
+
+export function capMessage(reason, limit) {
+  return reason === 'tool-calls'
+    ? `This answer stopped at the ${limit}-tool-call limit for one turn.`
+    : `This answer stopped at the ${limit.toLocaleString('en-US')}-output-token limit for one turn.`;
+}
 
 export function safeApprovalUrl(value) {
   if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return '';
@@ -531,7 +545,7 @@ function toolClient(clientFor, hosts, name, onCall) {
       const client = clientFor(host.name);
       if (!client) throw new Error(`No Arca reader is available for host "${host.name}".`);
       const input = toolInput(name, args);
-      await onCall?.({ name, host: host.name, input, callId: exec.callId });
+      await onCall?.({ name, host: host.name, input, callId: exec.callId, agent: exec.agent });
       return withHost(await client.call(name, input, exec.signal), host.name);
     },
   };
@@ -686,7 +700,7 @@ export function createProposeTool({ hosts = [], clientFor, onCall, onProposal, p
         payload = rest;
       }
       await onCall?.({
-        name: PROPOSE_TOOL, host: host.name, input: { action, args: payload }, callId: exec.callId,
+        name: PROPOSE_TOOL, host: host.name, input: { action, args: payload }, callId: exec.callId, agent: exec.agent,
       });
       let value;
       try {
@@ -788,7 +802,7 @@ export const Config = z.transform(z.object({
   defaultProject: z.string().default(''),
   chatEnabled: z.boolean().default(true),
   chatStatePath: z.string().default(''),
-  dailyTokenBudget: z.number().min(1).max(1000000000).step(1).default(1000000),
+  dailyTokenBudget: z.number().min(1).max(1000000000).step(1).default(DOCTOR_LIMITS.dailyTokenBudget),
 }), (config) => {
   const invalid = (message) => { throw new z.ValidationError(message, { path: ['hosts'] }); };
   const invalidProjects = (message) => { throw new z.ValidationError(message, { path: ['projects'] }); };

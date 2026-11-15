@@ -4,8 +4,8 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { proposalId } from './model.js';
 import {
-  DOCTOR_MODEL, DOCTOR_SESSION_NAME, DOCTOR_TOOLS, RESULT_CHARS, bound, createDoctorTools, doctorPrompt,
-  installDoctorSession, safeApprovalUrl, text,
+  DOCTOR_LIMITS, DOCTOR_MODEL, DOCTOR_SESSION_NAME, DOCTOR_TOOLS, RESULT_CHARS, bound, capMessage, createDoctorTools,
+  doctorPrompt, installDoctorSession, safeApprovalUrl, text,
 } from './doctor-session.js';
 
 // The Doctor's session definition (prompt, tools, allow-list, guard, model) lives in doctor-session.js, shared with
@@ -19,22 +19,16 @@ export const DEFAULTS = Object.freeze({
   setupMs: 60_000,
   cancelMs: 5_000,
   idleMs: 5_000,
-  toolCallsPerTurn: 40,
-  outputTokensPerTurn: 64_000,
-  dailyTokenBudget: 1_000_000,
+  toolCallsPerTurn: DOCTOR_LIMITS.toolCallsPerTurn,
+  outputTokensPerTurn: DOCTOR_LIMITS.outputTokensPerTurn,
+  dailyTokenBudget: DOCTOR_LIMITS.dailyTokenBudget,
   heartbeatMs: 15_000,
-  turnMs: 9 * 60 * 1000,
+  turnMs: DOCTOR_LIMITS.turnMs,
   bodyBytes: 64 * 1024,
   messageChars: 16 * 1024,
   resultChars: RESULT_CHARS,
   historyMessages: 200,
 });
-
-function capMessage(reason, limit) {
-  return reason === 'tool-calls'
-    ? `This answer stopped at the ${limit}-tool-call limit for one turn.`
-    : `This answer stopped at the ${limit.toLocaleString('en-US')}-output-token limit for one turn.`;
-}
 
 export function stateFilePath(env = process.env, configured = '') {
   const value = String(configured ?? '').trim();

@@ -605,16 +605,40 @@ canvas row's own config block. The schema is the same, so one block serves both:
               approvalUrl: <approval page URL>
 ```
 
-Run it with the DeepSeek key in the environment:
+Start it with the launcher, with the DeepSeek key in the environment:
 
 ```sh
-DSH_TUI_PRESET=arca-doctor dsh --profile <profile>
+arca-doctor --profile <profile>
+# or, from the profile: node <profile dir>/node_modules/arca-canvas-dsh/doctor-launch.js --profile <profile>
 ```
 
+The launcher reads the profile's composed config first and starts dsh-tui on the
+`arca-doctor` preset only when that preset is in it and switched on. Otherwise it exits
+non-zero and says why. Use it for a bot. dsh-tui itself treats an unknown
+`DSH_TUI_PRESET` as no preset, and the session then starts as a full coding agent.
+`--patch <file>` is passed through, and `--check` reads the profile and exits.
+
+Either way into the preset gets the Doctor's fences: a session started on it, and a
+blank session switched with `/preset arca-doctor`. If the fences cannot be installed,
+a new session is not opened, and a switched session refuses every tool call. A preset
+that cannot be composed fails the boot.
+
 The session is titled `Doctor`, and `deepseek-flash` is recorded as its model. The
-canvas's per-turn and daily budgets belong to the web chat, not to the session, so
-a terminal turn runs under dsh-tui's own output limit. If the preset cannot load,
-dsh-tui logs a warning and opens an ordinary session without the Doctor's tools.
+canvas's limits apply to each terminal session:
+
+- every model request asks for at most 64k output tokens;
+- a turn stops at 40 tool calls, past 64k output tokens, or after 9 minutes;
+- the daily token budget (`dailyTokenBudget`, default 1,000,000) is counted in
+  `arca-doctor-terminal.json`, beside `chatStatePath` when that is set, else in
+  `$DSH_HOME/storages`. Once it is spent, the next step is refused until the next day.
+
+`chatEnabled: false` keeps the terminal Doctor from starting.
+
+The fences bound the model, not the terminal. Anyone who can type into the bot's
+terminal is an operator: `!command` runs a shell, `/preset` switches the session away
+from the Doctor, and `/model` picks another model. Give that terminal only to people
+you would give a shell. In a terminal, the owner approves a proposal on the canvas card
+or on the approval page.
 
 ## Develop
 

@@ -16,9 +16,13 @@
     "./doctor": "./doctor.js",
     "./package.json": "./package.json"
   },
+  "bin": {
+    "arca-doctor": "./doctor-launch.js"
+  },
   "files": [
     "index.js",
     "doctor.js",
+    "doctor-launch.js",
     "src/arca-client.js",
     "src/token.js",
     "src/devices-client.js",
