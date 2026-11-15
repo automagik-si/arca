@@ -380,8 +380,9 @@ pub struct KernelConfig {
 
 /// The `kernel.instanceImport` key. `sourcePool` is the one Ceph pool an import reads disks from; `cephClient` (default
 /// `arca-import`) is the Ceph client, without its `client.` prefix, that reads it, read-only; `cephCluster` (default
-/// `ceph`) is the cluster both the source pool and the node's Incus Ceph pool are on. The client's keyring is at
-/// `/etc/ceph/<cephCluster>.client.<cephClient>.keyring`.
+/// `ceph`) is the cluster the source pool is on, by the name of its config file on this node,
+/// `/etc/ceph/<cephCluster>.conf`. It may be the cluster of the node's Incus Ceph pool or another one. The client's keyring
+/// is at `/etc/ceph/<cephCluster>.client.<cephClient>.keyring`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstanceImportConfig {

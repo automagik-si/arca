@@ -899,12 +899,21 @@ impl ActionKind {
                     "The edge stops serving this address and no longer opens its instance's port for it. The instance itself is not touched.",
                 ),
             ],
+            // The plan's rows, with the node's fact (the `Ceph` row: the source's cluster and the target's) after the
+            // last disk.
             Self::InstanceImport => match arca_vmimport::plan_of(args) {
-                Ok(plan) => plan
-                    .card()
-                    .into_iter()
-                    .map(|(label, value)| row(&label, &shown(&value, 1200)))
-                    .collect(),
+                Ok(plan) => {
+                    let mut rows = plan.card();
+                    let at = rows
+                        .iter()
+                        .rposition(|(label, _)| label.starts_with("Disk"))
+                        .map_or(rows.len(), |last| last + 1);
+                    let fact = crate::instance_move::fact_rows(gpu_product).unwrap_or_default();
+                    rows.splice(at..at, fact);
+                    rows.into_iter()
+                        .map(|(label, value)| row(&label, &shown(&value, 1200)))
+                        .collect()
+                }
                 Err(why) => vec![row("Source", &shown(&why, 400))],
             },
             Self::InstanceImportUndo => vec![

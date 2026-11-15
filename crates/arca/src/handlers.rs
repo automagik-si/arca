@@ -1872,7 +1872,7 @@ impl ToolHandler for ActionPropose {
         } else if let (ActionKind::InstanceImport, Some(node)) = (action, &self.node) {
             // A node that names no source pool, or a source whose disks are elsewhere, is refused now, so the owner is
             // never asked to approve an import this node cannot run.
-            crate::vm_import::check_proposal(node, &payload)?;
+            card_fact = Some(crate::vm_import::check_proposal(node, &payload)?);
             payload
         } else if let (ActionKind::FunctionRemove, Some(_)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
@@ -1936,6 +1936,8 @@ impl ToolHandler for ActionPropose {
             // only when it does, and otherwise why the database is created stopped. Both were read when the
             // proposal was given its template's fingerprint, from that one read of the template.
             ActionKind::ServiceCreate | ActionKind::PostgresCreate => card_fact.take(),
+            // The card of an import names the Ceph cluster its disks are read from and the one they are written to.
+            ActionKind::InstanceImport => card_fact.take(),
             // The card of a host restore says what the host has drifted from, read live from the root part now.
             ActionKind::HostNetworkRestore => Some(crate::host_network::proposal_fact(
                 &self.host_network_socket(),

@@ -4,11 +4,12 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
+use std::sync::Mutex;
 
 use arca_vmimport::source::{Bus, DiskKind, Firmware, Protocol};
 use arca_vmimport::{
-    FakeCopy, Held, IMPORT_KEY, ImportIncus, Place, Plan, PoolInfo, Probe, parse, plan_of, reduce,
-    reduce_shown, run, undo,
+    FakeCopy, Held, IMPORT_KEY, ImportIncus, Place, Plan, PoolInfo, Probe, RbdCopy, Runner, parse,
+    plan_of, reduce, reduce_shown, run, undo,
 };
 use serde_json::{Value, json};
 
@@ -614,6 +615,8 @@ fn nics_on_two_bridges_or_no_ceph_disk_are_refused() {
 #[derive(Default)]
 struct FakeImport {
     managed: bool,
+    /// The Ceph cluster of the Incus pool; `ceph` when `None`.
+    cluster: Option<String>,
     driver: Option<String>,
     exists: bool,
     fail_on: Option<&'static str>,
@@ -640,7 +643,7 @@ impl ImportIncus for FakeImport {
             pool: PoolInfo {
                 driver: self.driver.clone().unwrap_or_else(|| "ceph".to_string()),
                 osd_pool: format!("{pool}-osd"),
-                cluster: "ceph".to_string(),
+                cluster: self.cluster.clone().unwrap_or_else(|| "ceph".to_string()),
                 client: "incus".to_string(),
             },
             volume_project: "people".to_string(),
@@ -995,4 +998,275 @@ fn undo_removes_the_instance_its_volumes_and_its_acl() {
             .expect_err("gone")
             .contains("no instance")
     );
+}
+
+/// `rbd` as a recording: every command the copy runs, in order. `status` answers no watcher, `info` the size `sizes`
+/// gives the image, and the pipe into `fail_into` fails.
+#[derive(Default)]
+struct RecordedRbd {
+    sizes: BTreeMap<String, u64>,
+    fail_into: Option<String>,
+    calls: Mutex<Vec<Vec<String>>>,
+}
+
+impl RecordedRbd {
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().expect("calls").clone()
+    }
+}
+
+impl Runner for RecordedRbd {
+    fn output(&self, argv: &[String]) -> Result<String, String> {
+        self.calls.lock().expect("calls").push(argv.to_vec());
+        match argv.get(6).map(String::as_str) {
+            Some("status") => Ok(r#"{"watchers":[]}"#.to_string()),
+            Some("info") => {
+                let spec = argv.last().expect("a spec");
+                let size = self.sizes.get(spec).ok_or("no such image")?;
+                Ok(format!(r#"{{"size":{size}}}"#))
+            }
+            _ => Err(format!("unexpected rbd command {argv:?}")),
+        }
+    }
+
+    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String> {
+        let mut calls = self.calls.lock().expect("calls");
+        calls.push(first.to_vec());
+        calls.push(second.to_vec());
+        match &self.fail_into {
+            Some(spec) if second.last() == Some(spec) => Err("rbd import-diff failed".to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn copy_calls(copy: &RbdCopy<RecordedRbd>) -> Vec<Vec<String>> {
+    copy.runner().calls()
+}
+
+/// The `rbd` verbs that only read an image: who watches it, its size, and its data to standard output.
+const READ_VERBS: [&str; 3] = ["status", "info", "export-diff"];
+
+/// Checks every recorded command: each names a cluster and a client; every command on the source cluster, or as the
+/// source client, is a read of a source image to standard output; every write is `import-diff` on the target cluster
+/// as Incus's client, into the target pool. Answers how many commands read the source.
+fn source_only_read(calls: &[Vec<String>], source: (&str, &str), target: (&str, &str)) -> usize {
+    let mut reads = 0;
+    for argv in calls {
+        assert_eq!(argv[0], "rbd", "{argv:?}");
+        assert_eq!(
+            (argv[1].as_str(), argv[3].as_str(), argv[5].as_str()),
+            ("--cluster", "--id", "--no-progress"),
+            "{argv:?}"
+        );
+        let (cluster, client, verb) = (argv[2].as_str(), argv[4].as_str(), argv[6].as_str());
+        if cluster == source.0 || client == source.1 {
+            assert_eq!(
+                (cluster, client),
+                source,
+                "the source client stays on its cluster: {argv:?}"
+            );
+            assert!(
+                READ_VERBS.contains(&verb),
+                "the source is only read: {argv:?}"
+            );
+            // `export-diff <image> -` names the image first; `status` and `info` name it last.
+            let image = if verb == "export-diff" {
+                &argv[7]
+            } else {
+                argv.last().expect("an image")
+            };
+            assert!(
+                image.starts_with("src-pool/"),
+                "a read of a source image: {argv:?}"
+            );
+            if verb == "export-diff" {
+                assert_eq!(argv.len(), 9, "{argv:?}");
+                assert_eq!(argv[8], "-", "the data goes to the pipe: {argv:?}");
+            }
+            reads += 1;
+        } else {
+            assert_eq!((cluster, client), target, "{argv:?}");
+            assert!(["info", "import-diff"].contains(&verb), "{argv:?}");
+            assert!(
+                argv.last().expect("a spec").starts_with("remote-osd/"),
+                "{argv:?}"
+            );
+        }
+    }
+    reads
+}
+
+/// The UEFI import from the source cluster `from` into an Incus pool on the cluster `to`, with `rbd` recorded.
+fn import_between(from: &str, to: &str) -> (Value, Vec<Vec<String>>) {
+    let plan = plan(UEFI);
+    let mut rbd = RecordedRbd::default();
+    rbd.sizes.insert(
+        "remote-osd/virtual-machine_people_web-1.block".to_string(),
+        plan.copies[0].source.size_mib * 1024 * 1024,
+    );
+    for (name, size) in plan.volumes() {
+        rbd.sizes.insert(
+            format!("remote-osd/custom_people_{name}.block"),
+            size * 1024 * 1024,
+        );
+    }
+    let incus = FakeImport {
+        managed: true,
+        cluster: Some(to.to_string()),
+        ..FakeImport::default()
+    };
+    let copy = RbdCopy::new(from, "arca-import", rbd);
+    let answer =
+        run(&plan, "src-pool", &incus, &copy, &probe(Some(1))).expect("imported across clusters");
+    (answer, copy_calls(&copy))
+}
+
+#[test]
+fn across_two_ceph_clusters_the_source_cluster_is_only_ever_read() {
+    let (answer, calls) = import_between("source-b", "ceph");
+    // Two disks: a status and an export-diff of each on the source; an info and an import-diff of each on the target.
+    assert_eq!(calls.len(), 8);
+    assert_eq!(
+        source_only_read(&calls, ("source-b", "arca-import"), ("ceph", "incus")),
+        4
+    );
+    let writes: Vec<&Vec<String>> = calls
+        .iter()
+        .filter(|argv| argv[6] == "import-diff")
+        .collect();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(answer["ceph"]["from"], "source-b");
+    assert_eq!(answer["ceph"]["to"], "ceph");
+    assert_eq!(
+        answer["ceph"]["copied"],
+        "Copied from the Ceph cluster source-b (the pool src-pool, read only) to the Ceph cluster ceph, into the Incus pool remote (written as client.incus)"
+    );
+    assert_eq!(answer["note"], "The VM runs and read back.");
+}
+
+#[test]
+fn the_import_runs_the_same_in_either_direction_between_two_clusters() {
+    // Neither cluster is special: the node's config names the source's, Incus names the target pool's.
+    let (there, there_calls) = import_between("cluster-a", "cluster-b");
+    let (back, back_calls) = import_between("cluster-b", "cluster-a");
+    assert_eq!(
+        source_only_read(
+            &there_calls,
+            ("cluster-a", "arca-import"),
+            ("cluster-b", "incus")
+        ),
+        4
+    );
+    assert_eq!(
+        source_only_read(
+            &back_calls,
+            ("cluster-b", "arca-import"),
+            ("cluster-a", "incus")
+        ),
+        4
+    );
+    assert_eq!(
+        (there["ceph"]["from"].as_str(), there["ceph"]["to"].as_str()),
+        (Some("cluster-a"), Some("cluster-b"))
+    );
+    assert_eq!(
+        (back["ceph"]["from"].as_str(), back["ceph"]["to"].as_str()),
+        (Some("cluster-b"), Some("cluster-a"))
+    );
+    // The same commands, with the two names swapped.
+    let swapped: Vec<Vec<String>> = there_calls
+        .iter()
+        .map(|argv| {
+            argv.iter()
+                .map(|part| match part.as_str() {
+                    "cluster-a" => "cluster-b".to_string(),
+                    "cluster-b" => "cluster-a".to_string(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(swapped, back_calls);
+}
+
+#[test]
+fn a_failed_copy_across_two_clusters_still_only_reads_the_source() {
+    let plan = plan(UEFI);
+    let mut rbd = RecordedRbd::default();
+    rbd.sizes.insert(
+        "remote-osd/virtual-machine_people_web-1.block".to_string(),
+        plan.copies[0].source.size_mib * 1024 * 1024,
+    );
+    for (name, size) in plan.volumes() {
+        rbd.sizes.insert(
+            format!("remote-osd/custom_people_{name}.block"),
+            size * 1024 * 1024,
+        );
+    }
+    rbd.fail_into = Some("remote-osd/custom_people_web-1-disk1.block".to_string());
+    let incus = FakeImport {
+        managed: true,
+        ..FakeImport::default()
+    };
+    let copy = RbdCopy::new("source-b", "arca-import", rbd);
+    let failure =
+        run(&plan, "src-pool", &incus, &copy, &probe(Some(1))).expect_err("the copy fails");
+    assert_eq!(failure.step, "Copying a disk");
+    assert!(failure.words().ends_with("The source was not written."));
+    let calls = copy_calls(&copy);
+    assert_eq!(
+        source_only_read(&calls, ("source-b", "arca-import"), ("ceph", "incus")),
+        4
+    );
+    // The undo goes through Incus alone: no rbd command runs after the failed copy.
+    assert_eq!(calls.last().expect("a call")[6], "import-diff");
+    assert_eq!(
+        incus.calls.borrow()[3..],
+        [
+            "remove instance people/web-1",
+            "remove volume people/remote/web-1-disk1",
+            "remove acl default/arca-import-web-1",
+        ]
+    );
+}
+
+#[test]
+fn on_one_cluster_the_answer_says_so() {
+    let plan = plan(BIOS);
+    let copy = copy_for(&plan);
+    let answer = run(
+        &plan,
+        "src-pool",
+        &FakeImport::default(),
+        &copy,
+        &probe(Some(1)),
+    )
+    .expect("imported");
+    assert_eq!(answer["ceph"]["from"], "ceph");
+    assert_eq!(answer["ceph"]["to"], "ceph");
+    assert_eq!(
+        answer["ceph"]["copied"],
+        "Copied from the Ceph cluster ceph (the pool src-pool, read only) to the same cluster, into the Incus pool remote (written as client.incus)"
+    );
+}
+
+#[test]
+fn a_source_on_another_cluster_is_copied_and_not_refused() {
+    let plan = plan(BIOS);
+    let copy = FakeCopy::on_cluster("source-b");
+    copy.target(
+        "remote-osd/virtual-machine_people_web-1.block",
+        plan.copies[0].source.size_mib * 1024 * 1024,
+    );
+    let answer = run(
+        &plan,
+        "src-pool",
+        &FakeImport::default(),
+        &copy,
+        &probe(Some(1)),
+    )
+    .expect("imported");
+    assert_eq!(copy.copied().len(), 1);
+    assert_eq!(answer["ceph"]["from"], "source-b");
 }

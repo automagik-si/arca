@@ -1,8 +1,11 @@
 //! The disk copy: who holds a source image, the size of the image Incus made, and the copy from one into the other.
 //!
 //! [`RbdCopy`] does it with the `rbd` command, run through a [`Runner`]: two processes and a pipe, never a shell. It reads
-//! the source with its own Ceph client (read-only on the source pool) and writes the target with the Ceph identity Incus
-//! uses for the target pool. [`FakeCopy`] keeps everything in memory, for tests.
+//! the source with its own Ceph client (read-only on the source pool) of the source's cluster, and writes the target with
+//! the Ceph identity Incus uses for the target pool, of the target pool's cluster. The two may be one Ceph cluster or two:
+//! `rbd --cluster <name>` reads `/etc/ceph/<name>.conf` and the client's keyring beside it, so each side reaches its own
+//! cluster with its own key. The bytes stream from the reader to the writer through a pipe: the node holds no more of a
+//! disk than the pipe and the two `rbd` processes' own buffers. [`FakeCopy`] keeps everything in memory, for tests.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -45,7 +48,8 @@ impl TargetImage {
 
 /// The disk copy an import runs.
 pub trait DiskCopy: Send + Sync {
-    /// The cluster the source pool is on.
+    /// The cluster the source pool is on, by the name its config file has on this node (`/etc/ceph/<name>.conf`). It
+    /// may differ from the target pool's.
     fn cluster(&self) -> &str;
     /// Who holds the source image open, by address. Empty when no one does.
     fn watchers(&self, source: &SourceImage) -> Result<Vec<String>, String>;
@@ -151,6 +155,11 @@ impl<R: Runner> RbdCopy<R> {
             client: client.to_string(),
             runner,
         }
+    }
+
+    /// What runs the commands.
+    pub fn runner(&self) -> &R {
+        &self.runner
     }
 
     fn rbd(&self, client: &str, cluster: &str, rest: &[&str]) -> Vec<String> {
@@ -262,9 +271,17 @@ impl<R: Runner> DiskCopy for RbdCopy<R> {
 }
 
 /// A disk copy in memory: source images with their watchers, target images with their size and what was copied in.
-#[derive(Debug, Default)]
+/// Its source pool is on the cluster `ceph` unless [`FakeCopy::on_cluster`] names another.
+#[derive(Debug)]
 pub struct FakeCopy {
+    cluster: String,
     state: Mutex<FakeCopyState>,
+}
+
+impl Default for FakeCopy {
+    fn default() -> Self {
+        Self::on_cluster("ceph")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -276,6 +293,14 @@ struct FakeCopyState {
 }
 
 impl FakeCopy {
+    /// A fake whose source pool is on the cluster `cluster`.
+    pub fn on_cluster(cluster: &str) -> Self {
+        Self {
+            cluster: cluster.to_string(),
+            state: Mutex::new(FakeCopyState::default()),
+        }
+    }
+
     /// Someone at `address` holds the source image `pool/image` open.
     pub fn watch(&self, spec: &str, address: &str) {
         self.lock()
@@ -309,7 +334,7 @@ impl FakeCopy {
 
 impl DiskCopy for FakeCopy {
     fn cluster(&self) -> &str {
-        "ceph"
+        &self.cluster
     }
 
     fn watchers(&self, source: &SourceImage) -> Result<Vec<String>, String> {
@@ -417,6 +442,28 @@ mod tests {
                 "incus-osd/virtual-machine_people_web.block"
             ]
         );
+    }
+
+    #[test]
+    fn across_two_clusters_each_side_names_its_own_cluster_and_client() {
+        let copy = RbdCopy::new("source-b", "arca-import", Recorder::default());
+        copy.copy(&source(), &target()).expect("copied");
+        copy.watchers(&source())
+            .expect_err("no JSON from the recorder");
+        let calls = copy.runner.calls.lock().expect("calls").clone();
+        let (reader, writer, status) = (&calls[0], &calls[1], &calls[2]);
+        assert_eq!(
+            reader[1..5],
+            ["--cluster", "source-b", "--id", "arca-import"]
+        );
+        assert_eq!(reader[6], "export-diff");
+        assert_eq!(writer[1..5], ["--cluster", "ceph", "--id", "incus"]);
+        assert_eq!(writer[6], "import-diff");
+        assert_eq!(
+            status[1..5],
+            ["--cluster", "source-b", "--id", "arca-import"]
+        );
+        assert_eq!(status[6], "status");
     }
 
     #[test]

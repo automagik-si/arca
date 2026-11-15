@@ -3,8 +3,9 @@
 //!
 //! Both verbs run only with the one-shot grant of an action proposal the owner approved. The plan is a pure function of
 //! the approved arguments ([`arca_vmimport::plan_of`]), so the run does what the card said. The node's
-//! `kernel.instanceImport` names the one source pool an import reads and the Ceph client that reads it; a node without
-//! it refuses a proposal before the owner is asked.
+//! `kernel.instanceImport` names the one source pool an import reads, the Ceph client that reads it and the Ceph cluster
+//! it is on, which may be another cluster than the Incus pool's; a node without it refuses a proposal before the owner is
+//! asked. The card names both clusters.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -226,16 +227,67 @@ fn disabled() -> CallError {
     }
 }
 
+/// How long the proposal waits for Incus to say which Ceph cluster the target pool is on.
+const POOL_READ: Duration = Duration::from_secs(5);
+
 /// Checks a proposed `instance_import` against the node: the node must name a source pool, and every disk of the
-/// source must be in it. The plan itself is made and checked by [`ActionKind::prepare`].
-pub fn check_proposal(node: &NodeConfig, args: &Value) -> Result<(), CallError> {
+/// source must be in it. The plan itself is made and checked by [`ActionKind::prepare`]. Answers the card's fact: the
+/// `Ceph` row, which names the source's cluster and the target pool's, as Incus says now. An Incus that does not answer
+/// refuses nothing: the row then says the target's cluster is read when the import runs.
+pub fn check_proposal(node: &NodeConfig, args: &Value) -> Result<String, CallError> {
     let import = node.kernel.instance_import.as_ref().ok_or_else(disabled)?;
     let plan = arca_vmimport::plan_of(args).map_err(CallError::Invalid)?;
     plan.check_source_pool(&import.source_pool)
         .map_err(|message| CallError::Refused {
             code: "InstanceImportRefused".to_string(),
             message,
-        })
+        })?;
+    let pool = &plan.request.pool;
+    let target = VmImportWriter::new(node.incus.socket.clone())
+        .with_deadline(POOL_READ)
+        .pool(pool)
+        .ok()
+        .flatten()
+        .map(|read| {
+            read.pointer("/config/ceph.cluster_name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("ceph")
+                .to_string()
+        });
+    let row = ceph_words(
+        &import.ceph_cluster,
+        &import.ceph_client,
+        &import.source_pool,
+        pool,
+        target.as_deref(),
+    );
+    Ok(serde_json::to_string(&serde_json::json!({ "rows": [["Ceph", row]] })).unwrap_or_default())
+}
+
+/// The card's `Ceph` row: where the disks are read and where they are written. `target` is the Incus pool's cluster,
+/// `None` when Incus did not say.
+fn ceph_words(
+    cluster: &str,
+    client: &str,
+    source_pool: &str,
+    pool: &str,
+    target: Option<&str>,
+) -> String {
+    let from = format!(
+        "Read from the Ceph cluster {cluster} (the pool {source_pool}, as client.{client}, which may only read)"
+    );
+    match target {
+        Some(target) if target == cluster => {
+            format!("{from}, and written on the same cluster into the Incus pool {pool}")
+        }
+        Some(target) => format!(
+            "{from}, and copied to the Ceph cluster {target}, into the Incus pool {pool}. The source cluster is never written"
+        ),
+        None => format!(
+            "{from}, and written into the Incus pool {pool}, on the cluster Incus names for it when the import runs. The source cluster is never written"
+        ),
+    }
 }
 
 /// A proposal's arguments as anyone who lists it sees them: `plan_list`, the approval page (and the linked page hosts that
@@ -336,6 +388,28 @@ pub fn handlers(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_ceph_row_names_both_clusters() {
+        assert_eq!(
+            super::ceph_words(
+                "source-b",
+                "arca-import",
+                "src-pool",
+                "remote",
+                Some("ceph")
+            ),
+            "Read from the Ceph cluster source-b (the pool src-pool, as client.arca-import, which may only read), and copied to the Ceph cluster ceph, into the Incus pool remote. The source cluster is never written"
+        );
+        assert_eq!(
+            super::ceph_words("ceph", "arca-import", "src-pool", "remote", Some("ceph")),
+            "Read from the Ceph cluster ceph (the pool src-pool, as client.arca-import, which may only read), and written on the same cluster into the Incus pool remote"
+        );
+        assert!(
+            super::ceph_words("source-b", "arca-import", "src-pool", "remote", None)
+                .contains("on the cluster Incus names for it when the import runs")
+        );
+    }
+
     #[test]
     fn the_writer_and_the_plan_name_one_mark_and_one_acl_prefix() {
         assert_eq!(arca_incus::IMPORT_KEY, arca_vmimport::IMPORT_KEY);

@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arca::action_proposal::ActionKind;
-use arca::handlers::{ActionExecutor, plan_handlers};
+use arca::config::NodeConfig;
+use arca::handlers::{ActionExecutor, ActionSlot, plan_handlers_served};
 use arca::kernel::Kernel;
 use arca::vm_import::{ImportBackend, handlers as import_handlers};
 use arca_mcp::{CallError, ToolHandler};
@@ -52,15 +53,32 @@ fn rig(tag: &str, key: &SkKey) -> Rig {
         kernel_with_image(&scratch, &fake, verifier, NOW, None).expect("the kernel opens"),
     ));
     let clock = Arc::new(AtomicU64::new(NOW));
-    let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = plan_handlers(
+    // The node reads the source pool on a Ceph cluster of its own, `source-b`; the Incus pool is on `ceph`.
+    let node: NodeConfig = serde_json::from_value(json!({
+        "stateDir": scratch.dir.join("node-state"),
+        "incus": { "socket": fake.socket() },
+        "listen": { "unix": scratch.dir.join("arca.sock") },
+        "tokens": { "hashDir": scratch.dir.join("tokens") },
+        "kernel": {
+            "projects": ["arcak-svc"],
+            "droiddProjects": ["people"],
+            "instanceImport": { "sourcePool": "src-pool", "cephCluster": "source-b" }
+        }
+    }))
+    .expect("the node config");
+    let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = plan_handlers_served(
         Arc::clone(&kernel),
         Arc::new(move || clock.load(Ordering::SeqCst)),
         None,
         None,
+        None,
+        None,
+        ActionSlot::default(),
+        Some(Arc::new(node)),
     )
     .into_iter()
     .collect();
-    let copy = Arc::new(FakeCopy::default());
+    let copy = Arc::new(FakeCopy::on_cluster("source-b"));
     copy.target(
         "remote/virtual-machine_people_web-1.block",
         30_720 * 1024 * 1024,
@@ -157,6 +175,27 @@ fn an_approved_import_makes_the_vm_copies_the_disks_and_reads_back_and_the_undo_
         "Move the VM build & test (id 21) from the outside hypervisor into the instance web-1 in project people"
     );
     assert!(rig.writes().is_empty(), "a proposal changes nothing");
+    // The card names the cluster the disks are read from and the one they are written to, after the last disk.
+    let rows: Vec<(&str, &str)> = proposal["details"]
+        .as_array()
+        .expect("the card's rows")
+        .iter()
+        .map(|row| {
+            (
+                row["label"].as_str().unwrap_or_default(),
+                row["value"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let at = rows
+        .iter()
+        .position(|(label, _)| *label == "Ceph")
+        .expect("a Ceph row");
+    assert_eq!(rows[at - 1].0, "Disk 2");
+    assert_eq!(
+        rows[at].1,
+        "Read from the Ceph cluster source-b (the pool src-pool, as client.arca-import, which may only read), and copied to the Ceph cluster ceph, into the Incus pool remote. The source cluster is never written"
+    );
 
     // A direct call without the owner's approval runs nothing.
     let refused = rig
@@ -173,6 +212,14 @@ fn an_approved_import_makes_the_vm_copies_the_disks_and_reads_back_and_the_undo_
     assert_eq!(result["acls"], json!(["arca-import-web-1"]));
     assert_eq!(result["volumes"], json!(["web-1-disk1"]));
     assert_eq!(result["readBack"]["answered"], true);
+    assert_eq!(
+        result["ceph"],
+        json!({
+            "from": "source-b",
+            "to": "ceph",
+            "copied": "Copied from the Ceph cluster source-b (the pool src-pool, read only) to the Ceph cluster ceph, into the Incus pool remote (written as client.admin)"
+        })
+    );
     assert_eq!(
         rig.copy.copied(),
         [
