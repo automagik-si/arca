@@ -6,7 +6,9 @@
 //! [`version`] module decides which, from the request alone.
 //!
 //! Every request is refused `403` when it carries an `Origin` header. Otherwise it must carry a bearer token of a stored
-//! scope, or it is refused `401`. The server keeps only SHA-256 digests of the tokens, read from `<id>.hash` files.
+//! scope, or it is refused `401`. With an authorization server ([`Server::oauth`]) a bearer it issued is accepted too,
+//! and the `401` names the protected resource metadata (RFC 9728) where a client finds that server. The server keeps
+//! only SHA-256 digests of the stored tokens, read from `<id>.hash` files.
 //! It listens on a unix socket (mode 0600) and, optionally, on one tailnet address, on one proxy address that serves a
 //! single peer, and on a second unix socket for the node's own services.
 
@@ -18,7 +20,10 @@ pub mod jsonrpc;
 pub mod tools;
 pub mod version;
 
-pub use auth::{Caller, TokenStore, TokenStoreError, admin_token_ids, mint, mint_with_tools};
+pub use auth::{
+    Caller, ISSUED_PREFIX, IssuedTokens, TokenStore, TokenStoreError, admin_token_ids, mint,
+    mint_with_tools,
+};
 pub use elicit::{PendingPlan, TerminalApprover};
 pub use http::{
     GetHandler, GetReply, Server, loopback_addr_ok, peer_allowed, proxy_addr_ok, serve_filtered,

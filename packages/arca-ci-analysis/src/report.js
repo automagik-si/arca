@@ -1,5 +1,6 @@
 // The report a person reads (Markdown), and the one-line result an Arca function run ends with.
 
+import { percent } from './analyze.js';
 import { PRICES_AS_OF } from './cost.js';
 
 const n = (value, digits = 0) => (value == null ? '-' : Number(value).toFixed(digits));
@@ -16,6 +17,24 @@ export function markdown(report, { maxJobs = 25, maxFindings = 15 } = {}) {
     `Window: ${report.window.since} to ${report.window.until} (${report.window.days} days). Generated ${report.generatedAt}. ` +
       `${t.runs} runs, ${t.jobs} jobs, ${t.logsRead} job logs read. Repository is ${report.visibility}.`,
   );
+  const sampled = report.window.sampled;
+  if (sampled) {
+    out.push('');
+    out.push(
+      `Sampled: the newest ${sampled.maxRuns} completed runs of the ${sampled.daysAsked} days asked, so the window is the ` +
+        `${report.window.days} days they cover; weekly figures scale from that.`,
+    );
+  }
+  const partial = report.partial;
+  if (partial) {
+    out.push('');
+    out.push(
+      `**Partial:** not everything was read (${partial.reason}). Not read: ` +
+        `${partial.daysUnlisted ? `the runs of ${partial.daysUnlisted} day(s), ` : ''}the jobs of ${partial.runsWithoutJobs} run(s), ` +
+        `${partial.workflowsUnread} workflow file(s), ${partial.logsUnread} log(s). The figures cover what was read` +
+        `${partial.daysUnlisted ? `, and the window is the ${report.window.days} days whose runs were listed` : ''}.`,
+    );
+  }
   out.push('');
   out.push('## Summary');
   out.push('');
@@ -31,7 +50,7 @@ export function markdown(report, { maxJobs = 25, maxFindings = 15 } = {}) {
   const c = report.cache;
   out.push(
     `- Cache restores in the logs read: ${c.restores} (${c.hits} exact hits, ${c.partial} partial, ${c.misses} misses; hit rate ${
-      c.hitRate == null ? '-' : `${Math.round(c.hitRate * 100)}%`
+      c.hitRate == null ? '-' : percent(c.hitRate)
     })` + (c.activeBytes != null ? `; ${(c.activeBytes / 1024 ** 3).toFixed(2)} GiB in ${c.activeCount} caches.` : '.'),
   );
   out.push('');
@@ -84,7 +103,7 @@ export function markdown(report, { maxJobs = 25, maxFindings = 15 } = {}) {
   out.push('|---|---|---|---|---|---|');
   for (const j of report.jobs.slice(0, 10)) {
     for (const s of j.steps.slice(0, 3)) {
-      out.push(`| ${cell(j.name)} | ${cell(s.name)} | ${s.runs} | ${dur(s.p50)} | ${dur(s.p95)} | ${s.share == null ? '-' : `${Math.round(s.share * 100)}%`} |`);
+      out.push(`| ${cell(j.name)} | ${cell(s.name)} | ${s.runs} | ${dur(s.p50)} | ${dur(s.p95)} | ${s.share == null ? '-' : percent(s.share)} |`);
     }
   }
   out.push('');
@@ -129,7 +148,7 @@ export function markdown(report, { maxJobs = 25, maxFindings = 15 } = {}) {
     out.push('|---|---|---|---|---|---|---|---|---|');
     for (const s of report.cache.steps.slice(0, 15)) {
       out.push(
-        `| ${cell(s.job)} | ${cell((s.step ?? '').split('@')[0])} | ${s.restores} | ${s.hits} | ${s.partial} | ${s.misses} | ${Math.round(s.hitRate * 100)}% | ${s.gzip} | ${s.zstd} |`,
+        `| ${cell(s.job)} | ${cell((s.step ?? '').split('@')[0])} | ${s.restores} | ${s.hits} | ${s.partial} | ${s.misses} | ${percent(s.hitRate)} | ${s.gzip} | ${s.zstd} |`,
       );
     }
     out.push('');
@@ -162,6 +181,8 @@ export function resultLine(reports, { ok = true, errors = [] } = {}) {
     usd: report.totals.billedUsd,
     flaky: report.flaky.events,
     hit: report.cache.hitRate,
+    ...(report.partial ? { partial: report.partial.reason } : {}),
+    ...(report.window.sampled ? { days: report.window.days } : {}),
     top: report.findings.slice(0, 3).map((f) => ({ id: f.id, min: Math.round((f.weekly?.runnerMinutes ?? 0) + (f.weekly?.wallMinutes ?? 0)) })),
   }));
   let line = JSON.stringify({ ok, repos, errors: errors.slice(0, 5) });

@@ -1,63 +1,196 @@
 // Reads one repository's GitHub Actions history for a window into a dataset: plain JSON that the analysis reads and
 // that a test can hold as a fixture. Only GETs (see github.js). Logs are read for a bounded sample of jobs and kept
 // only as what was parsed from them, never as text.
+//
+// The requests are bounded before the first one is made (requestPlan): the jobs of at most `maxRuns` runs, the newest
+// in the window, at most `maxWorkflows` workflow files and the logs that pickLogs names. A busy repository has
+// thousands of runs a week, and one jobs request per run would spend an hour of a token's rate limit. When a request
+// fails part-way (the budget is spent, the rate limit will not reset in time, GitHub keeps failing), the dataset
+// keeps what was read and says what is missing in `partial`.
 
 import { parseLog } from './logs.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
-/** The defaults: how far back, and how many logs a night may read. */
-export const DEFAULTS = { days: 7, flakeLogs: 25, failureLogs: 15, sampleLogs: 60, samplesPerJob: 3 };
+/** The defaults: how far back, how many runs and workflows to read, and how many logs a night may read. */
+export const DEFAULTS = {
+  days: 7,
+  maxRuns: 300,
+  maxWorkflows: 20,
+  flakeLogs: 25,
+  failureLogs: 15,
+  sampleLogs: 60,
+  samplesPerJob: 3,
+};
+
+/**
+ * About how many REST requests one repository's collection makes with these options (retries, jobs lists over 100
+ * entries and runs still in progress add to it; the client's budget is the limit): the repository, the runs list (one
+ * page a day, plus one a hundred runs), one jobs list a run, the workflow files, the two cache lists, the logs, and
+ * the two requests that mint an App installation token when the client signs in as an App.
+ */
+export function requestPlan(options = {}) {
+  const o = { ...DEFAULTS, ...defined(options) };
+  const days = Math.ceil(o.days);
+  const logs = o.flakeLogs + o.failureLogs + o.sampleLogs;
+  return 1 + days + Math.ceil(o.maxRuns / 100) + o.maxRuns + o.maxWorkflows + 2 + logs + (o.app ? 2 : 0);
+}
+
+/**
+ * Options that keep the collection of `repos` repositories within `budget` requests in all: each repository gets an
+ * equal share, and when the defaults do not fit it, the runs and the logs read shrink together. Throws when even a
+ * small sample (20 runs and 5 logs a repository) does not fit.
+ */
+export function fitBudget(repos, budget, options = {}) {
+  const o = { ...DEFAULTS, ...defined(options) };
+  const share = Math.floor(budget / Math.max(1, repos));
+  if (requestPlan(o) <= share) return o;
+  const logs = o.flakeLogs + o.failureLogs + o.sampleLogs;
+  const fixed = requestPlan({ ...o, maxRuns: 0, flakeLogs: 0, failureLogs: 0, sampleLogs: 0 });
+  // What is left of the share goes to runs and logs in the defaults' proportion (300 runs to 100 logs).
+  const factor = Math.max(0, share - fixed - 1) / (o.maxRuns * 1.01 + logs);
+  const fitted = {
+    ...o,
+    maxRuns: Math.floor(o.maxRuns * factor),
+    flakeLogs: Math.floor(o.flakeLogs * factor),
+    failureLogs: Math.floor(o.failureLogs * factor),
+    sampleLogs: Math.floor(o.sampleLogs * factor),
+  };
+  if (fitted.maxRuns < 20 || fitted.flakeLogs + fitted.failureLogs + fitted.sampleLogs < 5) {
+    throw new Error(
+      `a budget of ${budget} requests is too small for ${repos} repositories over ${o.days} days (each needs at least ${requestPlan({ ...o, maxRuns: 20, flakeLogs: 2, failureLogs: 1, sampleLogs: 2 })}); raise --budget or name fewer repositories`,
+    );
+  }
+  return fitted;
+}
 
 export async function collect(gh, repo, options = {}) {
-  const { days, flakeLogs, failureLogs, sampleLogs, samplesPerJob } = {
-    ...DEFAULTS,
-    ...Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined)),
-  };
+  const o = { ...DEFAULTS, ...defined(options) };
   const until = options.until ? new Date(options.until) : new Date();
-  const since = new Date(until.getTime() - days * DAY);
+  const since = new Date(until.getTime() - o.days * DAY);
   const log = options.log ?? (() => {});
+  // A spent budget, a rate limit that will not reset in time or a dead credential (a 401, a refused App sign-in) stops
+  // the collection: nothing more can be read. Any other failure (GitHub still failing after its retries, a 403 on one
+  // endpoint the access does not cover) skips that one request and goes on.
+  let stopped = null;
+  let failed = 0;
+  let firstFailure = null;
+  const stop = (error) => {
+    if (error.code !== 'budget' && error.code !== 'rate-limit' && error.code !== 'auth') {
+      failed += 1;
+      firstFailure ??= error.message;
+      log(`${repo}: skipped one request (${error.message})`);
+      return;
+    }
+    if (!stopped) {
+      stopped = error.message;
+      log(`${repo}: stopped (${error.message}); keeping what was read`);
+    }
+  };
 
   const info = await gh.get(repo, `/repos/${repo}`);
   if (!info) throw new Error(`${repo} cannot be read with this access`);
 
-  // The runs list answers at most 1000 runs per query, so it is read one day at a time.
-  const runs = [];
-  for (let start = since.getTime(); start < until.getTime(); start += DAY) {
-    const end = Math.min(start + DAY, until.getTime());
+  // The runs list answers at most 1000 runs per query, so it is read one day at a time, the newest day first, until
+  // `maxRuns` completed runs are in hand.
+  let runs = [];
+  let listed = 0;
+  let full = true;
+  let daysUnlisted = 0;
+  const skipped = []; // [start, end) of the days skipped while the listing went on
+  let reached = until.getTime(); // the start of the oldest day the listing got to
+  for (let end = until.getTime(); end > since.getTime(); end -= DAY) {
+    const start = Math.max(end - DAY, since.getTime());
+    if (stopped) {
+      daysUnlisted += 1;
+      continue;
+    }
     const range = `${iso(start)}..${iso(end - 1000)}`;
-    const page = await gh.all(repo, `/repos/${repo}/actions/runs?created=${encodeURIComponent(range)}`, 'workflow_runs');
-    for (const run of page) if (run.status === 'completed') runs.push(slimRun(run));
+    try {
+      const page = await gh.all(repo, `/repos/${repo}/actions/runs?created=${encodeURIComponent(range)}`, 'workflow_runs', {
+        max: o.maxRuns - runs.length + 100,
+      });
+      listed += page.length;
+      for (const run of page) if (run.status === 'completed') runs.push(slimRun(run));
+      reached = start;
+    } catch (error) {
+      stop(error);
+      daysUnlisted += 1;
+      if (!stopped) skipped.push([start, end]);
+    }
+    if (runs.length >= o.maxRuns) {
+      full = end - DAY <= since.getTime();
+      break;
+    }
   }
-  log(`${repo}: ${runs.length} completed runs since ${iso(since.getTime())}`);
+  runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const sampled = runs.length > o.maxRuns || !full;
+  runs = runs.slice(0, o.maxRuns);
+  // A sample covers from its oldest run on, and the analysis scales to a week by that span, not by the days asked; a
+  // listing that stopped covers the days it got to, and a day skipped on the way is not in the window at all.
+  const from = sampled && runs.length ? Date.parse(runs.at(-1).createdAt) : stopped ? reached : since.getTime();
+  const gap = skipped.reduce((total, [start, end]) => total + Math.max(0, end - Math.max(start, from)), 0);
+  const cut = sampled || from > since.getTime() || gap > 0;
+  const windowDays = Math.max(0.01, Math.round(((until.getTime() - from - gap) / DAY) * 100) / 100);
+  log(`${repo}: ${runs.length} completed runs since ${iso(from)}${sampled ? ` (the newest ${o.maxRuns})` : ''}`);
 
   const jobs = [];
-  await Promise.all(
-    runs.map(async (run) => {
-      const list = await gh.all(repo, `/repos/${repo}/actions/runs/${run.id}/jobs?filter=all`, 'jobs');
-      for (const job of list) jobs.push(slimJob(job, run));
-    }),
-  );
+  const jobsRead = new Set();
+  let next = 0;
+  const worker = async () => {
+    while (!stopped && next < runs.length) {
+      const run = runs[next++];
+      try {
+        const list = await gh.all(repo, `/repos/${repo}/actions/runs/${run.id}/jobs?filter=all`, 'jobs');
+        for (const job of list) jobs.push(slimJob(job, run));
+        jobsRead.add(run.id);
+      } catch (error) {
+        stop(error);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, worker));
+  const runsWithoutJobs = runs.filter((run) => !jobsRead.has(run.id)).length;
+  runs = runs.filter((run) => jobsRead.has(run.id));
   log(`${repo}: ${jobs.length} jobs`);
 
   const workflows = {};
-  const paths = [...new Set(runs.map((run) => run.path).filter((path) => path?.startsWith('.github/workflows/')))];
-  await Promise.all(
-    paths.map(async (path) => {
+  const counts = new Map();
+  for (const run of runs) if (run.path?.startsWith('.github/workflows/')) counts.set(run.path, (counts.get(run.path) ?? 0) + 1);
+  const paths = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, o.maxWorkflows).map(([path]) => path);
+  for (const path of paths) {
+    if (stopped) break;
+    try {
       const file = await gh.get(repo, `/repos/${repo}/contents/${path}?ref=${encodeURIComponent(info.default_branch)}`);
       if (file?.content) workflows[path] = Buffer.from(file.content, 'base64').toString('utf8');
-    }),
-  );
+    } catch (error) {
+      stop(error);
+    }
+  }
 
-  const usage = await gh.get(repo, `/repos/${repo}/actions/cache/usage`);
-  const caches = await gh.all(repo, `/repos/${repo}/actions/caches?sort=size_in_bytes&direction=desc`, 'actions_caches', {
-    max: 100,
-  });
+  let usage = null;
+  let caches = [];
+  if (!stopped) {
+    try {
+      usage = await gh.get(repo, `/repos/${repo}/actions/cache/usage`);
+      caches = await gh.all(repo, `/repos/${repo}/actions/caches?sort=size_in_bytes&direction=desc`, 'actions_caches', {
+        max: 100,
+      });
+    } catch (error) {
+      stop(error);
+    }
+  }
 
   const logs = {};
-  for (const [jobId, why] of pickLogs(runs, jobs, { flakeLogs, failureLogs, sampleLogs, samplesPerJob })) {
-    const text = await gh.get(repo, `/repos/${repo}/actions/jobs/${jobId}/logs`, { raw: true });
-    if (text) logs[jobId] = { why, ...parseLog(text) };
+  const wanted = [...pickLogs(runs, jobs, o)];
+  for (const [jobId, why] of wanted) {
+    if (stopped) break;
+    try {
+      const text = await gh.get(repo, `/repos/${repo}/actions/jobs/${jobId}/logs`, { raw: true });
+      if (text) logs[jobId] = { why, ...parseLog(text) };
+    } catch (error) {
+      stop(error);
+    }
   }
   log(`${repo}: ${Object.keys(logs).length} logs read; ${gh.requests} requests`);
 
@@ -66,7 +199,22 @@ export async function collect(gh, repo, options = {}) {
     defaultBranch: info.default_branch,
     visibility: info.private ? 'private' : 'public',
     generatedAt: new Date().toISOString(),
-    window: { since: iso(since.getTime()), until: iso(until.getTime()), days },
+    window: {
+      since: iso(from),
+      until: iso(until.getTime()),
+      days: cut ? windowDays : o.days,
+      ...(sampled ? { sampled: { runs: runs.length + runsWithoutJobs, listed, maxRuns: o.maxRuns, daysAsked: o.days } } : {}),
+    },
+    partial:
+      stopped || failed
+        ? {
+            reason: stopped ?? `GitHub kept failing on ${failed} request(s), the first: ${firstFailure}`,
+            daysUnlisted,
+            runsWithoutJobs,
+            workflowsUnread: paths.length - Object.keys(workflows).length,
+            logsUnread: wanted.length - Object.keys(logs).length,
+          }
+        : null,
     runs,
     jobs,
     workflows,
@@ -83,6 +231,10 @@ export async function collect(gh, repo, options = {}) {
     },
     logs,
   };
+}
+
+function defined(options) {
+  return Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined));
 }
 
 function iso(ms) {

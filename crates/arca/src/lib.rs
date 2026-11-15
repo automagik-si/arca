@@ -21,6 +21,7 @@ pub mod cmd_call;
 pub mod cmd_host_network;
 pub mod cmd_init;
 pub mod cmd_link;
+pub mod cmd_oauth;
 pub mod cmd_probe;
 pub mod cmd_serve;
 pub mod cmd_setup_code;
@@ -47,11 +48,13 @@ pub mod host_network;
 pub mod kernel;
 pub mod lifecycle;
 pub mod linked;
+pub mod mcp_oauth;
 pub mod move_preflight;
 pub mod omni;
 mod passkey_change;
 pub mod peer_sync;
 pub mod registry;
+pub mod route;
 pub mod runners;
 pub mod service;
 pub mod service_exec;
@@ -94,6 +97,8 @@ const USAGE: &str = "usage: arca <command>
   token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--replace] [--config <file> | --hash-dir <dir>]
   token revoke <id> [--config <file> | --hash-dir <dir>]
   token reload [--config <file>] (the running node reads its tokens again)
+  oauth list [--config <file>] (the MCP apps connected through the approval page)
+  oauth revoke <client> [--config <file>] (disconnect one: its tokens stop working at once)
   store check [--config <file>]
   templates install [--config <file>] [--replace]
   service import plan --name <service> [--config <file>]
@@ -568,6 +573,7 @@ const COMMANDS: &[&str] = &[
     "host-network",
     "call",
     "token",
+    "oauth",
     "store",
     "templates",
     "service",
@@ -626,6 +632,25 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
                 "a templates action",
                 other.map(|(action, _)| action.as_str()),
                 &["install"],
+            )),
+        },
+        "oauth" => match rest.split_first() {
+            Some((action, rest)) if action == "list" => {
+                cmd_oauth::list(&parse_flags(rest, &["config"], &[])?)
+            }
+            Some((action, rest)) if action == "revoke" => {
+                let (client, rest) = rest.split_first().ok_or_else(|| {
+                    Failure::Usage(
+                        "oauth revoke needs the app's client id, as oauth list shows it: arca oauth revoke CLIENT_ID"
+                            .to_string(),
+                    )
+                })?;
+                cmd_oauth::revoke(client, &parse_flags(rest, &["config"], &[])?)
+            }
+            other => Err(unknown_word(
+                "an oauth action",
+                other.map(|(action, _)| action.as_str()),
+                &["list", "revoke"],
             )),
         },
         "token" => match rest.split_first() {

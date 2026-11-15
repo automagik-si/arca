@@ -365,6 +365,11 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             }),
             ActionKind::FunctionRemove => json!({ "name": "relay" }),
             ActionKind::HostNetworkRestore => json!({}),
+            ActionKind::RouteAdd => json!({
+                "hostname": "app.example.com", "instance": "web", "project": "default",
+                "port": 8080, "reach": "private",
+            }),
+            ActionKind::RouteRemove => json!({ "hostname": "app.example.com" }),
         }
     }
 
@@ -555,6 +560,37 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     .contains(&field.as_str())),
                 "the schema has a field the card does not show"
             );
+            continue;
+        }
+        if matches!(action, ActionKind::RouteAdd | ActionKind::RouteRemove) {
+            // Every argument is on the card, with the edge that serves it and the reach in words.
+            let shown: Vec<(&str, &str)> = details
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(shown[0], ("Address", "https://app.example.com"));
+            if action == ActionKind::RouteAdd {
+                assert_eq!(shown[1], ("Instance", "web"));
+                assert_eq!(shown[2], ("Project", "default"));
+                assert_eq!(shown[3], ("Port", "8080"));
+                assert_eq!(shown[4].0, "Reach");
+                assert!(shown[4].1.contains("tailnet") && shown[4].1.contains("403"));
+                assert_eq!(shown[5].0, "Edge");
+                for field in action.params_schema()["properties"]
+                    .as_object()
+                    .expect("properties")
+                    .keys()
+                {
+                    assert!(
+                        ["hostname", "instance", "project", "port", "reach"]
+                            .contains(&field.as_str()),
+                        "route_add field {field} is not on the card"
+                    );
+                }
+            } else {
+                assert_eq!(shown[1].0, "Edge");
+                assert!(shown[2].1.contains("not touched"));
+            }
             continue;
         }
         if action == ActionKind::FunctionRemove {
@@ -2142,7 +2178,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(all.len(), 25);
+    assert_eq!(all.len(), 27);
     assert_eq!(
         failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
         format!(

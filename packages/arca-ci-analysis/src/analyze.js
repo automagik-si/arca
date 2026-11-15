@@ -19,6 +19,14 @@ const seconds = (from, to) => (from && to ? Math.max(0, (Date.parse(to) - Date.p
 const round = (n, digits = 0) => (n == null ? null : Math.round(n * 10 ** digits) / 10 ** digits);
 const sum = (values) => values.reduce((a, b) => a + (b ?? 0), 0);
 
+/** A share as a whole percent that never rounds a real share to 0% or 100%: 1 in 224 is "<1%", not "0%". */
+export function percent(share) {
+  if (share == null) return '-';
+  if (share > 0 && share < 0.005) return '<1%';
+  if (share < 1 && share > 0.995) return '>99%';
+  return `${Math.round(share * 100)}%`;
+}
+
 /**
  * A runner label as `--move-to` takes it: one plain runs-on label, which the pull request writes into a workflow. It
  * starts with a letter, so YAML reads it written plain as a string (not `-`, `.inf` or `1e3`). That is the only check:
@@ -157,7 +165,7 @@ export function analyze(data, options = {}) {
     })
     .sort((a, b) => b.minutes - a.minutes);
 
-  const flaky = findFlaky(jobs, data.logs ?? {});
+  const flaky = findFlaky(jobs, data.logs ?? {}, { runsById, workflows });
   const tests = testTimes(jobs, data.logs ?? {});
   const cache = cacheStats(jobs, data.logs ?? {}, data.caches ?? {});
 
@@ -189,6 +197,7 @@ export function analyze(data, options = {}) {
     defaultBranch: data.defaultBranch,
     generatedAt: data.generatedAt,
     window: data.window,
+    partial: data.partial ?? null,
     totals: {
       runs: data.runs.length,
       jobs: jobs.length,
@@ -258,17 +267,29 @@ function findingId(repo, finding) {
 // ---------------------------------------------------------------------------------------------------------------
 // Flaky jobs and tests: a job that failed and then passed on the same commit.
 
-function findFlaky(jobs, logs) {
-  const groups = groupBy(
-    jobs.filter((job) => DONE.has(job.conclusion)),
-    (job) => `${job.path}\0${job.headSha}\0${job.name}`,
+function findFlaky(jobs, logs, { runsById = new Map(), workflows = {} } = {}) {
+  // A scheduled run tests the default branch as it is at that hour, and what it fails on is mostly outside the code
+  // (a token, the open pull requests): the same commit failing then passing there says nothing about flakiness.
+  const counted = jobs.filter((job) => DONE.has(job.conclusion) && runsById.get(job.runId)?.event !== 'schedule');
+  const groups = groupBy(counted, (job) => `${job.path}\0${job.headSha}\0${job.name}`);
+  const failedIn = groupBy(
+    jobs.filter((job) => job.conclusion === 'failure' || job.conclusion === 'cancelled'),
+    (job) => `${job.runId}\0${job.attempt}`,
   );
+  // A job that needs others and failed in an attempt where another job failed or was cancelled is a gate reporting
+  // that (a `needs:` job with `if: always()`), not a flake of its own: the job it reports on is counted instead. The
+  // other job is not matched by name, since older runs carry the names of an older workflow file.
+  const gateFailure = (job) => {
+    const workflow = workflows[job.path];
+    if (!(workflow && jobFor(workflow, job.name)?.needs?.length)) return false;
+    return (failedIn.get(`${job.runId}\0${job.attempt}`) ?? []).some((other) => other !== job);
+  };
   const events = [];
   for (const list of groups.values()) {
     const sorted = [...list].sort((a, b) => (a.completedAt ?? '').localeCompare(b.completedAt ?? ''));
     const firstPass = sorted.findIndex((job) => job.conclusion === 'success');
     if (firstPass <= 0) continue;
-    const failures = sorted.slice(0, firstPass).filter((job) => job.conclusion === 'failure');
+    const failures = sorted.slice(0, firstPass).filter((job) => job.conclusion === 'failure' && !gateFailure(job));
     if (failures.length === 0) continue;
     const pass = sorted[firstPass];
     events.push({
@@ -446,9 +467,11 @@ function failingWorkflows({ data, scale, workflowRows, jobs }) {
 }
 
 /**
- * Short jobs on a billed runner that an unbilled one would run as well: the free GitHub-hosted runner of a public
- * repository, or, when `moveTo` names one, the label of the repository owner's own runner pool (whatever the
- * repository's visibility). In a public repository anyone can open a pull request from a fork, and a fork pull request
+ * Jobs on a billed Linux x64 runner that an unbilled one would run as well. To the free GitHub-hosted runner of a
+ * public repository, only short jobs move: it is smaller than most billed runners, and a long job would get slower.
+ * To the owner's own runner pool (`moveTo`, whatever the repository's visibility), any job moves, whatever its
+ * length: the pool is sized by its owner, and the evidence asks for one as large as the runner the job leaves.
+ * In a public repository anyone can open a pull request from a fork, and a fork pull request
  * runs its own copy of the workflow, so it can name the pool. Every move in a public repository says so in its
  * evidence; where pull requests start the workflow, `forkSafe` keeps the ordinary ones on ubuntu-latest.
  */
@@ -470,7 +493,7 @@ function paidRunners({ data, scale, workflows, jobRows, moveTo }) {
       if (rows.length === 0 || rows.some((row) => row.freeForPublic || !row.perMinute || row.runner.startsWith('self-hosted'))) continue;
       const p50 = Math.max(...rows.map((row) => row.p50 ?? 0));
       const p95 = Math.max(...rows.map((row) => row.p95 ?? 0));
-      if (p50 > 90 || p95 > 180) continue;
+      if (!moveTo && (p50 > 90 || p95 > 180)) continue;
       const usd = sum(rows.map((row) => row.billedUsd));
       if (usd <= 0) continue;
       const linux = /ubuntu|linux/.test(job.runsOn) && !/arm/.test(job.runsOn);
@@ -481,12 +504,16 @@ function paidRunners({ data, scale, workflows, jobRows, moveTo }) {
     const usd = sum(moves.map((move) => move.usd));
     out.push({
       kind: 'paid-runner',
-      title: `Run ${moves.length} short job(s) of ${workflow.name ?? path} on ${moveTo ? moveTo : 'the free GitHub runner'}`,
+      title: moveTo
+        ? `Run ${moves.length} job(s) of ${workflow.name ?? path} on ${moveTo}`
+        : `Run ${moves.length} short job(s) of ${workflow.name ?? path} on the free GitHub runner`,
       path,
       evidence: [
         `${why}; these jobs run on ${[...new Set(moves.map((m) => m.from))].join(', ')} and cost $${round(usd, 2)} in ${data.window.days} days`,
         ...moves.map((m) => `${m.id}: p50 ${minutesText(m.p50)}, p95 ${minutesText(m.p95)} over ${m.runs} runs, $${round(m.usd, 2)}`),
-        'a short job gains little from a faster runner; a job that needs the provider\'s own cache or hardware should stay',
+        moveTo
+          ? `the pool's machines should be at least as large as ${[...new Set(moves.map((m) => m.from))].join(', ')}, or these jobs get slower; a job that needs the provider's own cache or hardware should stay`
+          : 'a short job gains little from a faster runner; a job that needs the provider\'s own cache or hardware should stay',
         ...(moveTo ? hostedLooking(moveTo) : []),
         ...(exposed ? publicPool(moveTo, forks) : []),
       ],
@@ -497,7 +524,8 @@ function paidRunners({ data, scale, workflows, jobRows, moveTo }) {
         kind: 'set-runner',
         path,
         jobs: moves.map((m) => ({ id: m.id, from: m.from, to: m.to })),
-        ...(exposed ? { pool: moveTo, public: true } : {}),
+        ...(moveTo ? { pool: moveTo } : {}),
+        ...(exposed ? { public: true } : {}),
         ...(forks ? { forks: 'ubuntu-latest' } : {}),
       },
       suggestion: forks
@@ -631,7 +659,7 @@ function flakyFindings({ data, scale, flaky }) {
       path: row.path,
       job: row.name,
       evidence: [
-        `${row.flakes} of ${row.commits} commits (${round(row.rate * 100)}%) failed this job and then passed it without a code change; ${round(row.wastedMinutes)} runner-min were spent on the failed attempts`,
+        `${row.flakes} of ${row.commits} commits (${percent(row.flakes / Math.max(1, row.commits))}) failed this job and then passed it without a code change; ${round(row.wastedMinutes)} runner-min were spent on the failed attempts`,
         ...row.examples.slice(0, 3).map((e) => `${sha(e.headSha)}: job ${e.failed.id} (run ${e.failed.runId} attempt ${e.failed.attempt}) failed, job ${e.passed.id} (${e.how}) passed`),
         row.tests.length ? `tests that failed in those attempts: ${row.tests.slice(0, 5).join('; ')}` : 'no failing test name could be read from the failed attempts\' logs',
       ],
@@ -775,7 +803,7 @@ function cacheFindings({ data, scale, cache }) {
     if (step.restores < 3 || step.hitRate >= 0.5) continue;
     out.push({
       kind: 'cache-miss',
-      title: `Cache in ${step.job} misses ${round((1 - step.hitRate) * 100)}% of the time`,
+      title: `Cache in ${step.job} misses ${percent(1 - step.hitRate)} of the time`,
       path: step.path,
       job: step.job,
       subject: step.step,
@@ -882,7 +910,7 @@ function splitJobs({ data, scale, workflowRows, jobRows }) {
       job: first.name,
       evidence: [
         `${first.name} takes ${minutesText(first.p50)} at p50 and sets the pace of ${workflow.name}${second ? ` (next longest job: ${minutesText(second.p50)})` : ''}`,
-        ...long.map((step) => `step ${step.name}: ${minutesText(step.p50)} p50, ${round(step.share * 100)}% of the job`),
+        ...long.map((step) => `step ${step.name}: ${minutesText(step.p50)} p50, ${percent(step.share)} of the job`),
       ],
       weekly: { runnerMinutes: 0, wallMinutes: round((savedWall / 60) * weeklyRuns) },
       confidence: 'estimated',

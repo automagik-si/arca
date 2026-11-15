@@ -83,7 +83,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 79] = [
+static VERBS: [Verb; 82] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1195,7 +1195,211 @@ static VERBS: [Verb; 79] = [
         params: os_update_params,
         result: os_update_result,
     },
+    Verb {
+        name: "route_add",
+        summary: "Serve https://<hostname> from this node's edge (the arca-edge service) to an instance of this node, in any project, on one tcp port, with a certificate by the Cloudflare DNS challenge. reach private (default) answers only the local networks and the tailnet, others get 403; public has no filter. The instance's address is read from Incus now and the edge's firewall opens it; an Arca service needs a link from the edge (service_connect). A hostname that has a route is re-pointed. The route is kept in the edge's desired state, its config is written and Caddy reloaded; a refused reload keeps the old config and the answer says so. From an approved proposal or a doctor token.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_route,
+        cut: no_cut,
+        params: route_add_params,
+        result: route_result,
+    },
+    Verb {
+        name: "route_remove",
+        summary: "Stop serving a hostname from this node's edge: its site leaves the edge's config, Caddy is reloaded and the edge's firewall no longer opens its target for it. The instance itself is not touched. A hostname with no route still has the config written again and reloaded, so a remove whose reload failed is retried by removing again. Runs from an approved proposal or a doctor token.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_route_remove,
+        cut: no_cut,
+        params: route_remove_params,
+        result: route_remove_result,
+    },
+    Verb {
+        name: "route_list",
+        summary: "This node's routes: each hostname with its instance, project, address, port and reach, and the edge that serves them with the address a person reaches it on. Empty, with no edge, on a node that has none.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_route_list,
+        cut: no_cut,
+        params: empty_params,
+        result: route_list_result,
+    },
 ];
+
+fn hostname_schema() -> Value {
+    json!({
+        "description": "A DNS name such as app.example.com: lowercase letters, digits and -, at least two labels, no wildcard.",
+        "maxLength": 253,
+        "minLength": 3,
+        "type": "string"
+    })
+}
+fn route_add_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "hostname": hostname_schema(),
+            "instance": {
+                "description": "The Incus instance that serves the route, on this node.",
+                "maxLength": 63,
+                "minLength": 1,
+                "type": "string"
+            },
+            "project": {
+                "description": "The instance's Incus project. Default: the node's service project.",
+                "maxLength": 63,
+                "minLength": 1,
+                "type": "string"
+            },
+            "port": {
+                "description": "The instance's tcp port the edge connects to.",
+                "maximum": 65535,
+                "minimum": 1,
+                "type": "integer"
+            },
+            "reach": {
+                "description": "private (default): only the local networks and the tailnet. public: no address filter.",
+                "enum": ["private", "public"],
+                "type": "string"
+            }
+        },
+        "required": ["hostname", "instance", "port"],
+        "type": "object"
+    })
+}
+fn route_remove_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": { "hostname": hostname_schema() },
+        "required": ["hostname"],
+        "type": "object"
+    })
+}
+fn route_view_schema() -> Value {
+    json!({
+        "properties": {
+            "hostname": { "type": "string" },
+            "url": { "type": "string" },
+            "instance": { "type": "string" },
+            "project": { "type": "string" },
+            "address": { "type": "string" },
+            "port": { "maximum": 65535, "minimum": 1, "type": "integer" },
+            "reach": { "enum": ["private", "public"], "type": "string" }
+        },
+        "required": ["hostname", "url", "instance", "project", "address", "port", "reach"],
+        "type": "object"
+    })
+}
+fn route_result() -> Value {
+    let mut schema = route_view_schema();
+    let properties = schema["properties"].as_object_mut().expect("an object");
+    properties.insert(
+        "edge".into(),
+        json!({
+            "properties": { "name": { "type": "string" }, "address": { "type": "string" } },
+            "required": ["name", "address"],
+            "type": "object"
+        }),
+    );
+    properties.insert("applied".into(), json!({ "type": "boolean" }));
+    properties.insert("reloaded".into(), json!({ "type": "boolean" }));
+    properties.insert("note".into(), json!({ "type": "string" }));
+    schema["required"].as_array_mut().expect("a list").extend([
+        json!("edge"),
+        json!("applied"),
+        json!("reloaded"),
+    ]);
+    schema
+}
+/// What a remove answers: the route it removed, or only the hostname when there was none (`removed` false), and what
+/// writing the edge's config did.
+fn route_remove_result() -> Value {
+    let mut schema = route_result();
+    schema["properties"]
+        .as_object_mut()
+        .expect("an object")
+        .insert("removed".into(), json!({ "type": "boolean" }));
+    schema["required"] = json!(["hostname", "url", "removed", "edge", "applied", "reloaded"]);
+    schema
+}
+fn route_list_result() -> Value {
+    json!({
+        "properties": {
+            "edge": {
+                "properties": {
+                    "name": { "type": "string" },
+                    "address": { "type": "string" },
+                    "ipv4": { "type": "string" }
+                },
+                "required": ["name", "address", "ipv4"],
+                "type": ["object", "null"]
+            },
+            "routes": { "items": route_view_schema(), "type": "array" }
+        },
+        "required": ["edge", "routes"],
+        "type": "object"
+    })
+}
+fn summary_route(v: &Value) -> String {
+    let what = "serving";
+    let state = if v["reloaded"] == true {
+        "the edge took it"
+    } else if v["applied"] == true {
+        "written; the edge reads it when it starts"
+    } else {
+        "recorded, but the edge did not take it"
+    };
+    format!(
+        "{what} {} -> {}:{} ({}): {state}",
+        v["url"].as_str().unwrap_or("?"),
+        v["instance"].as_str().unwrap_or("?"),
+        v["port"],
+        v["reach"].as_str().unwrap_or("?")
+    )
+}
+fn summary_route_remove(v: &Value) -> String {
+    let url = v["url"].as_str().unwrap_or("?");
+    let state = if v["reloaded"] == true {
+        "the edge took it"
+    } else if v["applied"] == true {
+        "written; the edge reads it when it starts"
+    } else {
+        "the edge did not take the new config and may still serve the name; remove it again once the edge runs"
+    };
+    if v["removed"] == true {
+        format!(
+            "stopped serving {url} (was {}:{}): {state}",
+            v["instance"].as_str().unwrap_or("?"),
+            v["port"]
+        )
+    } else {
+        if v["applied"] == true {
+            format!("{url} had no route; the edge's config was written again: {state}")
+        } else {
+            format!("{url} had no route; {state}")
+        }
+    }
+}
+fn summary_route_list(v: &Value) -> String {
+    let routes = v["routes"].as_array().map_or(0, Vec::len);
+    match v["edge"]["name"].as_str() {
+        Some(edge) => format!("{routes} route(s) on the edge {edge}"),
+        None => "no edge on this node".into(),
+    }
+}
 
 fn summary_github_mint(v: &Value) -> String {
     format!(
@@ -3111,8 +3315,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty-five verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 25] = [
+/// The twenty-seven verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 27] = [
     "service_create",
     "service_remove",
     "service_update",
@@ -3138,6 +3342,8 @@ const ACTION_NAMES: [&str; 25] = [
     "function_create",
     "function_remove",
     "host_network_restore",
+    "route_add",
+    "route_remove",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -3211,7 +3417,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 25] = [
+const ACTION_EXAMPLES: [(&str, &str); 27] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
@@ -3255,6 +3461,11 @@ const ACTION_EXAMPLES: [(&str, &str); 25] = [
     ),
     ("function_remove", r#"{"name":"relay"}"#),
     ("host_network_restore", r#"{}"#),
+    (
+        "route_add",
+        r#"{"hostname":"app.example.com","instance":"web","port":8080}"#,
+    ),
+    ("route_remove", r#"{"hostname":"app.example.com"}"#),
 ];
 
 /// The schema keyword that tells the door's check which branch of an `anyOf` a value is held to: the one whose `title`

@@ -268,6 +268,24 @@ pub fn router_with(
     Page::new(origin, kernel, clock, state_dir, display).router(false)
 }
 
+/// The WebAuthn relying party of the page at `origin`: `localhost` for `http://localhost:<port>`, else the host.
+///
+/// # Panics
+///
+/// Panics when `origin` is not a validated approval origin.
+pub fn rp_id_of(origin: &str) -> String {
+    if arca_approval::localhost_origin_port(origin).is_some() {
+        arca_approval::LOCALHOST_RP.to_string()
+    } else {
+        origin
+            .strip_prefix("https://")
+            .and_then(|authority| authority.split(':').next())
+            .filter(|host| !host.is_empty())
+            .expect("approvalOrigin is validated before the page router is built")
+            .to_string()
+    }
+}
+
 /// One approval-page binding, shared by the direct and trusted-proxy routers.
 pub struct Page {
     state: PageState,
@@ -286,16 +304,7 @@ impl Page {
         state_dir: PathBuf,
         display: Arc<dyn SetupCodeDisplay>,
     ) -> Self {
-        let rp_id = if arca_approval::localhost_origin_port(&origin).is_some() {
-            arca_approval::LOCALHOST_RP.to_string()
-        } else {
-            origin
-                .strip_prefix("https://")
-                .and_then(|authority| authority.split(':').next())
-                .filter(|host| !host.is_empty())
-                .expect("approvalOrigin is validated before the page router is built")
-                .to_string()
-        };
+        let rp_id = rp_id_of(&origin);
         let base_passkeys = kernel
             .lock()
             .map(|kernel| kernel.owner_passkey_lines())
@@ -1779,7 +1788,7 @@ const LOCAL_PROOF_FRESH: Duration = Duration::from_secs(60);
 /// [`LOCAL_PROOF_FRESH`], and the file was removed. A link, a directory, another user's file, a file that is not there,
 /// an old file, a file that cannot be removed, and a state directory that was opened up since `serve` checked it at
 /// start are all no proof.
-fn take_local_proof(state_dir: &Path, proof: &str) -> bool {
+pub(crate) fn take_local_proof(state_dir: &Path, proof: &str) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Ok(uid) = arca_approval::effective_uid() else {
         return false;

@@ -1876,6 +1876,11 @@ impl ToolHandler for ActionPropose {
                 let entries = lock(&self.kernel)?.entries().to_vec();
                 tenants::tenant_held(&entries, &payload, now)
             }
+            // The card of a route names the edge that serves it and where a person reaches that edge, as it is now.
+            ActionKind::RouteAdd | ActionKind::RouteRemove => {
+                let entries = lock(&self.kernel)?.entries().to_vec();
+                Some(service_routes::edge_fact(&entries))
+            }
             _ => None,
         };
         let mut kernel = lock(&self.kernel)?;
@@ -4667,6 +4672,7 @@ fn private_port_arg(listen: &crate::service::PrivateListen) -> Value {
 /// Why the private port a service's record names does not stand as recorded: the device on its instance, then the
 /// address on this host (`hosts`, when it could be read). `None` when both are as the record says.
 fn private_port_problem(
+    config: &crate::service::ServiceConfig,
     private: &crate::service::PrivateListen,
     live: Option<&Value>,
     hosts: Option<&Value>,
@@ -4674,7 +4680,9 @@ fn private_port_problem(
     let Some(live) = live else {
         return Some("its instance is gone".to_string());
     };
-    if live["devices"][crate::service::PRIVATE_DEVICE] != crate::service::private_device(private) {
+    if live["devices"][crate::service::PRIVATE_DEVICE]
+        != crate::service::private_device_of(config, private)
+    {
         return Some(format!(
             "its instance does not carry the device {} as Arca made it",
             crate::service::PRIVATE_DEVICE
@@ -5546,6 +5554,8 @@ mod service_external;
 mod service_follow;
 #[path = "service_omni.rs"]
 mod service_omni;
+#[path = "service_routes.rs"]
+mod service_routes;
 pub use service_follow::{Attestation, FollowEdges, Followed, Follower, spawn_follower};
 #[path = "service_reconfigure.rs"]
 mod service_reconfigure;
@@ -5627,6 +5637,9 @@ pub fn service_handlers_updating(
         "service_reconfigure",
         "service_import",
         "service_release",
+        "route_add",
+        "route_remove",
+        "route_list",
     ]
     .into_iter()
     .chain(function_verbs.iter().copied())
@@ -5827,7 +5840,12 @@ fn read_subject(verb: &str, args: &Value) -> String {
 fn nothing_changed(verb: &str, approved: bool) -> &'static str {
     if matches!(
         verb,
-        "service_list" | "service_status" | "service_logs" | "function_list" | "function_runs"
+        "service_list"
+            | "service_status"
+            | "service_logs"
+            | "function_list"
+            | "function_runs"
+            | "route_list"
     ) {
         ""
     } else if approved {
@@ -6438,6 +6456,7 @@ pub(crate) fn adopted_config(
         follow_version: None,
         no_new_privileges: false,
         raw_lxc: Vec::new(),
+        edge: None,
     })
 }
 
@@ -6649,6 +6668,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         follow_version: None,
         no_new_privileges: parts.template.no_new_privileges,
         raw_lxc: parts.template.raw_lxc.clone(),
+        edge: parts.template.edge.then(crate::route::EdgeRecord::default),
     })
 }
 
@@ -6735,6 +6755,7 @@ fn vm_service_config(
         follow_version: None,
         no_new_privileges: false,
         raw_lxc: Vec::new(),
+        edge: None,
     })
 }
 
@@ -7086,6 +7107,7 @@ impl ServiceHandler {
             "function_secret_set" => &["name", "key", "value"],
             "function_run" => &["name"],
             "function_runs" => &["name", "limit", "run"],
+            "route_add" | "route_remove" | "route_list" => service_routes::allowed(self.verb),
             _ => &[],
         };
         let object = args
@@ -7095,7 +7117,8 @@ impl ServiceHandler {
         let takes_tenant = !matches!(
             self.verb,
             "service_publish" | "service_unpublish" | "service_import" | "service_release"
-        ) && !self.verb.starts_with("function_");
+        ) && !self.verb.starts_with("function_")
+            && !self.verb.starts_with("route_");
         if let Some(key) = object
             .keys()
             .find(|key| !(takes_tenant && *key == "tenant") && !allowed.contains(&key.as_str()))
@@ -7130,6 +7153,8 @@ impl ServiceHandler {
                 | "function_remove"
                 | "function_secret_set"
                 | "function_run"
+                | "route_add"
+                | "route_remove"
         ) && caller.scope < Scope::Doctor
         {
             return Err(CallError::Forbidden {
@@ -7142,7 +7167,7 @@ impl ServiceHandler {
         if node_only_looks(&self.cfg)
             && !matches!(
                 self.verb,
-                "service_list" | "service_status" | "service_logs"
+                "service_list" | "service_status" | "service_logs" | "route_list"
             )
         {
             return Err(only_looks());
@@ -7181,6 +7206,8 @@ impl ServiceHandler {
                 | "service_release"
                 | "function_create"
                 | "function_secret_set"
+                | "route_add"
+                | "route_remove"
         ) {
             Some(self.writes.lock().map_err(|_| internal())?)
         } else {
@@ -7210,7 +7237,7 @@ impl ServiceHandler {
         let only_looks = node_only_looks(&self.cfg);
         let reading = matches!(
             self.verb,
-            "service_list" | "service_status" | "service_logs"
+            "service_list" | "service_status" | "service_logs" | "route_list"
         );
         let mut reads_as_it_is = only_looks && reading && tenant.is_none();
         if tenant.is_none() && no_service_project_asked(&self.cfg) {
@@ -7294,6 +7321,9 @@ impl ServiceHandler {
         // One name space, two kinds: a verb of one kind never acts on a record of the other.
         if let Some(refusal) = function_handlers::kind_refusal(self.verb, &args, &all_entries) {
             return Err(refusal);
+        }
+        if self.verb.starts_with("route_") {
+            return self.call_routes(&args, caller, &entries, now);
         }
         if matches!(
             self.verb,
@@ -7441,7 +7471,7 @@ impl ServiceHandler {
                     // address on this host. An address that cannot be read now is not called missing.
                     if let Some(private) = &config.private_port {
                         let hosts = host_observation(&read).ok();
-                        let problem = private_port_problem(private, live, hosts.as_ref());
+                        let problem = private_port_problem(&config, private, live, hosts.as_ref());
                         view["privatePort"]["ready"] = json!(problem.is_none());
                         if let Some(problem) = problem {
                             view["privatePort"]["problem"] = json!(problem);

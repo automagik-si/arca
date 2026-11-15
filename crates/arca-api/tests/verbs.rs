@@ -112,6 +112,9 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "github_mint_job",
             "github_disconnect",
             "os_update",
+            "route_add",
+            "route_remove",
+            "route_list",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -250,6 +253,9 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
             true,
             true,
         ),
+        ("route_add", VerbClass::L, Scope::Doctor, true, false),
+        ("route_remove", VerbClass::L, Scope::Doctor, true, false),
+        ("route_list", VerbClass::L, Scope::Viewer, false, false),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -372,6 +378,8 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "function_create",
         "function_remove",
         "host_network_restore",
+        "route_add",
+        "route_remove",
     ];
     let action_proposal = open(
         json!({
@@ -1692,7 +1700,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 25);
+    assert_eq!(actions.len(), 27);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));

@@ -380,6 +380,11 @@
     <div id="requests" class="plans"></div>
   </section>
 
+  <section id="apps-section" aria-labelledby="apps-title" hidden>
+    <h2 id="apps-title">Connected apps</h2>
+    <div id="apps" class="plans"></div>
+  </section>
+
   <section class="setup" aria-labelledby="setup-title">
     <h2 id="setup-title">Your passkeys</h2>
     <div id="passkeys" class="plans"></div>
@@ -1177,9 +1182,57 @@ async function decline(plan, button) {
   }
 }
 
+// The MCP apps the owner connected (see mcp_oauth.rs): each with its scope and a Disconnect that works at once.
+function appCard(app) {
+  const card = el("article", "card plan action");
+  const name = app.nameShared ? String(app.name) + " (another app has this name)" : String(app.name);
+  card.append(el("h3", "", name));
+  const facts = el("dl", "action-facts");
+  const fact = (label, value) => {
+    const row = el("div", "action-fact");
+    row.append(el("dt", "", label));
+    const detail = el("dd");
+    detail.append(el("code", "", value));
+    row.append(detail);
+    facts.append(row);
+  };
+  // The most the app may do across its live grants, and when it last used any of them: an app the owner stepped up
+  // holds a grant for each approval.
+  fact("Answers go to", (app.redirectHosts || []).join(", "));
+  fact("Allowed", String(app.scope));
+  fact("Last used", app.lastUsedAt ? new Date(app.lastUsedAt).toLocaleString() : "not since Arca started");
+  fact("Client id", String(app.clientId));
+  card.append(facts);
+  const button = el("button", "btn btn-secondary", "Disconnect");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await requestPost("/approve/oauth/revoke", { clientId: app.clientId });
+      status("Disconnected. That app's access stopped now.", "ok");
+      await loadApps();
+    } catch (error) {
+      fail(error);
+      button.disabled = false;
+    }
+  });
+  card.append(button);
+  return card;
+}
+
+async function loadApps() {
+  const answer = await fetch("/approve/oauth/clients", { headers: { Accept: "application/json" } });
+  if (!answer.ok) return;
+  const body = await answer.json();
+  const connected = (Array.isArray(body.clients) ? body.clients : []).filter((app) => app.connected);
+  document.getElementById("apps").replaceChildren(...connected.map(appCard));
+  document.getElementById("apps-section").hidden = connected.length === 0;
+}
+
 document.getElementById("get-code").addEventListener("click", getCode);
 document.getElementById("register").addEventListener("click", register);
 loadPlans();
+loadApps().catch(() => {});
 loadPasskeys().catch(fail);
 // Opening the page syncs this host's passkey list with the machines that keep it, so a changed list shows its card now.
 fetch("/approve/peer-keys/sync", { method: "POST" })

@@ -437,6 +437,10 @@ pub struct ServiceConfig {
     /// it always was. Only a container of the node's own project carries it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_lxc: Vec<String>,
+    /// Set when the service was made from an edge template (`"edge": true`): the node's routes, which the kernel
+    /// renders into the edge's Caddyfile. Absent on every other service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<crate::route::EdgeRecord>,
 }
 
 /// An image digest and the version Automagik published it as.
@@ -876,6 +880,27 @@ pub fn egress(cfg: &ServiceConfig, hosts: &Value) -> Vec<Value> {
             function.internet,
         );
     }
+    // An edge also reaches each of its routes' targets, on the route's port and no other.
+    if let Some(edge) = &cfg.edge {
+        let mut open = cfg.destinations.clone();
+        let own = arca_netproject::destination::node_own(hosts);
+        open.extend(
+            crate::route::destinations(edge)
+                .into_iter()
+                .filter(|target| {
+                    !own.contains(&target.address)
+                        && arca_netproject::destination::refusal(
+                            target.address,
+                            target.port,
+                            gateway,
+                        )
+                        .is_none()
+                }),
+        );
+        open.sort();
+        open.dedup();
+        return arca_netproject::tenant::egress_rules(gateway, hosts, block, &open);
+    }
     arca_netproject::tenant::egress_rules(gateway, hosts, block, &cfg.destinations)
 }
 
@@ -962,16 +987,17 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     }
     if let Some(lan) = &cfg.lan {
         // The wildcard bind exposes this port on every IPv4 interface, including a tailnet interface.
-        devices.insert(
-            "web".into(),
-            json!({"type":"proxy",
+        let mut web = json!({"type":"proxy",
             "listen":format!("tcp:0.0.0.0:{}", lan.port),
-            "connect":format!("tcp:127.0.0.1:{}", lan.port)}),
-        );
+            "connect":format!("tcp:127.0.0.1:{}", lan.port)});
+        if cfg.edge.is_some() {
+            web["proxy_protocol"] = json!("true");
+        }
+        devices.insert("web".into(), web);
     }
     if let Some(private) = &cfg.private_port {
         // One address only, never the wildcard: the port is reachable there and from nowhere else.
-        devices.insert(PRIVATE_DEVICE.into(), private_device(private));
+        devices.insert(PRIVATE_DEVICE.into(), private_device_of(cfg, private));
     }
     if let Some(link) = &cfg.kernel_access {
         devices.insert(KERNEL_DEVICE.into(), kernel_device(link));
@@ -1017,6 +1043,17 @@ pub fn private_device(private: &PrivateListen) -> Value {
     json!({"type":"proxy",
         "listen":format!("tcp:{}:{}", private.address, private.port),
         "connect":format!("tcp:127.0.0.1:{}", private.port)})
+}
+
+/// The private port's device as the instance of `cfg` carries it: [`private_device`], and for an edge the PROXY header.
+/// An edge reads each client's own address from that header: without it every visitor would come from the device's
+/// loopback, and a private route could not tell the local networks from the internet.
+pub fn private_device_of(cfg: &ServiceConfig, private: &PrivateListen) -> Value {
+    let mut device = private_device(private);
+    if cfg.edge.is_some() {
+        device["proxy_protocol"] = json!("true");
+    }
+    device
 }
 
 /// The body of the create of a service on the managed network, exactly as its record gives it. The effect journal
@@ -1453,6 +1490,11 @@ pub struct Template {
     /// No other kind sets it.
     #[serde(default)]
     pub update: Option<Update>,
+    /// The node's edge: a Caddy container that serves the node's routes ([`crate::route`]). Its service records the
+    /// routes, the kernel renders its Caddyfile, and its host port device sends the PROXY protocol header so Caddy sees
+    /// each client's own address. Off unless the template says `true`.
+    #[serde(default)]
+    pub edge: bool,
 }
 
 /// One rule of a template's `settingRules`: `{ "need": <amount>, "atLeast": <amount>, "why": "<words>" }`. An amount
