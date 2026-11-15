@@ -149,9 +149,15 @@ pub struct CmdOutput {
 
 /// Run a program (no shell) with a timeout; None when it cannot be started at all.
 pub fn run_cmd(argv: &[&str], timeout: Duration) -> Option<CmdOutput> {
+    run_cmd_env(argv, &[], timeout)
+}
+
+/// [`run_cmd`] with these variables added to the program's environment.
+pub fn run_cmd_env(argv: &[&str], env: &[(&str, &str)], timeout: Duration) -> Option<CmdOutput> {
     let (program, args) = argv.split_first()?;
     let mut child = Command::new(program)
         .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
