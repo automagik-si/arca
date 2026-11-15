@@ -544,6 +544,7 @@ mod cpu_power {
         assert_eq!(sample.power.cpu.reason.as_deref(), Some(REMOTE_HOST_REASON));
         assert!(sample.power.cpu.packages.is_empty());
         assert_eq!(sample.power.gpu.reason.as_deref(), Some(REMOTE_HOST_REASON));
+        assert_eq!(sample.power.chip.reason.as_deref(), Some(REMOTE_HOST_REASON));
         assert_eq!(sample.power.measured_power_w, None);
     }
 }
@@ -551,15 +552,33 @@ mod cpu_power {
 mod gpu_power {
     use super::*;
 
-    /// card1 is an amdgpu card at 0000:c6:00.0 whose hwmon gives power1_input in microwatts.
-    fn amdgpu(root: &Path, microwatts: &str) {
+    const PCI: &str = "0000:c6:00.0";
+
+    /// card1 is an amdgpu card at 0000:c6:00.0 whose hwmon gives a `PPT` power1_input in microwatts. `signs` adds what the
+    /// driver shows only on an APU (`vddnb`: the in1 voltage) or only on a discrete card (`fan`: fan controls; `pcie_bw`:
+    /// the PCIe counter on the device).
+    fn amdgpu(root: &Path, microwatts: &str, signs: &[&str]) {
         let device = "sys/devices/pci0000:00/0000:c6:00.0";
-        write(root, &format!("{device}/hwmon/hwmon9/name"), "amdgpu\n");
-        write(
-            root,
-            &format!("{device}/hwmon/hwmon9/power1_input"),
-            microwatts,
-        );
+        let hwmon = format!("{device}/hwmon/hwmon9");
+        write(root, &format!("{hwmon}/name"), "amdgpu\n");
+        write(root, &format!("{hwmon}/power1_label"), "PPT\n");
+        write(root, &format!("{hwmon}/power1_input"), microwatts);
+        write(root, &format!("{hwmon}/in0_label"), "vddgfx\n");
+        write(root, &format!("{hwmon}/in0_input"), "800\n");
+        for sign in signs {
+            match *sign {
+                "vddnb" => {
+                    write(root, &format!("{hwmon}/in1_label"), "vddnb\n");
+                    write(root, &format!("{hwmon}/in1_input"), "700\n");
+                }
+                "fan" => {
+                    write(root, &format!("{hwmon}/fan1_input"), "1200\n");
+                    write(root, &format!("{hwmon}/pwm1"), "80\n");
+                }
+                "pcie_bw" => write(root, &format!("{device}/pcie_bw"), "0 0 256\n"),
+                other => panic!("no such sign {other}"),
+            }
+        }
         fs::create_dir_all(root.join("sys/class/drm/card1")).expect("a dir");
         std::os::unix::fs::symlink(root.join(device), root.join("sys/class/drm/card1/device"))
             .expect("the device link");
@@ -567,44 +586,147 @@ mod gpu_power {
         fs::create_dir_all(root.join("sys/class/drm/card1-DP-1")).expect("a dir");
     }
 
-    #[test]
-    fn an_amdgpu_hwmon_power_is_read_in_watts_from_the_first_sample() {
-        let scratch = tree("amdgpu");
-        amdgpu(scratch.path(), "52035000\n");
-        let mut sampler = sampler(scratch.path(), Scripted::default(), true);
-        let sample = sampler.sample(1_000).clone();
+    /// A package counter that moves 50 J in five seconds: 10 W at the second sample.
+    fn package(root: &Path) {
+        zone(root, "intel-rapl:0", "package-0", 1_000_000, Some(262_143_328_850));
+    }
 
-        assert_eq!(sample.power.gpu.cards.len(), 1);
-        let card = &sample.power.gpu.cards[0];
-        assert_eq!(card.pci.as_deref(), Some("0000:c6:00.0"));
-        assert_eq!(card.card.as_deref(), Some("card1"));
-        assert_eq!(card.source, "hwmon");
-        assert_eq!(card.power_w, Some(52.035));
-        assert_eq!(card.reason, None);
-        assert_eq!(sample.power.gpu.power_w, Some(52.035));
-        assert_eq!(sample.power.gpu.reason, None);
-        // The CPU has no counter, so the measured sum is the card alone.
+    fn two_samples(scratch: &Scratch) -> HostSample {
+        let mut sampler = sampler(scratch.path(), Scripted::default(), true);
+        sampler.sample(1_000);
+        if scratch.path().join("sys/class/powercap/intel-rapl:0").exists() {
+            set_energy(scratch.path(), "intel-rapl:0", 51_000_000);
+        }
+        sampler.sample(6_000).clone()
+    }
+
+    fn not_added(sample: &HostSample) -> Vec<&str> {
+        sample.power.not_added.iter().map(String::as_str).collect()
+    }
+
+    fn close(left: Option<f64>, right: f64) -> bool {
+        left.is_some_and(|left| (left - right).abs() < 1e-9)
+    }
+
+    #[test]
+    fn an_integrated_chip_without_a_readable_package_counter_is_the_chip_and_never_a_gpu() {
+        let scratch = tree("chip");
+        amdgpu(scratch.path(), "52035000\n", &["vddnb"]);
+        // The package counter is there and does not read as a number, so the CPU has no figure of its own.
+        zone(scratch.path(), "intel-rapl:0", "package-0", 0, Some(262_143_328_850));
+        write(scratch.path(), "sys/class/powercap/intel-rapl:0/energy_uj", "garbage\n");
+        let sample = two_samples(&scratch);
+
+        assert!(sample.power.gpu.cards.is_empty(), "the chip is not a GPU");
+        assert_eq!(sample.power.gpu.reason.as_deref(), Some(power::GPU_IN_CHIP));
+        assert_eq!(sample.power.chip.sensors.len(), 1);
+        let sensor = &sample.power.chip.sensors[0];
+        assert_eq!(sensor.pci.as_deref(), Some(PCI));
+        assert_eq!(sensor.card.as_deref(), Some("card1"));
+        assert_eq!(sensor.label.as_deref(), Some("PPT"));
+        assert!(sensor.whole_chip);
+        assert!(sensor.basis.contains("vddnb"), "{}", sensor.basis);
+        assert_eq!(sensor.power_w, Some(52.035));
+        assert_eq!(sample.power.chip.power_w, Some(52.035));
+        assert!(sample.power.chip.added);
+        assert!(!sample.power.cpu.added);
         assert_eq!(sample.power.measured_power_w, Some(52.035));
+        let words = not_included(&sample);
+        assert!(!words.contains(&"the CPU packages"), "the CPU is inside the chip: {words:?}");
+        assert!(!words.iter().any(|word| word.contains(PCI)), "{words:?}");
+        assert!(not_added(&sample).is_empty(), "{:?}", not_added(&sample));
+    }
+
+    #[test]
+    fn a_discrete_card_beside_a_readable_package_counter_is_added_with_it() {
+        for sign in ["fan", "pcie_bw"] {
+            let scratch = tree(&format!("discrete-{sign}"));
+            amdgpu(scratch.path(), "52035000\n", &[sign]);
+            package(scratch.path());
+            let sample = two_samples(&scratch);
+
+            assert!(sample.power.chip.sensors.is_empty(), "{sign}");
+            assert_eq!(sample.power.gpu.cards.len(), 1, "{sign}");
+            let card = &sample.power.gpu.cards[0];
+            assert_eq!(card.pci.as_deref(), Some(PCI));
+            assert_eq!(card.source, "hwmon");
+            assert_eq!(card.power_w, Some(52.035));
+            let basis = card.basis.clone().expect("a basis");
+            assert!(basis.contains(sign), "{basis}");
+            assert_eq!(sample.power.cpu.power_w, Some(10.0));
+            assert!(sample.power.cpu.added);
+            assert!(close(sample.power.measured_power_w, 62.035), "{:?}", sample.power.measured_power_w);
+            assert!(!not_included(&sample).contains(&"the CPU packages"));
+            assert!(not_added(&sample).is_empty(), "{:?}", not_added(&sample));
+        }
+    }
+
+    #[test]
+    fn a_root_node_on_an_integrated_chip_counts_the_chip_once_and_names_the_packages_not_added() {
+        let scratch = tree("chip-and-package");
+        amdgpu(scratch.path(), "52035000\n", &["vddnb"]);
+        package(scratch.path());
+        let sample = two_samples(&scratch);
+
+        assert_eq!(sample.power.cpu.power_w, Some(10.0), "the packages are still measured");
+        assert!(!sample.power.cpu.added);
+        assert!(sample.power.chip.added);
+        assert_eq!(sample.power.measured_power_w, Some(52.035), "never 62.035");
+        let skipped = not_added(&sample);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].contains("the CPU packages"), "{skipped:?}");
+        assert!(skipped[0].contains(PCI), "{skipped:?}");
+        assert!(!not_included(&sample).contains(&"the CPU packages"));
+    }
+
+    #[test]
+    fn a_sensor_the_driver_does_not_classify_is_never_added() {
+        // No sign, and both signs at once: neither says for certain what the sensor measures.
+        for signs in [&[][..], &["vddnb", "fan"][..]] {
+            let scratch = tree("unsure");
+            amdgpu(scratch.path(), "52035000\n", signs);
+            package(scratch.path());
+            let sample = two_samples(&scratch);
+
+            assert!(sample.power.gpu.cards.is_empty(), "{signs:?}");
+            let sensor = &sample.power.chip.sensors[0];
+            assert!(!sensor.whole_chip, "{signs:?}");
+            assert_eq!(sensor.power_w, Some(52.035));
+            assert!(!sample.power.chip.added);
+            assert!(sample.power.cpu.added);
+            assert_eq!(sample.power.measured_power_w, Some(10.0), "{signs:?}");
+            assert!(not_added(&sample).iter().any(|word| word.contains(PCI)), "{:?}", not_added(&sample));
+            assert!(not_included(&sample).iter().any(|word| word.contains(PCI)), "{:?}", not_included(&sample));
+        }
+    }
+
+    #[test]
+    fn an_unclassified_sensor_alone_is_still_not_added() {
+        let scratch = tree("unsure-alone");
+        amdgpu(scratch.path(), "52035000\n", &[]);
+        let sample = two_samples(&scratch);
+        assert_eq!(sample.power.measured_power_w, None);
         assert!(not_included(&sample).contains(&"the CPU packages"));
     }
 
     #[test]
-    fn a_card_power_file_that_does_not_parse_has_no_figure_and_says_why() {
-        let scratch = tree("amdgpu-bad");
-        amdgpu(scratch.path(), "garbage\n");
-        let mut sampler = sampler(scratch.path(), Scripted::default(), true);
-        let sample = sampler.sample(1_000).clone();
-        let card = &sample.power.gpu.cards[0];
-        assert_eq!(card.power_w, None);
-        let reason = card.reason.clone().expect("a reason");
+    fn a_chip_with_no_figure_leaves_the_package_counter_in_the_sum_and_names_the_rest_of_the_chip() {
+        let scratch = tree("chip-bad");
+        amdgpu(scratch.path(), "garbage\n", &["vddnb"]);
+        package(scratch.path());
+        let sample = two_samples(&scratch);
+
+        let sensor = &sample.power.chip.sensors[0];
+        assert_eq!(sensor.power_w, None);
+        let reason = sensor.reason.clone().expect("a reason");
         assert!(reason.contains("power1_input"), "{reason}");
-        assert_eq!(sample.power.gpu.power_w, None);
-        assert_eq!(sample.power.measured_power_w, None);
-        assert!(
-            not_included(&sample).contains(&"the GPU 0000:c6:00.0"),
-            "{:?}",
-            not_included(&sample)
-        );
+        assert!(!sample.power.chip.added);
+        assert!(sample.power.cpu.added);
+        assert_eq!(sample.power.measured_power_w, Some(10.0));
+        let words = not_included(&sample);
+        assert!(!words.contains(&"the CPU packages"), "{words:?}");
+        assert!(words.iter().any(|word| word.contains(PCI)), "{words:?}");
+        assert!(not_added(&sample).is_empty());
     }
 
     #[test]
