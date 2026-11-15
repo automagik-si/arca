@@ -486,6 +486,70 @@ fn a_template_that_adds_a_generated_secret_is_reconfigured_on_the_first_approval
     for text in [proposed.to_string(), done.to_string(), journal] {
         assert!(!text.contains(&made), "a secret's value was shown");
     }
+    // The secret made in this run is named by its own file, never a copy, and the one held before keeps its
+    // reference: no two files hold one content, so the next reconcile writes nothing.
+    let record = rig.service_config("app");
+    assert_eq!(
+        record.environment["SESSION"],
+        "arca-secret:service-app/session-key"
+    );
+    assert_eq!(
+        record.environment["API_KEY"],
+        "arca-secret:service-app/api-key"
+    );
+    let writes = rig.fake.writes().len();
+    rig.apply(&record).expect("reconcile");
+    assert_eq!(rig.fake.writes().len(), writes, "nothing to write");
+}
+
+/// Review 1 of PR 200 (M1): a reconfigure before that change left a service naming a content-named copy of its
+/// generated secret, beside the secret's own file. Nothing removes that copy, so a later reconfigure that moved the
+/// record to the secret's own file would only move the extra write to the other order a directory lists the two in. A
+/// value whose record already names a reference holding it keeps that reference: the service reads back, and its
+/// reconcile writes, exactly as before the reconfigure.
+#[test]
+fn a_record_that_names_an_equal_copy_of_its_secret_keeps_it_through_a_reconfigure() {
+    let key = common::SkKey::from_seed(49);
+    let rig = node(&key);
+    let secret = api_key(&rig);
+    let copy = format!("v-{}", Digest::of(secret.as_bytes()).to_hex());
+    service::write_secret(&rig.dir.join("secrets/service-app").join(&copy), &secret)
+        .expect("the copy an earlier reconfigure left");
+    let reference = format!("arca-secret:service-app/{copy}");
+    let mut stale = serde_json::to_value(rig.service_config("app")).expect("the record");
+    stale["environment"]["API_KEY"] = json!(reference);
+    rig.kernel
+        .lock()
+        .expect("kernel")
+        .propose(
+            vec![arca::desired_store::EntryChange::Put(
+                arca::handlers::service_entry("service-app", "arca.service", stale),
+            )],
+            NOW,
+        )
+        .expect("the record an earlier reconfigure left");
+    assert_eq!(rig.service_config("app").environment["API_KEY"], reference);
+    // What a reconcile writes now: once on every reconcile when the directory lists the secret's own file first, and
+    // nothing otherwise. The order is the same for the rest of the run.
+    let reconcile = || {
+        let writes = rig.fake.writes().len();
+        rig.apply(&rig.service_config("app")).expect("reconcile");
+        rig.fake.writes().len() - writes
+    };
+    let before = reconcile();
+
+    let mut strict = first_template();
+    strict["noNewPrivileges"] = json!(true);
+    rig.template("app", strict);
+    let proposed = propose(&rig, json!({ "name": "app" })).expect("proposed");
+    let done = approve_and_run(&rig, &key, &proposed).expect("runs");
+    assert_eq!(done["readBack"]["matches"], true, "{done}");
+    assert_eq!(
+        instance(&rig, "app")["config"]["raw.lxc"],
+        "lxc.no_new_privs=1"
+    );
+    assert_eq!(rig.service_config("app").environment["API_KEY"], reference);
+    assert_eq!(reconcile(), before, "the reconcile writes as it did before");
 }
 
 #[test]

@@ -3612,6 +3612,15 @@ fn a_runner_that_takes_a_job_as_it_is_asked_to_give_its_place_up_keeps_its_job()
         "{}",
         pool.output()
     );
+    // And a kept runner of slot 1 is never asked again either.
+    assert!(
+        pool.output()
+            .matches("slot 1 (small): its runner is kept")
+            .count()
+            <= 1,
+        "{}",
+        pool.output()
+    );
     wait_for(&pool, "a runner of the large class", || {
         live_of(&github, "large") == 1
     });
