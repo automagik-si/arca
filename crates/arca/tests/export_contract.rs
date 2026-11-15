@@ -33,9 +33,10 @@ use arca_mcp::{
     CallError, Caller, GetHandler, GetReply, Server, TokenStore, ToolHandler, mint, serve_unix,
 };
 use arca_metrics::{
-    Cpu, CpuPower, DriveReading, DrivesReading, GpuCardPower, GpuPower, HostSample, InstanceCpu,
-    InstanceKind, InstanceReading, InstanceThreads, LatencyReading, Load, Memory, NicCounters,
-    OsdReading, PackagePower, Pool, Power, ProbeTarget, ProjectCount, Psi, Readings,
+    ChipPower, ChipSensor, Cpu, CpuPower, DriveReading, DrivesReading, GpuCardPower, GpuPower,
+    HostSample, InstanceCpu, InstanceKind, InstanceReading, InstanceThreads, LatencyReading, Load,
+    Memory, NicCounters, OsdReading, PackagePower, Pool, Power, ProbeTarget, ProjectCount, Psi,
+    Readings,
 };
 use arca_store::{AlertEvent, DB_FILE, EventState, ResolveReason, Store};
 use common::{NOW, Scratch, caller};
@@ -280,50 +281,50 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
     (sample, readings)
 }
 
-/// The power of the scenario: two CPU packages at 10 W and 5 W, one NVIDIA card at 42.5 W and an amdgpu card whose power
-/// file could not be read, which has no series.
+/// The power of the scenario, an integrated chip read as root: one CPU package at 10 W, which the whole-chip sensor (PPT,
+/// 30 W) holds, so it is measured and not added; and one discrete NVIDIA card at 42.5 W. The sum is 30 + 42.5 = 72.5 W.
 fn scenario_power() -> Power {
     Power {
         cpu: CpuPower {
-            power_w: Some(15.0),
+            power_w: Some(10.0),
             reason: None,
-            packages: vec![
-                PackagePower {
-                    zone: "intel-rapl:0".to_string(),
-                    name: "package-0".to_string(),
-                    power_w: Some(10.0),
-                    reason: None,
-                },
-                PackagePower {
-                    zone: "intel-rapl:1".to_string(),
-                    name: "package-1".to_string(),
-                    power_w: Some(5.0),
-                    reason: None,
-                },
-            ],
+            added: false,
+            packages: vec![PackagePower {
+                zone: "intel-rapl:0".to_string(),
+                name: "package-0".to_string(),
+                power_w: Some(10.0),
+                reason: None,
+            }],
         },
         gpu: GpuPower {
-            power_w: None,
-            reason: Some("the counter could not be read".to_string()),
-            cards: vec![
-                GpuCardPower {
-                    pci: Some("0000:01:00.0".to_string()),
-                    card: None,
-                    source: "nvidia-smi".to_string(),
-                    power_w: Some(42.5),
-                    reason: None,
-                },
-                GpuCardPower {
-                    pci: Some("0000:c6:00.0".to_string()),
-                    card: Some("card1".to_string()),
-                    source: "hwmon".to_string(),
-                    power_w: None,
-                    reason: Some("the counter could not be read".to_string()),
-                },
-            ],
+            power_w: Some(42.5),
+            reason: None,
+            cards: vec![GpuCardPower {
+                pci: Some("0000:01:00.0".to_string()),
+                card: None,
+                source: "nvidia-smi".to_string(),
+                basis: None,
+                power_w: Some(42.5),
+                reason: None,
+            }],
         },
-        measured_power_w: Some(57.5),
-        not_included: vec!["memory".to_string(), "the GPU 0000:c6:00.0".to_string()],
+        chip: ChipPower {
+            power_w: Some(30.0),
+            reason: None,
+            added: true,
+            sensors: vec![ChipSensor {
+                pci: Some("0000:c6:00.0".to_string()),
+                card: Some("card1".to_string()),
+                label: Some("PPT".to_string()),
+                whole_chip: true,
+                basis: "the amdgpu hwmon shows in1 (vddnb)".to_string(),
+                power_w: Some(30.0),
+                reason: None,
+            }],
+        },
+        measured_power_w: Some(72.5),
+        not_added: vec!["the CPU packages".to_string()],
+        not_included: vec!["memory".to_string()],
     }
 }
 

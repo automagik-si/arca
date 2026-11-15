@@ -2256,29 +2256,60 @@ machine says 24. It keeps that meaning. The additions tell the counts apart:
 
 The `power` block measures what this machine can measure of its own power, and says what it cannot:
 
-- **CPU packages.** Each top-level powercap zone named `package-<N>` under `/sys/class/powercap` is one package. Its
-  power is the change of its `energy_uj` counter between two samples over the time between them, in watts. The counter
-  wraps at the zone's `max_energy_range_uj`, and a wrap is read through. A sub-domain (`intel-rapl:0:0`, `core`,
-  `uncore`) is part of its package and is never added on top of it; a `dram` zone is memory and a `psys` zone is the whole
-  platform, so neither counts; a package that two interfaces show (`intel-rapl` and `intel-rapl-mmio`) is read once.
-  `power.cpu.packages` lists each package with `zone`, `name`, `powerW` and `reason`, and `power.cpu.powerW` is their sum
-  only when every package has a figure: a part of the CPU is not the CPU.
-- **GPUs.** An NVIDIA card's figure is the `power.draw` its telemetry already reads (see "GPUs"). Any other DRM card
-  whose driver exposes hwmon is read from `power1_input` (or `power1_average`) in microwatts; amdgpu does, for
-  integrated and discrete cards. A connector (`card1-DP-1`) is not a card. `power.gpu.cards` lists each with `pci`,
-  `card` (the DRM name, for hwmon), `source` (`nvidia-smi` or `hwmon`), `powerW` and `reason`. A card is a reading at the
-  sample, so it has a figure from the first sample.
-- **The sum.** `power.measuredPowerW` adds the CPU packages' sum (when it is known) and every GPU that has a figure;
-  `null` when nothing was measured. `power.notIncluded` says in words what it leaves out: always `memory`, `disks`,
-  `fans` and `the power supply's own loss`, then `the CPU packages` when they have no summed figure, and `the GPU <pci>`
-  for each card without one. It is never the machine's power at the wall.
+- **CPU packages** (`power.cpu`). Each top-level powercap zone named `package-<N>` under `/sys/class/powercap` is one
+  package. Its power is the change of its `energy_uj` counter between two samples over the time between them, in watts.
+  The counter wraps at the zone's `max_energy_range_uj`, and a wrap is read through. A sub-domain (`intel-rapl:0:0`,
+  `core`, `uncore`) is part of its package and is never added on top of it; a `dram` zone is memory and a `psys` zone is
+  the whole platform, so neither counts; a package that two interfaces show (`intel-rapl` and `intel-rapl-mmio`) is read
+  once. `power.cpu.packages` lists each package with `zone`, `name`, `powerW` and `reason`, and `power.cpu.powerW` is their
+  sum only when every package has a figure: a part of the CPU is not the CPU.
+- **Discrete GPUs** (`power.gpu`). An NVIDIA card's figure is the `power.draw` its telemetry already reads (see "GPUs").
+  A DRM card whose hwmon gives `power1_input` (or `power1_average`, in microwatts) is here only when that sensor is the
+  card's own (see below). `power.gpu.cards` lists each with `pci`, `card` (the DRM name, for hwmon), `source`
+  (`nvidia-smi` or `hwmon`), `basis` (for hwmon, why the sensor is the card's own), `powerW` and `reason`. A card is a
+  reading at the sample, so it has a figure from the first sample. When the only GPU is integrated, `power.gpu.reason`
+  says `the integrated GPU is measured with the whole chip, in the chip sensors`.
+- **Whole-chip sensors** (`power.chip`). On an APU, amdgpu's hwmon power is the whole chip's: the kernel's amdgpu hwmon
+  documentation says `power1_input` is "power used by the SoC" and "on APUs this includes the CPU". Such a sensor is never
+  listed as a GPU. `power.chip.sensors` lists each with `pci`, `card`, `label` (such as `PPT`), `wholeChip`, `basis`,
+  `powerW` and `reason`; `power.chip.powerW` is the sum of the `wholeChip` sensors when each has a figure.
+
+**How a sensor is classified.** The label decides nothing: amdgpu labels the sensor `PPT` on an APU and on a discrete
+card alike. What decides is what the driver shows beside it, by its own visibility rules (`hwmon_attributes_visible` and
+`default_attr_update` in the kernel's `drivers/gpu/drm/amd/pm/amdgpu_pm.c`):
+
+| What sysfs shows | What the driver's rule says | The sensor is |
+|------------------|-----------------------------|---------------|
+| `in1_input` or `in1_label` (vddnb) in the hwmon | shown only on an APU (and not on a multi-die part) | the whole chip (`wholeChip: true`) |
+| fan controls (`fan1_input`, `pwm1`, ...) in the hwmon | hidden on every APU | the card's own (`power.gpu`) |
+| `pcie_bw` on the device | hidden on every APU ("PCIe Perf counters won't work on APU nodes") | the card's own (`power.gpu`) |
+| none of these, or signs both ways | no certain answer: a multi-die APU shows none of them, and so may a discrete card without fan control or PCIe counters | not certain (`wholeChip: false`), never added |
+
+A hwmon sensor of a driver other than amdgpu is read as the card's own.
+
+**What the sum holds.** `power.measuredPowerW` holds each part once:
+
+1. every discrete GPU's own figure;
+2. for the CPU, the whole-chip sensors when each of them has a figure, because they hold the CPU packages and, besides,
+   the integrated GPU and the rest of the chip; only when they have no figure, the CPU packages' sum. `power.chip.added`
+   and `power.cpu.added` say which one the sum holds;
+3. never a sensor that is not certain (`wholeChip: false`): it may include the CPU.
+
+So a figure is never counted twice; at worst one is left out, and the block says so. `power.notAdded` names what was
+measured and not added because it overlaps, for example `the CPU packages: measured, not added, because the whole-chip
+sensor at 0000:c6:00.0 holds them`, or a sensor this machine does not classify. `power.notIncluded` names what the sum
+does not hold: always `memory`, `disks`, `fans` and `the power supply's own loss`; `the CPU packages` only when neither
+they nor a whole-chip sensor are added; `the integrated GPU and the rest of the chip at <pci>` when a whole-chip sensor
+has no figure; `the device at <pci>, whose sensor is not added` for a sensor that is not certain; and `the GPU <pci>` for a
+discrete card without a figure. It never names a part the sum holds. The sum is never the machine's power at the wall.
 
 A source without a figure carries a reason in plain words:
 
 | Reason | When |
 |--------|------|
 | `no CPU power counter on this machine` | no package zone exists, as in most virtual machines |
-| `no GPU power counter on this machine` | no card with a power reading exists |
+| `no GPU power counter on this machine` | no discrete card with a power reading, and no whole-chip sensor, exists |
+| `no whole-chip power sensor on this machine` | `power.chip.reason` when no chip sensor exists |
 | `the counter <file> is there, and this process may not read it: most kernels let only root read it` | the file exists and reading it is refused. Since 2020 most kernels make the package counters readable by root only; Arca does not change that, and a kernel not run as root reports this |
 | `the counter <file> could not be read` | the file exists and did not read as a number |
 | `only one sample so far; a rate needs two` | the first sample of a package |
@@ -2339,10 +2370,10 @@ disappearance until it has been seen once.
 list. A card whose telemetry was never measurable has a `null` telemetry and a reason, not a zero.
 
 In `mean`, `cpu.threads` is the newest known sample's, `cpu.physicalCores` the newest sample's that has one, and
-`cpu.busyThreads` the average over the samples that hold it. Each power figure (a package, a card, a sum and
-`measuredPowerW`) is averaged over the samples that hold it, so `measuredPowerW` can differ from the sum of the averaged
-parts when a source was missing in part of the window; the packages and cards listed are the newest sample's, a reason
-is kept only when the mean has no figure, and `notIncluded` is worked out from the mean's figures. `instanceCpu` lists
+`cpu.busyThreads` the average over the samples that hold it. Each power figure (a package, a card, a chip sensor and
+each section's sum) is averaged over the samples that hold it; the packages, cards and sensors listed are the newest
+sample's, and a reason is kept only when the mean has no figure. `measuredPowerW`, `notAdded` and `notIncluded` are then
+worked out from those means by the same rule as one sample's, so they agree with each other. `instanceCpu` lists
 the newest sample's rows, each averaged over the window's samples that hold a figure for it and sorted again; its
 `omitted`, `omittedBusyThreads` and `reason` are the newest sample's, so an instance that stopped during the window is
 not in the mean.
@@ -4337,8 +4368,9 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_node_gpu_busy_ratio` | gauge | | the share of time the GPU is busy, 0 to 1 |
 | `arca_node_cpu_package_power_watts` | gauge | `package` (`package-0`, ...) | a CPU package's power since the previous sample, from its powercap counter |
 | `arca_node_cpu_power_watts` | gauge | | the packages' power summed, written only when every package has a figure |
-| `arca_node_gpu_power_watts` | gauge | `gpu` (the PCI address, or the DRM card name), `source` (`nvidia-smi`, `hwmon`) | a GPU's power |
-| `arca_node_power_measured_watts` | gauge | | the sum of what was measured; not the power at the wall (see "CPU counts and power") |
+| `arca_node_gpu_power_watts` | gauge | `gpu` (the PCI address, or the DRM card name), `source` (`nvidia-smi`, `hwmon`) | a discrete GPU's own power |
+| `arca_node_chip_power_watts` | gauge | `chip` (the PCI address, or the DRM card name), `label` (such as `PPT`), `whole_chip` (`true`, `false`) | a whole-chip sensor: the CPU, its integrated GPU and the rest of the chip; `false` when the driver does not tell |
+| `arca_node_power_measured_watts` | gauge | | the sum of what was measured, each part once; not the power at the wall (see "CPU counts and power") |
 | `arca_node_network_receive_bytes_total` | counter | | the bytes the physical NICs received |
 | `arca_node_network_transmit_bytes_total` | counter | | the bytes the physical NICs sent |
 | `arca_pool_size_bytes` | gauge | `pool` | the size of a storage pool |

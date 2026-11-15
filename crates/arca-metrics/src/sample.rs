@@ -687,7 +687,8 @@ impl<R: IncusRead> Sampler<R> {
             now_ms,
         );
         self.energy_before = Some((now_ms, packages));
-        power::assemble(cpu, power::gpu_power(&self.cfg.sys_root, gpu))
+        let (gpu, chip) = power::devices(&self.cfg.sys_root, gpu);
+        power::assemble(cpu, gpu, chip)
     }
 
     /// Reads the GPU inventory through Incus and, on a local host only, the newest telemetry and process attribution.

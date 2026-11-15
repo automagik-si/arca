@@ -11,17 +11,21 @@ Write under this comment only what a reader needs beyond those lines; the releas
 reads today changes. `cpu.threads`, `cpu.physicalCores` and `cpu.busyThreads` tell the logical CPUs, the physical cores
 and how many threads were busy apart: `cpu.cores` keeps counting logical CPUs, so a 12-core, 24-thread machine still
 says 24 there. A new `power` block gives each CPU package's power in watts from its powercap energy counter (a rate
-between two samples, through the counter's wrap), their sum, each GPU's power (an NVIDIA card's `power.draw`, or a
-card's hwmon `power1_input`, as amdgpu gives), and `measuredPowerW`, the sum of what was measured, with `notIncluded`
-naming what it leaves out: memory, disks, fans, the power supply's own loss, and any source without a figure. It is not
-the power at the wall. A source without a figure says why in words: no counter on this machine, the counter is there
+between two samples, through the counter's wrap), their sum, each discrete GPU's own power (an NVIDIA card's
+`power.draw`, or a discrete card's hwmon `power1_input`), and the whole-chip sensors in `power.chip`: on an APU, amdgpu's
+`PPT` sensor holds the CPU and the integrated GPU, so it is never listed as a GPU. Arca tells the two apart by what the
+driver shows beside the sensor (the vddnb voltage only on an APU; fan controls or `pcie_bw` only on a discrete card); a
+sensor it cannot classify is never added. `measuredPowerW` holds each part once: the whole-chip sensors when they have a
+figure, otherwise the CPU packages, and never both. `notAdded` names what was measured and left out because it overlaps,
+and `notIncluded` what the sum does not hold: memory, disks, fans, the power supply's own loss, and any part without a
+figure. It is not the power at the wall. A source without a figure says why in words: no counter on this machine, the counter is there
 and this process may not read it (most kernels let only root read the package counters; the file is named), or only
 one sample so far. A new `instanceCpu` block gives each running instance's CPU as threads in use since its previous
 read, with its project and name: at most 50 rows, the largest first, and a count and a sum of the rest. An instance
 that started, restarted or was replaced between two reads has no figure for that sample, never a negative or a huge
 one. `/metrics` gains `arca_node_cpu_threads`, `arca_node_cpu_physical_cores`, `arca_node_cpu_busy_threads`,
 `arca_node_cpu_package_power_watts`, `arca_node_cpu_power_watts`, `arca_node_gpu_power_watts`,
-`arca_node_power_measured_watts` and `arca_instance_cpu_busy_threads`.
+`arca_node_chip_power_watts`, `arca_node_power_measured_watts` and `arca_instance_cpu_busy_threads`.
 
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,

@@ -3148,6 +3148,7 @@ fn power() -> Value {
             result(vec![
                 ("powerW", true, nullable(num())),
                 ("reason", true, nullable(string())),
+                ("added", true, boolean()),
                 (
                     "packages",
                     true,
@@ -3173,6 +3174,29 @@ fn power() -> Value {
                         ("pci", true, nullable(string())),
                         ("card", true, nullable(string())),
                         ("source", true, one_of(&["nvidia-smi", "hwmon"])),
+                        ("basis", true, nullable(string())),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        (
+            "chip",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                ("added", true, boolean()),
+                (
+                    "sensors",
+                    true,
+                    array(result(vec![
+                        ("pci", true, nullable(string())),
+                        ("card", true, nullable(string())),
+                        ("label", true, nullable(string())),
+                        ("wholeChip", true, boolean()),
+                        ("basis", true, string()),
                         ("powerW", true, nullable(num())),
                         ("reason", true, nullable(string())),
                     ])),
@@ -3180,10 +3204,11 @@ fn power() -> Value {
             ]),
         ),
         ("measuredPowerW", true, nullable(num())),
+        ("notAdded", true, array(string())),
         ("notIncluded", true, array(string())),
     ]);
     schema["description"] = json!(
-        "measuredPowerW sums the CPU packages (when every package has a figure) and each GPU with a figure. It is not the machine's power at the wall: notIncluded names what it leaves out."
+        "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall."
     );
     schema
 }

@@ -33,6 +33,7 @@ pub const GPU_BUSY: &str = "arca_node_gpu_busy_ratio";
 pub const CPU_PACKAGE_POWER: &str = "arca_node_cpu_package_power_watts";
 pub const CPU_POWER: &str = "arca_node_cpu_power_watts";
 pub const GPU_POWER: &str = "arca_node_gpu_power_watts";
+pub const CHIP_POWER: &str = "arca_node_chip_power_watts";
 pub const POWER_MEASURED: &str = "arca_node_power_measured_watts";
 pub const NETWORK_RECEIVE: &str = "arca_node_network_receive_bytes_total";
 pub const NETWORK_TRANSMIT: &str = "arca_node_network_transmit_bytes_total";
@@ -71,7 +72,7 @@ struct Family {
 }
 
 /// The families `/metrics` renders, in the export contract's order. A new family goes in its place in this order.
-const FAMILIES: [Family; 40] = [
+const FAMILIES: [Family; 41] = [
     Family {
         name: CPU_USED,
         kind: "gauge",
@@ -165,13 +166,19 @@ const FAMILIES: [Family; 40] = [
     Family {
         name: GPU_POWER,
         kind: "gauge",
-        help: "A GPU's power, in watts.",
+        help: "A discrete GPU's own power, in watts.",
         labels: &["gpu", "source"],
+    },
+    Family {
+        name: CHIP_POWER,
+        kind: "gauge",
+        help: "A whole-chip power sensor (the CPU, its integrated GPU and the rest of the chip), in watts; whole_chip is false when the driver does not tell whether it includes the CPU.",
+        labels: &["chip", "label", "whole_chip"],
     },
     Family {
         name: POWER_MEASURED,
         kind: "gauge",
-        help: "The sum of the CPU and GPU power measured, in watts; not the power at the wall: memory, disks, fans and the power supply's own loss are not in it.",
+        help: "The sum of the power measured, each part once, in watts; not the power at the wall: memory, disks, fans and the power supply's own loss are not in it.",
         labels: &[],
     },
     Family {
@@ -428,6 +435,28 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
             SeriesKind::Gauge,
             &labels,
             card.power_w,
+        );
+    }
+    for sensor in &power.chip.sensors {
+        let chip = sensor
+            .pci
+            .as_deref()
+            .or(sensor.card.as_deref())
+            .unwrap_or("");
+        let labels = [
+            ("chip", chip),
+            ("label", sensor.label.as_deref().unwrap_or("")),
+            (
+                "whole_chip",
+                if sensor.whole_chip { "true" } else { "false" },
+            ),
+        ];
+        push(
+            &mut out,
+            CHIP_POWER,
+            SeriesKind::Gauge,
+            &labels,
+            sensor.power_w,
         );
     }
     push(

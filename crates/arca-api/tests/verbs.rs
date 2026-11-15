@@ -1221,6 +1221,7 @@ fn power() -> Value {
                 json!({
                     "powerW": sum(),
                     "reason": text(),
+                    "added": { "type": "boolean" },
                     "packages": {
                         "type": "array",
                         "items": open(
@@ -1234,7 +1235,7 @@ fn power() -> Value {
                         )
                     }
                 }),
-                &["powerW", "reason", "packages"]
+                &["powerW", "reason", "added", "packages"]
             ),
             "gpu": open(
                 json!({
@@ -1247,22 +1248,54 @@ fn power() -> Value {
                                 "pci": text(),
                                 "card": text(),
                                 "source": { "type": "string", "enum": ["nvidia-smi", "hwmon"] },
+                                "basis": text(),
                                 "powerW": sum(),
                                 "reason": text()
                             }),
-                            &["pci", "card", "source", "powerW", "reason"]
+                            &["pci", "card", "source", "basis", "powerW", "reason"]
                         )
                     }
                 }),
                 &["powerW", "reason", "cards"]
             ),
+            "chip": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "added": { "type": "boolean" },
+                    "sensors": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "pci": text(),
+                                "card": text(),
+                                "label": text(),
+                                "wholeChip": { "type": "boolean" },
+                                "basis": { "type": "string" },
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["pci", "card", "label", "wholeChip", "basis", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "added", "sensors"]
+            ),
             "measuredPowerW": sum(),
+            "notAdded": { "type": "array", "items": { "type": "string" } },
             "notIncluded": { "type": "array", "items": { "type": "string" } }
         }),
-        &["cpu", "gpu", "measuredPowerW", "notIncluded"],
+        &[
+            "cpu",
+            "gpu",
+            "chip",
+            "measuredPowerW",
+            "notAdded",
+            "notIncluded",
+        ],
     );
     schema["description"] = json!(
-        "measuredPowerW sums the CPU packages (when every package has a figure) and each GPU with a figure. It is not the machine's power at the wall: notIncluded names what it leaves out."
+        "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall."
     );
     schema
 }

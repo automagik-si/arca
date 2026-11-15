@@ -544,7 +544,10 @@ mod cpu_power {
         assert_eq!(sample.power.cpu.reason.as_deref(), Some(REMOTE_HOST_REASON));
         assert!(sample.power.cpu.packages.is_empty());
         assert_eq!(sample.power.gpu.reason.as_deref(), Some(REMOTE_HOST_REASON));
-        assert_eq!(sample.power.chip.reason.as_deref(), Some(REMOTE_HOST_REASON));
+        assert_eq!(
+            sample.power.chip.reason.as_deref(),
+            Some(REMOTE_HOST_REASON)
+        );
         assert_eq!(sample.power.measured_power_w, None);
     }
 }
@@ -588,13 +591,23 @@ mod gpu_power {
 
     /// A package counter that moves 50 J in five seconds: 10 W at the second sample.
     fn package(root: &Path) {
-        zone(root, "intel-rapl:0", "package-0", 1_000_000, Some(262_143_328_850));
+        zone(
+            root,
+            "intel-rapl:0",
+            "package-0",
+            1_000_000,
+            Some(262_143_328_850),
+        );
     }
 
     fn two_samples(scratch: &Scratch) -> HostSample {
         let mut sampler = sampler(scratch.path(), Scripted::default(), true);
         sampler.sample(1_000);
-        if scratch.path().join("sys/class/powercap/intel-rapl:0").exists() {
+        if scratch
+            .path()
+            .join("sys/class/powercap/intel-rapl:0")
+            .exists()
+        {
             set_energy(scratch.path(), "intel-rapl:0", 51_000_000);
         }
         sampler.sample(6_000).clone()
@@ -613,8 +626,18 @@ mod gpu_power {
         let scratch = tree("chip");
         amdgpu(scratch.path(), "52035000\n", &["vddnb"]);
         // The package counter is there and does not read as a number, so the CPU has no figure of its own.
-        zone(scratch.path(), "intel-rapl:0", "package-0", 0, Some(262_143_328_850));
-        write(scratch.path(), "sys/class/powercap/intel-rapl:0/energy_uj", "garbage\n");
+        zone(
+            scratch.path(),
+            "intel-rapl:0",
+            "package-0",
+            0,
+            Some(262_143_328_850),
+        );
+        write(
+            scratch.path(),
+            "sys/class/powercap/intel-rapl:0/energy_uj",
+            "garbage\n",
+        );
         let sample = two_samples(&scratch);
 
         assert!(sample.power.gpu.cards.is_empty(), "the chip is not a GPU");
@@ -632,7 +655,10 @@ mod gpu_power {
         assert!(!sample.power.cpu.added);
         assert_eq!(sample.power.measured_power_w, Some(52.035));
         let words = not_included(&sample);
-        assert!(!words.contains(&"the CPU packages"), "the CPU is inside the chip: {words:?}");
+        assert!(
+            !words.contains(&"the CPU packages"),
+            "the CPU is inside the chip: {words:?}"
+        );
         assert!(!words.iter().any(|word| word.contains(PCI)), "{words:?}");
         assert!(not_added(&sample).is_empty(), "{:?}", not_added(&sample));
     }
@@ -655,7 +681,11 @@ mod gpu_power {
             assert!(basis.contains(sign), "{basis}");
             assert_eq!(sample.power.cpu.power_w, Some(10.0));
             assert!(sample.power.cpu.added);
-            assert!(close(sample.power.measured_power_w, 62.035), "{:?}", sample.power.measured_power_w);
+            assert!(
+                close(sample.power.measured_power_w, 62.035),
+                "{:?}",
+                sample.power.measured_power_w
+            );
             assert!(!not_included(&sample).contains(&"the CPU packages"));
             assert!(not_added(&sample).is_empty(), "{:?}", not_added(&sample));
         }
@@ -668,7 +698,11 @@ mod gpu_power {
         package(scratch.path());
         let sample = two_samples(&scratch);
 
-        assert_eq!(sample.power.cpu.power_w, Some(10.0), "the packages are still measured");
+        assert_eq!(
+            sample.power.cpu.power_w,
+            Some(10.0),
+            "the packages are still measured"
+        );
         assert!(!sample.power.cpu.added);
         assert!(sample.power.chip.added);
         assert_eq!(sample.power.measured_power_w, Some(52.035), "never 62.035");
@@ -695,8 +729,16 @@ mod gpu_power {
             assert!(!sample.power.chip.added);
             assert!(sample.power.cpu.added);
             assert_eq!(sample.power.measured_power_w, Some(10.0), "{signs:?}");
-            assert!(not_added(&sample).iter().any(|word| word.contains(PCI)), "{:?}", not_added(&sample));
-            assert!(not_included(&sample).iter().any(|word| word.contains(PCI)), "{:?}", not_included(&sample));
+            assert!(
+                not_added(&sample).iter().any(|word| word.contains(PCI)),
+                "{:?}",
+                not_added(&sample)
+            );
+            assert!(
+                not_included(&sample).iter().any(|word| word.contains(PCI)),
+                "{:?}",
+                not_included(&sample)
+            );
         }
     }
 
@@ -710,7 +752,8 @@ mod gpu_power {
     }
 
     #[test]
-    fn a_chip_with_no_figure_leaves_the_package_counter_in_the_sum_and_names_the_rest_of_the_chip() {
+    fn a_chip_with_no_figure_leaves_the_package_counter_in_the_sum_and_names_the_rest_of_the_chip()
+    {
         let scratch = tree("chip-bad");
         amdgpu(scratch.path(), "garbage\n", &["vddnb"]);
         package(scratch.path());

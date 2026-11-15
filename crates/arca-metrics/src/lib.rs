@@ -32,8 +32,8 @@ pub use mode::{
 };
 pub use osd::{OsUpdate, OsdReading, UpdateTrust};
 pub use power::{
-    CpuPower, GpuCardPower, GpuPower, NO_CPU_COUNTER, NO_GPU_COUNTER, NOT_INCLUDED, PackagePower,
-    Power,
+    ChipPower, ChipSensor, CpuPower, GpuCardPower, GpuPower, NO_CPU_COUNTER, NO_GPU_COUNTER,
+    NOT_INCLUDED, PackagePower, Power,
 };
 pub use probe::ProbeTarget;
 pub use sample::{

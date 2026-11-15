@@ -772,10 +772,92 @@
                   "type": "array"
                 },
                 "power": {
-                  "description": "measuredPowerW sums the CPU packages (when every package has a figure) and each GPU with a figure. It is not the machine's power at the wall: notIncluded names what it leaves out.",
+                  "description": "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall.",
                   "properties": {
+                    "chip": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sensors": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": "string"
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "label": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "wholeChip": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "label",
+                              "wholeChip",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "sensors"
+                      ],
+                      "type": "object"
+                    },
                     "cpu": {
                       "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
                         "packages": {
                           "items": {
                             "properties": {
@@ -824,6 +906,7 @@
                       "required": [
                         "powerW",
                         "reason",
+                        "added",
                         "packages"
                       ],
                       "type": "object"
@@ -833,6 +916,12 @@
                         "cards": {
                           "items": {
                             "properties": {
+                              "basis": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
                               "card": {
                                 "type": [
                                   "string",
@@ -869,6 +958,7 @@
                               "pci",
                               "card",
                               "source",
+                              "basis",
                               "powerW",
                               "reason"
                             ],
@@ -902,6 +992,12 @@
                         "null"
                       ]
                     },
+                    "notAdded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
                     "notIncluded": {
                       "items": {
                         "type": "string"
@@ -912,7 +1008,9 @@
                   "required": [
                     "cpu",
                     "gpu",
+                    "chip",
                     "measuredPowerW",
+                    "notAdded",
                     "notIncluded"
                   ],
                   "type": "object"
@@ -1493,10 +1591,92 @@
                   "type": "array"
                 },
                 "power": {
-                  "description": "measuredPowerW sums the CPU packages (when every package has a figure) and each GPU with a figure. It is not the machine's power at the wall: notIncluded names what it leaves out.",
+                  "description": "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall.",
                   "properties": {
+                    "chip": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sensors": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": "string"
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "label": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "wholeChip": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "label",
+                              "wholeChip",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "sensors"
+                      ],
+                      "type": "object"
+                    },
                     "cpu": {
                       "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
                         "packages": {
                           "items": {
                             "properties": {
@@ -1545,6 +1725,7 @@
                       "required": [
                         "powerW",
                         "reason",
+                        "added",
                         "packages"
                       ],
                       "type": "object"
@@ -1554,6 +1735,12 @@
                         "cards": {
                           "items": {
                             "properties": {
+                              "basis": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
                               "card": {
                                 "type": [
                                   "string",
@@ -1590,6 +1777,7 @@
                               "pci",
                               "card",
                               "source",
+                              "basis",
                               "powerW",
                               "reason"
                             ],
@@ -1623,6 +1811,12 @@
                         "null"
                       ]
                     },
+                    "notAdded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
                     "notIncluded": {
                       "items": {
                         "type": "string"
@@ -1633,7 +1827,9 @@
                   "required": [
                     "cpu",
                     "gpu",
+                    "chip",
                     "measuredPowerW",
+                    "notAdded",
                     "notIncluded"
                   ],
                   "type": "object"
