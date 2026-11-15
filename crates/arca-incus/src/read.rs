@@ -199,6 +199,20 @@ impl Framed {
             .map(|(_, value)| value.as_str())
     }
 
+    /// An answer as a test hands it to code that reads one: `headers` with lower-case names.
+    #[cfg(all(test, feature = "write"))]
+    pub(crate) fn for_test(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Self {
+        Self {
+            status,
+            reason: String::new(),
+            headers: headers
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            body: body.to_vec(),
+        }
+    }
+
     pub(crate) fn into_raw(self) -> RawResponse {
         RawResponse {
             status: self.status,

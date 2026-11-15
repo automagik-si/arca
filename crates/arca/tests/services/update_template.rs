@@ -174,6 +174,7 @@ fn one_card_moves_the_image_and_the_template_from_no_entrypoint_to_a_shell_one_w
             "snapshot",
             "rebuild",
             "apply",
+            "empty /run",
             "start",
             "health",
             "record",
@@ -418,10 +419,12 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
+    // As before, and `run`, which every service that keeps `/run` in memory answers.
     assert_eq!(
         keys,
-        ["digest", "message", "service", "snapshot", "updated"]
+        ["digest", "message", "run", "service", "snapshot", "updated"]
     );
+    assert_eq!(done["run"], "memory", "{done}");
     let after = rig.service_config("app");
     assert_eq!(after.environment, before.environment);
     assert_eq!(after.entrypoint, before.entrypoint);

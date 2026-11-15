@@ -1086,7 +1086,8 @@ then starts it as the call asked; `service_update` does the same after each rebu
 back); `service_reconfigure` does it for a service made before (below). Some images need what they ship in `/run`: an
 image that runs as a user other than root and keeps that user's directory there (a socket directory made at its build)
 cannot make it again in a memory `/run`, which is root's with mode 0755. So Arca reads the whole of `/run` first, and
-when any entry there is not owned by the container's root it removes nothing: `/run` is left on the disk as the image
+when any entry there is not owned by the container's root, or its owner is not said, or `/run` lists an entry that
+cannot be read back by its name (Incus lists a name that is not UTF-8 with U+FFFD in its place), it removes nothing: `/run` is left on the disk as the image
 has it, and the answer says `run: "disk"` with `runNote`. Otherwise the image's files under `/run` are removed and `/run`
 holds only what the service writes there after its start. Arca's own database template, `postgres-autopg`, says
 `"runTmpfs": false`: its image keeps its socket directory, `/var/run/autopg`, for its user. A template whose image needs
@@ -1099,7 +1100,7 @@ half of the host's memory. The instance carries `user.arca.runtmpfs=true` as its
 `runTmpfs: true`.
 
 The create's answer, `service_update`'s and `service_reconfigure`'s say where `/run` is: `run: "memory"` or `run:
-"disk"` with `runNote` when Arca left `/run` on the disk (an entry there that is not root's) or could not remove what
+"disk"` with `runNote` when Arca left `/run` on the disk (an entry there that is not root's, or one it cannot read) or could not remove what
 the image keeps there (more than 256 entries, a `/run` that is not a directory, a removal Incus refused): the service is then created and runs as it did before this change, with
 `/run` on its disk, and nothing is refused for it. For a stopped service it is read from Incus (the root holds nothing
 under `/run`, so its next start mounts a memory one). A running container's mount table cannot be read through Incus's

@@ -36,6 +36,11 @@ enum Found {
     Other,
 }
 
+/// What an emptying refuses when an entry `/run` lists cannot be read back by its name (Incus lists a name that is not
+/// UTF-8 with U+FFFD in its place, and a read of that name answers 404): its owner is not known, and it would stay on
+/// the disk, where Incus mounts no memory `/run`.
+pub const UNREADABLE: &str = "an entry /run lists cannot be read by its name, so its owner is not known: /run is left on the disk";
+
 /// What an emptying refuses when an entry under `/run` is not root's: a non-root image made it at its build (a socket
 /// directory of its user, say), and its user cannot make it again under a memory `/run`, which is root's with mode 0755.
 pub const NOT_ROOTS: &str =
@@ -47,7 +52,8 @@ pub const NOT_ROOTS: &str =
 ///
 /// The whole of `/run` is read before anything is removed, and nothing is removed when an entry there is not owned by
 /// the container's root ([`NOT_ROOTS`]): an image that runs as another user and keeps its own directory in `/run` needs
-/// it. A `/run` that is not a directory, more than [`RUN_ENTRIES_MAX`] entries or [`RUN_DEPTH_MAX`] levels, a name that
+/// it, and nothing when an entry it lists cannot be read by its name ([`UNREADABLE`]). A `/run` that is not a directory,
+/// more than [`RUN_ENTRIES_MAX`] entries or [`RUN_DEPTH_MAX`] levels, a name that
 /// cannot be one entry's, and any refused request are errors too. Only a removal can fail once removals began, and what
 /// was removed by then stays removed.
 pub(crate) fn empty_run(send: &Send<'_>, project: &str, name: &str) -> Result<usize, IncusError> {
@@ -70,8 +76,8 @@ pub(crate) fn empty_run(send: &Send<'_>, project: &str, name: &str) -> Result<us
 }
 
 /// Reads `path` and, for a directory, everything in it, and adds each to `order` after what it holds, so removing in
-/// that order removes a directory once it is empty. Refuses an entry that is not root's, and a link is one entry: its
-/// target is never read.
+/// that order removes a directory once it is empty. Refuses an entry that is not root's, or whose owner is not said, and
+/// one its parent lists that cannot be read ([`UNREADABLE`]). A link is one entry: its target is never read.
 fn scan(
     send: &Send<'_>,
     project: &str,
@@ -85,7 +91,7 @@ fn scan(
     }
     let (found, uid) = look(send, project, name, path)?;
     if matches!(found, Found::Missing) {
-        return Ok(());
+        return Err(refused(UNREADABLE));
     }
     if uid != Some(0) {
         return Err(refused(NOT_ROOTS));
@@ -270,6 +276,183 @@ mod tests {
             Some(false),
             "the last outcome"
         );
+    }
+
+    use std::cell::RefCell;
+
+    /// A container root as the files API answers it: each path is a directory (its names), a file, or not there, with
+    /// its owner's uid (`None`: no `X-Incus-uid` header). The requests sent are kept as "METHOD path".
+    struct Root {
+        entries: BTreeMap<String, (Option<Vec<String>>, Option<u32>)>,
+        sent: RefCell<Vec<String>>,
+    }
+
+    impl Root {
+        fn new(entries: &[(&str, Option<&[&str]>, Option<u32>)]) -> Self {
+            Self {
+                entries: entries
+                    .iter()
+                    .map(|(path, names, uid)| {
+                        (
+                            path.to_string(),
+                            (
+                                names.map(|names| names.iter().map(|n| n.to_string()).collect()),
+                                *uid,
+                            ),
+                        )
+                    })
+                    .collect(),
+                sent: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn send(&self, method: &str, target: &str) -> Result<Framed, IncusError> {
+            let path = target.split_once("&path=").expect("a path").1.to_string();
+            self.sent.borrow_mut().push(format!("{method} {path}"));
+            if method == "DELETE" {
+                return Ok(Framed::for_test(
+                    200,
+                    &[],
+                    br#"{"type":"sync","status":"Success","status_code":200,"metadata":{}}"#,
+                ));
+            }
+            let Some((names, uid)) = self.entries.get(&path) else {
+                return Ok(Framed::for_test(
+                    404,
+                    &[],
+                    br#"{"type":"error","error":"not found","error_code":404}"#,
+                ));
+            };
+            let uid = uid.map(|uid| uid.to_string());
+            let mut headers = vec![];
+            if let Some(uid) = &uid {
+                headers.push(("x-incus-uid", uid.as_str()));
+            }
+            match names {
+                Some(names) => {
+                    headers.push(("x-incus-type", "directory"));
+                    let body = serde_json::json!({
+                        "type": "sync", "status": "Success", "status_code": 200, "metadata": names,
+                    });
+                    Ok(Framed::for_test(200, &headers, body.to_string().as_bytes()))
+                }
+                None => {
+                    headers.push(("x-incus-type", "file"));
+                    Ok(Framed::for_test(200, &headers, b"bytes"))
+                }
+            }
+        }
+
+        fn deletes(&self) -> Vec<String> {
+            self.sent
+                .borrow()
+                .iter()
+                .filter(|line| line.starts_with("DELETE "))
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn empty(root: &Root) -> Result<usize, IncusError> {
+        empty_run(&|method, target| root.send(method, target), "p", "c")
+    }
+
+    fn refusal(result: Result<usize, IncusError>) -> String {
+        match result {
+            Err(error) => error.to_string(),
+            Ok(removed) => panic!("refused, not {removed} removed"),
+        }
+    }
+
+    #[test]
+    fn roots_entries_are_removed_deepest_first() {
+        let root = Root::new(&[
+            ("/run", Some(&["lock", "motd"]), Some(0)),
+            ("/run/lock", Some(&[".keep"]), Some(0)),
+            ("/run/lock/.keep", None, Some(0)),
+            ("/run/motd", None, Some(0)),
+        ]);
+        assert_eq!(empty(&root).expect("emptied"), 3);
+        assert_eq!(
+            root.deletes(),
+            [
+                "DELETE /run/lock/.keep",
+                "DELETE /run/lock",
+                "DELETE /run/motd"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entry_whose_owner_is_not_said_is_refused_and_nothing_is_removed() {
+        let root = Root::new(&[
+            ("/run", Some(&["lock", "app"]), Some(0)),
+            ("/run/lock", Some(&[]), Some(0)),
+            ("/run/app", None, None),
+        ]);
+        let why = refusal(empty(&root));
+        assert!(why.contains(NOT_ROOTS), "{why}");
+        assert!(root.deletes().is_empty(), "{:?}", root.sent.borrow());
+    }
+
+    #[test]
+    fn a_listed_entry_that_cannot_be_read_is_refused_and_nothing_is_removed() {
+        // Incus lists a name that is not UTF-8 with U+FFFD in its place, and a read of that name answers 404.
+        let root = Root::new(&[
+            ("/run", Some(&["lock", "app\u{fffd}"]), Some(0)),
+            ("/run/lock", Some(&[]), Some(0)),
+        ]);
+        let why = refusal(empty(&root));
+        assert!(why.contains(UNREADABLE), "{why}");
+        assert!(root.deletes().is_empty(), "{:?}", root.sent.borrow());
+        // A container with no /run at all has nothing to remove.
+        assert_eq!(empty(&Root::new(&[])).expect("no /run"), 0);
+    }
+
+    #[test]
+    fn a_run_nested_past_the_depth_cap_is_refused_and_nothing_is_removed() {
+        let mut entries: Vec<(String, Option<Vec<String>>)> = Vec::new();
+        let mut path = "/run".to_string();
+        for _ in 0..=RUN_DEPTH_MAX + 1 {
+            entries.push((path.clone(), Some(vec!["d".to_string()])));
+            path.push_str("/d");
+        }
+        entries.push((path, None));
+        let owned: Vec<(&str, Option<Vec<&str>>, Option<u32>)> = entries
+            .iter()
+            .map(|(path, names)| {
+                (
+                    path.as_str(),
+                    names
+                        .as_ref()
+                        .map(|names| names.iter().map(String::as_str).collect()),
+                    Some(0),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, Option<&[&str]>, Option<u32>)> = owned
+            .iter()
+            .map(|(path, names, uid)| (*path, names.as_deref(), *uid))
+            .collect();
+        let root = Root::new(&refs);
+        let why = refusal(empty(&root));
+        assert!(why.contains("deeper than Arca walks"), "{why}");
+        assert!(root.deletes().is_empty());
+
+        // One level less is walked whole and emptied.
+        let shallow: Vec<(&str, Option<&[&str]>, Option<u32>)> = refs
+            .iter()
+            .filter(|(path, _, _)| path.matches("/d").count() <= RUN_DEPTH_MAX)
+            .map(|(path, names, uid)| {
+                if path.matches("/d").count() == RUN_DEPTH_MAX {
+                    (*path, None, *uid)
+                } else {
+                    (*path, *names, *uid)
+                }
+            })
+            .collect();
+        let root = Root::new(&shallow);
+        assert_eq!(empty(&root).expect("emptied"), RUN_DEPTH_MAX);
     }
 
     #[test]
