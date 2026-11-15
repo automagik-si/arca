@@ -110,6 +110,7 @@ dependencies = [
  "arca-reconcile",
  "arca-runners",
  "arca-store",
+ "arca-vmimport",
  "arca-watch",
  "axum",
  "base64 0.23.1",
@@ -327,6 +328,17 @@ version = "0.29.0"
 dependencies = [
  "rusqlite",
  "serde_json",
+]
+
+[[package]]
+name = "arca-vmimport"
+version = "0.29.0"
+dependencies = [
+ "base64 0.23.1",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
 ]
 
 [[package]]

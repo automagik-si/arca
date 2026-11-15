@@ -2475,7 +2475,9 @@
                           "instance_move",
                           "instance_move_finish",
                           "route_add",
-                          "route_remove"
+                          "route_remove",
+                          "instance_import",
+                          "instance_import_undo"
                         ],
                         "type": "string"
                       },
@@ -2613,7 +2615,9 @@
               "instance_move",
               "instance_move_finish",
               "route_add",
-              "route_remove"
+              "route_remove",
+              "instance_import",
+              "instance_import_undo"
             ],
             "type": "string"
           }
@@ -4014,6 +4018,119 @@
                 ],
                 "title": "route_remove",
                 "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of instance_import: Move one virtual machine from an outside hypervisor into Incus, from an approved proposal. source is the outside hypervisor's own description of the VM (the onevm show -x XML; Arca never talks to the outside hypervisor). With the source powered off, Arca makes the VM with its CPUs, memory, firmware, MACs and inbound rules, copies each Ceph disk from the node's source pool into the Incus pool, seeds cloud-init, starts it and reads it back on port 22. A failure before the start removes what it made; the source is never written. Needs kernel.instanceImport. Example: {\"bridge\":\"br0\",\"name\":\"web-1\",\"pool\":\"remote\",\"project\":\"people\",\"source\":\"<VM><ID>7</ID><NAME>web-1</NAME><TEMPLATE><VCPU>2</VCPU><MEMORY>4096</MEMORY><DISK><DISK_ID>0</DISK_ID><IMAGE_ID>12</IMAGE_ID><SIZE>20480</SIZE><SOURCE>src-pool/web-1-root</SOURCE><TM_MAD>ceph</TM_MAD></DISK><NIC><NIC_ID>0</NIC_ID><MAC>02:00:c0:00:02:0a</MAC><BRIDGE>br0</BRIDGE></NIC></TEMPLATE></VM>\"}",
+                "examples": [
+                  {
+                    "bridge": "br0",
+                    "name": "web-1",
+                    "pool": "remote",
+                    "project": "people",
+                    "source": "<VM><ID>7</ID><NAME>web-1</NAME><TEMPLATE><VCPU>2</VCPU><MEMORY>4096</MEMORY><DISK><DISK_ID>0</DISK_ID><IMAGE_ID>12</IMAGE_ID><SIZE>20480</SIZE><SOURCE>src-pool/web-1-root</SOURCE><TM_MAD>ceph</TM_MAD></DISK><NIC><NIC_ID>0</NIC_ID><MAC>02:00:c0:00:02:0a</MAC><BRIDGE>br0</BRIDGE></NIC></TEMPLATE></VM>"
+                  }
+                ],
+                "properties": {
+                  "bridge": {
+                    "description": "The host bridge every NIC of the VM is on, with the source's MAC. Required when the source has a NIC. A source with security-group rules needs a bridge Incus manages.",
+                    "maxLength": 15,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9._-]+$",
+                    "type": "string"
+                  },
+                  "cpu": {
+                    "description": "CPUs in place of the source's.",
+                    "maximum": 512,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "memoryMib": {
+                    "description": "Memory in MiB in place of the source's.",
+                    "maximum": 4194304,
+                    "minimum": 256,
+                    "type": "integer"
+                  },
+                  "name": {
+                    "description": "The new Incus instance's name: a letter, then letters, digits and -, at most 44 characters.",
+                    "maxLength": 44,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z][a-zA-Z0-9-]*$",
+                    "type": "string"
+                  },
+                  "pool": {
+                    "description": "The Incus storage pool, of the ceph driver, the disks are copied into.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9_-]+$",
+                    "type": "string"
+                  },
+                  "project": {
+                    "description": "The Incus project the VM lands in. It must exist.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9_-]+$",
+                    "type": "string"
+                  },
+                  "source": {
+                    "description": "The outside hypervisor's description of the VM: the onevm show -x XML. Arca reads ID, NAME, STATE and TEMPLATE; HISTORY_RECORDS, MONITORING and USER_TEMPLATE may be left out to fit.",
+                    "maxLength": 49152,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "start": {
+                    "description": "Default true: start the VM after the copy and read it back. False leaves it stopped.",
+                    "type": "boolean"
+                  },
+                  "userData": {
+                    "description": "Default true: the source's cloud-init user data goes into the seed, and runs again on the first boot. False leaves it out.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "name",
+                  "project",
+                  "source",
+                  "pool"
+                ],
+                "title": "instance_import",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of instance_import_undo: Undo an instance import, from an approved proposal: the imported VM is stopped and deleted with the volumes and ACLs it names that carry the import mark. An instance without the mark is refused. The source in the outside hypervisor is not touched; powering it on again is the operator's step. Example: {\"name\":\"web-1\",\"project\":\"people\"}",
+                "examples": [
+                  {
+                    "name": "web-1",
+                    "project": "people"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The imported VM's Incus name.",
+                    "maxLength": 44,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z][a-zA-Z0-9-]*$",
+                    "type": "string"
+                  },
+                  "project": {
+                    "description": "The Incus project of the imported VM.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-zA-Z0-9_-]+$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project",
+                  "name"
+                ],
+                "title": "instance_import_undo",
+                "type": "object"
               }
             ],
             "description": "The action's own arguments: those of the anyOf branch whose title is the action.",
@@ -4067,7 +4184,9 @@
                 "instance_move",
                 "instance_move_finish",
                 "route_add",
-                "route_remove"
+                "route_remove",
+                "instance_import",
+                "instance_import_undo"
               ],
               "type": "string"
             },
@@ -4570,7 +4689,9 @@
                 "instance_move",
                 "instance_move_finish",
                 "route_add",
-                "route_remove"
+                "route_remove",
+                "instance_import",
+                "instance_import_undo"
               ],
               "type": "string"
             },
@@ -15127,6 +15248,320 @@
       "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
+    },
+    {
+      "name": "instance_import",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The new Incus instance's name: a letter, then letters, digits and -, at most 44 characters.",
+            "maxLength": 44,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z][a-zA-Z0-9-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "pool",
+          "required": true,
+          "schema": {
+            "description": "The Incus storage pool, of the ceph driver, the disks are copied into.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": true,
+          "schema": {
+            "description": "The Incus project the VM lands in. It must exist.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "source",
+          "required": true,
+          "schema": {
+            "description": "The outside hypervisor's description of the VM: the onevm show -x XML. Arca reads ID, NAME, STATE and TEMPLATE; HISTORY_RECORDS, MONITORING and USER_TEMPLATE may be left out to fit.",
+            "maxLength": 49152,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "bridge",
+          "required": false,
+          "schema": {
+            "description": "The host bridge every NIC of the VM is on, with the source's MAC. Required when the source has a NIC. A source with security-group rules needs a bridge Incus manages.",
+            "maxLength": 15,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9._-]+$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "cpu",
+          "required": false,
+          "schema": {
+            "description": "CPUs in place of the source's.",
+            "maximum": 512,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "memoryMib",
+          "required": false,
+          "schema": {
+            "description": "Memory in MiB in place of the source's.",
+            "maximum": 4194304,
+            "minimum": 256,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "start",
+          "required": false,
+          "schema": {
+            "description": "Default true: start the VM after the copy and read it back. False leaves it stopped.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "userData",
+          "required": false,
+          "schema": {
+            "description": "Default true: the source's cloud-init user data goes into the seed, and runs again on the first boot. False leaves it out.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "acls": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "disks": {
+              "items": {
+                "properties": {
+                  "device": {
+                    "type": "string"
+                  },
+                  "from": {
+                    "type": "string"
+                  },
+                  "sizeMib": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "device",
+                  "from",
+                  "sizeMib"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "mark": {
+              "type": "string"
+            },
+            "note": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "readBack": {
+              "properties": {
+                "address": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "agent": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "answered": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "agent",
+                "address",
+                "answered"
+              ],
+              "type": "object"
+            },
+            "source": {
+              "properties": {
+                "digest": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "digest"
+              ],
+              "type": "object"
+            },
+            "started": {
+              "type": "boolean"
+            },
+            "volumes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "instance",
+            "project",
+            "source",
+            "mark",
+            "acls",
+            "volumes",
+            "disks",
+            "started",
+            "readBack",
+            "note"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Move one virtual machine from an outside hypervisor into Incus, from an approved proposal. source is the outside hypervisor's own description of the VM (the onevm show -x XML; Arca never talks to the outside hypervisor). With the source powered off, Arca makes the VM with its CPUs, memory, firmware, MACs and inbound rules, copies each Ceph disk from the node's source pool into the Incus pool, seeds cloud-init, starts it and reads it back on port 22. A failure before the start removes what it made; the source is never written. Needs kernel.instanceImport.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "instance_import_undo",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The imported VM's Incus name.",
+            "maxLength": 44,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z][a-zA-Z0-9-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": true,
+          "schema": {
+            "description": "The Incus project of the imported VM.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "instance": {
+              "type": "string"
+            },
+            "left": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "note": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "removed": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "instance",
+            "project",
+            "removed",
+            "left",
+            "note"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Undo an instance import, from an approved proposal: the imported VM is stopped and deleted with the volumes and ACLs it names that carry the import mark. An instance without the mark is refused. The source in the outside hypervisor is not touched; powering it on again is the operator's step.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
     }
   ],
   "openrpc": "1.3.2",

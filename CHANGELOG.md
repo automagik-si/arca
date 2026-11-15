@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`instance_import` moves one virtual machine from an outside hypervisor (the `onevm show -x` XML, passed in by
+the operator) into Incus behind one owner card: the same CPUs, memory, firmware, disks and MACs, the source's
+security groups as an Incus network ACL, a cloud-init seed from its context, a full sparse disk copy from the source
+Ceph pool (read-only) into the Incus Ceph pool, and a read-back after the start. `instance_import_undo` stops and
+removes an imported VM; the source is never written. A node needs `kernel.instanceImport` for either.
+
 `action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
 `service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`
 row, the node asks anonymously over HTTPS for a pull token, the repository's tags (at most 5 pages) and the digests of
