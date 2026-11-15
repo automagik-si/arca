@@ -39,9 +39,11 @@ itself. On Arca OS the program is in the read-only image, and the OS update brin
 may not write is staged in that user's state, and `serve`, `shim` and `link serve` hand over to it at their start.
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the
-gate (a list, as before, still works). It pins Automagik 3.146.4, and its keeper pulls the server's image only once
-the image's GitHub build provenance (repository `automagik-si/automagik`) verifies with cosign v3.1.4, pinned by
-version and sha256; an image that does not verify is not pulled and the server does not start.
+gate. A `service_create` that gives a list is now refused (`expected a string`), since the template's default is text;
+a workspace made before with a list keeps working, as its own keeper reads it. It pins Automagik 3.146.5, and its
+keeper pulls the server's image only once the image's GitHub build provenance (repository `automagik-si/automagik`)
+verifies with cosign v3.1.4, pinned by version and sha256; an image that does not verify is not pulled and the server
+does not start. Its first boot downloads cosign from github.com and release-assets.githubusercontent.com.
 
 ## 0.30.0 (2026-11-15)
 

@@ -584,6 +584,19 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
         )
     );
     assert_eq!(created["serverImage"], settings["serverImage"]);
+    // The default is text, so a create that gives the list form of before is refused: only a workspace made before
+    // keeps a list, which its own keeper reads.
+    let refused = arca::service::create_settings(
+        &template,
+        Some(&json!({ "accessEmails": ["owner@example.com"] })),
+    )
+    .expect_err("a list is refused at create");
+    assert!(
+        format!("{refused:?}").contains(
+            "settings.accessEmails: expected a string, the type of the template's default"
+        ),
+        "{refused:?}"
+    );
     assert!(
         arca::service::create_settings(&template, Some(&json!({ "serverImage": SERVER_IMAGE })))
             .is_err()
@@ -2134,7 +2147,7 @@ fn the_first_boot_installs_what_it_names_and_speaks_on_the_console() {
     assert_eq!(
         workspace.read("curl.log"),
         format!(
-            "-fsSL --proto =https -o {}.part https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-{arch}\n",
+            "-fsSL --proto =https --connect-timeout 30 --max-time 600 -o {}.part https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-{arch}\n",
             workspace.dir.join("verifier/cosign").display()
         )
     );
@@ -2245,7 +2258,16 @@ fn a_first_boot_that_fails_says_on_the_console_what_is_missing_or_did_not_start(
     let output = workspace.command(None).output().expect("the first boot");
     assert_eq!(output.status.code(), Some(1));
     let console = workspace.read("console.log");
-    assert!(console.contains("the provenance verifier could not be downloaded (try 6 of 6)"));
-    assert!(console.contains("(sha256 of nothing: it was not downloaded, where"));
+    assert!(console.contains(
+        "the provenance verifier could not be downloaded from github.com and release-assets.githubusercontent.com within 600 seconds (try 6 of 6)"
+    ));
+    assert!(
+        console.contains(&format!(
+            "first boot failed: the provenance verifier could not be downloaded from https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-{} in 6 tries of at most 600 seconds each: the machine needs https to github.com and release-assets.githubusercontent.com. The machine has no workspace; service_remove it and create it again once it can reach github.com and release-assets.githubusercontent.com",
+            cosign_arch()
+        )),
+        "{console}"
+    );
+    assert!(!workspace.dir.join("verifier/cosign.part").exists());
     assert!(!workspace.dir.join("installed").exists());
 }

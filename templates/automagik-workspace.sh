@@ -115,7 +115,7 @@ RELAY_NET=automagik-relay
 
 # What this script takes from the Automagik server image, each in this one place, as the Automagik repository has
 # them at commit 5fe0be6 (server/compose.gate.yml, server/gate-entrypoint.mjs, server/gate-access.mjs,
-# server/gate-claim.mjs). Those four files are the same at 6cbb66e, the commit of release 3.146.4, the build the
+# server/gate-claim.mjs). Those four files are the same at 393254f, the commit of release 3.146.5, the build the
 # shipped template pins. A later build that changes one of them changes one line here.
 SERVER_PORT=3081                                  # the server's own port, fixed in the image
 GATE_PORT=3082                                    # the gate's port, the one upstream's compose file fixes
@@ -217,7 +217,7 @@ install_workspace() {
     exit 1
   fi
   if ! install_verifier; then
-    boot_say "first boot failed: $REFUSAL. The machine has no workspace; service_remove it and create it again once it can reach github.com"
+    boot_say "first boot failed: $REFUSAL. The machine has no workspace; service_remove it and create it again once it can reach github.com and release-assets.githubusercontent.com"
     exit 1
   fi
   mkdir -p "$WS_DOCKER_ETC"
@@ -262,7 +262,7 @@ UNIT
 # The provenance verifier: Sigstore's release of cosign for this machine's architecture, downloaded and kept only
 # when its sha256 is the one fixed above. A download that fails is tried again, as the package install is.
 install_verifier() {
-  local arch sum got try part="$WS_COSIGN.part"
+  local arch sum got try fetched part="$WS_COSIGN.part"
   case $(uname -m) in
     x86_64) arch=amd64 sum=$COSIGN_AMD64 ;;
     aarch64) arch=arm64 sum=$COSIGN_ARM64 ;;
@@ -277,15 +277,26 @@ install_verifier() {
     refuse "the provenance verifier's directory ${WS_COSIGN%/*} could not be made"
     return
   fi
+  # GitHub answers the release's address with a redirect to release-assets.githubusercontent.com, which serves the
+  # file: the machine needs https to both. Each try has a bound, so a transfer that stalls is a failed try.
+  fetched=''
   for try in 1 2 3 4 5 6; do
-    curl -fsSL --proto '=https' -o "$part" "$COSIGN_RELEASE/cosign-linux-$arch" && break
-    boot_say "first boot: the provenance verifier could not be downloaded (try $try of 6); trying again in $WS_APT_PAUSE seconds"
+    if curl -fsSL --proto '=https' --connect-timeout 30 --max-time 600 -o "$part" "$COSIGN_RELEASE/cosign-linux-$arch"; then
+      fetched=1
+      break
+    fi
+    boot_say "first boot: the provenance verifier could not be downloaded from github.com and release-assets.githubusercontent.com within 600 seconds (try $try of 6); trying again in $WS_APT_PAUSE seconds"
     sleep "$WS_APT_PAUSE"
   done
+  if [ -z "$fetched" ]; then
+    rm -f "$part"
+    refuse "the provenance verifier could not be downloaded from $COSIGN_RELEASE/cosign-linux-$arch in 6 tries of at most 600 seconds each: the machine needs https to github.com and release-assets.githubusercontent.com"
+    return
+  fi
   got=$(sha256sum "$part" 2>/dev/null | cut -d' ' -f1)
   if [ "$got" != "$sum" ]; then
     rm -f "$part"
-    refuse "the provenance verifier from $COSIGN_RELEASE/cosign-linux-$arch is not the one this script fixes (sha256 ${got:-of nothing: it was not downloaded}, where $sum was expected)"
+    refuse "the provenance verifier from $COSIGN_RELEASE/cosign-linux-$arch is not the one this script fixes (sha256 $got, where $sum was expected)"
     return
   fi
   if ! { chmod 0755 "$part" && mv -f "$part" "$WS_COSIGN"; }; then
