@@ -1681,9 +1681,11 @@ impl Moves {
                     )
                 };
                 // A source left stopped while its copy may run must not come back by itself on a restart of this host.
-                let kept = (!rolled.clean && !rolled.source_running && !rolled.target_removed)
-                    .then(|| keep_down(&source, &project, &name, one["uuid"].as_str()))
-                    .unwrap_or(KeptDown::NotOurs);
+                let kept = if !rolled.clean && !rolled.source_running && !rolled.target_removed {
+                    keep_down(&source, &project, &name, one["uuid"].as_str())
+                } else {
+                    KeptDown::NotOurs
+                };
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
                     "result": result, "downtimeMs": null, "reason": kept.reason(reason),
@@ -2550,16 +2552,16 @@ impl Moves {
                     ),
                 )
             };
-            let kept = (!rolled.clean && !rolled.source_running && !rolled.target_removed)
-                .then(|| {
-                    keep_down(
-                        &source,
-                        &instance.project,
-                        &instance.name,
-                        instance.uuid.as_deref(),
-                    )
-                })
-                .unwrap_or(KeptDown::NotOurs);
+            let kept = if !rolled.clean && !rolled.source_running && !rolled.target_removed {
+                keep_down(
+                    &source,
+                    &instance.project,
+                    &instance.name,
+                    instance.uuid.as_deref(),
+                )
+            } else {
+                KeptDown::NotOurs
+            };
             self.note(json!({
                 "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
                 "name": instance.name, "result": result, "downtimeMs": null, "reason": kept.reason(reason),
