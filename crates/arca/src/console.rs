@@ -12,7 +12,7 @@
 //! an earlier node left (a crash, a kill) is this user's regular 0400 file holding one dead token, and is replaced. The
 //! token's value is never printed, logged or put in an error.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -38,6 +38,9 @@ const FILE_LEN: u64 = 49;
 /// `O_NOFOLLOW` as this platform defines it (its value differs between architectures: x86_64 and aarch64 disagree), so an
 /// open never follows a link at the file's path. `create_new` (`O_EXCL`) refuses a link by itself too.
 const NOFOLLOW: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
+
+/// `O_NONBLOCK` as this platform defines it: an open of a FIFO put at the path returns at once instead of waiting.
+const NONBLOCK: i32 = rustix::fs::OFlags::NONBLOCK.bits() as i32;
 
 /// The console's token of one running node: the file it goes to and, until it is written, the secret.
 pub struct ConsoleToken {
@@ -188,9 +191,21 @@ fn is_leftover(path: &Path, meta: &fs::Metadata, uid: u32) -> bool {
     {
         return false;
     }
-    let Ok(file) = File::open(path) else {
+    // Opened without following a link and without waiting on a FIFO, and taken only when it is the very file the lstat
+    // saw: a path swapped between the two is no leftover.
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | NONBLOCK)
+        .open(path)
+    else {
         return false;
     };
+    let same = file.metadata().is_ok_and(|opened| {
+        opened.is_file() && (opened.dev(), opened.ino()) == (meta.dev(), meta.ino())
+    });
+    if !same {
+        return false;
+    }
     let mut bytes = Vec::new();
     if file.take(FILE_LEN + 1).read_to_end(&mut bytes).is_err() {
         return false;
@@ -250,6 +265,45 @@ mod tests {
             Some(rustix::io::Errno::LOOP.raw_os_error()),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_path_swapped_after_the_lstat_is_no_leftover() {
+        let scratch = Scratch::new("swapped");
+        let path = scratch.0.join("console.token");
+        let shaped = format!("arca_{}\n", "C".repeat(43));
+        let leftover = |at: &Path| {
+            fs::write(at, &shaped).expect("write");
+            fs::set_permissions(at, fs::Permissions::from_mode(0o400)).expect("0400");
+        };
+        leftover(&path);
+        let seen = fs::symlink_metadata(&path).expect("lstat");
+        assert!(
+            is_leftover(&path, &seen, own_uid()),
+            "the file the lstat saw"
+        );
+        // Another file of the same shape in its place.
+        fs::remove_file(&path).expect("remove");
+        let other = scratch.0.join("other");
+        leftover(&other);
+        fs::rename(&other, &path).expect("swap in a file");
+        assert!(!is_leftover(&path, &seen, own_uid()), "another file");
+        // A link to a file of that shape.
+        let target = scratch.0.join("target");
+        fs::rename(&path, &target).expect("move");
+        std::os::unix::fs::symlink(&target, &path).expect("link");
+        assert!(!is_leftover(&path, &seen, own_uid()), "a link");
+        // A FIFO: the check returns at once instead of waiting for a writer.
+        fs::remove_file(&path).expect("remove link");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o400),
+            0,
+        )
+        .expect("fifo");
+        assert!(!is_leftover(&path, &seen, own_uid()), "a FIFO");
     }
 
     #[test]

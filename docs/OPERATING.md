@@ -767,16 +767,14 @@ Its answer is `200` with the reading in `result.structuredContent`, the same obj
 a summary in `result.content[0].text`. A tool-level failure is `result.isError: true`. `401` means the token is not the
 node's current one (the node restarted, or the file is from an earlier start): read the file again and retry once; a
 missing file or socket means the node is not running. `403` means the verb is not one of the four. With curl, as the
-node's user:
+node's user, the header goes in on curl's standard input (`-H @-`), so the token is never on a command line, where
+other users of the machine could read it, and never in a second file:
 
 ```sh
-curl -s --unix-socket /run/arca/arca.sock -H "Authorization: Bearer $(cat /run/arca/console.token)" \
+{ printf 'Authorization: Bearer '; cat /run/arca/console.token; } | curl -s --unix-socket /run/arca/arca.sock -H @- \
   -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"node_metrics","arguments":{}}}' \
   http://localhost/mcp
 ```
-
-(The token passes through curl's command line there, where other users of the machine can read it; a program sends the
-header itself.)
 
 A service is one template-derived container in the service project. Its template lives in
 `<stateDir>/templates/<name>.json`; `service_create` allocates `.10`-`.239` on the service bridge, creates the

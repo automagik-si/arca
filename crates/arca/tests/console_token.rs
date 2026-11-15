@@ -543,3 +543,31 @@ fn status_security_counts_the_consoles_token_among_those_that_only_look() {
 fn node_plain(scratch: &Scratch) -> Node {
     node(scratch, None)
 }
+
+#[test]
+fn a_second_start_refused_by_a_live_node_leaves_that_nodes_token_file_alone() {
+    let scratch = Scratch::new("second");
+    let run = scratch.at("run");
+    private_dir(&run);
+    let file = run.join("console.token");
+    let node = node(&scratch, Some(&file));
+    let mut first = Serve::start(&node);
+    first.ready(&node);
+    let token = read_token(&file);
+    let before = fs::symlink_metadata(&file).expect("the live node's file");
+    let (status, stderr) = Serve::start(&node).refused();
+    assert!(!status.success(), "the second start is refused: {stderr}");
+    let after = fs::symlink_metadata(&file).expect("the file is still there");
+    assert_eq!(
+        (after.dev(), after.ino()),
+        (before.dev(), before.ino()),
+        "the same file"
+    );
+    assert_eq!(read_token(&file), token, "the same token");
+    assert_eq!(
+        call(&node, &token, "node_metrics").0,
+        200,
+        "and it still answers"
+    );
+    assert!(first.stop().success());
+}
