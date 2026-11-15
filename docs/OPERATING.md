@@ -4017,7 +4017,7 @@ already as declared, so the owner is never asked for an action that cannot run o
 
 ## Alerts
 
-On every 5-second tick, `serve` reads the node, evaluates eleven rules and writes the points and any alert events to
+On every 5-second tick, `serve` reads the node, evaluates twelve rules and writes the points and any alert events to
 `arca.db` (see "The store"). The thresholds come from `alerts.json` in the state directory. Alerts never write anything to
 Incus or to the desired state.
 
@@ -4067,6 +4067,7 @@ default is `forS` 60 and `clearForS` 120, so a condition that lasts 59 seconds n
 | `gpu-vram-high` | each card's used VRAM, in percent of its total, keyed by PCI address | 95 | 5 | warning |
 | `gpu-gone` | 1 for each card that was in the inventory and is gone from it now | 0 | 0 | critical |
 | `host-network-drift` | 1 for each item of the host's declared forwarding and firewall that is not as declared, keyed by `item`, from the root part's status file (see "Host forwarding and the firewall") | 0 | 0 | critical |
+| `runner-signin` | 1 for each runner pool whose last exchange with GitHub failed for a credential reason (401 bad credentials, 404 App not installed, 403 forbidden, or no credential in the kernel), keyed by `pool` (see [`RUNNERS.md`](RUNNERS.md)) | 0 | 0 | critical |
 
 A yes-or-no rule reads 1 when it is bad and 0 when it is fine, so its threshold of 0 fires on 1. The thresholds are a
 starting point. Tune them after a week of data.

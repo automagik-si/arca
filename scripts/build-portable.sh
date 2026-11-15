@@ -105,7 +105,7 @@ build_dirs() {
 # SOURCES: the files whose text the binary can carry. A new directory that the binary embeds
 # files from belongs here; until it is, a path-like string in it fails the build on the one
 # machine whose directories it happens to name, and the build says which string.
-SOURCES=(':(glob)crates/*/src/**' templates ontology wit)
+SOURCES=(':(glob)crates/*/src/**' ':(glob)crates/*/guest/**' templates ontology wit)
 check_paths() {
     local file="$1" head private pattern out found="" known="" leaked count
     head="$(git -C "$repo" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"

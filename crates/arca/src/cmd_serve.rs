@@ -295,11 +295,23 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     };
     let (sampler, metrics_source) = new_sampler(&cfg);
     let sampler = sampler.with_probes(probe_targets(&alerts_file.probes));
-    let ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
+    let mut ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
         .with_checks(targets)
         .with_watch(Arc::clone(&watch))
         .with_host_network(cfg.host_network.status.clone())
         .with_os_update(os_update.clone());
+    // The runner pools run only on a kernel-mode node: they create and delete their job machines. Their sign-in board
+    // is read by the alerts from the first tick; the pools start once the GitHub signer is open, below.
+    let runner_board = (kernel_mode
+        && cfg
+            .runners
+            .as_ref()
+            .is_some_and(|runners| !runners.pools.is_empty()))
+    .then(arca_runners::SignInBoard::new);
+    if let Some(board) = &runner_board {
+        ticker = ticker.with_runners(board.clone());
+    }
+    let runner_owner = node.clone();
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let reader = Arc::new(Mutex::new(reader));
@@ -659,6 +671,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         })?;
         for (verb, handler) in crate::github_handlers::handlers(&signer) {
             server = server.handle(verb, handler);
+        }
+        // The runner pools sign in with this signer's connections.
+        if let Some(board) = runner_board {
+            crate::runners::spawn(&cfg, &runner_owner, signer.clone(), board)
+                .map_err(Failure::Runtime)?;
         }
         Some(signer)
     } else {
