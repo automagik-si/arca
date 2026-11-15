@@ -437,7 +437,15 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
     assert_eq!(
         steps,
         [
-            "begin", "stop", "snapshot", "rebuild", "start", "health", "record", "end"
+            "begin",
+            "stop",
+            "snapshot",
+            "rebuild",
+            "empty /run",
+            "start",
+            "health",
+            "record",
+            "end"
         ]
     );
 }
