@@ -7,6 +7,14 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`arca.db` no longer commits on every 5-second tick. The raw 5-second points stay in a ring in the server's memory for one
+hour, and only their minute and hour rollups are written, one transaction a minute: 60 commits an hour where there were
+780, which matters on consumer SSDs without power-loss protection, where every commit with `synchronous=FULL` is a real
+flush. Alert events are still committed in the tick that makes them, with `synchronous=FULL`, and nothing else that is kept
+changes. A crash or a power loss now loses at most the raw samples of the minute that had not closed; the raw window is
+empty after a start until it fills again, and a read of it says so in words. A store from an earlier release has its raw
+rows read into the ring at the first open and deleted from the file at the first rollup.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and

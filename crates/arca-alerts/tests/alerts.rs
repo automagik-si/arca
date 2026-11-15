@@ -347,6 +347,8 @@ fn events_of(dir: &Path) -> Vec<AlertEvent> {
 struct Switches {
     fail: std::sync::Arc<AtomicBool>,
     slow: std::sync::Arc<AtomicBool>,
+    /// The rollup reports a transaction of 1.1 s.
+    slow_rollup: std::sync::Arc<AtomicBool>,
 }
 
 fn set(flag: &AtomicBool, on: bool) {
@@ -379,7 +381,11 @@ impl TickStore for Flaky {
     }
 
     fn rollup(&mut self, now_ms: u64) -> Result<RollupReport, StoreError> {
-        self.inner.rollup(now_ms)
+        let mut report = self.inner.rollup(now_ms)?;
+        if self.switches.slow_rollup.load(Ordering::SeqCst) {
+            report.commit_ms = 1_100;
+        }
+        Ok(report)
     }
 }
 
@@ -1584,6 +1590,33 @@ mod store_failure {
         );
         assert_eq!(cleared.store_slow_commits, 2, "the count stays");
         assert_eq!(cleared.store_write_failures, 0);
+    }
+
+    #[test]
+    fn a_slow_minute_rollup_counts_as_a_slow_commit_and_adds_to_the_ticks_time() {
+        let scratch = Scratch::new("slow-rollup");
+        let switches = Switches::default();
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        set(&switches.slow_rollup, true);
+        let inside = engine.tick(&Inputs::default(), Vec::new(), T0 + 5_000);
+        assert_eq!(
+            inside.store_slow_commits, 0,
+            "no rollup runs inside the minute"
+        );
+        let minute = engine.tick(&Inputs::default(), Vec::new(), T0 + 60_000);
+        set(&switches.slow_rollup, false);
+        assert_eq!(minute.store_slow_commits, 1, "the minute's rollup was slow");
+        assert!(
+            minute.commit_ms.expect("timed") >= 1_100,
+            "{:?}",
+            minute.commit_ms
+        );
+        assert!(
+            minute
+                .firing
+                .iter()
+                .any(|alert| alert.event.rule == STORE_COMMIT_SLOW)
+        );
     }
 
     #[test]
