@@ -443,7 +443,7 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
 fn handlers_with(
     rig: &mut Rig,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    probe: Arc<dyn Fn(&str, u16, bool) -> bool + Send + Sync>,
+    probe: arca::handlers::UpdateProbe,
 ) {
     rig.handlers = service_handlers_updating(
         rig.kernel.clone(),
