@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.30.0 (2026-11-15)
+
 `instance_import` moves one virtual machine from an outside hypervisor (the `onevm show -x` XML, passed in by
 the operator) into Incus behind one owner card: the same CPUs, memory, firmware, disks and MACs, the source's
 security groups as an Incus network ACL, a cloud-init seed from its context, a full sparse disk copy from the source
@@ -125,6 +127,42 @@ any instance of the node, in any project, with a certificate by the Cloudflare D
 `route_remove` and `route_list` keep the routes in the edge's own record; Arca writes the edge's whole config from them,
 reloads Caddy, and opens each target in the edge's firewall rules. A private route answers only the local networks and
 the tailnet. See "Routes" in OPERATING.md.
+
+- Merge feat/vm-import: import an OpenNebula VM disk into Arca
+- Merge fix/ci-flaky-reconfigure: a reconfigured exact secret line names the secret's own file; withTemplate updates get the same fix
+- Merge feat/janitor: arca-janitor disk cleanup with git-work and mount safety
+- Merge feat/service-update-with-template: service_update withTemplate, one card and one restart
+- Merge feat/omni-version-followup: Version row for digest-less creates, stuck-resolver deadline, ghcr local tests
+- Merge feat/instance-move-plan: move an instance to a linked host
+- Merge feat/plan-renew-lapsed: plan_renew re-makes lapsed delete plans
+- Merge feat/power-metrics: node power with the shared chip counted once
+- Merge feat/omni-any-build: any Omni build by digest, version named on the card
+- Merge feat/mcp-consent-scope-pick: the owner picks the level on the consent page
+- Merge feat/mcp-device-grant: MCP device grant
+- Merge feat/metrics-raw-ring: raw metrics points stay in memory, one commit a minute
+- Merge feat/console-read-path: the machine's console token
+- Merge feat/canvas-doctor-tui: Doctor in a terminal
+- Merge feat/mcp-linked-host: MCP linked-host relay with linkedNode
+- Merge feat/runner-image: GitHub runner VM images, built and recorded
+- Merge fix/runner-l20: a runner GitHub just handed a job is kept at the bound
+- Merge feat/owner-mcp-approvals: owner approvals from the MCP session
+- Merge feat/runner-per-job: a fresh VM per GitHub job, sized by its label
+- Merge fix/route-edge-stopped-change: edge root kept across update/rollback, entrypoint carried by service_reconfigure
+- Merge feat/mcp-oauth: OAuth sign-in for the MCP endpoint, passkey consent and scope step-up
+- Merge feat/service-routes: edge routes by card, kept across edge rebuilds
+- Merge fix/ci-analysis-signin-retry: a sign-in wait past the budget stops the run, a non-numeric retry-after keeps the backoff
+- Merge fix/ci-analysis-r2-lows: stop on a dead credential, skipped days leave the window, sign-in honours retry-after
+- Merge fix/ci-analysis-real-data: CI analysis budget, App token by default, real-data fixes B1-B8
+- Merge fix/runner-pool-regtoken: registration-token mode for the GitHub runner pool
+- Merge feat/service-reconfigure: change a running service's settings by card
+- Merge fix/ci-analysis-own-pool-test: the own-pool pricing test uses each label alone
+- Merge fix/ci-analysis-lows: CI analysis review LOWs, honest fork words
+- Merge feat/runner-onboarding: one-link GitHub runner onboarding
+- Merge fix/ci-flaky-tests: flaky tests fixed without quarantine
+- Merge feat/ci-analysis: functions may reach the internet when asked, and the CI analyzer package
+- Merge feat/fleet-update-view: fleet update view in the canvas
+- Merge feat/service-update-local-image (K1): service_update moves a local-image service to another pinned local image keeping its volume
+- Merge feat/instance-move-preflight: read-only go/no-go before moving an instance to a linked host
 
 ## 0.29.0 (2026-11-13)
 
