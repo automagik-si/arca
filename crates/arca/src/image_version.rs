@@ -234,7 +234,7 @@ impl VersionLookup {
         static START: OnceLock<Instant> = OnceLock::new();
         let start = *START.get_or_init(Instant::now);
         Self::new(
-            Arc::new(Ghcr),
+            Arc::new(Ghcr::ghcr_io()),
             Arc::new(move || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)),
         )
     }
@@ -306,7 +306,23 @@ impl VersionLookup {
 }
 
 /// ghcr.io, anonymously, over HTTPS.
-pub struct Ghcr;
+pub struct Ghcr {
+    /// Where every request goes: `https://ghcr.io` on a node, a local server in a test.
+    base: String,
+}
+
+impl Ghcr {
+    /// The node's own: `https://ghcr.io`.
+    pub fn ghcr_io() -> Self {
+        Self::at(&format!("https://{HOST}"))
+    }
+
+    fn at(base: &str) -> Self {
+        Self {
+            base: base.to_string(),
+        }
+    }
+}
 
 impl TagRegistry for Ghcr {
     fn open<'a>(
@@ -314,33 +330,11 @@ impl TagRegistry for Ghcr {
         repository: &str,
         wait: Duration,
     ) -> Result<Box<dyn RegistryRound + 'a>, Unanswered> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| Unanswered)?;
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| Unanswered)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("arca/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| Unanswered)?;
-        let mut round = GhcrRound {
-            runtime,
-            client,
-            repository: repository.to_string(),
-            token: String::new(),
-        };
-        let url = format!("https://{HOST}/token?scope=repository:{repository}:pull&service={HOST}");
+        let mut round = GhcrRound::new(&self.base, repository)?;
+        let url = format!(
+            "{}/token?scope=repository:{repository}:pull&service={HOST}",
+            self.base
+        );
         let (status, _, body) = round.send(reqwest::Method::GET, &url, None, wait)?;
         if status != 200 {
             return Err(Unanswered);
@@ -364,8 +358,10 @@ impl TagRegistry for Ghcr {
 }
 
 struct GhcrRound {
-    runtime: tokio::runtime::Runtime,
+    /// The round's own runtime; `None` only once the round is dropped.
+    runtime: Option<tokio::runtime::Runtime>,
     client: reqwest::Client,
+    base: String,
     repository: String,
     token: String,
 }
@@ -374,6 +370,40 @@ struct GhcrRound {
 type Answered = (u16, reqwest::header::HeaderMap, Vec<u8>);
 
 impl GhcrRound {
+    fn new(base: &str, repository: &str) -> Result<Self, Unanswered> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| Unanswered)?;
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| Unanswered)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("arca/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|_| Unanswered)?;
+        Ok(Self {
+            runtime: Some(runtime),
+            client,
+            base: base.to_string(),
+            repository: repository.to_string(),
+            token: String::new(),
+        })
+    }
+
+    fn runtime(&self) -> Result<&tokio::runtime::Runtime, Unanswered> {
+        self.runtime.as_ref().ok_or(Unanswered)
+    }
+
     fn send(
         &self,
         method: reqwest::Method,
@@ -388,7 +418,7 @@ impl GhcrRound {
         if let Some(accept) = accept {
             request = request.header("accept", accept);
         }
-        self.runtime.block_on(async {
+        self.runtime()?.block_on(async {
             tokio::time::timeout(wait, async {
                 let mut response = request.send().await.map_err(|_| Unanswered)?;
                 let status = response.status().as_u16();
@@ -411,8 +441,8 @@ impl GhcrRound {
 impl RegistryRound for GhcrRound {
     fn tags(&mut self, last: Option<&str>, wait: Duration) -> Result<Page, Unanswered> {
         let mut url = format!(
-            "https://{HOST}/v2/{}/tags/list?n={PAGE_SIZE}",
-            self.repository
+            "{}/v2/{}/tags/list?n={PAGE_SIZE}",
+            self.base, self.repository
         );
         if let Some(last) = last.filter(|tag| tag_grammar_ok(tag)) {
             url.push_str(&format!("&last={last}"));
@@ -444,7 +474,7 @@ impl RegistryRound for GhcrRound {
         if !version_tag_ok(tag) {
             return Err(Unanswered);
         }
-        let url = format!("https://{HOST}/v2/{}/manifests/{tag}", self.repository);
+        let url = format!("{}/v2/{}/manifests/{tag}", self.base, self.repository);
         let accept = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
         let (status, headers, _) = self.send(reqwest::Method::HEAD, &url, Some(accept), wait)?;
         if status != 200 {
@@ -567,7 +597,13 @@ mod tests {
 
     #[test]
     fn only_a_version_shaped_tag_counts() {
-        for good in ["v2.261024.2", "v1", "v10.0.0.1"] {
+        // 32 bytes is the most a tag may have.
+        for good in [
+            "v2.261024.2",
+            "v1",
+            "v10.0.0.1",
+            "v123456789.123456789.123456789.1",
+        ] {
             assert!(version_tag_ok(good), "{good}");
         }
         for bad in [
@@ -581,6 +617,8 @@ mod tests {
             "v2.261024.2\n",
             "v1234567890.1",
             "v2.<b>",
+            // Four groups of at most nine digits, 40 bytes.
+            "v123456789.123456789.123456789.123456789",
         ] {
             assert!(!version_tag_ok(bad), "{bad}");
         }
@@ -591,7 +629,7 @@ mod tests {
         assert_eq!(
             version_words(OMNI_IMAGE, DIGEST_A, Some("v2.261024.2")).expect("omni"),
             format!(
-                "Omni v2.261024.2 ({DIGEST_A}). The name is the tag ghcr.io gave this digest when this was proposed."
+                "Omni v2.261024.2 ({DIGEST_A}). The name is the tag ghcr.io gave this digest at most ten minutes before this was proposed."
             )
         );
         assert_eq!(
@@ -785,5 +823,237 @@ mod tests {
             None
         );
         assert_eq!(fake.requests(), 0);
+    }
+
+    /// A local HTTP server: each request is answered with what `answer` gives for its request line, and every request's
+    /// head is kept, so a test sees what reached it.
+    struct Local {
+        base: String,
+        heads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Local {
+        fn heads(&self) -> Vec<String> {
+            self.heads.lock().expect("heads").clone()
+        }
+    }
+
+    fn local(answer: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Local {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let base = format!("http://{}", listener.local_addr().expect("its address"));
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heads);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let line = head.lines().next().unwrap_or_default().to_string();
+                seen.lock().expect("heads").push(head);
+                // The client may hang up on an answer it refuses part way.
+                let _ = stream.write_all(&answer(&line));
+            }
+        });
+        Local { base, heads }
+    }
+
+    fn reply(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut answer = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            answer.push_str(&format!("{name}: {value}\r\n"));
+        }
+        answer.push_str("\r\n");
+        let mut answer = answer.into_bytes();
+        if !body.is_empty() {
+            answer.extend_from_slice(body);
+        }
+        answer
+    }
+
+    const TOKEN: &str = "abc.DEF-123_~+/=";
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A registry that gives `TOKEN`, then answers the tags and manifests with `rest`.
+    fn registry(rest: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Local {
+        local(move |line| {
+            if line.starts_with("GET /token?") {
+                reply(
+                    "200 OK",
+                    &[],
+                    format!("{{\"token\":\"{TOKEN}\"}}").as_bytes(),
+                )
+            } else {
+                rest(line)
+            }
+        })
+    }
+
+    #[test]
+    fn the_client_asks_only_its_base_for_a_token_tags_and_digests() {
+        let server = registry(|line| {
+            if line.starts_with("GET /v2/automagik-si/omni-api/tags/list?n=1000 ") {
+                reply(
+                    "200 OK",
+                    &[("link", "</v2/x/tags/list?n=1000&last=v2.1>; rel=\"next\"")],
+                    br#"{"tags":["v2.1","latest"]}"#,
+                )
+            } else if line.starts_with("HEAD /v2/automagik-si/omni-api/manifests/v2.1 ") {
+                reply("200 OK", &[("docker-content-digest", DIGEST_A)], b"")
+            } else {
+                reply("404 Not Found", &[], b"")
+            }
+        });
+        let ghcr = Ghcr::at(&server.base);
+        let mut round = ghcr.open("automagik-si/omni-api", WAIT).expect("a token");
+        let page = round.tags(None, WAIT).expect("a page");
+        assert_eq!(page.tags, vec!["v2.1".to_string(), "latest".to_string()]);
+        assert!(page.more);
+        assert_eq!(round.digest("v2.1", WAIT).as_deref(), Ok(DIGEST_A));
+        // A tag of another shape is never asked.
+        assert_eq!(round.digest("latest", WAIT), Err(Unanswered));
+        let heads = server.heads();
+        assert_eq!(heads.len(), 3, "{heads:?}");
+        assert!(
+            heads[0].starts_with(
+                "GET /token?scope=repository:automagik-si/omni-api:pull&service=ghcr.io "
+            ),
+            "{}",
+            heads[0]
+        );
+        for head in &heads[1..] {
+            assert!(
+                head.to_ascii_lowercase().contains(&format!(
+                    "authorization: bearer {}",
+                    TOKEN.to_ascii_lowercase()
+                )),
+                "{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirect_is_never_followed_and_the_bearer_goes_nowhere_else() {
+        let elsewhere = local(|_| {
+            reply(
+                "200 OK",
+                &[("docker-content-digest", DIGEST_A)],
+                format!("{{\"token\":\"{TOKEN}\",\"tags\":[\"v2.1\"]}}").as_bytes(),
+            )
+        });
+        // A token answer that redirects.
+        let away = elsewhere.base.clone();
+        let server = local(move |line| {
+            let path = line.split(' ').nth(1).unwrap_or("/");
+            reply("302 Found", &[("location", &format!("{away}{path}"))], b"")
+        });
+        assert!(
+            Ghcr::at(&server.base)
+                .open("automagik-si/omni-api", WAIT)
+                .is_err()
+        );
+        // Tags and a manifest that redirect, after a good token.
+        let away = elsewhere.base.clone();
+        let server = registry(move |line| {
+            let path = line.split(' ').nth(1).unwrap_or("/");
+            reply(
+                "307 Temporary Redirect",
+                &[("location", &format!("{away}{path}"))],
+                b"",
+            )
+        });
+        let ghcr = Ghcr::at(&server.base);
+        let mut round = ghcr.open("automagik-si/omni-api", WAIT).expect("a token");
+        assert!(round.tags(None, WAIT).is_err());
+        assert_eq!(round.digest("v2.1", WAIT), Err(Unanswered));
+        assert_eq!(elsewhere.heads(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_answer_over_the_cap_is_refused() {
+        let padded = |size: usize| {
+            let start = br#"{"tags":["v2.1"],"pad":""#;
+            let end = br#""}"#;
+            let mut body = start.to_vec();
+            body.resize(size - end.len(), b'x');
+            body.extend_from_slice(end);
+            body
+        };
+        for (size, kept) in [(ANSWER_MAX, true), (ANSWER_MAX + 1, false)] {
+            let body = padded(size);
+            assert_eq!(body.len(), size);
+            let server = registry(move |_| reply("200 OK", &[], &body));
+            let ghcr = Ghcr::at(&server.base);
+            let mut round = ghcr.open("automagik-si/omni-api", WAIT).expect("a token");
+            let page = round.tags(None, WAIT);
+            assert_eq!(page.is_ok(), kept, "{size} bytes");
+        }
+    }
+
+    #[test]
+    fn a_token_of_another_shape_is_refused() {
+        for token in [
+            "".to_string(),
+            "two words".to_string(),
+            "<b>".to_string(),
+            "x".repeat(8193),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({ "token": token })).expect("JSON");
+            let server = local(move |_| reply("200 OK", &[], &body));
+            assert!(
+                Ghcr::at(&server.base)
+                    .open("automagik-si/omni-api", WAIT)
+                    .is_err(),
+                "{token:.20}"
+            );
+        }
+        let server = local(|_| reply("401 Unauthorized", &[], br#"{"token":"abc"}"#));
+        assert!(
+            Ghcr::at(&server.base)
+                .open("automagik-si/omni-api", WAIT)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_digest_header_of_another_shape_is_refused() {
+        for digest in [
+            "sha256:XYZ",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "",
+        ] {
+            let server =
+                registry(move |_| reply("200 OK", &[("docker-content-digest", digest)], b""));
+            let ghcr = Ghcr::at(&server.base);
+            let mut round = ghcr.open("automagik-si/omni-api", WAIT).expect("a token");
+            assert_eq!(round.digest("v2.1", WAIT), Err(Unanswered), "{digest}");
+        }
+    }
+
+    /// A round that ends does not wait for a request still stuck in the runtime's blocking pool, as a resolver that
+    /// hangs leaves one: the 5-second deadline is the whole wait.
+    #[test]
+    fn a_round_that_ends_leaves_a_stuck_resolver_behind() {
+        let round = GhcrRound::new("http://127.0.0.1:9", "automagik-si/omni-api").expect("a round");
+        let (started, running) = std::sync::mpsc::channel();
+        round.runtime().expect("a runtime").spawn_blocking(move || {
+            let _ = started.send(());
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        running.recv().expect("the stuck lookup runs");
+        let at = Instant::now();
+        drop(round);
+        assert!(at.elapsed() < Duration::from_secs(1), "{:?}", at.elapsed());
     }
 }

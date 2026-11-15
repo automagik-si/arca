@@ -3267,11 +3267,52 @@ mod tests {
                 1_000,
                 None,
                 None,
-                Some(row),
+                Some(row.clone()),
             )
             .expect("proposed");
         assert!(
             plain
+                .details
+                .iter()
+                .all(|row| row.label != crate::image_version::ROW_LABEL)
+        );
+        // A create that names no digest is made at its template's pin, which its image names: the row for that digest
+        // is kept, through the journal too, and a row for any other digest is not.
+        let at = |name: &str, digest: &str| {
+            let mut args = create_args(name);
+            args["image"] = json!(format!("{}@{digest}", crate::image_version::OMNI_IMAGE));
+            args
+        };
+        let pinned = store
+            .propose_labelled(
+                ActionKind::ServiceCreate,
+                at("pinned", &digest),
+                1_000,
+                None,
+                None,
+                Some(row.clone()),
+            )
+            .expect("proposed");
+        assert_eq!(pinned.details.last(), Some(&row));
+        let reopened = ActionProposalStore::open(&dir.0, 1_001, None);
+        let kept = reopened
+            .waiting()
+            .iter()
+            .find(|proposal| proposal.id == pinned.id)
+            .expect("kept");
+        assert_eq!(kept.details.last(), Some(&row));
+        let other = store
+            .propose_labelled(
+                ActionKind::ServiceCreate,
+                at("other", &format!("sha256:{}", "f".repeat(64))),
+                1_000,
+                None,
+                None,
+                Some(row.clone()),
+            )
+            .expect("proposed");
+        assert!(
+            other
                 .details
                 .iter()
                 .all(|row| row.label != crate::image_version::ROW_LABEL)

@@ -391,7 +391,7 @@ fn a_proposed_create_at_a_digest_binds_it_and_its_card_names_the_version() {
         "{version}"
     );
     assert!(
-        version.contains("ghcr.io gave this digest when this was proposed"),
+        version.contains("ghcr.io gave this digest at most ten minutes before this was proposed"),
         "{version}"
     );
     // The version is a label: it is no argument, so the approval binds the digest alone.
@@ -460,7 +460,7 @@ fn a_miss_or_a_registry_failure_says_version_unknown_and_the_proposal_still_succ
 }
 
 #[test]
-fn a_create_without_a_digest_asks_no_registry_and_its_card_has_no_version_row() {
+fn a_create_without_a_digest_names_the_version_of_the_templates_pin() {
     let rig = omni_node(None);
     let registry = FakeRegistry::new(&[("v2.261024.2", DIGEST)]);
     let plans = plans(
@@ -471,6 +471,38 @@ fn a_create_without_a_digest_asks_no_registry_and_its_card_has_no_version_row() 
         &plans,
         "service_create",
         json!({ "name": "omni", "template": "omni-api" }),
+    )
+    .expect("proposed");
+    assert_eq!(
+        proposed["args"]["image"],
+        format!("ghcr.io/automagik-si/omni-api@{DIGEST}")
+    );
+    assert!(proposed["args"].get("digest").is_none());
+    let version = row(&proposed, "Version").expect("a version row");
+    assert!(
+        version.starts_with(&format!("Omni v2.261024.2 ({DIGEST})")),
+        "{version}"
+    );
+    assert_eq!(registry.opens.load(Ordering::SeqCst), 1);
+
+    // An image that is not looked up gets no row and asks nothing.
+    let rig = omni_node(None);
+    rig.template(
+        "app",
+        json!({
+            "name": "app", "kind": "oci", "image": "registry.example/app",
+            "digest": DIGEST, "ports": [80], "env": {}, "publishable": false
+        }),
+    );
+    let registry = FakeRegistry::new(&[("v2.261024.2", DIGEST)]);
+    let app_plans = self::plans(
+        &rig,
+        &versions(&registry, &Arc::new(AtomicU64::new(5_000_000))),
+    );
+    let proposed = propose(
+        &app_plans,
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
     )
     .expect("proposed");
     assert_eq!(row(&proposed, "Version"), None);
