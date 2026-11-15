@@ -296,15 +296,33 @@
                 },
                 "cpu": {
                   "properties": {
+                    "busyThreads": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
                     "cores": {
                       "type": "integer"
                     },
                     "coresKnown": {
                       "type": "boolean"
                     },
+                    "physicalCores": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "reason": {
                       "type": [
                         "string",
+                        "null"
+                      ]
+                    },
+                    "threads": {
+                      "type": [
+                        "integer",
                         "null"
                       ]
                     },
@@ -553,6 +571,61 @@
                     "null"
                   ]
                 },
+                "instanceCpu": {
+                  "properties": {
+                    "instances": {
+                      "items": {
+                        "properties": {
+                          "busyThreads": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "project": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "project",
+                          "name",
+                          "busyThreads",
+                          "reason"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "omitted": {
+                      "type": "integer"
+                    },
+                    "omittedBusyThreads": {
+                      "type": "number"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "instances",
+                    "omitted",
+                    "omittedBusyThreads",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
                 "instancesNotRead": {
                   "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read.",
                   "items": {
@@ -720,6 +793,250 @@
                     "type": "object"
                   },
                   "type": "array"
+                },
+                "power": {
+                  "description": "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall.",
+                  "properties": {
+                    "chip": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sensors": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": "string"
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "label": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "wholeChip": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "label",
+                              "wholeChip",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "sensors"
+                      ],
+                      "type": "object"
+                    },
+                    "cpu": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "packages": {
+                          "items": {
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "zone": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "zone",
+                              "name",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "packages"
+                      ],
+                      "type": "object"
+                    },
+                    "gpu": {
+                      "properties": {
+                        "cards": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "source": {
+                                "enum": [
+                                  "nvidia-smi",
+                                  "hwmon"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "source",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "cards"
+                      ],
+                      "type": "object"
+                    },
+                    "measuredPowerW": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "notAdded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "notIncluded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "cpu",
+                    "gpu",
+                    "chip",
+                    "measuredPowerW",
+                    "notAdded",
+                    "notIncluded"
+                  ],
+                  "type": "object"
                 },
                 "projects": {
                   "items": {
@@ -798,15 +1115,33 @@
                 },
                 "cpu": {
                   "properties": {
+                    "busyThreads": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
                     "cores": {
                       "type": "integer"
                     },
                     "coresKnown": {
                       "type": "boolean"
                     },
+                    "physicalCores": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "reason": {
                       "type": [
                         "string",
+                        "null"
+                      ]
+                    },
+                    "threads": {
+                      "type": [
+                        "integer",
                         "null"
                       ]
                     },
@@ -1055,6 +1390,61 @@
                     "null"
                   ]
                 },
+                "instanceCpu": {
+                  "properties": {
+                    "instances": {
+                      "items": {
+                        "properties": {
+                          "busyThreads": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "project": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "project",
+                          "name",
+                          "busyThreads",
+                          "reason"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "omitted": {
+                      "type": "integer"
+                    },
+                    "omittedBusyThreads": {
+                      "type": "number"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "instances",
+                    "omitted",
+                    "omittedBusyThreads",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
                 "instancesNotRead": {
                   "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read.",
                   "items": {
@@ -1222,6 +1612,250 @@
                     "type": "object"
                   },
                   "type": "array"
+                },
+                "power": {
+                  "description": "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall.",
+                  "properties": {
+                    "chip": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sensors": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": "string"
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "label": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "wholeChip": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "label",
+                              "wholeChip",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "sensors"
+                      ],
+                      "type": "object"
+                    },
+                    "cpu": {
+                      "properties": {
+                        "added": {
+                          "type": "boolean"
+                        },
+                        "packages": {
+                          "items": {
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "zone": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "zone",
+                              "name",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "added",
+                        "packages"
+                      ],
+                      "type": "object"
+                    },
+                    "gpu": {
+                      "properties": {
+                        "cards": {
+                          "items": {
+                            "properties": {
+                              "basis": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "card": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "pci": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "powerW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "source": {
+                                "enum": [
+                                  "nvidia-smi",
+                                  "hwmon"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "pci",
+                              "card",
+                              "source",
+                              "basis",
+                              "powerW",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "powerW": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "powerW",
+                        "reason",
+                        "cards"
+                      ],
+                      "type": "object"
+                    },
+                    "measuredPowerW": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "notAdded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "notIncluded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "cpu",
+                    "gpu",
+                    "chip",
+                    "measuredPowerW",
+                    "notAdded",
+                    "notIncluded"
+                  ],
+                  "type": "object"
                 },
                 "projects": {
                   "items": {

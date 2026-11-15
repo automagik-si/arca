@@ -3155,6 +3155,9 @@ fn host_sample() -> Value {
                 ("cores", true, int()),
                 ("coresKnown", true, boolean()),
                 ("reason", true, nullable(string())),
+                ("threads", false, nullable(int())),
+                ("physicalCores", false, nullable(int())),
+                ("busyThreads", false, nullable(num())),
             ]),
         ),
         (
@@ -3219,6 +3222,103 @@ fn host_sample() -> Value {
             ])),
         ),
         ("instancesNotRead", true, instances_not_read()),
+        ("power", false, power()),
+        ("instanceCpu", false, instance_cpu()),
+    ])
+}
+
+/// The power block of a host sample: the CPU packages' power from their energy counters, the GPUs' power, and the sum of
+/// what was measured with the words for what it leaves out. A source with no figure carries a reason, never a zero.
+fn power() -> Value {
+    let mut schema = result(vec![
+        (
+            "cpu",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                ("added", true, boolean()),
+                (
+                    "packages",
+                    true,
+                    array(result(vec![
+                        ("zone", true, string()),
+                        ("name", true, string()),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        (
+            "gpu",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                (
+                    "cards",
+                    true,
+                    array(result(vec![
+                        ("pci", true, nullable(string())),
+                        ("card", true, nullable(string())),
+                        ("source", true, one_of(&["nvidia-smi", "hwmon"])),
+                        ("basis", true, nullable(string())),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        (
+            "chip",
+            true,
+            result(vec![
+                ("powerW", true, nullable(num())),
+                ("reason", true, nullable(string())),
+                ("added", true, boolean()),
+                (
+                    "sensors",
+                    true,
+                    array(result(vec![
+                        ("pci", true, nullable(string())),
+                        ("card", true, nullable(string())),
+                        ("label", true, nullable(string())),
+                        ("wholeChip", true, boolean()),
+                        ("basis", true, string()),
+                        ("powerW", true, nullable(num())),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
+        ("measuredPowerW", true, nullable(num())),
+        ("notAdded", true, array(string())),
+        ("notIncluded", true, array(string())),
+    ]);
+    schema["description"] = json!(
+        "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall."
+    );
+    schema
+}
+
+/// Each running instance's CPU in threads in use since its previous read: at most 50 rows, the largest first, and a count
+/// and a sum of the rest.
+fn instance_cpu() -> Value {
+    result(vec![
+        (
+            "instances",
+            true,
+            array(result(vec![
+                ("project", true, string()),
+                ("name", true, string()),
+                ("busyThreads", true, nullable(num())),
+                ("reason", true, nullable(string())),
+            ])),
+        ),
+        ("omitted", true, int()),
+        ("omittedBusyThreads", true, num()),
+        ("reason", true, nullable(string())),
     ])
 }
 

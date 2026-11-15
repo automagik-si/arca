@@ -92,6 +92,8 @@ pub fn read_usage<R: IncusRead>(
 pub struct HostTotals {
     /// The logical CPUs the host has, from `/cpu/total`. Incus counts threads here.
     pub cpu_threads: u64,
+    /// The physical cores, counted from `/cpu/sockets[].cores[]`. `None` when the document does not list them.
+    pub cpu_cores: Option<u64>,
     /// The host's memory, in bytes, from `/memory/total`.
     pub memory_total_bytes: u64,
     /// The memory in use, in bytes, from `/memory/used`.
@@ -112,9 +114,21 @@ fn host_totals(document: &Value) -> Option<HostTotals> {
     let memory_used_bytes = document.pointer("/memory/used")?.as_u64()?;
     (cpu_threads > 0 && memory_total_bytes > 0).then_some(HostTotals {
         cpu_threads,
+        cpu_cores: physical_cores(document),
         memory_total_bytes,
         memory_used_bytes,
     })
+}
+
+/// The physical cores a `/1.0/resources` document lists: the length of each socket's `cores` list, summed. `None` unless
+/// every socket carries such a list and the sum is above zero.
+fn physical_cores(document: &Value) -> Option<u64> {
+    let sockets = document.pointer("/cpu/sockets")?.as_array()?;
+    let cores = sockets
+        .iter()
+        .map(|socket| socket.get("cores")?.as_array().map(Vec::len))
+        .sum::<Option<usize>>()?;
+    (cores > 0).then(|| u64::try_from(cores).unwrap_or(u64::MAX))
 }
 
 /// The kind of an instance. Incus has two: a container, and a virtual machine (`virtual-machine` on the wire).
@@ -154,6 +168,8 @@ pub struct InstanceReading {
 pub struct Listed {
     pub reading: InstanceReading,
     pub last_used: Option<String>,
+    /// `created_at`: an instance deleted and made again under the same name has a new one.
+    pub created: Option<String>,
 }
 
 /// The storage pool list Incus answers, recursed so that each entry carries its name.
@@ -221,6 +237,10 @@ fn listed(row: &Value) -> Option<Listed> {
         },
         last_used: row
             .get("last_used_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        created: row
+            .get("created_at")
             .and_then(Value::as_str)
             .map(str::to_string),
     })
@@ -338,6 +358,7 @@ mod tests {
             host_totals(&full),
             Some(HostTotals {
                 cpu_threads: 16,
+                cpu_cores: None,
                 memory_total_bytes: 17_045_651_456,
                 memory_used_bytes: 3_417_186_304,
             })
