@@ -2891,3 +2891,20 @@ fn a_verified_copy_the_next_start_records_takes_the_recorded_autostart() {
     assert_eq!(source_autostart(&rig), "false");
     assert_eq!(result_line(&rig, "web")["copyAutostartSet"], true);
 }
+
+/// R6-1: the copy's creation records the source's own boot.autostart in the journal, so a next start can give it to a
+/// verified copy after the run turned the source's off.
+#[test]
+fn the_copys_creation_records_the_sources_autostart() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    assert_eq!(rig.wait(&id)["phase"], "moved");
+    let created = rig
+        .journal()
+        .into_iter()
+        .find(|line| line["event"] == "created" && line["targetUuid"].is_string())
+        .expect("the created line");
+    assert_eq!(created["sourceAutostart"], "true", "{created}");
+}
