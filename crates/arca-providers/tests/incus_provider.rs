@@ -863,6 +863,42 @@ fn host_addresses_collects_inet_and_inet6_and_reads_only_the_listing_and_each_st
 }
 
 #[test]
+fn host_addresses_on_incus_os_read_the_physical_interfaces_incus_osd_holds() {
+    // On IncusOS the uplink is not in /1.0/networks: only the managed bridges are, and incus-osd answers the rest.
+    let (_scratch, fake) = start("host-addresses-os");
+    fake.set_host_interfaces(vec![("br0".to_string(), vec!["10.0.9.1".parse().unwrap()])]);
+    fake.set_host_netmask("10.0.9.1".parse().unwrap(), 24);
+    fake.set_os_network(json!({
+        "config": {"interfaces": [{"name": "eth0", "addresses": ["192.0.2.7/24", "dhcp6"]}]},
+        "state": {"interfaces": {
+            "eth0": {"addresses": ["192.0.2.7", "2001:db8::7"], "state": "routable"},
+            "wlan0": {"state": "no-carrier"},
+            "br0": {"addresses": ["10.0.9.1"]},
+        }},
+    }));
+    let read = UnixIncus::new(fake.socket().to_path_buf());
+    let mut found = arca_providers::incus::host_networks(&read).expect("the host's addresses");
+    found.sort();
+    let mut expected: Vec<(IpAddr, Option<u8>)> = vec![
+        ("10.0.9.1".parse().unwrap(), Some(24)),
+        ("192.0.2.7".parse().unwrap(), Some(24)),
+        ("2001:db8::7".parse().unwrap(), None),
+    ];
+    expected.sort();
+    assert_eq!(found, expected);
+    let paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/1.0/networks?recursion=1".to_string(),
+            "/1.0/networks/br0/state".to_string(),
+            "/os/1.0/system/network".to_string(),
+        ]
+    );
+    assert!(only_gets(&fake));
+}
+
+#[test]
 fn host_addresses_through_the_kernel_needs_the_plugin_to_declare_observes() {
     let (scratch, fake) = start("observes");
     fake.set_host_interfaces(vec![(

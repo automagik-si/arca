@@ -5,32 +5,42 @@ Node 22 or later, no dependencies.
 
 ## What it reads
 
-Read-only, from the GitHub Actions API, for a window (7 days by default): every completed workflow run, every job of
-every attempt with its steps and timings, the workflow files at the default branch, the repository's cache usage, and
-the logs of a bounded sample of jobs (the failed attempts of flaky jobs, the newest other failures, the newest
-successful runs of the costliest jobs). A log is parsed as it is read and only what was parsed is kept: cache restores
-(hit, partial, miss, gzip or zstd) and tests (failed ones, and those over 2 s with their times; bun, node, cargo,
-nextest, go, pytest, jest/vitest/playwright marks, TAP).
+Read-only, from the GitHub Actions API, for a window (7 days by default): the completed workflow runs, the newest 300
+of them at most (`--max-runs`), every job of every attempt of those runs with its steps and timings, the workflow files
+at the default branch (20 at most), the repository's cache usage, and the logs of a bounded sample of jobs (the failed
+attempts of flaky jobs, the newest other failures, the newest successful runs of the costliest jobs). A log is parsed
+as it is read and only what was parsed is kept: cache restores (hit, partial, miss, gzip or zstd) and tests (failed
+ones, and those over 2 s with their times; bun, node, cargo, nextest, go, pytest, jest/vitest/playwright marks, TAP).
 
-Access, from the environment, never printed:
+A busy repository has thousands of runs a week, and reading the jobs of each costs one request. So before its first
+request a run prints its plan to stderr: the most requests it can make. `--budget` (600 by default, `BUDGET`) is a hard
+limit on GitHub REST requests for the whole run. When the plan is over it, the runs and logs read per repository
+shrink to fit. When a run is sampled, the report says so, and its window is the span the sampled runs cover, so weekly
+figures stay right. When reading stops part-way (the budget is spent, a rate limit will not reset in time, GitHub keeps
+failing), the dataset keeps what was read and the report says what is missing. A rate limit waits for its reset (70
+min at most in all). A server error is tried again after 2, 4, 8 and 16 s.
 
-| Variable | What |
+Access, never printed, in this order:
+
+| Where | What |
 |---|---|
-| `GITHUB_TOKEN` | A token that can read the repositories. |
+| `--installation-token-file FILE` or `GITHUB_INSTALLATION_TOKEN` | A GitHub App installation token (`ghs_…`). Its rate limit is the App's on that installation. |
 | `GITHUB_APP_ID`, `GITHUB_APP_KEY_B64` | A GitHub App installed on the selected repositories, its PEM key as base64 on one line. The App needs repository permissions **Actions: read**, **Contents: read** and **Metadata: read**, and nothing else. Each run mints an installation token narrowed to one repository and those three permissions. |
+| `GITHUB_TOKEN` | An installation token. A person's token (`gho_…` from `gh auth token`, `ghp_…`, `github_pat_…`) is used only with `--allow-user-token` (`ALLOW_USER_TOKEN=1`): its rate limit is shared with everything that person runs, merges and CI included. |
 
 ## What it reports
 
 Per repository: runs, jobs, runner minutes (rounded up per job, as billed) and cost at list price and as billed (free
 minutes of public repositories taken off; self-hosted minutes priced at 0; prices in `src/cost.js`, dated); p50/p95/max
-per workflow, job and step; queue time per job and runner; flaky jobs (failed, then passed on the same commit) with the
-tests that failed; the slowest tests and whether any log read showed them failing; cache hit rate; and the findings,
+per workflow, job and step; queue time per job and runner; flaky jobs (failed, then passed on the same commit; not a
+scheduled run, whose result depends on more than the code, and not a gate job with `needs:` that failed because a job
+of its attempt failed or was cancelled) with the tests that failed; the slowest tests and whether any log read showed them failing; cache hit rate; and the findings,
 ranked by what they save a week (a billed dollar 100 points, a waiting minute 1, an unbilled runner minute 0.2;
 estimates weigh 0.6).
 
 | Finding | Change it proposes | PR step writes it |
 |---|---|---|
-| `paid-runner` | short jobs of a public repository moved off a billed runner to `ubuntu-latest` | yes |
+| `paid-runner` | short jobs of a public repository moved off a billed runner to `ubuntu-latest`; with `--move-to`, any job on a provider's or GitHub's larger billed Linux x64 runner moved to your own pool, whatever its length (not yet a job on GitHub's standard runners, such as `ubuntu-latest`, even in a private repository where they are billed) | yes |
 | `cancel-superseded` | a concurrency group with `cancel-in-progress` | yes, when the workflow has none |
 | `duplicate-trigger` | `push` limited to named branches when a branch's push and pull request run the same commit | yes |
 | `missing-timeout` | `timeout-minutes` of 3 × p95 (at least 10) | yes |
@@ -40,9 +50,10 @@ estimates weigh 0.6).
 ## Use
 
 ```
-GITHUB_TOKEN=... node src/cli.js --repo acme/app --repo acme/lib --out out/
+node src/cli.js --installation-token-file token.txt --repo acme/app --repo acme/lib --out out/
 node src/cli.js --dataset out/acme__app/dataset.json --out out/      # analyse a saved dataset again, offline
-node src/cli.js --repo acme/app --move-to acme-4vcpu-ubuntu-2404 --out out/  # short billed jobs go to your own pool
+node src/cli.js --installation-token-file token.txt --repo acme/app --move-to acme-4vcpu-ubuntu-2404 --out out/  # billed Linux jobs go to your own pool
+node src/cli.js --installation-token-file token.txt --repo acme/app --days 2 --max-runs 300 --budget 600  # a busy repository, sampled
 node src/pr-cli.js --report out/acme__app/report.json --workdir work/  # draft the top writable finding
 node src/pr-cli.js --report out/acme__app/report.json --workdir work/ --open   # push to a fork, open a DRAFT PR
 ```

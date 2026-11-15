@@ -151,7 +151,8 @@ impl ServiceExec {
         {
             return Err(ExecError::Refused("target"));
         }
-        if cfg.source["protocol"] == "oci" {
+        // An OCI image carries none of the tools of a system container; only an edge's own closed command runs in one.
+        if cfg.source["protocol"] == "oci" && cfg.edge.is_none() {
             return Err(ExecError::Refused("oci"));
         }
         let uuid = target.uuid.as_ref().ok_or(ExecError::Refused("uuid"))?;

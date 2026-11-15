@@ -39,6 +39,12 @@ must already be in the service project's image store, the record takes the alias
 (or keeps its own), and the data volume is kept. Keep the old image in the project store until the update has
 succeeded: a rollback in a project without snapshots rebuilds the old root from it.
 
+Routes: a node's edge, a Caddy container made from the new shipped `arca-edge` template, serves `https://<name>` for
+any instance of the node, in any project, with a certificate by the Cloudflare DNS challenge. `route_add`,
+`route_remove` and `route_list` keep the routes in the edge's own record; Arca writes the edge's whole config from them,
+reloads Caddy, and opens each target in the edge's firewall rules. A private route answers only the local networks and
+the tailnet. See "Routes" in OPERATING.md.
+
 ## 0.29.0 (2026-11-13)
 
 A function whose `command` is a shell and its script (`["/bin/sh", "-c", <script>]`) now starts on a node whose Incus
