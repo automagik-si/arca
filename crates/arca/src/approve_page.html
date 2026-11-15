@@ -1208,7 +1208,8 @@ function appCard(app) {
   };
   // The most the app may do across its live grants, and when it last used any of them: an app the owner stepped up
   // holds a grant for each approval.
-  fact("Answers go to", (app.redirectHosts || []).join(", "));
+  // An app that connected with a code (an agent on another device) has no address to answer.
+  fact("Answers go to", (app.redirectHosts || []).join(", ") || "an app on another device, by code");
   fact("Allowed", String(app.scope));
   if (app.approvals) fact("Approvals", "asks you about waiting plans in its own window");
   fact("Last used", app.lastUsedAt ? new Date(app.lastUsedAt).toLocaleString() : "not since Arca started");

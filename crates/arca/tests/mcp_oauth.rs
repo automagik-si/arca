@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -219,42 +219,26 @@ impl Rig {
         content_type: &str,
         body: &[u8],
     ) -> Reply {
-        let mut stream = UnixStream::connect(&self.socket).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
-        let mut head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nContent-Length: {}\r\n",
-            body.len()
-        );
-        if !body.is_empty() {
-            head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        send_on(&self.socket, method, path, headers, content_type, body)
+    }
+
+    /// The store as a restart reads it from disk, serving its routes on a socket of its own: its path.
+    fn serve_reopened(&self, name: &str) -> PathBuf {
+        let router = Arc::new(self.reopened()).router();
+        let socket = self._scratch.path(name);
+        let served = socket.clone();
+        self._runtime.spawn(async move {
+            let _ = serve_unix(router, &served).await;
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(
+                Instant::now() < until,
+                "the reopened store's server started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
-        for (name, value) in headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
-        head.push_str("\r\n");
-        let mut bytes = head.into_bytes();
-        bytes.extend_from_slice(body);
-        stream.write_all(&bytes).expect("write");
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("read");
-        let split = raw
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("a response head");
-        let head = String::from_utf8_lossy(&raw[..split]).to_string();
-        let status = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|status| status.parse().ok())
-            .expect("a status");
-        Reply {
-            status,
-            head,
-            body: raw[split + 4..].to_vec(),
-        }
+        socket
     }
 
     fn get(&self, path: &str) -> Reply {
@@ -458,6 +442,53 @@ impl Rig {
 
     fn journal(&self) -> String {
         fs::read_to_string(self.state_dir.join(arca::mcp_oauth::JOURNAL_FILE)).unwrap_or_default()
+    }
+}
+
+/// One HTTP request on the unix socket `socket`, read to the end.
+fn send_on(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    content_type: &str,
+    body: &[u8],
+) -> Reply {
+    let mut stream = UnixStream::connect(socket).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if !body.is_empty() {
+        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    stream.write_all(&bytes).expect("write");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .expect("a status");
+    Reply {
+        status,
+        head,
+        body: raw[split + 4..].to_vec(),
     }
 }
 
@@ -1834,4 +1865,595 @@ fn the_session_is_never_asked_about_an_erasing_plan_that_action_propose_answers_
         "{}",
         asked.message
     );
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// The device authorization grant (RFC 8628): an agent away from the person's browser (in a container or on a server)
+// shows a short link and a code; the person approves on any device with the passkey; the agent polls for its token.
+
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// The letters a user code is made of (RFC 8628 6.1: no vowels, nothing that reads as another letter or a digit).
+const USER_CODE_LETTERS: &str = "BCDFGHJKLMNPQRSTVWXZ";
+
+impl Rig {
+    /// A client that registers for the device grant alone, with no redirect.
+    fn device_client(&self, name: &str) -> String {
+        let reply = self.send(
+            "POST",
+            "/oauth/register",
+            &[],
+            "application/json",
+            json!({ "client_name": name, "grant_types": [DEVICE_GRANT, "refresh_token"], "token_endpoint_auth_method": "none" })
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(reply.status, 201, "register: {}", reply.text());
+        let body = reply.json();
+        assert_eq!(body["grant_types"], json!([DEVICE_GRANT, "refresh_token"]));
+        body["client_id"].as_str().expect("a client id").to_string()
+    }
+
+    /// `POST /oauth/device_authorization` with `pairs`.
+    fn device_authorization(&self, pairs: &[(&str, &str)]) -> Reply {
+        self.send(
+            "POST",
+            "/oauth/device_authorization",
+            &[],
+            "application/x-www-form-urlencoded",
+            form(pairs).as_bytes(),
+        )
+    }
+
+    /// A device authorization for `client` at `scope` that must be taken: its answer.
+    fn device_code(&self, client: &str, scope: &str) -> Value {
+        let reply = self.device_authorization(&[
+            ("client_id", client),
+            ("scope", scope),
+            ("resource", &format!("{ORIGIN}/mcp")),
+        ]);
+        assert_eq!(reply.status, 200, "device authorization: {}", reply.text());
+        assert_eq!(reply.header("cache-control").as_deref(), Some("no-store"));
+        reply.json()
+    }
+
+    /// The agent's poll of the token endpoint with `device_code`.
+    fn poll(&self, client: &str, device_code: &str) -> Reply {
+        self.token(&[
+            ("grant_type", DEVICE_GRANT),
+            ("device_code", device_code),
+            ("client_id", client),
+        ])
+    }
+}
+
+/// The path and query of `url` on this origin.
+fn on_origin(url: &str) -> String {
+    url.strip_prefix(ORIGIN)
+        .expect("a URL on the page origin")
+        .to_string()
+}
+
+#[test]
+fn an_agent_away_from_the_browser_shows_a_link_and_a_code_and_polls_for_its_token_after_the_passkey()
+ {
+    let (rig, key) = Rig::new("oauth-device");
+    let client = rig.device_client("Codex in a container");
+    let device = rig.device_code(&client, "doctor");
+    let user_code = device["user_code"]
+        .as_str()
+        .expect("a user code")
+        .to_string();
+    let (left, right) = user_code.split_once('-').expect("two groups of four");
+    assert!(
+        left.len() == 4
+            && right.len() == 4
+            && left
+                .chars()
+                .chain(right.chars())
+                .all(|c| USER_CODE_LETTERS.contains(c)),
+        "{user_code}"
+    );
+    assert_eq!(
+        device["verification_uri"],
+        json!(format!("{ORIGIN}/oauth/device"))
+    );
+    assert_eq!(
+        device["verification_uri_complete"],
+        json!(format!("{ORIGIN}/oauth/device?user_code={user_code}"))
+    );
+    assert_eq!(device["expires_in"], json!(600));
+    assert_eq!(device["interval"], json!(5));
+    let device_code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    assert!(
+        !rig.journal().contains(&device_code),
+        "no device code in the journal"
+    );
+
+    // Nobody approved yet: the agent is told to keep waiting.
+    let waiting = rig.poll(&client, &device_code);
+    assert_eq!(waiting.status, 400, "{}", waiting.text());
+    assert_eq!(error_of(&waiting), "authorization_pending");
+
+    // The link alone opens a page where the person types the code.
+    let entry = rig.get("/oauth/device");
+    assert_eq!(entry.status, 200, "{}", entry.text());
+    assert!(
+        entry.text().contains("name=\"user_code\""),
+        "{}",
+        entry.text()
+    );
+    // The full link, or the code typed in lower case without its dash, opens the consent page for it.
+    let typed = rig.get(&format!(
+        "/oauth/device?user_code={}",
+        user_code.replace('-', "").to_lowercase()
+    ));
+    assert_eq!(
+        Rig::request_id(&typed),
+        Rig::request_id(
+            &rig.get(&on_origin(
+                device["verification_uri_complete"]
+                    .as_str()
+                    .expect("a link")
+            ))
+        )
+    );
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    let text = page.text();
+    assert!(text.contains("Codex in a container"), "the name is shown");
+    assert!(
+        text.contains(&user_code),
+        "the code is shown, to match with the agent's"
+    );
+    assert!(text.contains("<strong id=\"scope\">doctor</strong>"));
+    assert!(text.contains("another device"), "{text}");
+    assert!(
+        text.contains("id=\"device-note\""),
+        "the warning not to approve a code someone sent: {text}"
+    );
+    assert!(
+        !text.contains("redirect-host"),
+        "a device request has no redirect"
+    );
+
+    // The passkey approves; the page answers with words, not a redirect.
+    rig.advance(5_000);
+    let approved = rig.approve_with(&key, &Rig::request_id(&page));
+    assert_eq!(approved.status, 200, "{}", approved.text());
+    assert!(
+        approved.json().get("redirect").is_none(),
+        "{}",
+        approved.text()
+    );
+    assert!(
+        approved.json()["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("app"))
+    );
+
+    // The next poll gets the tokens, at the scope approved, and they call MCP with it.
+    let reply = rig.poll(&client, &device_code);
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(reply.header("cache-control").as_deref(), Some("no-store"));
+    let body = reply.json();
+    assert_eq!(body["token_type"], json!("Bearer"));
+    assert_eq!(body["scope"], json!("doctor"));
+    let access = body["access_token"].as_str().expect("access").to_string();
+    let refresh = body["refresh_token"].as_str().expect("refresh").to_string();
+    assert!(
+        rig.tools(&access).contains(&"service_remove".to_string()),
+        "a doctor verb"
+    );
+    // The device code works once.
+    rig.advance(5_000);
+    let again = rig.poll(&client, &device_code);
+    assert_eq!(error_of(&again), "invalid_grant", "{}", again.text());
+    // It refreshes like any grant.
+    let renewed = rig.refresh(&client, &refresh, None);
+    assert_eq!(renewed.status, 200, "{}", renewed.text());
+    // The journal says it was granted to a device, by the passkey, with no secret.
+    let journal = rig.journal();
+    assert!(journal.contains("\"event\":\"granted\""), "{journal}");
+    assert!(journal.contains("\"device\":true"), "{journal}");
+    for secret in [&access, &refresh, &device_code] {
+        assert!(!journal.contains(secret.as_str()));
+    }
+}
+
+#[test]
+fn a_device_viewer_is_stepped_up_by_asking_again_with_the_scope_the_door_names() {
+    let (rig, key) = Rig::new("oauth-device-step-up");
+    let client = rig.device_client("Claude on a server");
+    let connect = |scope: &str| {
+        let device = rig.device_code(&client, scope);
+        let page = rig.get(&on_origin(
+            device["verification_uri_complete"]
+                .as_str()
+                .expect("a link"),
+        ));
+        let approved = rig.approve_with(&key, &Rig::request_id(&page));
+        assert_eq!(approved.status, 200, "{}", approved.text());
+        let reply = rig.poll(
+            &client,
+            device["device_code"].as_str().expect("a device code"),
+        );
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        reply.json()["access_token"]
+            .as_str()
+            .expect("access")
+            .to_string()
+    };
+    let viewer = connect("viewer");
+    let call = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "service_remove", "arguments": { "name": "nats" } } });
+    let refused = rig.mcp(Some(&viewer), call.clone());
+    assert_eq!(refused.status, 403);
+    assert!(
+        refused
+            .header("www-authenticate")
+            .is_some_and(|c| c.starts_with("Bearer error=\"insufficient_scope\", scope=\"doctor\"")),
+        "{:?}",
+        refused.header("www-authenticate")
+    );
+    let doctor = connect("doctor");
+    assert_ne!(rig.mcp(Some(&doctor), call).status, 403);
+}
+
+#[test]
+fn a_device_code_polled_too_fast_slows_down_and_a_no_or_the_clock_ends_it() {
+    let (rig, key) = Rig::new("oauth-device-poll");
+    let _ = key;
+    let client = rig.device_client("Codex");
+    let device = rig.device_code(&client, "viewer");
+    let code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    assert_eq!(error_of(&rig.poll(&client, &code)), "authorization_pending");
+    // Again at once, under the interval: slow down, and the interval grows by five seconds (RFC 8628 3.5).
+    assert_eq!(error_of(&rig.poll(&client, &code)), "slow_down");
+    rig.advance(5_000);
+    assert_eq!(
+        error_of(&rig.poll(&client, &code)),
+        "slow_down",
+        "the interval is ten seconds now"
+    );
+    rig.advance(10_000);
+    assert_eq!(error_of(&rig.poll(&client, &code)), "authorization_pending");
+    // The person says no on the page: the agent is told access_denied, once.
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    let denied = rig.page_post(
+        "/oauth/authorize/deny",
+        json!({ "id": Rig::request_id(&page) }),
+    );
+    assert_eq!(denied.status, 200, "{}", denied.text());
+    assert!(denied.json().get("redirect").is_none(), "{}", denied.text());
+    // Decided, its link opens no consent page any more.
+    let decided = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    assert_eq!(decided.status, 404, "{}", decided.text());
+    rig.advance(10_000);
+    assert_eq!(error_of(&rig.poll(&client, &code)), "access_denied");
+    rig.advance(10_000);
+    assert_eq!(error_of(&rig.poll(&client, &code)), "invalid_grant");
+    assert!(rig.journal().contains("\"event\":\"denied\""));
+    // Ten minutes on, a device code nobody approved has expired, and its link opens no consent page.
+    let late = rig.device_code(&client, "viewer");
+    rig.advance(600_000);
+    let expired = rig.poll(
+        &client,
+        late["device_code"].as_str().expect("a device code"),
+    );
+    assert_eq!(error_of(&expired), "expired_token", "{}", expired.text());
+    let gone = rig.get(&on_origin(
+        late["verification_uri_complete"].as_str().expect("a link"),
+    ));
+    assert_eq!(gone.status, 404, "{}", gone.text());
+    assert!(!gone.text().contains("data-request"));
+}
+
+#[test]
+fn a_device_request_is_checked_like_a_consent_request_and_its_code_is_bound_to_its_client() {
+    let (rig, key) = Rig::new("oauth-device-checks");
+    let client = rig.device_client("Codex");
+    let other = rig.device_client("Another agent");
+    let resource = format!("{ORIGIN}/mcp");
+    let refused = |pairs: &[(&str, &str)]| error_of(&rig.device_authorization(pairs));
+    assert_eq!(
+        refused(&[("client_id", "mcpc-unknown"), ("scope", "viewer")]),
+        "invalid_client"
+    );
+    assert_eq!(
+        refused(&[("client_id", &client), ("scope", "admin")]),
+        "invalid_scope"
+    );
+    assert_eq!(
+        refused(&[
+            ("client_id", &client),
+            ("scope", "viewer"),
+            ("resource", "https://elsewhere.example.com/mcp")
+        ]),
+        "invalid_target"
+    );
+    // No scope means viewer, as on the consent page; no resource means this node's.
+    let plain = rig.device_authorization(&[("client_id", &client)]);
+    assert_eq!(plain.status, 200, "{}", plain.text());
+    // A device code polled by another client is refused, and stays its client's.
+    let device = rig.device_code(&client, "viewer");
+    let code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    let approved = rig.approve_with(&key, &Rig::request_id(&page));
+    assert_eq!(approved.status, 200, "{}", approved.text());
+    assert_eq!(error_of(&rig.poll(&other, &code)), "invalid_grant");
+    assert_eq!(rig.poll(&client, &code).status, 200);
+    // A code nobody issued opens no consent page.
+    let unknown = rig.get("/oauth/device?user_code=BCDF-GHJK");
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
+    // A client with neither a redirect nor the device grant is still refused at registration.
+    let bare = rig.send(
+        "POST",
+        "/oauth/register",
+        &[],
+        "application/json",
+        json!({ "client_name": "Nothing", "token_endpoint_auth_method": "none" })
+            .to_string()
+            .as_bytes(),
+    );
+    assert_eq!(bare.status, 400, "{}", bare.text());
+    // A device-only client has no redirect, so the code flow never sends anything anywhere for it.
+    let code_flow = rig.authorize(&client, &[("redirect_uri", None)]);
+    assert!(
+        !code_flow.text().contains("data-request"),
+        "{}",
+        code_flow.text()
+    );
+    let _ = resource;
+}
+
+#[test]
+fn the_metadata_names_the_device_endpoint_and_grant() {
+    let (rig, _key) = Rig::new("oauth-device-metadata");
+    let metadata = rig.get("/.well-known/oauth-authorization-server").json();
+    assert_eq!(
+        metadata["device_authorization_endpoint"],
+        json!(format!("{ORIGIN}/oauth/device_authorization"))
+    );
+    let grants = metadata["grant_types_supported"]
+        .as_array()
+        .expect("grant types");
+    assert!(grants.contains(&json!(DEVICE_GRANT)), "{grants:?}");
+    assert!(
+        grants.contains(&json!("authorization_code")),
+        "the code flow stays"
+    );
+}
+
+#[test]
+fn device_codes_are_bounded_even_when_each_request_is_denied_at_once() {
+    let (rig, _key) = Rig::new("oauth-device-bound");
+    let client = rig.device_client("Churn");
+    for _ in 0..50 {
+        rig.device_code(&client, "viewer");
+    }
+    let refused = rig.device_authorization(&[("client_id", &client)]);
+    assert_eq!(refused.status, 429, "{}", refused.text());
+    assert_eq!(error_of(&refused), "temporarily_unavailable");
+    // The requests lapse; a loop that denies each new one at once frees its request, and still meets a bound on the
+    // device codes it leaves behind.
+    rig.advance(600_001);
+    let mut taken = 0;
+    let mut bounded = None;
+    for _ in 0..200 {
+        let reply = rig.device_authorization(&[("client_id", &client)]);
+        if reply.status == 429 {
+            bounded = Some(error_of(&reply));
+            break;
+        }
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        taken += 1;
+        let page = rig.get(&on_origin(
+            reply.json()["verification_uri_complete"]
+                .as_str()
+                .expect("a link"),
+        ));
+        let denied = rig.page_post(
+            "/oauth/authorize/deny",
+            json!({ "id": Rig::request_id(&page) }),
+        );
+        assert_eq!(denied.status, 200, "{}", denied.text());
+    }
+    assert_eq!(
+        bounded.as_deref(),
+        Some("temporarily_unavailable"),
+        "refused after {taken}"
+    );
+    assert!(taken <= 50, "{taken} device codes past the first fifty");
+    // Once the held ones are swept, device codes are given again.
+    rig.advance(20 * 60 * 1000);
+    assert_eq!(
+        rig.device_authorization(&[("client_id", &client)]).status,
+        200
+    );
+}
+
+#[test]
+fn a_client_registered_for_its_redirect_alone_cannot_start_a_device_flow() {
+    let (rig, _key) = Rig::new("oauth-device-code-only");
+    let desktop = rig.client("Claude Desktop");
+    let refused = rig.device_authorization(&[("client_id", &desktop), ("scope", "operator")]);
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    assert_eq!(error_of(&refused), "unauthorized_client");
+    // One that registered both may use both.
+    let both = rig.send(
+        "POST",
+        "/oauth/register",
+        &[],
+        "application/json",
+        json!({ "client_name": "Both", "redirect_uris": [REDIRECT], "grant_types": ["authorization_code", DEVICE_GRANT, "refresh_token"], "token_endpoint_auth_method": "none" })
+            .to_string()
+            .as_bytes(),
+    );
+    assert_eq!(both.status, 201, "{}", both.text());
+    let body = both.json();
+    assert_eq!(
+        body["grant_types"],
+        json!(["authorization_code", DEVICE_GRANT, "refresh_token"])
+    );
+    let id = body["client_id"].as_str().expect("a client id").to_string();
+    assert_eq!(rig.device_authorization(&[("client_id", &id)]).status, 200);
+    assert!(rig.authorize(&id, &[]).text().contains("data-request"));
+    // The grant types survive a restart of the store: the reopened store still starts a device flow for a device
+    // client, and still refuses one to the client that registered its redirect alone.
+    let agent = rig.device_client("Agent on a server");
+    let socket = rig.serve_reopened("reopened.sock");
+    let start = |client: &str| {
+        send_on(
+            &socket,
+            "POST",
+            "/oauth/device_authorization",
+            &[],
+            "application/x-www-form-urlencoded",
+            form(&[("client_id", client), ("scope", "viewer")]).as_bytes(),
+        )
+    };
+    let started = start(&agent);
+    assert_eq!(started.status, 200, "{}", started.text());
+    assert!(
+        started.json()["device_code"].is_string(),
+        "{}",
+        started.text()
+    );
+    let refused = start(&desktop);
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    assert_eq!(error_of(&refused), "unauthorized_client");
+}
+
+#[test]
+fn the_passkey_statement_of_a_device_request_binds_its_user_code() {
+    let (rig, _key) = Rig::new("oauth-device-binds");
+    let client = rig.device_client("Bound");
+    let device = rig.device_code(&client, "doctor");
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    let id = Rig::request_id(&page);
+    let begun = rig.page_post("/oauth/authorize/begin", json!({ "id": id }));
+    assert_eq!(begun.status, 200, "{}", begun.text());
+    let statement: Value =
+        serde_json::from_str(begun.json()["statement"].as_str().expect("a statement"))
+            .expect("json");
+    let bound = json!({
+        "request": id, "client": client, "name": "Bound", "redirectUri": "", "scope": "doctor",
+        "resource": format!("{ORIGIN}/mcp"), "codeChallenge": "", "userCode": device["user_code"],
+    });
+    assert_eq!(statement["action"], json!("mcp_authorize"));
+    assert_eq!(statement["target"], json!(client));
+    assert_eq!(
+        statement["paramsDigest"],
+        json!(arca_kernel::canon::params_digest(&bound).expect("digest"))
+    );
+}
+
+#[test]
+fn a_revoked_clients_waiting_device_code_ends_at_once() {
+    let (rig, _key) = Rig::new("oauth-device-revoked");
+    let client = rig.device_client("Gone");
+    let kept = rig.device_client("Kept");
+    let device = rig.device_code(&client, "viewer");
+    let code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    let kept_code = rig.device_code(&kept, "viewer")["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    assert_eq!(error_of(&rig.poll(&client, &code)), "authorization_pending");
+    rig.oauth.revoke_client(&client, "test").expect("revoked");
+    rig.advance(5_000);
+    assert_eq!(error_of(&rig.poll(&client, &code)), "invalid_grant");
+    // Only that client's codes end: another client's waiting code still waits.
+    assert_eq!(
+        error_of(&rig.poll(&kept, &kept_code)),
+        "authorization_pending"
+    );
+}
+
+#[test]
+fn a_device_grant_with_approvals_is_the_owners_session_as_the_code_flows_is() {
+    let (rig, key) = Rig::new("oauth-device-approvals");
+    let client = rig.device_client("Codex on a server");
+    let device = rig.device_code(&client, "viewer approvals");
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    // The device consent page says it plainly, as the code flow's does.
+    let text = page.text();
+    assert!(text.contains("id=\"approvals\""), "{text}");
+    assert!(
+        text.contains("It also asks to be your signed-in session for approvals."),
+        "{text}"
+    );
+    assert!(
+        text.contains("<strong id=\"scope\">viewer approvals</strong>"),
+        "{text}"
+    );
+    assert!(text.contains("id=\"device-note\""), "{text}");
+    let approved = rig.approve_with(&key, &Rig::request_id(&page));
+    assert_eq!(approved.status, 200, "{}", approved.text());
+    let granted = rig
+        .journal()
+        .lines()
+        .find(|line| line.contains("\"event\":\"granted\""))
+        .expect("a granted line")
+        .to_string();
+    assert!(
+        granted.contains("\"device\":true") && granted.contains("\"scope\":\"viewer approvals\""),
+        "{granted}"
+    );
+    // The agent polls a little later: the passkey still counts from the moment it approved.
+    rig.advance(10_000);
+    let reply = rig.poll(
+        &client,
+        device["device_code"].as_str().expect("a device code"),
+    );
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(reply.json()["scope"], json!("viewer approvals"));
+    let session = rig.caller(reply.json()["access_token"].as_str().expect("access"));
+    assert!(matches!(rig.oauth.session(&session), Session::Ready { .. }));
+    assert!(
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .owner_session_live(rig.now())
+    );
+    // Twelve hours after the passkey (not after the poll), it is asked to step up, as the code flow's is.
+    rig.advance(STEP_UP_MS - 10_000);
+    assert!(matches!(
+        rig.oauth.session(&session),
+        Session::StepUp { .. }
+    ));
 }

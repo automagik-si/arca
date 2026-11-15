@@ -35,8 +35,8 @@ pub const ACTION_PROPOSALS_FILE: &str = "action-proposals.jsonl";
 /// How many unexpired action proposals may wait at once. A ninth is refused.
 pub const MAX_WAITING: usize = 8;
 
-/// How long after it was made a proposal may be held open for the owner's signed-in session: a day. After that it lapses
-/// as any other, after its last fifteen minutes, so undecided plans never keep the queue full for good.
+/// How long after it was made a proposal may be held open for the owner's signed-in session: a day. A held proposal lapses
+/// a day after it was made at the latest, so undecided plans never keep the queue full for good.
 pub const HOLD_MAX_MS: u64 = 24 * 60 * 60 * 1000;
 /// How many accepted proposals one token may make in [`PROPOSAL_RATE_WINDOW_MS`].
 pub const PROPOSAL_RATE_MAX: usize = 30;
@@ -1814,8 +1814,9 @@ impl ActionProposalStore {
 
     /// Keeps every waiting proposal the owner's signed-in session may approve ([`ActionProposal::for_session`]) open for
     /// another [`PLAN_TTL_MS`] from `now` once less than half of it is left, never past [`HOLD_MAX_MS`] after it was made:
-    /// that session is connected and will be asked. The journal is rewritten only when one moved. Answers how
-    /// many moved.
+    /// that session is connected and will be asked. The move is kept in memory alone: the journal is not rewritten, so
+    /// its approved, declined and result lines stay until the journal is compacted at open or past [`MAX_COMPACT_BYTES`].
+    /// After a restart, a held proposal counts from the expiry it was journalled with. Answers how many moved.
     pub fn hold(&mut self, now: u64) -> usize {
         let mut moved = 0;
         for proposal in &mut self.waiting {
@@ -1831,9 +1832,6 @@ impl ActionProposalStore {
                 proposal.expires_at = until;
                 moved += 1;
             }
-        }
-        if moved > 0 {
-            self.compact();
         }
         moved
     }
@@ -2483,6 +2481,33 @@ mod tests {
                     .starts_with("action-proposals.jsonl.bad-")
             });
         assert!(quarantined, "the large file was quarantined");
+    }
+
+    #[test]
+    fn a_decline_line_survives_a_hold_tick() {
+        let dir = Temp::new("hold-keeps-lines");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let declined = store
+            .propose(ActionKind::ServiceCreate, create_args("no"), 1_000, None)
+            .expect("the declined proposal");
+        let held = store
+            .propose(ActionKind::ServiceCreate, create_args("held"), 1_000, None)
+            .expect("the held proposal");
+        store
+            .decline_noting(&declined.id, "in the owner's signed-in session")
+            .expect("the decline")
+            .expect("it was waiting");
+        // Less than half of the fifteen minutes is left: the session's hold moves the other one forward.
+        let now = 1_000 + PLAN_TTL_MS / 2 + 1;
+        assert_eq!(store.hold(now), 1);
+        assert_eq!(store.waiting()[0].id, held.id);
+        assert!(store.waiting()[0].expires_at > held.expires_at);
+        let text = fs::read_to_string(dir.0.join(ACTION_PROPOSALS_FILE)).expect("the journal");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("\"declined\"") && line.contains(&declined.id)),
+            "the decline is still journalled after the hold tick: {text}"
+        );
     }
 
     #[test]
