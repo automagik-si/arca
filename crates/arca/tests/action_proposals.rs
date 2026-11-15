@@ -555,11 +555,37 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                         "timeoutSeconds",
                         "eraseData",
                         "noNewPrivileges",
+                        "withTemplate",
+                        "changes",
                         "tenant"
                     ]
                     .contains(&field.as_str())),
                 "the schema has a field the card does not show"
             );
+            // With its template, the card also shows every template change and the one interruption.
+            let mut with = prepared.clone();
+            with["withTemplate"] = json!(true);
+            with["changes"] = json!({
+                "environment": [{ "key": "MODE", "change": "added", "value": "two" }],
+                "entrypoint": { "to": "/bin/sh -ec 'cd \"$HOME\"'", "from": "" }
+            });
+            let rows = action.details(&with);
+            let shown: Vec<(&str, &str)> = rows
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(shown.len(), 9, "{shown:?}");
+            let value = |label: &str| {
+                shown
+                    .iter()
+                    .find(|row| row.0 == label)
+                    .unwrap_or_else(|| panic!("the card lacks {label}: {shown:?}"))
+                    .1
+            };
+            assert!(value("Template changes").contains("its entrypoint"));
+            assert_eq!(value("Env MODE"), "added: two");
+            assert!(value("Entrypoint").contains("cd \"$HOME\""));
+            assert!(value("Effect").contains("starts it once"));
             continue;
         }
         if matches!(action, ActionKind::RouteAdd | ActionKind::RouteRemove) {
