@@ -45,6 +45,7 @@ pub mod gpu;
 pub mod guest_secrets;
 pub mod handlers;
 pub mod host_network;
+pub mod image_version;
 pub mod kernel;
 pub mod lifecycle;
 pub mod linked;

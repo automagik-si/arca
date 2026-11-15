@@ -168,6 +168,65 @@ pub fn source_with(source: &Value, digest: &str, pinned_alias: Option<&str>) -> 
     Some(json!({ "type": "image", "alias": alias, "fingerprint": hex }))
 }
 
+/// The template a `service_create` makes its service from when the call names `digest`: the same template at that
+/// digest of its own repository, by the very rule an update moves a service by ([`source_with`] over the template's
+/// own source, after [`digest_ok`]), so a create can only name another build of the template's image. The digest is
+/// passed to Incus untouched: a multi-arch index digest stays the index's, and each node pulls its own architecture.
+/// Without `digest`, the template as it is. A digest of any other shape, or one given with a template that is not an
+/// OCI image, is an invalid argument.
+pub(super) fn template_at(
+    template: &crate::service::Template,
+    digest: Option<&Value>,
+) -> Result<crate::service::Template, CallError> {
+    // RED: the digest is not applied yet.
+    #[allow(unreachable_code)]
+    if digest.is_some() || digest.is_none() {
+        return Ok(template.clone());
+    }
+    let Some(digest) = digest else {
+        return Ok(template.clone());
+    };
+    if template.kind != "oci" {
+        return Err(CallError::Invalid(format!(
+            "digest: template {} is not an OCI image by digest, so a create from it names no digest",
+            template.name
+        )));
+    }
+    let moved = digest
+        .as_str()
+        .filter(|digest| digest_ok(digest))
+        .and_then(|digest| {
+            let source = crate::service::source(template).ok()?;
+            source_with(&source, digest, None).map(|_| digest)
+        })
+        .ok_or_else(|| {
+            CallError::Invalid(
+                "digest: expected sha256: and 64 lower-case hex digits, the digest of another build of the template's own image"
+                    .into(),
+            )
+        })?;
+    let mut at = template.clone();
+    at.digest = Some(moved.to_string());
+    Ok(at)
+}
+
+/// The image (`<registry>/<repository>`) of the OCI service a `service_update` proposal names, for the card's version
+/// lookup. `None` for any other service, or a name no service has.
+pub(super) fn proposed_image(cfg: &NodeConfig, entries: &[Entry], payload: &Value) -> Option<String> {
+    let name = payload["name"].as_str()?;
+    let scope = tenants::tenant_arg(cfg, payload, entries).ok()?;
+    let scoped = tenants::scoped_entries(entries, scope.as_ref());
+    let (_, config) = service_entries(&scoped)
+        .into_iter()
+        .find(|(_, config)| config.name == name)?;
+    if config.source["protocol"] != "oci" {
+        return None;
+    }
+    let host = config.source["server"].as_str()?.strip_prefix("https://")?;
+    let (repository, _) = config.source["alias"].as_str()?.rsplit_once("@sha256:")?;
+    Some(format!("{host}/{repository}"))
+}
+
 /// The source an update to `digest` gives the service `config`: the OCI source with its digest replaced, or the local
 /// pinned source with the new fingerprint and the installed template's alias when that template pins the same
 /// fingerprint. `None` when the service's own source is neither kind.

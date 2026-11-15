@@ -347,6 +347,20 @@ impl Kernel {
             .propose_using(action, args, now_ms, gpu_product, uses)
     }
 
+    /// The same, with the card's `Version` row ([`ActionProposalStore::propose_labelled`]).
+    pub fn propose_action_labelled(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now_ms: u64,
+        gpu_product: Option<&str>,
+        uses: Option<String>,
+        version: Option<crate::action_proposal::ActionDetail>,
+    ) -> Result<ActionProposal, ProposeError> {
+        self.action_proposals
+            .propose_labelled(action, args, now_ms, gpu_product, uses, version)
+    }
+
     /// Declines one waiting action proposal, whatever its age. Returns whether one waited under `id`.
     pub fn decline_action(&mut self, id: &str) -> Result<bool, KernelError> {
         self.action_proposals

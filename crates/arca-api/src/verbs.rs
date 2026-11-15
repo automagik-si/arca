@@ -4418,6 +4418,11 @@ fn service_create_params_base() -> Value {
                 "minLength": 1,
                 "type": "string"
             },
+            "digest": {
+                "description": "Only for a template of an OCI image by digest: create the service from this build of the template's own image instead of the digest the template pins: sha256: and 64 lower-case hex digits, the service keeping the template's repository, as service_update moves one. A multi-arch index digest is passed to Incus as it is, so each node pulls its own architecture. Left out, the template's own digest. A proposal's card shows the image at this digest (and, for Omni's image, the version the registry's tag names it by when it is proposed), and the approval binds it.",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+            },
             "templateDigest": {
                 "description": "Filled in by the node when a create is proposed: SHA-256, in hex, of the template's file and of each script it names, as the node holds them then. The create runs only while the template on the node is still exactly that one. A caller leaves it out; one that states it must state the node's own.",
                 "pattern": "^[0-9a-f]{64}$",

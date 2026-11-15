@@ -1562,6 +1562,36 @@ fn loaded_words(
     stored_summary: &str,
     stored_details: &[ActionDetail],
 ) -> (String, Vec<ActionDetail>) {
+    // The card's `Version` row closes it when the proposal named one: a label read from the registry when it was made,
+    // kept when it is a row [`crate::image_version`] writes for this proposal's digest, and dropped otherwise.
+    if let Some((last, rest)) = stored_details.split_last()
+        && last.label == crate::image_version::ROW_LABEL
+    {
+        let (summary, mut details) = loaded_rows(action, args, stored_summary, rest);
+        if version_row_fits(action, args, last) {
+            details.push(last.clone());
+        }
+        return (summary, details);
+    }
+    loaded_rows(action, args, stored_summary, stored_details)
+}
+
+/// Whether `row` is a `Version` row for this proposal: a create or an update that names a digest, with the words
+/// [`crate::image_version`] writes for that digest.
+fn version_row_fits(action: ActionKind, args: &Value, row: &ActionDetail) -> bool {
+    matches!(action, ActionKind::ServiceCreate | ActionKind::ServiceUpdate)
+        && row.label == crate::image_version::ROW_LABEL
+        && args["digest"]
+            .as_str()
+            .is_some_and(|digest| crate::image_version::row_fits(&row.value, digest))
+}
+
+fn loaded_rows(
+    action: ActionKind,
+    args: &Value,
+    stored_summary: &str,
+    stored_details: &[ActionDetail],
+) -> (String, Vec<ActionDetail>) {
     // The parts of a deploy's removal were read from the desired state when it was proposed, and are not in its
     // arguments either: the journal's own rows are kept when they are the rows this action writes for these arguments.
     if action == ActionKind::DeployRemove {
@@ -1766,6 +1796,21 @@ impl ActionProposalStore {
         gpu_product: Option<&str>,
         uses: Option<String>,
     ) -> Result<ActionProposal, ProposeError> {
+        self.propose_labelled(action, args, now, gpu_product, uses, None)
+    }
+
+    /// The same, with the card's `Version` row for a create or an update that names a digest
+    /// ([`crate::image_version`]): a label read when the proposal is made, kept with the proposal's rows and no part of
+    /// its arguments, so the args digest the owner signs is the same with it or without it.
+    pub fn propose_labelled(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now: u64,
+        gpu_product: Option<&str>,
+        uses: Option<String>,
+        version: Option<ActionDetail>,
+    ) -> Result<ActionProposal, ProposeError> {
         self.waiting.retain(|proposal| !proposal.expired(now));
         let digest = action_args_digest(action.as_str(), &args).ok_or_else(|| {
             ProposeError::Store(io::Error::other("arguments do not canonicalize"))
@@ -1788,7 +1833,11 @@ impl ActionProposalStore {
             id,
             action: action.as_str().to_string(),
             summary: action.summary_with(&args, gpu_product),
-            details: action.details_with_gpu(&args, gpu_product),
+            details: {
+                let mut details = action.details_with_gpu(&args, gpu_product);
+                details.extend(version.filter(|row| version_row_fits(action, &args, row)));
+                details
+            },
             uses: uses
                 .filter(|_| action.says_uses())
                 .map(|words| shown(&words, USES_MAX)),
