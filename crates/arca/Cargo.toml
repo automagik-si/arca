@@ -30,6 +30,7 @@ arca-reconcile.workspace = true
 arca-runners.workspace = true
 arca-store.workspace = true
 arca-watch.workspace = true
+arca-vmimport.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rsa.workspace = true

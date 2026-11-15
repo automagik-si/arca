@@ -1,0 +1,16 @@
+<VM>
+  <ID>12</ID>
+  <NAME>archive</NAME>
+  <STATE>2</STATE>
+  <TEMPLATE>
+    <DISK>
+      <DISK_ID><![CDATA[0]]></DISK_ID>
+      <IMAGE_ID><![CDATA[15]]></IMAGE_ID>
+      <SIZE><![CDATA[12288]]></SIZE>
+      <SOURCE><![CDATA[src-pool/archive-d0]]></SOURCE>
+      <TM_MAD><![CDATA[ceph]]></TM_MAD>
+    </DISK>
+    <MEMORY><![CDATA[4096]]></MEMORY>
+    <VCPU><![CDATA[2]]></VCPU>
+  </TEMPLATE>
+</VM>

@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`instance_import` moves one virtual machine from an outside hypervisor (the `onevm show -x` XML, passed in by
+the operator) into Incus behind one owner card: the same CPUs, memory, firmware, disks and MACs, the source's
+security groups as an Incus network ACL, a cloud-init seed from its context, a full sparse disk copy from the source
+Ceph pool (read-only) into the Incus Ceph pool, and a read-back after the start. `instance_import_undo` stops and
+removes an imported VM; the source is never written. A node needs `kernel.instanceImport` for either.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and

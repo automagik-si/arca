@@ -358,6 +358,32 @@ pub struct KernelConfig {
     /// the address and the port.
     #[serde(default)]
     pub service_listen_addresses: Vec<String>,
+    /// Moving virtual machines in from an outside hypervisor (`instance_import`): the Ceph pool their disks are in and the
+    /// Ceph client that reads it. Absent, the node refuses `instance_import` when it is proposed.
+    #[serde(default)]
+    pub instance_import: Option<InstanceImportConfig>,
+}
+
+/// The `kernel.instanceImport` key. `sourcePool` is the one Ceph pool an import reads disks from; `cephClient` (default
+/// `arca-import`) is the Ceph client, without its `client.` prefix, that reads it, read-only; `cephCluster` (default
+/// `ceph`) is the cluster both the source pool and the node's Incus Ceph pool are on. The client's keyring is at
+/// `/etc/ceph/<cephCluster>.client.<cephClient>.keyring`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstanceImportConfig {
+    pub source_pool: String,
+    #[serde(default = "default_import_client")]
+    pub ceph_client: String,
+    #[serde(default = "default_import_cluster")]
+    pub ceph_cluster: String,
+}
+
+fn default_import_client() -> String {
+    "arca-import".to_string()
+}
+
+fn default_import_cluster() -> String {
+    "ceph".to_string()
 }
 
 impl KernelConfig {
@@ -542,6 +568,8 @@ pub enum ConfigError {
     ImportServices(&'static str),
     /// The `kernel.tenants` key breaks a rule. The text names the rule, never a value.
     Tenants(&'static str),
+    /// The `kernel.instanceImport` key breaks a rule. The text names the rule, never a value.
+    InstanceImport(&'static str),
     /// The `kernel.serviceDestinations` list breaks a rule. The text names the rule, never a value.
     ServiceDestinations(&'static str),
     /// The `kernel.serviceListenAddresses` list breaks a rule. The text names the rule, never a value.
@@ -588,6 +616,7 @@ impl fmt::Display for ConfigError {
             Self::Approval(why) => write!(f, "approval is refused: {why}"),
             Self::Bridged(why) => write!(f, "kernel.bridged is refused: {why}"),
             Self::ImportServices(why) => write!(f, "kernel.importServices is refused: {why}"),
+            Self::InstanceImport(why) => write!(f, "kernel.instanceImport is refused: {why}"),
             Self::Tenants(why) => write!(f, "kernel.tenants is refused: {why}"),
             Self::ServiceDestinations(why) => {
                 write!(f, "kernel.serviceDestinations is refused: {why}")
@@ -716,6 +745,7 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     check_adopt(kernel)?;
     check_bridged(kernel)?;
     check_import_services(kernel)?;
+    check_instance_import(kernel)?;
     check_tenants(kernel)?;
     check_service_destinations(kernel)?;
     check_service_listen_addresses(kernel)?;
@@ -997,6 +1027,29 @@ fn check_bridged(kernel: &KernelConfig) -> Result<(), ConfigError> {
 /// The import rules: each entry names a service by a service name, a project that `droiddProjects` lists, and an IPv4 /24;
 /// no name is listed twice; and the node has a service network of its own (a managed or a mixed node, never a bridged
 /// one) and is not a scratch run.
+fn check_instance_import(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    let Some(import) = &kernel.instance_import else {
+        return Ok(());
+    };
+    let ceph = |name: &str| arca_vmimport::source::ceph_name_ok(name);
+    if !ceph(&import.source_pool) {
+        return Err(ConfigError::InstanceImport(
+            "sourcePool is not a Ceph pool name",
+        ));
+    }
+    if !ceph(&import.ceph_client) || import.ceph_client.starts_with("client.") {
+        return Err(ConfigError::InstanceImport(
+            "cephClient is not a Ceph client name without its client. prefix",
+        ));
+    }
+    if !ceph(&import.ceph_cluster) {
+        return Err(ConfigError::InstanceImport(
+            "cephCluster is not a Ceph cluster name",
+        ));
+    }
+    Ok(())
+}
+
 fn check_import_services(kernel: &KernelConfig) -> Result<(), ConfigError> {
     if kernel.import_services.is_empty() {
         return Ok(());
@@ -1862,6 +1915,37 @@ mod tests {
             serde_json::from_value(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
         check(&config)?;
         Ok(config)
+    }
+
+    #[test]
+    fn the_instance_import_key_is_absent_by_default_and_has_defaults() {
+        use serde_json::json;
+        assert!(
+            importing(json!({}))
+                .expect("no key")
+                .kernel
+                .instance_import
+                .is_none()
+        );
+        let set =
+            importing(json!({ "instanceImport": { "sourcePool": "src-pool" } })).expect("a pool");
+        let import = set.kernel.instance_import.expect("the key");
+        assert_eq!(
+            (
+                import.source_pool.as_str(),
+                import.ceph_client.as_str(),
+                import.ceph_cluster.as_str()
+            ),
+            ("src-pool", "arca-import", "ceph")
+        );
+        for bad in [
+            json!({ "sourcePool": "src pool" }),
+            json!({ "sourcePool": "src-pool", "cephClient": "client.arca" }),
+            json!({ "sourcePool": "src-pool", "cephCluster": "--id" }),
+            json!({ "sourcePool": "src-pool", "unknown": 1 }),
+        ] {
+            assert!(importing(json!({ "instanceImport": bad })).is_err());
+        }
     }
 
     #[test]

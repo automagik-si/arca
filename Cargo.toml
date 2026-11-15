@@ -30,6 +30,7 @@ arca-reconcile = { path = "crates/arca-reconcile" }
 arca-runners = { path = "crates/arca-runners" }
 arca-store = { path = "crates/arca-store" }
 arca-vm = { path = "crates/arca-vm" }
+arca-vmimport = { path = "crates/arca-vmimport" }
 arca-watch = { path = "crates/arca-watch" }
 arca-wit = { path = "crates/arca-wit" }
 axum = "=0.8.9"
@@ -53,6 +54,8 @@ webpki-roots = "=1.0.11"
 # it alone reads (crates/arca/src/github_api.rs).
 rsa = { version = "=0.9.10", default-features = false, features = ["std", "u64_digit"] }
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
+# The outside hypervisor's VM description (instance_import). In the lock already through plist (iroh).
+quick-xml = "=0.42.0"
 # SQLite is compiled from its bundled source, so the static musl build needs no system library.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 # The browser passkey test's TLS front, and the GitHub signer's client config. Both are in the lock already through iroh;
