@@ -1,8 +1,11 @@
-//! The node's own store, `arca.db` in the state directory: the host metric points and the alert event log in one SQLite file.
+//! The node's own store, `arca.db` in the state directory: the host metric rollups and the alert event log in one SQLite
+//! file, and the raw 5-second points in memory beside it.
 //!
 //! The file is in WAL mode with `synchronous=FULL`, so every commit is on disk when it returns, as a journal append is. Every
-//! connection reads its pragmas back and refuses to open unless the journal mode is `wal` and `synchronous` is 2. The sampler
-//! thread is the only writer; every other reader opens [`Store::open_read_only`]. An error text names what failed, never the
+//! connection reads its pragmas back and refuses to open unless the journal mode is `wal` and `synchronous` is 2. The raw
+//! points never reach the file: they live in the writer's ring (see [`raw`]), and the file takes their minute and hour
+//! rollups, one transaction a minute. An alert event is committed in the tick that makes it, as before. The sampler thread
+//! is the only writer; every other reader opens [`Store::open_read_only`]. An error text names what failed, never the
 //! content of a row.
 
 use std::collections::BTreeMap;
@@ -14,7 +17,12 @@ use std::time::Duration;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Row, Transaction, params};
 use serde_json::{Value, json};
 
+mod raw;
 mod rollup;
+
+pub use raw::{RAW_SLOTS, RawWindow};
+
+use raw::RawRing;
 
 /// The store's file name in the state directory.
 pub const DB_FILE: &str = "arca.db";
@@ -46,6 +54,11 @@ const EVENT_COLUMNS: &str = "seq, alert_id, rule, severity, state, labels, value
 pub struct Store {
     conn: Connection,
     path: PathBuf,
+    /// The raw points of the last hour. Only the writer fills it.
+    raw: RawRing,
+    writer: bool,
+    /// When the store was opened, in epoch milliseconds: the ring holds nothing older.
+    opened_ms: u64,
 }
 
 /// A store just opened for writing, with the pragmas it read back.
@@ -207,17 +220,19 @@ impl AlertEvent {
     }
 }
 
-/// What a rollup did: the rows it wrote to each tier, and the rows and events its retention deleted.
+/// What a rollup did: the rows it wrote to each tier, the points and events its retention deleted, and how long it took.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RollupReport {
     /// Minute buckets written to tier 1.
     pub minutes_rolled: u64,
     /// Hour buckets written to tier 2.
     pub hours_rolled: u64,
-    /// Points deleted from any tier.
+    /// Points deleted from any tier: raw points dropped from the ring, and rows deleted from the file.
     pub deleted_points: u64,
     /// Alert events deleted: resolved alerts past their retention, with their firing events.
     pub deleted_events: u64,
+    /// How long the rollup's transaction took to commit, in milliseconds. The checkpoint when an hour closes is not counted.
+    pub commit_ms: u64,
 }
 
 /// A tier of the store: the raw points, the one-minute rollup or the one-hour rollup.
@@ -271,11 +286,21 @@ impl Store {
             return reset_corrupt(state_dir, path, now_ms);
         }
         match open_writer(&path, now_ms) {
-            Ok((conn, pragmas)) => Ok(Opened {
-                store: Store { conn, path },
-                reset: None,
-                pragmas,
-            }),
+            Ok((conn, pragmas)) => {
+                let mut raw = RawRing::default();
+                raw.load(&conn)?;
+                Ok(Opened {
+                    store: Store {
+                        conn,
+                        path,
+                        raw,
+                        writer: true,
+                        opened_ms: now_ms,
+                    },
+                    reset: None,
+                    pragmas,
+                })
+            }
             Err(Failure::Corrupt) => reset_corrupt(state_dir, path, now_ms),
             Err(Failure::Other(error)) => Err(error),
         }
@@ -291,7 +316,13 @@ impl Store {
         conn.pragma_update(None, "synchronous", 2)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         Store::check_pragmas(&conn)?;
-        Ok(Store { conn, path })
+        Ok(Store {
+            conn,
+            path,
+            raw: RawRing::default(),
+            writer: false,
+            opened_ms: 0,
+        })
     }
 
     /// Reads the pragmas of `conn` back, and refuses a connection that is not in WAL mode with `synchronous` 2 (FULL).
@@ -317,8 +348,9 @@ impl Store {
         Ok(pragmas)
     }
 
-    /// Commits one tick in one transaction: the tier-0 points, then the events in order, then the highest `seq`. It returns
-    /// the events' sequence numbers. A firing event's `alert_id` is its own `seq`. A resolve without an `alert_id` takes the
+    /// Takes one tick: the raw points go into the ring, in memory, and the events are committed to the file in one
+    /// transaction, in order, then the highest `seq`. A tick without events writes nothing to the file. It returns the
+    /// events' sequence numbers. A firing event's `alert_id` is its own `seq`. A resolve without an `alert_id` takes the
     /// `seq` of the newest firing event with the same rule and labels in the batch. A point whose value is not finite is
     /// left out.
     pub fn commit_tick(
@@ -327,14 +359,11 @@ impl Store {
         points: &[Point],
         events: &[AlertEvent],
     ) -> Result<Vec<u64>, StoreError> {
-        let tx = self.conn.transaction()?;
-        for point in points.iter().filter(|point| point.value.is_finite()) {
-            let series = series_id(&tx, point)?;
-            tx.prepare_cached(
-                "INSERT OR REPLACE INTO points (tier, at, series_id, avg, min, max) VALUES (0, ?1, ?2, ?3, ?3, ?3)",
-            )?
-            .execute(params![int(at)?, series, point.value])?;
+        self.raw.push(at, points)?;
+        if events.is_empty() {
+            return Ok(Vec::new());
         }
+        let tx = self.conn.transaction()?;
         let mut seqs: Vec<u64> = Vec::with_capacity(events.len());
         for (index, event) in events.iter().enumerate() {
             let labels = labels_text(&event.labels)?;
@@ -423,7 +452,19 @@ impl Store {
         size(&self.path) + size(Path::new(&wal))
     }
 
-    /// The points of `tier` for the series named `name` with `from_ms <= at < to_ms`, oldest first, then by labels.
+    /// The raw points of the series named `name` with `from_ms <= at < to_ms`, from the ring, and in words the part of the
+    /// window the ring cannot answer: the samples from before the store opened, or every sample for a read-only store.
+    pub fn raw(&self, name: &str, from_ms: u64, to_ms: u64) -> RawWindow {
+        RawWindow {
+            points: self.raw.points(name, from_ms, to_ms),
+            missing: self
+                .raw
+                .missing(self.writer, self.opened_ms, from_ms, to_ms),
+        }
+    }
+
+    /// The points of `tier` for the series named `name` with `from_ms <= at < to_ms`, oldest first, then by labels. The raw
+    /// tier is read from the ring; [`Store::raw`] also says what it cannot answer.
     pub fn points(
         &self,
         tier: Tier,
@@ -431,6 +472,9 @@ impl Store {
         from_ms: u64,
         to_ms: u64,
     ) -> Result<Vec<StoredPoint>, StoreError> {
+        if tier == Tier::Raw {
+            return Ok(self.raw.points(name, from_ms, to_ms));
+        }
         let mut stmt = self.conn.prepare_cached(
             "SELECT p.at, s.labels, p.avg, p.min, p.max FROM points p JOIN series s ON s.id = p.series_id
              WHERE p.tier = ?1 AND s.name = ?2 AND p.at >= ?3 AND p.at < ?4 ORDER BY p.at, s.labels",
@@ -525,7 +569,13 @@ fn reset_corrupt(state_dir: &Path, path: PathBuf, now_ms: u64) -> Result<Opened,
         Failure::Corrupt => StoreError::Sqlite("a new store failed its quick check".to_string()),
     })?;
     Ok(Opened {
-        store: Store { conn, path },
+        store: Store {
+            conn,
+            path,
+            raw: RawRing::default(),
+            writer: true,
+            opened_ms: now_ms,
+        },
         reset: Some(suffix),
         pragmas,
     })
@@ -581,18 +631,22 @@ fn migrate(conn: &mut Connection, floor: u64) -> Result<(), StoreError> {
     }
 }
 
-/// The id of the point's series, which is created on its first point.
-fn series_id(tx: &Transaction<'_>, point: &Point) -> Result<i64, StoreError> {
-    let labels = labels_text(&point.labels)?;
+/// The id of the series named `name` with the stored `labels` text, which is created on its first rollup.
+fn series_id(
+    tx: &Transaction<'_>,
+    name: &str,
+    labels: &str,
+    kind: SeriesKind,
+) -> Result<i64, StoreError> {
     let found: Option<i64> = tx
         .prepare_cached("SELECT id FROM series WHERE name = ?1 AND labels = ?2")?
-        .query_row(params![point.name, labels], |row| row.get(0))
+        .query_row(params![name, labels], |row| row.get(0))
         .optional()?;
     if let Some(id) = found {
         return Ok(id);
     }
     tx.prepare_cached("INSERT INTO series (name, labels, kind) VALUES (?1, ?2, ?3)")?
-        .execute(params![point.name, labels, point.kind.as_str()])?;
+        .execute(params![name, labels, kind.as_str()])?;
     Ok(tx.last_insert_rowid())
 }
 

@@ -1,16 +1,20 @@
-//! Rollups and retention. The raw points (tier 0) roll into one-minute buckets (tier 1), and the minute buckets roll into
-//! one-hour buckets (tier 2). A rollup runs in one transaction: it rolls every closed bucket after the mark it last reached,
-//! moves the marks, and only then deletes the rows that are past their retention. A bucket with no data stays a gap.
+//! Rollups and retention. The raw points, in the ring, roll into one-minute buckets (tier 1), and the minute buckets roll
+//! into one-hour buckets (tier 2). A rollup runs in one transaction: it rolls every closed bucket after the mark it last
+//! reached, moves the marks, and only then deletes the rows that are past their retention. A bucket with no data stays a gap.
+//! The ring drops its expired points only once that transaction has committed.
+
+use std::time::Instant;
 
 use rusqlite::{CachedStatement, OptionalExtension, Transaction, params};
 
-use crate::{RollupReport, Store, StoreError, Tier, int, uint};
+use crate::raw::{RAW_KEEP_MS, RawRing};
+use crate::{RollupReport, SeriesKind, Store, StoreError, Tier, int, series_id, uint};
 
 const MINUTE_MS: u64 = 60_000;
 const HOUR_MS: u64 = 3_600_000;
 const DAY_MS: u64 = 24 * HOUR_MS;
-/// How far back each tier keeps its rows, measured from the rollup's `now`. A row exactly this old is kept.
-const RAW_KEEP_MS: u64 = HOUR_MS;
+/// How far back each tier keeps its rows, measured from the rollup's `now`. A row exactly this old is kept. The raw points'
+/// hour is [`RAW_KEEP_MS`].
 const MINUTE_KEEP_MS: u64 = 7 * DAY_MS;
 const HOUR_KEEP_MS: u64 = 90 * DAY_MS;
 /// How long a resolved alert is kept after its resolve. A firing alert is never deleted.
@@ -84,9 +88,11 @@ impl Bucket {
 }
 
 impl Store {
-    /// Rolls every closed minute after `rolled_minute` into tier 1 and every closed hour after `rolled_hour` into tier 2, moves
-    /// both marks, and then deletes the rows that the retention has expired. A bucket is closed when it ends at or before
-    /// `now_ms`. When an hour closes, the WAL is checkpointed with `TRUNCATE` and the free pages are returned.
+    /// Rolls every closed minute after `rolled_minute` from the ring into tier 1 and every closed hour after `rolled_hour`
+    /// into tier 2, moves both marks, and then deletes the rows that the retention has expired, with every raw row an earlier
+    /// release left in the file. A bucket is closed when it ends at or before `now_ms`. Once the transaction has committed,
+    /// the ring drops the points older than an hour. When an hour closes, the WAL is checkpointed with `TRUNCATE` and the
+    /// free pages are returned.
     ///
     /// A gauge's minute is the mean of its raw values, with their min and max. A counter's minute is its last value. An hour
     /// is built from the minutes: a gauge's average is the mean of the minute averages, which is the mean of the raw values
@@ -95,21 +101,17 @@ impl Store {
         let minute_end = now_ms - now_ms % MINUTE_MS;
         let hour_end = now_ms - now_ms % HOUR_MS;
         let mut report = RollupReport::default();
+        let started = Instant::now();
         let tx = self.conn.transaction()?;
 
         let minute_from = match mark(&tx, MINUTE_MARK)? {
             Some(from) => from,
-            None => first_at(&tx, Tier::Raw)?
+            None => self
+                .raw
+                .first_at()
                 .map_or(minute_end, |at| (at - at % MINUTE_MS).min(minute_end)),
         };
-        report.minutes_rolled = roll(
-            &tx,
-            Tier::Raw,
-            Tier::Minute,
-            minute_from,
-            minute_end,
-            MINUTE_MS,
-        )?;
+        report.minutes_rolled = roll_raw(&tx, &self.raw, minute_from, minute_end)?;
         set_mark(&tx, MINUTE_MARK, minute_end.max(minute_from))?;
 
         let hour_from = match mark(&tx, HOUR_MARK)? {
@@ -121,11 +123,16 @@ impl Store {
         set_mark(&tx, HOUR_MARK, hour_end.max(hour_from))?;
         let hour_closed = hour_from < hour_end;
 
-        report.deleted_points += delete_points(&tx, Tier::Raw, now_ms, RAW_KEEP_MS)?;
+        // The file holds no raw rows from this release on; the ones an earlier release wrote were read into the ring at open.
+        report.deleted_points += tx
+            .prepare_cached("DELETE FROM points WHERE tier = 0")?
+            .execute([])? as u64;
         report.deleted_points += delete_points(&tx, Tier::Minute, now_ms, MINUTE_KEEP_MS)?;
         report.deleted_points += delete_points(&tx, Tier::Hour, now_ms, HOUR_KEEP_MS)?;
         report.deleted_events = delete_events(&tx, now_ms)?;
         tx.commit()?;
+        report.commit_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        report.deleted_points += self.raw.expire(now_ms, RAW_KEEP_MS);
 
         if hour_closed {
             self.conn
@@ -134,6 +141,55 @@ impl Store {
         }
         Ok(report)
     }
+}
+
+/// Rolls the ring's points with `from <= at < to` into minute buckets, one row per series and minute, in tier 1. A series
+/// gets its row in `series` on its first rolled minute. Returns the number of rows written.
+fn roll_raw(tx: &Transaction<'_>, ring: &RawRing, from: u64, to: u64) -> Result<u64, StoreError> {
+    if from >= to {
+        return Ok(0);
+    }
+    let mut write = tx.prepare_cached(
+        "INSERT OR REPLACE INTO points (tier, at, series_id, avg, min, max) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut written = 0;
+    for ((name, labels), series) in &ring.series {
+        let counter = series.kind == SeriesKind::Counter;
+        let mut id: Option<i64> = None;
+        let mut open: Option<Bucket> = None;
+        for &(at, value) in series
+            .points
+            .iter()
+            .filter(|(at, _)| *at >= from && *at < to)
+        {
+            let row_id = match id {
+                Some(id) => id,
+                None => *id.insert(series_id(tx, name, labels, series.kind)?),
+            };
+            let start = at - at % MINUTE_MS;
+            let reading = Reading {
+                counter,
+                avg: value,
+                min: value,
+                max: value,
+            };
+            match open.as_mut() {
+                Some(bucket) if bucket.start == start => bucket.add(reading),
+                _ => {
+                    if let Some(done) = open.take() {
+                        done.flush(&mut write, Tier::Minute)?;
+                        written += 1;
+                    }
+                    open = Some(Bucket::open(row_id, start, reading));
+                }
+            }
+        }
+        if let Some(done) = open.take() {
+            done.flush(&mut write, Tier::Minute)?;
+            written += 1;
+        }
+    }
+    Ok(written)
 }
 
 /// Rolls the `source` rows with `from <= at < to` into `bucket_ms` buckets, one row per series and bucket, in `target`. Returns

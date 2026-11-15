@@ -4171,8 +4171,8 @@ already as declared, so the owner is never asked for an action that cannot run o
 
 ## Alerts
 
-On every 5-second tick, `serve` reads the node, evaluates twelve rules and writes the points and any alert events to
-`arca.db` (see "The store"). The thresholds come from `alerts.json` in the state directory. Alerts never write anything to
+On every 5-second tick, `serve` reads the node, evaluates twelve rules, keeps the points in memory and writes any alert
+events to `arca.db`; once a minute it writes the points' minute rollup there (see "The store"). The thresholds come from `alerts.json` in the state directory. Alerts never write anything to
 Incus or to the desired state.
 
 ### alerts.json
@@ -4465,25 +4465,43 @@ next commit that works (see "Store failure").
 
 ## The store
 
-`<stateDir>/arca.db` holds the points and the alert events. It is SQLite, built into `arca`, so it needs no system library.
+`<stateDir>/arca.db` holds the minute and hour rollups of the points, and the alert events. The raw 5-second points are
+kept in memory only. It is SQLite, built into `arca`, so it needs no system library.
 
 ### Durability and writes
 
-- The file is in WAL mode with `synchronous=FULL`. A commit is on disk when it returns, so a tick that committed survives a
-  crash or a power loss. `NORMAL` is not used, because it could lose the last commits.
-- Each 5-second tick is one transaction: the tick's points and its alert events. The measured one-host example under
-  "Sizing" has 125 series.
+- The file is in WAL mode with `synchronous=FULL`. A commit is on disk when it returns, so an alert event or a rollup that
+  committed survives a crash or a power loss. `NORMAL` is not used, because it could lose the last commits.
+- The raw 5-second points are not written to the file. They stay in a ring in the server's memory for one hour, and the
+  minute's rollup is written once a minute, in one transaction with the hour's rollup when an hour closes. A tick writes
+  to the file only when it has alert events, which are committed in that tick's transaction, as before.
+- Why: on a disk without power-loss protection, as most consumer SSDs are, every commit with `synchronous=FULL` costs a real
+  flush. Writing each tick made 720 commits an hour (17,280 a day) besides the 60 rollups; writing only the rollups makes 60
+(see "Sizing" for the measured hour).
+  The test `an_hour_of_ticks_commits_once_a_minute` in `arca-store` counts them over an hour of ticks with the measured
+  node's 125 series, and the bytes written.
+- What a crash, a power loss or a restart loses: the raw samples of the minute that had not closed yet, at most one minute;
+  the minutes before it are in the file as their rollups (average, minimum and maximum). The raw window starts empty after a
+  start and fills again over the next hour. A read of a raw window the ring cannot answer in full says so in words, with
+  the time it holds samples from, and never fills the gap with zeros. A read-only store holds no raw samples and says so.
+- The ring keeps at most 720 points per series (one hour at 5 seconds), 16 bytes each: about 11 KiB per series, and about
+  1.4 MiB for the measured node's 125 series. A series that has had no point for an hour leaves the ring.
+- A store written by an earlier release still holds its raw rows. The first open reads them into the ring, so the minute
+  that was open when it stopped is rolled whole, and the first rollup deletes every raw row from the file.
+- The measured one-host example under "Sizing" has 125 series.
 - The WAL is checkpointed automatically every 1000 pages, and after a checkpoint its file is cut back to at most 64 MiB. When
   an hour closes, the rollup checkpoints the WAL fully and returns free pages, which can stall one tick by up to 5 seconds.
 - Each connection reads back its journal mode and `synchronous` value. If they are not `wal` and 2, the store refuses to open,
   and `serve` stops with exit 1.
-- `alerts_list.commitMs` is the time of the last commit, and `storeBytes` is the size of `arca.db` with its `-wal` file.
+- `alerts_list.commitMs` is the time of the last tick's writes: its alert events' commit, and on the first tick of a minute
+  the rollup's commit as well (the hour's checkpoint is not counted). A tick with neither writes nothing to the file, and
+  its `commitMs` is near 0. `storeBytes` is the size of `arca.db` with its `-wal` file.
 
 ### Tiers and retention
 
 | Tier | Resolution | Kept | Rows per series at full retention |
 |------|------------|------|-----------------------------------|
-| raw | the 5-second points | 1 hour | 720 |
+| raw | the 5-second points, in memory only | 1 hour | 720, none in the file |
 | minute | 1 minute: average, minimum and maximum | 7 days | 10,080 |
 | hour | 1 hour: average, minimum and maximum | 90 days | 2,160 |
 
@@ -4493,9 +4511,13 @@ bucket with no data stays a gap. Resolved alerts are kept 90 days, and a firing 
 
 ### Sizing
 
-Measured at full retention with 125 series, the store holds 1,620,000 rows in 70.8 MiB, which is about 0.6 MiB per series. The
-test `size_estimate` in `arca-store` checks that 125 series stay under 128 MiB. To estimate a node, multiply its series count
-by 0.6 MiB.
+Measured at full retention with 125 series, the file holds 1,530,000 minute and hour rows in 67.0 MiB, which is about
+0.55 MiB per series; the raw hour adds about 1.4 MiB of memory, not of disk. The test `size_estimate` in `arca-store` checks
+that 125 series stay under 128 MiB. To estimate a node, multiply its series count by 0.55 MiB.
+
+The test `an_hour_of_ticks_commits_once_a_minute` measures an hour of those 125 series: 60 commits and 1.9 MiB handed to the
+file. Writing every tick, as releases before the ring did, made 780 commits and 21.1 MiB. Under `strace` on ext4 the hour
+makes 74 fsyncs (the 60 commits, the hour's checkpoint and the WAL's own header syncs), where it made 806.
 
 ### Checking the store
 
@@ -4518,14 +4540,16 @@ client's `after` cursor therefore never sees `seq` go backwards.
 
 When a commit fails, for example on a full disk:
 
-- The tick still publishes, with `storeError: {at, message}` in `alerts_list`, and that tick's points are dropped.
+- The tick still publishes, with `storeError: {at, message}` in `alerts_list`. Its points are in the ring already, so they
+  are not lost: the next rollup that works writes their minute.
 - Its alert events wait in memory, at most 1,000. Past that the oldest are dropped. The `storeError` message then counts
   every alert event dropped since the server started, and that count does not reset until a restart.
 - The next commit that works writes the waiting events with their original times. Until then they appear in `alerts_list`
   without a `seq`, and they are not in `/alerts`.
 - `store-write-failed` fires at once, and `arca_store_write_failures_total` counts the failure.
 - A commit that works and takes over one second is no failure: its events are kept and nothing waits. `store-commit-slow`, a
-  warning, fires at once, and `arca_store_slow_commits_total` counts it.
+  warning, fires at once, and `arca_store_slow_commits_total` counts it. A minute's rollup whose transaction takes over one
+  second counts the same way, since it is now the minute's write of the points.
 - A rollup that fails, which runs at the first tick of a minute, takes the same path: that tick's `storeError` is set and
   `store-write-failed` fires.
 
