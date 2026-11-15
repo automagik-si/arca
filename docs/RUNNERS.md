@@ -163,12 +163,12 @@ Records and logs go to `<stateDir>/runners/<pool>/`.
 
 The pool never ends a runner that has a job: the job runs as long as it runs, and a failed read of the runner (Incus
 restarting or stalled) is not an exit, so the pool reads again five seconds later. A runner without a job whose reads
-fail sixty times in a row (five minutes or more) is ended, its runner removed from GitHub first; if GitHub keeps it
-because it has just handed it a job, it is watched on. A runner GitHub reports finished that has
+fail sixty times in a row (five minutes or more) is ended, its runner removed from GitHub first; if the runner stays
+on GitHub (GitHub has just handed it a job, or the removal call failed), it is watched on and its count starts again. A runner GitHub reports finished that has
 not exited ten minutes later is stuck, and its machine is ended. An idle runner is replaced by a fresh machine after an
 hour without a job, and an idle runner above what the class wants goes after five minutes; either way its runner is
-removed from GitHub first (call 8), and the machine stays if GitHub refuses because it has just handed the runner a
-job. A runner that exited without a job is removed from GitHub after its machine is destroyed.
+removed from GitHub first (call 8), and the machine stays if the runner stays on GitHub (GitHub has just handed it
+a job, or the removal call failed); the pool asks again thirty seconds later. A runner that exited without a job is removed from GitHub after its machine is destroyed.
 
 The controller deletes every instance in its project that carries its mark and that it does not know: all of them at
 start, and any it finds every five minutes after (a machine an earlier destroy or listing could not reach).
