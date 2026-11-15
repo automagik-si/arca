@@ -35,10 +35,9 @@ const KEY: &str = "console.tokenFile";
 /// The length of the file this node writes: a token (`arca_` and 43 characters) and a newline.
 const FILE_LEN: u64 = 49;
 
-#[cfg(target_os = "linux")]
-const NOFOLLOW: i32 = 0o400000;
-#[cfg(not(target_os = "linux"))]
-const NOFOLLOW: i32 = 0;
+/// `O_NOFOLLOW` as this platform defines it (its value differs between architectures: x86_64 and aarch64 disagree), so an
+/// open never follows a link at the file's path. `create_new` (`O_EXCL`) refuses a link by itself too.
+const NOFOLLOW: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
 
 /// The console's token of one running node: the file it goes to and, until it is written, the secret.
 pub struct ConsoleToken {
@@ -225,6 +224,32 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn the_nofollow_flag_is_this_platforms() {
+        assert_eq!(
+            NOFOLLOW,
+            rustix::fs::OFlags::NOFOLLOW.bits() as i32,
+            "the flag is the platform's O_NOFOLLOW"
+        );
+        // And it does what the platform's does: an open with it alone (no O_EXCL to refuse the link for it) does not
+        // follow a link.
+        let scratch = Scratch::new("nofollow");
+        let target = scratch.0.join("target");
+        fs::write(&target, "target\n").expect("target");
+        let link = scratch.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        let opened = OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW)
+            .open(&link);
+        let error = opened.expect_err("a link is not followed");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::LOOP.raw_os_error()),
+            "{error}"
+        );
     }
 
     #[test]
