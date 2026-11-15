@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use arca_mcp::CallError;
+
 use crate::config::LinkedHost;
 
 /// The longest a relayed decline or any other relayed write may take, in either direction.
@@ -51,6 +53,12 @@ pub enum RelayError {
 
 /// Calls `verb` with `arguments` on the linked kernel `host`, and returns its structured result.
 pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, RelayError> {
+    answer_of(&reply(host, verb, arguments)?)
+}
+
+/// Calls `verb` with `arguments` on the linked kernel `host`, and returns its JSON-RPC reply as it wrote it: an object
+/// with its `result` or its `error`.
+pub fn reply(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, RelayError> {
     let token = read_token(host)?;
     let request = json!({
         "jsonrpc": "2.0",
@@ -65,7 +73,45 @@ pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, Re
         _ => return Err(RelayError::Unreachable),
     }
     let reply: Value = serde_json::from_slice(&body).map_err(|_| RelayError::Unreachable)?;
-    answer_of(&reply)
+    let answered = reply.get("result").is_some_and(Value::is_object)
+        || reply.get("error").is_some_and(Value::is_object);
+    if !answered {
+        return Err(RelayError::Unreachable);
+    }
+    Ok(reply)
+}
+
+/// The MCP door's relay for a call that names a linked node (`node`): this kernel's linked hosts, by name. The door has
+/// checked the caller on this kernel already; the call goes to the named host's socket with its token, as every relay of
+/// this module does, and the host's reply comes back as it wrote it.
+pub struct LinkedNodes {
+    pub hosts: Vec<LinkedHost>,
+}
+
+impl arca_mcp::LinkedNodes for LinkedNodes {
+    fn relay(&self, node: &str, verb: &str, arguments: Value) -> Result<Value, CallError> {
+        // The refusal names the linked nodes and never echoes the name it was given, as every argument refusal.
+        let Some(host) = self.hosts.iter().find(|host| host.name == node) else {
+            let names: Vec<&str> = self.hosts.iter().map(|host| host.name.as_str()).collect();
+            return Err(CallError::Invalid(format!(
+                "/node: not a linked node of this kernel; the linked nodes are {}",
+                names.join(", ")
+            )));
+        };
+        reply(host, verb, arguments).map_err(|error| match error {
+            RelayError::Token => CallError::Refused {
+                code: "LinkToken".to_string(),
+                message: format!(
+                    "the linked node {node} does not accept this kernel's token for {verb}"
+                ),
+            },
+            // `reply` answers only these two; a refusal or a failure is in the reply it returns.
+            _ => CallError::Refused {
+                code: "Unreachable".to_string(),
+                message: format!("the linked node {node} could not be reached just now"),
+            },
+        })
+    }
 }
 
 /// A linked kernel's JSON-RPC reply as the relay's answer: its structured result, its refusal as it sent it, or why it

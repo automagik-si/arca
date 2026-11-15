@@ -726,6 +726,8 @@ function actionCard(plan) {
   };
   const more = moreDetails(plan.summary);
   const audit = more.add;
+  // A plan that waits on a linked machine names it first: approving it here changes that machine, not this one.
+  if (plan.linkedHost) fact("Machine", String(plan.linkedHost));
   const details = Array.isArray(plan.details) ? plan.details : [];
   for (const detail of details) (folded(detail) ? audit : fact)(detail.label, detail.value);
   if (plan.uses) fact("Uses", plan.uses);

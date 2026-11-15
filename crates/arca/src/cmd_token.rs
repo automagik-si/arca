@@ -112,6 +112,18 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
 
 /// `token revoke <id> [--config <c> | --hash-dir <d>]`: removes the token's hash file and sends a running serve SIGHUP.
 pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
+    // A token the node holds in memory has no hash file to remove, and the console's comes back at the next start: it is
+    // turned off by its config key.
+    if id == crate::console::CONSOLE_TOKEN_ID {
+        return Err(Failure::Config(format!(
+            "{id} is the console's token: the node makes it at each start, holds it in memory only and writes it to the file console.tokenFile names, so there is no hash file to revoke. To turn it off, remove the console key (console.tokenFile) from the config and restart the node; a restart alone replaces it with a new token"
+        )));
+    }
+    if id.starts_with(arca_mcp::HELD_PREFIX) {
+        return Err(Failure::Config(format!(
+            "{id} is a token the node holds in memory only, so there is no hash file to revoke; it ends when the node stops"
+        )));
+    }
     if !valid_id(id) {
         return Err(Failure::Usage(
             "--id is 1 to 64 lowercase letters, digits or hyphens, starting with a letter or a digit"

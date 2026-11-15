@@ -5,6 +5,10 @@
 //! `tools=<comma list>`, each on its own line. A secret carries 256 random bits, so a plain digest is enough: a copied hash file yields no usable secret.
 //! A secret is never stored, logged or echoed, and an error names a file, never its content. The token directory is a real
 //! directory, not a symlink, owned by this process and writable by its owner only.
+//!
+//! Besides the stored tokens, the store keeps the tokens this process holds itself ([`TokenStore::hold`]): made at start,
+//! known only to this process's memory, never in the token directory, kept by a reload and gone with the process. Their ids
+//! begin with [`HELD_PREFIX`], which no hash file's name can carry, so a held token never shadows a stored one.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -108,10 +112,17 @@ struct Entry {
     digest: [u8; 32],
 }
 
-/// The loaded token digests, read once at start and replaceable on SIGHUP. Cloning shares the live set.
+/// The prefix of the id of every token this process holds and never stores ([`TokenStore::hold`]). A stored token's id is
+/// lowercase letters, digits and hyphens, so no hash file can carry it.
+pub const HELD_PREFIX: &str = "node:";
+
+/// The loaded token digests, read once at start and replaceable on SIGHUP, and the tokens this process holds itself, which
+/// a reload keeps. Cloning shares the live set.
 #[derive(Clone)]
 pub struct TokenStore {
     entries: Arc<RwLock<Vec<Entry>>>,
+    /// The tokens this process made and holds in memory only ([`TokenStore::hold`]). A reload never touches them.
+    held: Arc<RwLock<Vec<Entry>>>,
     /// The hash files the last load left out ([`TokenStore::ignored`]).
     ignored: Arc<RwLock<Vec<String>>>,
 }
@@ -122,6 +133,10 @@ impl std::fmt::Debug for TokenStore {
             .field(
                 "tokens",
                 &self.entries.read().map(|e| e.len()).unwrap_or_default(),
+            )
+            .field(
+                "held",
+                &self.held.read().map(|e| e.len()).unwrap_or_default(),
             )
             .finish()
     }
@@ -177,6 +192,7 @@ impl TokenStore {
         entries.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(TokenStore {
             entries: Arc::new(RwLock::new(entries)),
+            held: Arc::new(RwLock::new(Vec::new())),
             ignored: Arc::new(RwLock::new(ignored)),
         })
     }
@@ -190,7 +206,8 @@ impl TokenStore {
             .unwrap_or_default()
     }
 
-    /// Replaces the live token set from `dir` and returns its size. The previous set stays in place when the load fails.
+    /// Replaces the live set of stored tokens from `dir` and returns its size. The previous set stays in place when the load
+    /// fails. The tokens this process holds ([`TokenStore::hold`]) are not in `dir`, and a reload keeps them.
     pub fn reload(&self, dir: &Path) -> Result<usize, TokenStoreError> {
         let loaded = TokenStore::load(dir)?;
         let next = loaded
@@ -211,15 +228,16 @@ impl TokenStore {
         Ok(len)
     }
 
-    /// The caller a bearer authenticates as, or `None`. Every stored digest is compared, with no early exit.
+    /// The caller a bearer authenticates as, or `None`. Every stored and held digest is compared, with no early exit.
     pub fn lookup(&self, bearer: &str) -> Option<Caller> {
         if !well_formed(bearer) {
             return None;
         }
         let digest = sha256(bearer.as_bytes());
         let entries = self.entries.read().ok()?;
+        let held = self.held.read().ok()?;
         let mut found = None;
-        for entry in entries.iter() {
+        for entry in entries.iter().chain(held.iter()) {
             if digests_equal(&entry.digest, &digest) {
                 found = Some(entry);
             }
@@ -231,7 +249,52 @@ impl TokenStore {
         })
     }
 
-    /// Every token's id, scope and optional tool list, by id. Never a digest or a secret.
+    /// Makes a new secret of `scope`, limited to `tools`, that this process holds under `id` in memory only, and returns it.
+    /// Nothing is written to the token directory: the caller decides where the secret goes. A reload keeps the token, and
+    /// it ends with the process. A second call with the same id replaces the first token, whose secret then authenticates
+    /// nobody.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `id` does not begin with [`HELD_PREFIX`]: an id a hash file could carry would let a stored token and a
+    /// held one share a name, a wiring error found at start.
+    pub fn hold(&self, id: &str, scope: Scope, tools: Vec<String>) -> String {
+        assert!(
+            id.starts_with(HELD_PREFIX) && id.len() > HELD_PREFIX.len(),
+            "a held token's id begins with {HELD_PREFIX}, which no hash file can carry: {id}"
+        );
+        let (secret, _) = mint(scope);
+        let entry = Entry {
+            id: id.to_string(),
+            scope,
+            tools: Some(tools),
+            digest: sha256(secret.as_bytes()),
+        };
+        let mut held = self
+            .held
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|e| e.id != id);
+        held.push(entry);
+        held.sort_by(|a, b| a.id.cmp(&b.id));
+        secret
+    }
+
+    /// Every token this process holds and never stores ([`TokenStore::hold`]): its id, scope and tool list, by id. Never
+    /// a digest or a secret.
+    pub fn held_ids(&self) -> Vec<(String, Scope, Option<Vec<String>>)> {
+        self.held
+            .read()
+            .map(|held| {
+                held.iter()
+                    .map(|e| (e.id.clone(), e.scope, e.tools.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every stored token's id, scope and optional tool list, by id. Never a digest or a secret. The tokens this process
+    /// holds are [`TokenStore::held_ids`].
     pub fn ids(&self) -> Vec<(String, Scope, Option<Vec<String>>)> {
         self.entries
             .read()

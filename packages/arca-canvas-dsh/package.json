@@ -13,21 +13,29 @@
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./doctor": "./doctor.js",
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "arca-doctor": "./doctor-launch.js"
   },
   "files": [
     "index.js",
+    "doctor.js",
+    "doctor-launch.js",
     "src/arca-client.js",
     "src/token.js",
     "src/devices-client.js",
     "src/snapshot.js",
     "client.js",
     "cordis.patch.yml",
+    "doctor.patch.yml",
     "README.md",
     "src/approval.js",
     "page.js",
     "page.css",
     "src/chat.js",
+    "src/doctor-session.js",
     "src/model.js",
     "src/fleet.js",
     "src/render.js",

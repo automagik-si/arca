@@ -394,7 +394,8 @@ fn an_argument_the_verb_does_not_take_is_a_tool_error_exit_3_with_its_code_and_w
         stdout_json(&out),
         json!({
             "code": "invalid_arguments",
-            "message": "unknown field 'plna'; this verb takes no field"
+            // plan_list's only field is the optional `node` (a linked node to ask).
+            "message": "unknown field 'plna'; this verb takes: node"
         })
     );
 }

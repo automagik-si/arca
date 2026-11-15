@@ -181,6 +181,7 @@ refused without the value being echoed back.
 | `link` | no | The node link: `name`, `forward`, `pairMinutes`, `localOnly`, `port` and `peers`. See "The link". |
 | `follow.intervalSeconds` | no | Seconds between two looks of the Automagik follower at Automagik's published record, 60 to 86400. 600 when absent. |
 | `hostNetwork.socket`, `hostNetwork.status` | no | Absolute paths of the root part's socket and status file; `/run/arca-host-network/host-network.sock` and `/run/arca-host-network/status.json` when absent. See "Host forwarding and the firewall". |
+| `console.tokenFile` | no | Absolute path of the file `serve` writes the machine's own console's token to: one viewer token limited to `node_metrics`, `arca_status`, `alerts_list` and `service_list`, made at each start and held in memory only. Absent, no such token is made. See "The console's token". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`); or `http://localhost:<port>` with the port of `listen.loopback`, the page of a node on its own machine with no domain and no certificate. Its host is the WebAuthn rp id; it is not the host an approval statement names. |
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
@@ -193,6 +194,7 @@ The config is refused, with exit 2, when:
 - a key is unknown, a required key is missing, or a value has the wrong form;
 - `follow.intervalSeconds` is not a whole number from 60 to 86400;
 - `hostNetwork.socket` or `hostNetwork.status` is not an absolute path;
+- `console.tokenFile` is not an absolute path that names a file (not `/`, not ending in `/` or `..`);
 - `approvalHost` is not a host name: one letter or digit, then up to 252 letters, digits, dots or hyphens;
 - `approvalOrigin` is not `https://`, a lowercase host name, and at most a non-443 port, with no path, nor
   `http://localhost:<port>`; or it is `http://localhost:<port>` and `listen.loopback` is not set to `127.0.0.1` or
@@ -702,6 +704,77 @@ restarted or signalled. The hash files stay mode 0400. The signal goes through a
 
 The secret file holds the secret and one newline. A client reads that file, strips the newline, and sends the secret as
 `Authorization: Bearer <secret>`. Keep the secret out of command lines, logs and shell history.
+
+### The console's token
+
+The machine's own console (on Arca OS, the screen a root program draws) reads from the node with a token like any other
+client. Nobody is at that machine to mint one, so the node makes it, when the config names a file for it:
+
+```json
+"console": { "tokenFile": "/run/arca/console.token" }
+```
+
+- **What it may do.** It is a `viewer` token limited to four reads, fixed in the code and not in the config:
+  `node_metrics`, `arca_status`, `alerts_list` and `service_list`. Any other verb is refused `403`, as for any token with
+  a tool list, and the reply's one-line body names the verb (`forbidden: journal_list is not on this token's list of
+  tools`). Its id is `node:console`; no hash file can carry that id, since an id there holds no colon.
+- **When it is made.** At each start, `serve` checks the file's place before anything listens, holds the new token in
+  memory, and writes it to the file once it holds its unix socket and before it serves there: created new, mode 0400,
+  never through a link, the token and one newline. It is never in `tokens.hashDir`.
+- **The start is refused, with exit 2 and words that name `console.tokenFile`,** when the file's directory is missing,
+  is a link, is not owned by the user that runs `serve`, or is open to its group or others (it must be mode 0700); when a
+  link is at the file's path; and when something other than this node's earlier file is there. The node leaves such a
+  link or file alone. A file a node left when it was killed (this user's regular 0400 file, one token and a newline) is
+  replaced.
+- **How long it lives.** A token reload (`SIGHUP`, `arca token reload`) keeps it and does not rewrite the file. A restart
+  replaces it: the earlier value is `401` from then on, and the file holds the new one. A stop removes the file, when it is
+  still the one this process wrote.
+- **Where the owner sees it.** `token_list` lists it after the stored tokens as `{ "id": "node:console", "scope":
+  "viewer", "tools": [...], "stored": false, "console": true }`. `arca status --security` counts it among the tokens that
+  only look and names its file and its four reads. `arca token revoke node:console` is refused with exit 2: there is no
+  hash file to remove. **To turn it off, remove `console.tokenFile` from the config and restart the node.**
+
+Root on that machine can read the file, and root there can already do everything, so the file gives nobody new power;
+the bearer rule stays one rule on every route and every listener.
+
+A client that is not an MCP client sends two requests, each a `POST /mcp` over the node's unix socket (`listen.unix`)
+on its own connection, with the token read from the file at each call and the newline stripped. The socket answers only
+the user that runs the node. First `initialize`:
+
+```
+POST /mcp HTTP/1.1
+Host: localhost
+Authorization: Bearer <the token from the file>
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"console","version":"1"}}}
+```
+
+Its answer is `200` with `result.protocolVersion` `2025-11-25`. Then the call, here `node_metrics`:
+
+```
+POST /mcp HTTP/1.1
+Host: localhost
+Authorization: Bearer <the token from the file>
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"node_metrics","arguments":{}}}
+```
+
+Its answer is `200` with the reading in `result.structuredContent`, the same object `arca call node_metrics` prints, and
+a summary in `result.content[0].text`. A tool-level failure is `result.isError: true`. `401` means the token is not the
+node's current one (the node restarted, or the file is from an earlier start): read the file again and retry once; a
+missing file or socket means the node is not running. `403` means the verb is not one of the four. With curl, as the
+node's user, the header goes in on curl's standard input (`-H @-`), so the token is never on a command line, where
+other users of the machine could read it, and never in a second file:
+
+```sh
+{ printf 'Authorization: Bearer '; cat /run/arca/console.token; } | curl -s --unix-socket /run/arca/arca.sock -H @- \
+  -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"node_metrics","arguments":{}}}' \
+  http://localhost/mcp
+```
 
 A service is one template-derived container in the service project. Its template lives in
 `<stateDir>/templates/<name>.json`; `service_create` allocates `.10`-`.239` on the service bridge, creates the
@@ -1898,6 +1971,48 @@ in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, 
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
+
+### Asking a linked node: `node`
+
+One door reaches every kernel this one is linked to (`approval.linkedHosts`, see
+[Approving on another kernel of this machine](#approving-on-another-kernel-of-this-machine)). Every read the door serves,
+and `action_propose`, take an optional `node`: the `name` of one linked host. `arca_status` lists the names under
+`approval.linkedHosts`. Without `node` a call is this kernel's own, exactly as before.
+
+With `node` set, the door first checks the caller here, exactly as for a call of its own: its scope and its tool list. A
+caller that may not make the call on this kernel may not make it on a linked node, whatever the linked token holds. The
+door then takes `node` out and sends the rest of the call to that host's `socket` with the token in its `tokenFile`, the
+way the approval page relays, and returns the host's answer as the host gave it, with `linkedNode` naming it: in the
+structured content of a result, in `data` of a refusal, and as a last text line of a tool error. Every field the host
+wrote is left as it wrote it (a relayed `arca_status` keeps that host's own `node` id), and no result has a field named
+`linkedNode`, so a relayed answer fits the tool's own `outputSchema` and an MCP client that checks it accepts it. So `watch_report` with `"node": "beta"` answers with beta's instances, and `action_propose`
+with `"node": "beta"` records the proposal on beta: it waits in beta's plans, this kernel's approval page lists it under
+beta with the machine named on the card, and the owner's passkey approval goes to beta, which checks it itself. This
+kernel's terminal is never asked about a plan that waits on another node.
+
+- A `node` that is not linked is an invalid argument (`invalid_arguments: /node: not a linked node of this kernel; the
+  linked nodes are beta, gamma`). On a kernel with no linked hosts it says so.
+- A linked host that does not answer is refused `Unreachable`, naming it; one that refuses the token for that verb is
+  refused `LinkToken`, naming it. Neither is ever answered by this kernel instead. A refusal of the host's own (say
+  `TooManyProposals`) comes back with its code and words, and `linkedNode` in its `data`.
+- A write never takes `node`: one that names it is refused at this kernel's argument check, and nothing is relayed.
+
+The three `owner_approval_*` reads take no `node`: their rows are the calling token's own requests, and a relayed call
+is made with the linked token. The token in `tokenFile` must admit each verb relayed: the page's token minted with
+`--tools plan_list,action_approve,plan_decline` admits only those, so `watch_report` through it is refused `LinkToken`.
+To read and propose through the door as well, mint the linked kernel's token with the page's verbs, `action_propose` and
+the reads, and nothing else (never without `--tools`: that token would hold every `doctor` write on the linked kernel,
+and the door relays none of them):
+
+```sh
+arca token mint --scope doctor --id relay-alpha \
+  --tools plan_list,action_approve,plan_decline,action_propose,arca_status,node_metrics,watch_report,journal_list,alerts_list,postgres_list,ontology_query,service_list,service_status,service_logs,omni_status,storage_list,snapshot_list,tenant_list,tenant_status,tenant_usage,function_list,function_runs,registry_list,instance_move_preflight,github_connect_status,github_bindings,github_audit,os_update,route_list \
+  --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
+```
+
+For a linked kernel on another machine, add `peer_keys_sync` (see [Approving on another machine](#approving-on-another-machine)).
+`token_list` takes `node` too, but it is an `operator` verb and a `doctor` token cannot list it, so through this token it is
+refused `LinkToken`.
 
 ### When Incus does not answer, and when the answer is "internal"
 
@@ -3302,7 +3417,9 @@ the file holding a token for it:
 ```
 
 `name` is the name the canvas knows that machine by (its `hosts[].name` in the canvas config). The token is minted on the
-linked kernel with scope `doctor`, limited to the three verbs the page relays:
+linked kernel with scope `doctor`, limited to the verbs relayed with it. For the page alone that is its three verbs; to
+read and propose on that kernel through this kernel's MCP door as well, list those verbs too (see
+[Asking a linked node: `node`](#asking-a-linked-node-node)):
 
 ```sh
 arca token mint --scope doctor --id relay-alpha --tools plan_list,action_approve,plan_decline \
