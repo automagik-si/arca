@@ -473,7 +473,10 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "github_bindings",
             "github_audit",
             "os_update",
-            "route_list"
+            "route_list",
+            "support_report",
+            "support_report_status",
+            "support_reports"
         ]
     );
 }
@@ -1154,4 +1157,112 @@ fn a_get_on_the_mcp_path_is_not_served() {
         "only POST is served: {}",
         text.lines().next().unwrap_or("")
     );
+}
+
+/// A POST route that never refuses on its own: it records each path it was asked for, so a call that reaches it shows.
+struct Poke(Arc<Mutex<Vec<String>>>);
+
+impl arca_mcp::PostHandler for Poke {
+    fn post(&self, path: &str, caller: &Caller) -> Result<arca_mcp::GetReply, CallError> {
+        self.0.lock().expect("the paths").push(path.to_string());
+        if path.ends_with("/0/poke") {
+            return Err(CallError::Invalid("zero".into()));
+        }
+        Ok(arca_mcp::GetReply {
+            content_type: "application/json",
+            body: json!({ "by": caller.token_id }).to_string().into_bytes(),
+        })
+    }
+}
+
+/// A POST route is its verb's action: the door admits a token to it exactly as to the verb, before the handler runs. For
+/// `support_report_ack` that is an operator, or a token whose list names it; a viewer or doctor with no list, or a list that
+/// leaves it out, is refused 403 with no body, and the handler never sees the request.
+#[test]
+fn a_post_route_admits_only_the_tokens_its_verb_admits() {
+    let scratch = Scratch::new("post-route");
+    let viewer = mint_into(scratch.path(), "viewer", Scope::Viewer);
+    let doctor = mint_into(scratch.path(), "doctor", Scope::Doctor);
+    let operator = mint_into(scratch.path(), "operator", Scope::Operator);
+    let mut listed = |id: &str, scope: Scope, tools: &[&str]| {
+        let tools: Vec<String> = tools.iter().map(|tool| tool.to_string()).collect();
+        let (secret, text) = mint_with_tools(scope, Some(&tools));
+        write_hash_file(scratch.path(), id, &text, 0o400);
+        secret
+    };
+    let named = listed(
+        "named",
+        Scope::Viewer,
+        &["support_reports", "support_report_ack"],
+    );
+    let other = listed("other", Scope::Viewer, &["support_reports"]);
+    let op_other = listed("op-other", Scope::Operator, &["support_reports"]);
+    let tokens = TokenStore::load(scratch.path()).expect("the store loads");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = Server::new(verbs(), tokens).post_route(
+        "/things/{id}/poke",
+        "support_report_ack",
+        Arc::new(Poke(Arc::clone(&seen))),
+    );
+    let rt = Runtime::new().expect("runtime");
+    let socket = scratch.at("arca.sock");
+    let (router, served) = (server.router(), socket.clone());
+    rt.spawn(async move { serve_unix(router, &served).await });
+    wait_for_socket(&socket);
+    let poke = |token: Option<&str>, path: &str| {
+        let mut head = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n"
+        );
+        if let Some(token) = token {
+            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        head.push_str("\r\n");
+        exchange(&mut connect_unix(&socket), head.as_bytes())
+    };
+    for (id, token) in [
+        ("viewer", &viewer),
+        ("doctor", &doctor),
+        ("other", &other),
+        ("op-other", &op_other),
+    ] {
+        let reply = poke(Some(token), "/things/1/poke");
+        assert_eq!(reply.status, 403, "{id}");
+        assert!(reply.body.is_empty(), "{id}: the refusal says nothing");
+    }
+    assert_eq!(poke(None, "/things/1/poke").status, 401);
+    assert!(
+        seen.lock().expect("the paths").is_empty(),
+        "no refused request reached the handler"
+    );
+    let reply = poke(Some(&named), "/things/1/poke");
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.json(), json!({ "by": "named" }));
+    assert_eq!(poke(Some(&operator), "/things/2/poke").status, 200);
+    assert_eq!(poke(Some(&operator), "/things/0/poke").status, 400);
+    assert_eq!(
+        *seen.lock().expect("the paths"),
+        ["/things/1/poke", "/things/2/poke", "/things/0/poke"]
+    );
+    // The same rule holds for the verb on /mcp and in the tool list.
+    let call = |token: &str, method: &str, params: Value| {
+        let mut stream = connect_unix(&socket);
+        post(
+            &mut stream,
+            &[bearer(token)],
+            &rpc(json!(1), method, params),
+        )
+    };
+    let ack = json!({ "name": "support_report_ack", "arguments": { "id": 1 } });
+    assert_eq!(call(&viewer, "tools/call", ack.clone()).status, 403);
+    assert_eq!(call(&doctor, "tools/call", ack.clone()).status, 403);
+    assert_eq!(call(&named, "tools/call", ack.clone()).status, 200);
+    assert_eq!(call(&operator, "tools/call", ack).status, 200);
+    let offered = |token: &str| {
+        names_of(&call(token, "tools/list", json!({}))).contains(&"support_report_ack".to_string())
+    };
+    assert!(!offered(&viewer));
+    assert!(!offered(&doctor));
+    assert!(!offered(&other));
+    assert!(offered(&named));
+    assert!(offered(&operator));
 }

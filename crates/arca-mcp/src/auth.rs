@@ -47,6 +47,12 @@ impl Caller {
             .as_ref()
             .is_none_or(|tools| tools.iter().any(|name| name == tool))
     }
+
+    /// Whether this caller may call `verb`: its scope, its tool list, and for a verb a token reaches only by naming it
+    /// ([`arca_api::verbs::NAMED_ONLY`]) an operator scope or a list that names it.
+    pub fn admits(&self, verb: &arca_api::Verb) -> bool {
+        arca_api::may_call_listed(self.scope, self.tools.as_deref(), verb)
+    }
 }
 
 /// The prefix of the caller id of every token an authorization server issued ([`IssuedTokens`]). A stored token's id is

@@ -26,7 +26,7 @@ pub use auth::{
 };
 pub use elicit::{Asking, PendingPlan, TerminalApprover};
 pub use http::{
-    GetHandler, GetReply, Server, loopback_addr_ok, peer_allowed, proxy_addr_ok, serve_filtered,
+    GetHandler, GetReply, PostHandler, Server, loopback_addr_ok, peer_allowed, proxy_addr_ok, serve_filtered,
     serve_loopback, serve_loopback_with, serve_proxy, serve_services, serve_tailnet, serve_unix,
     serve_unix_bound, services_path_ok, tailnet_addr_ok,
 };

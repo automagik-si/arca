@@ -12,7 +12,7 @@
 use arca_api::verbs::{LINKED_NODE, NODE, NOT_CONFIRMED, take_confirm};
 use std::sync::Arc;
 
-use arca_api::{Verb, conforms, may_call};
+use arca_api::{Verb, conforms};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
@@ -226,7 +226,7 @@ fn tools_for(server: &Server, caller: &Caller) -> Vec<Value> {
     server
         .verbs
         .iter()
-        .filter(|v| may_call(caller.scope, v) && caller.allows_tool(v.name))
+        .filter(|v| caller.admits(v))
         .map(|v| {
             json!({
                 "name": v.name,
@@ -263,7 +263,7 @@ async fn call_tool(
     let Some(verb) = server.verbs.iter().find(|v| v.name == name) else {
         return Ok(Some(error_reply(id, unknown_tool, "not_found", None)));
     };
-    if !may_call(caller.scope, verb) || !caller.allows_tool(verb.name) {
+    if !caller.admits(verb) {
         return Err(CallError::Forbidden {
             verb: name.to_string(),
         });

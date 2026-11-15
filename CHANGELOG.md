@@ -7,6 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Support reports: `support_report` (any viewer) files a report, with a title of at most 200 characters, a body of at most
+16 KiB, and optionally a severity, a service and a tenant, as one line of `<stateDir>/support-reports.jsonl`; a token
+files at most 10 an hour, and no field holds a control character except a newline in the body. It changes nothing and
+needs no approval. The support side pulls the reports from `GET /reports?after=<id>` (NDJSON, the same shape and token
+check as `/alerts`) or `support_reports`, with the caller's words under `report` and marked untrusted, and marks one
+picked up with `POST /reports/<id>/ack` or `support_report_ack`, which only an operator token, or a token whose tool list
+names that verb, may call. `support_report_status` tells the filer whether its report was picked up. The kernel sends
+nothing outward and holds no credential of the support side.
+
 ## 0.32.0 (2026-11-16)
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the

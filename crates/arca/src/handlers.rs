@@ -1027,7 +1027,7 @@ impl GetHandler for AlertsExport {
 }
 
 /// The `after` of a query string: the value of its first `after=` pair, or 0 when there is none.
-fn after_of(query: Option<&str>) -> Result<u64, CallError> {
+pub(crate) fn after_of(query: Option<&str>) -> Result<u64, CallError> {
     let value = query
         .unwrap_or("")
         .split('&')
