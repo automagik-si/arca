@@ -5,6 +5,9 @@ use arca::handlers::{UpdateOptions, service_handlers_updating};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+#[path = "update_template.rs"]
+mod with_template;
+
 const NEW: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
 fn app_template() -> Value {

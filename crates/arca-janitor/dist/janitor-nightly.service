@@ -1,0 +1,9 @@
+# Queues the nightly clean on the running janitor and returns at once; the job itself runs in janitor.service.
+[Unit]
+Description=Queue arca-janitor's nightly clean
+Requires=janitor.service
+After=janitor.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/arca-janitor submit nightly

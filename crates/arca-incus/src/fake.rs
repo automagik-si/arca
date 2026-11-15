@@ -234,6 +234,8 @@ struct Shared {
     rebuild_refusals: Mutex<BTreeMap<(String, String), bool>>,
     /// The snapshots each instance was restored to, in order.
     restores: Mutex<BTreeMap<(String, String), Vec<String>>>,
+    /// The power changes each instance was asked for, in order: `start`, `stop` or `restart`, whatever Incus answered.
+    state_actions: Mutex<BTreeMap<(String, String), Vec<String>>>,
     counter: AtomicU64,
     /// The `/1.0/resources` document the fake serves, when a test sets one.
     resources: Mutex<Option<Value>>,
@@ -469,6 +471,7 @@ impl Shared {
             rebuilds: Mutex::new(BTreeMap::new()),
             rebuild_refusals: Mutex::new(BTreeMap::new()),
             restores: Mutex::new(BTreeMap::new()),
+            state_actions: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
             pool_drivers: Mutex::new(BTreeMap::new()),
@@ -543,6 +546,16 @@ impl FakeIncus {
     /// fake: it keeps no root, and its config and devices are what they were.
     pub fn restores(&self, project: &str, name: &str) -> Vec<String> {
         lock(&self.shared.restores)
+            .get(&(project.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The power changes the instance `name` in `project` was asked for through a PUT of its state, in order: `start`,
+    /// `stop` or `restart`, each as it was asked, whether or not it was done. Every interruption of a running
+    /// service is a `stop` or a `restart` here.
+    pub fn state_actions(&self, project: &str, name: &str) -> Vec<String> {
+        lock(&self.shared.state_actions)
             .get(&(project.to_string(), name.to_string()))
             .cloned()
             .unwrap_or_default()
@@ -3769,6 +3782,10 @@ fn change_state(
     };
     let force = sent.get("force").and_then(Value::as_bool) == Some(true);
     let running = text_of(&store.objects[index].body, "status") == "Running";
+    lock(&shared.state_actions)
+        .entry((address.project.clone(), address.name.clone()))
+        .or_default()
+        .push(text_in(&sent, "action"));
     match text_in(&sent, "action").as_str() {
         "start" if running => bad("The instance is already running"),
         "start"

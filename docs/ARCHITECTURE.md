@@ -20,8 +20,9 @@
 | `arca-link` | the node link: one endpoint, one-time pairing and byte streams to local sockets |
 | `arca-api`, `arca-mcp` | the verb table, the OpenRPC document, and the MCP server |
 | `arca-wit` | the WIT world `arca:plugin@0.1.0` |
+| `arca-janitor` | a polite, job-based cleanup runner (`arca-janitor`): space reports, growth, clean plans applied by id with every protection checked again, and rule-based insights on where the trash comes from; it depends on no other Arca crate yet ([`README`](../crates/arca-janitor/README.md)) |
 
-Those are the 17 crates under `crates/`. Beside them: `packages/arca-canvas-dsh` (the canvas plugin, a Node package),
+Those are the 18 crates under `crates/`. Beside them: `packages/arca-canvas-dsh` (the canvas plugin, a Node package),
 `templates/` (the shipped service templates), `schema/` (the OpenRPC document, `arca.openrpc.json`, and the released
 `0.1.0` one it is checked against), `ontology/`, `wit/`, `deploy/systemd/` and `scripts/`.
 
