@@ -158,7 +158,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 83] = [
+static VERBS: [Verb; 84] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -270,6 +270,20 @@ static VERBS: [Verb; 83] = [
         cut: no_cut,
         params: plan_decline_params,
         result: plan_decline_result,
+    },
+    Verb {
+        name: "plan_renew",
+        summary: "Makes again each waiting delete plan whose fifteen minutes ran out without an approval, from what the journal still holds, so plan_list shows it and the owner can be asked again. The same objects keep the same plan id; only its creation time is now. A plan still inside its fifteen minutes keeps its age. A declined entry, an entry the desired state carries again, one with nothing left to delete, and every plan while an earlier effect is unresolved are not renewed, each with why. Nothing is written to Incus, the journal or the desired state.",
+        class: VerbClass::L,
+        min_scope: Scope::Operator,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_renew,
+        cut: no_cut,
+        params: plan_renew_params,
+        result: plan_renew_result,
     },
     Verb {
         name: "approval_submit",
@@ -2734,6 +2748,15 @@ pub fn summary_decline(v: &Value) -> String {
     )
 }
 
+/// A short line for a successful `plan_renew`.
+pub fn summary_renew(v: &Value) -> String {
+    format!(
+        "{} lapsed plan(s) renewed; {} not renewed",
+        v["renewed"].as_array().map_or(0, Vec::len),
+        v["notRenewed"].as_array().map_or(0, Vec::len)
+    )
+}
+
 /// A short line for a successful `approval_submit`.
 pub fn summary_approval(v: &Value) -> String {
     format!(
@@ -3810,6 +3833,38 @@ fn plan_decline_result() -> Value {
     result(vec![
         ("plan", true, plan_ref()),
         ("retained", true, array(object_ref())),
+    ])
+}
+
+fn plan_renew_params() -> Value {
+    params(vec![])
+}
+
+fn plan_renew_result() -> Value {
+    result(vec![
+        ("renewed", true, array(renewed_plan())),
+        ("notRenewed", true, array(lapsed_plan())),
+    ])
+}
+
+/// A plan `plan_renew` made again: its id, entry and objects, and its new creation time and expiry. The statement the owner
+/// signs comes from `plan_list`.
+fn renewed_plan() -> Value {
+    result(vec![
+        ("plan", true, hex64()),
+        ("entry", true, string()),
+        ("objects", true, array(object_ref())),
+        ("createdAt", true, int()),
+        ("expiresAt", true, int()),
+    ])
+}
+
+/// A lapsed plan `plan_renew` did not make again, and why in plain words.
+fn lapsed_plan() -> Value {
+    result(vec![
+        ("plan", true, hex64()),
+        ("entry", true, string()),
+        ("why", true, string()),
     ])
 }
 

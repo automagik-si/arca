@@ -52,6 +52,13 @@ one. `/metrics` gains `arca_node_cpu_threads`, `arca_node_cpu_physical_cores`, `
 `arca_node_cpu_package_power_watts`, `arca_node_cpu_power_watts`, `arca_node_gpu_power_watts`,
 `arca_node_chip_power_watts`, `arca_node_power_measured_watts` and `arca_instance_cpu_busy_threads`.
 
+A delete plan nobody approved within its fifteen minutes can be shown to the owner again without a restart: the new
+operator verb `plan_renew` puts each lapsed plan back with fifteen new minutes and the same id, from what the journal still
+holds, and says why for each one it leaves (a declined entry, an entry the desired state carries again, nothing left to
+delete, or an earlier effect still unresolved). It sends nothing to Incus and writes no journal line. Until now a failed
+create that had already made its data volume left that volume, and the network rule held for it, with no card to approve
+once the plan lapsed.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and
