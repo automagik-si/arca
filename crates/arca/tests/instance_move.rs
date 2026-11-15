@@ -2385,3 +2385,119 @@ fn the_already_moved_reason_says_to_keep_what_the_copy_holds() {
         "{reasons}"
     );
 }
+
+fn source_autostart(rig: &Rig) -> Value {
+    writer(&rig.source)
+        .get("/1.0/instances/web?project=shop")
+        .expect("the source")["config"]["boot.autostart"]
+        .clone()
+}
+
+/// R5-1 (A): the next start leaves a stopped source beside a copy that was started: a restart of this host must not
+/// start it, so its boot.autostart is turned off.
+#[test]
+fn a_source_left_beside_a_started_copy_by_recovery_has_autostart_off() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Running");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+            json!({ "event": "cutover", "step": "starting" }),
+        ],
+    );
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(source_autostart(&rig), "false");
+    assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+}
+
+/// R5-1 (B): a rollback that cannot read the target leaves the source stopped, and turns its boot.autostart off.
+#[test]
+fn a_source_left_stopped_by_a_rollback_that_could_not_read_the_target_has_autostart_off() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let last = held(&rig, 1);
+    rig.target.refuse_start("shop", "web");
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    rig.source.release_operation(&last);
+    let status = rig.wait(&id);
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Stopped")
+    );
+    assert_eq!(source_autostart(&rig), "false");
+    assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+}
+
+/// R5-1 (B, at the next start): the recovery's rollback cannot read the target either; the same holds.
+#[test]
+fn a_source_left_stopped_by_a_recovery_rollback_has_autostart_off() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    writer(&rig.source)
+        .set_state("shop", "web", "stop", true, Duration::from_secs(5))
+        .expect("stopped");
+    let uuid = copy_on_target(&rig, "web", "Stopped");
+    interrupted(
+        &rig,
+        "mv-0123456789ab",
+        vec![
+            json!({ "event": "created", "targetUuid": uuid }),
+            json!({ "event": "cutover", "step": "stopped", "wasRunning": true }),
+        ],
+    );
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    rig.moves.recover();
+    let status = rig.wait("mv-0123456789ab");
+    assert_eq!(status["instances"][0]["result"], "failed", "{status}");
+    assert_eq!(
+        rig.source.instance_status("shop", "web").as_deref(),
+        Some("Stopped")
+    );
+    assert_eq!(source_autostart(&rig), "false");
+    assert_eq!(result_line(&rig, "web")["autostartOff"], true);
+}
+
+/// R5-1: when turning it off fails, the result says so for the owner.
+#[test]
+fn a_failed_move_whose_source_keeps_autostart_says_so() {
+    let rig = Rig::new(vec![web()], 100);
+    rig.source
+        .set_instance_config("shop", "web", "boot.autostart", "true");
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(PushPlan::Pass);
+    rig.source.plan_push(hold());
+    let id = rig.start(&["web"])["move"].as_str().unwrap().to_string();
+    let last = held(&rig, 1);
+    rig.target.refuse_start("shop", "web");
+    rig.target.fail_reads("/1.0/instances/web", 1000, 500);
+    rig.source.set_reject_patch("/1.0/instances/web");
+    rig.source.release_operation(&last);
+    let status = rig.wait(&id);
+    let one = &status["instances"][0];
+    assert_eq!(one["result"], "failed", "{status}");
+    assert!(
+        one["reason"]
+            .as_str()
+            .unwrap()
+            .contains("boot.autostart could not be turned off"),
+        "{one}"
+    );
+    assert_eq!(result_line(&rig, "web")["autostartOff"], false);
+}
