@@ -41,15 +41,28 @@ Arca updates its own programs with nobody at a terminal (`crates/arca/src/self_u
   finds them all from the manager's `ExecStart` lines and an `Automagik Arca` version answer, groups them by the file
   their paths resolve to, and replaces each file behind the release. A lock in the manager's runtime directory keeps
   it to one run at a time, and its result is written into every node's state directory it found.
-- **Order and proof.** Shims restart first, then nodes, then links, one at a time; a restart counts only when the unit's
-  main process is up, stays up, and its own `/proc/<pid>/exe` says the release's version. Anything else puts every
-  changed program back and restarts the units again. The proof is the running process, not the file on disk.
+- **Order and proof.** Shims restart first, then nodes, then links, one at a time. A restart counts only when the
+  unit is up within `update.healthSeconds`, a node answers on its own socket, the unit then stays the same process with
+  no restart for `update.healthSeconds` more, and its own `/proc/<pid>/exe` says the release's version. Anything else
+  puts every changed program back and restarts the units again. The proof is the running process, not the file on disk.
+- **A run can be cut off.** Before the first rename the run writes `pending.json` into every node's record, and removes
+  it when every unit is confirmed or rolled back. A run that finds one settles it first: it finishes the update when
+  every unit it names is healthy on the release, and rolls it back otherwise. A release that was rolled back is held
+  back until a newer one is published, so a bad release is not retried every six hours.
+- **Only a signed release installs.** `SHA256SUMS.sig` must be an Ed25519 signature of `SHA256SUMS` by a key the program
+  holds (`RELEASE_KEYS`, verified with ring); the binary and the release's own `install.sh` must match `SHA256SUMS`, and
+  the binary must answer `--version` on this machine, before any program is touched. The release workflow signs with a
+  key from an environment secret. No key exists yet, so today a node only reports what is available.
+- **Only release builds are replaced.** A program older than the release is replaced only when its bytes are the
+  published binary of the version it says. A build from a branch is kept, so a node running a branch is never moved
+  onto a release it did not ask for.
 - **The owner's attention wins.** A node with an owner approval card waiting is not restarted: each `serve` writes its
-  count of waiting cards each minute, and the run waits for zero. A release is checked against its `SHA256SUMS` (the
-  binary and the release's own `install.sh`) and must answer `--version` on this machine before any program is touched.
-- **A program that cannot be written is staged.** Arca OS runs Arca from its read-only image. There the run stages the
-  release in the node's state directory with a manifest and its SHA-256, and `serve` hands over to it (`exec`) at its
-  start when it is newer than itself. The OS update and the kernel update stay independent: whichever program is newer
-  runs, so neither can move the node backwards.
+  count of waiting cards each minute, and the run waits for zero.
+- **Where the program cannot be written.** A program on a read-only file system is the OS image's: Arca OS brings its
+  `arca` with the OS update, and the kernel update leaves it alone (`os-managed`). A program in a directory only its
+  user may not write (a user unit running a program in a system path) gets the release staged in that user's own
+  state, with a manifest and its SHA-256; `serve`, `shim` and `link serve` hand over to it (`exec` of the very file
+  they hashed) at their start when it is newer than themselves. Staging is refused when another unit runs the program
+  and would not hand over.
 
 To build, test and release Arca, read [`docs/BUILDING.md`](BUILDING.md).

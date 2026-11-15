@@ -18,8 +18,8 @@ name: Release
 #   aarch64  builds the aarch64 binary on GitHub's hosted arm64 runner, from the release commit's tag, with the same
 #            scripts/release.sh as cut. Like cut, it reads and writes nothing of the repository's: its token is read-only,
 #            and it hands over one file, the binary.
-#   publish  may write, and runs no code of the repository and none of its scripts: git, gh and sha256sum from the
-#            runner's image, on the lines written in this file. It checks what was handed over (the bundle is exactly
+#   publish  may write, and runs no code of the repository and none of its scripts: git, gh, sha256sum and openssl
+#            from the runner's image, on the lines written in this file. It checks what was handed over (the bundle is exactly
 #            one commit on top of dev, named as a release commit, touching only the files that state the version;
 #            the tag points at it; SHA256SUMS matches the binary and the installer; the installer is the release
 #            commit's own), pushes dev and the tag in one atomic push, and publishes the GitHub release `v<version>`
@@ -28,6 +28,9 @@ name: Release
 #              arca-<version>-linux-aarch64  the portable binary for aarch64 (glibc 2.34 or newer)
 #              install.sh                    scripts/install.sh as the release commit holds it: it installs this release
 #              SHA256SUMS                    the checksums of those three
+#              SHA256SUMS.sig                the Ed25519 signature of SHA256SUMS by the release signing key, when the
+#                                            release-signing environment holds one (ARCA_RELEASE_SIGNING_KEY); the
+#                                            kernel updater installs only a release whose signature verifies
 #            and that version's CHANGELOG.md section as the notes.
 #   main     moves main to the release commit. main holds released commits and nothing else.
 #
@@ -320,6 +323,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+    # Its secret is the release signing key (the Sign SHA256SUMS step).
+    environment: release-signing
     outputs:
       version: ${{ steps.publish.outputs.version }}
       sha: ${{ steps.publish.outputs.sha }}
@@ -328,9 +333,9 @@ jobs:
       MODE: ${{ needs.cut.outputs.mode }}
       VERSION: ${{ needs.cut.outputs.version }}
       PRERELEASE: ${{ inputs.prerelease }}
-    # This job holds the token that can write. It runs nothing from the repository: no script of it, no build, no
-    # test, no package's install. Only git, gh and sha256sum, on the lines below. The installer it publishes is a
-    # file to it: compared and uploaded, never started.
+    # This job holds the token that can write, and the release signing key. It runs nothing from the repository: no
+    # script of it, no build, no test, no package's install. Only git, gh, sha256sum and openssl, on the lines below.
+    # The installer it publishes is a file to it: compared and uploaded, never started.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -575,6 +580,32 @@ jobs:
           cp -- "${ARM}/${asset}" "${HANDOVER}/${asset}"
           (cd "${HANDOVER}" && sha256sum -- "arca-${VERSION}-linux-x86_64" "${asset}" install.sh > SHA256SUMS)
 
+      # The kernel updater installs a release by itself only when SHA256SUMS.sig is an Ed25519 signature of SHA256SUMS
+      # by a key its program holds (crates/arca/src/self_update.rs, RELEASE_KEYS). The private key is the
+      # release-signing environment's ARCA_RELEASE_SIGNING_KEY secret, PEM. While no such secret exists the release
+      # is published unsigned, as before, and the updaters only say it is available.
+      - name: Sign SHA256SUMS
+        if: steps.check.outputs.commit != ''
+        env:
+          SIGNING_KEY: ${{ secrets.ARCA_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          stop() { echo "::error::$*"; exit 1; }
+          if [[ -z "${SIGNING_KEY}" ]]; then
+            echo "::warning::no ARCA_RELEASE_SIGNING_KEY: v${VERSION} is published unsigned, and the kernel updaters only say it is available"
+            exit 0
+          fi
+          HANDOVER="${RUNNER_TEMP}/release"
+          key=$(umask 077 && mktemp "${RUNNER_TEMP}/signing.XXXXXX")
+          trap 'rm -f -- "${key}" "${key}.pub"' EXIT
+          printf '%s\n' "${SIGNING_KEY}" > "${key}"
+          openssl pkey -in "${key}" -pubout -out "${key}.pub" 2> /dev/null || stop "ARCA_RELEASE_SIGNING_KEY is not a private key openssl reads"
+          openssl pkeyutl -sign -inkey "${key}" -rawin -in "${HANDOVER}/SHA256SUMS" -out "${HANDOVER}/SHA256SUMS.sig"
+          [[ "$(wc -c < "${HANDOVER}/SHA256SUMS.sig")" == 64 ]] || stop "the signature is not 64 bytes: the key is not an Ed25519 key"
+          openssl pkeyutl -verify -pubin -inkey "${key}.pub" -rawin -in "${HANDOVER}/SHA256SUMS" \
+            -sigfile "${HANDOVER}/SHA256SUMS.sig" > /dev/null || stop "the signature does not verify"
+          echo "::notice::SHA256SUMS of v${VERSION} is signed by the key whose public half is $(openssl pkey -pubin -in "${key}.pub" -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+
       - name: Push dev and the tag
         id: push
         if: needs.cut.outputs.mode == 'cut' && steps.check.outputs.commit != ''
@@ -607,7 +638,9 @@ jobs:
           flags=(--latest)
           [[ "${PRERELEASE}" != "true" ]] || flags=(--prerelease --latest=false)
           cd "${RUNNER_TEMP}/release"
-          gh release create "v${VERSION}" "arca-${VERSION}-linux-x86_64" "arca-${VERSION}-linux-aarch64" install.sh SHA256SUMS "${flags[@]}" \
+          files=("arca-${VERSION}-linux-x86_64" "arca-${VERSION}-linux-aarch64" install.sh SHA256SUMS)
+          [[ ! -f SHA256SUMS.sig ]] || files+=(SHA256SUMS.sig)
+          gh release create "v${VERSION}" "${files[@]}" "${flags[@]}" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --title "Automagik Arca ${VERSION}" \

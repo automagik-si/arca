@@ -4,24 +4,30 @@
 //! any hour). When a look is due it starts `arca update run` as a transient systemd unit of its own manager, so the run
 //! outlives the restarts it makes. One run:
 //!
-//! 1. takes the machine's update lock, so two nodes of one machine never update at once;
-//! 2. reads the releases of `automagik-si/arca` (`update.source`) and picks the newest of the channel;
+//! 1. takes the machine's update lock, so two runs of one manager never overlap, and first finishes or rolls back an
+//!    update an earlier run left unconfirmed (its `pending.json`);
+//! 2. reads the releases of `automagik-si/arca` (`update.source`) and picks the newest of the channel; a release this
+//!    machine rolled back is held back until a newer one is published;
 //! 3. finds every systemd unit of its manager whose `ExecStart` runs an Arca program: the installer's `arca.service`,
 //!    the guide's hand-made units, a link, a second node with its own program path. A program is a file that answers
 //!    `--version` with `Automagik Arca <version>`; units are grouped by the file their path resolves to;
-//! 4. keeps each program that is as new as the release, or newer, as it is; never puts an older program over a newer one;
-//! 5. waits, outside `update.window`, and while any node it would restart has an owner approval card waiting;
-//! 6. downloads the binary for this machine's architecture, the release's `SHA256SUMS` and `install.sh`, and checks both
-//!    files against `SHA256SUMS` and the binary's own `--version`; a file that does not match keeps every old program;
-//! 7. puts the binary in place as the installer does: written beside the program and renamed over it in one step, with
-//!    the old one kept as `<program>.previous`. A program on a file system it cannot write (Arca OS's image) is staged
-//!    in the node's state directory instead, and that node's `serve` hands over to it at its start ([`hand_over`]);
-//! 8. restarts the units of the programs it changed one at a time, shims first, then nodes, then links, and reads back
-//!    the version each one's main process runs. A unit that does not come back, or comes back with another version,
-//!    rolls every program back and restarts the units again, and the `kernel-update-failed` alert fires;
+//! 4. keeps each program that is as new as the release, and each that is not byte for byte the published binary of the
+//!    version it says (a build from a branch); never puts an older program over a newer one. A program on a read-only file system is
+//!    the OS's (Arca OS's image), and the OS update brings it: it is named `os-managed` and left alone;
+//! 5. waits outside `update.window`, and while any node it would restart has an owner approval card waiting;
+//! 6. downloads the binary for this machine's architecture, the release's `SHA256SUMS`, its signature and `install.sh`;
+//!    the signature must be one of [`RELEASE_KEYS`] over `SHA256SUMS`, both files must match `SHA256SUMS`, and the
+//!    binary must say the release's version; anything else keeps every old program;
+//! 7. writes `pending.json`, then puts the binary in place as the installer does: written beside the program and renamed
+//!    over it in one step, with the old one kept as `<program>.previous`. A program in a directory this user may not
+//!    write, whose units all hand over ([`hand_over`]), is staged under the user's own state instead;
+//! 8. restarts the units of the programs it changed one at a time, shims first, then nodes, then links, and watches
+//!    each for `update.healthSeconds`: the same process, never restarted, a node answering on its own socket, and the
+//!    release's version read from the process itself. Anything else rolls every program back, restarts the units
+//!    again, and the `kernel-update-failed` alert fires;
 //! 9. runs `arca templates install` for each node that has templates, as the installer does on an upgrade.
 //!
-//! Every look and every step is journalled in `<stateDir>/kernel-update/journal.jsonl` of each node the run touched, and
+//! Every look and every step is journalled in `<stateDir>/kernel-update/journal.jsonl` of each node the run found, and
 //! the last result is in `<stateDir>/kernel-update/state.json`, which `arca_status` and the alert read.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,6 +47,16 @@ use crate::config::{NodeConfig, UpdateChannel, UpdateConfig};
 use crate::handlers::ReleaseVersion as Version;
 use crate::{Failure, Flags};
 
+/// The Ed25519 public keys a release's `SHA256SUMS.sig` must verify against, 32 bytes each; more than one while a key
+/// is rotated.
+///
+/// PLACEHOLDER: NO RELEASE SIGNING KEY EXISTS YET. The list is empty on purpose, and while it is, the updater looks and
+/// says what is available but installs nothing (`unsigned`). Making the key is the owner's call. Once the key pair is
+/// made and its private half is the publish job's `ARCA_RELEASE_SIGNING_KEY` secret (`.github/workflows/release.yml`),
+/// its public half goes here: `openssl pkey -in key.pem -pubout -outform DER | tail -c 32 | od -An -tu1` gives the
+/// 32 bytes.
+pub const RELEASE_KEYS: &[[u8; 32]] = &[];
+
 /// The updater's directory in a node's state directory.
 pub const UPDATE_DIR: &str = "kernel-update";
 /// The last result, in [`UPDATE_DIR`].
@@ -49,14 +65,18 @@ pub const STATE_FILE: &str = "state.json";
 pub const JOURNAL_FILE: &str = "journal.jsonl";
 /// How many owner approval cards wait on the node, written by its `serve` each minute, in [`UPDATE_DIR`].
 pub const WAITING_FILE: &str = "waiting.json";
-/// The program a node hands over to at its start, when its own program cannot be replaced, in [`UPDATE_DIR`].
+/// An update whose programs are in place and whose units were not all confirmed yet, in [`UPDATE_DIR`].
+pub const PENDING_FILE: &str = "pending.json";
+/// In a program's staging directory: the staged program its units hand over to.
 pub const STAGED_FILE: &str = "current.json";
-/// The staged program before the last one, for a rollback, in [`UPDATE_DIR`].
+/// In a program's staging directory: the staged program before the last one, for a rollback.
 pub const STAGED_PREVIOUS_FILE: &str = "previous.json";
-/// Set in the environment of a `serve` that a hand-over started, so it never hands over again.
+/// Set in the environment of a process that a hand-over started, so it never hands over again.
 pub const HANDED_OVER: &str = "ARCA_HANDED_OVER";
 /// The lock one run holds, in the manager's runtime directory.
 const LOCK_FILE: &str = "arca-update.lock";
+/// The lock's place in the staging root when the manager has no runtime directory. No staging step removes it.
+const STAGE_LOCK_FILE: &str = "update.lock";
 /// A waiting count older than this, in milliseconds, is not read: its node is not running.
 const WAITING_MAX_AGE_MS: u64 = 180_000;
 /// The most a release listing may hold.
@@ -67,6 +87,8 @@ const MAX_ASSET: usize = 512 * 1024 * 1024;
 const VERSION_WAIT: Duration = Duration::from_secs(15);
 /// How long one `systemctl` call may take. A restart waits for the unit's start, which waits for its own start steps.
 const SYSTEMCTL_WAIT: Duration = Duration::from_secs(180);
+/// How long a node has to answer one request on its socket.
+const ANSWER_WAIT: Duration = Duration::from_secs(5);
 /// The first look waits this long after a node starts, so a node that an update just restarted settles first.
 const FIRST_LOOK_AFTER: Duration = Duration::from_secs(300);
 /// A run that was put off (a waiting card, outside the window, no answer from the releases) is tried again this soon.
@@ -107,7 +129,9 @@ fn run_for(command: &mut Command, wait: Duration) -> Result<(bool, String, Strin
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return Err(format!("could not start {:?}: {e}", command.get_program())),
+            Err(e) => {
+                return Err(format!("could not start {:?}: {e}", command.get_program()));
+            }
         }
     };
     let drain = |pipe: Option<Box<dyn io::Read + Send>>| {
@@ -161,10 +185,10 @@ fn now_ms() -> u64 {
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// Releases
+// Releases and their signature
 // -------------------------------------------------------------------------------------------------------------------
 
-/// One release of the channel: its version and its assets by name.
+/// One release: its version and its assets by name.
 #[derive(Debug, Clone)]
 pub struct Release {
     pub version: Version,
@@ -173,54 +197,55 @@ pub struct Release {
     pub assets: BTreeMap<String, String>,
 }
 
+/// One release of a GitHub releases answer, when it is a `v<semantic version>` tag and not a draft.
+fn release_of(release: &Value) -> Option<Release> {
+    if release["draft"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let tag = release["tag_name"].as_str()?;
+    let text = tag.strip_prefix('v')?;
+    let version = Version::parse(text)?;
+    let assets = release["assets"]
+        .as_array()
+        .map(|assets| {
+            assets
+                .iter()
+                .filter_map(|asset| {
+                    Some((
+                        asset["name"].as_str()?.to_string(),
+                        asset["browser_download_url"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Release {
+        version,
+        version_text: text.to_string(),
+        tag: tag.to_string(),
+        assets,
+    })
+}
+
 /// The newest release of `channel` in a GitHub releases listing. A draft is never one; a pre-release only in the
 /// `prerelease` channel; a tag that is not `v<semantic version>` is skipped.
 pub fn newest_release(listing: &str, channel: UpdateChannel) -> Result<Option<Release>, String> {
     let releases: Vec<Value> = serde_json::from_str(listing)
         .map_err(|_| "the releases listing is not a JSON list".to_string())?;
     let mut newest: Option<Release> = None;
-    for release in releases {
-        if release["draft"].as_bool().unwrap_or(false) {
-            continue;
-        }
+    for release in &releases {
         if release["prerelease"].as_bool().unwrap_or(false) && channel == UpdateChannel::Stable {
             continue;
         }
-        let Some(tag) = release["tag_name"].as_str() else {
-            continue;
-        };
-        let Some(text) = tag.strip_prefix('v') else {
-            continue;
-        };
-        let Some(version) = Version::parse(text) else {
+        let Some(release) = release_of(release) else {
             continue;
         };
         if newest
             .as_ref()
-            .is_some_and(|newest| newest.version >= version)
+            .is_none_or(|newest| release.version > newest.version)
         {
-            continue;
+            newest = Some(release);
         }
-        let assets = release["assets"]
-            .as_array()
-            .map(|assets| {
-                assets
-                    .iter()
-                    .filter_map(|asset| {
-                        Some((
-                            asset["name"].as_str()?.to_string(),
-                            asset["browser_download_url"].as_str()?.to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        newest = Some(Release {
-            version,
-            version_text: text.to_string(),
-            tag: tag.to_string(),
-            assets,
-        });
     }
     Ok(newest)
 }
@@ -241,17 +266,26 @@ pub fn checksum_of(sums: &str, name: &str) -> Option<String> {
     })
 }
 
+/// Whether `signature` (64 bytes, as `openssl pkeyutl -sign` writes it) is one of `keys`' Ed25519 signatures of `sums`.
+pub fn signed_by(keys: &[[u8; 32]], sums: &[u8], signature: &[u8]) -> bool {
+    signature.len() == 64
+        && keys.iter().any(|key| {
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+                .verify(sums, signature)
+                .is_ok()
+        })
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
+fn sha256_of(mut reader: impl io::Read) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 16];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -262,6 +296,28 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect())
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    sha256_of(File::open(path)?)
+}
+
+/// Why a fetch did not give a body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetch {
+    /// The address answered 404.
+    NotFound,
+    /// Anything else, in words that hold no credential.
+    Failed(String),
+}
+
+impl Fetch {
+    fn words(self) -> String {
+        match self {
+            Self::NotFound => "not found".to_string(),
+            Self::Failed(words) => words,
+        }
+    }
 }
 
 /// The updater's HTTP client: TLS through rustls and ring with the Mozilla roots, so a static program needs no system
@@ -299,8 +355,8 @@ impl Http {
         Ok(Self { runtime, client })
     }
 
-    /// The body at `url`, at most `max` bytes, or why it could not be read.
-    pub fn get(&self, url: &str, max: usize) -> Result<Vec<u8>, String> {
+    /// The body at `url`, at most `max` bytes.
+    pub fn get(&self, url: &str, max: usize) -> Result<Vec<u8>, Fetch> {
         self.runtime.block_on(async {
             let mut response = self
                 .client
@@ -311,18 +367,24 @@ impl Http {
                 )
                 .send()
                 .await
-                .map_err(|e| format!("{url} did not answer: {}", without_url(&e)))?;
+                .map_err(|e| Fetch::Failed(format!("{url} did not answer: {}", without_url(&e))))?;
+            if response.status().as_u16() == 404 {
+                return Err(Fetch::NotFound);
+            }
             if !response.status().is_success() {
-                return Err(format!("{url} answered {}", response.status().as_u16()));
+                return Err(Fetch::Failed(format!(
+                    "{url} answered {}",
+                    response.status().as_u16()
+                )));
             }
             let mut body = Vec::new();
             while let Some(chunk) = response
                 .chunk()
                 .await
-                .map_err(|e| format!("{url} was cut short: {}", without_url(&e)))?
+                .map_err(|e| Fetch::Failed(format!("{url} was cut short: {}", without_url(&e))))?
             {
                 if body.len() + chunk.len() > max {
-                    return Err(format!("{url} is larger than {max} bytes"));
+                    return Err(Fetch::Failed(format!("{url} is larger than {max} bytes")));
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -337,6 +399,47 @@ fn without_url(error: &reqwest::Error) -> String {
         text = text.replace(url.as_str(), "the address");
     }
     text
+}
+
+/// Why a release's checksums cannot be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sums {
+    /// The release has no `SHA256SUMS.sig`, or this program holds no key to check one with.
+    Unsigned(String),
+    /// The signature does not verify, or a file is missing or cannot be read.
+    Bad(String),
+}
+
+/// The release's `SHA256SUMS`, once its signature verified against `keys`.
+fn signed_sums(http: &Http, release: &Release, keys: &[[u8; 32]]) -> Result<String, Sums> {
+    if keys.is_empty() {
+        return Err(Sums::Unsigned(
+            "this program holds no release signing key, so it installs no release by itself"
+                .to_string(),
+        ));
+    }
+    let fetch = |name: &str| -> Result<Vec<u8>, Sums> {
+        let url = release.assets.get(name).ok_or_else(|| {
+            if name == "SHA256SUMS.sig" {
+                Sums::Unsigned(format!(
+                    "release {} is not signed (no SHA256SUMS.sig)",
+                    release.tag
+                ))
+            } else {
+                Sums::Bad(format!("release {} has no {name}", release.tag))
+            }
+        })?;
+        http.get(url, MAX_LISTING).map_err(|e| Sums::Bad(e.words()))
+    };
+    let sums = fetch("SHA256SUMS")?;
+    let signature = fetch("SHA256SUMS.sig")?;
+    if !signed_by(keys, &sums, &signature) {
+        return Err(Sums::Bad(format!(
+            "the signature of release {}'s SHA256SUMS does not verify against this program's release keys; every program was kept",
+            release.tag
+        )));
+    }
+    Ok(String::from_utf8_lossy(&sums).into_owned())
 }
 
 // -------------------------------------------------------------------------------------------------------------------
@@ -369,6 +472,11 @@ impl Role {
             Self::Link => "link",
             Self::Other => "other",
         }
+    }
+
+    /// Whether a unit of this role hands over to a staged program at its start ([`hand_over`]).
+    pub fn hands_over(self) -> bool {
+        self != Role::Other
     }
 }
 
@@ -419,6 +527,8 @@ pub trait Units {
     fn running(&self, unit: &str) -> Result<Running, String>;
     /// The version the unit's main process runs, as that process's own program says.
     fn running_version(&self, unit: &str, running: &Running) -> Option<String>;
+    /// Whether a node unit answers on its own socket now.
+    fn answers(&self, unit: &Unit) -> bool;
 }
 
 /// The systemd manager this process belongs to: the system's for root, else the user's.
@@ -499,6 +609,31 @@ fn may_be_arca(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with("arca"))
+}
+
+/// Whether something answers HTTP on the unix socket `socket`: a tokenless `POST /mcp` gets a status line (401 from a
+/// node) within [`ANSWER_WAIT`].
+pub fn socket_answers(socket: &Path) -> bool {
+    use std::os::unix::net::UnixStream;
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(ANSWER_WAIT));
+    let _ = stream.set_read_timeout(Some(ANSWER_WAIT));
+    let request =
+        "POST /mcp HTTP/1.1\r\nHost: arca\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut head = [0u8; 12];
+    let mut read = 0;
+    while read < head.len() {
+        match stream.read(&mut head[read..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => read += n,
+        }
+    }
+    head[..read].starts_with(b"HTTP/1.")
 }
 
 impl Units for Systemd {
@@ -592,13 +727,130 @@ impl Units for Systemd {
         (running.pid > 0)
             .then(|| program_version(&PathBuf::from(format!("/proc/{}/exe", running.pid))))?
     }
+
+    fn answers(&self, unit: &Unit) -> bool {
+        node_config(unit).is_some_and(|config| socket_answers(&config.listen.unix))
+    }
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// Staged programs (a program on a file system the updater cannot write, such as Arca OS's image)
+// Where a program goes: in place, staged, or left to the OS
 // -------------------------------------------------------------------------------------------------------------------
 
-/// A program staged in a node's state directory, as its manifest names it and checked against it.
+/// What a write beside a program found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirWrite {
+    /// The directory can be written.
+    Writable,
+    /// The file system is read-only: the program belongs to the OS image.
+    ReadOnly,
+    /// This user may not write the directory.
+    Denied,
+    /// Anything else, in words.
+    Failed(String),
+}
+
+/// Where the release goes for one program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// Renamed over the program.
+    InPlace,
+    /// Staged in the user's staging root, for its units to hand over to.
+    Staged,
+    /// The OS brings this program; the updater leaves it alone. The words say why.
+    OsManaged(String),
+    /// It cannot be updated here; the words name why (the units that would not hand over).
+    Refused(String),
+}
+
+/// Whether the directory `dir` can be written, found by making and removing one empty file there.
+pub fn probe_write(dir: &Path) -> DirWrite {
+    if mount_flags(dir).is_some_and(|flags| flags.contains(rustix::fs::StatVfsMountFlags::RDONLY)) {
+        return DirWrite::ReadOnly;
+    }
+    let probe = dir.join(format!(".arca-update-probe.{}", std::process::id()));
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            DirWrite::Writable
+        }
+        Err(e) if e.kind() == io::ErrorKind::ReadOnlyFilesystem => DirWrite::ReadOnly,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => DirWrite::Denied,
+        Err(e) => DirWrite::Failed(format!("{} cannot be written: {e}", dir.display())),
+    }
+}
+
+/// The mount flags of the file system `path` is on, or of its nearest ancestor that exists.
+fn mount_flags(path: &Path) -> Option<rustix::fs::StatVfsMountFlags> {
+    let mut path = path;
+    loop {
+        if let Ok(stat) = rustix::fs::statvfs(path) {
+            return Some(stat.f_flag);
+        }
+        path = path.parent()?;
+    }
+}
+
+/// Whether programs staged under `root` may run: its file system is neither read-only nor mounted `noexec`.
+pub fn stage_runs(root: &Path) -> bool {
+    use rustix::fs::StatVfsMountFlags as F;
+    mount_flags(root).is_some_and(|flags| !flags.intersects(F::NOEXEC | F::RDONLY))
+}
+
+/// Where the release goes for a program in a directory that `write` found, whose staging root may run programs or
+/// not, run by `units`.
+pub fn placement(write: &DirWrite, stage_runs: bool, units: &[Unit]) -> Placement {
+    match write {
+        DirWrite::Writable => Placement::InPlace,
+        DirWrite::ReadOnly => Placement::OsManaged(
+            "it is on a read-only file system: the OS image brings it, through the OS update".to_string(),
+        ),
+        DirWrite::Denied if !stage_runs => Placement::OsManaged(
+            "this user may not write it, and the place a release would be staged in may not run programs (noexec)"
+                .to_string(),
+        ),
+        DirWrite::Denied => {
+            let stuck: Vec<&str> = units
+                .iter()
+                .filter(|unit| unit.active && !unit.role().hands_over())
+                .map(|unit| unit.name.as_str())
+                .collect();
+            if stuck.is_empty() {
+                Placement::Staged
+            } else {
+                Placement::Refused(format!(
+                    "this user may not write it, and {} would not run a staged release",
+                    stuck.join(", ")
+                ))
+            }
+        }
+        DirWrite::Failed(words) => Placement::Refused(words.clone()),
+    }
+}
+
+/// The user's staging root: `/var/lib/arca-update` for root, else `~/.local/state/arca-update`.
+pub fn stage_root() -> Option<PathBuf> {
+    if rustix::process::geteuid().is_root() {
+        return Some(PathBuf::from("/var/lib/arca-update"));
+    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| Path::new(&home).join(".local/state/arca-update"))
+}
+
+/// A program's own staging directory under `root`: named by the SHA-256 of the program's path, so two programs of one
+/// user never share one.
+pub fn staging_dir(root: &Path, program: &Path) -> PathBuf {
+    let digest = sha256_hex(program.as_os_str().as_encoded_bytes());
+    root.join(&digest[..16])
+}
+
+/// A staged program as its manifest names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Staged {
     pub path: PathBuf,
@@ -620,54 +872,85 @@ fn staged_manifest(dir: &Path, file: &str) -> Option<Staged> {
     })
 }
 
-/// The program staged for the node with this state directory, when there is one this process may run: a regular file
-/// of this user's that nobody else may write, whose content is the manifest's.
-pub fn staged_program(state_dir: &Path) -> Option<Staged> {
-    let staged = staged_manifest(&state_dir.join(UPDATE_DIR), STAGED_FILE)?;
+/// Whether a staged file may run: a regular file (never a link) of this user's that nobody else may write.
+fn staged_file_ok(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_file()
+        && meta.uid() == rustix::process::geteuid().as_raw()
+        && meta.mode() & 0o022 == 0
+}
+
+/// The program staged in the staging directory `dir`, when there is one this process may run and whose content is
+/// the manifest's.
+pub fn staged_program(dir: &Path) -> Option<Staged> {
+    let staged = staged_manifest(dir, STAGED_FILE)?;
     let meta = fs::symlink_metadata(&staged.path).ok()?;
-    let own = rustix::process::geteuid().as_raw();
-    if !meta.file_type().is_file() || meta.uid() != own || meta.mode() & 0o022 != 0 {
+    if !staged_file_ok(&meta) {
         return None;
     }
     (sha256_file(&staged.path).ok()? == staged.sha256).then_some(staged)
 }
 
-/// At the start of `serve`: when the node's state directory holds a staged program newer than this one, the process
-/// becomes that program, with the same arguments. A staged program that is not newer is left alone, so an OS update
-/// that brought a newer program wins. Nothing here stops the start: a hand-over that fails is said, and this program
-/// goes on.
-pub fn hand_over(state_dir: &Path) {
+/// Whether a program of version `own` hands over to a staged program of version `staged`: only to a newer one, so an
+/// OS update or an install that brought a newer program wins.
+pub fn should_hand_over(own: &str, staged: &str) -> bool {
+    newer(staged, own)
+}
+
+/// At the start of `serve`, `shim` and `link serve`: when this program has a staged release newer than itself, the
+/// process becomes that release, with the same arguments. The staged file is opened once, without following a link,
+/// checked and hashed through that one descriptor, and that very file is run (`/proc/self/fd/<n>`). Nothing here stops
+/// the start: a hand-over that cannot happen is said, and this program goes on.
+pub fn hand_over() {
+    use std::os::unix::io::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
     if std::env::var_os(HANDED_OVER).is_some() {
         return;
     }
-    let Some(staged) = staged_program(state_dir) else {
+    let (Some(root), Ok(own)) = (stage_root(), std::env::current_exe()) else {
         return;
     };
-    let (Some(staged_version), Some(own)) = (
-        Version::parse(&staged.version),
-        Version::parse(env!("CARGO_PKG_VERSION")),
-    ) else {
+    let own = fs::canonicalize(&own).unwrap_or(own);
+    let dir = staging_dir(&root, &own);
+    let Some(staged) = staged_manifest(&dir, STAGED_FILE) else {
         return;
     };
-    if staged_version <= own {
+    if !should_hand_over(env!("CARGO_PKG_VERSION"), &staged.version) {
         return;
     }
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let refuse = |why: &str| {
+        eprintln!(
+            "arca: the staged release {} at {} is not used: {why}; this program goes on",
+            staged.version,
+            staged.path.display()
+        );
+    };
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&staged.path)
+    else {
+        return refuse("it cannot be opened");
+    };
+    if !file.metadata().is_ok_and(|meta| staged_file_ok(&meta)) {
+        return refuse("it is not a file of this user's that only this user may write");
+    }
+    if sha256_of(&file).ok().as_deref() != Some(staged.sha256.as_str()) {
+        return refuse("its content is not the manifest's");
+    }
+    let mut args = std::env::args_os();
+    let arg0 = args.next().unwrap_or_else(|| OsString::from("arca"));
     eprintln!(
         "arca: this program is {}; handing over to the kernel update {} staged at {}",
         env!("CARGO_PKG_VERSION"),
         staged.version,
         staged.path.display()
     );
-    let error = Command::new(&staged.path)
+    let error = Command::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .arg0(arg0)
         .args(args)
         .env(HANDED_OVER, "1")
         .exec();
-    eprintln!(
-        "arca: the hand-over to {} failed ({error}); this program goes on",
-        staged.path.display()
-    );
+    refuse(&format!("it did not start ({error})"));
 }
 
 // -------------------------------------------------------------------------------------------------------------------
@@ -697,6 +980,12 @@ fn write_private(path: &Path, text: &str) -> io::Result<()> {
 /// The last result of the updater on the node with this state directory, or `None` when it never ran there.
 pub fn read_state(state_dir: &Path) -> Option<Value> {
     let text = fs::read_to_string(state_dir.join(UPDATE_DIR).join(STATE_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// An update left unconfirmed on the node with this state directory.
+pub fn read_pending(state_dir: &Path) -> Option<Value> {
+    let text = fs::read_to_string(state_dir.join(UPDATE_DIR).join(PENDING_FILE)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -732,7 +1021,7 @@ impl Records {
     }
 
     /// The last result, merged over what the record held, so a look keeps the last update's time.
-    fn state(&self, fields: Value) {
+    fn state(&self, fields: &Value) {
         for dir in &self.dirs {
             let mut state = read_state(dir).unwrap_or_else(|| json!({}));
             if let (Some(state), Some(fields)) = (state.as_object_mut(), fields.as_object()) {
@@ -749,9 +1038,30 @@ impl Records {
             }
         }
     }
+
+    /// Writes the pending update into every node's record. It is written before the first program changes.
+    fn pending(&self, pending: &Value) -> Result<(), String> {
+        for dir in &self.dirs {
+            let path = dir.join(UPDATE_DIR).join(PENDING_FILE);
+            write_private(&path, &format!("{pending}\n")).map_err(|e| {
+                format!(
+                    "the pending record {} cannot be written: {e}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn clear_pending(&self) {
+        for dir in &self.dirs {
+            let _ = fs::remove_file(dir.join(UPDATE_DIR).join(PENDING_FILE));
+        }
+    }
 }
 
-/// The count of waiting cards a node's `serve` wrote, when it is fresh.
+/// The count of waiting cards a node's `serve` wrote, when it is fresh. A stale or missing count is no card: its node
+/// is not running, or cannot say.
 fn waiting_on(state_dir: &Path, now: u64) -> Option<u64> {
     let text = fs::read_to_string(state_dir.join(UPDATE_DIR).join(WAITING_FILE)).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
@@ -779,36 +1089,75 @@ struct Program {
     path: PathBuf,
     /// What the units' paths say, for the words.
     named: BTreeSet<PathBuf>,
-    /// The version the file says, or a staged program's when that is newer.
+    /// The version the program's units run: the file's, or a staged release's when that is newer.
     version: String,
+    /// The SHA-256 of what the units run.
+    sha256: Option<String>,
     units: Vec<Unit>,
-    /// The state directory of a node that runs it, where it may be staged.
-    state_dir: Option<PathBuf>,
+    /// The state directories of the nodes that run it.
+    state_dirs: BTreeSet<PathBuf>,
 }
 
 /// How one program was changed, so it can be put back.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Changed {
     /// Renamed over in place; the old file is at `previous`.
     InPlace { path: PathBuf, previous: PathBuf },
-    /// Staged in a node's state directory; the earlier manifest, if any, is kept as `previous.json`.
+    /// Staged in the program's staging directory; the earlier manifest, if any, is kept as `previous.json`.
     Staged { dir: PathBuf, had_previous: bool },
 }
 
-/// What one run needs from outside: the service manager, the clock's pace and where the installer keeps its note.
+impl Changed {
+    fn json(&self) -> Value {
+        match self {
+            Self::InPlace { path, previous } => {
+                json!({ "how": "in-place", "path": path, "previous": previous })
+            }
+            Self::Staged { dir, had_previous } => {
+                json!({ "how": "staged", "dir": dir, "hadPrevious": had_previous })
+            }
+        }
+    }
+
+    fn of(value: &Value) -> Option<Self> {
+        match value["how"].as_str()? {
+            "in-place" => Some(Self::InPlace {
+                path: PathBuf::from(value["path"].as_str()?),
+                previous: PathBuf::from(value["previous"].as_str()?),
+            }),
+            "staged" => Some(Self::Staged {
+                dir: PathBuf::from(value["dir"].as_str()?),
+                had_previous: value["hadPrevious"].as_bool()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// One unit a run restarts, and the version it ran before.
+#[derive(Debug, Clone)]
+struct Restart {
+    unit: Unit,
+    from: String,
+}
+
+/// What one run needs from outside: the service manager, the release keys, the clock's pace, and its places.
 pub struct Run<'a> {
     pub config: &'a NodeConfig,
     pub units: &'a dyn Units,
     /// This machine's architecture, as the release names it (`x86_64`, `aarch64`).
     pub arch: &'a str,
-    /// How long a restarted unit may take to come back, and how long it must then stay up.
+    /// The keys a release's `SHA256SUMS.sig` must verify against: [`RELEASE_KEYS`].
+    pub keys: &'a [[u8; 32]],
+    /// How long a restarted unit has to come back, and how long it must then stay up.
     pub health: Duration,
-    pub settle: Duration,
     pub poll: Duration,
     /// The installer's own note of the program it installed (`~/.local/state/arca-install/program.sha256`).
     pub install_note: Option<PathBuf>,
     /// The machine's update lock.
     pub lock: PathBuf,
+    /// Where releases are staged for programs this user may not write: [`stage_root`].
+    pub stage_root: Option<PathBuf>,
     /// The time of day, minutes in UTC, for the window.
     pub minute_of_day: u32,
 }
@@ -816,7 +1165,8 @@ pub struct Run<'a> {
 /// What one run ended with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// `up-to-date`, `updated`, `deferred`, `waiting-for-window`, `check-failed`, `failed`, `rolled-back` or `busy`.
+    /// `up-to-date`, `updated`, `deferred`, `waiting-for-window`, `check-failed`, `failed`, `rolled-back`, `held-back`,
+    /// `os-managed`, `branch-build`, `unsigned`, `available` (a look of `arca update check`) or `busy`.
     pub result: &'static str,
     pub reason: Option<String>,
     pub available: Option<String>,
@@ -842,9 +1192,20 @@ impl Outcome {
         })
     }
 
-    /// Whether the run failed in a way the alert names: a release that did not verify, or one rolled back.
+    /// Whether the run failed in a way the alert names: a release that did not verify, one rolled back, or one held
+    /// back because it was rolled back.
     pub fn failed(&self) -> bool {
-        matches!(self.result, "failed" | "rolled-back")
+        matches!(self.result, "failed" | "rolled-back" | "held-back")
+    }
+
+    /// Whether the run settles the alert: a failure sets it, and an update, an up-to-date look or a program the
+    /// updater leaves alone clears it. A put-off look leaves it as it was.
+    fn settles(&self) -> bool {
+        self.failed()
+            || matches!(
+                self.result,
+                "updated" | "up-to-date" | "os-managed" | "branch-build" | "unsigned"
+            )
     }
 }
 
@@ -858,7 +1219,8 @@ pub fn in_window(window: Option<(u32, u32)>, minute: u32) -> bool {
 }
 
 impl Run<'_> {
-    /// One look, and an update when one is due. Everything is journalled; only the lock held by another run is not.
+    /// One look, and an update when one is due. Everything is journalled; only the lock held by another run is not, and
+    /// `arca update check` (`install` false) writes nothing.
     pub fn run(&self, install: bool) -> Outcome {
         let lock = match self.take_lock() {
             Ok(lock) => lock,
@@ -867,24 +1229,36 @@ impl Run<'_> {
         let mut records = Records {
             dirs: BTreeSet::from([self.config.state_dir.clone()]),
         };
-        let outcome = self.look(install, &mut records);
-        let now = now_ms();
-        let mut fields = json!({
-            "checkedAtMs": now,
-            "result": outcome.result,
-            "reason": outcome.reason,
-            "failed": outcome.failed(),
-        });
-        if let Some(available) = &outcome.available {
-            fields["available"] = json!(available);
-        }
-        if outcome.result == "updated" {
-            fields["updatedAtMs"] = json!(now);
-            fields["updated"] = outcome.detail["units"].clone();
-        }
-        // `arca update check` only looks: it writes no record.
+        let pending = install
+            .then(|| read_pending(&self.config.state_dir))
+            .flatten();
+        let outcome = match pending {
+            Some(pending) => self.settle_pending(&pending, &mut records),
+            None => self.look(install, &mut records),
+        };
         if install {
-            records.state(fields);
+            let now = now_ms();
+            let mut fields = json!({
+                "checkedAtMs": now,
+                "result": outcome.result,
+                "reason": outcome.reason,
+            });
+            if let Some(available) = &outcome.available {
+                fields["available"] = json!(available);
+            }
+            if outcome.settles() {
+                fields["failed"] = json!(outcome.failed());
+            }
+            match outcome.result {
+                "updated" => {
+                    fields["updatedAtMs"] = json!(now);
+                    fields["updated"] = outcome.detail["units"].clone();
+                    fields["rolledBack"] = Value::Null;
+                }
+                "rolled-back" => fields["rolledBack"] = json!(outcome.available),
+                _ => {}
+            }
+            records.state(&fields);
             records.line(
                 "check",
                 json!({
@@ -919,6 +1293,13 @@ impl Run<'_> {
         Ok(file)
     }
 
+    /// The staging directory of a program, when this user has a staging root.
+    fn staging(&self, program: &Path) -> Option<PathBuf> {
+        self.stage_root
+            .as_deref()
+            .map(|root| staging_dir(root, program))
+    }
+
     /// The programs the units run, grouped by the file each path resolves to. A path that does not answer as an Arca
     /// program is not one.
     fn programs(&self, units: Vec<Unit>) -> Vec<Program> {
@@ -941,24 +1322,71 @@ impl Run<'_> {
                 path: file.clone(),
                 named: BTreeSet::new(),
                 version: version.clone(),
+                sha256: sha256_file(&file).ok(),
                 units: Vec::new(),
-                state_dir: None,
+                state_dirs: BTreeSet::new(),
             });
             program.named.insert(unit.program.clone());
-            if program.state_dir.is_none() {
-                program.state_dir = state_dir;
-            }
+            program.state_dirs.extend(state_dir);
             program.units.push(unit);
         }
-        // A program staged in a node's state directory is what that node runs when it is newer than the file.
+        // A release staged for a program is what its units run when it is newer than the file.
         for program in by_file.values_mut() {
-            if let Some(staged) = program.state_dir.as_deref().and_then(staged_program)
+            if let Some(staged) = self
+                .staging(&program.path)
+                .and_then(|dir| staged_program(&dir))
                 && newer(&staged.version, &program.version)
             {
                 program.version = staged.version;
+                program.sha256 = Some(staged.sha256);
             }
         }
         by_file.into_values().collect()
+    }
+
+    /// Whether `program` is, byte for byte, the published binary of its own version: a release this updater may replace.
+    /// A build from a branch says a release's version and is another file; a version that was never published is one
+    /// too. The checksums only name what a program is, so their signature is not needed here: a false listing could at
+    /// most keep a program, or have it replaced by a release whose own signature verified.
+    fn is_release_build(
+        &self,
+        http: &Http,
+        program: &Program,
+        known: &mut BTreeMap<String, Option<String>>,
+    ) -> Result<bool, String> {
+        let want = match known.get(&program.version) {
+            Some(want) => want.clone(),
+            None => {
+                let url = format!(
+                    "{}/releases/tags/v{}",
+                    self.config.update.source, program.version
+                );
+                let release = match http.get(&url, MAX_LISTING) {
+                    Err(Fetch::NotFound) => None,
+                    Err(Fetch::Failed(words)) => return Err(words),
+                    Ok(body) => serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .as_ref()
+                        .and_then(release_of),
+                };
+                let want = match release
+                    .as_ref()
+                    .and_then(|release| release.assets.get("SHA256SUMS"))
+                {
+                    None => None,
+                    Some(url) => {
+                        let sums = http.get(url, MAX_LISTING).map_err(Fetch::words)?;
+                        checksum_of(
+                            &String::from_utf8_lossy(&sums),
+                            &asset_name(&program.version, self.arch),
+                        )
+                    }
+                };
+                known.insert(program.version.clone(), want.clone());
+                want
+            }
+        };
+        Ok(want.is_some() && want == program.sha256)
     }
 
     fn look(&self, install: bool, records: &mut Records) -> Outcome {
@@ -972,7 +1400,7 @@ impl Run<'_> {
             MAX_LISTING,
         ) {
             Ok(body) => String::from_utf8_lossy(&body).into_owned(),
-            Err(reason) => return Outcome::new("check-failed", Some(reason), None),
+            Err(fetch) => return Outcome::new("check-failed", Some(fetch.words()), None),
         };
         let release = match newest_release(&listing, update.channel) {
             Ok(Some(release)) => release,
@@ -995,31 +1423,110 @@ impl Run<'_> {
         };
         let programs = self.programs(units);
         for program in &programs {
-            if let Some(dir) = &program.state_dir {
-                records.dirs.insert(dir.clone());
-            }
+            records.dirs.extend(program.state_dirs.iter().cloned());
         }
-        let behind: Vec<&Program> = programs
-            .iter()
-            .filter(|program| newer(&release.version_text, &program.version))
-            .collect();
         let mut outcome = Outcome::new("up-to-date", None, available.clone());
-        outcome.detail = json!({
-            "programs": programs.iter().map(|program| json!({
+        let mut rows = Vec::new();
+        let mut behind: Vec<(&Program, Placement)> = Vec::new();
+        let mut kept: Vec<(&'static str, String)> = Vec::new();
+        let mut known = BTreeMap::new();
+        for program in &programs {
+            let mut row = json!({
                 "path": program.path,
                 "version": program.version,
                 "units": program.units.iter().map(|unit| &unit.name).collect::<Vec<_>>(),
                 "behind": newer(&release.version_text, &program.version),
-            })).collect::<Vec<_>>(),
+            });
+            if newer(&release.version_text, &program.version) {
+                let dir = program.path.parent().unwrap_or(Path::new("/"));
+                let stage_ok = self.stage_root.as_deref().is_some_and(stage_runs);
+                match placement(&probe_write(dir), stage_ok, &program.units) {
+                    Placement::OsManaged(why) => {
+                        row["kept"] = json!("os-managed");
+                        kept.push(("os-managed", format!("{}: {why}", program.path.display())));
+                    }
+                    placement => match self.is_release_build(&http, program, &mut known) {
+                        Err(reason) => {
+                            return Outcome::new("check-failed", Some(reason), available);
+                        }
+                        Ok(false) => {
+                            row["kept"] = json!("branch-build");
+                            kept.push((
+                                    "branch-build",
+                                    format!(
+                                        "{} says {} but is not that release's published binary (a build from a branch): it is kept",
+                                        program.path.display(),
+                                        program.version
+                                    ),
+                                ));
+                        }
+                        Ok(true) => {
+                            row["placement"] = json!(match &placement {
+                                Placement::InPlace => "in-place",
+                                Placement::Staged => "staged",
+                                _ => "refused",
+                            });
+                            behind.push((program, placement));
+                        }
+                    },
+                }
+            }
+            rows.push(row);
+        }
+        outcome.detail = json!({ "programs": rows });
+        if programs.is_empty() {
+            outcome.reason = Some("no unit of this manager runs an Arca program".to_string());
+        }
+        let kept_words = (!kept.is_empty()).then(|| {
+            kept.iter()
+                .map(|(_, words)| words.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
         });
         if behind.is_empty() {
-            if programs.is_empty() {
-                outcome.reason = Some("no unit of this manager runs an Arca program".to_string());
+            if let Some((kind, _)) = kept.first() {
+                outcome.result = *kind;
+                outcome.reason = kept_words;
             }
             return outcome;
         }
         if !install {
             outcome.result = "available";
+            outcome.reason = kept_words;
+            return outcome;
+        }
+        if self.keys.is_empty() {
+            outcome.result = "unsigned";
+            outcome.reason = Some(
+                "this program holds no release signing key, so it installs no release by itself"
+                    .to_string(),
+            );
+            return outcome;
+        }
+        let rolled_back = read_state(&self.config.state_dir)
+            .and_then(|state| state["rolledBack"].as_str().map(str::to_string));
+        if rolled_back.as_deref() == Some(release.version_text.as_str()) {
+            outcome.result = "held-back";
+            outcome.reason = Some(format!(
+                "release {} was rolled back on this machine; the next newer release is installed",
+                release.version_text
+            ));
+            return outcome;
+        }
+        if let Some((program, Placement::Refused(why))) = behind
+            .iter()
+            .find(|(_, placement)| matches!(placement, Placement::Refused(_)))
+        {
+            let reason = format!(
+                "{} cannot be updated: {why}; every program was kept",
+                program.path.display()
+            );
+            records.line(
+                "failed",
+                json!({ "release": release.version_text, "reason": reason }),
+            );
+            outcome.result = "failed";
+            outcome.reason = Some(reason);
             return outcome;
         }
         let window = update
@@ -1038,7 +1545,7 @@ impl Run<'_> {
         let now = now_ms();
         let waiting: Vec<String> = behind
             .iter()
-            .flat_map(|program| program.units.iter())
+            .flat_map(|(program, _)| program.units.iter())
             .filter(|unit| unit.active && unit.role() == Role::Node)
             .filter_map(|unit| {
                 let dir = node_config(unit)?.state_dir;
@@ -1065,7 +1572,7 @@ impl Run<'_> {
         &self,
         http: &Http,
         release: &Release,
-        behind: &[&Program],
+        behind: &[(&Program, Placement)],
         records: &Records,
         mut outcome: Outcome,
     ) -> Outcome {
@@ -1079,28 +1586,30 @@ impl Run<'_> {
             outcome
         };
         let asset = asset_name(&release.version_text, self.arch);
+        records.line(
+            "download",
+            json!({ "release": release.version_text, "asset": asset }),
+        );
+        let sums = match signed_sums(http, release, self.keys) {
+            Ok(sums) => sums,
+            Err(Sums::Unsigned(reason)) => {
+                outcome.result = "unsigned";
+                outcome.reason = Some(reason);
+                return outcome;
+            }
+            Err(Sums::Bad(reason)) => return failed(outcome, reason),
+        };
         let fetch = |name: &str| -> Result<Vec<u8>, String> {
             let url = release
                 .assets
                 .get(name)
                 .ok_or_else(|| format!("release {} has no {name}", release.tag))?;
-            http.get(url, MAX_ASSET)
+            http.get(url, MAX_ASSET).map_err(Fetch::words)
         };
-        records.line(
-            "download",
-            json!({ "release": release.version_text, "asset": asset }),
-        );
-        let (sums, binary, installer) =
-            match (fetch("SHA256SUMS"), fetch(&asset), fetch("install.sh")) {
-                (Ok(sums), Ok(binary), Ok(installer)) => (
-                    String::from_utf8_lossy(&sums).into_owned(),
-                    binary,
-                    installer,
-                ),
-                (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
-                    return failed(outcome, reason);
-                }
-            };
+        let (binary, installer) = match (fetch(&asset), fetch("install.sh")) {
+            (Ok(binary), Ok(installer)) => (binary, installer),
+            (Err(reason), _) | (_, Err(reason)) => return failed(outcome, reason),
+        };
         for (name, bytes) in [(asset.as_str(), &binary), ("install.sh", &installer)] {
             let Some(want) = checksum_of(&sums, name) else {
                 return failed(
@@ -1119,101 +1628,109 @@ impl Run<'_> {
             }
         }
         let sha256 = sha256_hex(&binary);
-        // The program is written beside the first program it replaces and asked its version there, so a binary that
-        // does not start on this machine changes nothing.
-        let mut changed: Vec<Changed> = Vec::new();
-        let mut moved: Vec<Value> = Vec::new();
-        for program in behind {
-            match self.put_in_place(program, release, &binary, &sha256) {
-                Ok(change) => {
-                    records.line(
-                        "install",
-                        json!({ "program": program.path, "from": program.version, "to": release.version_text,
-                                "how": match &change { Changed::InPlace { .. } => "in-place", Changed::Staged { .. } => "staged" } }),
-                    );
-                    changed.push(change);
-                }
+        // The units to restart: the active ones of each program that changes, shims first, then nodes, then links.
+        let mut restarts: Vec<Restart> = behind
+            .iter()
+            .flat_map(|(program, _)| {
+                program.units.iter().map(move |unit| Restart {
+                    unit: unit.clone(),
+                    from: program.version.clone(),
+                })
+            })
+            .filter(|restart| restart.unit.active)
+            .collect();
+        restarts.sort_by(|a, b| (a.unit.role(), &a.unit.name).cmp(&(b.unit.role(), &b.unit.name)));
+        // Every program is written and checked beside its place before the first one is renamed, and the pending
+        // record names what will change, so a run that is killed half-way is finished or undone by the next one.
+        let mut prepared = Vec::new();
+        for (program, placement) in behind {
+            match self.prepare(program, placement, release, &binary) {
+                Ok(step) => prepared.push((program, step)),
                 Err(reason) => {
-                    rollback(&changed);
+                    for (_, step) in &prepared {
+                        step.discard();
+                    }
                     return failed(outcome, reason);
                 }
             }
         }
-        // Shims first, then nodes, then links, then the rest; within a role by name.
-        let mut restarts: Vec<(&Program, &Unit)> = behind
+        let planned: Vec<Value> = prepared
             .iter()
-            .flat_map(|program| program.units.iter().map(move |unit| (*program, unit)))
-            .filter(|(_, unit)| unit.active)
+            .map(|(_, step)| step.change().json())
             .collect();
-        restarts.sort_by(|a, b| (a.1.role(), &a.1.name).cmp(&(b.1.role(), &b.1.name)));
-        let mut done: Vec<(&Program, &Unit)> = Vec::new();
-        for (program, unit) in &restarts {
-            done.push((program, unit));
-            match self.restart_and_read(unit, &release.version_text) {
+        let pending = json!({
+            "release": release.version_text,
+            "atMs": now_ms(),
+            "changes": planned,
+            "units": restarts.iter().map(|r| json!({ "name": r.unit.name, "program": r.unit.program, "args": r.unit.args, "from": r.from })).collect::<Vec<_>>(),
+        });
+        if let Err(reason) = records.pending(&pending) {
+            for (_, step) in &prepared {
+                step.discard();
+            }
+            records.clear_pending();
+            return failed(outcome, reason);
+        }
+        let mut changed: Vec<Changed> = Vec::new();
+        let mut prepared = prepared.into_iter();
+        while let Some((program, step)) = prepared.next() {
+            match step.commit(release, &sha256) {
+                Ok(change) => {
+                    if let (Some(note), Changed::InPlace { .. }) = (&self.install_note, &change)
+                        && let Some(old) = &program.sha256
+                    {
+                        renew_install_note(note, &program.named, old, &sha256);
+                    }
+                    records.line(
+                        "install",
+                        json!({ "program": program.path, "from": program.version, "to": release.version_text, "how": change.json()["how"] }),
+                    );
+                    changed.push(change);
+                }
+                Err(reason) => {
+                    for (_, rest) in prepared {
+                        rest.discard();
+                    }
+                    rollback(&changed);
+                    records.clear_pending();
+                    return failed(outcome, reason);
+                }
+            }
+        }
+        let mut moved: Vec<Value> = Vec::new();
+        for (index, restart) in restarts.iter().enumerate() {
+            match self.restart_and_watch(&restart.unit, &release.version_text) {
                 Ok(version) => {
-                    records.line("restart", json!({ "unit": unit.name, "version": version }));
-                    moved.push(json!({ "unit": unit.name, "role": unit.role().as_str(), "from": program.version, "to": version }));
+                    records.line(
+                        "restart",
+                        json!({ "unit": restart.unit.name, "version": version }),
+                    );
+                    moved.push(json!({ "unit": restart.unit.name, "role": restart.unit.role().as_str(), "from": restart.from, "to": version }));
                 }
                 Err(reason) => {
                     let reason = format!(
                         "{} did not come back on {}: {reason}",
-                        unit.name, release.version_text
+                        restart.unit.name, release.version_text
                     );
-                    records.line("restart", json!({ "unit": unit.name, "error": reason }));
-                    rollback(&changed);
-                    let mut readback = Vec::new();
-                    for (program, unit) in &done {
-                        let read = self.restart_and_read(unit, &program.version);
-                        readback.push(json!({ "unit": unit.name, "version": read.as_ref().ok(), "error": read.err() }));
-                    }
                     records.line(
-                        "rolled-back",
-                        json!({ "release": release.version_text, "reason": reason, "units": readback }),
+                        "restart",
+                        json!({ "unit": restart.unit.name, "error": reason }),
                     );
-                    outcome.result = "rolled-back";
-                    outcome.reason = Some(reason);
-                    outcome.detail["units"] = json!(readback);
-                    return outcome;
+                    return self.roll_back(
+                        release.version_text.clone(),
+                        &changed,
+                        &restarts[..=index],
+                        reason,
+                        records,
+                        outcome,
+                    );
                 }
             }
         }
-        // The templates of each node that has them, as the installer brings them up to an upgrade.
-        let mut templates = Vec::new();
-        for program in behind {
-            for unit in program
-                .units
-                .iter()
-                .filter(|unit| unit.role() == Role::Node)
-            {
-                let Some(config_path) = unit.config() else {
-                    continue;
-                };
-                let Some(config) = node_config(unit) else {
-                    continue;
-                };
-                if !config.state_dir.join("templates").exists() {
-                    continue;
-                }
-                let runs = program_to_run(program, &config.state_dir);
-                let mut command = Command::new(runs);
-                command.args([
-                    OsString::from("templates"),
-                    OsString::from("install"),
-                    OsString::from("--config"),
-                    config_path.into_os_string(),
-                ]);
-                let said = match run_for(&mut command, Duration::from_secs(120)) {
-                    Ok((true, out, _)) => {
-                        json!({ "unit": unit.name, "said": serde_json::from_str::<Value>(out.trim()).unwrap_or(json!(out.trim())) })
-                    }
-                    Ok((false, out, err)) => {
-                        json!({ "unit": unit.name, "error": format!("{}{}", out.trim(), err.trim()) })
-                    }
-                    Err(reason) => json!({ "unit": unit.name, "error": reason }),
-                };
-                records.line("templates", said.clone());
-                templates.push(said);
-            }
+        records.clear_pending();
+        let templates = self.templates(behind);
+        for said in &templates {
+            records.line("templates", said.clone());
         }
         // The old programs are kept as `.previous`, so a person can still put one back by hand.
         records.line(
@@ -1227,101 +1744,150 @@ impl Run<'_> {
         outcome
     }
 
-    /// Puts the release's binary where `program` is: in place where its directory can be written, else staged in its
-    /// node's state directory.
-    fn put_in_place(
+    /// Puts every changed program back, restarts `restarted` again on what they ran before, and reads their versions
+    /// back.
+    fn roll_back(
         &self,
-        program: &Program,
-        release: &Release,
-        binary: &[u8],
-        sha256: &str,
-    ) -> Result<Changed, String> {
-        let dir = program.path.parent().unwrap_or(Path::new("/"));
-        let temp = dir.join(format!(
-            ".arca-update-{}.{}",
-            release.version_text,
-            std::process::id()
-        ));
-        match write_program(&temp, binary) {
-            Ok(()) => {
-                if let Err(reason) = check_written(&temp, &release.version_text) {
-                    let _ = fs::remove_file(&temp);
-                    return Err(reason);
-                }
-                let previous = previous_of(&program.path);
-                let old_sha = sha256_file(&program.path).ok();
-                let _ = fs::remove_file(&previous);
-                if let Err(e) = fs::hard_link(&program.path, &previous)
-                    .or_else(|_| fs::copy(&program.path, &previous).map(|_| ()))
-                {
-                    let _ = fs::remove_file(&temp);
-                    return Err(format!(
-                        "the old program {} could not be kept: {e}",
-                        program.path.display()
-                    ));
-                }
-                if let Err(e) = fs::rename(&temp, &program.path) {
-                    let _ = fs::remove_file(&temp);
-                    return Err(format!(
-                        "{} could not be replaced: {e}",
-                        program.path.display()
-                    ));
-                }
-                if let (Some(note), Some(old_sha)) = (&self.install_note, old_sha) {
-                    renew_install_note(note, &program.named, &old_sha, sha256);
-                }
-                Ok(Changed::InPlace {
-                    path: program.path.clone(),
-                    previous,
-                })
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::ReadOnlyFilesystem | io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                let Some(state_dir) = &program.state_dir else {
-                    return Err(format!(
-                        "{} cannot be written ({error}) and no node that runs it has a state directory to stage it in",
-                        program.path.display()
-                    ));
-                };
-                stage(state_dir, release, binary, sha256)
-            }
-            Err(error) => Err(format!(
-                "the new program could not be written beside {}: {error}",
-                program.path.display()
-            )),
+        release: String,
+        changed: &[Changed],
+        restarted: &[Restart],
+        reason: String,
+        records: &Records,
+        mut outcome: Outcome,
+    ) -> Outcome {
+        rollback(changed);
+        let mut readback = Vec::new();
+        for restart in restarted {
+            let read = self.restart_and_watch(&restart.unit, &restart.from);
+            readback.push(json!({ "unit": restart.unit.name, "version": read.as_ref().ok(), "error": read.err() }));
         }
+        records.line(
+            "rolled-back",
+            json!({ "release": release, "reason": reason, "units": readback }),
+        );
+        records.clear_pending();
+        outcome.result = "rolled-back";
+        outcome.reason = Some(reason);
+        outcome.available = Some(release);
+        outcome.detail["units"] = json!(readback);
+        outcome
     }
 
-    /// Restarts one unit and waits for it to come back on `version` and stay up.
-    fn restart_and_read(&self, unit: &Unit, version: &str) -> Result<String, String> {
-        self.units.restart(&unit.name)?;
-        let deadline = Instant::now() + self.health;
-        let mut seen = None;
-        while Instant::now() < deadline {
-            if let Ok(running) = self.units.running(&unit.name)
-                && running.active
-                && running.pid > 0
+    /// An update an earlier run left pending (it was stopped after it changed programs and before it confirmed every
+    /// unit): finished when every unit it named runs the release and is healthy now, else rolled back.
+    fn settle_pending(&self, pending: &Value, records: &mut Records) -> Outcome {
+        let release = pending["release"].as_str().unwrap_or_default().to_string();
+        let changes: Vec<Changed> = pending["changes"]
+            .as_array()
+            .map(|changes| changes.iter().filter_map(Changed::of).collect())
+            .unwrap_or_default();
+        let restarts: Vec<Restart> = pending["units"]
+            .as_array()
+            .map(|units| {
+                units
+                    .iter()
+                    .filter_map(|unit| {
+                        Some(Restart {
+                            unit: Unit {
+                                name: unit["name"].as_str()?.to_string(),
+                                program: PathBuf::from(unit["program"].as_str()?),
+                                args: unit["args"]
+                                    .as_array()?
+                                    .iter()
+                                    .filter_map(|arg| arg.as_str().map(str::to_string))
+                                    .collect(),
+                                active: true,
+                            },
+                            from: unit["from"].as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for restart in &restarts {
+            if let Some(config) = (restart.unit.role() == Role::Node)
+                .then(|| node_config(&restart.unit))
+                .flatten()
             {
-                seen = Some(running);
+                records.dirs.insert(config.state_dir);
+            }
+        }
+        let mut outcome = Outcome::new("updated", None, Some(release.clone()));
+        let unconfirmed: Vec<&str> = restarts
+            .iter()
+            .filter(|restart| !self.healthy_now(&restart.unit, &release))
+            .map(|restart| restart.unit.name.as_str())
+            .collect();
+        if unconfirmed.is_empty() {
+            records.line("finished", json!({ "release": release }));
+            records.clear_pending();
+            outcome.detail["units"] = json!(restarts.iter().map(|r| json!({ "unit": r.unit.name, "role": r.unit.role().as_str(), "from": r.from, "to": release })).collect::<Vec<_>>());
+            return outcome;
+        }
+        let reason = format!(
+            "an earlier run changed the programs and stopped before it confirmed {}",
+            unconfirmed.join(", ")
+        );
+        self.roll_back(release, &changes, &restarts, reason, records, outcome)
+    }
+
+    /// Whether a unit runs `version` now and is healthy: active, and a node answers on its socket.
+    fn healthy_now(&self, unit: &Unit, version: &str) -> bool {
+        let Ok(running) = self.units.running(&unit.name) else {
+            return false;
+        };
+        running.active
+            && running.pid > 0
+            && self.units.running_version(&unit.name, &running).as_deref() == Some(version)
+            && (unit.role() != Role::Node || self.units.answers(unit))
+    }
+
+    /// Restarts one unit and watches it: it must be running within `health`, a node must answer on its socket, and it
+    /// must then stay the same process, never restarted, for the whole of `health`, and say `version`.
+    fn restart_and_watch(&self, unit: &Unit, version: &str) -> Result<String, String> {
+        self.units.restart(&unit.name)?;
+        let wait_until = |done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + self.health;
+            loop {
+                if done() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(self.poll);
+            }
+        };
+        let up = |running: &Result<Running, String>| {
+            running
+                .as_ref()
+                .is_ok_and(|running| running.active && running.pid > 0)
+        };
+        if !wait_until(&|| up(&self.units.running(&unit.name))) {
+            return Err(format!(
+                "it was not running within {} s",
+                self.health.as_secs_f32()
+            ));
+        }
+        let first = self.units.running(&unit.name)?;
+        if unit.role() == Role::Node && !wait_until(&|| self.units.answers(unit)) {
+            return Err(format!(
+                "it did not answer on its socket within {} s",
+                self.health.as_secs_f32()
+            ));
+        }
+        let watch_until = Instant::now() + self.health;
+        loop {
+            let now = self.units.running(&unit.name)?;
+            if !now.active || now.pid != first.pid || now.restarts != first.restarts {
+                return Err("it stopped or restarted after it started".to_string());
+            }
+            if Instant::now() >= watch_until {
                 break;
             }
             std::thread::sleep(self.poll);
         }
-        let Some(first) = seen else {
-            return Err(format!(
-                "it was not running within {} s",
-                self.health.as_secs()
-            ));
-        };
-        std::thread::sleep(self.settle);
         let now = self.units.running(&unit.name)?;
-        if !now.active || now.pid != first.pid || now.restarts != first.restarts {
-            return Err("it stopped or restarted after it started".to_string());
-        }
         let read = self
             .units
             .running_version(&unit.name, &now)
@@ -1330,6 +1896,187 @@ impl Run<'_> {
             return Err(format!("it runs {read}"));
         }
         Ok(read)
+    }
+
+    /// Writes the release beside where it goes, checked, ready to be put in place by one rename.
+    fn prepare(
+        &self,
+        program: &Program,
+        placement: &Placement,
+        release: &Release,
+        binary: &[u8],
+    ) -> Result<Prepared, String> {
+        match placement {
+            Placement::InPlace => {
+                let dir = program.path.parent().unwrap_or(Path::new("/"));
+                let temp = dir.join(format!(
+                    ".arca-update-{}.{}",
+                    release.version_text,
+                    std::process::id()
+                ));
+                write_checked(&temp, binary, &release.version_text)?;
+                Ok(Prepared::InPlace {
+                    temp,
+                    path: program.path.clone(),
+                })
+            }
+            Placement::Staged => {
+                let dir = self
+                    .staging(&program.path)
+                    .ok_or("this user has no place to stage a release in")?;
+                fs::create_dir_all(&dir)
+                    .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)))
+                    .map_err(|e| format!("{} cannot be made: {e}", dir.display()))?;
+                let name = format!("arca-{}", release.version_text);
+                let temp = dir.join(format!(".{name}.{}", std::process::id()));
+                write_checked(&temp, binary, &release.version_text)?;
+                Ok(Prepared::Staged { temp, dir, name })
+            }
+            Placement::OsManaged(why) | Placement::Refused(why) => Err(why.clone()),
+        }
+    }
+
+    /// The templates of each node that has them, brought up to the release by the program its node now runs.
+    fn templates(&self, behind: &[(&Program, Placement)]) -> Vec<Value> {
+        let mut said = Vec::new();
+        for (program, _) in behind {
+            for unit in program
+                .units
+                .iter()
+                .filter(|unit| unit.role() == Role::Node)
+            {
+                let (Some(config_path), Some(config)) = (unit.config(), node_config(unit)) else {
+                    continue;
+                };
+                if !config.state_dir.join("templates").exists() {
+                    continue;
+                }
+                let runs = self
+                    .staging(&program.path)
+                    .and_then(|dir| staged_program(&dir))
+                    .filter(|staged| {
+                        newer(
+                            &staged.version,
+                            &program_version(&program.path).unwrap_or_default(),
+                        )
+                    })
+                    .map_or_else(|| program.path.clone(), |staged| staged.path);
+                let mut command = Command::new(runs);
+                command.args([
+                    OsString::from("templates"),
+                    OsString::from("install"),
+                    OsString::from("--config"),
+                    config_path.into_os_string(),
+                ]);
+                said.push(match run_for(&mut command, Duration::from_secs(120)) {
+                    Ok((true, out, _)) => {
+                        json!({ "unit": unit.name, "said": serde_json::from_str::<Value>(out.trim()).unwrap_or(json!(out.trim())) })
+                    }
+                    Ok((false, out, err)) => {
+                        json!({ "unit": unit.name, "error": format!("{}{}", out.trim(), err.trim()) })
+                    }
+                    Err(reason) => json!({ "unit": unit.name, "error": reason }),
+                });
+            }
+        }
+        said
+    }
+}
+
+/// A release written beside where it goes, and checked.
+enum Prepared {
+    InPlace {
+        temp: PathBuf,
+        path: PathBuf,
+    },
+    Staged {
+        temp: PathBuf,
+        dir: PathBuf,
+        name: String,
+    },
+}
+
+impl Prepared {
+    /// What committing it changes.
+    fn change(&self) -> Changed {
+        match self {
+            Self::InPlace { path, .. } => Changed::InPlace {
+                path: path.clone(),
+                previous: previous_of(path),
+            },
+            Self::Staged { dir, .. } => Changed::Staged {
+                dir: dir.clone(),
+                had_previous: dir.join(STAGED_FILE).exists(),
+            },
+        }
+    }
+
+    fn discard(&self) {
+        let (Self::InPlace { temp, .. } | Self::Staged { temp, .. }) = self;
+        let _ = fs::remove_file(temp);
+    }
+
+    /// Puts it in place: the old program is kept, then the new one is renamed over it in one step.
+    fn commit(self, release: &Release, sha256: &str) -> Result<Changed, String> {
+        let change = self.change();
+        match self {
+            Self::InPlace { temp, path } => {
+                let previous = previous_of(&path);
+                let _ = fs::remove_file(&previous);
+                if let Err(e) = fs::hard_link(&path, &previous)
+                    .or_else(|_| fs::copy(&path, &previous).map(|_| ()))
+                {
+                    let _ = fs::remove_file(&temp);
+                    return Err(format!(
+                        "the old program {} could not be kept: {e}",
+                        path.display()
+                    ));
+                }
+                if let Err(e) = fs::rename(&temp, &path) {
+                    let _ = fs::remove_file(&temp);
+                    return Err(format!("{} could not be replaced: {e}", path.display()));
+                }
+            }
+            Self::Staged { temp, dir, name } => {
+                let path = dir.join(&name);
+                fs::rename(&temp, &path)
+                    .map_err(|e| format!("{} cannot be written: {e}", path.display()))?;
+                let current = dir.join(STAGED_FILE);
+                if current.exists() {
+                    fs::rename(&current, dir.join(STAGED_PREVIOUS_FILE))
+                        .map_err(|e| format!("{} cannot be kept: {e}", current.display()))?;
+                }
+                let manifest =
+                    json!({ "file": name, "version": release.version_text, "sha256": sha256 });
+                write_private(&current, &format!("{manifest}\n"))
+                    .map_err(|e| format!("{} cannot be written: {e}", current.display()))?;
+                prune_staged(&dir);
+            }
+        }
+        Ok(change)
+    }
+}
+
+/// Removes the staged releases that are neither the current one nor the one before it. Only files named
+/// `arca-<version>` are staged releases; nothing else in the directory is touched.
+fn prune_staged(dir: &Path) {
+    let keep: BTreeSet<PathBuf> = [STAGED_FILE, STAGED_PREVIOUS_FILE]
+        .into_iter()
+        .filter_map(|file| staged_manifest(dir, file).map(|staged| staged.path))
+        .collect();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let release = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("arca-"))
+            .is_some_and(|version| Version::parse(version).is_some());
+        if release && !keep.contains(&path) {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -1350,103 +2097,44 @@ fn node_config(unit: &Unit) -> Option<NodeConfig> {
     crate::config::load(&path).ok()
 }
 
-/// The program that runs for `program`: the staged one, when that is what its node runs.
-fn program_to_run(program: &Program, state_dir: &Path) -> PathBuf {
-    match staged_program(state_dir) {
-        Some(staged)
-            if newer(
-                &staged.version,
-                &program_version(&program.path).unwrap_or_default(),
-            ) =>
-        {
-            staged.path
-        }
-        _ => program.path.clone(),
-    }
-}
-
 fn previous_of(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(OsString::from).unwrap_or_default();
     name.push(".previous");
     path.with_file_name(name)
 }
 
-fn write_program(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o755)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-}
-
-/// The written program must say the release's version on this machine.
-fn check_written(path: &Path, version: &str) -> Result<(), String> {
-    match program_version(path) {
-        Some(said) if said == version => Ok(()),
-        Some(said) => Err(format!(
+/// Writes the release's binary at `path`, and checks that it says `version` on this machine. A file that cannot be
+/// written whole, or does not say it, is removed again.
+fn write_checked(path: &Path, bytes: &[u8], version: &str) -> Result<(), String> {
+    let written = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(path);
+        return Err(format!(
+            "the new program {} cannot be written: {e}",
+            path.display()
+        ));
+    }
+    let said = program_version(path);
+    if said.as_deref() == Some(version) {
+        return Ok(());
+    }
+    let _ = fs::remove_file(path);
+    Err(match said {
+        Some(said) => format!(
             "the downloaded program says it is {said}, not {version}; every program was kept"
-        )),
-        None => Err(
-            "the downloaded program does not start on this machine; every program was kept"
-                .to_string(),
         ),
-    }
-}
-
-/// Stages the release in the node's state directory, for its `serve` to hand over to at its start.
-fn stage(
-    state_dir: &Path,
-    release: &Release,
-    binary: &[u8],
-    sha256: &str,
-) -> Result<Changed, String> {
-    let dir = state_dir.join(UPDATE_DIR);
-    fs::create_dir_all(&dir).map_err(|e| format!("{} cannot be made: {e}", dir.display()))?;
-    let name = format!("arca-{}", release.version_text);
-    let path = dir.join(&name);
-    let temp = dir.join(format!(".{name}.{}", std::process::id()));
-    let _ = fs::remove_file(&temp);
-    write_program(&temp, binary)
-        .map_err(|e| format!("{} cannot be written: {e}", temp.display()))?;
-    if let Err(reason) = check_written(&temp, &release.version_text) {
-        let _ = fs::remove_file(&temp);
-        return Err(reason);
-    }
-    fs::rename(&temp, &path).map_err(|e| format!("{} cannot be written: {e}", path.display()))?;
-    let current = dir.join(STAGED_FILE);
-    let previous = dir.join(STAGED_PREVIOUS_FILE);
-    let had_previous = current.exists();
-    if had_previous {
-        fs::rename(&current, &previous)
-            .map_err(|e| format!("{} cannot be kept: {e}", current.display()))?;
-    }
-    let manifest = json!({ "file": name, "version": release.version_text, "sha256": sha256 });
-    write_private(&current, &format!("{manifest}\n"))
-        .map_err(|e| format!("{} cannot be written: {e}", current.display()))?;
-    // Staged programs that are neither the current one nor the one before it are no longer needed.
-    let keep: BTreeSet<PathBuf> = [
-        Some(path.clone()),
-        staged_manifest(&dir, STAGED_PREVIOUS_FILE).map(|s| s.path),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let staged_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("arca-"));
-            if staged_name && !keep.contains(&path) {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-    Ok(Changed::Staged { dir, had_previous })
+        None => "the downloaded program does not start on this machine; every program was kept"
+            .to_string(),
+    })
 }
 
 /// Puts every changed program back as it was.
@@ -1524,7 +2212,7 @@ pub fn status_json(update: &UpdateConfig, state_dir: &Path) -> Value {
     })
 }
 
-/// The alert input: whether the updater's last run on this node failed. A node it never ran on has not failed.
+/// The alert input: whether the updater's last settled run on this node failed. A node it never ran on has not failed.
 pub fn alert_input(
     state_dir: &Path,
     now_ms: u64,
@@ -1638,14 +2326,17 @@ fn launch(config_path: &Path) -> Result<(), String> {
 // The command
 // -------------------------------------------------------------------------------------------------------------------
 
-/// The machine's update lock: in the manager's runtime directory, so one run per manager at a time.
+/// The machine's update lock: in the manager's runtime directory, so one run per manager at a time; else in the
+/// staging root, under a name no staging step removes.
 fn lock_path(state_dir: &Path) -> PathBuf {
     if rustix::process::geteuid().is_root() {
         return PathBuf::from("/run").join(LOCK_FILE);
     }
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
         Some(dir) => PathBuf::from(dir).join(LOCK_FILE),
-        None => state_dir.join(UPDATE_DIR).join(LOCK_FILE),
+        None => stage_root()
+            .unwrap_or_else(|| state_dir.join(UPDATE_DIR))
+            .join(STAGE_LOCK_FILE),
     }
 }
 
@@ -1668,11 +2359,12 @@ pub fn command(flags: &Flags, install: bool) -> Result<Option<Value>, Failure> {
         config: &config,
         units: &manager,
         arch: std::env::consts::ARCH,
+        keys: RELEASE_KEYS,
         health: Duration::from_secs(config.update.health_seconds),
-        settle: Duration::from_secs(5),
         poll: Duration::from_millis(500),
         install_note,
         lock: lock_path(&config.state_dir),
+        stage_root: stage_root(),
         minute_of_day: minute_now(),
     };
     let outcome = run.run(install);

@@ -2764,4 +2764,106 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_update_key_has_safe_defaults_and_its_rules_refuse_what_would_misbehave() {
+        let config =
+            load(&ConfigFile::new("update-default", &plain()).0).expect("the default loads");
+        assert!(config.update.automatic);
+        assert_eq!(config.update.channel, UpdateChannel::Stable);
+        assert_eq!(config.update.check_every_seconds, 21_600);
+        assert_eq!(config.update.health_seconds, 30);
+        assert_eq!(config.update.window, None);
+        assert_eq!(
+            config.update.source,
+            "https://api.github.com/repos/automagik-si/arca"
+        );
+
+        let with = |update: serde_json::Value| {
+            let mut value = plain();
+            value["update"] = update;
+            value
+        };
+        let fine = with(serde_json::json!({
+            "automatic": false, "channel": "prerelease", "checkEverySeconds": 600, "healthSeconds": 600,
+            "window": "23:00-01:30", "source": "http://127.0.0.1:8080/repos/x/y"
+        }));
+        let config = load(&ConfigFile::new("update-fine", &fine).0).expect("the edges load");
+        assert!(!config.update.automatic);
+        assert_eq!(config.update.channel, UpdateChannel::Prerelease);
+        assert_eq!(update_window("23:00-01:30"), Some((23 * 60, 90)));
+
+        for (tag, update, words) in [
+            (
+                "often",
+                serde_json::json!({ "checkEverySeconds": 599 }),
+                "update.checkEverySeconds",
+            ),
+            (
+                "seldom",
+                serde_json::json!({ "checkEverySeconds": 604_801 }),
+                "update.checkEverySeconds",
+            ),
+            (
+                "short",
+                serde_json::json!({ "healthSeconds": 4 }),
+                "update.healthSeconds",
+            ),
+            (
+                "long",
+                serde_json::json!({ "healthSeconds": 601 }),
+                "update.healthSeconds",
+            ),
+            (
+                "window",
+                serde_json::json!({ "window": "2:00-04:00" }),
+                "update.window",
+            ),
+            (
+                "same",
+                serde_json::json!({ "window": "02:00-02:00" }),
+                "update.window",
+            ),
+            (
+                "hour",
+                serde_json::json!({ "window": "24:00-01:00" }),
+                "update.window",
+            ),
+            (
+                "plain",
+                serde_json::json!({ "source": "http://example.com/repos/x/y" }),
+                "update.source",
+            ),
+            (
+                "slash",
+                serde_json::json!({ "source": "https://example.com/repos/x/y/" }),
+                "update.source",
+            ),
+            (
+                "space",
+                serde_json::json!({ "source": "https://example.com/a b" }),
+                "update.source",
+            ),
+            (
+                "nohost",
+                serde_json::json!({ "source": "https:///repos" }),
+                "update.source",
+            ),
+            (
+                "scheme",
+                serde_json::json!({ "source": "ftp://127.0.0.1/x" }),
+                "update.source",
+            ),
+        ] {
+            let refusal = ConfigFile::new(&format!("update-{tag}"), &with(update)).refusal();
+            assert!(
+                refusal.contains("update is refused") && refusal.contains(words),
+                "{tag}: {refusal}"
+            );
+        }
+        assert!(update_source_ok("http://localhost:9/x"));
+        assert!(update_source_ok("http://[::1]:9/x"));
+        assert!(!update_source_ok("http://127.0.0.1.example.com/x"));
+        assert!(update_source_ok("https://example.com"));
+    }
 }

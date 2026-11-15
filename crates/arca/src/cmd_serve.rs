@@ -179,9 +179,6 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             "serve refuses a config whose kernel.adopt is not empty: such a config is for arca adopt alone".to_string(),
         ));
     }
-    // A node whose own program cannot be replaced (Arca OS's image) runs the newer release the kernel updater staged in
-    // its state directory: the process becomes that program before it does anything else.
-    crate::self_update::hand_over(&cfg.state_dir);
     let started = Instant::now();
     // SIGHUP is taken before anything else is done. Left at its default it ends the process, and a start takes as long
     // as the kernel's first reconcile: a `token reload`, or anything else that hangs up on the node in that time, would
