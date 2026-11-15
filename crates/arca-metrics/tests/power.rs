@@ -555,12 +555,12 @@ mod cpu_power {
 mod gpu_power {
     use super::*;
 
-    const PCI: &str = "0000:c6:00.0";
+    pub(super) const PCI: &str = "0000:c6:00.0";
 
     /// card1 is an amdgpu card at 0000:c6:00.0 whose hwmon gives a `PPT` power1_input in microwatts. `signs` adds what the
     /// driver shows only on an APU (`vddnb`: the in1 voltage) or only on a discrete card (`fan`: fan controls; `pcie_bw`:
     /// the PCIe counter on the device).
-    fn amdgpu(root: &Path, microwatts: &str, signs: &[&str]) {
+    pub(super) fn amdgpu(root: &Path, microwatts: &str, signs: &[&str]) {
         let device = "sys/devices/pci0000:00/0000:c6:00.0";
         let hwmon = format!("{device}/hwmon/hwmon9");
         write(root, &format!("{hwmon}/name"), "amdgpu\n");
@@ -590,7 +590,7 @@ mod gpu_power {
     }
 
     /// A package counter that moves 50 J in five seconds: 10 W at the second sample.
-    fn package(root: &Path) {
+    pub(super) fn package(root: &Path) {
         zone(
             root,
             "intel-rapl:0",
@@ -723,6 +723,7 @@ mod gpu_power {
             let sample = two_samples(&scratch);
 
             assert!(sample.power.gpu.cards.is_empty(), "{signs:?}");
+            gpu_reason_points_at_the_chip_sensors(&sample);
             let sensor = &sample.power.chip.sensors[0];
             assert!(!sensor.whole_chip, "{signs:?}");
             assert_eq!(sensor.power_w, Some(52.035));
@@ -749,6 +750,16 @@ mod gpu_power {
         let sample = two_samples(&scratch);
         assert_eq!(sample.power.measured_power_w, None);
         assert!(not_included(&sample).contains(&"the CPU packages"));
+        assert!(sample.power.gpu.cards.is_empty());
+        gpu_reason_points_at_the_chip_sensors(&sample);
+    }
+
+    /// The device has a power counter, listed in the chip sensors, so the GPU's reason must not say there is none.
+    fn gpu_reason_points_at_the_chip_sensors(sample: &HostSample) {
+        let reason = sample.power.gpu.reason.as_deref().expect("a reason");
+        assert_ne!(reason, NO_GPU_COUNTER, "the device has a counter");
+        assert!(reason.contains("chip sensors"), "{reason}");
+        assert!(reason.contains("CPU"), "{reason}");
     }
 
     #[test]
@@ -866,6 +877,50 @@ mod power_mean {
             "the newest known reading has none"
         );
         assert_eq!(averaged.power.measured_power_w, Some(15.0));
+    }
+
+    #[test]
+    fn the_mean_of_a_root_node_on_an_integrated_chip_counts_the_averaged_chip_once() {
+        use super::gpu_power::{PCI, amdgpu, package};
+        let scratch = tree("mean-chip");
+        let power1 = "sys/devices/pci0000:00/0000:c6:00.0/hwmon/hwmon9/power1_input";
+        amdgpu(scratch.path(), "40000000\n", &["vddnb"]);
+        package(scratch.path());
+        let mut sampler = sampler(scratch.path(), Scripted::default(), true);
+        // The chip reads 40, 50 and 60 W: 50 W on average. The package has no rate at the first sample, then moves
+        // 50 J and 100 J in five seconds each: 10 and 20 W, 15 W on average.
+        sampler.sample(1_000);
+        write(scratch.path(), power1, "50000000\n");
+        set_energy(scratch.path(), "intel-rapl:0", 51_000_000);
+        sampler.sample(6_000);
+        write(scratch.path(), power1, "60000000\n");
+        set_energy(scratch.path(), "intel-rapl:0", 151_000_000);
+        sampler.sample(11_000);
+
+        let averaged = mean(&sampler.history(1)).expect("a mean");
+        let power = &averaged.power;
+        assert_eq!(power.chip.power_w, Some(50.0));
+        assert_eq!(power.chip.sensors[0].power_w, Some(50.0));
+        assert!(power.chip.added);
+        assert_eq!(
+            power.cpu.power_w,
+            Some(15.0),
+            "the packages are still measured"
+        );
+        assert!(!power.cpu.added);
+        assert_eq!(
+            power.measured_power_w,
+            Some(50.0),
+            "the chip once, never 65"
+        );
+        assert_eq!(power.not_added.len(), 1, "{:?}", power.not_added);
+        assert!(
+            power.not_added[0].contains("the CPU packages"),
+            "{:?}",
+            power.not_added
+        );
+        assert!(power.not_added[0].contains(PCI), "{:?}", power.not_added);
+        assert!(!not_included(&averaged).contains(&"the CPU packages"));
     }
 }
 
