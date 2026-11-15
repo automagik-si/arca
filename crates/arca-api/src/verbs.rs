@@ -503,7 +503,7 @@ static VERBS: [Verb; 88] = [
     },
     Verb {
         name: "service_update",
-        summary: "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another digest or fingerprint in one call (or, with follow, say whether the node moves an Automagik server by itself): it is stopped, its root rebuilt from the new image (data volume, config, secrets and firewall rules are kept), started, and checked within timeoutSeconds (120 by default). On any failure the old version is put back. A local image must already be in the service project's image store. A service whose template declares a data volume it lacks would lose its data: it is refused before any change, unless eraseData, which needs the owner's approval through action_propose.",
+        summary: "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another one (or, with follow, say whether the node moves an Automagik server by itself): stopped, root rebuilt from the new image (data volume, config, secrets and firewall rules kept), started, checked within timeoutSeconds (120 by default); on any failure the old version is put back. A local image must already be in the project's image store. A service keeping its data on its root is refused unless eraseData. withTemplate also applies what its CURRENT template says, as service_reconfigure would, in the same restart. eraseData and withTemplate need an owner card (action_propose).",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -3882,8 +3882,9 @@ fn action_propose_params() -> Value {
 /// removed or overwritten before the action's own check runs (the GPU verbs from the instance, storage_add from the
 /// disk survey, the snapshot verbs from the source or the snapshot). A branch takes any value for them, as the door did
 /// before it held `args` to a branch, and says so.
-pub const KERNEL_FILLED: [(&str, &[&str]); 6] = [
+pub const KERNEL_FILLED: [(&str, &[&str]); 7] = [
     ("service_reconfigure", &["changes"]),
+    ("service_update", &["changes"]),
     ("gpu_attach", &["project", "kind", "uuid"]),
     ("gpu_detach", &["project", "kind", "uuid"]),
     (
@@ -5301,6 +5302,8 @@ pub fn summary_service_update(v: &Value) -> String {
         "Service already runs that image.".to_string()
     } else if v.get("noNewPrivileges").is_some() {
         "Service's no-new-privileges setting changed.".to_string()
+    } else if v.get("changes").is_some() {
+        "Service updated and made what its template says.".to_string()
     } else {
         "Service updated.".to_string()
     }
@@ -5324,24 +5327,44 @@ fn service_reconfigure_params() -> Value {
                 "minLength": 1,
                 "type": "string"
             },
-            "changes": {
-                "additionalProperties": false,
-                "properties": {
-                    "entrypoint": { "type": "object" },
-                    "environment": { "items": { "type": "object" }, "type": "array" },
-                    "noNewPrivileges": { "type": "object" },
-                    "ports": { "type": "object" },
-                    "rawLxc": { "type": "object" },
-                    "secrets": { "items": { "type": "object" }, "type": "array" }
-                },
-                "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
-                "type": "object"
-            },
+            "changes": template_changes_schema("A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference."),
             "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
         },
         "required": ["name", "approval"],
         "type": "object"
     })))
+}
+
+/// The difference between a service and its template now, as `service_reconfigure` and `service_update` with
+/// `withTemplate` carry it; `who` says who fills it in.
+fn template_changes_schema(who: &str) -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "entrypoint": { "type": "object" },
+            "environment": { "items": { "type": "object" }, "type": "array" },
+            "noNewPrivileges": { "type": "object" },
+            "ports": { "type": "object" },
+            "rawLxc": { "type": "object" },
+            "secrets": { "items": { "type": "object" }, "type": "array" }
+        },
+        "description": format!("The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({{from, to}} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). {who}"),
+        "type": "object"
+    })
+}
+
+/// The config read back after the start, against what a template's difference applied.
+fn read_back_schema() -> Value {
+    json!({
+        "additionalProperties": false,
+        "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc, or oci.entrypoint) that differ. Never a value.",
+        "properties": {
+            "differs": { "items": { "type": "string" }, "type": "array" },
+            "matches": { "type": "boolean" }
+        },
+        "required": ["matches", "differs"],
+        "type": "object"
+    })
 }
 
 fn service_reconfigure_result() -> Value {
@@ -5353,16 +5376,7 @@ fn service_reconfigure_result() -> Value {
                 "type": "object"
             },
             "message": { "type": "string" },
-            "readBack": {
-                "additionalProperties": false,
-                "description": "The instance's config read back after the restart, against what was applied: matches, and the names of the environment keys (or raw.lxc, or oci.entrypoint) that differ. Never a value.",
-                "properties": {
-                    "differs": { "items": { "type": "string" }, "type": "array" },
-                    "matches": { "type": "boolean" }
-                },
-                "required": ["matches", "differs"],
-                "type": "object"
-            },
+            "readBack": read_back_schema(),
             "reconfigured": {
                 "description": "False when nothing was written: the service already was what its template says, or the only difference is a secret whose value is set separately.",
                 "type": "boolean"
@@ -5391,11 +5405,12 @@ fn service_update_params_base() -> Value {
         "additionalProperties": false,
         "properties": {
             "approval": {
-                "description": "Only with eraseData: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data; this verb is not called with an approval of its own.",
+                "description": "Only with eraseData or withTemplate: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data, or shows every setting its template changes; this verb is not called with an approval of its own.",
                 "maxLength": 16384,
                 "minLength": 1,
                 "type": "string"
             },
+            "changes": template_changes_schema("Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference."),
             "digest": {
                 "description": "The image to move to: sha256: and 64 lower-case hex digits. For an OCI image, the digest, and the service keeps its image's repository; for a service made from a local image pinned by fingerprint, the new image's fingerprint. Give it, or follow, not both.",
                 "pattern": "^sha256:[0-9a-f]{64}$",
@@ -5419,6 +5434,10 @@ fn service_update_params_base() -> Value {
                 "maximum": 900,
                 "minimum": 1,
                 "type": "integer"
+            },
+            "withTemplate": {
+                "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
+                "type": "boolean"
             }
         },
         "required": ["name"],
@@ -5430,6 +5449,10 @@ fn service_update_result() -> Value {
     json!({
         "additionalProperties": false,
         "properties": {
+            "changes": {
+                "description": "Present with withTemplate: the template's difference that was applied with the new image, as the owner's card showed it. No secret value is in it.",
+                "type": "object"
+            },
             "digest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
             "follow": {
                 "description": "Present when the call set whether the service follows Automagik's releases: what it set.",
@@ -5440,6 +5463,7 @@ fn service_update_result() -> Value {
                 "description": "Present when the call changed whether the service runs with no-new-privileges, to match its template: what it set. The service was restarted when it ran, and its image and data were not touched.",
                 "type": "boolean"
             },
+            "readBack": read_back_schema(),
             "restarted": {
                 "description": "Present with noNewPrivileges: whether the service was restarted for it (true when it was running).",
                 "type": "boolean"

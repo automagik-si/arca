@@ -1824,11 +1824,23 @@ impl ToolHandler for ActionPropose {
                 return Err(refusal);
             }
             payload
-        } else if let (ActionKind::ServiceUpdate, Some(node)) = (action, &self.node) {
+        } else if action == ActionKind::ServiceUpdate {
             // An update that would erase what the service keeps inside its container is refused now, so the owner is
-            // never asked to approve it.
-            let entries = lock(&self.kernel)?.entries().to_vec();
-            service_update::check_proposal(node, &entries, &payload)?
+            // never asked to approve it. With withTemplate, the template's difference is worked out now and recorded,
+            // so the card shows it and the approval binds it; what a caller sent there is never kept.
+            match &self.node {
+                Some(node) => {
+                    let entries = lock(&self.kernel)?.entries().to_vec();
+                    service_update::check_proposal(node, &entries, &payload)?
+                }
+                None => {
+                    let mut payload = payload;
+                    if let Some(object) = payload.as_object_mut() {
+                        object.remove("changes");
+                    }
+                    payload
+                }
+            }
         } else if action == ActionKind::ServiceReconfigure {
             // The difference the run would apply is worked out now and recorded, so the card shows it and the
             // approval binds it. What a caller sent there is never kept.
@@ -7444,6 +7456,10 @@ impl ServiceHandler {
                 "eraseData",
                 // What an update of the service's no-new-privileges sets, so its card says it.
                 "noNewPrivileges",
+                // The same rebuild also makes the service what its template says now; only an approved card runs it.
+                "withTemplate",
+                // What a proposal with withTemplate is given when it is made: the template's difference, for the card.
+                "changes",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
             ],

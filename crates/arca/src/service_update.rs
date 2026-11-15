@@ -19,15 +19,25 @@
 //! rebuild replaces: it is refused before anything is written, unless the call states `eraseData`, which only an
 //! approved proposal may (see [`ServiceHandler::call_update`]).
 //!
+//! With `withTemplate`, which only an approved proposal may state, the same run also makes the service what its
+//! CURRENT template says, as `service_reconfigure` would (environment, links' values, declared secrets, ports,
+//! `rawLxc`, no-new-privileges, entrypoint): the difference is worked out when the proposal is made and recorded in
+//! it as `changes`, so the card shows it and the approval binds it; the run works it out again and changes nothing
+//! unless it is still that difference. The record is written after the rebuild, while the instance is stopped, so the
+//! node writes its config before the one start: one interruption for the image and the settings. A failure after that
+//! write puts the old record back too, before the old version is started.
+//!
 //! A failure at any step puts the old version back: the snapshot is restored (or, in a project that does not allow
 //! snapshots, the root is rebuilt from the old digest), the old version is started when it was running, and the answer
 //! is the error and the words "rolled back". Nothing is asked of the owner: the verb is a doctor's, and works in a
 //! tenant as it does outside one. The snapshot holds the root, the config and the devices of the instance; the data
 //! volume is the service's own and is not snapshotted, so what the new version wrote there stays.
+use super::service_reconfigure::{self, Doing, Ready, Written};
 use super::*;
 use crate::service::ServiceConfig;
 use arca_incus::{IncusError, InstanceState, StateAction, StateChanger};
 use arca_kernel::desired::Entry;
+use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
@@ -436,6 +446,43 @@ fn key_first(name: &str, wanted: bool) -> CallError {
     ))
 }
 
+/// Whether the call states `withTemplate: true`.
+fn with_template(args: &Value) -> Result<bool, CallError> {
+    match args.get("withTemplate") {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| CallError::Invalid("withTemplate: expected true or false".into())),
+    }
+}
+
+/// What `withTemplate` does not go with, and what does not go without it.
+fn template_conflicts(args: &Value, with: bool) -> Result<(), CallError> {
+    if with && args.get("digest").is_none() {
+        return Err(CallError::Invalid(
+            "withTemplate: give it with the digest the service moves to".into(),
+        ));
+    }
+    if with && args.get("noNewPrivileges").is_some() {
+        return Err(CallError::Invalid(
+            "noNewPrivileges: with withTemplate the template's setting is among the changes the card shows".into(),
+        ));
+    }
+    if !with && args.get("changes").is_some() {
+        return Err(CallError::Invalid(
+            "changes: it is the template's difference that a proposal with withTemplate fills in; give withTemplate: true".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal of `withTemplate` for the digest the service already runs: there is no rebuild to ride on.
+fn same_digest_with_template(name: &str) -> CallError {
+    refused(format!(
+        "update service {name}: the service already runs this digest, so there is no new image for withTemplate to go in with: service_reconfigure applies its template alone. Nothing was changed"
+    ))
+}
+
 /// What a proposal of `service_update` is held to when it is made, so the owner is never shown a card for an update
 /// the node would refuse: one that mixes `follow` with what it does not go with, or that would erase the service's
 /// data without `eraseData`. Answers the arguments to record. A card that states `eraseData` for a service that has
@@ -446,10 +493,18 @@ pub(super) fn check_proposal(
     entries: &[Entry],
     payload: &Value,
 ) -> Result<Value, CallError> {
+    // The template's difference is the node's to work out: what a caller sent there is never kept.
+    let mut payload = payload.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("changes");
+    }
+    let payload = &payload;
     if payload.get("follow").is_some() {
         conflicts(payload)?;
         return Ok(payload.clone());
     }
+    let with = with_template(payload)?;
+    template_conflicts(payload, with)?;
     let erase = payload.get("eraseData").and_then(Value::as_bool) == Some(true);
     let Some(name) = payload["name"].as_str() else {
         return Ok(payload.clone());
@@ -465,15 +520,29 @@ pub(super) fn check_proposal(
     if config.adopted || config.function.is_some() || config.vm.is_some() {
         return Ok(payload.clone());
     }
+    let moves = payload["digest"]
+        .as_str()
+        .and_then(|digest| next_source(cfg, &config, digest))
+        .is_some_and(|source| !same_image(&source, &config.source));
+    // With the template: the difference the run would apply, worked out now as `service_reconfigure` works it out,
+    // so the card shows it and the approval binds it. No-new-privileges is among it, so the key's own path is not
+    // taken.
+    let mut payload = payload.clone();
+    if with {
+        if !moves {
+            return Err(same_digest_with_template(name));
+        }
+        payload["changes"] =
+            service_reconfigure::plan(Doing::Update, cfg, &scoped, &config, &BTreeSet::new())?
+                .changes;
+        return data_check(cfg, &config, payload, erase);
+    }
+    let payload = &payload;
     // The key change the run will make, worked out as the run works it out. A same-digest proposal is that change
     // alone, with a card of its own: it restarts the service and erases nothing, so it needs no `eraseData`, and a
     // card that states it is refused. A digest move while the key differs is refused, so the owner never sees a card
     // the run would refuse.
     let wanted = key_change(cfg, &config);
-    let moves = payload["digest"]
-        .as_str()
-        .and_then(|digest| next_source(cfg, &config, digest))
-        .is_some_and(|source| !same_image(&source, &config.source));
     match (
         wanted,
         payload.get("noNewPrivileges").and_then(Value::as_bool),
@@ -507,22 +576,33 @@ pub(super) fn check_proposal(
         }
         (None, None) => {}
     }
-    let Ok(changer) = state_changer_for(cfg, &config) else {
-        return Ok(payload.clone());
+    data_check(cfg, &config, payload.clone(), erase)
+}
+
+/// The data part of [`check_proposal`]: an update that would erase the service's data without `eraseData` is refused,
+/// and `eraseData` is left out for a service that has its volume. What cannot be read now is left to the run.
+fn data_check(
+    cfg: &NodeConfig,
+    config: &ServiceConfig,
+    payload: Value,
+    erase: bool,
+) -> Result<Value, CallError> {
+    let Ok(changer) = state_changer_for(cfg, config) else {
+        return Ok(payload);
     };
     let Ok(seen) = changer.read(&config.project, &config.instance) else {
-        return Ok(payload.clone());
+        return Ok(payload);
     };
-    match (data_on_the_root(cfg, &config, &seen), erase) {
-        (Some(path), false) => Err(erasing(&config, &path)),
+    match (data_on_the_root(cfg, config, &seen), erase) {
+        (Some(path), false) => Err(erasing(config, &path)),
         (None, true) => {
-            let mut plain = payload.clone();
+            let mut plain = payload;
             if let Some(object) = plain.as_object_mut() {
                 object.remove("eraseData");
             }
             Ok(plain)
         }
-        _ => Ok(payload.clone()),
+        _ => Ok(payload),
     }
 }
 
@@ -542,6 +622,11 @@ fn conflicts(args: &Value) -> Result<(), CallError> {
         return Err(CallError::Invalid(
             "noNewPrivileges: it is set by an update at the service's digest, not with follow"
                 .into(),
+        ));
+    }
+    if args.get("withTemplate").is_some() || args.get("changes").is_some() {
+        return Err(CallError::Invalid(
+            "withTemplate: give it with a digest, not with follow".into(),
         ));
     }
     Ok(())
@@ -662,6 +747,18 @@ impl ServiceHandler {
                 "update service {name}: eraseData erases the service's data, so it needs the owner's approval: propose the update with action_propose, and the card says in words that the data is erased. Nothing was changed"
             )));
         }
+        let with = if args.get("follow").is_some() {
+            false
+        } else {
+            let with = with_template(args)?;
+            template_conflicts(args, with)?;
+            with
+        };
+        if with && !approved {
+            return Err(refused(format!(
+                "update service {name}: withTemplate also makes the service what its template says now, which runs only from a card the owner approved: propose it with action_propose, and the card shows every change it makes. Nothing was changed"
+            )));
+        }
         if let Some(follow) = args.get("follow") {
             if args.get("digest").is_some() || args.get("timeoutSeconds").is_some() {
                 return Err(CallError::Invalid(
@@ -717,25 +814,16 @@ impl ServiceHandler {
                 "its template declares no port, so there is nothing to check after the start",
             ));
         };
-        // How the node can tell that it answers: the host port's proxy, the droidd port, or only that it runs.
-        let reach = if let Some(lan) = &config.lan {
-            Reach::Lan(lan.port)
-        } else if let Some((address, port)) = config
-            .private_port
-            .as_ref()
-            .and_then(|private| Some((private.address.parse().ok()?, private.port)))
-        {
-            Reach::Private(address, port)
-        } else if config.droidd_port == Some(port) {
-            Reach::Direct(port)
-        } else {
-            Reach::Running
-        };
+        let reach = reach_of(&config, port);
         // What the template says now about no-new-privileges, against what the service has. A difference is applied
         // as a config write and a restart, never a rebuild, so the data stays where it is. It is its own step: an
         // update that also moves the digest is refused, so no answer mixes the two and a failure of one never
         // leaves the other half done.
-        let wanted = key_change(&self.cfg, &config);
+        let wanted = if with {
+            None
+        } else {
+            key_change(&self.cfg, &config)
+        };
         if let Some(wanted) = wanted {
             if !same_image(&new_source, &config.source) {
                 return Err(key_first(&name, wanted));
@@ -759,6 +847,9 @@ impl ServiceHandler {
             return Err(said(
                 "noNewPrivileges: the service's template says what the service already has. Nothing was changed",
             ));
+        }
+        if with && same_image(&new_source, &config.source) {
+            return Err(same_digest_with_template(&name));
         }
         if same_image(&new_source, &config.source) {
             return Ok(json!({
@@ -819,6 +910,36 @@ impl ServiceHandler {
                 "the service has never been started, and a rebuild would leave it unable to start: start it with instance_start first",
             ));
         }
+        // The template's difference, worked out again: the run changes nothing unless it is the one on the card.
+        let first = if with {
+            let first = service_reconfigure::plan(
+                Doing::Update,
+                &self.cfg,
+                entries,
+                &config,
+                &BTreeSet::new(),
+            )?;
+            if args.get("changes") != Some(&first.changes) {
+                return Err(said(
+                    "the service or its template changed since the owner's card was made, so the card no longer says what would be applied: propose it again",
+                ));
+            }
+            Some(first)
+        } else {
+            None
+        };
+        // The new version listens where its template says now, so the health check looks there, never at the old port.
+        let (port, reach) = match &first {
+            Some(first) => {
+                let Some(port) = first.next.ports.first().copied() else {
+                    return Err(said(
+                        "its template now declares no port, so there is nothing to check after the start",
+                    ));
+                };
+                (port, reach_of(&first.next, port))
+            }
+            None => (port, reach),
+        };
         let journal = Journal {
             path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
             id: format!("{}-{}", entry.id.0, (self.clock)()),
@@ -836,9 +957,30 @@ impl ServiceHandler {
         if let Some(fingerprint) = config.source["fingerprint"].as_str() {
             begin["fromFingerprint"] = json!(fingerprint);
         }
+        if let Some(first) = &first {
+            begin["template"] = service_reconfigure::names_of(&first.changes);
+        }
         journal
             .line("begin", true, begin)
             .map_err(|_| said("the update journal could not be written"))?;
+        // The secrets the template makes are made now, and each hidden value put behind a reference, before anything
+        // is stopped: a plan that moved meanwhile is refused with nothing changed.
+        let template = match first {
+            Some(first) => {
+                let ready = if first.writes {
+                    Some(self.ready_plan(Doing::Update, entries, &config, &first, &journal)?)
+                } else {
+                    None
+                };
+                Some(TemplateStep {
+                    changes: first.changes,
+                    ready,
+                    old: config.clone(),
+                    written: Cell::new(false),
+                })
+            }
+            None => None,
+        };
         // Nothing in a tenant's project is fetched with the node's credential.
         let registry = if config.tenant.is_some() {
             None
@@ -860,6 +1002,7 @@ impl ServiceHandler {
             registry: registry.as_ref(),
             journal: &journal,
             was_running: seen.is_running(),
+            template: template.as_ref(),
         };
         let outcome = run.go(seen);
         drop(claim);
@@ -1001,6 +1144,7 @@ impl ServiceHandler {
                 registry: None,
                 journal: &journal,
                 was_running,
+                template: None,
             };
             if let Err(failure) = run.healthy() {
                 journal.step("health", false, json!({ "why": failure.why }));
@@ -1069,6 +1213,24 @@ struct KeyUpdate {
     seconds: u64,
 }
 
+/// How the node can tell that the service `config` answers on its first port `port`: the host port's proxy, the
+/// droidd port its firewall opens to the node, or only that it runs.
+fn reach_of(config: &ServiceConfig, port: u16) -> Reach {
+    if let Some(lan) = &config.lan {
+        Reach::Lan(lan.port)
+    } else if let Some((address, port)) = config
+        .private_port
+        .as_ref()
+        .and_then(|private| Some((private.address.parse().ok()?, private.port)))
+    {
+        Reach::Private(address, port)
+    } else if config.droidd_port == Some(port) {
+        Reach::Direct(port)
+    } else {
+        Reach::Running
+    }
+}
+
 /// How the node tells that a service answers.
 #[derive(Clone, Copy)]
 enum Reach {
@@ -1080,6 +1242,19 @@ enum Reach {
     Direct(u16),
     /// The node can reach nothing of it: the instance must stay running.
     Running,
+}
+
+/// The template's part of an update with `withTemplate`.
+struct TemplateStep {
+    /// The difference the card showed and the run applies.
+    changes: Value,
+    /// The record to write, or `None` when the difference writes nothing (a secret whose value is set separately).
+    ready: Option<Ready>,
+    /// The record a rollback puts back, exactly: one that named no entrypoint names none again, and the node takes
+    /// the template's off the instance.
+    old: ServiceConfig,
+    /// Whether the new record may be saved, so a rollback must put the old one back.
+    written: Cell<bool>,
 }
 
 struct Run<'a> {
@@ -1095,6 +1270,7 @@ struct Run<'a> {
     registry: Option<&'a arca_incus::RegistryCredential>,
     journal: &'a Journal,
     was_running: bool,
+    template: Option<&'a TemplateStep>,
 }
 
 impl Run<'_> {
@@ -1104,16 +1280,39 @@ impl Run<'_> {
         let mut back: Option<Back> = None;
         let failure = match self.forward(&mut instance, &mut back) {
             Ok(snapshot) => {
+                let Some(template) = self.template else {
+                    self.journal
+                        .step("end", true, json!({ "digest": self.digest }));
+                    return Ok(json!({
+                        "updated": true,
+                        "service": name,
+                        "digest": self.digest,
+                        "snapshot": snapshot,
+                        "message": format!(
+                            "service {name} runs {} and its port {} answered",
+                            self.digest, self.port,
+                        ),
+                    }));
+                };
+                let differs = self.read_back(template);
                 self.journal
-                    .step("end", true, json!({ "digest": self.digest }));
+                    .step("end", differs.is_empty(), json!({ "digest": self.digest }));
                 return Ok(json!({
                     "updated": true,
                     "service": name,
                     "digest": self.digest,
                     "snapshot": snapshot,
+                    "changes": template.changes,
+                    "readBack": { "matches": differs.is_empty(), "differs": differs },
                     "message": format!(
-                        "service {name} runs {} and its port {} answered",
-                        self.digest, self.port,
+                        "service {name} runs {} and what its template says now, started once for both, and its port {} answered; {}",
+                        self.digest,
+                        self.port,
+                        if differs.is_empty() {
+                            "its config read back as applied".to_string()
+                        } else {
+                            format!("its config read back differs at {}: service_status shows how it is", differs.join(", "))
+                        },
                     ),
                 }));
             }
@@ -1156,15 +1355,15 @@ impl Run<'_> {
         };
         match self.roll_back(&mut instance, &back, failure.step) {
             Ok(back) => {
-                self.journal.step(
-                    "end",
-                    false,
-                    json!({ "rolledBack": true, "rootKept": back.root_kept, "oldAnswers": back.answers }),
-                );
+                let mut end = json!({ "rolledBack": true, "rootKept": back.root_kept, "oldAnswers": back.answers });
+                if let Some(restored) = back.record {
+                    end["recordRestored"] = json!(restored);
+                }
+                self.journal.step("end", false, end);
                 Err(CallError::Refused {
                     code: "rolled_back".into(),
                     message: format!(
-                        "update service {name} to {}: {} failed: {}. The update was rolled back: {}the old version is {}{}",
+                        "update service {name} to {}: {} failed: {}. The update was rolled back: {}{}the old version is {}{}",
                         self.digest,
                         failure.step,
                         failure.why,
@@ -1173,6 +1372,9 @@ impl Run<'_> {
                         } else {
                             ""
                         },
+                        self.record_words(back.record)
+                            .map(|words| format!("{words}; "))
+                            .unwrap_or_default(),
                         if self.was_running {
                             "running again"
                         } else {
@@ -1186,17 +1388,24 @@ impl Run<'_> {
                     ),
                 })
             }
-            Err(second) => {
-                self.journal.step(
-                    "end",
-                    false,
-                    json!({ "rolledBack": false, "why": second.why }),
-                );
+            Err((second, record)) => {
+                let mut end = json!({ "rolledBack": false, "why": second.why });
+                if let Some(restored) = record {
+                    end["recordRestored"] = json!(restored);
+                }
+                self.journal.step("end", false, end);
                 Err(CallError::Refused {
                     code: "rollback_failed".into(),
                     message: format!(
-                        "update service {name} to {}: {} failed: {}. It was NOT rolled back: {} failed: {}. The service is stopped; service_status shows what is there",
-                        self.digest, failure.step, failure.why, second.step, second.why,
+                        "update service {name} to {}: {} failed: {}. It was NOT rolled back: {} failed: {}. {}The service is stopped; service_status shows what is there",
+                        self.digest,
+                        failure.step,
+                        failure.why,
+                        second.step,
+                        second.why,
+                        self.record_words(record)
+                            .map(|words| format!("{}. ", sentence(words)))
+                            .unwrap_or_default(),
                     ),
                 })
             }
@@ -1295,6 +1504,7 @@ impl Run<'_> {
         self.journal
             .step("rebuild", true, json!({ "digest": self.digest }));
         self.edge_root();
+        self.apply_template()?;
         self.started(instance)?;
         self.journal.step("start", true, json!({}));
         self.healthy()?;
@@ -1425,6 +1635,20 @@ impl Run<'_> {
         instance: &mut InstanceState,
         back: &Back,
         after: &str,
+    ) -> Result<Rolled, (Failure, Option<bool>)> {
+        // The template's settings go back first, whatever happens to the root after: the node writes the old config
+        // while the instance is still stopped (or running, which takes it at its next start).
+        let record = self.put_template_back();
+        self.root_back(instance, back, after, record)
+            .map_err(|failure| (failure, record))
+    }
+
+    fn root_back(
+        &self,
+        instance: &mut InstanceState,
+        back: &Back,
+        after: &str,
+        record: Option<bool>,
     ) -> Result<Rolled, Failure> {
         self.stopped(instance)?;
         let mut root_kept = false;
@@ -1460,8 +1684,100 @@ impl Run<'_> {
             answers = self.answers_within(self.seconds.min(OLD_ANSWERS_SECONDS));
             self.journal.step("old answers", answers, json!({}));
         }
-        Ok(Rolled { root_kept, answers })
+        Ok(Rolled {
+            root_kept,
+            answers,
+            record,
+        })
     }
+
+    /// With the template: its record is written, under the node's write gate and only while the record is the one the
+    /// card was made from. The node writes the instance's config from it while the instance is stopped, so the one
+    /// start that follows takes the new image and the new settings together.
+    fn apply_template(&self) -> Result<(), Failure> {
+        let Some(ready) = self.template.and_then(|step| step.ready.as_ref()) else {
+            return Ok(());
+        };
+        let step = self.template.expect("a template step");
+        match self
+            .handler
+            .write_plan(&self.entry.id.0, self.config, &ready.next)
+        {
+            Written::Done => {
+                step.written.set(true);
+                self.journal.step("apply", true, json!({}));
+                Ok(())
+            }
+            Written::Stale { .. } => Err(Failure::said(
+                "apply",
+                "the service's record changed since the card was made (a link or a secret was set meanwhile), so its template's settings were not written: propose it again".to_string(),
+            )),
+            Written::Refused(why) => {
+                step.written.set(true);
+                Err(Failure::said(
+                    "apply",
+                    format!("the node did not apply the template's settings: {why}"),
+                ))
+            }
+        }
+    }
+
+    /// Puts the old record back when the template's was written: `None` when there was nothing to put back, else whether
+    /// it worked.
+    fn put_template_back(&self) -> Option<bool> {
+        let step = self.template.filter(|step| step.written.get())?;
+        let restored = self
+            .handler
+            .put_plan_back(&self.entry.id.0, &step.old, true);
+        self.journal.step("put back", restored, json!({}));
+        Some(restored)
+    }
+
+    /// What a refusal says of the record a rollback put back, or `None` when there was nothing to put back.
+    fn record_words(&self, record: Option<bool>) -> Option<&'static str> {
+        record.map(|restored| {
+            if restored {
+                "its old settings are back in its record and its instance's config, its entrypoint among them"
+            } else {
+                "its old settings could not be put back in its record (service_status shows what it says)"
+            }
+        })
+    }
+
+    /// The config read back after the start, against the template's settings that were applied: the keys that differ,
+    /// never a value. Journalled.
+    fn read_back(&self, template: &TemplateStep) -> Vec<String> {
+        let Some(ready) = &template.ready else {
+            return Vec::new();
+        };
+        let differs = match self
+            .changer
+            .read(&self.config.project, &self.config.instance)
+        {
+            Ok(state) => service_reconfigure::read_back_differs(
+                &state,
+                &ready.applied,
+                self.config,
+                &ready.next,
+            ),
+            Err(_) => vec!["(the instance could not be read)".to_string()],
+        };
+        self.journal.step(
+            "read back",
+            differs.is_empty(),
+            json!({ "differs": differs }),
+        );
+        differs
+    }
+}
+
+/// `words` with its first letter in upper case, to begin a sentence.
+fn sentence(words: &str) -> String {
+    let mut letters = words.chars();
+    letters
+        .next()
+        .map(|first| first.to_uppercase().chain(letters).collect())
+        .unwrap_or_default()
 }
 
 /// What a rollback did.
@@ -1470,4 +1786,6 @@ struct Rolled {
     root_kept: bool,
     /// The old version answered after it was started.
     answers: bool,
+    /// With the template: whether its old record was put back, or `None` when there was nothing to put back.
+    record: Option<bool>,
 }

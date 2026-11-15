@@ -277,6 +277,10 @@ pub const NO_NEW_PRIVS_RAW_LXC: &str = "lxc.no_new_privs=1";
 /// carries the key, so every other instance is as it always was. A later reconcile removes `raw.lxc` once the template
 /// declares no line any more only when `raw.lxc` still is this value: anything else there was put by someone else.
 pub const RAW_LXC_KEY: &str = "user.arca.rawlxc";
+/// The key that marks the entrypoint a reconcile moved an instance to: the `oci.entrypoint` Arca wrote there. A record
+/// that names no entrypoint takes off only one that still carries this mark, so an entrypoint Arca did not write is
+/// never touched.
+pub const ENTRYPOINT_KEY: &str = "user.arca.entrypoint";
 /// The most `rawLxc` lines a template may declare.
 pub const RAW_LXC_MAX_LINES: usize = 16;
 /// The longest `rawLxc` line, in bytes.
@@ -1371,11 +1375,26 @@ impl Plugin for Service {
                 }
             }
             // The entrypoint follows the record when the record names one (`service_reconfigure` moves it to what the
-            // template says now); Incus takes it at the instance's next start. One the record does not name is left.
-            if let Some(entrypoint) = desired["config"]["oci.entrypoint"].as_str()
-                && current.get("oci.entrypoint").and_then(Value::as_str) != Some(entrypoint)
-            {
-                changes.insert("oci.entrypoint".into(), Some(entrypoint.to_owned()));
+            // template says now); Incus takes it at the instance's next start, and the value written is marked
+            // ([`ENTRYPOINT_KEY`]). One the record does not name is left, unless it is the one the mark says Arca
+            // wrote: a record put back to no entrypoint (a rolled-back `service_update` with its template) takes it
+            // off, so the image's own runs again.
+            let mark = current.get(ENTRYPOINT_KEY).and_then(Value::as_str);
+            let now = current.get("oci.entrypoint").and_then(Value::as_str);
+            match desired["config"]["oci.entrypoint"].as_str() {
+                Some(entrypoint) if now != Some(entrypoint) => {
+                    changes.insert("oci.entrypoint".into(), Some(entrypoint.to_owned()));
+                    changes.insert(ENTRYPOINT_KEY.into(), Some(entrypoint.to_owned()));
+                }
+                Some(_) => {}
+                None => {
+                    if let Some(mark) = mark {
+                        if now == Some(mark) {
+                            changes.insert("oci.entrypoint".into(), None);
+                        }
+                        changes.insert(ENTRYPOINT_KEY.into(), None);
+                    }
+                }
             }
             for (key, value) in &cfg.environment {
                 if cfg

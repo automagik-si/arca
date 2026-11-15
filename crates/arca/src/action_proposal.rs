@@ -242,6 +242,11 @@ impl ActionKind {
         {
             return "It cannot be undone: the service's data is erased and cannot be brought back.";
         }
+        if self == Self::ServiceUpdate
+            && args.get("withTemplate").and_then(Value::as_bool) == Some(true)
+        {
+            return "If the new version's port does not answer, Arca puts the old image and the old settings back by itself. To go back after a good update, change the template back and ask your assistant to update the service to the old digest with its template.";
+        }
         if self == Self::ServiceUpdate && args.get("noNewPrivileges").is_some() {
             return "If the service does not come back healthy, Arca puts the old setting back by itself. To go back after a good change, change the setting in the template and ask your assistant to update the service to the digest it already runs.";
         }
@@ -620,6 +625,13 @@ impl ActionKind {
                 if args.get("eraseData").and_then(Value::as_bool) == Some(true) {
                     rows.push(row("Erase data", ERASE_DATA_WORDS));
                 }
+                if args.get("withTemplate").and_then(Value::as_bool) == Some(true) {
+                    rows.extend(template_rows("Template changes", &args["changes"]));
+                    rows.push(row(
+                        "Effect",
+                        "Arca stops the service, rebuilds it from the new image, writes these settings into it and starts it once: one interruption for both. If its port does not answer, Arca puts back the old image and the old settings by itself. No secret value is shown here.",
+                    ));
+                }
                 rows
             }
             Self::ServiceReconfigure => reconfigure_rows(args),
@@ -949,6 +961,15 @@ impl ActionKind {
                 format!(
                     "Change whether the service {} follows Automagik's releases",
                     text("name")
+                )
+            }
+            Self::ServiceUpdate
+                if args.get("withTemplate").and_then(Value::as_bool) == Some(true) =>
+            {
+                format!(
+                    "Update the service {} to a new image and make it what its template says now: {} (one restart)",
+                    text("name"),
+                    reconfigure_count(&args["changes"])
                 )
             }
             Self::ServiceUpdate => format!("Update the service {} to a new image", text("name")),
@@ -1457,14 +1478,24 @@ fn list_words(list: &Value) -> String {
 /// gives, is never shown: its row names the secrets or the link. A secret is named, never shown.
 fn reconfigure_rows(args: &Value) -> Vec<ActionDetail> {
     let row = |label: String, value: String| ActionDetail { label, value };
-    let changes = &args["changes"];
-    let mut rows = vec![
-        row(
-            "Name".into(),
-            args["name"].as_str().unwrap_or_default().to_string(),
-        ),
-        row("Changes".into(), reconfigure_count(changes)),
-    ];
+    let mut rows = vec![row(
+        "Name".into(),
+        args["name"].as_str().unwrap_or_default().to_string(),
+    )];
+    rows.extend(template_rows("Changes", &args["changes"]));
+    rows.push(row(
+        "Effect".into(),
+        "Arca writes these into the service and restarts it once if it runs, which interrupts it; a stopped service takes them at its next start. Then it reads the service's settings back. Its image and its data are not touched, and no secret value is shown here.".to_string(),
+    ));
+    rows
+}
+
+/// The rows of a template's difference, as a reconfigure and an update with its template show it: a row counting the
+/// changes under `label`, then one row for each environment key, each secret, the ports, the low-level container
+/// settings and the entrypoint that change.
+fn template_rows(label: &str, changes: &Value) -> Vec<ActionDetail> {
+    let row = |label: String, value: String| ActionDetail { label, value };
+    let mut rows = vec![row(label.into(), reconfigure_count(changes))];
     for item in changes["environment"].as_array().into_iter().flatten() {
         let key = shown(item["key"].as_str().unwrap_or_default(), 64);
         let change = item["change"].as_str().unwrap_or_default();
@@ -1552,10 +1583,6 @@ fn reconfigure_rows(args: &Value) -> Vec<ActionDetail> {
             ),
         ));
     }
-    rows.push(row(
-        "Effect".into(),
-        "Arca writes these into the service and restarts it once if it runs, which interrupts it; a stopped service takes them at its next start. Then it reads the service's settings back. Its image and its data are not touched, and no secret value is shown here.".to_string(),
-    ));
     rows
 }
 
