@@ -438,6 +438,13 @@ fn a_reconfigure_adds_sched_core_beside_no_new_privileges_and_the_card_shows_raw
         instance(&rig, "app")["config"]["raw.lxc"],
         "lxc.no_new_privs=1\nlxc.sched.core=0"
     );
+    // A value that is one secret and nothing else names that secret's own file, as the create wrote it, and never a
+    // copy: two files with one content read back as either reference, by the order a directory lists them in, and a
+    // reconcile then wrote the value again (an 11th write on ext4).
+    assert_eq!(
+        rig.service_config("app").environment["API_KEY"],
+        "arca-secret:service-app/api-key"
+    );
     // The next reconcile keeps both lines.
     let writes = rig.fake.writes().len();
     rig.apply(&rig.service_config("app")).expect("reconcile");

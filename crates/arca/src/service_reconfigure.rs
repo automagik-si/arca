@@ -44,6 +44,10 @@ pub(super) struct Plan {
     next: ServiceConfig,
     /// The environment keys whose values are kept behind a reference: those that hold a secret or come from a link.
     hidden: BTreeSet<String>,
+    /// The hidden keys whose template line is one secret and nothing else, with that secret's own reference. Such a key
+    /// names the secret's file, as a create writes it, and never a copy of its content: two files with one content make
+    /// the instance's value read back as either reference, and a reconcile then writes it again.
+    own: BTreeMap<String, String>,
     /// The secrets the template makes that the service does not hold yet, with their prefixes.
     generate: Vec<(String, String)>,
     /// The difference, as the card shows it and the approval binds it.
@@ -354,6 +358,21 @@ pub(super) fn plan(
         .filter(|(_, (_, kind))| *kind != Kind::Plain)
         .map(|(key, _)| key.clone())
         .collect();
+    let own = next_env
+        .iter()
+        .filter_map(|(key, (_, kind))| {
+            let Kind::Secrets(names) = kind else {
+                return None;
+            };
+            let [secret] = names.as_slice() else {
+                return None;
+            };
+            (template.env.get(key)? == &format!("{{{{secret:{secret}}}}}"))
+                .then(|| service_wiring::secret_reference_in(node, config, secret))
+                .flatten()
+                .map(|reference| (key.clone(), reference))
+        })
+        .collect();
     let mut next = config.clone();
     next.environment = next_env
         .into_iter()
@@ -369,6 +388,7 @@ pub(super) fn plan(
     Ok(Plan {
         next,
         hidden,
+        own,
         generate,
         changes: Value::Object(changes),
         writes,
@@ -552,8 +572,11 @@ impl ServiceHandler {
         let mut next = made.next;
         for key in &made.hidden {
             if let Some(value) = next.environment.get(key).cloned() {
-                next.environment
-                    .insert(key.clone(), self.store_value(&owner, &value)?);
+                let reference = match made.own.get(key) {
+                    Some(reference) => reference.clone(),
+                    None => self.store_value(&owner, &value)?,
+                };
+                next.environment.insert(key.clone(), reference);
             }
         }
         let fields = |record: &mut ServiceConfig, from: &ServiceConfig| {

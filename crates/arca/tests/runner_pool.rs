@@ -3602,9 +3602,12 @@ fn a_runner_that_takes_a_job_as_it_is_asked_to_give_its_place_up_keeps_its_job()
         "{}",
         pool.output()
     );
-    // The runner GitHub kept was asked once.
+    // The runner GitHub kept was asked once. Slot 1's runner may be asked too, when the pool read it as waiting before
+    // its job showed (a loaded machine): GitHub keeps it as well, which is the same race, answered the same way.
     assert_eq!(
-        pool.output().matches("its runner is kept").count(),
+        pool.output()
+            .matches("slot 0 (small): its runner is kept")
+            .count(),
         1,
         "{}",
         pool.output()
