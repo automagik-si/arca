@@ -451,9 +451,23 @@ fn a_passing_plan_is_frozen_with_its_digest_and_a_changed_source_gives_another()
     assert_eq!(one["project"], "shop");
     assert_eq!(one["name"], "web");
     assert!(one["uuid"].is_string(), "{one}");
-    assert_eq!(one["bytes"]["instance"], json!(2 * MIB));
-    assert_eq!(one["bytes"]["volumes"], json!(MIB));
-    assert_eq!(one["bytes"]["measured"], json!(3 * MIB));
+    // The files' bytes, plus each folder's own blocks: none on tmpfs, 4 KiB a folder on ext4.
+    let near = |value: &Value, bytes: u64| {
+        value
+            .as_u64()
+            .is_some_and(|got| got >= bytes && got < bytes + 64 * 1024)
+    };
+    assert!(near(&one["bytes"]["instance"], 2 * MIB), "{one}");
+    assert!(near(&one["bytes"]["volumes"], MIB), "{one}");
+    assert!(near(&one["bytes"]["measured"], 3 * MIB), "{one}");
+    assert_eq!(
+        one["bytes"]["measured"].as_u64(),
+        one["bytes"]["instance"]
+            .as_u64()
+            .zip(one["bytes"]["volumes"].as_u64())
+            .map(|(instance, volumes)| instance + volumes),
+        "{one}"
+    );
     assert!(one["bytes"]["needed"].as_u64().unwrap() > 3 * MIB);
     assert_eq!(one["rounds"]["preCopy"], 2);
     assert_eq!(one["volumes"][0]["name"], "web-data");
