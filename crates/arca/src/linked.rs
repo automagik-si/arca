@@ -92,8 +92,10 @@ pub fn admits(host: &LinkedHost, verb: &str) -> Option<bool> {
 }
 
 /// How long the page waits for a linked kernel's answer to the approval of action `action` with arguments `args`: the
-/// kernel runs the action before it answers. A `service_update` waits for its port up to `timeoutSeconds` (120 by
-/// default), and once more when it puts the old version back, so it waits twice that beyond every other action's wait.
+/// kernel runs the action before it answers. A `service_update` can take far longer than any other action: one Incus
+/// step of its rebuild may take up to `STEP_DEADLINE` (600 s, a registry pull included), its new version then has
+/// `timeoutSeconds` (120 by default) to answer, and after a rollback the old version has up to `OLD_ANSWERS_SECONDS`
+/// (30 s, never more than `timeoutSeconds`). It waits all of that beyond every other action's wait.
 pub fn approval_wait(action: &str, args: &Value) -> Duration {
     if action != "service_update" {
         return APPROVAL_TIMEOUT;
@@ -103,7 +105,8 @@ pub fn approval_wait(action: &str, args: &Value) -> Duration {
         .and_then(Value::as_u64)
         .unwrap_or(crate::handlers::DEFAULT_HEALTH_SECONDS)
         .min(crate::handlers::MAX_HEALTH_SECONDS);
-    APPROVAL_TIMEOUT + Duration::from_secs(2 * health)
+    let old_answers = health.min(crate::handlers::OLD_ANSWERS_SECONDS);
+    APPROVAL_TIMEOUT + crate::handlers::STEP_DEADLINE + Duration::from_secs(health + old_answers)
 }
 
 /// One JSON-RPC `method` with `params` to the linked kernel `host`, and its reply as it wrote it.
@@ -358,19 +361,27 @@ mod tests {
     }
 
     #[test]
-    fn a_service_update_waits_for_its_health_check_twice_beyond_the_approval_wait() {
-        // The 2026-11-15 card: service_update with timeoutSeconds 300 ran past the old flat 180 s.
+    fn a_service_update_waits_for_one_slow_step_and_both_health_checks_beyond_the_approval_wait() {
+        let step = crate::handlers::STEP_DEADLINE;
+        // The 2026-11-15 card: service_update with timeoutSeconds 300 ran past the old flat 180 s. It waits one 600 s
+        // Incus step, 300 s for the new version and 30 s for the old one after a rollback.
         let card = approval_wait("service_update", &json!({ "timeoutSeconds": 300 }));
-        assert_eq!(card, APPROVAL_TIMEOUT + Duration::from_secs(600));
-        // Without timeoutSeconds the update still checks for its default 120 s.
+        assert_eq!(card, APPROVAL_TIMEOUT + step + Duration::from_secs(330));
+        assert_eq!(card, Duration::from_secs(180 + 600 + 330));
+        // Without timeoutSeconds the update checks for its default 120 s.
         assert_eq!(
             approval_wait("service_update", &json!({})),
-            APPROVAL_TIMEOUT + Duration::from_secs(240)
+            APPROVAL_TIMEOUT + step + Duration::from_secs(150)
+        );
+        // A timeout under 30 s gives the old version no more than that.
+        assert_eq!(
+            approval_wait("service_update", &json!({ "timeoutSeconds": 10 })),
+            APPROVAL_TIMEOUT + step + Duration::from_secs(20)
         );
         // A value past the most the update takes waits no longer than that most.
         assert_eq!(
             approval_wait("service_update", &json!({ "timeoutSeconds": 100_000 })),
-            APPROVAL_TIMEOUT + Duration::from_secs(2 * crate::handlers::MAX_HEALTH_SECONDS)
+            APPROVAL_TIMEOUT + step + Duration::from_secs(crate::handlers::MAX_HEALTH_SECONDS + 30)
         );
         // Every other action waits as before.
         assert_eq!(

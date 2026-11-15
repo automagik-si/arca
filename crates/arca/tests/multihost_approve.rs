@@ -683,6 +683,11 @@ fn a_decline_is_relayed_to_the_linked_host_only() {
         Pair::waiting(&pair.alpha, &id),
         "alpha's own proposal is untouched"
     );
+    assert_eq!(
+        *pair.log.lock().expect("the log"),
+        vec![format!("arca: approval of {id} on beta: declined")],
+        "one line, and it says declined"
+    );
 }
 
 #[test]

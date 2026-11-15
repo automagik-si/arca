@@ -1487,8 +1487,10 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       approvals.fetchStartedAt = Date.now();
       try {
         const next = await readApprovalPlans();
-        // The trusted passkeys are read once, with the first list, and not at the first tap.
-        if (!approvals.credentialIds) loadCredentialIds().catch(() => {});
+        // The trusted passkeys are read with the list, and not at the tap: again whenever their count changed, and until
+        // there is one.
+        if (next.passkeysTrusted !== approvals.passkeysTrusted) approvals.credentialIds = null;
+        if (!approvals.credentialIds && next.passkeysTrusted > 0) loadCredentialIds().catch(() => {});
         const now = Date.now();
         for (const [id, plan] of next.plans) {
           const card = approvals.cards.get(id);
@@ -1688,6 +1690,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     return article;
   }
 
+  // The passkeys the approval page trusts. A list with none is not kept: the next list or tap reads it again.
   async function loadCredentialIds() {
     if (approvals.credentialIds) return approvals.credentialIds;
     const response = await fetch('/approve', {
@@ -1699,10 +1702,11 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     let ids = [];
     try { ids = JSON.parse(parsed.body?.dataset?.credentialIds || '[]'); } catch { ids = []; }
     if (!Array.isArray(ids)) ids = [];
-    approvals.credentialIds = ids
+    const trusted = ids
       .filter((value) => typeof value === 'string' && value)
       .map((value) => ({ type: 'public-key', id: fromB64url(value) }));
-    return approvals.credentialIds;
+    approvals.credentialIds = trusted.length ? trusted : null;
+    return trusted;
   }
 
   // The challenge the passkey signs for `statement`.

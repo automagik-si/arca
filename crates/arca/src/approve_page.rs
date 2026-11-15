@@ -29,7 +29,7 @@
 //! Every approval and decline from the page writes one log line on this host with its outcome code alone (`approved`,
 //! `refused <code>`, `unreachable`, `declined`), never the statement or the proof.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1098,25 +1098,59 @@ async fn plans(State(state): State<Arc<PageState>>) -> Response {
     };
     let (rows, hosts) = listed;
     if let Ok(mut waits) = state.linked_waits.lock() {
-        waits.clear();
-        for row in rows.iter().filter(|row| row["kind"] == json!("action")) {
-            if let (Some(host), Some(id), Some(action)) = (
-                row["linkedHost"].as_str(),
-                row["id"].as_str(),
-                row["action"].as_str(),
-            ) {
-                waits.insert(
-                    format!("{host}\n{id}"),
-                    linked::approval_wait(action, &row["args"]),
-                );
-            }
-        }
+        keep_waits(&mut waits, &rows, &hosts);
     }
     if let Some(plans) = body["plans"].as_array_mut() {
         plans.extend(rows);
     }
     body["linkedHosts"] = json!(hosts);
     Json(body).into_response()
+}
+
+/// Records how long an approval of each listed linked action may wait (`host\nid`). A host read just now replaces its
+/// waits; one that could not be read keeps the waits it was last listed with.
+fn keep_waits(waits: &mut HashMap<String, Duration>, rows: &[Value], hosts: &[Value]) {
+    let read: HashSet<&str> = hosts
+        .iter()
+        .filter(|host| host["read"] == json!(true))
+        .filter_map(|host| host["name"].as_str())
+        .collect();
+    waits.retain(|key, _| {
+        key.split_once('\n')
+            .is_some_and(|(host, _)| !read.contains(host))
+    });
+    for row in rows.iter().filter(|row| row["kind"] == json!("action")) {
+        if let (Some(host), Some(id), Some(action)) = (
+            row["linkedHost"].as_str(),
+            row["id"].as_str(),
+            row["action"].as_str(),
+        ) {
+            waits.insert(
+                format!("{host}\n{id}"),
+                linked::approval_wait(action, &row["args"]),
+            );
+        }
+    }
+}
+
+/// Where a linked approval of `id` goes on `host`, and how long it waits: an action to `action_approve`, as long as the
+/// card was listed to take; a delete plan's digest to `approval_submit`. `None` for any other id.
+fn relay_route(
+    waits: &HashMap<String, Duration>,
+    host: &str,
+    id: &str,
+) -> Option<(&'static str, Duration)> {
+    if id.starts_with("act-") {
+        let wait = waits
+            .get(&format!("{host}\n{id}"))
+            .copied()
+            .unwrap_or(linked::APPROVAL_TIMEOUT);
+        Some(("action_approve", wait))
+    } else if is_plan_digest(id) {
+        Some(("approval_submit", linked::APPROVAL_TIMEOUT))
+    } else {
+        None
+    }
 }
 
 /// The changed passkey lists waiting for the owner, one card per linked host: the host, the statement it issued, how many
@@ -1371,8 +1405,8 @@ fn relay_answer(name: &str, verb: &str, answer: Result<Value, RelayError>) -> (O
         Ok(value) => (Outcome::Approved, Json(value).into_response()),
         Err(error) => {
             let outcome = match &error {
-                RelayError::Refused { code, .. } => Outcome::Refused(code.clone()),
-                RelayError::Failed(_) => Outcome::Refused("Failed".to_string()),
+                RelayError::Refused { code, message } => refusal_outcome(code, message),
+                RelayError::Failed(message) => refusal_outcome("Failed", message),
                 RelayError::Token => Outcome::Refused("LinkToken".to_string()),
                 RelayError::Unreachable => Outcome::Unreachable,
             };
@@ -1413,14 +1447,31 @@ fn relay_error_response(name: &str, verb: &str, error: RelayError) -> Response {
 /// What became of one approval or decline from the page, for its log line.
 enum Outcome {
     Approved,
+    /// The approval was accepted and spent, and the action then failed with this code.
+    ApprovedThenFailed(String),
     Declined,
     Refused(String),
     Unreachable,
 }
 
+/// A refusal's outcome: an approval that was accepted and whose action then failed says so, not `refused`. Only the
+/// message's opening words are read; the message never reaches the log.
+fn refusal_outcome(code: &str, message: &str) -> Outcome {
+    if message.starts_with(crate::handlers::APPROVED_BUT_FAILED) {
+        Outcome::ApprovedThenFailed(code.to_string())
+    } else {
+        Outcome::Refused(code.to_string())
+    }
+}
+
 /// The one log line of an approval or decline from the page: the id, the host and the outcome code. Never the statement,
 /// the proof or a message; an id of any other shape is written as `-`.
 fn log_outcome(state: &PageState, id: &str, host: &str, outcome: &Outcome) {
+    write_outcome(&state.log, id, host, outcome);
+}
+
+/// [`log_outcome`] to the log `log`.
+fn write_outcome(log: &Arc<dyn Fn(&str) + Send + Sync>, id: &str, host: &str, outcome: &Outcome) {
     let shaped = |text: &str| {
         !text.is_empty()
             && text.len() <= 80
@@ -1432,21 +1483,25 @@ fn log_outcome(state: &PageState, id: &str, host: &str, outcome: &Outcome) {
     let host = if shaped(host) { host } else { "-" };
     let said = match outcome {
         Outcome::Approved => "approved".to_string(),
+        Outcome::ApprovedThenFailed(code) if shaped(code) => {
+            format!("approved, then failed {code}")
+        }
+        Outcome::ApprovedThenFailed(_) => "approved, then failed -".to_string(),
         Outcome::Declined => "declined".to_string(),
         Outcome::Refused(code) if shaped(code) => format!("refused {code}"),
         Outcome::Refused(_) => "refused -".to_string(),
         Outcome::Unreachable => "unreachable".to_string(),
     };
-    (state.log)(&format!("arca: approval of {id} on {host}: {said}"));
+    log(&format!("arca: approval of {id} on {host}: {said}"));
 }
 
 /// A local call's failure as its log outcome.
 fn call_outcome(error: &CallError) -> Outcome {
     match error {
-        CallError::Refused { code, .. }
-        | CallError::UntrustedRefused { code, .. }
-        | CallError::RefusedWith { code, .. } => Outcome::Refused(code.clone()),
-        CallError::Invalid(_) => Outcome::Refused("Invalid".to_string()),
+        CallError::Refused { code, message }
+        | CallError::UntrustedRefused { code, message }
+        | CallError::RefusedWith { code, message, .. } => refusal_outcome(code, message),
+        CallError::Invalid(message) => refusal_outcome("Invalid", message),
         _ => Outcome::Refused("Internal".to_string()),
     }
 }
@@ -1490,17 +1545,12 @@ async fn approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
             let Some(approval) = args.get("approval").and_then(Value::as_str) else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
-            let (verb, wait) = if action {
-                let wait = state
-                    .linked_waits
-                    .lock()
-                    .ok()
-                    .and_then(|waits| waits.get(&format!("{}\n{id}", host.name)).copied())
-                    .unwrap_or(linked::APPROVAL_TIMEOUT);
-                ("action_approve", wait)
-            } else if is_plan_digest(&id) {
-                ("approval_submit", linked::APPROVAL_TIMEOUT)
-            } else {
+            let route = state
+                .linked_waits
+                .lock()
+                .ok()
+                .and_then(|waits| relay_route(&waits, &host.name, &id));
+            let Some((verb, wait)) = route else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
             let name = host.name.clone();
@@ -2331,6 +2381,112 @@ mod test_passkey;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_linked_approval_waits_as_long_as_its_card_was_listed_to_take_and_an_unread_host_keeps_its_waits()
+     {
+        let row = |host: &str, id: &str, action: &str, args: Value| json!({ "kind": "action", "linkedHost": host, "id": id, "action": action, "args": args });
+        let update = linked::approval_wait("service_update", &json!({ "timeoutSeconds": 300 }));
+        assert!(update > linked::APPROVAL_TIMEOUT);
+        let mut waits = HashMap::new();
+        keep_waits(
+            &mut waits,
+            &[
+                row(
+                    "beta",
+                    "act-1",
+                    "service_update",
+                    json!({ "timeoutSeconds": 300 }),
+                ),
+                row(
+                    "gamma",
+                    "act-2",
+                    "service_update",
+                    json!({ "timeoutSeconds": 300 }),
+                ),
+                row("beta", "act-3", "instance_stop", json!({})),
+            ],
+            &[
+                json!({ "name": "beta", "read": true }),
+                json!({ "name": "gamma", "read": true }),
+            ],
+        );
+        assert_eq!(
+            relay_route(&waits, "beta", "act-1"),
+            Some(("action_approve", update))
+        );
+        assert_eq!(
+            relay_route(&waits, "beta", "act-3"),
+            Some(("action_approve", linked::APPROVAL_TIMEOUT))
+        );
+        // The wait is the card's own host's: the same id on another host is not that card.
+        assert_eq!(
+            relay_route(&waits, "delta", "act-1"),
+            Some(("action_approve", linked::APPROVAL_TIMEOUT))
+        );
+        // beta is read again without act-1; gamma cannot be read and keeps act-2's wait.
+        keep_waits(
+            &mut waits,
+            &[],
+            &[
+                json!({ "name": "beta", "read": true }),
+                json!({ "name": "gamma", "read": false }),
+            ],
+        );
+        assert_eq!(
+            relay_route(&waits, "beta", "act-1"),
+            Some(("action_approve", linked::APPROVAL_TIMEOUT))
+        );
+        assert_eq!(
+            relay_route(&waits, "gamma", "act-2"),
+            Some(("action_approve", update))
+        );
+        // A delete plan's digest goes to approval_submit; any other id goes nowhere.
+        let digest = "a".repeat(64);
+        assert_eq!(
+            relay_route(&waits, "beta", &digest),
+            Some(("approval_submit", linked::APPROVAL_TIMEOUT))
+        );
+        assert_eq!(relay_route(&waits, "beta", "plan-1"), None);
+    }
+
+    #[test]
+    fn an_approval_accepted_whose_action_then_failed_is_logged_as_approved_then_failed() {
+        let failed = format!(
+            "{} service_update did not complete: no room",
+            crate::handlers::APPROVED_BUT_FAILED
+        );
+        let said = |outcome: Outcome| {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let kept = Arc::clone(&lines);
+            let log: Arc<dyn Fn(&str) + Send + Sync> =
+                Arc::new(move |line: &str| kept.lock().expect("the log").push(line.to_string()));
+            write_outcome(&log, "act-1", "beta", &outcome);
+            let said = lines.lock().expect("the log").first().cloned();
+            said.expect("one line")
+        };
+        assert_eq!(
+            said(refusal_outcome("NoRoom", &failed)),
+            "arca: approval of act-1 on beta: approved, then failed NoRoom"
+        );
+        assert_eq!(
+            said(refusal_outcome("Expired", "the approval has expired")),
+            "arca: approval of act-1 on beta: refused Expired"
+        );
+        assert_eq!(
+            said(call_outcome(&CallError::Refused {
+                code: "NoRoom".to_string(),
+                message: failed.clone()
+            })),
+            "arca: approval of act-1 on beta: approved, then failed NoRoom"
+        );
+        assert_eq!(
+            said(call_outcome(&CallError::Invalid("bad".to_string()))),
+            "arca: approval of act-1 on beta: refused Invalid"
+        );
+        // The message never reaches the line.
+        assert!(!said(refusal_outcome("NoRoom", &failed)).contains("no room"));
+    }
 
     #[test]
     fn state_line_append_is_idempotent_by_credential_or_fingerprint() {

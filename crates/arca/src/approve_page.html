@@ -174,6 +174,7 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   /* what went wrong with one card, on the card */
+  .card.gone { display: flex; align-items: center; justify-content: center; border-style: dashed; box-shadow: none; color: var(--arca-muted); font-size: var(--arca-text-sm); text-align: center; }
   .card-note {
     --tone: var(--arca-bad); --tone-soft: var(--arca-bad-soft);
     margin-top: var(--arca-space-3); padding: var(--arca-space-2) var(--arca-space-3);
@@ -489,6 +490,12 @@ let busy = 0;
 let listing = 0;
 // What went wrong on a card, by card, kept across a redraw of the list until that card is tapped again or is gone.
 const cardNotes = new Map();
+// The cards drawn now, in the order they stand on the page (see placeCards).
+const drawnPlans = [];
+const drawnRequests = [];
+// How long a tap is held off after the cards moved, and the timer that lets taps through again.
+const HOLD_MS = 1000;
+let holding = 0;
 
 const REFUSALS = {
   Expired: "This approval ran out of time. Reload the page and try again.",
@@ -677,7 +684,9 @@ function inSentence(text) {
   return /[.!?]$/.test(lowered) ? lowered : lowered + ".";
 }
 
-function planCard(plan) {
+// The cards below take `current`: the card's item as last listed. A refresh that keeps a card in place gives it the
+// item it just read (the same plan, with a fresh statement), and a tap reads it once, when it starts.
+function planCard(plan, current = () => plan) {
   const card = el("article", "card plan");
   const objects = Array.isArray(plan.objects) ? plan.objects : [];
 
@@ -735,7 +744,7 @@ function planCard(plan) {
   row.append(el("span", "digest-label", "Fingerprint"), chip, copy);
   digest.append(row, full);
 
-  const button = approveButton(title, (button) => approve(plan, button));
+  const button = approveButton(title, (button) => approve(current(), button));
 
   const more = moreDetails(title);
   more.box.append(digest);
@@ -751,7 +760,7 @@ function planCard(plan) {
   return card;
 }
 
-function actionCard(plan) {
+function actionCard(plan, current = () => plan) {
   const card = el("article", "card plan action");
   const meta = el("div", "plan-meta");
   const expiry = el("time", "expiry");
@@ -793,10 +802,10 @@ function actionCard(plan) {
   audit("Fingerprint", digest, true);
 
   const buttons = el("div", "actions");
-  const approving = approveButton(plan.summary, (button) => approve(plan, button));
+  const approving = approveButton(plan.summary, (button) => approve(current(), button));
   const declineButton = el("button", "btn btn-secondary", "Decline");
   declineButton.type = "button";
-  declineButton.addEventListener("click", () => decline(plan, declineButton));
+  declineButton.addEventListener("click", () => decline(current(), declineButton));
   buttons.append(approving, declineButton);
 
   card.append(meta, heading, facts, more.box, buttons);
@@ -806,7 +815,7 @@ function actionCard(plan) {
 
 // A card for a passkey list another machine keeps in sync from this page: the owner approves it with a passkey that
 // machine already trusts, and this page relays the signed statement with the list. No passkey line is shown.
-function peerKeysCard(card) {
+function peerKeysCard(card, current = () => card) {
   const node = el("article", "card plan action");
   const meta = el("div", "plan-meta");
   meta.append(el("span", "badge", "Passkeys"));
@@ -819,7 +828,7 @@ function peerKeysCard(card) {
   }
   const heading = el("h3", "", card.title);
   const text = el("p", "notice-text", card.linkedHost + " will trust " + card.keys + " passkey" + (card.keys === 1 ? "" : "s") + " from this page for approvals. Confirm with a passkey it already trusts.");
-  const button = approveButton(card.title, (button) => trustPeerKeys(card, button));
+  const button = approveButton(card.title, (button) => trustPeerKeys(current(), button));
   node.append(meta, heading, text, button);
   return node;
 }
@@ -855,7 +864,7 @@ async function trustPeerKeys(card, button) {
 const REQUEST_WORDS = { delete: "Delete", publish: "Publish", spend: "Spend on" };
 
 // A request an agent made with owner_approval_request. Everything in it is the agent's words, so every part is set as text.
-function requestCard(request) {
+function requestCard(request, current = () => request) {
   const fields = request.fields || {};
   const card = el("article", "card plan action");
   const meta = el("div", "plan-meta");
@@ -893,10 +902,10 @@ function requestCard(request) {
   more.add("Fingerprint", String(fields.paramsDigest || ""), true);
 
   const buttons = el("div", "actions");
-  const approving = approveButton(title, (button) => approveRequest(request, button));
+  const approving = approveButton(title, (button) => approveRequest(current(), button));
   const denyButton = el("button", "btn btn-secondary", "Decline");
   denyButton.type = "button";
-  denyButton.addEventListener("click", () => denyRequest(request, denyButton));
+  denyButton.addEventListener("click", () => denyRequest(current(), denyButton));
   buttons.append(approving, denyButton);
 
   card.append(meta, heading, ...(code ? [code] : []), facts, more.box, buttons);
@@ -954,12 +963,14 @@ async function denyRequest(request, button) {
   }
 }
 
-function showRequests(requests) {
+// Draws the pending requests in place (see placeCards) and says whether a drawn one moved.
+function showRequests(requests, quiet) {
   const section = document.getElementById("requests-section");
   const target = document.getElementById("requests");
   const pending = (Array.isArray(requests) ? requests : []).filter((request) => request.state === "pending");
-  target.replaceChildren(...pending.map(requestCard));
-  section.hidden = pending.length === 0;
+  const moved = placeCards(target, drawnRequests, pending, (request) => String(request.id), requestCard, quiet);
+  section.hidden = drawnRequests.length === 0;
+  return moved;
 }
 
 function showTrusted(count) {
@@ -969,6 +980,82 @@ function showTrusted(count) {
   const field = document.getElementById("setup-code");
   getCode.hidden = count > 0;
   field.hidden = count > 0;
+}
+
+// A card's item without what a listing renews each time (its statement and its challenge), and whether a passkey is
+// trusted (its Approve button says so): two listings of the same card with the same shape draw
+// the same card.
+function cardShape(item) {
+  const { statement, challenge, ...rest } = item;
+  return document.body.dataset.trusted + JSON.stringify(rest);
+}
+
+// Draws the cards of one list without moving one the owner may be reading or about to tap. A card still listed keeps
+// its place, its open Details and its focus, and takes the fresh item for its next tap; one whose words changed is drawn
+// again in its own place. A new card goes after the others. A card no longer listed leaves a placeholder of its height
+// (it lapsed, or was approved or declined somewhere else), and the owner's own next action (a listing that is not
+// `quiet`) takes the placeholders away. Says whether anything on the list was drawn, drawn again or taken away.
+function placeCards(target, drawn, items, keyOf, draw, quiet) {
+  const listed = new Map(items.map((item) => [keyOf(item), item]));
+  if (!drawn.length) target.replaceChildren();
+  let moved = false;
+  const kept = [];
+  for (const entry of drawn) {
+    const item = listed.get(entry.key);
+    listed.delete(entry.key);
+    if (!item) {
+      if (!quiet) {
+        entry.node.remove();
+        moved = true;
+        continue;
+      }
+      if (!entry.gone) {
+        const gone = el("div", "card gone", "No longer waiting: it lapsed, or was approved or declined somewhere else.");
+        gone.style.minHeight = entry.node.offsetHeight + "px";
+        entry.node.replaceWith(gone);
+        entry.node = gone;
+        entry.gone = true;
+        moved = true;
+      }
+      kept.push(entry);
+      continue;
+    }
+    entry.item = item;
+    const shape = cardShape(item);
+    if (entry.gone || shape !== entry.shape) {
+      const node = draw(item, () => entry.item);
+      entry.node.replaceWith(node);
+      entry.node = node;
+      entry.gone = false;
+      entry.shape = shape;
+      moved = true;
+    } else {
+      const expiry = entry.node.querySelector("time.expiry");
+      const at = typeof item.expiresAt === "number" ? item.expiresAt : Date.parse(item.expiresAt);
+      if (expiry && !item.heldForSession && Number.isFinite(at)) {
+        expiry.replaceChildren(icon("clock"), expiryText(at));
+        expiry.classList.toggle("soon", at - Date.now() < 5 * 60000);
+      }
+    }
+    kept.push(entry);
+  }
+  for (const [key, item] of listed) {
+    const entry = { key, item, shape: cardShape(item), gone: false };
+    entry.node = draw(item, () => entry.item);
+    target.append(entry.node);
+    kept.push(entry);
+    moved = true;
+  }
+  drawn.splice(0, drawn.length, ...kept);
+  return moved;
+}
+
+// For a moment after the cards moved, a tap does nothing: it was aimed at what stood there before.
+function holdTaps() {
+  const lists = ["plans", "requests", "apps"].map((id) => document.getElementById(id));
+  for (const list of lists) list.inert = true;
+  clearTimeout(holding);
+  holding = setTimeout(() => { for (const list of lists) list.inert = false; }, HOLD_MS);
 }
 
 // Reads what is waiting and draws it. Every card gets its challenge now, so a tap goes straight to the passkey. A quiet
@@ -981,23 +1068,29 @@ async function loadPlans(quiet) {
     if (!response.ok) throw new Error("the plan list answered " + response.status);
     const body = await response.json();
     const peerKeys = Array.isArray(body.peerKeys) ? body.peerKeys : [];
+    for (const card of peerKeys) card.kind = "peerKeys";
     await Promise.all([...body.plans, ...peerKeys].map(async (card) => {
       if (typeof card.statement !== "string") return;
       try { card.challenge = await challengeOf(card.statement); } catch { /* computed at the tap instead */ }
     }));
     // A refresh that a tap overtook draws nothing: the card being approved keeps its place and its disabled button.
     if (mine !== listing || (quiet && busy)) return;
+    // Taps are held only when cards were already drawn: the first drawing moves nothing a finger was aimed at.
+    const before = drawnPlans.length + drawnRequests.length;
     showTrusted(body.passkeysTrusted || 0);
-    showRequests(body.approvalRequests);
+    let moved = showRequests(body.approvalRequests, quiet);
     const listed = new Set(body.plans.map(cardKey));
     for (const key of [...cardNotes.keys()]) if (!listed.has(key)) cardNotes.delete(key);
-    target.replaceChildren();
-    if (!body.plans.length && !peerKeys.length) {
-      target.append(notice("empty", "Nothing to approve", "When Arca wants to change or delete something, it will wait here for your OK."));
-      return;
+    const keyOf = (item) => item.kind === "peerKeys" ? "keys\n" + item.linkedHost : "plan\n" + cardKey(item);
+    const draw = (item, current) => {
+      if (item.kind === "peerKeys") return peerKeysCard(item, current);
+      return item.kind === "action" ? actionCard(item, current) : planCard(item, current);
+    };
+    if (placeCards(target, drawnPlans, [...peerKeys, ...body.plans], keyOf, draw, quiet)) moved = true;
+    if (!drawnPlans.length && !target.querySelector(".notice:not(.problem)")) {
+      target.replaceChildren(notice("empty", "Nothing to approve", "When Arca wants to change or delete something, it will wait here for your OK."));
     }
-    for (const card of peerKeys) target.append(peerKeysCard(card));
-    for (const plan of body.plans) target.append(plan.kind === "action" ? actionCard(plan) : planCard(plan));
+    if (moved && before) holdTaps();
   } catch (error) {
     if (quiet || mine !== listing) return;
     const card = notice("problem", "Couldn't load what's waiting", "Your plans are safe. Nothing changes until you approve it.");
@@ -1009,6 +1102,7 @@ async function loadPlans(quiet) {
       loadPlans();
     });
     card.append(retry);
+    drawnPlans.length = 0;
     target.replaceChildren(card);
     fail(error);
   }
@@ -1258,7 +1352,7 @@ async function approve(plan, button) {
       // The card's statement outlived its 10 minutes: the list is read again, with fresh statements, and the owner taps
       // the same card once more.
       const again = "This card had been open too long, so Arca renewed it. Tap Approve again.";
-      noteCard(plan, null, again, "warn");
+      noteCard(plan, card, again, "warn");
       status(again, "warn");
       await loadPlans();
       return;

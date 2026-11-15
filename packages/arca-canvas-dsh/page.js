@@ -2243,7 +2243,8 @@
         approvals.fetchStartedAt = Date.now();
         try {
           const next = await readApprovalPlans();
-          if (!approvals.credentialIds) loadCredentialIds().catch(() => {
+          if (next.passkeysTrusted !== approvals.passkeysTrusted) approvals.credentialIds = null;
+          if (!approvals.credentialIds && next.passkeysTrusted > 0) loadCredentialIds().catch(() => {
           });
           const now = Date.now();
           for (const [id, plan] of next.plans) {
@@ -2444,8 +2445,9 @@
         ids = [];
       }
       if (!Array.isArray(ids)) ids = [];
-      approvals.credentialIds = ids.filter((value) => typeof value === "string" && value).map((value) => ({ type: "public-key", id: fromB64url(value) }));
-      return approvals.credentialIds;
+      const trusted = ids.filter((value) => typeof value === "string" && value).map((value) => ({ type: "public-key", id: fromB64url(value) }));
+      approvals.credentialIds = trusted.length ? trusted : null;
+      return trusted;
     }
     async function approvalChallenge(statement) {
       return new Uint8Array(await crypto.subtle.digest(

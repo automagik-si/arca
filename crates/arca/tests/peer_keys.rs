@@ -1631,7 +1631,8 @@ fn the_page_host_syncs_to_a_host_that_names_it_in_another_letter_case() {
 #[test]
 fn the_approval_page_renders_the_passkey_list_card_and_posts_a_linked_rows_host() {
     let html = include_str!("../src/approve_page.html");
-    assert!(html.contains("for (const card of peerKeys) target.append(peerKeysCard(card));"));
+    assert!(html.contains("if (item.kind === \"peerKeys\") return peerKeysCard(item, current);"));
+    assert!(html.contains("[...peerKeys, ...body.plans]"));
     assert!(
         html.contains(
             "JSON.stringify({ host: card.linkedHost, statement: card.statement, proof })"

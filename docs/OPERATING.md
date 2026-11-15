@@ -3908,6 +3908,13 @@ passkey challenge when it reads the list, so a tap goes straight to the passkey 
 when nothing is awaited before the prompt). What went wrong with one card is said on that card, as well as in the status
 line at the top.
 
+A new reading of the list never moves a card the owner may be reading or about to tap. A card still waiting keeps its
+place, its open Details and the keyboard focus, and its next tap signs the statement just read for it. A new card goes
+after the others, wherever the list puts it. A card that stopped waiting while the page was open (it lapsed, or was
+approved or declined somewhere else) leaves a placeholder of its height, which the owner's next approval or decline takes
+away. For a second after a reading that changed what is drawn, the page takes no tap on its cards, so a tap aimed at what
+stood there before does nothing.
+
 Every route of the page, the canvas routes below among them, answers the same with one trailing slash as without it
 (`/approve/` is `/approve`, `/approve/plans/` is `/approve/plans`): the same handler under the same rules, not a
 redirect, so a POST stays a POST and a query string stays with it. Two slashes, or an encoded one, are no route.
@@ -4132,13 +4139,17 @@ Then:
   its result with `host` added, or its exact refusal (403 `{refusal, message}`, for example `WrongHost`, `BadSignature`,
   `Expired` or `Replayed`). `POST /approve/decline` with a `host` relays an action's decline to `plan_decline` the same
   way. The page waits for a relayed approval as long as the action can run: 180 seconds, and for a `service_update`
-  twice its `timeoutSeconds` (120 by default) more, since it may check its port again when it puts the old version back.
+  longer: one Incus step of its rebuild may take 600 seconds (a registry pull included), its new version has its
+  `timeoutSeconds` (120 by default) to answer, and after a rollback the old one has up to 30 more. A `service_update`
+  with `timeoutSeconds` 300 waits 1110 seconds. The wait comes from the card as last listed: a linked host the page
+  could not read keeps the wait it was listed with before.
 - A `host` the page does not list is refused 403 `{ "refusal": "NotLinked", "message": "this machine is not linked for
   approvals yet" }`. A linked kernel that refuses the token answers 502 `LinkToken`, with a message that says what to
   change; one that does not answer, 502 `Unreachable`. Nothing is relayed in either case.
 - Every approval and decline from the page, of its own kernel's cards or a linked one's, writes one line to the page
-  host's log: `arca: approval of <id> on <host>: approved`, `refused <code>`, `unreachable` or `declined`. The line never
-  holds the statement, its nonce or the proof.
+  host's log: `arca: approval of <id> on <host>: approved`, `approved, then failed <code>` (the approval was accepted
+  and spent, and the action then failed), `refused <code>`, `unreachable` or `declined`. The line never holds the
+  statement, its nonce, the proof or a message.
 - Without a `host`, the page approves only on its own kernel, as before. It never calls its own kernel for another
   kernel's id.
 

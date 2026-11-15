@@ -486,11 +486,34 @@ impl Chrome {
         answer["result"]["value"].clone()
     }
 
+    /// Clicks the button `selector` once it is on the page, enabled, and not held off: the page holds taps for a moment
+    /// after its cards moved (`inert`), and a person's tap does nothing there.
     fn click(&mut self, selector: &str) {
-        let found = self.eval(&format!(
-            "(() => {{ const b = document.querySelector({selector:?}); if (!b || b.disabled) return false; b.click(); return true; }})()"
-        ));
-        assert_eq!(found, json!(true), "{selector} is on the page and enabled");
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let found = self.eval(&format!(
+                "(() => {{ const b = document.querySelector({selector:?}); if (!b || b.disabled || b.closest('[inert]')) return false; b.click(); return true; }})()"
+            ));
+            if found == json!(true) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{selector} is on the page and enabled"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// A person's tap at `(x, y)` in the page's viewport: a real mouse press and release, which an `inert` part of the page
+    /// does not take.
+    fn tap_at(&mut self, x: f64, y: f64) {
+        for kind in ["mousePressed", "mouseReleased"] {
+            self.page(
+                "Input.dispatchMouseEvent",
+                json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 }),
+            );
+        }
     }
 
     /// Waits until the page's status line reads `want` (its start) in the ok tone. A bad or warning tone fails at once.
@@ -1206,14 +1229,21 @@ fn two_approvals_in_one_page_load_both_reach_the_server_and_a_later_card_shows_u
          return true; })()",
     );
     let tap = |chrome: &mut Chrome, name: &str| {
-        let tapped = chrome.eval(&format!(
+        let deadline = Instant::now() + WAIT;
+        while chrome.eval(&format!(
             "(() => {{ const card = [...document.querySelectorAll('#plans article.action')] \
                .find((c) => c.querySelector('h3').textContent.includes('service {name} from')); \
              const button = card && card.querySelector('button.approve'); \
-             if (!button || button.disabled) return false; \
+             if (!button || button.disabled || button.closest('[inert]')) return false; \
              window.__inTap = true; button.click(); window.__inTap = false; return true; }})()"
-        ));
-        assert_eq!(tapped, json!(true), "the card for {name} is on the page");
+        )) != json!(true)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the card for {name} is on the page"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
     };
 
     tap(&mut chrome, "nats");
@@ -1242,6 +1272,496 @@ fn two_approvals_in_one_page_load_both_reach_the_server_and_a_later_card_shows_u
 
     drop(chrome);
     assert_eq!(serve.terminate(), Some(0), "serve exits 0 on SIGTERM");
+}
+
+/// Review 1 of PR 205, in a real browser with two real kernels: node1's page, and node2 linked to it. node2 trusts node1's
+/// passkeys for node1's origin, and node1 holds a relay token for node2.
+/// - While a tap runs, the page's refresh reads nothing.
+/// - A refresh whose list puts a new card above a drawn one keeps the drawn one where it was. The new card goes after it,
+///   taps are held off for a moment, and a real tap at the old place approves the card that was read there.
+/// - A card refused `Expired` says so on the card, is renewed in place, and the next tap approves it.
+/// - Decline on a linked card declines it on its own machine.
+/// - A card that stops waiting while the page is open leaves a placeholder of its height, and nothing below it moves.
+#[test]
+#[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
+fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and_a_linked_decline_reaches_its_host()
+ {
+    let chrome_binary = std::env::var(CHROME_ENV).unwrap_or_else(|_| DEFAULT_CHROME.to_string());
+    let scratch = Scratch::new("browser-keep");
+    let bin = scratch.at("bin");
+    private_dir(&bin);
+    let notify = bin.join("notify-send");
+    fs::write(&notify, "#!/bin/sh\nexit 1\n").expect("the stub desktop");
+    fs::set_permissions(&notify, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let kernel_config = json!({
+        "projects": [arca_netproject::PROJECT], "scratch": false, "droiddProjects": ["droid"],
+        "reservedCidrs": [], "serviceCidr": "192.0.2.0/24"
+    });
+    // One machine: its state, its tokens and an assistant's viewer token, a fake Incus and the nats template.
+    let machine = |name: &str| {
+        let state = scratch.at(&format!("{name}-state"));
+        private_dir(&state);
+        let hash_dir = scratch.at(&format!("{name}-tokens"));
+        private_dir(&hash_dir);
+        let secret_file = scratch.at(&format!("{name}-viewer.secret"));
+        run(
+            arca()
+                .args([
+                    "token",
+                    "mint",
+                    "--scope",
+                    "viewer",
+                    "--id",
+                    "assistant-1",
+                    "--hash-dir",
+                ])
+                .arg(&hash_dir)
+                .arg("--out")
+                .arg(&secret_file),
+            "token mint",
+        );
+        let viewer = fs::read_to_string(&secret_file)
+            .expect("the secret")
+            .trim_end()
+            .to_string();
+        let incus_dir = scratch.at(&format!("{name}-incus"));
+        private_dir(&incus_dir);
+        let fake = FakeIncus::start(
+            &incus_dir,
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                networks: vec![],
+                pools: vec![],
+            },
+        )
+        .expect("the fake Incus");
+        fake.add_profile(
+            "default",
+            json!({ "name": "default", "config": {},
+                    "devices": { "root": { "type": "disk", "pool": "default", "path": "/" } } }),
+        );
+        let templates = state.join("templates");
+        private_dir(&templates);
+        fs::write(
+            templates.join("nats.json"),
+            json!({
+                "name": "nats", "kind": "oci", "image": "docker.io/library/nats",
+                "digest": format!("sha256:{}", "a".repeat(64)),
+                "ports": [4222], "env": {}, "publishable": false
+            })
+            .to_string(),
+        )
+        .expect("the template");
+        (state, hash_dir, viewer, fake)
+    };
+    let (state1, tokens1, viewer1, fake1) = machine("node1");
+    let (state2, tokens2, viewer2, fake2) = machine("node2");
+    let relay_file = scratch.at("node2-relay.secret");
+    run(
+        arca()
+            .args([
+                "token",
+                "mint",
+                "--scope",
+                "doctor",
+                "--id",
+                "relay",
+                "--tools",
+                "plan_list,action_approve,plan_decline,approval_submit",
+                "--hash-dir",
+            ])
+            .arg(&tokens2)
+            .arg("--out")
+            .arg(&relay_file),
+        "token mint",
+    );
+    let relay = fs::read_to_string(&relay_file)
+        .expect("the relay secret")
+        .trim_end()
+        .to_string();
+
+    // node1's page is at https://localhost:<port>, the origin node2 trusts node1's passkeys for.
+    let (cert, key, spki) = certificate(&scratch.at("tls"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let origin = format!(
+        "https://localhost:{}",
+        listener.local_addr().expect("addr").port()
+    );
+    let socket1 = scratch.at("node1.sock");
+    let socket2 = scratch.at("node2.sock");
+    tls_front(listener, cert, key, socket1.clone());
+    let config2 = scratch.at("node2.json");
+    fs::write(
+        &config2,
+        json!({
+            "stateDir": state2.display().to_string(),
+            "incus": { "socket": fake2.socket().display().to_string(), "pools": [] },
+            "listen": { "unix": socket2.display().to_string(), "tailnet": null },
+            "tokens": { "hashDir": tokens2.display().to_string() },
+            "approvalHost": "node2",
+            "kernel": kernel_config,
+            "approval": {
+                "trustOwnerKeysFrom": [state1.join(arca_approval::STATE_PASSKEYS_FILE).display().to_string()],
+                "origins": [origin]
+            }
+        })
+        .to_string(),
+    )
+    .expect("node2's config");
+    let config1 = scratch.at("node1.json");
+    fs::write(
+        &config1,
+        json!({
+            "stateDir": state1.display().to_string(),
+            "incus": { "socket": fake1.socket().display().to_string(), "pools": [] },
+            "listen": { "unix": socket1.display().to_string(), "tailnet": null },
+            "tokens": { "hashDir": tokens1.display().to_string() },
+            "approvalOrigin": origin,
+            "approvalHost": "node1",
+            "kernel": kernel_config,
+            "approval": {
+                "linkedHosts": [{
+                    "name": "node2",
+                    "socket": socket2.display().to_string(),
+                    "tokenFile": relay_file.display().to_string()
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .expect("node1's config");
+    let mut serve2 = Serve::start(&config2, &bin, scratch.at("node2.log"));
+    serve2.wait_for(&socket2);
+    let mut serve = Serve::start(&config1, &bin, scratch.at("node1.log"));
+    serve.wait_for(&socket1);
+    let propose = |socket: &Path, viewer: &str, id: u64, name: &str| -> String {
+        let proposed = result(
+            &mcp(
+                socket,
+                viewer,
+                id,
+                "action_propose",
+                json!({ "action": "service_create", "args": { "name": name, "template": "nats" } }),
+            ),
+            "action_propose",
+        );
+        proposed["id"].as_str().expect("an id").to_string()
+    };
+    propose(&socket1, &viewer1, 1, "nats");
+    propose(&socket2, &viewer2, 1, "natsb");
+    let natsc = propose(&socket2, &viewer2, 2, "natsc");
+
+    let mut chrome = Chrome::launch(
+        &chrome_binary,
+        &scratch.at("chrome"),
+        &spki,
+        &scratch.at("chrome.log"),
+    );
+    chrome.page("WebAuthn.enable", json!({ "enableUI": false }));
+    chrome.page(
+        "Emulation.setFocusEmulationEnabled",
+        json!({ "enabled": true }),
+    );
+    chrome.authenticator("internal");
+    chrome.page(
+        "Page.navigate",
+        json!({ "url": format!("{origin}/approve") }),
+    );
+    let wait_for = |chrome: &mut Chrome, js: &str, what: &str| {
+        let deadline = Instant::now() + WAIT;
+        while chrome.eval(js) != json!(true) {
+            assert!(
+                Instant::now() < deadline,
+                "{what}; node1's log:\n{}\nnode2's log:\n{}",
+                serve.log_text(),
+                serve2.log_text()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // The card for the service `name`, in page script.
+    let card = |name: &str| {
+        format!(
+            "[...document.querySelectorAll('#plans article.action')].find((c) => c.querySelector('h3').textContent.includes('service {name} from'))"
+        )
+    };
+    wait_for(
+        &mut chrome,
+        "document.readyState === 'complete' && document.querySelectorAll('#plans article.action').length === 3",
+        "the page loads with node1's card and node2's two",
+    );
+
+    // The first passkey, with the terminal's setup code.
+    let out = arca()
+        .args(["setup-code", "--config"])
+        .arg(&config1)
+        .output()
+        .expect("run arca setup-code");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed: Value = serde_json::from_slice(&out.stdout).expect("JSON on stdout");
+    let code = printed["code"].as_str().expect("a code").to_string();
+    chrome.eval(&format!(
+        "document.getElementById('setup-code').value = {code:?}; document.getElementById('passkey-label').value = 'This computer'; true"
+    ));
+    chrome.click("#register");
+    chrome.status_ok("Passkey trusted.", &serve);
+    wait_for(
+        &mut chrome,
+        "[...document.querySelectorAll('#plans button.approve')].every((b) => b.textContent === 'Approve') && !document.getElementById('plans').inert",
+        "with a passkey trusted, the cards' buttons approve, and taps are let through",
+    );
+
+    // From here the page is never loaded again. Every list the page reads, and every passkey request, is counted; a
+    // passkey request can be held until the test lets it go.
+    chrome.eval(
+        "(() => { window.__sameLoad = true; window.__lists = 0; window.__gets = 0; window.__getHook = null; \
+         const fetched = window.fetch.bind(window); \
+         window.fetch = (url, options) => { if (String(url) === '/approve/plans') window.__lists++; return fetched(url, options); }; \
+         const get = navigator.credentials.get.bind(navigator.credentials); \
+         navigator.credentials.get = (options) => { window.__gets++; return window.__getHook ? window.__getHook(options) : get(options); }; \
+         return true; })()",
+    );
+    let click = |chrome: &mut Chrome, name: &str, button: &str| {
+        let deadline = Instant::now() + WAIT;
+        while chrome.eval(&format!(
+            "(() => {{ const card = {}; const b = card && card.querySelector({button:?}); \
+             if (!b || b.disabled || b.closest('[inert]')) return false; status(''); b.click(); return true; }})()",
+            card(name)
+        )) != json!(true)
+        {
+            assert!(Instant::now() < deadline, "{button} on the card for {name}");
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // 1. The page's refresh reads the list while nothing is being approved, and reads nothing while a tap runs.
+    assert_eq!(chrome.eval("document.visibilityState"), json!("visible"));
+    chrome.eval("window.__lists = 0; refreshPlans(); true");
+    wait_for(
+        &mut chrome,
+        "window.__lists === 1",
+        "the refresh reads the list",
+    );
+    chrome.eval(
+        "window.__getHook = () => new Promise((resolve, reject) => { window.__cancel = () => reject(new DOMException('cancelled', 'NotAllowedError')); }); true",
+    );
+    click(&mut chrome, "nats", "button.approve");
+    wait_for(
+        &mut chrome,
+        "typeof window.__cancel === 'function'",
+        "the tap asks for the passkey",
+    );
+    chrome.eval(
+        "window.__lists = 0; refreshPlans(); document.dispatchEvent(new Event('visibilitychange')); true",
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        chrome.eval("window.__lists"),
+        json!(0),
+        "no list is read while a tap runs"
+    );
+    chrome.eval("window.__getHook = null; window.__cancel(); window.__cancel = undefined; true");
+    wait_for(
+        &mut chrome,
+        &format!("!{}.querySelector('button.approve').disabled", card("nats")),
+        "the cancelled tap gives the card its button back",
+    );
+
+    // 2. A card proposed on node1 lists above node2's: a refresh keeps node2's card where it was and puts the new card
+    //    after it, holds taps off for a moment, and a real tap at the old place approves the card that was read there.
+    let place = |chrome: &mut Chrome, name: &str| -> (f64, f64) {
+        let at = chrome.eval(&format!(
+            "(() => {{ const r = {}.querySelector('button.approve').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()",
+            card(name)
+        ));
+        (at[0].as_f64().expect("x"), at[1].as_f64().expect("y"))
+    };
+    chrome.eval(&format!(
+        "{}.scrollIntoView({{ block: 'center' }}); window.scrollBy(0, 0); true",
+        card("natsb")
+    ));
+    let before = place(&mut chrome, "natsb");
+    chrome.eval(&format!("{}.dataset.read = 'yes'; true", card("natsb")));
+    propose(&socket1, &viewer1, 2, "natsd");
+    assert_eq!(
+        chrome.eval(
+            "fetch('/approve/plans').then((r) => r.json()).then((b) => { \
+               const at = (name) => b.plans.findIndex((p) => String(p.summary).includes('service ' + name + ' from')); \
+               return at('natsd') < at('natsb'); })"
+        ),
+        json!(true),
+        "the new card lists above the card being read"
+    );
+    chrome.eval(
+        "(() => { window.__held = false; const plans = document.getElementById('plans'); \
+         new MutationObserver(() => { if (plans.inert) window.__held = true; }).observe(plans, { attributes: true, attributeFilter: ['inert'] }); \
+         refreshPlans(); return true; })()",
+    );
+    wait_for(
+        &mut chrome,
+        &format!("!!{}", card("natsd")),
+        "the refresh draws the new card",
+    );
+    assert_eq!(
+        chrome.eval(&format!(
+            "[window.__held, {}.dataset.read, [...document.querySelectorAll('#plans article')].at(-1) === {}]",
+            card("natsb"),
+            card("natsd")
+        )),
+        json!([true, "yes", true]),
+        "taps were held off, the card being read is the same card, and the new card went after the others"
+    );
+    let after = place(&mut chrome, "natsb");
+    assert!(
+        (after.0 - before.0).abs() < 0.5 && (after.1 - before.1).abs() < 0.5,
+        "the card being read did not move: {before:?} then {after:?}"
+    );
+    wait_for(
+        &mut chrome,
+        "!document.getElementById('plans').inert",
+        "taps are let through again",
+    );
+    let gets = chrome.eval("window.__gets");
+    chrome.eval("status(''); true");
+    chrome.tap_at(before.0, before.1);
+    chrome.status_ok("Approved. Done: create the service natsb ", &serve);
+    assert_eq!(
+        chrome.eval("window.__gets"),
+        json!(gets.as_u64().expect("a count") + 1),
+        "one tap, one passkey request"
+    );
+    assert!(
+        instance_exists(&fake2, "natsb"),
+        "node2 ran the card that was read"
+    );
+    assert!(
+        !instance_exists(&fake1, "natsd"),
+        "the new card was not approved"
+    );
+
+    // 3. node1's card, signed over a statement past its ten minutes, is refused Expired; the page says so on the card,
+    //    renews it in place, and the next tap approves it.
+    chrome.eval(&format!(
+        "(() => {{ const listed = window.fetch; window.__age = true; \
+         window.fetch = async (url, options) => {{ \
+           const answer = await listed(url, options); \
+           if (String(url) !== '/approve/plans' || !window.__age) return answer; \
+           window.__age = false; \
+           const body = await answer.json(); \
+           for (const plan of body.plans) if (String(plan.summary).includes('service nats from')) {{ \
+             const statement = JSON.parse(plan.statement); \
+             const older = (stamp) => new Date(Date.parse(stamp) - 11 * 60000).toISOString(); \
+             statement.issuedAt = older(statement.issuedAt); statement.expiresAt = older(statement.expiresAt); \
+             plan.statement = JSON.stringify(statement); \
+           }} \
+           return new Response(JSON.stringify(body), {{ status: 200, headers: {{ 'Content-Type': 'application/json' }} }}); \
+         }}; \
+         {}.dataset.read = 'yes'; return loadPlans().then(() => true); }})()",
+        card("nats")
+    ));
+    click(&mut chrome, "nats", "button.approve");
+    wait_for(
+        &mut chrome,
+        &format!(
+            "(() => {{ const c = {}; const note = c && c.querySelector('.card-note'); return !!note && c.dataset.read === 'yes' && note.textContent.includes('Tap Approve again') && !c.querySelector('button.approve').disabled; }})()",
+            card("nats")
+        ),
+        "the Expired card says so on itself, in its own place",
+    );
+    assert!(
+        !instance_exists(&fake1, "nats"),
+        "nothing ran on the stale statement"
+    );
+    click(&mut chrome, "nats", "button.approve");
+    chrome.status_ok("Approved. Done: create the service nats ", &serve);
+    assert!(instance_exists(&fake1, "nats"), "the renewed card ran");
+
+    // 4. Decline on node2's card declines it on node2.
+    click(&mut chrome, "natsc", "button.btn-secondary");
+    chrome.status_ok("Declined. Nothing changed.", &serve);
+    let listed = result(
+        &mcp(&socket2, &relay, 3, "plan_list", json!({})),
+        "plan_list",
+    );
+    assert!(
+        !listed.to_string().contains(&natsc),
+        "node2 no longer lists the declined card: {listed}"
+    );
+    assert!(!instance_exists(&fake2, "natsc"), "nothing ran");
+
+    // 5. A card declined on node2 while the page is open leaves a placeholder of its height, and nothing below it moves.
+    let natse = propose(&socket2, &viewer2, 4, "natse");
+    chrome.eval("refreshPlans(); true");
+    wait_for(
+        &mut chrome,
+        &format!("!!{}", card("natse")),
+        "node2's new card shows up",
+    );
+    wait_for(
+        &mut chrome,
+        "!document.getElementById('plans').inert",
+        "taps are let through again",
+    );
+    let measure = format!(
+        "(() => {{ const r = {}.getBoundingClientRect(); const d = document.querySelector('section.setup').getBoundingClientRect(); return [r.top, r.height, d.top]; }})()",
+        card("natse")
+    );
+    let measured = chrome.eval(&measure);
+    result(
+        &mcp(
+            &socket2,
+            &relay,
+            5,
+            "plan_decline",
+            json!({ "plan": natse }),
+        ),
+        "plan_decline",
+    );
+    chrome.eval("refreshPlans(); true");
+    wait_for(
+        &mut chrome,
+        &format!(
+            "!{} && !!document.querySelector('#plans .card.gone')",
+            card("natse")
+        ),
+        "the declined card leaves a placeholder",
+    );
+    let gone = chrome.eval(
+        "(() => { const g = document.querySelector('#plans .card.gone').getBoundingClientRect(); const d = document.querySelector('section.setup').getBoundingClientRect(); return [g.top, g.height, d.top]; })()",
+    );
+    let close = |a: &Value, b: &Value| {
+        (a.as_f64().expect("a number") - b.as_f64().expect("a number")).abs() < 0.5
+    };
+    assert!(
+        close(&gone[0], &measured[0])
+            && close(&gone[1], &measured[1])
+            && close(&gone[2], &measured[2]),
+        "the placeholder stands where the card stood, at its height, and what comes after it stays: {measured} then {gone}"
+    );
+
+    assert_eq!(
+        chrome.eval("window.__sameLoad === true"),
+        json!(true),
+        "one page load"
+    );
+    let log = serve.log_text();
+    for line in [
+        "on node2: approved",
+        "on node1: refused Expired",
+        "on node1: approved",
+        "on node2: declined",
+    ] {
+        assert!(log.contains(line), "node1's log has {line:?}:\n{log}");
+    }
+    drop(chrome);
+    assert_eq!(serve.terminate(), Some(0), "node1 exits 0 on SIGTERM");
+    assert_eq!(serve2.terminate(), Some(0), "node2 exits 0 on SIGTERM");
 }
 
 /// What a device that makes only RSA keys leaves of a page's `pubKeyCredParams`: RS256 (-257). It runs in the loaded page
