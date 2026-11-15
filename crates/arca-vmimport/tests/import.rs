@@ -7,8 +7,8 @@ use std::net::Ipv4Addr;
 
 use arca_vmimport::source::{Bus, DiskKind, Firmware, Protocol};
 use arca_vmimport::{
-    FakeCopy, Held, IMPORT_KEY, ImportIncus, Place, Plan, PoolInfo, Probe, parse, plan_of, run,
-    undo,
+    FakeCopy, Held, IMPORT_KEY, ImportIncus, Place, Plan, PoolInfo, Probe, parse, plan_of, reduce,
+    run, undo,
 };
 use serde_json::{Value, json};
 
@@ -370,6 +370,68 @@ fn the_card_names_every_step_and_what_is_not_carried() {
     assert!(
         bios.iter()
             .any(|(_, value)| value.contains("pc-i440fx-8.2"))
+    );
+}
+
+#[test]
+fn the_reduced_description_reads_the_same_holds_no_secret_and_reduces_to_itself() {
+    // A template that also holds a VNC password, notes with markup and a carriage return, and history.
+    let busy = BIOS.replace(
+        "<TEMPLATE>",
+        "<TEMPLATE><GRAPHICS><PASSWD>vnc-secret</PASSWD></GRAPHICS><DESCRIPTION>a &amp; b</DESCRIPTION>",
+    )
+    .replace(
+        "<SET_HOSTNAME>",
+        "<CRYPTED_PASSWORD>crypt-secret</CRYPTED_PASSWORD><START_SCRIPT>start-script-secret &lt;x&gt; &amp;&#13;</START_SCRIPT><SET_HOSTNAME>",
+    )
+    .replace("<USER_TEMPLATE/>", "<USER_TEMPLATE><NOTE>user-template-note</NOTE></USER_TEMPLATE><HISTORY_RECORDS><HISTORY><HOSTNAME>h</HOSTNAME></HISTORY></HISTORY_RECORDS>");
+    let with_odd_user_data = UEFI.replace(
+        "<USERDATA_ENCODING><![CDATA[base64]]></USERDATA_ENCODING>\n      <USER_DATA><![CDATA[I2Nsb3VkLWNvbmZpZwp0aW1lem9uZTogVVRDCg==]]></USER_DATA>",
+        "<USER_DATA>#cloud-config&#13;\nruncmd: [\"a &amp;&amp; b &lt; c\"]</USER_DATA>",
+    );
+    assert_ne!(
+        with_odd_user_data, UEFI,
+        "the fixture still holds the user data the test replaces"
+    );
+    for xml in [
+        BIOS,
+        UEFI,
+        CLONE,
+        NO_NIC,
+        busy.as_str(),
+        with_odd_user_data.as_str(),
+    ] {
+        let reduced = reduce(xml).expect("reduced");
+        assert_eq!(
+            reduce(&reduced).expect("reduced again"),
+            reduced,
+            "a reduced text reduces to itself"
+        );
+        let (mut whole, mut cut) = (parse(xml).expect("read"), parse(&reduced).expect("read"));
+        whole.digest.clear();
+        cut.digest.clear();
+        assert_eq!(cut, whole, "the reduced text reads as the whole did");
+    }
+    let bios = reduce(&busy).expect("reduced");
+    for secret in [
+        "not-a-real-password",
+        "crypt-secret",
+        "start-script-secret",
+        "vnc-secret",
+        "user-template-note",
+        "a &amp; b",
+    ] {
+        assert!(!bios.contains(secret), "{secret} left in {bios}");
+    }
+    for name in ["<PASSWORD/>", "<CRYPTED_PASSWORD/>", "<START_SCRIPT/>"] {
+        assert!(bios.contains(name), "{name} is kept by name");
+    }
+    let uefi = reduce(UEFI).expect("reduced");
+    assert!(!uefi.contains("ZWNobyBoaQ=="));
+    assert!(uefi.contains("<START_SCRIPT_BASE64/>"));
+    assert!(
+        uefi.contains("I2Nsb3VkLWNvbmZpZwp0aW1lem9uZTogVVRDCg=="),
+        "the seed's user data stays"
     );
 }
 

@@ -49,8 +49,13 @@ Arca reads only `ID`, `NAME`, `STATE` and `TEMPLATE`, and the operator may leave
 `USER_TEMPLATE`.
 
 The source description is parsed when the proposal is made, so a description Arca cannot read, or one it cannot move
-(a disk that is not on Ceph, NICs on two bridges), is refused before the owner is asked. The proposal binds the whole
-XML text: the card shows what it says, and the approval covers exactly that text.
+(a disk that is not on Ceph, NICs on two bridges), is refused before the owner is asked. Before the proposal is made,
+the text is cut down to what Arca reads (`source::reduce`): the elements the parser reads keep their text, every other
+element is left out, and a context key the seed does not carry stays only as an empty element, so the card names it
+but its value (`PASSWORD`, `CRYPTED_PASSWORD`, `START_SCRIPT`, …) never reaches the proposals file, the propose answer
+or `plan_list`. The proposal binds that reduced text: the card shows what it says, and the approval covers exactly
+that text. Reducing a reduced text gives the same text, so the run, which prepares the stored arguments again, binds
+the same digest.
 
 ## The plan, step by step
 
@@ -157,9 +162,12 @@ rbd --cluster <c> --id <source client> export-diff <source pool>/<image> -
 ## Ceph access
 
 - **Source pool: read-only.** A new client, by default `client.arca-import`, with
-  `mon 'profile rbd' osd 'profile rbd-read-only pool=<source pool>'`. It covers `rbd status` (watchers), `rbd info`
+  `mon 'allow r' osd 'profile rbd-read-only pool=<source pool>'`. It covers `rbd status` (watchers), `rbd info`
   (size, parent), and `export-diff`, including a clone's parent in the same pool. It needs no snapshot: the source is
-  off, so its head is stable.
+  off, so its head is stable. The mon side is `allow r`, not `profile rbd`: `profile rbd` also grants
+  `osd blocklist add`, which librbd uses only to fence a dead holder of an image's exclusive lock. A read-only open
+  never takes that lock, so `export-diff` never needs it, and a client with it could fence a running VM on the cluster.
+  The P2 test on a throwaway pool confirms the three commands under exactly this grant.
 - **Target pool: no new grant.** The write uses the Ceph identity Incus already uses for that pool (its
   `ceph.user.name`), whose keyring is already on the node.
 

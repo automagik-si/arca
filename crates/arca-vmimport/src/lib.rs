@@ -13,7 +13,7 @@ pub mod source;
 pub use copy::{DiskCopy, FakeCopy, ProcessRunner, RbdCopy, Runner, SourceImage, TargetImage};
 pub use plan::{ACL_PREFIX, IMPORT_KEY, Plan, Request, Target};
 pub use run::{Failure, Held, ImportIncus, Place, PoolInfo, Probe, incus_rbd_image, run, undo};
-pub use source::{ParseError, SourceVm, parse};
+pub use source::{ParseError, SourceVm, parse, reduce};
 
 /// Parses `args.source` and builds the plan `args` ask for: what a proposal and an approved run both call, so the card
 /// and the run come from the same function of the same arguments.

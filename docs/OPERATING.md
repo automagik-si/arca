@@ -2510,11 +2510,19 @@ The node needs, in its config:
 The client needs read access to the source pool only:
 
 ```
-ceph auth get-or-create client.arca-import mon 'profile rbd' osd 'profile rbd-read-only pool=<source pool>'
+ceph auth get-or-create client.arca-import mon 'allow r' osd 'profile rbd-read-only pool=<source pool>'
 ```
 
 The copy writes into the Incus pool as the Ceph user Incus already uses for it (the pool's `ceph.user.name`). Without
 `kernel.instanceImport` the node refuses `instance_import` when it is proposed.
+
+The proposal keeps the description cut down to what Arca reads: the VM's id, name, state, size, firmware, disks, NICs,
+security group rules, and of the context only the network keys, the SSH keys, the host name and the user data. Every
+other context key is kept by name with no value, so a `PASSWORD`, `CRYPTED_PASSWORD` or `START_SCRIPT` never reaches the
+proposals file, the `action_propose` answer or `plan_list`; the rest of the template (a VNC password, notes, history) is
+left out whole. Viewers of `plan_list` see that reduced description, user data and SSH keys included. The user data
+rests in `action-proposals.jsonl` until the proposal is run or lapses, and after the run Incus keeps it in the VM's
+`cloud-init.user-data`; `userData: false` leaves it out of the seed but not out of the proposal.
 
 The imported VM carries no `user.arcakernel.entry`: Arca's instance verbs (`instance_start`, `instance_stop`) do not
 act on it yet.

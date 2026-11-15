@@ -1024,9 +1024,8 @@ fn check_bridged(kernel: &KernelConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// The import rules: each entry names a service by a service name, a project that `droiddProjects` lists, and an IPv4 /24;
-/// no name is listed twice; and the node has a service network of its own (a managed or a mixed node, never a bridged
-/// one) and is not a scratch run.
+/// The `kernel.instanceImport` rules: the source pool, the Ceph client (without its `client.` prefix) and the cluster are
+/// each a plain Ceph name, as `rbd` takes them.
 fn check_instance_import(kernel: &KernelConfig) -> Result<(), ConfigError> {
     let Some(import) = &kernel.instance_import else {
         return Ok(());
@@ -1050,6 +1049,9 @@ fn check_instance_import(kernel: &KernelConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The import rules: each entry names a service by a service name, a project that `droiddProjects` lists, and an IPv4 /24;
+/// no name is listed twice; and the node has a service network of its own (a managed or a mixed node, never a bridged
+/// one) and is not a scratch run.
 fn check_import_services(kernel: &KernelConfig) -> Result<(), ConfigError> {
     if kernel.import_services.is_empty() {
         return Ok(());

@@ -372,6 +372,154 @@ pub fn parse(xml: &str) -> Result<SourceVm, ParseError> {
     })
 }
 
+/// The elements [`parse`] reads under each parent; every other element is left out of [`reduce`]'s text.
+fn kept(parent: &str, name: &str) -> bool {
+    let keys: &[&str] = match parent {
+        "VM" => &["ID", "NAME", "STATE", "LCM_STATE", "TEMPLATE"],
+        "TEMPLATE" => &[
+            "VCPU",
+            "MEMORY",
+            "MEMORY_MAX",
+            "OS",
+            "DISK",
+            "NIC",
+            "SECURITY_GROUP_RULE",
+            "CONTEXT",
+        ],
+        "OS" => &["FIRMWARE", "FIRMWARE_SECURE", "MACHINE", "BOOT"],
+        "DISK" => &[
+            "DISK_ID",
+            "TYPE",
+            "TM_MAD",
+            "SIZE",
+            "TARGET",
+            "DEV_PREFIX",
+            "IMAGE_ID",
+            "SOURCE",
+            "IMAGE",
+            "CLONE",
+            "POOL_NAME",
+        ],
+        "NIC" => &[
+            "NIC_ID",
+            "MAC",
+            "IP",
+            "BRIDGE",
+            "SECURITY_GROUPS",
+            "NETWORK",
+        ],
+        "SECURITY_GROUP_RULE" => &[
+            "SECURITY_GROUP_ID",
+            "SECURITY_GROUP_NAME",
+            "RULE_TYPE",
+            "PROTOCOL",
+            "RANGE",
+            "IP",
+            "SIZE",
+            "ICMP_TYPE",
+            "NETWORK_ID",
+        ],
+        _ => &[],
+    };
+    keys.contains(&name)
+}
+
+/// A context key whose value the seed reads. The other keys [`read_key`] knows are kept by name only.
+fn context_value_kept(key: &str) -> bool {
+    match eth_key(key) {
+        Some((_, field)) => matches!(
+            field,
+            "MAC"
+                | "IP"
+                | "MASK"
+                | "GATEWAY"
+                | "DNS"
+                | "SEARCH_DOMAIN"
+                | "MTU"
+                | "IP6"
+                | "IP6_PREFIX_LENGTH"
+                | "IP6_GATEWAY"
+        ),
+        None => read_key(key) && !matches!(key, "DISK_ID" | "TARGET"),
+    }
+}
+
+/// Element text as XML: plain when it holds nothing XML reads, else a CDATA section, else character references. A
+/// carriage return is always a reference, because a reader turns a literal one into a line feed.
+fn push_text(out: &mut String, text: &str) {
+    if !text.contains(['&', '<', '>', '\r']) {
+        out.push_str(text);
+    } else if !text.contains("]]>") && !text.contains('\r') {
+        out.push_str("<![CDATA[");
+        out.push_str(text);
+        out.push_str("]]>");
+    } else {
+        for c in text.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '\r' => out.push_str("&#13;"),
+                c => out.push(c),
+            }
+        }
+    }
+}
+
+fn push_node(out: &mut String, parent: &str, node: &Node) {
+    if parent == "CONTEXT" {
+        if !plain(&node.name, 64, b"_") {
+            return;
+        }
+        let text = node.text.trim();
+        if context_value_kept(&node.name) && !text.is_empty() {
+            out.push_str(&format!("<{}>", node.name));
+            push_text(out, text);
+            out.push_str(&format!("</{}>", node.name));
+        } else {
+            out.push_str(&format!("<{}/>", node.name));
+        }
+        return;
+    }
+    if !kept(parent, &node.name) {
+        return;
+    }
+    out.push_str(&format!("<{}>", node.name));
+    if matches!(
+        node.name.as_str(),
+        "TEMPLATE" | "OS" | "DISK" | "NIC" | "SECURITY_GROUP_RULE" | "CONTEXT"
+    ) {
+        for child in &node.children {
+            push_node(out, &node.name, child);
+        }
+    } else {
+        push_text(out, node.text.trim());
+    }
+    out.push_str(&format!("</{}>", node.name));
+}
+
+/// The description cut down to what [`parse`] reads, so a proposal binds and keeps no more of it than the plan uses.
+///
+/// Every element `parse` reads is kept, in its order, with its text; every other element is left out, with its text
+/// (a VNC password, the template's own notes, the outside hypervisor's history). A context key the seed does not
+/// carry stays as an empty element, so the card can still name it, but its value is gone: `PASSWORD`,
+/// `CRYPTED_PASSWORD` and `START_SCRIPT_BASE64` never reach a proposal. `parse` reads the reduced text as it read the
+/// whole, but for the digest, and the reduction of a reduced text is the same text.
+pub fn reduce(xml: &str) -> Result<String, ParseError> {
+    if xml.len() > MAX_SOURCE_BYTES {
+        return refuse(format!(
+            "the description is longer than {MAX_SOURCE_BYTES} bytes"
+        ));
+    }
+    let vm = tree(xml)?;
+    let mut out = String::from("<VM>");
+    for child in &vm.children {
+        push_node(&mut out, "VM", child);
+    }
+    out.push_str("</VM>");
+    Ok(out)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

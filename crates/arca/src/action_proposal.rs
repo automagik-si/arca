@@ -497,9 +497,16 @@ impl ActionKind {
             Self::FunctionCreate => {
                 args = crate::function::prepare(&args)?;
             }
-            // The description is read and the whole plan made now, so a source Arca cannot move is refused before the
-            // owner is asked, and the card shows what the run will do.
+            // The description is cut down to what the plan reads, so the proposal file, the propose answer and
+            // plan_list never hold a context password or start script; the cut is the same on the stored args, so the
+            // approved run binds the same text. The whole plan is made now, so a source Arca cannot move is refused
+            // before the owner is asked, and the card shows what the run will do.
             Self::InstanceImport => {
+                if let Some(source) = args.get("source").and_then(Value::as_str) {
+                    let reduced = arca_vmimport::reduce(source)
+                        .map_err(|error| format!("args/source: {error}"))?;
+                    args["source"] = Value::String(reduced);
+                }
                 arca_vmimport::plan_of(&args)?;
             }
             Self::InstanceImportUndo => {

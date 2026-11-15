@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arca::action_proposal::ActionKind;
 use arca::handlers::{ActionExecutor, plan_handlers};
 use arca::kernel::Kernel;
 use arca::vm_import::{ImportBackend, handlers as import_handlers};
@@ -18,6 +19,7 @@ use common::*;
 use serde_json::{Value, json};
 
 const UEFI: &str = include_str!("../../arca-vmimport/tests/fixtures/uefi-two-disks-sg.xml");
+const BIOS: &str = include_str!("../../arca-vmimport/tests/fixtures/bios-one-disk.xml");
 
 struct Answers;
 
@@ -258,4 +260,71 @@ fn a_description_arca_cannot_move_is_refused_when_it_is_proposed() {
     let mut no_bridge = import_args();
     no_bridge.as_object_mut().expect("args").remove("bridge");
     assert!(rig.propose("instance_import", no_bridge).is_err());
+}
+
+/// Every file under `dir`, read as text where it is text.
+fn files_text(dir: &std::path::Path) -> String {
+    let mut text = String::new();
+    for entry in std::fs::read_dir(dir).expect("the scratch dir").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            text.push_str(&files_text(&path));
+        } else if let Ok(read) = std::fs::read(&path) {
+            text.push_str(&String::from_utf8_lossy(&read));
+        }
+    }
+    text
+}
+
+#[test]
+fn a_proposal_keeps_no_context_secret_in_the_journal_the_answer_or_plan_list() {
+    let key = SkKey::from_seed(44);
+    let rig = rig("import-secrets", &key);
+    let secrets = ["ZWNobyBoaQ==", "not-a-real-password"];
+    assert!(
+        UEFI.contains(secrets[0]) && BIOS.contains(secrets[1]),
+        "the fixtures hold the secrets"
+    );
+    let mut bios = import_args();
+    bios["source"] = json!(BIOS);
+    bios["name"] = json!("web-2");
+    let answers = [
+        rig.propose("instance_import", import_args())
+            .expect("proposed"),
+        rig.propose("instance_import", bios).expect("proposed"),
+    ];
+    let listed = call_verb(&rig.handlers, "plan_list", json!({})).expect("listed");
+    let journal = files_text(&rig._scratch.dir);
+    assert!(
+        journal.contains("START_SCRIPT_BASE64"),
+        "the journal names the key the seed does not carry"
+    );
+    for secret in secrets {
+        for answer in &answers {
+            assert!(
+                !answer.to_string().contains(secret),
+                "{secret} in the propose answer"
+            );
+        }
+        assert!(
+            !listed.to_string().contains(secret),
+            "{secret} in plan_list"
+        );
+        assert!(
+            !journal.contains(secret),
+            "{secret} in a file the kernel wrote"
+        );
+    }
+    // The run prepares the stored args again: the same args, so the approval binds the same digest.
+    let stored = &answers[0]["args"];
+    let again = ActionKind::InstanceImport
+        .prepare(stored, None)
+        .expect("prepared");
+    assert_eq!(&again, stored);
+    assert_eq!(
+        ActionKind::InstanceImport
+            .prepare(&again, None)
+            .expect("prepared"),
+        again
+    );
 }

@@ -2,7 +2,9 @@
 //! The import writer against the fake Incus: it makes only marked objects of the shapes an import makes, and it starts,
 //! stops and deletes only objects that carry the import mark.
 
-use std::path::PathBuf;
+use std::io::{Read as _, Write as _};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arca_incus::{FakeIncus, FakeState, IMPORT_KEY, IncusError, VmImportWriter};
@@ -212,4 +214,50 @@ fn an_instance_without_the_mark_is_never_started_or_removed() {
     assert!(rig.writer.remove_acl("default", "not-an-import").is_err());
     assert!(writes(&rig).is_empty());
     assert!(!rig.writer.agent_answers("people", "someone-else"));
+}
+
+/// One POST straight to the fake, past the writer: how an object the import did not make comes to exist.
+fn post_past_the_writer(socket: &Path, path: &str, body: &Value) {
+    let mut stream = UnixStream::connect(socket).expect("the fake answers");
+    let body = body.to_string();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: incus\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("sent");
+    stream.shutdown(std::net::Shutdown::Write).expect("sent");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).expect("answered");
+    assert!(answer.starts_with("HTTP/1.1 2"), "{answer}");
+}
+
+#[test]
+fn a_volume_or_acl_without_the_mark_is_never_removed_even_with_an_import_name() {
+    let rig = rig();
+    post_past_the_writer(
+        rig.fake.socket(),
+        "/1.0/storage-pools/remote/volumes/custom?project=people",
+        &json!({ "name": "web-1-disk1", "type": "custom", "content_type": "block", "config": { "size": "1024MiB" } }),
+    );
+    rig.fake.add_acl(
+        "default",
+        json!({ "name": "arca-import-web-1", "config": {}, "ingress": [], "egress": [] }),
+    );
+    let before = writes(&rig);
+    assert!(matches!(
+        rig.writer.remove_volume("people", "remote", "web-1-disk1"),
+        Err(IncusError::Refused(_))
+    ));
+    assert!(matches!(
+        rig.writer.remove_acl("default", "arca-import-web-1"),
+        Err(IncusError::Refused(_))
+    ));
+    assert_eq!(writes(&rig), before, "no DELETE was sent");
+    assert!(
+        rig.fake
+            .requests()
+            .iter()
+            .all(|request| request.method != "DELETE")
+    );
 }
