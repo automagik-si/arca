@@ -107,6 +107,32 @@ fn tailnet_image() -> String {
         .to_string()
 }
 
+/// The stand-in for cosign: it writes its call into docker's call log, so that the order of the check and the pull
+/// shows, and the home it was given beside it. While `docker/cosign-fail` is there it says that file's words on its
+/// standard error and fails, as cosign does for an image without a matching attestation.
+fn fake_cosign() -> String {
+    format!(
+        "#!{}\nprintf 'cosign %s\\n' \"$*\" >>\"$FAKE_DOCKER_DIR/calls.log\"\nprintf '%s\\n' \"$HOME\" >\"$FAKE_DOCKER_DIR/cosign-home\"\nif [ -e \"$FAKE_DOCKER_DIR/cosign-fail\" ]; then\n  cat \"$FAKE_DOCKER_DIR/cosign-fail\" >&2\n  exit 1\nfi\necho '{{\"payloadType\":\"application/vnd.in-toto+json\"}}'\n",
+        which("bash").display()
+    )
+}
+
+/// The name Sigstore's release gives this machine's architecture, as the first boot picks it.
+fn cosign_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "amd64",
+    }
+}
+
+/// The cosign arguments the keeper must give: SLSA v1 provenance, a certificate GitHub Actions issued to a workflow
+/// of Automagik's repository, and the image by digest.
+fn cosign_call(image: &str) -> String {
+    format!(
+        "cosign verify-attestation --type slsaprovenance1 --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp ^https://github\\.com/automagik-si/automagik/ --certificate-github-workflow-repository automagik-si/automagik {image}"
+    )
+}
+
 /// A workspace reached on a tailnet, under the machine's own tailnet name.
 fn tailnet_settings() -> Value {
     json!({ "reach": "tailnet", "publicUrl": TAILNET_URL, "serverImage": SERVER_IMAGE })
@@ -175,6 +201,21 @@ impl Workspace {
         for (tool, code) in [("systemctl", 0), ("apt-get", 0)] {
             workspace.stand_in(tool, code);
         }
+        // The verifier as the first boot leaves it, and Sigstore's release as the stand-in curl serves it: the same
+        // stand-in, whose sha256 the test gives the script in place of the real binary's.
+        fs::create_dir_all(workspace.dir.join("verifier")).expect("scratch");
+        executable(&workspace.dir.join("verifier/cosign"), &fake_cosign());
+        fs::write(workspace.dir.join("cosign-release"), fake_cosign()).expect("the release");
+        executable(
+            &workspace.dir.join("bin/curl"),
+            &format!(
+                "#!{bash}\nprintf '%s\\n' \"$*\" >>'{log}'\n[ ! -e '{fail}' ] || exit 22\nwhile [ $# -gt 0 ]; do\n  case $1 in\n    -o) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ncat '{release}' >\"$out\"\n",
+                bash = which("bash").display(),
+                log = workspace.dir.join("curl.log").display(),
+                fail = workspace.dir.join("curl-fail").display(),
+                release = workspace.dir.join("cosign-release").display(),
+            ),
+        );
         for program in listed_programs() {
             let link = workspace.dir.join("bin").join(&program);
             if !link.exists() {
@@ -238,6 +279,8 @@ impl Workspace {
             .env("WS_REFUSE_EVERY", "1")
             .env("WS_BACKOFF_MAX", "1")
             .env("WS_APT_PAUSE", "0")
+            .env("WS_COSIGN", self.dir.join("verifier/cosign"))
+            .env("WS_COSIGN_SHA256", sha256_hex(fake_cosign().as_bytes()))
             .env("FAKE_DOCKER_DIR", self.dir.join("docker"));
         command
     }
@@ -522,7 +565,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
         Some(&json!({
             "reach": "tailnet",
             "publicUrl": TAILNET_URL,
-            "accessEmails": ["owner@example.com"]
+            "accessEmails": "owner@example.com, second@example.org"
         })),
     )
     .expect("a create may give these")
@@ -537,10 +580,23 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
         (
             &json!("tailnet"),
             &json!(TAILNET_URL),
-            &json!(["owner@example.com"])
+            &json!("owner@example.com, second@example.org")
         )
     );
     assert_eq!(created["serverImage"], settings["serverImage"]);
+    // The default is text, so a create that gives the list form of before is refused: only a workspace made before
+    // keeps a list, which its own keeper reads.
+    let refused = arca::service::create_settings(
+        &template,
+        Some(&json!({ "accessEmails": ["owner@example.com"] })),
+    )
+    .expect_err("a list is refused at create");
+    assert!(
+        format!("{refused:?}").contains(
+            "settings.accessEmails: expected a string, the type of the template's default"
+        ),
+        "{refused:?}"
+    );
     assert!(
         arca::service::create_settings(&template, Some(&json!({ "serverImage": SERVER_IMAGE })))
             .is_err()
@@ -554,7 +610,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             &settings["accessAudience"],
             &settings["accessEmails"]
         ),
-        (&json!(""), &json!(""), &json!([]))
+        (&json!(""), &json!(""), &json!(""))
     );
     let mut workspace = Workspace::new(settings);
     workspace.start();
@@ -565,7 +621,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     assert_eq!(
         workspace.runs("automagik-server"),
         [format!(
-            "run -d --name automagik-server --restart no -v {}:/data {}",
+            "run -d --name automagik-server --pull never --restart no -v {}:/data {}",
             workspace.dir.join("data").display(),
             settings["serverImage"].as_str().expect("an image")
         )]
@@ -594,7 +650,7 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
     assert_eq!(
         workspace.runs("automagik-server"),
         [format!(
-            "run -d --name automagik-server --restart no -v {}:/data {SERVER_IMAGE}",
+            "run -d --name automagik-server --pull never --restart no -v {}:/data {SERVER_IMAGE}",
             data.display()
         )]
     );
@@ -604,13 +660,40 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
     assert_eq!(
         workspace.runs("automagik-gate"),
         [format!(
-            "run -d --name automagik-gate --network container:automagik-server --restart no --read-only --cap-drop ALL --security-opt no-new-privileges:true --entrypoint /nodejs/bin/node -e AUTOMAGIK_GATE_ENABLED=1 -e AUTOMAGIK_GATE_ORIGIN={URL} -e AUTOMAGIK_GATE_PORT=3082 -e AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN={ACCESS_TEAM} -e AUTOMAGIK_GATE_ACCESS_AUD={ACCESS_AUDIENCE} -e AUTOMAGIK_GATE_ACCESS_EMAILS=owner@example.com,second.owner+ws@example.org -v {}:/data -v {}:/dsh:ro {SERVER_IMAGE} /opt/automagik/gate-entrypoint.mjs",
+            "run -d --name automagik-gate --pull never --network container:automagik-server --restart no --read-only --cap-drop ALL --security-opt no-new-privileges:true --entrypoint /nodejs/bin/node -e AUTOMAGIK_GATE_ENABLED=1 -e AUTOMAGIK_GATE_ORIGIN={URL} -e AUTOMAGIK_GATE_PORT=3082 -e AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN={ACCESS_TEAM} -e AUTOMAGIK_GATE_ACCESS_AUD={ACCESS_AUDIENCE} -e AUTOMAGIK_GATE_ACCESS_EMAILS=owner@example.com,second.owner+ws@example.org -v {}:/data -v {}:/dsh:ro {SERVER_IMAGE} /opt/automagik/gate-entrypoint.mjs",
             gate_data.display(),
             data.display()
         )]
     );
     assert!(data.is_dir() && gate_data.is_dir());
     assert!(workspace.runs("automagik-tunnel").is_empty());
+    // The server's image is pulled once, after its GitHub build provenance verified, and the server and the gate
+    // are started from it with --pull never, so Docker pulls it nowhere else. cosign's home is on the machine's
+    // memory.
+    says(
+        &workspace,
+        "the server image's build provenance verifies: built on GitHub by a workflow of automagik-si/automagik; pulling it",
+    );
+    let calls = workspace.read("docker/calls.log");
+    let at = |what: &str| {
+        calls
+            .find(what)
+            .unwrap_or_else(|| panic!("{what} is not in:\n{calls}"))
+    };
+    assert!(at(&format!("image inspect {SERVER_IMAGE}\n")) < at(&cosign_call(SERVER_IMAGE)));
+    assert!(at(&cosign_call(SERVER_IMAGE)) < at(&format!("pull -q {SERVER_IMAGE}\n")));
+    assert!(at(&format!("pull -q {SERVER_IMAGE}\n")) < at("run -d --name automagik-server "));
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("pull "))
+            .count(),
+        1
+    );
+    assert_eq!(
+        workspace.read("docker/cosign-home").trim(),
+        workspace.dir.join("run/cosign").display().to_string()
+    );
     // Health is the image's own check, run inside each container.
     let calls = workspace.read("docker/calls.log");
     for name in ["automagik-server", "automagik-gate"] {
@@ -1150,8 +1233,131 @@ fn a_new_token_replaces_the_tunnel_only_and_the_others_follow_the_server() {
     assert!(at("run -d --name automagik-server") < at("run -d --name automagik-tunnel"));
     assert!(!calls.contains("cannot join"));
     assert!(!workspace.output().contains("cannot join"));
+    // The new server comes from the image already here, verified when it was pulled: no second check, no pull.
+    assert_eq!(calls.matches("cosign verify-attestation").count(), 1);
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("pull "))
+            .count(),
+        1
+    );
     let written = workspace.everything_written();
     assert!(!written.contains(TOKEN) && !written.contains(OTHER_TOKEN));
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+/// accessEmails as text, one address or several separated by commas, reaches the gate unchanged, as one argument:
+/// the gate trims each address and compares them without regard to case. The list form is
+/// `the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token`'s.
+#[test]
+fn access_emails_as_text_reach_the_gate_unchanged() {
+    for (emails, count) in [
+        ("Owner@Example.com", 1),
+        (" owner@example.com , second.owner+ws@example.org", 2),
+    ] {
+        let mut value = settings_with_access(URL);
+        value["accessEmails"] = json!(emails);
+        let mut workspace = Workspace::new(&value);
+        workspace.start();
+        says(
+            &workspace,
+            &format!(
+                "sign-in by Cloudflare Access (team {ACCESS_TEAM}, {count} e-mail address(es))"
+            ),
+        );
+        says(&workspace, "the gate is started from");
+        let gate = workspace.runs("automagik-gate");
+        assert_eq!(gate.len(), 1);
+        assert!(
+            gate[0].contains(&format!(
+                " -e AUTOMAGIK_GATE_ACCESS_AUD={ACCESS_AUDIENCE} -e AUTOMAGIK_GATE_ACCESS_EMAILS={emails} -v "
+            )),
+            "{}",
+            gate[0]
+        );
+        // One argument: the fake docker found the image where it follows the options.
+        assert_eq!(
+            workspace
+                .read("docker/containers/automagik-gate/image")
+                .trim(),
+            SERVER_IMAGE
+        );
+        assert_eq!(workspace.stop(), Some(0));
+    }
+}
+
+/// The server's image is pulled only once its build provenance verifies. One that does not verify is never pulled
+/// and nothing is started from it; the keeper says why, in the status line too, and tries again after a pause.
+#[test]
+fn a_server_image_whose_provenance_does_not_verify_is_not_pulled_and_nothing_starts() {
+    let mut workspace = Workspace::new(&settings_with_access(URL));
+    fs::write(
+        workspace.dir.join("docker/cosign-fail"),
+        "Error: no matching attestations: \nerror during command execution: no matching attestations: \n",
+    )
+    .expect("the failure");
+    workspace.secret(TOKEN);
+    workspace.start();
+    let words = "the server is not started: its image's build provenance did not verify, so the image is not pulled (cosign says: error during command execution: no matching attestations: )";
+    says(
+        &workspace,
+        &format!("{words}. It is tried again after a pause"),
+    );
+    says(
+        &workspace,
+        &format!("status: {words}; the gate is not running"),
+    );
+    wait_for(&workspace, "a second check", || {
+        workspace
+            .read("docker/calls.log")
+            .matches(&cosign_call(SERVER_IMAGE))
+            .count()
+            >= 2
+    });
+    let calls = workspace.read("docker/calls.log");
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line.starts_with("pull ") || line.starts_with("run ")),
+        "{calls}"
+    );
+    // Once it verifies, it is pulled and everything starts.
+    fs::remove_file(workspace.dir.join("docker/cosign-fail")).expect("mended");
+    says(&workspace, "the gate is healthy (HTTP 401");
+    assert_eq!(workspace.stop(), Some(0));
+
+    // A pull that fails after the check: said, and nothing is started.
+    let mut workspace = Workspace::new(&settings(URL));
+    fs::write(
+        workspace.dir.join("docker/fail-pull"),
+        "Error response from daemon: manifest unknown\n",
+    )
+    .expect("the failure");
+    workspace.start();
+    says(
+        &workspace,
+        "the server's image could not be pulled: Error response from daemon: manifest unknown",
+    );
+    assert!(workspace.runs("automagik-server").is_empty());
+    assert_eq!(workspace.stop(), Some(0));
+
+    // No verifier on the machine: said, and nothing is pulled or started.
+    let mut workspace = Workspace::new(&settings(URL));
+    fs::remove_file(workspace.dir.join("verifier/cosign")).expect("no verifier");
+    workspace.start();
+    says(
+        &workspace,
+        &format!(
+            "(the verifier {} is not on this machine: the first boot did not finish)",
+            workspace.dir.join("verifier/cosign").display()
+        ),
+    );
+    let calls = workspace.read("docker/calls.log");
+    assert!(
+        !calls.contains("pull ") && !calls.contains("run "),
+        "{calls}"
+    );
     assert_eq!(workspace.stop(), Some(0));
 }
 
@@ -1215,7 +1421,7 @@ fn a_part_that_is_not_healthy_and_a_start_that_fails_are_said_in_words() {
 #[test]
 fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
     let access = |team: &str, audience: &str, emails: Value| json!({ "accessTeamDomain": team, "accessAudience": audience, "accessEmails": emails });
-    let cases: [(Value, &str); 25] = [
+    let cases: [(Value, &str); 30] = [
         (
             json!({ "serverImage": "registry.example/server:latest" }),
             "settings.serverImage is an image by digest",
@@ -1295,7 +1501,7 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
                 ACCESS_AUDIENCE,
                 json!(["owner@example.com,other@example.org"]),
             ),
-            "settings.accessEmails is a list of 1 to 16 e-mail addresses, one in each entry",
+            "settings.accessEmails is 1 to 16 e-mail addresses: one, or several separated by commas (owner@example.com, second@example.com), or a list with one address in each entry",
         ),
         (
             access(
@@ -1303,7 +1509,46 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
                 ACCESS_AUDIENCE,
                 json!(["owner@example.com\nother@example.org"]),
             ),
-            "settings.accessEmails is a list of 1 to 16 e-mail addresses, one in each entry",
+            "settings.accessEmails is 1 to 16 e-mail addresses: one, or several separated by commas (owner@example.com, second@example.com), or a list with one address in each entry",
+        ),
+        // As text, every piece between two commas is one address: one that is not, or nothing between two commas,
+        // would stop the gate, so the keeper refuses it first. Seventeen are too many, as in a list.
+        (
+            access(
+                ACCESS_TEAM,
+                ACCESS_AUDIENCE,
+                json!("owner@example.com, not-an-address"),
+            ),
+            "settings.accessEmails is 1 to 16 e-mail addresses: one, or several separated by commas",
+        ),
+        (
+            access(
+                ACCESS_TEAM,
+                ACCESS_AUDIENCE,
+                json!("owner@example.com,,other@example.org"),
+            ),
+            "settings.accessEmails is 1 to 16 e-mail addresses",
+        ),
+        (
+            access(
+                ACCESS_TEAM,
+                ACCESS_AUDIENCE,
+                json!("owner@example.com; other@example.org"),
+            ),
+            "settings.accessEmails is 1 to 16 e-mail addresses",
+        ),
+        (
+            access(
+                ACCESS_TEAM,
+                ACCESS_AUDIENCE,
+                json!(vec!["owner@example.com"; 17].join(",")),
+            ),
+            "settings.accessEmails is 1 to 16 e-mail addresses",
+        ),
+        // Text of spaces alone is not set, as an empty list is.
+        (
+            access(ACCESS_TEAM, ACCESS_AUDIENCE, json!("   ")),
+            "go together: set all three, or none",
         ),
         (
             {
@@ -1415,14 +1660,14 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
     assert_eq!(
         workspace.runs("automagik-server"),
         [format!(
-            "run -d --name automagik-server --restart no -v {}:/data {SERVER_IMAGE}",
+            "run -d --name automagik-server --pull never --restart no -v {}:/data {SERVER_IMAGE}",
             data.display()
         )]
     );
     assert_eq!(
         workspace.runs("automagik-gate"),
         [format!(
-            "run -d --name automagik-gate --network container:automagik-server --restart no --read-only --cap-drop ALL --security-opt no-new-privileges:true --entrypoint /nodejs/bin/node -e AUTOMAGIK_GATE_ENABLED=1 -e AUTOMAGIK_GATE_ORIGIN={TAILNET_URL} -e AUTOMAGIK_GATE_PORT=3082 -e AUTOMAGIK_GATE_CLAIM=remote -v {}:/data -v {}:/dsh:ro {SERVER_IMAGE} /opt/automagik/gate-entrypoint.mjs",
+            "run -d --name automagik-gate --pull never --network container:automagik-server --restart no --read-only --cap-drop ALL --security-opt no-new-privileges:true --entrypoint /nodejs/bin/node -e AUTOMAGIK_GATE_ENABLED=1 -e AUTOMAGIK_GATE_ORIGIN={TAILNET_URL} -e AUTOMAGIK_GATE_PORT=3082 -e AUTOMAGIK_GATE_CLAIM=remote -v {}:/data -v {}:/dsh:ro {SERVER_IMAGE} /opt/automagik/gate-entrypoint.mjs",
             gate_data.display(),
             data.display()
         )]
@@ -1439,7 +1684,7 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
     let relay = workspace.runs("automagik-relay");
     assert_eq!(relay.len(), 1);
     assert!(relay[0].starts_with(&format!(
-        "run -d --name automagik-relay --network container:automagik-server --restart no --read-only --cap-drop ALL --security-opt no-new-privileges:true --entrypoint /nodejs/bin/node {SERVER_IMAGE} -e const net=require(\"net\");"
+        "run -d --name automagik-relay --pull never --network container:automagik-server --restart no --read-only --cap-drop ALL --security-opt no-new-privileges:true --entrypoint /nodejs/bin/node {SERVER_IMAGE} -e const net=require(\"net\");"
     )));
     assert!(relay[0].ends_with(".listen(Number(port),ip) 10.88.0.2 3082"));
     assert!(relay[0].contains("net.connect(Number(port),\"127.0.0.1\")"));
@@ -1894,8 +2139,20 @@ fn the_first_boot_installs_what_it_names_and_speaks_on_the_console() {
     // Compose is not needed: the keeper starts the containers itself.
     assert_eq!(
         workspace.read("apt-get.log"),
-        "update -q\ninstall -y -q --no-install-recommends docker.io docker-cli jq ca-certificates coreutils\n"
+        "update -q\ninstall -y -q --no-install-recommends docker.io docker-cli jq ca-certificates coreutils curl\n"
     );
+    // The provenance verifier: Sigstore's release for this machine's architecture, over https only, kept at its
+    // place once its sha256 is the one fixed (here the stand-in's).
+    let arch = cosign_arch();
+    assert_eq!(
+        workspace.read("curl.log"),
+        format!(
+            "-fsSL --proto =https --connect-timeout 30 --max-time 600 -o {}.part https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-{arch}\n",
+            workspace.dir.join("verifier/cosign").display()
+        )
+    );
+    assert_eq!(workspace.read("verifier/cosign"), fake_cosign());
+    assert!(!workspace.dir.join("verifier/cosign.part").exists());
     // The keeper is this script, installed, and a service that speaks on the console.
     assert_eq!(
         fs::read(workspace.dir.join("installed")).expect("installed"),
@@ -1922,6 +2179,7 @@ fn the_first_boot_installs_what_it_names_and_speaks_on_the_console() {
     let console = workspace.read("console.log");
     for words in [
         "arca-automagik-workspace: first boot: installing docker.io docker-cli",
+        "arca-automagik-workspace: first boot: installing the provenance verifier, cosign-linux-",
         "arca-automagik-workspace: first boot done: the keeper is installed and started",
     ] {
         assert!(console.contains(words) && said.contains(words), "{words}");
@@ -1941,7 +2199,7 @@ fn a_first_boot_that_fails_says_on_the_console_what_is_missing_or_did_not_start(
     let console = workspace.read("console.log");
     assert!(
         console.contains(
-            "first boot failed: these commands are missing after the install: docker. The packages asked for were: docker.io docker-cli jq ca-certificates coreutils."
+            "first boot failed: these commands are missing after the install: docker. The packages asked for were: docker.io docker-cli jq ca-certificates coreutils curl."
         ),
         "{console}"
     );
@@ -1973,4 +2231,43 @@ fn a_first_boot_that_fails_says_on_the_console_what_is_missing_or_did_not_start(
         "{console}"
     );
     assert!(!console.contains("first boot done"));
+
+    // The verifier that arrives is not the one the script fixes: said, with both sums, and nothing is kept.
+    let arch = cosign_arch();
+    let workspace = Workspace::new(&settings(URL));
+    fs::remove_file(workspace.dir.join("verifier/cosign")).expect("none yet");
+    fs::write(workspace.dir.join("cosign-release"), "not cosign\n").expect("another file");
+    let output = workspace.command(None).output().expect("the first boot");
+    assert_eq!(output.status.code(), Some(1));
+    let console = workspace.read("console.log");
+    assert!(
+        console.contains(&format!(
+            "first boot failed: the provenance verifier from https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-{arch} is not the one this script fixes (sha256 {}, where {} was expected). The machine has no workspace",
+            sha256_hex(b"not cosign\n"),
+            sha256_hex(fake_cosign().as_bytes())
+        )),
+        "{console}"
+    );
+    assert!(!workspace.dir.join("verifier/cosign").exists());
+    assert!(!workspace.dir.join("verifier/cosign.part").exists());
+    assert!(!workspace.dir.join("installed").exists());
+
+    // It cannot be downloaded: each try is said, then the failure.
+    let workspace = Workspace::new(&settings(URL));
+    fs::write(workspace.dir.join("curl-fail"), "").expect("no network");
+    let output = workspace.command(None).output().expect("the first boot");
+    assert_eq!(output.status.code(), Some(1));
+    let console = workspace.read("console.log");
+    assert!(console.contains(
+        "the provenance verifier could not be downloaded from github.com and release-assets.githubusercontent.com within 600 seconds (try 6 of 6)"
+    ));
+    assert!(
+        console.contains(&format!(
+            "first boot failed: the provenance verifier could not be downloaded from https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-{} in 6 tries of at most 600 seconds each: the machine needs https to github.com and release-assets.githubusercontent.com. The machine has no workspace; service_remove it and create it again once it can reach github.com and release-assets.githubusercontent.com",
+            cosign_arch()
+        )),
+        "{console}"
+    );
+    assert!(!workspace.dir.join("verifier/cosign.part").exists());
+    assert!(!workspace.dir.join("installed").exists());
 }

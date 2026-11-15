@@ -84,6 +84,16 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik-workspace.json",
         "d30cf55d0c3de85be17a4e726aefd5018213d2bb4e5798b97837cbda826f22a9",
     ),
+    // 0.17.0 to 0.30.0: Automagik's release 3.136.4, and accessEmails a list only.
+    (
+        "automagik-workspace.json",
+        "4ca51bf0d82dfc9e319fc63c43a863883cd9b273ae5e0e7deaec1941c73dedca",
+    ),
+    // 0.17.0 to 0.30.0: before it took accessEmails as text and checked the server image's build provenance.
+    (
+        "automagik-workspace.sh",
+        "f1d027aae081bed0f3c65089362f34fb80597a69b6b7c930a0af60400faa9189",
+    ),
     // 0.14.0 to 0.16.0: before it said that the gate's files are the same in release 3.136.4.
     (
         "automagik-workspace.sh",
