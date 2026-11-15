@@ -120,6 +120,7 @@ dependencies = [
  "p256",
  "regex",
  "reqwest",
+ "ring",
  "rsa",
  "rusqlite",
  "rustix",

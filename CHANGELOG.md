@@ -20,6 +20,24 @@ its image keeps its socket directory there. A template says `"runTmpfs": false` 
 files in `/run`. The answers say `run: "memory"`, or `run: "disk"` with the reason when `/run` was left on the disk,
 in which case the service runs as before.
 
+Arca can keep itself up to date. Every node looks for a newer release of `automagik-si/arca` every six hours (the new
+`update` config key: on by default, releases only, at any hour; a window, the pre-release channel and the interval can
+be set). It installs a release by itself only when the release's `SHA256SUMS` is signed by a key the program holds, and
+no release signing key exists yet: until one is made, a node says which release is available (`unsigned`) and installs
+nothing. The release workflow signs `SHA256SUMS` once the `ARCA_RELEASE_SIGNING_KEY` secret exists. A signed release is
+installed with nobody at a terminal: the run finds every systemd unit that runs an Arca program (the installer's
+`arca.service`, the guide's hand-made units, links, nodes with their own program path), checks the binary and the
+release's `install.sh` against `SHA256SUMS`, replaces each program behind the release and keeps the old one as
+`<program>.previous`, and restarts shims, then nodes, then links, one at a time. Each unit must come back within
+`update.healthSeconds`, a node must answer on its own socket, and the unit must then stay up for `update.healthSeconds`
+on the release's version. A unit that does not rolls every program back, fires the new `kernel-update-failed` alert,
+and holds that release back until a newer one is published. A run cut off half-way is finished or rolled back by the
+next one. A build from a branch is never replaced, and a node with an owner approval card waiting is not restarted until
+none waits. The templates are brought up to the release as the installer does. `arca_status` shows the current and
+available versions under `update`; `arca update check` says what a run would do, and `arca update run` is the run
+itself. On Arca OS the program is in the read-only image, and the OS update brings it (`os-managed`); a program its user
+may not write is staged in that user's state, and `serve`, `shim` and `link serve` hand over to it at their start.
+
 ## 0.30.0 (2026-11-15)
 
 `instance_import` moves one virtual machine from an outside hypervisor (the `onevm show -x` XML, passed in by

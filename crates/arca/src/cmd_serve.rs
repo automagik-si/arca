@@ -307,7 +307,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .with_checks(targets)
         .with_watch(Arc::clone(&watch))
         .with_host_network(cfg.host_network.status.clone())
-        .with_os_update(os_update.clone());
+        .with_os_update(os_update.clone())
+        .with_kernel_update(cfg.state_dir.clone());
     // The runner pools run only on a kernel-mode node: they create and delete their job machines. Their sign-in board
     // is read by the alerts from the first tick; the pools start once the GitHub signer is open, below.
     let runner_board = (kernel_mode
@@ -347,6 +348,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .handle(
             "arca_status",
             Arc::new(StatusHandler {
+                update: Some((cfg.update.clone(), cfg.state_dir.clone())),
                 node: node.clone(),
                 mode,
                 applied_seq,
@@ -677,6 +679,15 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 Failure::Runtime(format!("the approval requests cannot be opened: {e}"))
             })?,
     );
+    // The kernel updater's schedule: it counts the cards that wait for the owner each minute (no update restarts this node
+    // while one waits) and starts `arca update run` when a look is due.
+    let waiting: crate::self_update::Waiting = {
+        let kernel = Arc::clone(&kernel);
+        let requests = Arc::clone(&approval_requests);
+        Arc::new(move || crate::handlers::waiting_cards(&kernel, &requests, now_ms()))
+    };
+    crate::self_update::spawn_schedule(config_path.clone(), cfg.clone(), waiting)
+        .map_err(|e| Failure::Runtime(e.to_string()))?;
     // The GitHub signer: its store is `<stateDir>/github`, and a node that only looks has none of its verbs.
     let github_signer = if kernel_mode {
         let signer = crate::github_signer::Signer::open(

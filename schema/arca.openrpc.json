@@ -230,6 +230,75 @@
               "minLength": 64,
               "type": "string"
             },
+            "update": {
+              "properties": {
+                "automatic": {
+                  "type": "boolean"
+                },
+                "available": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "channel": {
+                  "enum": [
+                    "stable",
+                    "prerelease"
+                  ],
+                  "type": "string"
+                },
+                "current": {
+                  "type": "string"
+                },
+                "failed": {
+                  "type": "boolean"
+                },
+                "lastCheckAt": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "lastReason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lastResult": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lastUpdateAt": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "window": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "automatic",
+                "channel",
+                "window",
+                "current",
+                "available",
+                "lastCheckAt",
+                "lastResult",
+                "lastReason",
+                "lastUpdateAt",
+                "failed"
+              ],
+              "type": "object"
+            },
             "uptimeS": {
               "minimum": 0,
               "type": "integer"

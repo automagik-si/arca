@@ -655,6 +655,7 @@ fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
     let kernel = rig.kernel.lock().expect("kernel");
     let seq = kernel.applied_seq().expect("applied sequence");
     let status = Arc::new(StatusHandler {
+        update: None,
         node: "node1".into(),
         mode: "kernel",
         applied_seq: kernel.applied_seq_reader(),

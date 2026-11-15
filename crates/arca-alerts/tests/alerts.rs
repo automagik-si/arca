@@ -77,6 +77,7 @@ fn max_age(id: RuleId) -> u64 {
         RuleId::SmartWarning => SMART_MAX_AGE_MS,
         RuleId::HostNetwork => HOST_NETWORK_MAX_AGE_MS,
         RuleId::RunnerSignIn => arca_alerts::eval::RUNNER_SIGNIN_MAX_AGE_MS,
+        RuleId::KernelUpdateFailed => arca_alerts::eval::KERNEL_UPDATE_MAX_AGE_MS,
     }
 }
 
@@ -193,6 +194,14 @@ fn reading_of(id: RuleId, value: f64, at: u64) -> Inputs {
                 }],
             });
         }
+        RuleId::KernelUpdateFailed => {
+            inputs.kernel_update = Some(Timed {
+                at,
+                value: arca_alerts::eval::KernelUpdateUse {
+                    failed: value > 0.0,
+                },
+            });
+        }
     }
     inputs
 }
@@ -211,7 +220,7 @@ struct Case {
     low: f64,
 }
 
-const CASES: [Case; 12] = [
+const CASES: [Case; 13] = [
     Case {
         id: RuleId::DiskPoolFull,
         high: 95.0,
@@ -280,6 +289,12 @@ const CASES: [Case; 12] = [
     },
     Case {
         id: RuleId::RunnerSignIn,
+        high: 1.0,
+        band: None,
+        low: 0.0,
+    },
+    Case {
+        id: RuleId::KernelUpdateFailed,
         high: 1.0,
         band: None,
         low: 0.0,

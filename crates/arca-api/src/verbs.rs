@@ -3575,6 +3575,22 @@ fn arca_status_result() -> Value {
                 ("passkeys", true, nullable(at_least(0))),
             ]),
         ),
+        (
+            "update",
+            false,
+            result(vec![
+                ("automatic", true, boolean()),
+                ("channel", true, one_of(&["stable", "prerelease"])),
+                ("window", true, nullable(string())),
+                ("current", true, string()),
+                ("available", true, nullable(string())),
+                ("lastCheckAt", true, nullable(int())),
+                ("lastResult", true, nullable(string())),
+                ("lastReason", true, nullable(string())),
+                ("lastUpdateAt", true, nullable(int())),
+                ("failed", true, boolean()),
+            ]),
+        ),
     ])
 }
 

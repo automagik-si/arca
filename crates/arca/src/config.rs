@@ -82,6 +82,117 @@ pub struct NodeConfig {
     /// is made.
     #[serde(default)]
     pub console: Option<ConsoleConfig>,
+    /// The kernel's own update: how often the node looks for a newer Arca release, in which channel, and when it may
+    /// install one. Absent, it looks every six hours, for releases only, and installs at any hour.
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// The `update` key: the kernel updater (`crate::self_update`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Whether the node looks and installs on its own. `true` when absent; `false` leaves `arca update run` by hand.
+    #[serde(default = "default_true")]
+    pub automatic: bool,
+    /// `stable` (releases only, the default) or `prerelease` (pre-releases too).
+    #[serde(default)]
+    pub channel: UpdateChannel,
+    /// Seconds between two looks, 600 to 604800. 21600 (six hours) when absent.
+    #[serde(default = "default_update_seconds")]
+    pub check_every_seconds: u64,
+    /// When an install may start, `HH:MM-HH:MM` in UTC; the end may be before the start, for a window over midnight. A
+    /// look outside it still looks and says what is available. Absent, at any hour.
+    #[serde(default)]
+    pub window: Option<String>,
+    /// The releases API of the repository: `https://api.github.com/repos/automagik-si/arca` when absent. Another `https`
+    /// address is a mirror; `http` only for a loopback address (a test's release server).
+    #[serde(default = "default_update_source")]
+    pub source: String,
+    /// How long a restarted unit has to come back and stay up before the update is rolled back, 5 to 600 seconds. 30 when
+    /// absent.
+    #[serde(default = "default_update_health_seconds")]
+    pub health_seconds: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            automatic: true,
+            channel: UpdateChannel::default(),
+            check_every_seconds: default_update_seconds(),
+            window: None,
+            source: default_update_source(),
+            health_seconds: default_update_health_seconds(),
+        }
+    }
+}
+
+/// Which releases the kernel updater installs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Releases only.
+    #[default]
+    Stable,
+    /// Pre-releases too.
+    Prerelease,
+}
+
+impl UpdateChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Prerelease => "prerelease",
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_update_seconds() -> u64 {
+    21_600
+}
+
+fn default_update_source() -> String {
+    "https://api.github.com/repos/automagik-si/arca".to_string()
+}
+
+fn default_update_health_seconds() -> u64 {
+    30
+}
+
+/// A window `HH:MM-HH:MM` as its two minutes of the day, in UTC.
+pub fn update_window(text: &str) -> Option<(u32, u32)> {
+    let minute = |part: &str| -> Option<u32> {
+        let (hours, minutes) = part.split_once(':')?;
+        if hours.len() != 2 || minutes.len() != 2 {
+            return None;
+        }
+        let (hours, minutes): (u32, u32) = (hours.parse().ok()?, minutes.parse().ok()?);
+        (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
+    };
+    let (start, end) = text.split_once('-')?;
+    let (start, end) = (minute(start)?, minute(end)?);
+    (start != end).then_some((start, end))
+}
+
+/// Whether the releases address may be used: `https://` and a host, or `http://` and a loopback host.
+pub fn update_source_ok(source: &str) -> bool {
+    if source.chars().any(|c| c.is_whitespace() || c.is_control()) || source.ends_with('/') {
+        return false;
+    }
+    if let Some(rest) = source.strip_prefix("https://") {
+        return !rest.is_empty() && !rest.starts_with('/');
+    }
+    let Some(rest) = source.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
 /// The `runners` key.
@@ -555,6 +666,8 @@ pub enum ConfigError {
     FollowInterval,
     /// `hostNetwork.socket` or `hostNetwork.status` is not an absolute path.
     HostNetworkPath,
+    /// A value of `update` breaks its rule; the key is named.
+    Update(&'static str),
     /// A runner pool breaks a rule; the rule is named.
     Runners(String),
     /// `console.tokenFile` is not an absolute path that names a file in a directory.
@@ -653,6 +766,7 @@ impl fmt::Display for ConfigError {
                 "follow.intervalSeconds is refused: it must be a whole number of seconds from 60 to 86400"
             ),
             Self::Runners(rule) => write!(f, "runners is refused: {rule}"),
+            Self::Update(rule) => write!(f, "update is refused: {rule}"),
             Self::HostNetworkPath => write!(
                 f,
                 "hostNetwork.socket and hostNetwork.status are refused: each must be an absolute path"
@@ -708,6 +822,35 @@ fn parse(text: &str) -> Result<NodeConfig, String> {
         )
     })?;
     Ok(config)
+}
+
+/// The rules of the `update` key.
+fn check_update(update: &UpdateConfig) -> Result<(), ConfigError> {
+    if !(600..=604_800).contains(&update.check_every_seconds) {
+        return Err(ConfigError::Update(
+            "update.checkEverySeconds must be a whole number of seconds from 600 to 604800",
+        ));
+    }
+    if !(5..=600).contains(&update.health_seconds) {
+        return Err(ConfigError::Update(
+            "update.healthSeconds must be a whole number of seconds from 5 to 600",
+        ));
+    }
+    if update
+        .window
+        .as_deref()
+        .is_some_and(|window| update_window(window).is_none())
+    {
+        return Err(ConfigError::Update(
+            "update.window must be HH:MM-HH:MM in UTC, two different times",
+        ));
+    }
+    if !update_source_ok(&update.source) {
+        return Err(ConfigError::Update(
+            "update.source must be an https address with no trailing slash, or http on a loopback address",
+        ));
+    }
+    Ok(())
 }
 
 /// The rules a parsed config must meet.
@@ -782,6 +925,7 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     if !config.host_network.socket.is_absolute() || !config.host_network.status.is_absolute() {
         return Err(ConfigError::HostNetworkPath);
     }
+    check_update(&config.update)?;
     if let Some(runners) = &config.runners {
         let mut names = std::collections::BTreeSet::new();
         for pool in &runners.pools {
@@ -2619,5 +2763,107 @@ mod tests {
                 "{good:?} is a loopback canvas origin"
             );
         }
+    }
+
+    #[test]
+    fn the_update_key_has_safe_defaults_and_its_rules_refuse_what_would_misbehave() {
+        let config =
+            load(&ConfigFile::new("update-default", &plain()).0).expect("the default loads");
+        assert!(config.update.automatic);
+        assert_eq!(config.update.channel, UpdateChannel::Stable);
+        assert_eq!(config.update.check_every_seconds, 21_600);
+        assert_eq!(config.update.health_seconds, 30);
+        assert_eq!(config.update.window, None);
+        assert_eq!(
+            config.update.source,
+            "https://api.github.com/repos/automagik-si/arca"
+        );
+
+        let with = |update: serde_json::Value| {
+            let mut value = plain();
+            value["update"] = update;
+            value
+        };
+        let fine = with(serde_json::json!({
+            "automatic": false, "channel": "prerelease", "checkEverySeconds": 600, "healthSeconds": 600,
+            "window": "23:00-01:30", "source": "http://127.0.0.1:8080/repos/x/y"
+        }));
+        let config = load(&ConfigFile::new("update-fine", &fine).0).expect("the edges load");
+        assert!(!config.update.automatic);
+        assert_eq!(config.update.channel, UpdateChannel::Prerelease);
+        assert_eq!(update_window("23:00-01:30"), Some((23 * 60, 90)));
+
+        for (tag, update, words) in [
+            (
+                "often",
+                serde_json::json!({ "checkEverySeconds": 599 }),
+                "update.checkEverySeconds",
+            ),
+            (
+                "seldom",
+                serde_json::json!({ "checkEverySeconds": 604_801 }),
+                "update.checkEverySeconds",
+            ),
+            (
+                "short",
+                serde_json::json!({ "healthSeconds": 4 }),
+                "update.healthSeconds",
+            ),
+            (
+                "long",
+                serde_json::json!({ "healthSeconds": 601 }),
+                "update.healthSeconds",
+            ),
+            (
+                "window",
+                serde_json::json!({ "window": "2:00-04:00" }),
+                "update.window",
+            ),
+            (
+                "same",
+                serde_json::json!({ "window": "02:00-02:00" }),
+                "update.window",
+            ),
+            (
+                "hour",
+                serde_json::json!({ "window": "24:00-01:00" }),
+                "update.window",
+            ),
+            (
+                "plain",
+                serde_json::json!({ "source": "http://example.com/repos/x/y" }),
+                "update.source",
+            ),
+            (
+                "slash",
+                serde_json::json!({ "source": "https://example.com/repos/x/y/" }),
+                "update.source",
+            ),
+            (
+                "space",
+                serde_json::json!({ "source": "https://example.com/a b" }),
+                "update.source",
+            ),
+            (
+                "nohost",
+                serde_json::json!({ "source": "https:///repos" }),
+                "update.source",
+            ),
+            (
+                "scheme",
+                serde_json::json!({ "source": "ftp://127.0.0.1/x" }),
+                "update.source",
+            ),
+        ] {
+            let refusal = ConfigFile::new(&format!("update-{tag}"), &with(update)).refusal();
+            assert!(
+                refusal.contains("update is refused") && refusal.contains(words),
+                "{tag}: {refusal}"
+            );
+        }
+        assert!(update_source_ok("http://localhost:9/x"));
+        assert!(update_source_ok("http://[::1]:9/x"));
+        assert!(!update_source_ok("http://127.0.0.1.example.com/x"));
+        assert!(update_source_ok("https://example.com"));
     }
 }
