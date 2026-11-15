@@ -4819,7 +4819,6 @@ fn a_lapsed_plan_of_a_failed_create_is_renewed_listed_again_and_its_approval_del
     let journal = journal_len(&rig);
 
     let renewed = operator_call(&verbs, "plan_renew", json!({})).expect("plan_renew answers");
-    eprintln!("plan_renew answered: {renewed}");
 
     assert_eq!(renewed["notRenewed"], json!([]), "{renewed}");
     let plan = &renewed["renewed"][0];
@@ -4885,12 +4884,16 @@ fn plan_renew_with_an_unresolved_intent_renews_nothing_and_says_why() {
     let verbs = plan_verbs_at(&rig, &clock);
     let id = operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"][0]["plan"].clone();
     // A second create whose instance answer never came leaves its intent open.
-    rig.template("other", nats_template());
+    let mut other = nats_template();
+    other["name"] = json!("other");
+    rig.template("other", other);
     *rig.unknown_create.lock().unwrap() = true;
-    assert!(
+    let Err(CallError::Refused { message, .. }) =
         rig.call("service_create", json!({"name":"other","template":"other"}))
-            .is_err()
-    );
+    else {
+        panic!("an unresolved create is refused");
+    };
+    assert!(message.contains("the intent stays open"), "{message}");
     clock.store(NOW + 16 * 60 * 1000, Ordering::SeqCst);
     let writes = rig.fake.writes().len();
     let journal = journal_len(&rig);

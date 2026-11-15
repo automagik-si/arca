@@ -2813,7 +2813,7 @@ objects as for any plan. `plan_list` itself never renews.
 
 ```
 arca call plan_renew --config /etc/arca/node.json --token-file "$HOME/.config/arca/operator-1.secret" --args '{}'
-{"notRenewed":[],"renewed":[{"createdAt":1793362620000,"entry":"svc-nats","expiresAt":1793363520000,"objects":[{"kind":"volume","name":"nats-data","project":"arca-services","uuid":null}],"plan":"<64 hex digits>"}]}
+{"notRenewed":[],"renewed":[{"createdAt":1793362560000,"entry":"service-nats","expiresAt":1793363460000,"objects":[{"kind":"volume","name":"nats-data","project":"arcak-svc","uuid":null}],"plan":"405ae7aa22557eccc77be27748ec6175faec7a38949f49f2865541f6fc42d25b"}]}
 ```
 
 Kernel instances start on create unless the body sets `start: false`; removal force-stops a running instance and waits for that operation before DELETE.
