@@ -275,6 +275,9 @@ struct Store {
     image_run_owners: BTreeMap<String, u32>,
     /// What each container's root disk holds under `/run`, by project and name, in the same form.
     run_disk: BTreeMap<(String, String), BTreeSet<String>>,
+    /// What each snapshot's root held under `/run`, by project, instance and snapshot: a restore puts it back, as
+    /// Incus restores the whole root.
+    run_snapshots: BTreeMap<(String, String, String), BTreeSet<String>>,
     /// The running containers Incus gave a memory `/run`, by project and name: Incus mounts one on an OCI container's
     /// `/run` only when the root holds nothing there at its start.
     run_memory: BTreeSet<(String, String)>,
@@ -444,6 +447,7 @@ impl Shared {
             image_run: Vec::new(),
             image_run_owners: BTreeMap::new(),
             run_disk: BTreeMap::new(),
+            run_snapshots: BTreeMap::new(),
             run_memory: BTreeSet::new(),
         };
         for index in 0..store.objects.len() {
@@ -2586,7 +2590,8 @@ fn put(
         return write_project(shared, store, index, &body, true);
     }
     let bad = |message: &str| (400, String::new(), error_envelope(400, message));
-    // A restore names a snapshot the instance holds and replaces nothing the fake keeps.
+    // A restore names a snapshot the instance holds and puts back its root's `/run`; it replaces nothing else the fake
+    // keeps.
     if let Some(Value::String(snapshot)) = body.get("restore") {
         let held = Address {
             kind: "snapshot",
@@ -2604,6 +2609,18 @@ fn put(
         if text_of(&store.objects[index].body, "status") != "Stopped" {
             return bad("the fake restores only a stopped instance");
         }
+        let run = store
+            .run_snapshots
+            .get(&(
+                address.project.clone(),
+                address.name.clone(),
+                snapshot.clone(),
+            ))
+            .cloned()
+            .unwrap_or_default();
+        store
+            .run_disk
+            .insert((address.project.clone(), address.name.clone()), run);
         lock(&shared.restores)
             .entry((address.project.clone(), address.name.clone()))
             .or_default()
@@ -3975,6 +3992,21 @@ fn snapshot_or_backup(
             409,
             String::new(),
             error_envelope(409, "the snapshot already exists"),
+        );
+    }
+    if kind == "snapshot" {
+        let held = store
+            .run_disk
+            .get(&(address.project.clone(), address.parent.clone()))
+            .cloned()
+            .unwrap_or_default();
+        store.run_snapshots.insert(
+            (
+                address.project.clone(),
+                address.parent.clone(),
+                name.clone(),
+            ),
+            held,
         );
     }
     store.objects.push(Stored {

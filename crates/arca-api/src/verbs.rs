@@ -517,7 +517,7 @@ static VERBS: [Verb; 90] = [
     },
     Verb {
         name: "service_reconfigure",
-        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
+        summary: "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint, whether /run is memory), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -5654,7 +5654,7 @@ fn service_update_params_base() -> Value {
                 "type": "integer"
             },
             "withTemplate": {
-                "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
+                "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint, whether /run is memory): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
                 "type": "boolean"
             }
         },

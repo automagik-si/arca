@@ -767,3 +767,75 @@ fn an_older_service_gets_a_memory_run_with_its_new_image_in_the_one_restart() {
     rig.apply(&rig.service_config("app")).expect("reconcile");
     assert_eq!(rig.fake.writes().len(), writes);
 }
+
+/// The same older service, whose withTemplate update fails its health check: the rollback puts back the old record
+/// (`runTmpfs: false`) and the old root, and leaves that root's `/run` as the image has it. Only the new version's root
+/// was emptied, so the old version starts with `/run` on its disk, as it ran before the update.
+#[test]
+fn a_rollback_of_an_older_service_leaves_the_old_roots_run_on_its_disk() {
+    for snapshots in [false, true] {
+        let key = common::SkKey::from_seed(89);
+        let up = Arc::new(AtomicBool::new(false));
+        let rig = bare_node(&up, Some(&key));
+        rig.fake
+            .set_image_run(&["/run/lock/", "/run/lock/.keep", "/run/motd"]);
+        let mut before = first();
+        before["runTmpfs"] = json!(false);
+        rig.template("app", before);
+        rig.call(
+            "service_create",
+            json!({ "name": "app", "template": "app" }),
+        )
+        .expect("create");
+        if snapshots {
+            let path = format!("/1.0/projects/{PROJECT}");
+            let mut config = rig.get(&path).expect("the project")["config"].clone();
+            config["restricted.snapshots"] = json!("allow");
+            rig.edit("PATCH", &path, json!({ "config": config }));
+        }
+        rig.template("app", first());
+        let proposed = propose_update(&rig, with_template()).expect("proposed");
+        assert_eq!(
+            proposed["args"]["changes"],
+            json!({ "runTmpfs": { "from": false, "to": true } }),
+            "{proposed}"
+        );
+
+        let (code, message) = refusal_words(approve(&rig, &key, &proposed));
+        assert_eq!(code, "rolled_back", "{message}");
+        assert!(message.contains("health check"), "{message}");
+        if snapshots {
+            assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
+        } else {
+            assert_eq!(
+                rig.fake.rebuilds(PROJECT, "app"),
+                vec!["registry", "registry"]
+            );
+        }
+
+        // The old record and config: no memory /run, and its root keeps what the image ships in /run.
+        assert!(!rig.service_config("app").run_tmpfs);
+        assert!(config(&rig).get(service::RUN_TMPFS_KEY).is_none());
+        assert_eq!(instance(&rig)["status"], "Running");
+        assert!(
+            !rig.fake.run_on_disk(PROJECT, "app").is_empty(),
+            "snapshots {snapshots}"
+        );
+        assert!(!rig.fake.run_in_memory(PROJECT, "app"));
+
+        // The new root was emptied before its start; nothing was emptied after the old root came back.
+        let steps: Vec<String> = journal(&rig).into_iter().map(|(step, _)| step).collect();
+        let back = steps
+            .iter()
+            .position(|step| step == "restore" || step == "rebuild back")
+            .unwrap_or_else(|| panic!("the old root in {steps:?}"));
+        let emptied: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| *step == "empty /run")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(emptied.len(), 1, "{steps:?}");
+        assert!(emptied[0] < back, "{steps:?}");
+    }
+}
