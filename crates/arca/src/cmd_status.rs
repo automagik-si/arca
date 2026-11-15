@@ -113,6 +113,39 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The console's token, counted among the tokens that only look: the viewer tokens of the token directory and the one
+/// the node makes at each start for the machine's own console.
+fn console_words(cfg: &NodeConfig, file: &Path) -> Vec<String> {
+    let count = match arca_mcp::TokenStore::load(&cfg.tokens.hash_dir) {
+        Ok(store) => {
+            let stored = store
+                .ids()
+                .into_iter()
+                .filter(|(_, scope, _)| *scope == arca_api::Scope::Viewer)
+                .count();
+            format!(
+                "Tokens that only look: {}, the console's among them.",
+                stored + 1
+            )
+        }
+        Err(_) => format!(
+            "Tokens that only look: the console's, and the viewer tokens in {}, which could not be read.",
+            cfg.tokens.hash_dir.display()
+        ),
+    };
+    vec![
+        count,
+        format!(
+            "  - The console's token ({}) is made at each start of the node, held in memory only and never stored, and written to {} at mode 0400 for the machine's own console. A restart replaces it, and a clean stop removes the file. It may call only {}.",
+            crate::console::CONSOLE_TOKEN_ID,
+            file.display(),
+            crate::console::CONSOLE_TOOLS.join(", ")
+        ),
+        "  - To turn it off: remove console.tokenFile from the config and restart the node."
+            .to_string(),
+    ]
+}
+
 /// `status --security`: what a person should know before sharing this machine, or a token of this node, with anyone
 /// else. The installer's report shows one line to connect an assistant and names this command for the rest. Every line
 /// is about a door the config opens; a config that opens none says so.
@@ -131,6 +164,10 @@ pub(crate) fn security(cfg: &NodeConfig, config: &Path, tokens: &DirectTokens) -
         "The unix socket {} answers only the user who runs the node. `arca call` and `arca status` use it, and it has no port for anyone to take.",
         cfg.listen.unix.display()
     ));
+    if let Some(console) = &cfg.console {
+        lines.push(String::new());
+        lines.extend(console_words(cfg, &console.token_file));
+    }
     match cfg.listen.loopback {
         Some(door) => {
             lines.push(String::new());

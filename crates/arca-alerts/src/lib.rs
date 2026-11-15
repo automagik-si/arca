@@ -1,6 +1,6 @@
 //! Arca's node alerts. The [`Engine`] runs on the sampler's tick: it evaluates the rules over the tick's [`eval::Inputs`],
-//! commits the tick's points and alert events to the store in one transaction, and returns the [`AlertSnapshot`] the tick
-//! publishes, whether the commit worked or not. Alerts have no write path: nothing here writes to Incus or to the desired
+//! hands the tick's points to the store's in-memory ring, commits its alert events in one transaction, and returns the
+//! [`AlertSnapshot`] the tick publishes, whether the commit worked or not. Alerts have no write path: nothing here writes to Incus or to the desired
 //! state.
 //!
 //! A failed commit keeps its events in a queue, at most [`QUEUE_LIMIT`] long. The next commit that works writes the queue and
@@ -210,16 +210,26 @@ impl<S: TickStore> Engine<S> {
         Ok(engine)
     }
 
-    /// Evaluates the rules, commits `points` and the tick's events in one transaction, runs the rollup on the first tick of
-    /// each minute, and returns the snapshot to publish. A failed commit still returns a snapshot, marked with the error.
+    /// Evaluates the rules, hands `points` to the store's ring and commits the tick's events in one transaction, runs the
+    /// rollup on the first tick of each minute, and returns the snapshot to publish. The rollup is the minute's write of the
+    /// points, so its commit time is added to the tick's, and one over [`SLOW_COMMIT`] counts as a slow commit. A failed
+    /// commit still returns a snapshot, marked with the error.
     pub fn tick(&mut self, inputs: &Inputs, points: Vec<Point>, now_ms: u64) -> AlertSnapshot {
         let events = self.eval.step(&self.rules, inputs, now_ms);
-        let (mut failed, commit_ms) = self.commit(now_ms, &points, events);
+        let (mut failed, mut commit_ms) = self.commit(now_ms, &points, events);
         if now_ms / 60_000 != self.rolled_minute {
             self.rolled_minute = now_ms / 60_000;
-            if let Err(error) = self.store.rollup(now_ms) {
-                self.record_failure(now_ms);
-                failed.get_or_insert(error);
+            match self.store.rollup(now_ms) {
+                Ok(report) => {
+                    commit_ms = commit_ms.saturating_add(report.commit_ms);
+                    if Duration::from_millis(report.commit_ms) > SLOW_COMMIT {
+                        self.record_slow(now_ms);
+                    }
+                }
+                Err(error) => {
+                    self.record_failure(now_ms);
+                    failed.get_or_insert(error);
+                }
             }
         }
         let store_error = failed.map(|error| self.store_error_mark(&error, now_ms));

@@ -46,7 +46,9 @@ async function approve() {
   buttons(false);
   status("Confirm with your passkey…", "");
   try {
-    const begun = await post(paths.begin, { id: request });
+    // The level the owner picked on a consent page; a page without a pick (the step-up page) sends none.
+    const picked = document.querySelector('input[name="scope"]:checked');
+    const begun = await post(paths.begin, picked ? { id: request, scope: picked.value } : { id: request });
     const challenge = await crypto.subtle.digest(
       "SHA-256",
       enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + begun.statement),
@@ -76,7 +78,9 @@ async function approve() {
       status("Approved. Taking you back to the app…", "ok");
       location.assign(done.redirect);
     } else {
-      status("Confirmed. Go back to " + (done.name || "the app") + ": it can ask you now.", "ok");
+      // A device request says what happens next (the app on the other device picks up its answer by itself); a step-up
+      // confirmation names the app.
+      status(done.message || "Confirmed. Go back to " + (done.name || "the app") + ": it can ask you now.", "ok");
     }
   } catch (error) {
     const name = error && error.name;
@@ -89,8 +93,12 @@ async function deny() {
   buttons(false);
   try {
     const done = await post("/oauth/authorize/deny", { id: request });
-    status("Not allowed. Taking you back to the app…", "ok");
-    location.assign(done.redirect);
+    if (done.redirect) {
+      status("Not allowed. Taking you back to the app…", "ok");
+      location.assign(done.redirect);
+    } else {
+      status(done.message || "Not allowed.", "ok");
+    }
   } catch (error) {
     status(String(error.message || error), "bad");
     buttons(true);

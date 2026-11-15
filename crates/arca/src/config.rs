@@ -78,6 +78,10 @@ pub struct NodeConfig {
     /// none. Served only by a kernel-mode node.
     #[serde(default)]
     pub runners: Option<RunnersConfig>,
+    /// The machine's own console (Arca OS's screen): the file `serve` writes the console's token to. Absent, no such token
+    /// is made.
+    #[serde(default)]
+    pub console: Option<ConsoleConfig>,
 }
 
 /// The `runners` key.
@@ -86,6 +90,15 @@ pub struct NodeConfig {
 pub struct RunnersConfig {
     /// The pools. Each signs in with the GitHub signer's connection its `binding` names.
     pub pools: Vec<arca_runners::PoolConfig>,
+}
+
+/// The `console` key. `tokenFile` is an absolute path to a file in a directory only the node's user enters: at each start
+/// `serve` makes one viewer token limited to [`crate::console::CONSOLE_TOOLS`], holds it in memory only and writes it
+/// there at mode 0400; a clean stop removes the file. The read list is fixed in code, not here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsoleConfig {
+    pub token_file: PathBuf,
 }
 
 /// The `hostNetwork` key: the socket and the status file of the root part (`arca host-network run`).
@@ -216,8 +229,9 @@ pub struct PeerKeysConfig {
     pub origins: Vec<String>,
 }
 
-/// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token the page relays
-/// with (scope `doctor`, and ideally limited to `plan_list`, `action_approve` and `plan_decline`). `incusSocket`, when set,
+/// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token this kernel relays
+/// with: the approval page (`plan_list`, `action_approve`, `plan_decline`) and the MCP door's calls that name it with
+/// `node` (the reads and `action_propose`). Scope `doctor`, limited to the verbs relayed with it. `incusSocket`, when set,
 /// is that machine's Incus socket on this one (local, or forwarded to a path here): `instance_move_preflight` reads the
 /// linked host's facts through it, with GETs only.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -543,6 +557,8 @@ pub enum ConfigError {
     HostNetworkPath,
     /// A runner pool breaks a rule; the rule is named.
     Runners(String),
+    /// `console.tokenFile` is not an absolute path that names a file in a directory.
+    ConsoleTokenFile,
     /// The approval origin is not an https origin with a host name and at most a non-443 port, nor the localhost origin.
     /// The value is left out.
     ApprovalOrigin,
@@ -640,6 +656,10 @@ impl fmt::Display for ConfigError {
             Self::HostNetworkPath => write!(
                 f,
                 "hostNetwork.socket and hostNetwork.status are refused: each must be an absolute path"
+            ),
+            Self::ConsoleTokenFile => write!(
+                f,
+                "console.tokenFile is refused: it must be an absolute path that names a file, such as /run/arca/console.token"
             ),
             Self::ApprovalOrigin => write!(
                 f,
@@ -771,6 +791,11 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
             }
         }
     }
+    if let Some(console) = &config.console
+        && !console_file_ok(&console.token_file)
+    {
+        return Err(ConfigError::ConsoleTokenFile);
+    }
     if let Some(host) = &config.approval_host
         && !host_name_ok(host)
     {
@@ -800,6 +825,18 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
         check_approval(approval)?;
     }
     Ok(())
+}
+
+/// An absolute path whose last part is a plain file name (not `..`, not `.`, no trailing slash) under a parent directory.
+fn console_file_ok(path: &Path) -> bool {
+    let text = path.as_os_str().as_encoded_bytes();
+    path.is_absolute()
+        && !text.ends_with(b"/")
+        && matches!(
+            path.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        )
+        && path.parent().is_some_and(|parent| parent != Path::new(""))
 }
 
 /// The `approval` rules: absolute trusted file paths with at least one origin, each origin an approval origin, and linked
@@ -1518,6 +1555,41 @@ mod tests {
             value["approvalHost"] = serde_json::json!(host);
         }
         serde_json::from_value(value).expect("the fixture config parses")
+    }
+
+    #[test]
+    fn the_consoles_token_file_is_absent_by_default_and_must_be_an_absolute_file_path() {
+        assert_eq!(config_with(None).console, None, "absent by default");
+        let with = |file: &str| {
+            let mut value = serde_json::to_value(serde_json::json!({
+                "stateDir": "/nonexistent/state",
+                "incus": { "socket": "/nonexistent/incus.sock" },
+                "listen": { "unix": "/nonexistent/arca.sock" },
+                "tokens": { "hashDir": "/nonexistent/tokens" },
+                "kernel": { "droiddProjects": ["droid"] }
+            }))
+            .expect("json");
+            value["console"] = serde_json::json!({ "tokenFile": file });
+            let config: NodeConfig = serde_json::from_value(value).expect("parses");
+            check(&config)
+        };
+        assert_eq!(with("/run/arca/console.token"), Ok(()));
+        for bad in ["run/arca/console.token", "/", "/run/arca/", "/run/arca/.."] {
+            let refused = with(bad).expect_err(bad);
+            assert!(
+                refused.to_string().contains("console.tokenFile"),
+                "{bad}: {refused}"
+            );
+        }
+        let unknown: Result<NodeConfig, _> = serde_json::from_value(serde_json::json!({
+            "stateDir": "/s", "incus": { "socket": "/i" }, "listen": { "unix": "/u" },
+            "tokens": { "hashDir": "/t" }, "kernel": { "droiddProjects": ["d"] },
+            "console": { "tokenFile": "/run/arca/console.token", "tools": ["token_list"] }
+        }));
+        assert!(
+            unknown.is_err(),
+            "the read list is not the config's to widen"
+        );
     }
 
     #[test]

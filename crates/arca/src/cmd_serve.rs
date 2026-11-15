@@ -41,6 +41,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
+use crate::console::ConsoleToken;
 use crate::handlers::{
     ActionExecutor, ActionSlot, AlertsExport, AlertsHandler, AlertsPublished, ApprovalStatus,
     Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, OsUpdateHandler,
@@ -200,6 +201,13 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The token store is read before anything listens. The server and the SIGHUP handler share it.
     let tokens = TokenStore::load(&cfg.tokens.hash_dir).map_err(token_failure)?;
     say_ignored_tokens(&tokens);
+    // The console's token, when the config names its file: the file's place is checked now, before anything listens, and
+    // the token is held in the store's memory. The file is written once the node holds its unix socket.
+    let console = cfg
+        .console
+        .as_ref()
+        .map(|console| ConsoleToken::prepare(&console.token_file, &tokens))
+        .transpose()?;
     let key = NodeKey::load_or_create(&cfg.state_dir.join(NODE_KEY_FILE))
         .map_err(|e| Failure::Runtime(e.to_string()))?;
     let node = key.id().to_hex();
@@ -755,12 +763,18 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             page: approval_page.clone(),
         }),
     );
-    let router = server.router();
     let linked_hosts = cfg
         .approval
         .as_ref()
         .map(|approval| approval.linked_hosts.clone())
         .unwrap_or_default();
+    // A read or a proposal that names a linked node (`node`) is relayed to it by the door, after the caller is checked here.
+    if !linked_hosts.is_empty() {
+        server = server.linked_nodes(Arc::new(crate::linked::LinkedNodes {
+            hosts: linked_hosts.clone(),
+        }));
+    }
+    let router = server.router();
     // The page host keeps its own passkey list in sync on each linked host that asks for it: now, every ten minutes, and
     // when the approval page asks.
     let peer_sync = (cfg.approval_origin.is_some() && !linked_hosts.is_empty())
@@ -961,7 +975,24 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         tokio::select! {
             // The pid file is published the moment the socket is this process's own, and before any request is served: a
             // start that is refused never reaches it, so the file never names a process that holds no listener.
-            result = serve_unix_bound(router.clone(), &unix_path, || publish_pid(&pid_path)) => result,
+            // The console's token file is written there too, so a refused start never touches a live node's file, and a
+            // file that cannot be written stops the start.
+            result = serve_unix_bound(router.clone(), &unix_path, || {
+                publish_pid(&pid_path);
+                match &console {
+                    Some(console) => console.write().map(|()| {
+                        eprintln!(
+                            "arca: the console's token is in {} (viewer, limited to {})",
+                            console.path().display(),
+                            crate::console::CONSOLE_TOOLS.join(", ")
+                        );
+                    }).map_err(|error| io::Error::new(
+                        error.kind(),
+                        format!("the console's token file was not written: {error}"),
+                    )),
+                    None => Ok(()),
+                }
+            }) => result,
             result = loopback => result,
             result = loopback_twin => result,
             result = tailnet => result,
@@ -972,6 +1003,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     });
     remove_own_pid(&pid_path);
     remove_own_pid(&reload_path);
+    // The token in the file dies with this process, so the file goes too: on a clean stop and on a failed one alike.
+    if let Some(console) = &console {
+        console.remove_own();
+    }
     match outcome {
         Ok(()) => {
             remove_own_socket(&cfg.listen.unix);

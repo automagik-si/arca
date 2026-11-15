@@ -774,3 +774,56 @@ async fn an_idle_runner_is_given_up_after_the_bound_and_taken_off_github_first()
     .await;
     rig.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runner_github_just_handed_a_job_is_kept_at_the_bound() {
+    let timing = Timing {
+        watch_retry: Duration::from_millis(50),
+        ..Timing::default()
+    };
+    // One machine at most, so the failed reads are all this runner's.
+    let rig = rig_timed(config(1, 1, 32), timing, |_, _| {}).await;
+    until("a warm runner", Duration::from_secs(10), || {
+        rig.pool.status().classes[0].idle == 1
+    })
+    .await;
+    let first = rig.launcher.live()[0].clone();
+    // GitHub hands the warm runner a job and the pool never hears JobStarted: it still counts the runner idle.
+    rig.github.hold_started(true);
+    rig.launcher.fail_watches(150);
+    rig.github.queue_job(job("handed", &[LABEL], 0.5));
+    until(
+        "the job handed to the warm runner",
+        Duration::from_secs(3),
+        || rig.github.runner_holds_job(&first),
+    )
+    .await;
+    assert_eq!(
+        rig.pool.status().classes[0].busy,
+        0,
+        "the pool must not know of the job"
+    );
+    until("the handed job", Duration::from_secs(30), || {
+        rig.github.finished().len() == 1
+    })
+    .await;
+    let finished = rig.github.finished();
+    assert_eq!(finished[0].result, "succeeded", "{finished:?}");
+    assert_eq!(finished[0].runner, first);
+    assert!(
+        !rig.launcher.destroyed_while_registered().contains(&first),
+        "{:?}",
+        rig.launcher.destroyed_while_registered()
+    );
+    // GitHub refused the removal at the 60th and the 120th failure; the count restarted after each.
+    let refused = rig
+        .github
+        .calls()
+        .into_iter()
+        .filter(|call| {
+            call.method == "DELETE" && call.path.contains("/agents/") && call.status == 400
+        })
+        .count();
+    assert!((1..=3).contains(&refused), "refused removals: {refused}");
+    rig.finish().await;
+}

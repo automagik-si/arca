@@ -1241,7 +1241,7 @@ test('the per-turn tool-call cap stops at 40 by default and never registers the 
   assert.equal(result.events.at(-1).data.reason, 'tool-calls');
   assert.equal(fake.executed.length, 2);
   assert.equal(result.events.filter((event) => event.event === 'tool' && event.data.state === 'running').length, 2);
-  assert.ok(fake.cancels.includes('tool-calls'));
+  assert.ok(fake.cancels.some((cause) => cause?.kind === 'hook' && cause.reason === 'tool-calls'));
 });
 
 test('a cap reached mid-response stops the next tool from dispatching', async (t) => {
@@ -1510,6 +1510,19 @@ test('the dispatch guard denies run_code and a tool registered after setup', asy
   assert.equal([...fake.globals.keys()].includes('late_tool'), true, 'the late tool really was registered');
 });
 
+test('closing the chat cancels its agent with a DSH cancel cause, never a bare string', async (t) => {
+  const { chat, fake, port } = await harness(t, {
+    script: async (api) => {
+      api.text('hello');
+      api.end();
+    },
+  });
+  const answered = await post(port, { message: 'hi' });
+  assert.equal(answered.events.at(-1).data.reason, 'complete');
+  await chat.close();
+  assert.deepEqual(fake.cancels, [{ kind: 'disposed' }]);
+});
+
 test('a cancelled run must end before the next; its late events are dropped', async (t) => {
   let first = true;
   const { fake, port, statePath } = await harness(t, {
@@ -1531,7 +1544,7 @@ test('a cancelled run must end before the next; its late events are dropped', as
   });
   const firstPost = post(port, { message: 'first' });
   await until(() => fake.cancels.length === 1);
-  assert.deepEqual(fake.cancels, ['timeout']);
+  assert.deepEqual(fake.cancels, [{ kind: 'hook', reason: 'timeout' }]);
   assert.equal(fake.followed.length, 1, 'the run started before its deadline passed');
   const busy = await post(port, { message: 'while cancelling' });
   assert.equal(busy.status, 429, 'the next turn waits for the cancelled run to end');
@@ -1804,7 +1817,7 @@ test('an agent error with no turn/end releases the turn and the next request', a
   const first = await post(port, { message: 'error' });
   const elapsed = Date.now() - started;
   assert.equal(first.events.at(-1).data.reason, 'error');
-  assert.deepEqual(fake.cancels, ['error']);
+  assert.deepEqual(fake.cancels, [{ kind: 'hook', reason: 'error' }]);
   // The fallback this test set to 20 ms released the turn. The default one would have taken this long.
   assert.ok(elapsed < DEFAULTS.cancelMs, `the error released the turn in ${elapsed}ms`);
   const second = await post(port, { message: 'after error' });

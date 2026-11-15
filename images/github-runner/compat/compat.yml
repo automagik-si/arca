@@ -1,0 +1,191 @@
+# The compatibility test: the same jobs on GitHub's runner and on Arca's, then compare.sh puts what each saw side by
+# side. Copy this folder into a private test repository (as .github/workflows/compat.yml and compat/*.sh), give that
+# repository Arca's runner group, and run it by hand (workflow_dispatch). Never in a public repository: self-hosted
+# runners there take jobs from anyone's pull request.
+#
+# Every job runs twice, once per side. A job writes what it saw (fingerprint.sh, or its own checks) as fp.tsv and
+# uploads it as fp-<job>-<side>; the job's own pass or fail is compared too.
+name: runner-image-compat
+
+on:
+  workflow_dispatch:
+    inputs:
+      github:
+        description: "runs-on for GitHub's runner (JSON)"
+        default: '"ubuntu-24.04"'
+      arca:
+        description: "runs-on for Arca's runner (JSON: a label or a list of labels)"
+        default: '["self-hosted", "arca-ubuntu-24.04"]'
+
+permissions:
+  contents: read
+
+env:
+  FP: fp.tsv
+
+jobs:
+  fingerprint:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [github, arca]
+        group: [environment, tools, system, toolcache]
+    runs-on: ${{ fromJSON(matrix.side == 'github' && inputs.github || inputs.arca) }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash compat/fingerprint.sh ${{ matrix.group }} > "$FP"
+      - uses: actions/upload-artifact@v7
+        with: { name: "fp-${{ matrix.group }}-${{ matrix.side }}", path: fp.tsv }
+
+  setup-actions:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [github, arca]
+    runs-on: ${{ fromJSON(matrix.side == 'github' && inputs.github || inputs.arca) }}
+    steps:
+      - uses: actions/setup-node@v7
+        with: { node-version: "22" }
+      - run: printf 'node 22\t%s %s\n' "$(node --version)" "$(case $(command -v node) in "$RUNNER_TOOL_CACHE"/*) echo toolcache;; *) echo elsewhere;; esac)" >> "$FP"
+      - uses: actions/setup-node@v7
+        with: { node-version: "24" }
+      - run: printf 'node 24\t%s %s\n' "$(node --version | cut -d. -f1)" "$(case $(command -v node) in "$RUNNER_TOOL_CACHE"/*) echo toolcache;; *) echo elsewhere;; esac)" >> "$FP"
+      - uses: actions/setup-python@v7
+        with: { python-version: "3.12" }
+      - run: printf 'python 3.12\t%s %s\n' "$(python --version | cut -d. -f1,2)" "$(case $(command -v python) in "$RUNNER_TOOL_CACHE"/*) echo toolcache;; *) echo elsewhere;; esac)" >> "$FP"
+      - name: pip installs into the toolcache Python
+        run: printf 'pip install\t%s\n' "$(pip install -q cowsay >/dev/null 2>&1 && command -v cowsay | sed "s|$RUNNER_TOOL_CACHE|<toolcache>|")" >> "$FP"
+      - uses: actions/setup-go@v7
+        with: { go-version: "1.25", cache: false }
+      - run: printf 'go 1.25\t%s %s\n' "$(go version | awk '{print $3}' | cut -d. -f1,2)" "$(case $(command -v go) in "$RUNNER_TOOL_CACHE"/*) echo toolcache;; *) echo elsewhere;; esac)" >> "$FP"
+      - name: pnpm through corepack
+        run: printf 'corepack pnpm\t%s\n' "$(corepack enable pnpm >/dev/null 2>&1 && pnpm --version >/dev/null 2>&1 && echo ok || echo failed)" >> "$FP"
+      - uses: actions/upload-artifact@v7
+        with: { name: "fp-setup-actions-${{ matrix.side }}", path: fp.tsv }
+
+  docker:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [github, arca]
+    runs-on: ${{ fromJSON(matrix.side == 'github' && inputs.github || inputs.arca) }}
+    steps:
+      - name: bind mount from outside the workspace
+        run: |
+          mkdir -p /tmp/compat && echo hello > /tmp/compat/file
+          printf 'bind mount /tmp\t%s\n' "$(docker run --rm -v /tmp/compat:/x alpine:3.22 cat /x/file 2>&1 | tail -1)" >> "$FP"
+      - name: host network
+        run: |
+          docker run -d --rm --name web -p 8080:80 nginx:1.29-alpine >/dev/null
+          for _ in $(seq 30); do curl -fs localhost:8080 >/dev/null && break; sleep 1; done
+          printf 'published port on localhost\t%s\n' "$(curl -fs -o /dev/null -w '%{http_code}' localhost:8080)" >> "$FP"
+          docker stop web >/dev/null
+      - name: build with buildx
+        run: |
+          printf 'FROM alpine:3.22\nRUN echo built > /b\n' > Dockerfile
+          printf 'docker buildx build\t%s\n' "$(docker buildx build -q -t compat:1 --load . >/dev/null 2>&1 && docker run --rm compat:1 cat /b)" >> "$FP"
+      - name: compose
+        run: |
+          printf 'services:\n  a:\n    image: alpine:3.22\n    command: echo composed\n' > compose.yml
+          printf 'docker compose run\t%s\n' "$(docker compose run --rm a 2>/dev/null | tail -1)" >> "$FP"
+      - name: privileged container
+        run: printf 'privileged\t%s\n' "$(docker run --rm --privileged alpine:3.22 sh -c 'mount -t tmpfs t /mnt && echo ok' 2>&1 | tail -1)" >> "$FP"
+      - uses: actions/upload-artifact@v7
+        with: { name: "fp-docker-${{ matrix.side }}", path: fp.tsv }
+
+  service-containers:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [github, arca]
+    runs-on: ${{ fromJSON(matrix.side == 'github' && inputs.github || inputs.arca) }}
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: compat }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+    steps:
+      - run: |
+          printf 'postgres service\t%s\n' "$(pg_isready -h localhost -p 5432 >/dev/null && echo ready || echo down)" >> "$FP"
+          printf 'redis service\t%s\n' "$( (exec 3<>/dev/tcp/localhost/6379 && printf 'PING\r\n' >&3 && head -c5 <&3 | tr -d '\r\n') 2>/dev/null || echo down)" >> "$FP"
+      - uses: actions/upload-artifact@v7
+        with: { name: "fp-service-containers-${{ matrix.side }}", path: fp.tsv }
+
+  container-job:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [github, arca]
+    runs-on: ${{ fromJSON(matrix.side == 'github' && inputs.github || inputs.arca) }}
+    container: node:22-bookworm
+    steps:
+      - run: printf 'container job node\t%s\n' "$(node --version | cut -d. -f1)" >> "$FP"
+      - uses: actions/upload-artifact@v7
+        with: { name: "fp-container-job-${{ matrix.side }}", path: fp.tsv }
+
+  databases:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [github, arca]
+    runs-on: ${{ fromJSON(matrix.side == 'github' && inputs.github || inputs.arca) }}
+    steps:
+      - run: |
+          sudo systemctl start mysql.service
+          printf 'mysql preinstalled\t%s\n' "$(mysql -uroot -proot -N -e 'select 1' 2>/dev/null || echo failed)" >> "$FP"
+          sudo systemctl start postgresql.service
+          printf 'postgresql preinstalled\t%s\n' "$(sudo -u postgres psql -tAc 'select 1' 2>/dev/null || echo failed)" >> "$FP"
+      - uses: actions/upload-artifact@v7
+        with: { name: "fp-databases-${{ matrix.side }}", path: fp.tsv }
+
+  browsers:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [github, arca]
+    runs-on: ${{ fromJSON(matrix.side == 'github' && inputs.github || inputs.arca) }}
+    steps:
+      - name: Playwright browsers without install-deps (the system libraries must already be there)
+        run: |
+          npx -y playwright@1.65.1 install chromium firefox >/dev/null
+          cat > launch.mjs <<'EOF'
+          const { chromium, firefox } = await import(process.env.PW);
+          for (const [name, type] of [["chromium", chromium], ["firefox", firefox]]) {
+            try { const b = await type.launch(); const p = await b.newPage(); await p.goto("data:text/html,<title>ok</title>");
+                  console.log(`playwright ${name}\t${await p.title()}`); await b.close(); }
+            catch (e) { console.log(`playwright ${name}\tfailed`); }
+          }
+          EOF
+          npm i -s --no-save playwright@1.65.1 >/dev/null 2>&1
+          PW="$PWD/node_modules/playwright/index.mjs" node launch.mjs >> "$FP"
+      - name: preinstalled Chrome under xvfb
+        run: printf 'chrome headless\t%s\n' "$(xvfb-run -a google-chrome --headless=new --no-sandbox --dump-dom 'data:text/html,<p>ok</p>' 2>/dev/null | grep -o '<p>ok</p>')" >> "$FP"
+      - uses: actions/upload-artifact@v7
+        with: { name: "fp-browsers-${{ matrix.side }}", path: fp.tsv }
+
+  # A cache saved on GitHub's runner must be found on ours: the cache's version includes its compression (zstd on
+  # GitHub's image), so a runner without zstd misses it.
+  cache-save:
+    runs-on: ${{ fromJSON(inputs.github) }}
+    steps:
+      - run: mkdir -p c && echo "${{ github.run_id }}" > c/id
+      - uses: actions/cache/save@v6
+        with: { path: c, key: "compat-${{ github.run_id }}" }
+  cache-restore:
+    needs: cache-save
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [github, arca]
+    runs-on: ${{ fromJSON(matrix.side == 'github' && inputs.github || inputs.arca) }}
+    steps:
+      - id: restore
+        uses: actions/cache/restore@v6
+        with: { path: c, key: "compat-${{ github.run_id }}" }
+      - run: printf 'cache saved on GitHub restored\t%s %s\n' "${{ steps.restore.outputs.cache-hit }}" "$(cat c/id 2>/dev/null | sed 's/[0-9]*/<id>/')" >> "$FP"
+      - uses: actions/upload-artifact@v7
+        with: { name: "fp-cache-${{ matrix.side }}", path: fp.tsv }

@@ -9,7 +9,19 @@
   "methods": [
     {
       "name": "arca_status",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -256,6 +268,17 @@
             "maximum": 60,
             "minimum": 1,
             "type": "integer"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
           }
         }
       ],
@@ -1292,7 +1315,19 @@
     },
     {
       "name": "watch_report",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -1434,7 +1469,19 @@
     },
     {
       "name": "token_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -1443,6 +1490,9 @@
               "items": {
                 "properties": {
                   "admin": {
+                    "type": "boolean"
+                  },
+                  "console": {
                     "type": "boolean"
                   },
                   "id": {
@@ -1455,6 +1505,9 @@
                       "operator"
                     ],
                     "type": "string"
+                  },
+                  "stored": {
+                    "type": "boolean"
                   },
                   "tools": {
                     "items": {
@@ -1478,7 +1531,7 @@
           "type": "object"
         }
       },
-      "summary": "The interim API tokens by id and scope. Never a secret or a hash.",
+      "summary": "The interim API tokens by id and scope, and the node's own unstored console token marked as such. Never a secret or a hash.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
@@ -1500,6 +1553,17 @@
           "required": false,
           "schema": {
             "type": "integer"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
           }
         }
       ],
@@ -1649,7 +1713,19 @@
     },
     {
       "name": "plan_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -3312,6 +3388,17 @@
             "type": "object",
             "x-arca-by": "action"
           }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -3850,7 +3937,19 @@
     },
     {
       "name": "alerts_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -4251,6 +4350,17 @@
       "name": "postgres_list",
       "params": [
         {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
           "name": "tenant",
           "required": false,
           "schema": {
@@ -4581,6 +4691,17 @@
           "required": true,
           "schema": {
             "maxLength": 128,
+            "type": "string"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
             "type": "string"
           }
         }
@@ -5210,6 +5331,17 @@
       "name": "service_list",
       "params": [
         {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
           "name": "tenant",
           "required": false,
           "schema": {
@@ -5549,6 +5681,17 @@
           "schema": {
             "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
             "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
             "type": "string"
           }
         },
@@ -5900,6 +6043,17 @@
             "maximum": 200,
             "minimum": 1,
             "type": "integer"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
           }
         },
         {
@@ -7288,6 +7442,17 @@
             "minLength": 1,
             "type": "string"
           }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -8216,7 +8381,19 @@
     },
     {
       "name": "storage_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -8863,6 +9040,17 @@
     {
       "name": "snapshot_list",
       "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
         {
           "name": "tenant",
           "required": false,
@@ -9640,7 +9828,19 @@
     },
     {
       "name": "tenant_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -9769,6 +9969,17 @@
             "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -9886,6 +10097,17 @@
           "schema": {
             "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
             "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
             "type": "string"
           }
         }
@@ -10694,7 +10916,19 @@
     },
     {
       "name": "function_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -10906,6 +11140,17 @@
             "maximum": 100,
             "minimum": 1,
             "type": "integer"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
           }
         },
         {
@@ -11276,7 +11521,19 @@
     },
     {
       "name": "registry_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -11480,6 +11737,17 @@
           "schema": {
             "description": "Check for a live (stateful) move: the target's CPU must then have every CPU feature of this host. Absent or false, a cold move, where a missing feature is a risk and not a blocker.",
             "type": "boolean"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
           }
         }
       ],
@@ -12038,6 +12306,17 @@
             "minLength": 1,
             "type": "string"
           }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -12153,7 +12432,19 @@
     },
     {
       "name": "github_bindings",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -12463,6 +12754,17 @@
             "maximum": 1000,
             "minimum": 1,
             "type": "integer"
+          }
+        },
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
           }
         }
       ],
@@ -12911,7 +13213,19 @@
     },
     {
       "name": "os_update",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -13320,7 +13634,19 @@
     },
     {
       "name": "route_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {

@@ -1,0 +1,15 @@
+# GitHub's machines get 4096 MB of swap from Azure's agent (configure-environment.sh asks it for that). This makes the
+# same at boot, so the image does not carry the file.
+[Unit]
+Description=Arca: 4 GB swap file, as on GitHub's runners
+DefaultDependencies=no
+After=local-fs.target
+Before=swap.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'f=/mnt/swapfile; [ -e "$f" ] || { fallocate -l 4096M "$f" && chmod 600 "$f" && mkswap "$f" >/dev/null; }; swapon "$f"'
+
+[Install]
+WantedBy=swap.target

@@ -117,6 +117,7 @@ struct World {
     token: String,
     installed: bool,
     refuse_mints: bool,
+    hold_started: bool,
     registration_tokens: BTreeSet<String>,
     admin_tokens: BTreeSet<String>,
     scale_sets: BTreeMap<u64, FakeScaleSet>,
@@ -190,6 +191,19 @@ impl FakeGitHub {
     /// permission after the listener connected.
     pub fn refuse_mints(&self, refuse: bool) {
         self.lock().refuse_mints = refuse;
+    }
+
+    /// GitHub still starts jobs, but sends no `JobStarted`: the pool keeps counting the runner idle.
+    pub fn hold_started(&self, hold: bool) {
+        self.lock().hold_started = hold;
+    }
+
+    /// The runner of that name holds a job.
+    pub fn runner_holds_job(&self, name: &str) -> bool {
+        self.lock()
+            .runners
+            .values()
+            .any(|runner| runner.name == name && runner.job.is_some())
     }
 
     /// Every Actions service admin token given out stops working, as when one expires or is revoked.
@@ -398,7 +412,9 @@ fn assign(world: &mut World) {
         job.assigned_ms = now_ms();
         job.started = Some(Instant::now());
         let message = job_message("JobStarted", job, Some((runner_id, &name)));
-        push(world, set, vec![message]);
+        if !world.hold_started {
+            push(world, set, vec![message]);
+        }
     }
 }
 

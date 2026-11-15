@@ -1,5 +1,6 @@
 //! The store on a temporary state directory: the pragmas it opens with, one tick's commit of points and events, the rollups
-//! and their retention, the corrupt-file rename, durability across an abort, and the size at full retention.
+//! and their retention, the raw ring across a restart and an upgrade, the corrupt-file rename, durability across an abort,
+//! the size at full retention, and the commits and bytes of an hour of ticks.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -237,11 +238,15 @@ mod rollup {
         }
         drop(store);
 
-        // Five hours later the node starts again. The minute the stop cut is closed now, and its raw rows are still there.
+        // Five hours later the node starts again. The minute the stop cut is closed now, but its raw points were in memory
+        // and went with the stop: only the minutes before it are in the file.
         let restart = stop + 5 * HOUR;
         let mut store = Store::open(dir.path(), restart).expect("reopen").store;
         let report = store.rollup(restart).expect("catch-up");
-        assert_eq!(report.minutes_rolled, 1, "only the minute the stop cut");
+        assert_eq!(
+            report.minutes_rolled, 0,
+            "the minute the stop cut had its raw points in memory"
+        );
         assert_eq!(
             report.hours_rolled, 1,
             "only the hour that closed during the stop"
@@ -259,16 +264,12 @@ mod rollup {
         );
 
         let minutes = store.points(Tier::Minute, SERIES, 0, FAR).expect("read");
-        assert_eq!(minutes.len(), 91, "every minute with data is rolled once");
+        assert_eq!(minutes.len(), 90, "every closed minute is rolled once");
         assert_eq!(minutes[0].at, base);
         assert_eq!(minutes[0].avg, 5.5, "the mean of ticks 0 to 11");
         assert_eq!((minutes[0].min, minutes[0].max), (0.0, 11.0));
-        let cut = minutes.last().expect("the cut minute");
-        assert_eq!(cut.at, base + 90 * MINUTE);
-        assert_eq!(
-            cut.avg, 1082.5,
-            "the mean of ticks 1080 to 1085, rolled from raw rows before the stop"
-        );
+        let last = minutes.last().expect("the last closed minute");
+        assert_eq!(last.at, base + 89 * MINUTE, "the cut minute is a gap");
 
         let hours = store.points(Tier::Hour, SERIES, 0, FAR).expect("read");
         assert_eq!(
@@ -279,11 +280,11 @@ mod rollup {
             hours[0].avg, 359.5,
             "the mean of the minute averages of hour 0"
         );
-        assert_eq!((hours[1].min, hours[1].max), (720.0, 1085.0));
-        let expected = (2235.0 * 12.0 + 30.0 * 5.5 + 1082.5) / 31.0;
+        assert_eq!((hours[1].min, hours[1].max), (720.0, 1079.0));
+        let expected = (2235.0 * 12.0 + 30.0 * 5.5) / 30.0;
         assert!(
             (hours[1].avg - expected).abs() < 1e-9,
-            "hour 1 averages minutes 60 to 90"
+            "hour 1 averages minutes 60 to 89"
         );
     }
 
@@ -445,6 +446,195 @@ mod rollup {
             rolled,
             vec![base, base + MINUTE, base + 3 * MINUTE],
             "minute 2 stays a gap"
+        );
+    }
+}
+
+mod raw_ring {
+    use super::*;
+
+    const BASE: u64 = 1_000 * DAY;
+
+    fn rows_of_tier(dir: &Path, tier: i64) -> i64 {
+        let conn = rusqlite::Connection::open_with_flags(
+            dir.join(arca_store::DB_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open");
+        conn.query_row(
+            "SELECT count(*) FROM points WHERE tier = ?1",
+            [tier],
+            |row| row.get(0),
+        )
+        .expect("count")
+    }
+
+    #[test]
+    fn a_tick_without_events_writes_no_raw_row_and_the_ring_answers() {
+        let dir = StateDir::new("ring-read");
+        let mut store = Store::open(dir.path(), BASE).expect("open").store;
+        for tick in 0..3u64 {
+            let seqs = store
+                .commit_tick(BASE + tick * 5_000, &[gauge(tick as f64)], &[])
+                .expect("tick");
+            assert!(seqs.is_empty());
+        }
+        assert_eq!(
+            rows_of_tier(dir.path(), 0),
+            0,
+            "no raw row reaches the file"
+        );
+        let window = store.raw(SERIES, BASE, BASE + MINUTE);
+        assert_eq!(
+            window.points.iter().map(|p| p.avg).collect::<Vec<_>>(),
+            vec![0.0, 1.0, 2.0]
+        );
+        assert_eq!(window.missing, None, "the ring holds the whole window");
+        assert_eq!(
+            store
+                .points(Tier::Raw, SERIES, BASE, BASE + MINUTE)
+                .expect("read"),
+            window.points
+        );
+
+        // A tick at an `at` already held replaces it, as the raw rows' primary key did.
+        store.commit_tick(BASE, &[gauge(9.0)], &[]).expect("tick");
+        assert_eq!(store.raw(SERIES, BASE, BASE + 1).points[0].avg, 9.0);
+    }
+
+    #[test]
+    fn after_a_restart_the_raw_window_is_empty_and_says_so_while_rollups_survive() {
+        let dir = StateDir::new("ring-restart");
+        let mut store = Store::open(dir.path(), BASE).expect("open").store;
+        for tick in 0..24u64 {
+            store
+                .commit_tick(BASE + tick * 5_000, &[gauge(1.0)], &[])
+                .expect("tick");
+        }
+        store.rollup(BASE + 2 * MINUTE).expect("rollup");
+        drop(store);
+
+        let restart = BASE + 3 * MINUTE;
+        let mut store = Store::open(dir.path(), restart).expect("reopen").store;
+        assert_eq!(
+            store
+                .points(Tier::Minute, SERIES, 0, FAR)
+                .expect("read")
+                .len(),
+            2,
+            "the minute rollups survive the restart"
+        );
+        let empty = store.raw(SERIES, BASE, restart);
+        assert!(
+            empty.points.is_empty(),
+            "no zeros stand in for the lost samples"
+        );
+        let words = empty.missing.expect("an empty ring says so");
+        assert!(
+            words.contains("no raw sample has been taken since the store opened")
+                && words.contains(&restart.to_string()),
+            "{words}"
+        );
+
+        store
+            .commit_tick(restart + 5_000, &[gauge(2.0)], &[])
+            .expect("tick");
+        let partial = store.raw(SERIES, BASE, restart + MINUTE);
+        assert_eq!(partial.points.len(), 1);
+        let words = partial.missing.expect("the window starts before the ring");
+        assert!(
+            words.contains(&format!("before {}", restart + 5_000)),
+            "{words}"
+        );
+        assert_eq!(
+            store.raw(SERIES, restart + 5_000, restart + MINUTE).missing,
+            None
+        );
+
+        let reader = Store::open_read_only(dir.path()).expect("a reader opens");
+        let read_only = reader.raw(SERIES, BASE, FAR);
+        assert!(read_only.points.is_empty());
+        assert!(
+            read_only
+                .missing
+                .expect("words")
+                .contains("read-only store holds no raw samples")
+        );
+    }
+
+    #[test]
+    fn the_raw_rows_of_an_earlier_release_are_rolled_then_deleted() {
+        let dir = StateDir::new("ring-upgrade");
+        drop(Store::open(dir.path(), BASE).expect("create"));
+        // An earlier release wrote each tick as a raw row: minute 0 closed and minute 1 cut by the stop.
+        {
+            let conn =
+                rusqlite::Connection::open(dir.path().join(arca_store::DB_FILE)).expect("open");
+            conn.execute(
+                "INSERT INTO series (id, name, labels, kind) VALUES (1, ?1, '{\"pool\":\"default\"}', 'gauge')",
+                [SERIES],
+            )
+            .expect("series");
+            for tick in 0..18i64 {
+                conn.execute(
+                    "INSERT INTO points (tier, at, series_id, avg, min, max) VALUES (0, ?1, 1, ?2, ?2, ?2)",
+                    rusqlite::params![BASE as i64 + tick * 5_000, tick as f64],
+                )
+                .expect("a raw row");
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('rolled_minute', ?1)",
+                [BASE as i64],
+            )
+            .expect("the mark");
+        }
+        assert_eq!(rows_of_tier(dir.path(), 0), 18);
+
+        let restart = BASE + MINUTE + 40_000;
+        let mut store = Store::open(dir.path(), restart).expect("reopen").store;
+        assert_eq!(
+            store.raw(SERIES, BASE, restart).points.len(),
+            18,
+            "read into the ring"
+        );
+        store
+            .commit_tick(restart, &[gauge(100.0)], &[])
+            .expect("tick");
+        store.rollup(BASE + 2 * MINUTE).expect("rollup");
+        assert_eq!(
+            rows_of_tier(dir.path(), 0),
+            0,
+            "every raw row left the file"
+        );
+        let minutes = store.points(Tier::Minute, SERIES, 0, FAR).expect("read");
+        assert_eq!(minutes.len(), 2);
+        assert_eq!(minutes[0].avg, 5.5, "minute 0 from the old rows");
+        assert_eq!(
+            (minutes[1].min, minutes[1].max),
+            (12.0, 100.0),
+            "minute 1 whole: the old rows and the new tick"
+        );
+    }
+
+    #[test]
+    fn the_ring_keeps_at_most_an_hour_per_series() {
+        let dir = StateDir::new("ring-bound");
+        let mut store = Store::open(dir.path(), BASE).expect("open").store;
+        for tick in 0..(arca_store::RAW_SLOTS as u64 + 10) {
+            store
+                .commit_tick(BASE + tick * 1_000, &[gauge(tick as f64)], &[])
+                .expect("tick");
+        }
+        let held = store.raw(SERIES, 0, FAR).points;
+        assert_eq!(held.len(), arca_store::RAW_SLOTS, "the oldest points went");
+        assert_eq!(held[0].avg, 10.0);
+        let words = store
+            .raw(SERIES, BASE, FAR)
+            .missing
+            .expect("the dropped points are said");
+        assert!(
+            words.contains(&format!("before {}", BASE + 10_000)),
+            "{words}"
         );
     }
 }
@@ -662,12 +852,6 @@ mod size_estimate {
                 .expect("prepare");
             for id in 1..=SERIES_COUNT {
                 let value = |k: u64| 0.5 + k as f64 * 0.37 + id as f64 * 0.01;
-                for k in 0..720u64 {
-                    let at = (NOW - HOUR + k * 5_000) as i64;
-                    points
-                        .execute(rusqlite::params![0, at, id, value(k)])
-                        .expect("a raw row");
-                }
                 for k in 0..10_080u64 {
                     let at = (NOW - 7 * DAY + k * MINUTE) as i64;
                     points
@@ -686,7 +870,8 @@ mod size_estimate {
         let rows: i64 = conn
             .query_row("SELECT count(*) FROM points", [], |row| row.get(0))
             .expect("count");
-        assert_eq!(rows, SERIES_COUNT * (720 + 10_080 + 2_160));
+        // The raw points are in memory, so the file holds only the minute and hour rows.
+        assert_eq!(rows, SERIES_COUNT * (10_080 + 2_160));
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
             .expect("checkpoint");
         drop(conn);
@@ -698,5 +883,89 @@ mod size_estimate {
             bytes as f64 / 1_048_576.0
         );
         assert!(bytes < 128 * 1_048_576, "{bytes} bytes is over 128 MB");
+    }
+}
+
+mod writes {
+    use super::*;
+
+    /// The series count of the measured one-host node (see "Sizing" in OPERATING.md).
+    const SERIES_COUNT: usize = 125;
+    /// The sampler's tick.
+    const TICK: u64 = 5_000;
+
+    /// The bytes this thread has handed to `write` and `pwrite` so far. SQLite writes on the thread that calls it, so the
+    /// count is the store's own writes, whatever other tests do meanwhile.
+    fn thread_wchar() -> u64 {
+        let io = fs::read_to_string("/proc/thread-self/io").expect("this thread's I/O counters");
+        io.lines()
+            .find_map(|line| line.strip_prefix("wchar: "))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("the wchar line")
+    }
+
+    /// One hour of the server's ticks: a tick every 5 s with the node's 125 points and no alert event, and the rollup at the
+    /// first tick of each minute, as the alert engine runs them. A second connection's `data_version` moves once for every
+    /// commit another connection makes to the file, so it counts the store's commits from outside the store; with
+    /// `synchronous=FULL` each commit is one fsync of the WAL. The raw 5-second points stay in memory, so the hour commits
+    /// once a minute: the minute's rollup.
+    #[test]
+    fn an_hour_of_ticks_commits_once_a_minute() {
+        let dir = StateDir::new("writes");
+        let base = 1_000 * DAY;
+        let mut store = Store::open(dir.path(), base).expect("open").store;
+        store.rollup(base).expect("the start's rollup");
+        let reader = rusqlite::Connection::open_with_flags(
+            dir.path().join(arca_store::DB_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("a second connection");
+        let data_version = || -> i64 {
+            reader
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .expect("data_version")
+        };
+        let points: Vec<Point> = (0..SERIES_COUNT)
+            .map(|i| Point {
+                name: format!("arca_bench_{i}"),
+                labels: pool("default"),
+                kind: SeriesKind::Gauge,
+                value: i as f64,
+            })
+            .collect();
+
+        let mut seen = data_version();
+        let mut commits = 0u64;
+        let mut count = |now: i64| {
+            if now != seen {
+                commits += 1;
+                seen = now;
+            }
+        };
+        let written_before = thread_wchar();
+        let mut rolled_minute = base / MINUTE;
+        for k in 1..=HOUR / TICK {
+            let at = base + k * TICK;
+            store.commit_tick(at, &points, &[]).expect("the tick");
+            count(data_version());
+            if at / MINUTE != rolled_minute {
+                rolled_minute = at / MINUTE;
+                store.rollup(at).expect("the minute's rollup");
+                count(data_version());
+            }
+        }
+        let written = thread_wchar() - written_before;
+        println!(
+            "writes: {SERIES_COUNT} series, one hour of 5 s ticks: {commits} commits, {written} bytes written ({:.1} MiB)",
+            written as f64 / 1_048_576.0
+        );
+        assert!(
+            commits <= 60,
+            "{commits} commits in an hour: the raw points reached the file"
+        );
+        assert!(
+            commits >= 60,
+            "{commits} commits: a minute's rollup did not commit"
+        );
     }
 }

@@ -281,7 +281,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
 fn ontology_query_schemas_equal_its_table_row() {
     let v = verb("ontology_query").expect("present");
     assert_eq!(
-        (v.params)(),
+        own_params(v),
         closed_with(json!({"id": {"type": "string", "maxLength": 128}}), &["id"])
     );
     let nullable_enum =
@@ -448,7 +448,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
     });
 
     let list = verb("plan_list").expect("present");
-    assert_eq!((list.params)(), closed(json!({})));
+    assert_eq!(own_params(list), closed(json!({})));
     assert_eq!(
         (list.result)(),
         open(
@@ -459,7 +459,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
 
     let propose = verb("action_propose").expect("present");
     assert_eq!(
-        (propose.params)(),
+        own_params(propose),
         closed_with(
             json!({
                 "action": { "type": "string", "enum": action_names },
@@ -590,7 +590,7 @@ fn peer_keys_sync_takes_lines_and_an_optional_signed_statement_and_never_echoes_
 #[test]
 fn arca_status_schemas_equal_its_table_row() {
     let v = verb("arca_status").expect("present");
-    assert_eq!((v.params)(), closed(json!({})));
+    assert_eq!(own_params(v), closed(json!({})));
     assert_eq!(
         (v.result)(),
         open(
@@ -691,7 +691,7 @@ fn arca_status_schemas_equal_its_table_row() {
 #[test]
 fn alerts_list_takes_no_argument_and_requires_every_key_of_its_result_and_events() {
     let v = verb("alerts_list").expect("present");
-    assert_eq!((v.params)(), closed(json!({})));
+    assert_eq!(own_params(v), closed(json!({})));
     let result = (v.result)();
     let event = &result["properties"]["resolvedRecent"]["items"];
     let firing = &result["properties"]["firing"]["items"];
@@ -760,7 +760,7 @@ fn alerts_list_takes_no_argument_and_requires_every_key_of_its_result_and_events
 fn node_metrics_params_and_result_equal_its_table_row() {
     let v = verb("node_metrics").expect("present");
     assert_eq!(
-        (v.params)(),
+        own_params(v),
         closed_with(
             json!({ "minutes": { "type": "integer", "minimum": 1, "maximum": 60 } }),
             &[]
@@ -790,7 +790,7 @@ fn node_metrics_result_has_no_renter_gate_at_any_depth() {
 #[test]
 fn watch_report_schemas_equal_its_table_row() {
     let v = verb("watch_report").expect("present");
-    assert_eq!((v.params)(), closed(json!({})));
+    assert_eq!(own_params(v), closed(json!({})));
     let instance = json!({
         "type": "object",
         "properties": {
@@ -851,7 +851,7 @@ fn watch_report_schemas_equal_its_table_row() {
 #[test]
 fn token_list_schemas_equal_its_table_row() {
     let v = verb("token_list").expect("present");
-    assert_eq!((v.params)(), closed(json!({})));
+    assert_eq!(own_params(v), closed(json!({})));
     assert_eq!(
         (v.result)(),
         open(
@@ -864,7 +864,9 @@ fn token_list_schemas_equal_its_table_row() {
                             "id": { "type": "string" },
                             "scope": { "type": "string", "enum": ["viewer", "doctor", "operator"] },
                             "tools": { "type": "array", "items": { "type": "string" } },
-                            "admin": { "type": "boolean" }
+                            "admin": { "type": "boolean" },
+                            "stored": { "type": "boolean" },
+                            "console": { "type": "boolean" }
                         },
                         "required": ["id", "scope"]
                     }
@@ -1102,6 +1104,16 @@ fn class_and_scope_spell_the_document_values() {
 }
 
 // Expected-schema helpers. They build the same shape the table row names: a closed params object or an open result object.
+
+/// A verb's params without the optional `node` every read takes: the verb's own fields, as its golden row has them.
+/// `node` is checked on its own (`node_is_an_optional_argument_of_every_read_and_of_action_propose_only`).
+fn own_params(v: &arca_api::Verb) -> Value {
+    let mut params = (v.params)();
+    if let Some(properties) = params["properties"].as_object_mut() {
+        properties.remove(arca_api::verbs::NODE);
+    }
+    params
+}
 
 fn closed(props: Value) -> Value {
     closed_with(props, &[])
@@ -1405,7 +1417,7 @@ fn omni_schemas_equal_the_golden_and_every_omni_verb_is_untrusted() {
     for row in rows {
         let v = verb(row["name"].as_str().unwrap()).unwrap();
         assert_eq!(
-            parity_shape(&(v.params)()),
+            parity_shape(&own_params(v)),
             parity_shape(&row["inputSchema"]),
             "{}",
             v.name
@@ -1864,4 +1876,44 @@ fn a_field_the_kernel_fills_in_is_taken_at_the_door_with_any_value() {
         ),
         Ok(())
     );
+}
+
+/// `node` names a linked node: every read the door serves takes it, and `action_propose`, always optional. The only reads
+/// without it are the `owner_approval_*` ones, whose rows are the calling token's own; no write verb takes it.
+#[test]
+fn node_is_an_optional_argument_of_every_read_and_of_action_propose_only() {
+    use arca_api::verbs::NODE;
+    for v in verbs() {
+        let params = (v.params)();
+        assert_eq!(
+            params["properties"].get(NODE).is_some(),
+            v.takes_node(),
+            "{}",
+            v.name
+        );
+        let required = params["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!(NODE)), "{}", v.name);
+        if v.takes_node() {
+            assert!(!v.writes, "{} writes", v.name);
+            assert_eq!(params["properties"][NODE]["type"], json!("string"));
+        } else {
+            assert!(
+                v.writes || v.name.starts_with("owner_approval_"),
+                "the read {} takes no node",
+                v.name
+            );
+        }
+    }
+    // A relayed answer names its node in `linkedNode`: no result may have that field, so a relayed answer keeps every
+    // field the node wrote and fits the tool's own schema.
+    for v in verbs() {
+        assert!(
+            !mentions_key(&(v.result)(), arca_api::verbs::LINKED_NODE),
+            "{} has a result field named linkedNode",
+            v.name
+        );
+    }
+    assert!(verb("action_propose").expect("present").takes_node());
+    assert!(verb("watch_report").expect("present").takes_node());
+    assert!(verb("route_list").expect("present").takes_node());
 }
