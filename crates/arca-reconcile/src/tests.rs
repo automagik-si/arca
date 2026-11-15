@@ -640,9 +640,15 @@ fn a_lapsed_plan_whose_entry_is_retained_meanwhile_is_not_renewed_and_says_why()
         renewal.not_renewed[0].why.contains("declined"),
         "{renewal:?}"
     );
-    assert_eq!(r.pending_plans(), vec![plan], "the lapsed plan is left as it was");
+    assert_eq!(
+        r.pending_plans(),
+        vec![plan],
+        "the lapsed plan is left as it was"
+    );
 }
 
+/// The reconcile that carries the entry again withdraws its plan, so a renewal finds nothing of it. This pins that guarantee;
+/// the `carried` branch in `renew_lapsed` is a defensive backstop this sequence does not reach.
 #[test]
 fn an_entry_the_desired_state_carries_again_is_not_renewed() {
     let key = NodeKey::generate();
@@ -664,7 +670,10 @@ fn an_entry_the_desired_state_carries_again_is_not_renewed() {
         vec![dummy_entry("e1", json!({}))],
     );
     r.reconcile(&doc2, LAPSED);
-    assert!(r.pending_plans().is_empty(), "the plan is withdrawn as today");
+    assert!(
+        r.pending_plans().is_empty(),
+        "the plan is withdrawn as today"
+    );
 
     let renewal = r.renew_lapsed(LAPSED);
 
@@ -716,7 +725,11 @@ fn an_unresolved_intent_renews_nothing_and_says_why() {
         renewal.not_renewed[0].why.contains("unresolved"),
         "{renewal:?}"
     );
-    assert_eq!(r.pending_plans(), vec![plan], "the lapsed plan is left as it was");
+    assert_eq!(
+        r.pending_plans(),
+        vec![plan],
+        "the lapsed plan is left as it was"
+    );
 }
 
 #[test]

@@ -4795,7 +4795,8 @@ fn journal_len(rig: &Rig) -> usize {
 }
 
 #[test]
-fn a_lapsed_plan_of_a_failed_create_is_renewed_listed_again_and_its_approval_deletes_the_volume_then_the_acl() {
+fn a_lapsed_plan_of_a_failed_create_is_renewed_listed_again_and_its_approval_deletes_the_volume_then_the_acl()
+ {
     let key = common::SkKey::from_seed(1);
     let rig = failed_data_create(&key);
     let clock = Arc::new(AtomicU64::new(NOW));
@@ -4805,7 +4806,10 @@ fn a_lapsed_plan_of_a_failed_create_is_renewed_listed_again_and_its_approval_del
     assert!(rig.get(&volume).is_some(), "the volume waits");
     assert!(rig.get(&acl).is_some(), "the ACL is held for it");
     let listed = operator_call(&verbs, "plan_list", json!({})).unwrap();
-    let id = listed["plans"][0]["plan"].as_str().expect("a plan waits").to_string();
+    let id = listed["plans"][0]["plan"]
+        .as_str()
+        .expect("a plan waits")
+        .to_string();
 
     // Sixteen minutes on, nobody approved: the plan is left out, and its approval would be refused as expired.
     let later = NOW + 16 * 60 * 1000;
@@ -4834,7 +4838,8 @@ fn a_lapsed_plan_of_a_failed_create_is_renewed_listed_again_and_its_approval_del
     let card = &listed["plans"][0];
     assert_eq!(card["plan"], json!(id), "{listed}");
     assert_eq!(card["createdAt"], json!(later));
-    let approval = common::approve_statement(&key, card["statement"].as_str().expect("a statement"));
+    let approval =
+        common::approve_statement(&key, card["statement"].as_str().expect("a statement"));
     let run = operator_call(
         &verbs,
         "approval_submit",
@@ -4849,7 +4854,11 @@ fn a_lapsed_plan_of_a_failed_create_is_renewed_listed_again_and_its_approval_del
         .iter()
         .map(|object| object["kind"].as_str().expect("a kind"))
         .collect();
-    assert_eq!(deleted, ["volume", "acl"], "the volume goes first, then the held ACL");
+    assert_eq!(
+        deleted,
+        ["volume", "acl"],
+        "the volume goes first, then the held ACL"
+    );
     assert!(rig.get(&volume).is_none(), "the volume is gone");
     assert!(rig.get(&acl).is_none(), "the ACL is retired");
     assert_eq!(
@@ -4864,7 +4873,8 @@ fn plan_renew_leaves_a_plan_inside_its_fifteen_minutes_as_it_is() {
     let rig = failed_data_create(&key);
     let clock = Arc::new(AtomicU64::new(NOW + 14 * 60 * 1000));
     let verbs = plan_verbs_at(&rig, &clock);
-    let before = operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"][0]["createdAt"].clone();
+    let before =
+        operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"][0]["createdAt"].clone();
 
     let renewed = operator_call(&verbs, "plan_renew", json!({})).unwrap();
 

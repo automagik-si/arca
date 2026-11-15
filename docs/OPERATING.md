@@ -2923,8 +2923,9 @@ the same plan id, so a card for it reads as the same plan. A plan still inside i
 with `plan`, `entry` and `why`): an entry declined earlier is never asked about again; an entry the desired state carries again,
 or one the journal holds nothing left to delete of, has its plan withdrawn; and while an earlier effect is unresolved nothing is
 renewed. `plan_renew` sends nothing to Incus, writes no journal line and changes no desired state. Everything else about the
-plan stays: the statement comes from `plan_list`, an approval must be made after the renewal, and the run checks the live
-objects as for any plan. `plan_list` itself never renews.
+plan stays: the statement comes from `plan_list`, and the run checks the live objects as for any plan. The renewed plan keeps its
+id, so an approval the owner signed for the plan before it lapsed, and never spent, still runs it within that approval's own
+ten minutes; after those, a new approval is needed. `plan_list` itself never renews.
 
 ```
 arca call plan_renew --config /etc/arca/node.json --token-file "$HOME/.config/arca/operator-1.secret" --args '{}'

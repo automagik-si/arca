@@ -50,8 +50,7 @@ const RENEW_RETAINED_WHY: &str =
     "the entry's objects are retained after a declined plan; the owner is not asked again";
 
 /// Why a lapsed plan of an entry the desired state carries again is withdrawn instead.
-const RENEW_CARRIED_WHY: &str =
-    "the desired state carries the entry again; its plan is withdrawn";
+const RENEW_CARRIED_WHY: &str = "the desired state carries the entry again; its plan is withdrawn";
 
 /// Why a lapsed plan with nothing left to delete is withdrawn instead.
 const RENEW_NOTHING_WHY: &str =
@@ -164,7 +163,9 @@ pub struct Reconciler<S: JournalStore> {
     converged: BTreeMap<EntryId, Entry>,
     pending: Vec<Pending>,
     /// The entries the last applied document carries, suspended ones included. A lapsed plan is made again only for an entry
-    /// that is not here.
+    /// that is not here. This is a defensive backstop: [`Reconciler::reconcile`] withdraws the plans of these entries in the
+    /// same call that sets the set, and every call runs under the kernel's one lock, so [`Reconciler::renew_lapsed`] does not
+    /// find such a plan today.
     carried: BTreeSet<EntryId>,
     /// What the last resolution settled.
     resolution: Resolution,
@@ -572,7 +573,9 @@ impl<S: JournalStore> Reconciler<S> {
     /// for an entry retained after a declined plan, or while an earlier effect is unresolved; each says why.
     ///
     /// Nothing is written: no class-A revert, no delete and no journal record, and the desired state does not change. A
-    /// renewed plan runs only under an approval made for it after this call, with the same checks as any plan.
+    /// renewed plan keeps its digest, so an approval the owner signed for the plan before it lapsed, and never spent, still
+    /// runs it within that approval's own ten minutes; any other run needs a new approval. Every run has the same checks as
+    /// any plan.
     pub fn renew_lapsed(&mut self, now_ms: u64) -> Renewal {
         let lapsed: Vec<DeletePlan> = self
             .pending
@@ -593,6 +596,7 @@ impl<S: JournalStore> Reconciler<S> {
         }
         for old in lapsed {
             let id = old.entry.clone();
+            // Defensive: reconcile already withdrew the plan of a carried entry under the same lock (see `carried`).
             let why = if self.carried.contains(&id) {
                 self.pending.retain(|pending| pending.plan.entry != id);
                 RENEW_CARRIED_WHY.to_string()
