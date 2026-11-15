@@ -612,6 +612,21 @@ fn answers(host: &str, port: u16) -> bool {
     })
 }
 
+/// What a result says when [`keep_down`] could not turn `boot.autostart` off.
+const AUTOSTART_LEFT_ON: &str = "boot.autostart could not be turned off on the stopped source here: a restart of this host would start it beside its copy; turn it off";
+
+/// Turns `boot.autostart` off on a source a move leaves stopped while a copy of it may run, so a restart of this host
+/// does not start it beside the copy. `None` when there is nothing of the plan's to turn off: the source is gone, or it
+/// is another instance of the name (another uuid), which is left alone. Otherwise whether it was turned off.
+fn keep_down(source: &MoveWriter, project: &str, name: &str, uuid: Option<&str>) -> Option<bool> {
+    match source.get(&instance_path(project, name)) {
+        Err(IncusError::Status { code: 404, .. }) => return None,
+        Ok(doc) if uuid.is_some() && uuid_of(&doc).as_deref() != uuid => return None,
+        _ => {}
+    }
+    Some(source.disable_autostart(project, name).is_ok())
+}
+
 /// Reads a copy an earlier move recorded (`uuid` on `target`): `None` when it cannot run there (gone, another instance
 /// of the name, or Stopped), or why it may (it runs, or the target cannot be read).
 type CopyProbe<'a> = &'a dyn Fn(&str, &str, &str, &str) -> Option<String>;
@@ -651,7 +666,8 @@ struct HeldCopy {
 
 /// The newest earlier move whose recorded copy of `project/name` (the instance of `uuid`, when both sides know it) may
 /// still run on its target, whatever that move's result: a second move of the instance could then leave two copies
-/// running. Each recorded copy is read on its target through `probe`; a copy read gone or stopped releases it.
+/// running. A copy its rollback journaled removed holds nothing and is not read; each other recorded copy is read on its
+/// target through `probe`, and a copy read gone or stopped releases it.
 fn held_copy(
     records: &BTreeMap<String, MoveRecord>,
     project: &str,
@@ -1577,9 +1593,19 @@ impl Moves {
                         ),
                     )
                 };
+                // A source left stopped while its copy may run must not come back by itself on a restart of this host.
+                let autostart_off =
+                    (!rolled.clean && !rolled.source_running && !rolled.target_removed)
+                        .then(|| keep_down(&source, &project, &name, one["uuid"].as_str()))
+                        .flatten();
+                let reason = if autostart_off == Some(false) {
+                    format!("{reason}; {AUTOSTART_LEFT_ON}")
+                } else {
+                    reason
+                };
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
-                    "result": result, "downtimeMs": null, "reason": reason,
+                    "result": result, "downtimeMs": null, "reason": reason, "autostartOff": autostart_off,
                 }));
                 result
             }
@@ -2338,10 +2364,21 @@ impl Moves {
                     "{stopped} after the copy was started on {target} and before its checks were journaled: the copy may have served writes, so it was left as it is and the source stays stopped. Keep one of them: to come back, stop the copy on {target} and start the source here; to keep the copy, leave the source stopped. Until the copy on {target} is stopped or gone, no other move takes this instance",
                     target = record.target
                 );
+                let autostart_off = keep_down(
+                    &source,
+                    &instance.project,
+                    &instance.name,
+                    instance.uuid.as_deref(),
+                );
+                let reason = if autostart_off == Some(false) {
+                    format!("{reason}; {AUTOSTART_LEFT_ON}")
+                } else {
+                    reason
+                };
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
                     "name": instance.name, "result": "failed", "downtimeMs": null, "reason": reason,
-                    "targetUuid": instance.target_uuid, "recovered": true,
+                    "targetUuid": instance.target_uuid, "recovered": true, "autostartOff": autostart_off,
                 }));
                 results.push("failed");
                 continue;
@@ -2391,9 +2428,25 @@ impl Moves {
                     ),
                 )
             };
+            let autostart_off = (!rolled.clean && !rolled.source_running && !rolled.target_removed)
+                .then(|| {
+                    keep_down(
+                        &source,
+                        &instance.project,
+                        &instance.name,
+                        instance.uuid.as_deref(),
+                    )
+                })
+                .flatten();
+            let reason = if autostart_off == Some(false) {
+                format!("{reason}; {AUTOSTART_LEFT_ON}")
+            } else {
+                reason
+            };
             self.note(json!({
                 "event": "result", "at": self.now(), "move": record.id, "project": instance.project,
                 "name": instance.name, "result": result, "downtimeMs": null, "reason": reason,
+                "autostartOff": autostart_off,
             }));
             results.push(result);
         }
