@@ -7,18 +7,24 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-A container service made from an OCI image keeps `/run` in memory (a tmpfs), never on the container's disk: a short-lived secret staged there no
-longer touches the disk. Incus mounts a tmpfs on an OCI container's `/run` only when the image keeps nothing there, so
-Arca now empties the image's `/run` on the root disk before the first start, after each `service_update` rebuild, and in
-a `service_reconfigure` of a service made before (its card says `/run becomes memory, restart once`), or in the one
-restart of a `service_update` with `withTemplate`, which carries the same `/run` row. No project
-restriction is loosened and it works in tenants too. The mount has `mode=755` but neither `nosuid` nor `nodev`, and no
-size of its own: the service's memory limit bounds it when the template sets `limits.memory`. Arca leaves `/run` on the
-disk, untouched, when an entry there is not root's (a non-root image's own directory, which it needs) or cannot be
-read back by its name, and
-`postgres-autopg` says `"runTmpfs": false`, since its image keeps its socket directory there. A template says
-`"runTmpfs": false` for any other image that needs its own files in `/run`. The answers say `run: "memory"`, or
-`run: "disk"` with the reason when `/run` was left on the disk, in which case the service runs as before.
+A container service made from an OCI image keeps `/run` in memory (a tmpfs), never on the container's disk: a
+short-lived secret staged there no longer touches the disk. Incus mounts a tmpfs on an OCI container's `/run` only
+when the image keeps nothing there, so Arca now empties the image's `/run` on the root disk before the first start,
+after each `service_update` rebuild, and in a `service_reconfigure` of a service made before (its card says
+`/run becomes memory, restart once`), or in the one restart of a `service_update` with `withTemplate`, which carries
+the same `/run` row. No project restriction is loosened and it works in tenants too. The mount has `mode=755` but
+neither `nosuid` nor `nodev`, and no size of its own: the service's memory limit bounds it when the template sets
+`limits.memory`. Arca leaves `/run` on the disk, untouched, when an entry there is not root's (a non-root image's own
+directory, which it needs) or cannot be read back by its name, and `postgres-autopg` says `"runTmpfs": false`, since
+its image keeps its socket directory there. A template says `"runTmpfs": false` for any other image that needs its own
+files in `/run`. The answers say `run: "memory"`, or `run: "disk"` with the reason when `/run` was left on the disk,
+in which case the service runs as before.
+
+`instance_import` moves one virtual machine from an outside hypervisor (the `onevm show -x` XML, passed in by
+the operator) into Incus behind one owner card: the same CPUs, memory, firmware, disks and MACs, the source's
+security groups as an Incus network ACL, a cloud-init seed from its context, a full sparse disk copy from the source
+Ceph pool (read-only) into the Incus Ceph pool, and a read-back after the start. `instance_import_undo` stops and
+removes an imported VM; the source is never written. A node needs `kernel.instanceImport` for either.
 
 `action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
 `service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`

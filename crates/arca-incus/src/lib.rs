@@ -40,6 +40,9 @@ pub mod runner_vm;
 pub mod shim;
 #[cfg(feature = "write")]
 pub mod snapshot;
+/// The writer of an instance import: one virtual machine moved in from an outside hypervisor, with its volumes and ACLs.
+#[cfg(feature = "write")]
+pub mod vm_import;
 #[cfg(feature = "write")]
 pub mod write;
 
@@ -75,6 +78,8 @@ pub use snapshot::{
     FS_UUID_KEY, LateReport, PoolSource, Progress, SNAPSHOT_POOL_DESCRIPTION, SNAPSHOT_PROJECT,
     SNAPSHOT_STORAGE_KEY, SnapshotWriter, VERIFIED_KEY,
 };
+#[cfg(feature = "write")]
+pub use vm_import::{IMPORT_ACL_PREFIX, IMPORT_KEY, VmImportWriter, import_marked};
 #[cfg(feature = "write")]
 pub use write::{
     Owned, ProjectFamily, Reading, RegistryCredential, UnixIncusWriter, acl_rules_match,

@@ -11,7 +11,9 @@
 //! every proposed record against its action's own validation and the kernel's configured image, keeps only the waiting,
 //! unexpired proposals and rewrites it atomically. A file that cannot be read, holds a line that fails validation, or is too
 //! large is quarantined as `<name>.bad-<ts>` and the kernel starts with no proposals: this file can never stop a start. The
-//! file holds no approval string, proof or secret.
+//! file holds no approval string or proof. It holds what a proposal binds, and one action binds a secret: an
+//! `instance_import` keeps the source's cloud-init user data, which the run puts in the VM's seed. It stays in this file,
+//! which is mode 0600, until the next compaction after the proposal is run, declined or lapses. No listing shows it.
 //!
 //! Appending keeps the journal bounded as well: once the file passes [`MAX_COMPACT_BYTES`] it is compacted to the waiting set
 //! before the call returns. A stale temporary file from a compaction that a crash interrupted is removed when the kernel next
@@ -81,6 +83,8 @@ pub enum ActionKind {
     InstanceMoveFinish,
     RouteAdd,
     RouteRemove,
+    InstanceImport,
+    InstanceImportUndo,
 }
 
 /// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
@@ -140,7 +144,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 29] = [
+    pub const ALL: [ActionKind; 31] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
@@ -170,6 +174,8 @@ impl ActionKind {
         Self::InstanceMoveFinish,
         Self::RouteAdd,
         Self::RouteRemove,
+        Self::InstanceImport,
+        Self::InstanceImportUndo,
     ];
 
     /// How the owner undoes this action once it has run, in the owner's words: the card says it beside what the action
@@ -231,6 +237,12 @@ impl ActionKind {
             }
             Self::RouteAdd => "Ask your assistant to stop serving the address.",
             Self::RouteRemove => "Ask your assistant to serve the address again.",
+            Self::InstanceImport => {
+                "Ask your assistant to undo the import: the VM is stopped and removed with its disks and rules. Then power the source on again in the outside hypervisor: it was never written."
+            }
+            Self::InstanceImportUndo => {
+                "It cannot be undone: the imported VM's disks are deleted, with anything written to them since the import. The source in the outside hypervisor is untouched; power it on there to go back, or import it again."
+            }
         }
     }
 
@@ -262,6 +274,7 @@ impl ActionKind {
             | Self::TenantRemove
             | Self::DeployRemove
             | Self::FunctionRemove
+            | Self::InstanceImportUndo
             | Self::StorageAdd => true,
             Self::ServiceUpdate => args.get("eraseData").and_then(Value::as_bool) == Some(true),
             _ => false,
@@ -305,6 +318,8 @@ impl ActionKind {
             Self::InstanceMoveFinish => "instance_move_finish",
             Self::RouteAdd => "route_add",
             Self::RouteRemove => "route_remove",
+            Self::InstanceImport => "instance_import",
+            Self::InstanceImportUndo => "instance_import_undo",
         }
     }
 
@@ -500,6 +515,24 @@ impl ActionKind {
             // shows each limit and the approval binds it.
             Self::FunctionCreate => {
                 args = crate::function::prepare(&args)?;
+            }
+            // The description is cut down to what the plan reads, so the proposal file, the propose answer and
+            // plan_list never hold a context password or start script; the cut is the same on the stored args, so the
+            // approved run binds the same text. The whole plan is made now, so a source Arca cannot move is refused
+            // before the owner is asked, and the card shows what the run will do.
+            Self::InstanceImport => {
+                if let Some(source) = args.get("source").and_then(Value::as_str) {
+                    let reduced = arca_vmimport::reduce(source)
+                        .map_err(|error| format!("args/source: {error}"))?;
+                    args["source"] = Value::String(reduced);
+                }
+                arca_vmimport::plan_of(&args)?;
+            }
+            Self::InstanceImportUndo => {
+                let name = args["name"].as_str().unwrap_or_default();
+                if !arca_vmimport::plan::instance_name_ok(name) {
+                    return Err("args/name: expected an instance name".to_string());
+                }
             }
             _ => {}
         }
@@ -866,6 +899,22 @@ impl ActionKind {
                     "The edge stops serving this address and no longer opens its instance's port for it. The instance itself is not touched.",
                 ),
             ],
+            Self::InstanceImport => match arca_vmimport::plan_of(args) {
+                Ok(plan) => plan
+                    .card()
+                    .into_iter()
+                    .map(|(label, value)| row(&label, &shown(&value, 1200)))
+                    .collect(),
+                Err(why) => vec![row("Source", &shown(&why, 400))],
+            },
+            Self::InstanceImportUndo => vec![
+                row("Instance", text("name")),
+                row("Project", text("project")),
+                row(
+                    "Effect",
+                    "Stops the imported VM at once and deletes it, with the volumes and the network ACLs it names that an import made. Only a VM that carries the import mark is touched. The source in the outside hypervisor is not touched.",
+                ),
+            ],
             Self::DeployRemove => vec![
                 row("Deploy", text("deploy")),
                 // What the deploy holds as the proposal is made: the owner sees each part he approves the removal of.
@@ -1080,6 +1129,19 @@ impl ActionKind {
             Self::RouteRemove => format!(
                 "Stop serving https://{}",
                 text("hostname").to_ascii_lowercase()
+            ),
+            Self::InstanceImport => match arca_vmimport::plan_of(args) {
+                Ok(plan) => plan.summary(),
+                Err(_) => format!(
+                    "Move a VM from an outside hypervisor into the instance {} in project {}",
+                    text("name"),
+                    text("project")
+                ),
+            },
+            Self::InstanceImportUndo => format!(
+                "Undo the import of the instance {} in project {}: stop and remove it",
+                text("name"),
+                text("project")
             ),
         };
         // A service that can call the kernel is named as one.

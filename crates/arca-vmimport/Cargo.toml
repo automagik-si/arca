@@ -1,0 +1,17 @@
+[package]
+name = "arca-vmimport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Moving a virtual machine from an outside hypervisor into Incus: the source description, the plan, the cloud-init seed, the disk copy and the run with its undo"
+
+[dependencies]
+base64.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

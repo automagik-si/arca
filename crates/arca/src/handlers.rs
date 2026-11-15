@@ -1401,6 +1401,12 @@ pub fn plan_handlers_versioned(
     let storage_add = storage_handler(ActionKind::StorageAdd);
     let snapshot_create = storage_handler(ActionKind::SnapshotCreate);
     let snapshot_delete = storage_handler(ActionKind::SnapshotDelete);
+    let import_handlers = crate::vm_import::handlers(
+        Arc::clone(&kernel),
+        node.as_deref()
+            .and_then(crate::vm_import::ImportBackend::from_node)
+            .map(Arc::new),
+    );
     let host_network_socket = node.as_ref().map_or_else(
         || std::path::PathBuf::from(arca_hostnet::SOCKET_FILE),
         |node| node.host_network.socket.clone(),
@@ -1488,6 +1494,7 @@ pub fn plan_handlers_versioned(
     ]
     .into_iter()
     .chain(instance_handlers)
+    .chain(import_handlers)
     .collect()
 }
 
@@ -1610,7 +1617,7 @@ fn action_json(
         "action": proposal.action,
         "summary": proposal.summary,
         "details": proposal.details,
-        "args": proposal.args,
+        "args": crate::vm_import::shown_args(&proposal.action, &proposal.args),
         "argsDigest": proposal.args_digest,
         "createdAt": proposal.created_ms,
         "expiresAt": proposal.expires_at,
@@ -1862,6 +1869,11 @@ impl ToolHandler for ActionPropose {
             // approval binds them. A create the node would refuse is refused now.
             let entries = lock(&self.kernel)?.entries().to_vec();
             function_handlers::enrich_function_create(node, &entries, &payload)?
+        } else if let (ActionKind::InstanceImport, Some(node)) = (action, &self.node) {
+            // A node that names no source pool, or a source whose disks are elsewhere, is refused now, so the owner is
+            // never asked to approve an import this node cannot run.
+            crate::vm_import::check_proposal(node, &payload)?;
+            payload
         } else if let (ActionKind::FunctionRemove, Some(_)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
             function_handlers::check_function_remove(&entries, &payload)?;
@@ -2032,7 +2044,7 @@ impl ToolHandler for ActionPropose {
             "action": proposal.action,
             "summary": proposal.summary,
             "details": proposal.details,
-            "args": proposal.args,
+            "args": crate::vm_import::shown_args(&proposal.action, &proposal.args),
             "argsDigest": proposal.args_digest,
             "createdAt": proposal.created_ms,
             "expiresAt": proposal.expires_at,
@@ -2915,6 +2927,8 @@ impl ActionExecutor {
                 | "function_create"
                 | "function_remove"
                 | "host_network_restore"
+                | "instance_import"
+                | "instance_import_undo"
                 | "instance_move"
                 | "instance_move_finish"
         ) {

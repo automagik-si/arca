@@ -2847,6 +2847,77 @@ The operator re-points the proxy, then asks again; `go` turns true. Several inst
 another against the same pool: an earlier one that fits counts as pending for the later ones, and its name is in their
 `detail` and in `measure.pendingFor`.
 
+## Moving a VM in from an outside hypervisor: `instance_import`
+
+`instance_import` moves one virtual machine from an outside hypervisor into Incus on this node. It
+runs only from an action proposal the owner approved, and `instance_import_undo` takes the import out again behind its
+own card. The design, with the copy methods compared, is `crates/arca-vmimport/DESIGN.md`.
+
+Arca never talks to the outside hypervisor. The operator reads the VM's description there (`onevm show -x <id>`) and
+passes the XML as `source`; it may leave out `HISTORY_RECORDS`, `MONITORING` and `USER_TEMPLATE` to stay under the
+48 KiB the argument takes. The other arguments: `name` (the new instance), `project` (it must exist), `pool` (an Incus
+pool of the `ceph` driver), `bridge` (the host bridge every NIC lands on, required when the source has a NIC), and the
+optional `cpu` and `memoryMib` (in place of the source's size), `userData` (default `true`) and `start` (default `true`).
+
+The proposal reads the description and makes the whole plan, so a description Arca cannot move (a disk that is not on
+Ceph, NICs on two bridges, a disk outside the node's source pool) is refused before the owner is asked. The card names
+the source with its description's digest, the size, the firmware, each disk with where it lands, each NIC with its MAC
+and address, the network ACL made from the source's security groups and the rules it cannot carry, what cloud-init gets,
+what is not carried, the operator's step before approving (power the source off, never delete it), the downtime and the
+read-back.
+
+When it runs:
+
+1. It checks that no one holds a source disk open (`rbd status`): a running source stops the import before anything is
+   made.
+2. It makes, each marked `user.arcakernel.import`, the ACL `arca-import-<name>` (when the source has security-group
+   rules; the bridge must then be one Incus manages), a custom block volume `<name>-disk<N>` for each disk after the
+   first, and the VM, stopped, with an empty root of the source disk's size, the source's CPUs, memory, firmware
+   (`security.csm` for BIOS, `security.secureboot` as the source) and MACs, and the cloud-init keys.
+3. It copies each disk into the Ceph image Incus made for it (`rbd export-diff` piped into `rbd import-diff`: only data
+   the disk holds is read), after checking that image's size.
+4. It starts the VM and reads it back: whether the Incus agent answers, and whether the source's address accepts a
+   connection on port 22, for up to five minutes.
+
+A failure before the start removes what the run made. A failed read-back leaves the VM running and says so. The source
+is never written; going back is powering it on again in the outside hypervisor.
+
+The seed: `cloud-init.network-config` carries each NIC's address, gateway, name servers and MTU from the source's context,
+matched by MAC (only when the context says `NETWORK=YES`); `cloud-init.vendor-data` carries the SSH keys, the hostname and
+`ssh_deletekeys: false`, so the guest keeps its host keys; `cloud-init.user-data` carries the source's user data unless
+`userData` is `false`. Cloud-init sees a new instance, so that user data runs again on the first boot.
+
+The node needs, in its config:
+
+```json
+"kernel": { "instanceImport": { "sourcePool": "src-pool", "cephClient": "arca-import", "cephCluster": "ceph" } }
+```
+
+`cephClient` (default `arca-import`) and `cephCluster` (default `ceph`) may be left out. The node needs the `rbd` command
+(`ceph-common`) and the client's keyring at `/etc/ceph/<cephCluster>.client.<cephClient>.keyring`, readable by the kernel.
+The client needs read access to the source pool only:
+
+```
+ceph auth get-or-create client.arca-import mon 'allow r' osd 'profile rbd-read-only pool=<source pool>'
+```
+
+The copy writes into the Incus pool as the Ceph user Incus already uses for it (the pool's `ceph.user.name`). Without
+`kernel.instanceImport` the node refuses `instance_import` when it is proposed.
+
+The proposal keeps the description cut down to what Arca reads: the VM's id, name, state, size, firmware, disks, NICs,
+security group rules, and of the context only the network keys, the SSH keys, the host name and the user data. Every
+other context key is kept by name with no value, so a `PASSWORD`, `CRYPTED_PASSWORD` or `START_SCRIPT` never reaches the
+proposals file, the `action_propose` answer or `plan_list`; the rest of the template (a VNC password, notes, history) is
+left out whole. The user data is kept too, because the run seeds the VM with it, but it is never shown: `plan_list`,
+the approval page (and a linked page host that reads it) and the `action_propose` answer show the description with
+`USER_DATA` as an empty element, and `argsDigest` is still the digest of what the proposal keeps. The user data stays in
+`action-proposals.jsonl` (mode 0600) until the next compaction after the proposal is run, declined or lapses, and after
+the run Incus keeps it in the VM's `cloud-init.user-data`; `userData: false` leaves it out of the seed but not out of the
+proposals file.
+
+The imported VM carries no `user.arcakernel.entry`: Arca's instance verbs (`instance_start`, `instance_stop`) do not
+act on it yet.
+
 ## Moving containers to a linked host: `instance_move`
 
 A move takes containers from this node to a linked host with one owner card. The owner approves once; Incus does the
