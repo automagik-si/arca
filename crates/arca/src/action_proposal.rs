@@ -35,8 +35,8 @@ pub const ACTION_PROPOSALS_FILE: &str = "action-proposals.jsonl";
 /// How many unexpired action proposals may wait at once. A ninth is refused.
 pub const MAX_WAITING: usize = 8;
 
-/// How long after it was made a proposal may be held open for the owner's signed-in session: a day. After that it lapses
-/// as any other, after its last fifteen minutes, so undecided plans never keep the queue full for good.
+/// How long after it was made a proposal may be held open for the owner's signed-in session: a day. A held proposal lapses
+/// a day after it was made at the latest, so undecided plans never keep the queue full for good.
 pub const HOLD_MAX_MS: u64 = 24 * 60 * 60 * 1000;
 /// How many accepted proposals one token may make in [`PROPOSAL_RATE_WINDOW_MS`].
 pub const PROPOSAL_RATE_MAX: usize = 30;
@@ -77,6 +77,8 @@ pub enum ActionKind {
     FunctionCreate,
     FunctionRemove,
     HostNetworkRestore,
+    InstanceMove,
+    InstanceMoveFinish,
     RouteAdd,
     RouteRemove,
 }
@@ -138,7 +140,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 27] = [
+    pub const ALL: [ActionKind; 29] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
@@ -164,6 +166,8 @@ impl ActionKind {
         Self::FunctionCreate,
         Self::FunctionRemove,
         Self::HostNetworkRestore,
+        Self::InstanceMove,
+        Self::InstanceMoveFinish,
         Self::RouteAdd,
         Self::RouteRemove,
     ];
@@ -218,6 +222,12 @@ impl ActionKind {
             }
             Self::HostNetworkRestore => {
                 "There is nothing to undo: it only puts the host back to what its declared file says, and the file is not changed."
+            }
+            Self::InstanceMove => {
+                "A failure before the moved copy passes its checks is rolled back by itself. After a verified move the source stays on this host, stopped: to go back, stop the copy on the target and start the source again, until you finish the move."
+            }
+            Self::InstanceMoveFinish => {
+                "It cannot be undone: the source instances and their custom volumes are deleted from this host; the moved copies on the target stay."
             }
             Self::RouteAdd => "Ask your assistant to stop serving the address.",
             Self::RouteRemove => "Ask your assistant to serve the address again.",
@@ -286,6 +296,8 @@ impl ActionKind {
             Self::FunctionCreate => "function_create",
             Self::FunctionRemove => "function_remove",
             Self::HostNetworkRestore => "host_network_restore",
+            Self::InstanceMove => "instance_move",
+            Self::InstanceMoveFinish => "instance_move_finish",
             Self::RouteAdd => "route_add",
             Self::RouteRemove => "route_remove",
         }
@@ -510,6 +522,10 @@ impl ActionKind {
         let rows = match self {
             Self::ServiceCreate => {
                 let mut rows = vec![row("Name", text("name")), row("Template", text("template"))];
+                // A create at another build of the template's own image names its digest, as an update does.
+                if args.get("digest").is_some() {
+                    rows.push(row("Digest", text("digest")));
+                }
                 // Only a virtual machine on a host bridge names these.
                 if args.get("bridge").is_some() {
                     rows.push(row("Host bridge", text("bridge")));
@@ -764,6 +780,38 @@ impl ActionKind {
                     "Sets IP forwarding as the host's declared file says, adds the firewall rules that let the declared bridges' containers reach out, and sets the FORWARD policy the file records. No container and nothing in Arca's own state changes.",
                 ),
             ],
+            // What the frozen plan holds, read from its plan file when the proposal was made: a row per instance,
+            // the transport, the credential and the rollback.
+            Self::InstanceMove => {
+                let mut rows = vec![row("Plan", text("plan")), row("Target", text("target"))];
+                match crate::instance_move::fact_rows(gpu_product) {
+                    Some(fact) => rows.extend(fact.iter().map(|(label, value)| row(label, value))),
+                    None => {
+                        for one in args["instances"].as_array().into_iter().flatten() {
+                            rows.push(row(
+                                &format!(
+                                    "Move {}/{}",
+                                    one["project"].as_str().unwrap_or_default(),
+                                    one["name"].as_str().unwrap_or_default()
+                                ),
+                                "as the plan says",
+                            ));
+                        }
+                    }
+                }
+                rows
+            }
+            Self::InstanceMoveFinish => {
+                let mut rows = vec![row("Move", text("move"))];
+                match crate::instance_move::fact_rows(gpu_product) {
+                    Some(fact) => rows.extend(fact.iter().map(|(label, value)| row(label, value))),
+                    None => rows.push(row(
+                        "Delete",
+                        "the move's verified source instances and their custom volumes on this host",
+                    )),
+                }
+                rows
+            }
             Self::RouteAdd => {
                 let reach = args["reach"]
                     .as_str()
@@ -985,6 +1033,23 @@ impl ActionKind {
                 "Put this host's forwarding and firewall rules back as its declared file says"
                     .to_string()
             }
+            Self::InstanceMove => {
+                let count = args["instances"].as_array().map_or(0, Vec::len);
+                if count == 1 {
+                    format!(
+                        "Move the container {}/{} to {}",
+                        args["instances"][0]["project"].as_str().unwrap_or_default(),
+                        args["instances"][0]["name"].as_str().unwrap_or_default(),
+                        text("target")
+                    )
+                } else {
+                    format!("Move {count} containers to {}", text("target"))
+                }
+            }
+            Self::InstanceMoveFinish => format!(
+                "Finish the move {}: delete its sources on this host",
+                text("move")
+            ),
             Self::RouteAdd => format!(
                 "Serve https://{} from the instance {} on port {}",
                 text("hostname").to_ascii_lowercase(),
@@ -1582,8 +1647,67 @@ fn loaded_words(
     stored_summary: &str,
     stored_details: &[ActionDetail],
 ) -> (String, Vec<ActionDetail>) {
+    // The card's `Version` row closes it when the proposal named one: a label read from the registry when it was made,
+    // kept when it is a row [`crate::image_version`] writes for this proposal's digest, and dropped otherwise.
+    if let Some((last, rest)) = stored_details.split_last()
+        && last.label == crate::image_version::ROW_LABEL
+    {
+        let (summary, mut details) = loaded_rows(action, args, stored_summary, rest);
+        if version_row_fits(action, args, last) {
+            details.push(last.clone());
+        }
+        return (summary, details);
+    }
+    loaded_rows(action, args, stored_summary, stored_details)
+}
+
+/// Whether `row` is a `Version` row for this proposal, with the words [`crate::image_version`] writes for its digest: a
+/// create's is the one its image names (asked for, or its template's pin) or else the one it asks for, an update's the
+/// one it names.
+fn version_row_fits(action: ActionKind, args: &Value, row: &ActionDetail) -> bool {
+    let digest = match action {
+        ActionKind::ServiceCreate => args["image"]
+            .as_str()
+            .and_then(|image| image.split_once('@'))
+            .map(|(_, digest)| digest)
+            .or_else(|| args["digest"].as_str()),
+        ActionKind::ServiceUpdate => args["digest"].as_str(),
+        _ => None,
+    };
+    row.label == crate::image_version::ROW_LABEL
+        && digest.is_some_and(|digest| crate::image_version::row_fits(&row.value, digest))
+}
+
+fn loaded_rows(
+    action: ActionKind,
+    args: &Value,
+    stored_summary: &str,
+    stored_details: &[ActionDetail],
+) -> (String, Vec<ActionDetail>) {
     // The parts of a deploy's removal were read from the desired state when it was proposed, and are not in its
     // arguments either: the journal's own rows are kept when they are the rows this action writes for these arguments.
+    // A move's rows were read from its frozen plan, and a finish's from the move journal: the journal's rows are kept
+    // when they open with the rows this action writes for these arguments.
+    if matches!(
+        action,
+        ActionKind::InstanceMove | ActionKind::InstanceMoveFinish
+    ) {
+        let rebuilt = action.details(args);
+        let head = if action == ActionKind::InstanceMove {
+            2
+        } else {
+            1
+        };
+        let fits = stored_details.len() > head && stored_details[..head] == rebuilt[..head];
+        return (
+            action.summary(args),
+            if fits {
+                stored_details.to_vec()
+            } else {
+                rebuilt
+            },
+        );
+    }
     if action == ActionKind::DeployRemove {
         let rebuilt = action.details(args);
         let fits = stored_details.len() == rebuilt.len()
@@ -1786,6 +1910,20 @@ impl ActionProposalStore {
         gpu_product: Option<&str>,
         uses: Option<String>,
     ) -> Result<ActionProposal, ProposeError> {
+        self.propose_labelled(action, args, now, gpu_product, uses, None)
+    }
+
+    /// The same, with the card's `Version` row for a create or an update at a digest ([`crate::image_version`]): a label read when the proposal is made, kept with the proposal's rows and no part of
+    /// its arguments, so the args digest the owner signs is the same with it or without it.
+    pub fn propose_labelled(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now: u64,
+        gpu_product: Option<&str>,
+        uses: Option<String>,
+        version: Option<ActionDetail>,
+    ) -> Result<ActionProposal, ProposeError> {
         self.waiting.retain(|proposal| !proposal.expired(now));
         let digest = action_args_digest(action.as_str(), &args).ok_or_else(|| {
             ProposeError::Store(io::Error::other("arguments do not canonicalize"))
@@ -1808,7 +1946,11 @@ impl ActionProposalStore {
             id,
             action: action.as_str().to_string(),
             summary: action.summary_with(&args, gpu_product),
-            details: action.details_with_gpu(&args, gpu_product),
+            details: {
+                let mut details = action.details_with_gpu(&args, gpu_product);
+                details.extend(version.filter(|row| version_row_fits(action, &args, row)));
+                details
+            },
             uses: uses
                 .filter(|_| action.says_uses())
                 .map(|words| shown(&words, USES_MAX)),
@@ -1834,8 +1976,9 @@ impl ActionProposalStore {
 
     /// Keeps every waiting proposal the owner's signed-in session may approve ([`ActionProposal::for_session`]) open for
     /// another [`PLAN_TTL_MS`] from `now` once less than half of it is left, never past [`HOLD_MAX_MS`] after it was made:
-    /// that session is connected and will be asked. The journal is rewritten only when one moved. Answers how
-    /// many moved.
+    /// that session is connected and will be asked. The move is kept in memory alone: the journal is not rewritten, so
+    /// its approved, declined and result lines stay until the journal is compacted at open or past [`MAX_COMPACT_BYTES`].
+    /// After a restart, a held proposal counts from the expiry it was journalled with. Answers how many moved.
     pub fn hold(&mut self, now: u64) -> usize {
         let mut moved = 0;
         for proposal in &mut self.waiting {
@@ -1851,9 +1994,6 @@ impl ActionProposalStore {
                 proposal.expires_at = until;
                 moved += 1;
             }
-        }
-        if moved > 0 {
-            self.compact();
         }
         moved
     }
@@ -2506,6 +2646,33 @@ mod tests {
     }
 
     #[test]
+    fn a_decline_line_survives_a_hold_tick() {
+        let dir = Temp::new("hold-keeps-lines");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let declined = store
+            .propose(ActionKind::ServiceCreate, create_args("no"), 1_000, None)
+            .expect("the declined proposal");
+        let held = store
+            .propose(ActionKind::ServiceCreate, create_args("held"), 1_000, None)
+            .expect("the held proposal");
+        store
+            .decline_noting(&declined.id, "in the owner's signed-in session")
+            .expect("the decline")
+            .expect("it was waiting");
+        // Less than half of the fifteen minutes is left: the session's hold moves the other one forward.
+        let now = 1_000 + PLAN_TTL_MS / 2 + 1;
+        assert_eq!(store.hold(now), 1);
+        assert_eq!(store.waiting()[0].id, held.id);
+        assert!(store.waiting()[0].expires_at > held.expires_at);
+        let text = fs::read_to_string(dir.0.join(ACTION_PROPOSALS_FILE)).expect("the journal");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("\"declined\"") && line.contains(&declined.id)),
+            "the decline is still journalled after the hold tick: {text}"
+        );
+    }
+
+    #[test]
     fn opening_compacts_to_waiting_unexpired_proposals() {
         let dir = Temp::new("compact");
         let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
@@ -3139,6 +3306,124 @@ mod tests {
         let undo = ActionKind::StorageAdd.undo_words();
         assert!(!undo.contains("A disk that was erased"), "{undo}");
         assert!(undo.starts_with("If a disk was erased for it"), "{undo}");
+    }
+
+    /// The card's `Version` row is a label kept with the proposal: it survives the journal when it is the row Arca writes
+    /// for the proposal's digest, a planted one is dropped, and the args digest is the same with it or without it.
+    #[test]
+    fn a_version_row_is_kept_through_the_journal_and_a_planted_one_is_dropped() {
+        let digest = format!("sha256:{}", "e".repeat(64));
+        let mut args = create_args("omni");
+        args["digest"] = json!(digest);
+        let row = ActionDetail {
+            label: crate::image_version::ROW_LABEL.to_string(),
+            value: crate::image_version::version_words(
+                crate::image_version::OMNI_IMAGE,
+                &digest,
+                Some("v2.261024.2"),
+            )
+            .expect("Omni's image is looked up"),
+        };
+        let dir = Temp::new("version-row");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let proposed = store
+            .propose_labelled(
+                ActionKind::ServiceCreate,
+                args.clone(),
+                1_000,
+                None,
+                None,
+                Some(row.clone()),
+            )
+            .expect("proposed");
+        assert_eq!(proposed.details.last(), Some(&row));
+        assert_eq!(
+            Some(proposed.args_digest.clone()),
+            action_args_digest("service_create", &args)
+        );
+        let reopened = ActionProposalStore::open(&dir.0, 1_001, None);
+        assert_eq!(reopened.waiting()[0].details.last(), Some(&row));
+
+        for planted in [
+            "Omni v9.9.9 (sha256:0000) planted words",
+            "Omni latest (also planted)",
+        ] {
+            let other = Temp::new("version-row-planted");
+            let mut line: Value =
+                serde_json::from_str(&proposed_line("service_create", &args, 1_000)).expect("JSON");
+            line["proposal"]["details"]
+                .as_array_mut()
+                .expect("details")
+                .push(json!({ "label": crate::image_version::ROW_LABEL, "value": planted }));
+            write_journal(&other.0, &format!("{line}\n"));
+            let reopened = ActionProposalStore::open(&other.0, 1_001, None);
+            assert_eq!(reopened.waiting().len(), 1);
+            assert!(
+                reopened.waiting()[0]
+                    .details
+                    .iter()
+                    .all(|row| row.label != crate::image_version::ROW_LABEL),
+                "{planted}"
+            );
+        }
+        // A row given to a proposal that names no digest is not kept either.
+        let plain = store
+            .propose_labelled(
+                ActionKind::ServiceCreate,
+                create_args("plain"),
+                1_000,
+                None,
+                None,
+                Some(row.clone()),
+            )
+            .expect("proposed");
+        assert!(
+            plain
+                .details
+                .iter()
+                .all(|row| row.label != crate::image_version::ROW_LABEL)
+        );
+        // A create that names no digest is made at its template's pin, which its image names: the row for that digest
+        // is kept, through the journal too, and a row for any other digest is not.
+        let at = |name: &str, digest: &str| {
+            let mut args = create_args(name);
+            args["image"] = json!(format!("{}@{digest}", crate::image_version::OMNI_IMAGE));
+            args
+        };
+        let pinned = store
+            .propose_labelled(
+                ActionKind::ServiceCreate,
+                at("pinned", &digest),
+                1_000,
+                None,
+                None,
+                Some(row.clone()),
+            )
+            .expect("proposed");
+        assert_eq!(pinned.details.last(), Some(&row));
+        let reopened = ActionProposalStore::open(&dir.0, 1_001, None);
+        let kept = reopened
+            .waiting()
+            .iter()
+            .find(|proposal| proposal.id == pinned.id)
+            .expect("kept");
+        assert_eq!(kept.details.last(), Some(&row));
+        let other = store
+            .propose_labelled(
+                ActionKind::ServiceCreate,
+                at("other", &format!("sha256:{}", "f".repeat(64))),
+                1_000,
+                None,
+                None,
+                Some(row.clone()),
+            )
+            .expect("proposed");
+        assert!(
+            other
+                .details
+                .iter()
+                .all(|row| row.label != crate::image_version::ROW_LABEL)
+        );
     }
 
     /// A proposal keeps what its create uses through the journal, so the card says it after the kernel opens again.

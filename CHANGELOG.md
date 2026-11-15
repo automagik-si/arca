@@ -18,6 +18,67 @@ disk, untouched, when an entry there is not root's (a non-root image's own direc
 `"runTmpfs": false` for any other image that needs its own files in `/run`. The answers say `run: "memory"`, or
 `run: "disk"` with the reason when `/run` was left on the disk, in which case the service runs as before.
 
+`action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
+`service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`
+row, the node asks anonymously over HTTPS for a pull token, the repository's tags (at most 5 pages) and the digests of
+the newest 50 version tags. Nothing else is sent, no redirect is followed, and one round ends within 5 seconds. The
+answer is kept as one map for at most ten minutes, so a node asks at most once a minute when unnamed digests are
+proposed, and otherwise once every ten minutes. A node that cannot reach ghcr.io shows `version unknown` and refuses
+nothing; a node with an egress allowlist that should name versions must allow `ghcr.io:443`, which Incus already uses
+to pull the image.
+
+One MCP door reaches the whole fleet: every read the door serves, and `action_propose`, take an optional `node`, the
+name of one of `approval.linkedHosts` (`arca_status` lists them). The caller is checked on this kernel first, as for a
+call of its own; the call then runs on that node with its linked token, and its answer comes back as the node gave it,
+with `linkedNode` naming it (every field the node wrote is kept, so the answer fits the tool's own schema). A proposal made this way waits on that node, and this kernel's approval page shows it with the
+machine named on the card. A name that is not linked is an invalid argument listing the linked names; a node that does
+not answer is refused `Unreachable`, and one that refuses the token `LinkToken`. Without `node` nothing changes. The
+linked kernel's token must admit the relayed verbs: the page's three-verb token does not. OPERATING.md ("Asking a linked
+node") gives the one `--tools` line to mint it with; never mint it without `--tools`.
+
+A node can make a token for the machine's own console: with `console.tokenFile` in the config, `serve` makes one viewer
+token at each start, limited to `node_metrics`, `arca_status`, `alerts_list` and `service_list`, holds it in memory only
+and writes it to that file at mode 0400. A reload keeps it, a restart replaces it, and a stop removes the file. The start
+is refused when the file's directory is open to group or others or not the node user's, or when a link or another file is
+at its path. `token_list` shows it as the console's (`console: true`, `stored: false`), `arca status --security` counts it
+among the tokens that only look, and `token revoke` of it says to remove the key instead. A `403` to a `tools/call` with a stored
+token now carries one line that names the refused verb; a GET route's `403` stays bare. See "The console's token" in docs/OPERATING.md.
+
+`arca.db` no longer commits on every 5-second tick. The raw 5-second points stay in a ring in the server's memory for one
+hour, and only their minute and hour rollups are written, one transaction a minute: 60 commits an hour where there were
+780, which matters on consumer SSDs without power-loss protection, where every commit with `synchronous=FULL` is a real
+flush. Alert events are still committed in the tick that makes them, with `synchronous=FULL`, and nothing else that is kept
+changes. A crash or a power loss now loses at most the raw samples of the minute that had not closed; the raw window is
+empty after a start until it fills again, and a read of it says so in words. A store from an earlier release has its raw
+rows read into the ring at the first open and deleted from the file at the first rollup.
+
+`node_metrics` and `arca metrics --json` say what the machine's compute and power are, as additions; no field a client
+reads today changes. `cpu.threads`, `cpu.physicalCores` and `cpu.busyThreads` tell the logical CPUs, the physical cores
+and how many threads were busy apart: `cpu.cores` keeps counting logical CPUs, so a 12-core, 24-thread machine still
+says 24 there. A new `power` block gives each CPU package's power in watts from its powercap energy counter (a rate
+between two samples, through the counter's wrap), their sum, each discrete GPU's own power (an NVIDIA card's
+`power.draw`, or a discrete card's hwmon `power1_input`), and the whole-chip sensors in `power.chip`: on an APU, amdgpu's
+`PPT` sensor holds the CPU and the integrated GPU, so it is never listed as a GPU. Arca tells the two apart by what the
+driver shows beside the sensor (the vddnb voltage only on an APU; fan controls or `pcie_bw` only on a discrete card); a
+sensor it cannot classify is never added. `measuredPowerW` holds each part once: the whole-chip sensors when they have a
+figure, otherwise the CPU packages, and never both. `notAdded` names what was measured and left out because it overlaps,
+and `notIncluded` what the sum does not hold: memory, disks, fans, the power supply's own loss, and any part without a
+figure. It is not the power at the wall. A source without a figure says why in words: no counter on this machine, the counter is there
+and this process may not read it (most kernels let only root read the package counters; the file is named), or only
+one sample so far. A new `instanceCpu` block gives each running instance's CPU as threads in use since its previous
+read, with its project and name: at most 50 rows, the largest first, and a count and a sum of the rest. An instance
+that started, restarted or was replaced between two reads has no figure for that sample, never a negative or a huge
+one. `/metrics` gains `arca_node_cpu_threads`, `arca_node_cpu_physical_cores`, `arca_node_cpu_busy_threads`,
+`arca_node_cpu_package_power_watts`, `arca_node_cpu_power_watts`, `arca_node_gpu_power_watts`,
+`arca_node_chip_power_watts`, `arca_node_power_measured_watts` and `arca_instance_cpu_busy_threads`.
+
+A delete plan nobody approved within its fifteen minutes can be shown to the owner again without a restart: the new
+operator verb `plan_renew` puts each lapsed plan back with fifteen new minutes and the same id, from what the journal still
+holds, and says why for each one it leaves (a declined entry, an entry the desired state carries again, nothing left to
+delete, or an earlier effect still unresolved). It sends nothing to Incus and writes no journal line. Until now a failed
+create that had already made its data volume left that volume, and the network rule held for it, with no card to approve
+once the plan lapsed.
+
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,
 `zstd`, `wget`, `skopeo`, `xz-utils`, `zip`, `rsync` and `gh`, which GitHub's `ubuntu-latest` has and the runner image lacks; settable at create), and
@@ -43,6 +104,12 @@ declare `rawLxc` lines (`lxc.sched.core=0`, say) that Arca keeps in `raw.lxc` be
 reconcile; a service without them is reconciled as before. The create and reconfigure cards show `raw.lxc` whole, and
 give every line but `lxc.sched.core` and `lxc.no_new_privs=1` a plain-words row saying it may loosen the container's
 isolation.
+
+`images/github-runner/` builds GitHub's `ubuntu-latest` runner image as an Incus virtual-machine image from GitHub's
+own scripts (actions/runner-images, pinned to one release per Ubuntu line, 24.04 and 26.04), with the runner program,
+the `runner` user, GitHub's environment and a filled toolcache inside, and one just-in-time job per machine.
+`check-release.sh` follows GitHub's releases; each build publishes what differs from GitHub's image in
+`docs/runner-image/<tag>/`; `compat/` runs the same jobs on GitHub's runner and ours and compares them.
 
 `service_update` now moves a running container service made from a local image pinned by fingerprint, as it already
 moves one made from an image by digest on a registry: the call's `digest` is the new image's fingerprint, the image

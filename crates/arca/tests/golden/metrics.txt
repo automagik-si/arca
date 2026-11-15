@@ -4,6 +4,15 @@ arca_node_cpu_used_ratio{node="0000000000000000000000000000000000000000000000000
 # HELP arca_node_cpu_cores The number of CPUs.
 # TYPE arca_node_cpu_cores gauge
 arca_node_cpu_cores{node="0000000000000000000000000000000000000000000000000000000000000000"} 4
+# HELP arca_node_cpu_threads The logical CPUs (threads).
+# TYPE arca_node_cpu_threads gauge
+arca_node_cpu_threads{node="0000000000000000000000000000000000000000000000000000000000000000"} 4
+# HELP arca_node_cpu_physical_cores The physical CPU cores.
+# TYPE arca_node_cpu_physical_cores gauge
+arca_node_cpu_physical_cores{node="0000000000000000000000000000000000000000000000000000000000000000"} 2
+# HELP arca_node_cpu_busy_threads The threads busy since the previous sample, as a count.
+# TYPE arca_node_cpu_busy_threads gauge
+arca_node_cpu_busy_threads{node="0000000000000000000000000000000000000000000000000000000000000000"} 0.5
 # HELP arca_node_load The load average over 1, 5 and 15 minutes.
 # TYPE arca_node_load gauge
 arca_node_load{node="0000000000000000000000000000000000000000000000000000000000000000",window="15m"} 0.125
@@ -32,6 +41,21 @@ arca_node_cpu_temperature_celsius{node="0000000000000000000000000000000000000000
 # HELP arca_node_gpu_busy_ratio The share of time the GPU is busy, from 0 to 1.
 # TYPE arca_node_gpu_busy_ratio gauge
 arca_node_gpu_busy_ratio{node="0000000000000000000000000000000000000000000000000000000000000000"} 0.1
+# HELP arca_node_cpu_package_power_watts A CPU package's power since the previous sample, in watts, from its powercap energy counter.
+# TYPE arca_node_cpu_package_power_watts gauge
+arca_node_cpu_package_power_watts{node="0000000000000000000000000000000000000000000000000000000000000000",package="package-0"} 10
+# HELP arca_node_cpu_power_watts The CPU packages' power summed, in watts, when every package has a figure.
+# TYPE arca_node_cpu_power_watts gauge
+arca_node_cpu_power_watts{node="0000000000000000000000000000000000000000000000000000000000000000"} 10
+# HELP arca_node_gpu_power_watts A discrete GPU's own power, in watts.
+# TYPE arca_node_gpu_power_watts gauge
+arca_node_gpu_power_watts{node="0000000000000000000000000000000000000000000000000000000000000000",gpu="0000:01:00.0",source="nvidia-smi"} 42.5
+# HELP arca_node_chip_power_watts A whole-chip power sensor (the CPU, its integrated GPU and the rest of the chip), in watts; whole_chip is false when the driver does not tell whether it includes the CPU.
+# TYPE arca_node_chip_power_watts gauge
+arca_node_chip_power_watts{node="0000000000000000000000000000000000000000000000000000000000000000",chip="0000:c6:00.0",label="PPT",whole_chip="true"} 30
+# HELP arca_node_power_measured_watts The sum of the power measured, each part once, in watts; not the power at the wall: memory, disks, fans and the power supply's own loss are not in it.
+# TYPE arca_node_power_measured_watts gauge
+arca_node_power_measured_watts{node="0000000000000000000000000000000000000000000000000000000000000000"} 72.5
 # HELP arca_node_network_receive_bytes_total The bytes the physical NICs have received.
 # TYPE arca_node_network_receive_bytes_total counter
 arca_node_network_receive_bytes_total{node="0000000000000000000000000000000000000000000000000000000000000000"} 1000
@@ -73,6 +97,10 @@ arca_instance_starts_total{node="00000000000000000000000000000000000000000000000
 # TYPE arca_instance_cpu_seconds_total counter
 arca_instance_cpu_seconds_total{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="db1"} 4.5
 arca_instance_cpu_seconds_total{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="vm1"} 120
+# HELP arca_instance_cpu_busy_threads The threads an instance had busy between its previous read and this one, as a count.
+# TYPE arca_instance_cpu_busy_threads gauge
+arca_instance_cpu_busy_threads{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="db1"} 0.25
+arca_instance_cpu_busy_threads{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="vm1"} 1.5
 # HELP arca_instance_memory_used_bytes The memory an instance uses, in bytes.
 # TYPE arca_instance_memory_used_bytes gauge
 arca_instance_memory_used_bytes{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="db1"} 1073741824

@@ -3313,6 +3313,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 
 #[path = "services/approval_requests.rs"]
 mod approval_requests;
+#[path = "services/create_digest.rs"]
+mod create_digest;
 #[path = "services/destinations.rs"]
 mod destinations;
 #[path = "services/external.rs"]
@@ -4736,5 +4738,199 @@ fn a_create_whose_outcome_is_not_known_does_not_claim_that_nothing_was_left_behi
         ))
         .is_some(),
         "nothing was reverted: the ACL the refusal warns about is still there"
+    );
+}
+
+/// The plan verbs over the rig's kernel, with their own clock, so a test can let a plan lapse.
+fn plan_verbs_at(rig: &Rig, clock: &Arc<AtomicU64>) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
+    let clock = Arc::clone(clock);
+    arca::handlers::plan_handlers(
+        Arc::clone(&rig.kernel),
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+        None,
+        None,
+    )
+    .into_iter()
+    .collect()
+}
+
+fn operator_call(
+    handlers: &HashMap<&'static str, Arc<dyn ToolHandler>>,
+    verb: &str,
+    args: Value,
+) -> Result<Value, CallError> {
+    handlers[verb].call(
+        args,
+        &Caller {
+            token_id: "operator".into(),
+            scope: Scope::Operator,
+            tools: None,
+        },
+    )
+}
+
+/// A data template's create that fails after its volume was made: the entry leaves the desired state, the volume (class B)
+/// waits in a plan, and the service's ACL (class A) is held until the volume is gone.
+fn failed_data_create(key: &common::SkKey) -> Rig {
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(key),
+    );
+    let mut template = nats_template();
+    template["data"] = json!({"path":"/data"});
+    rig.template("nats", template);
+    rig.fake.set_reject_config_on_post("/1.0/instances");
+    assert!(
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+            .is_err(),
+        "the create fails"
+    );
+    rig
+}
+
+const NATS_VOLUME: &str = "/1.0/storage-pools/pool1/volumes/custom/nats-data";
+
+fn journal_len(rig: &Rig) -> usize {
+    fs::read(rig.dir.join(arca::kernel::JOURNAL_FILE))
+        .expect("the journal is readable")
+        .len()
+}
+
+#[test]
+fn a_lapsed_plan_of_a_failed_create_is_renewed_listed_again_and_its_approval_deletes_the_volume_then_the_acl()
+ {
+    let key = common::SkKey::from_seed(1);
+    let rig = failed_data_create(&key);
+    let clock = Arc::new(AtomicU64::new(NOW));
+    let verbs = plan_verbs_at(&rig, &clock);
+    let acl = format!("/1.0/network-acls/{PROJECT}-svc-nats?project=default");
+    let volume = format!("{NATS_VOLUME}?project={PROJECT}");
+    assert!(rig.get(&volume).is_some(), "the volume waits");
+    assert!(rig.get(&acl).is_some(), "the ACL is held for it");
+    let listed = operator_call(&verbs, "plan_list", json!({})).unwrap();
+    let id = listed["plans"][0]["plan"]
+        .as_str()
+        .expect("a plan waits")
+        .to_string();
+
+    // Sixteen minutes on, nobody approved: the plan is left out, and its approval would be refused as expired.
+    let later = NOW + 16 * 60 * 1000;
+    clock.store(later, Ordering::SeqCst);
+    assert_eq!(
+        operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"],
+        json!([]),
+        "a lapsed plan is not listed"
+    );
+    let writes = rig.fake.writes().len();
+    let journal = journal_len(&rig);
+
+    let renewed = operator_call(&verbs, "plan_renew", json!({})).expect("plan_renew answers");
+
+    assert_eq!(renewed["notRenewed"], json!([]), "{renewed}");
+    let plan = &renewed["renewed"][0];
+    assert_eq!(plan["plan"], json!(id), "the same objects keep the same id");
+    assert_eq!(plan["entry"], listed["plans"][0]["entry"]);
+    assert_eq!(plan["objects"], listed["plans"][0]["objects"]);
+    assert_eq!(plan["createdAt"], json!(later));
+    assert_eq!(plan["expiresAt"], json!(later + 15 * 60 * 1000));
+    assert_eq!(rig.fake.writes().len(), writes, "nothing was sent to Incus");
+    assert_eq!(journal_len(&rig), journal, "nothing was journalled");
+
+    let listed = operator_call(&verbs, "plan_list", json!({})).unwrap();
+    let card = &listed["plans"][0];
+    assert_eq!(card["plan"], json!(id), "{listed}");
+    assert_eq!(card["createdAt"], json!(later));
+    let approval =
+        common::approve_statement(&key, card["statement"].as_str().expect("a statement"));
+    let run = operator_call(
+        &verbs,
+        "approval_submit",
+        json!({ "plan": id, "approval": approval }),
+    )
+    .expect("an approval made after the renewal runs the delete");
+
+    assert_eq!(run["partial"], json!(false), "{run}");
+    let deleted: Vec<&str> = run["deleted"]
+        .as_array()
+        .expect("deleted")
+        .iter()
+        .map(|object| object["kind"].as_str().expect("a kind"))
+        .collect();
+    assert_eq!(
+        deleted,
+        ["volume", "acl"],
+        "the volume goes first, then the held ACL"
+    );
+    assert!(rig.get(&volume).is_none(), "the volume is gone");
+    assert!(rig.get(&acl).is_none(), "the ACL is retired");
+    assert_eq!(
+        operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"],
+        json!([])
+    );
+}
+
+#[test]
+fn plan_renew_leaves_a_plan_inside_its_fifteen_minutes_as_it_is() {
+    let key = common::SkKey::from_seed(1);
+    let rig = failed_data_create(&key);
+    let clock = Arc::new(AtomicU64::new(NOW + 14 * 60 * 1000));
+    let verbs = plan_verbs_at(&rig, &clock);
+    let before =
+        operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"][0]["createdAt"].clone();
+
+    let renewed = operator_call(&verbs, "plan_renew", json!({})).unwrap();
+
+    assert_eq!(renewed, json!({ "renewed": [], "notRenewed": [] }));
+    assert_eq!(
+        operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"][0]["createdAt"],
+        before,
+        "its age does not restart"
+    );
+}
+
+#[test]
+fn plan_renew_with_an_unresolved_intent_renews_nothing_and_says_why() {
+    let key = common::SkKey::from_seed(1);
+    let rig = failed_data_create(&key);
+    let clock = Arc::new(AtomicU64::new(NOW));
+    let verbs = plan_verbs_at(&rig, &clock);
+    let id = operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"][0]["plan"].clone();
+    // A second create whose instance answer never came leaves its intent open.
+    let mut other = nats_template();
+    other["name"] = json!("other");
+    rig.template("other", other);
+    *rig.unknown_create.lock().unwrap() = true;
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"other","template":"other"}))
+    else {
+        panic!("an unresolved create is refused");
+    };
+    assert!(message.contains("the intent stays open"), "{message}");
+    clock.store(NOW + 16 * 60 * 1000, Ordering::SeqCst);
+    let writes = rig.fake.writes().len();
+    let journal = journal_len(&rig);
+
+    let renewed = operator_call(&verbs, "plan_renew", json!({})).unwrap();
+
+    assert_eq!(renewed["renewed"], json!([]), "{renewed}");
+    assert_eq!(renewed["notRenewed"][0]["plan"], id, "{renewed}");
+    assert_eq!(
+        renewed["notRenewed"][0]["why"],
+        json!("an earlier effect is unresolved; no plan is made again until it is settled")
+    );
+    assert_eq!(rig.fake.writes().len(), writes);
+    assert_eq!(journal_len(&rig), journal);
+    assert_eq!(
+        operator_call(&verbs, "plan_list", json!({})).unwrap()["plans"],
+        json!([]),
+        "the lapsed plan is still left out"
     );
 }

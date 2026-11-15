@@ -200,13 +200,14 @@ fn mcp(socket: &Path, secret: &str, name: &str, arguments: Value) -> Value {
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .unwrap_or_default();
-    // A call the door refuses outright has no JSON-RPC answer: its HTTP status says so.
-    if text.is_empty() {
-        let status = reply
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or_else(|| panic!("{name} answers HTTP: {reply}"));
+    // A call the door refuses outright has no JSON-RPC answer: its HTTP status says so (a 403 carries one line of words
+    // naming the verb, never JSON).
+    let status = reply
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("{name} answers HTTP: {reply}"));
+    if text.is_empty() || matches!(status, 401 | 403) {
         return json!({ "http": status });
     }
     serde_json::from_str(text).unwrap_or_else(|_| panic!("{name} answers JSON-RPC: {reply}"))

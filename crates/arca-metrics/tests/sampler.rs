@@ -159,6 +159,9 @@ fn bare(at: u64) -> HostSample {
             cores: 4,
             cores_known: true,
             reason: None,
+            threads: Some(4),
+            physical_cores: None,
+            busy_threads: None,
         },
         load: Load {
             one: None,
@@ -186,6 +189,8 @@ fn bare(at: u64) -> HostSample {
         network: None,
         projects: Vec::new(),
         instances_not_read: Vec::new(),
+        power: arca_metrics::Power::default(),
+        instance_cpu: arca_metrics::InstanceCpu::default(),
     }
 }
 
@@ -354,7 +359,10 @@ fn a_missing_cpu_file_gives_zero_cores_and_no_percentage() {
             used_pct: None,
             cores: 0,
             cores_known: false,
-            reason: None
+            reason: None,
+            threads: None,
+            physical_cores: None,
+            busy_threads: None,
         }
     );
 }
@@ -380,7 +388,10 @@ fn an_unparseable_aggregate_line_reads_no_percentage_but_still_counts_cores() {
             used_pct: None,
             cores: 2,
             cores_known: true,
-            reason: None
+            reason: None,
+            threads: Some(2),
+            physical_cores: None,
+            busy_threads: None,
         }
     );
 }

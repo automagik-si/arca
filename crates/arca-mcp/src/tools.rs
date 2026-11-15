@@ -11,6 +11,21 @@ pub trait ToolHandler: Send + Sync {
     ) -> Result<serde_json::Value, CallError>;
 }
 
+/// The kernels a call may name with `node` ([`arca_api::verbs::NODE`]): this kernel's linked hosts. The MCP door checks
+/// the caller's scope and tool list on this kernel first, exactly as for a local call, then takes `node` out of the
+/// arguments and hands the rest here.
+pub trait LinkedNodes: Send + Sync {
+    /// Calls `verb` with `arguments` on the linked node `node`, and returns that node's JSON-RPC reply as it wrote it: an
+    /// object with its `result` or its `error`. A name that is not linked is `CallError::Invalid` naming the linked
+    /// nodes; a node that cannot be asked is a refusal that names it. Never this kernel's own answer.
+    fn relay(
+        &self,
+        node: &str,
+        verb: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, CallError>;
+}
+
 /// Why a call did not return a result. The HTTP layer answers `Unauthenticated` with 401, `Forbidden` with 403 and
 /// `Internal` with 500, with no body. `NotFound`, `Invalid` and the three refusals (`Refused`, `UntrustedRefused` and
 /// `RefusedWith`) are JSON-RPC errors inside a 200.

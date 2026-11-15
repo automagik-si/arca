@@ -1246,18 +1246,26 @@ impl ToolHandler for JournalListHandler {
     }
 }
 
-/// `token_list`: the id, scope and optional tool list of each live token. No secret and no digest.
+/// `token_list`: the id, scope and optional tool list of each live token. No secret and no digest. The stored tokens come
+/// first, by id, then the ones the node holds in memory only, each with `stored: false`; the console's says `console: true`.
 pub struct TokenListHandler {
     pub tokens: TokenStore,
 }
 
 impl ToolHandler for TokenListHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let held = self
+            .tokens
+            .held_ids()
+            .into_iter()
+            .map(|token| (token, false));
         let tokens: Vec<Value> = self
             .tokens
             .ids()
             .into_iter()
-            .map(|(id, scope, tools)| {
+            .map(|token| (token, true))
+            .chain(held)
+            .map(|((id, scope, tools), stored)| {
                 // An admin token lists as the operator it is above, and says so: the scope enum is a released result.
                 let shown = scope.min(Scope::Operator);
                 let mut token = json!({ "id": id, "scope": shown.as_str() });
@@ -1266,6 +1274,12 @@ impl ToolHandler for TokenListHandler {
                 }
                 if let Some(tools) = tools {
                     token["tools"] = json!(tools);
+                }
+                if !stored {
+                    token["stored"] = json!(false);
+                    if id == crate::console::CONSOLE_TOKEN_ID {
+                        token["console"] = json!(true);
+                    }
                 }
                 token
             })
@@ -1347,6 +1361,32 @@ pub fn plan_handlers_served(
     actions: ActionSlot,
     node: Option<Arc<NodeConfig>>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    plan_handlers_versioned(
+        kernel,
+        clock,
+        postgres_image,
+        gpu,
+        storage,
+        lifecycle,
+        actions,
+        node,
+        Arc::new(crate::image_version::VersionLookup::ghcr()),
+    )
+}
+
+/// The plan handlers of [`plan_handlers_served`], whose proposals look image versions up through `versions`.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_handlers_versioned(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    postgres_image: Option<String>,
+    gpu: Option<Arc<dyn GpuBackend>>,
+    storage: Option<Arc<crate::storage::Storage>>,
+    lifecycle: Option<Arc<crate::lifecycle::InstanceLifecycle>>,
+    actions: ActionSlot,
+    node: Option<Arc<NodeConfig>>,
+    versions: Arc<crate::image_version::VersionLookup>,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     let rate = Arc::new(ProposalRateLimiter::default());
     let instance_handlers =
         crate::lifecycle::handlers(Arc::clone(&kernel), Arc::clone(&clock), lifecycle.clone());
@@ -1391,6 +1431,7 @@ pub fn plan_handlers_served(
                 storage: storage.clone(),
                 node,
                 lifecycle,
+                versions,
             }) as Arc<dyn ToolHandler>,
         ),
         ("storage_add", storage_add),
@@ -1416,6 +1457,13 @@ pub fn plan_handlers_served(
             "plan_decline",
             Arc::new(PlanDecline {
                 kernel: Arc::clone(&kernel),
+            }) as Arc<dyn ToolHandler>,
+        ),
+        (
+            "plan_renew",
+            Arc::new(PlanRenew {
+                kernel: Arc::clone(&kernel),
+                clock: Arc::clone(&clock),
             }) as Arc<dyn ToolHandler>,
         ),
         (
@@ -1593,6 +1641,8 @@ struct ActionPropose {
     storage: Option<Arc<crate::storage::Storage>>,
     node: Option<Arc<NodeConfig>>,
     lifecycle: Option<Arc<crate::lifecycle::InstanceLifecycle>>,
+    /// The version lookup the cards of a create or an update at a digest share ([`crate::image_version`]).
+    versions: Arc<crate::image_version::VersionLookup>,
 }
 
 impl ActionPropose {
@@ -1866,6 +1916,17 @@ impl ToolHandler for ActionPropose {
             ActionKind::HostNetworkRestore => Some(crate::host_network::proposal_fact(
                 &self.host_network_socket(),
             )?),
+            // The card of a move shows its frozen plan, and a finish's what it deletes, read from the move journal now;
+            // a plan that is not there, has expired or does not fit, and a move not verified, propose nothing.
+            ActionKind::InstanceMove | ActionKind::InstanceMoveFinish => {
+                let node = self.node.as_deref().ok_or_else(|| CallError::Refused {
+                    code: "NoNode".to_string(),
+                    message: "this kernel has no node config, so it holds no move".to_string(),
+                })?;
+                Some(crate::instance_move::check_proposal(
+                    node, action, &payload, now,
+                )?)
+            }
             // The card of a deploy's removal lists the deploy's parts as they stand now.
             ActionKind::DeployRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
@@ -1880,6 +1941,24 @@ impl ToolHandler for ActionPropose {
             ActionKind::RouteAdd | ActionKind::RouteRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
                 Some(service_routes::edge_fact(&entries))
+            }
+            _ => None,
+        };
+        // The version the digest of a create or an update is, as its registry's tags name it, for the card's `Version`
+        // row: a label, read now and never again, with no lock held. It never refuses: a miss is "version unknown". A
+        // create is at the digest its image names: the one it asks for, or else its template's pin.
+        let version = match (action, &self.node, payload["digest"].as_str()) {
+            (ActionKind::ServiceCreate, Some(_), _) => payload["image"]
+                .as_str()
+                .and_then(|image| image.split_once('@'))
+                .filter(|(_, digest)| service_update::digest_ok(digest))
+                .and_then(|(image, digest)| self.versions.row(image, digest)),
+            (ActionKind::ServiceUpdate, Some(node), Some(digest)) => {
+                let image = {
+                    let entries = lock(&self.kernel)?.entries().to_vec();
+                    service_update::proposed_image(node, &entries, &payload)
+                };
+                image.and_then(|image| self.versions.row(&image, digest))
             }
             _ => None,
         };
@@ -1905,12 +1984,13 @@ impl ToolHandler for ActionPropose {
                 fields: retry_after(wait),
             });
         }
-        let proposal = match kernel.propose_action_using(
+        let proposal = match kernel.propose_action_labelled(
             action,
             payload,
             now,
             gpu_product.as_deref(),
             card_uses,
+            version,
         ) {
             Ok(proposal) => proposal,
             Err(error) => {
@@ -2225,6 +2305,46 @@ pub(crate) fn decline_plan(kernel: &mut Kernel, args: &Value) -> Result<Value, C
             false => Err(no_such_plan()),
             true => Ok(json!({ "plan": id, "retained": [] })),
         },
+    }
+}
+
+/// `plan_renew`: makes again each waiting delete plan whose fifteen minutes ran out, so `plan_list` shows it again. It takes no
+/// argument, and it writes nothing to Incus, the journal or the desired state.
+struct PlanRenew {
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+}
+
+impl ToolHandler for PlanRenew {
+    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let now = (self.clock)();
+        let mut kernel = lock(&self.kernel)?;
+        let renewal = kernel.renew_lapsed(now);
+        let renewed = renewal
+            .renewed
+            .iter()
+            .map(|plan| {
+                Ok(json!({
+                    "plan": plan.digest.to_hex(),
+                    "entry": plan.entry.0,
+                    "objects": objects_json(&plan.objects)?,
+                    "createdAt": plan.created_ms,
+                    "expiresAt": plan.created_ms.saturating_add(PLAN_TTL_MS),
+                }))
+            })
+            .collect::<Result<Vec<Value>, CallError>>()?;
+        let not_renewed: Vec<Value> = renewal
+            .not_renewed
+            .iter()
+            .map(|lapsed| {
+                json!({
+                    "plan": lapsed.plan.digest.to_hex(),
+                    "entry": lapsed.plan.entry.0,
+                    "why": lapsed.why,
+                })
+            })
+            .collect();
+        Ok(json!({ "renewed": renewed, "notRenewed": not_renewed }))
     }
 }
 
@@ -2783,6 +2903,8 @@ impl ActionExecutor {
                 | "function_create"
                 | "function_remove"
                 | "host_network_restore"
+                | "instance_move"
+                | "instance_move_finish"
         ) {
             call["approval"] = json!(grant);
         }
@@ -4175,7 +4297,10 @@ fn enrich_service_create(
     // What the owner is shown is what is created: the proposal is given the image the template names and the
     // fingerprint of the template's content as this node holds it now, so the card shows the image and the approval
     // binds both. A caller that states either is only compared with the node's own.
-    let image = crate::service::template_image(&content.template);
+    // A create that names a digest is made from another build of the template's own image: the card shows that
+    // image by its digest and the approval binds it.
+    let at = service_update::template_at(&content.template, payload.get("digest"))?;
+    let image = crate::service::template_image(&at);
     let digest = content.bound().map_err(service_template_error)?.to_string();
     if payload
         .get("image")
@@ -4203,7 +4328,7 @@ fn enrich_service_create(
         }
         payload
     };
-    let template = content.template;
+    let template = at;
     *card_uses = Some(crate::action_proposal::uses_words(
         &template,
         tenant.is_some(),
@@ -5810,7 +5935,7 @@ mod service_reconfigure;
 mod service_update;
 #[path = "service_wiring.rs"]
 mod service_wiring;
-pub use service_update::{Probe as UpdateProbe, UpdateOptions};
+pub use service_update::{Probe as UpdateProbe, UpdateOptions, digest_ok as service_digest_ok};
 #[path = "tenants.rs"]
 mod tenants;
 pub use tenants::{SnapshotListInTenant, spawn_front_sync, sync_front, tenant_handlers};
@@ -7300,6 +7425,8 @@ impl ServiceHandler {
                 "privatePort",
                 "destinations",
                 "settings",
+                // Another build of the template's own image, by digest (`service_update::template_at`).
+                "digest",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
                 // What a proposal is given when it is made: the image the template names and the fingerprint of
@@ -8074,7 +8201,10 @@ impl ServiceHandler {
                 // is compared with this read, and the service is made from this read and no other.
                 let content = crate::service::load_template_content(&templates_dir, template_name)
                     .map_err(service_template_error)?;
-                let template = content.template.clone();
+                // A call that names a digest makes the service from that build of the template's own image, by the
+                // rule service_update moves one by: the source, the record and the image the call is held to are
+                // all at that digest.
+                let template = service_update::template_at(&content.template, args.get("digest"))?;
                 // A call that states the `raw.lxc` lines (a proposal fills them in for the card) states exactly the
                 // template's: it can only refuse, never widen.
                 if let Some(stated) = args.get("rawLxc")

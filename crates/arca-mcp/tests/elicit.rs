@@ -57,6 +57,10 @@ struct Approver {
     created: Mutex<Vec<u64>>,
     /// Answer as the node does when the proposal is no longer waiting.
     gone: AtomicBool,
+    /// Decline on a no, as the node does for the owner's signed-in session. Off, a no leaves the plan waiting.
+    declines: AtomicBool,
+    /// Every decline: the plan, its `created_at` and who said no.
+    declined: Mutex<Vec<(String, u64, String)>>,
 }
 
 impl TerminalApprover for Approver {
@@ -86,6 +90,18 @@ impl TerminalApprover for Approver {
         Ok(
             json!({ "plan": plan, "id": plan, "action": "service_remove", "result": { "removed": true } }),
         )
+    }
+
+    fn decline(&self, plan: &str, created_at: u64, caller: &Caller) -> bool {
+        if !self.declines.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.declined.lock().expect("lock").push((
+            plan.to_string(),
+            created_at,
+            caller.token_id.clone(),
+        ));
+        true
     }
 }
 
@@ -133,6 +149,10 @@ impl Fixture {
 
     fn approvals(&self) -> Vec<(String, String)> {
         self.approver.approved.lock().expect("lock").clone()
+    }
+
+    fn declines(&self) -> Vec<(String, u64, String)> {
+        self.approver.declined.lock().expect("lock").clone()
     }
 
     fn post(&self, secret: &str, body: &[u8], extra: &[(String, String)]) -> Reply {
@@ -660,5 +680,68 @@ fn a_yes_for_a_plan_that_is_no_longer_waiting_is_refused_and_runs_nothing() {
     answer(&fixture, &fixture.admin, &id, yes);
     let reply = call.reply();
     assert_eq!(reply["error"]["data"]["refusal"], "NoSuchPlan", "{reply}");
+    assert!(fixture.approvals().is_empty());
+}
+
+fn no() -> Value {
+    json!({ "action": "accept", "content": { "approve": "no" } })
+}
+
+#[test]
+fn legacy_a_no_on_the_single_question_declines_the_plan_when_the_node_declines() {
+    let fixture = Fixture::start("legacy-no", true, Duration::from_secs(5));
+    fixture.approver.declines.store(true, Ordering::SeqCst);
+    fixture.initialize(&fixture.admin, form());
+    let mut call = Stream::open(&fixture, &fixture.admin);
+    let id = call.request()["id"].clone();
+    assert_eq!(answer(&fixture, &fixture.admin, &id, no()).status, 202);
+    let reply = call.reply();
+    let structured = &reply["result"]["structuredContent"];
+    assert_eq!(structured["id"], PLAN);
+    assert_eq!(structured["declinedIn"], "terminal", "{reply}");
+    assert!(structured.get("approvedIn").is_none(), "{reply}");
+    assert_fits_the_advertised_schema(structured);
+    assert_eq!(
+        fixture.declines(),
+        vec![(PLAN.to_string(), 1, "admin-1".to_string())]
+    );
+    assert!(fixture.approvals().is_empty());
+    let text = reply["result"]["content"].to_string();
+    assert!(text.contains("declined in"), "{text}");
+}
+
+#[test]
+fn modern_a_no_on_the_single_question_declines_the_plan_and_spends_the_state() {
+    let fixture = Fixture::start("modern-no", true, Duration::from_secs(5));
+    fixture.approver.declines.store(true, Ordering::SeqCst);
+    let first = fixture.modern_call(&fixture.admin, form(), json!({}), propose_args());
+    let state = first.json()["result"]["requestState"]
+        .as_str()
+        .expect("a state")
+        .to_string();
+    let answers = json!({ "requestState": state, "inputResponses": { "approve": no() } });
+    let done = fixture
+        .modern_call(&fixture.admin, form(), answers.clone(), propose_args())
+        .json();
+    assert_eq!(done["result"]["resultType"], "complete", "{done}");
+    let structured = &done["result"]["structuredContent"];
+    assert_eq!(structured["id"], PLAN);
+    assert_eq!(structured["declinedIn"], "terminal", "{done}");
+    assert_fits_the_advertised_schema(structured);
+    assert_eq!(
+        fixture.declines(),
+        vec![(PLAN.to_string(), 1, "admin-1".to_string())]
+    );
+    assert_eq!(
+        fixture.proposed.load(Ordering::SeqCst),
+        1,
+        "the no does not run the call again"
+    );
+    // The state was spent by the no: sent again it is refused and declines nothing more.
+    let replay = fixture
+        .modern_call(&fixture.admin, form(), answers, propose_args())
+        .json();
+    assert_eq!(replay["error"]["code"], -32602, "{replay}");
+    assert_eq!(fixture.declines().len(), 1);
     assert!(fixture.approvals().is_empty());
 }

@@ -394,7 +394,8 @@ fn an_argument_the_verb_does_not_take_is_a_tool_error_exit_3_with_its_code_and_w
         stdout_json(&out),
         json!({
             "code": "invalid_arguments",
-            "message": "unknown field 'plna'; this verb takes no field"
+            // plan_list's only field is the optional `node` (a linked node to ask).
+            "message": "unknown field 'plna'; this verb takes: node"
         })
     );
 }
@@ -406,6 +407,22 @@ fn a_viewer_calling_a_write_verb_is_refused_403_and_the_call_exits_4() {
     let out = call(&node, &node.viewer, "plan_decline", &["--args", &args]);
     assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
     assert!(out.stdout.is_empty(), "a refused call prints no result");
+}
+
+#[test]
+fn plan_renew_refuses_a_viewer_and_a_doctor_and_answers_an_operator() {
+    let node = start_node("plan-renew");
+    for token in [&node.viewer, &node.doctor] {
+        let out = call(&node, token, "plan_renew", &["--args", "{}"]);
+        assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.stdout.is_empty(), "a refused call prints no result");
+    }
+    let out = call(&node, &node.operator, "plan_renew", &["--args", "{}"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout_json(&out),
+        json!({ "renewed": [], "notRenewed": [] })
+    );
 }
 
 #[test]

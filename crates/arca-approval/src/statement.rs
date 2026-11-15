@@ -50,6 +50,8 @@ pub enum ArcaAction {
     FunctionCreate,
     FunctionRemove,
     HostNetworkRestore,
+    InstanceMove,
+    InstanceMoveFinish,
     /// The owner lets an MCP client act on this node with the scope it asked for (OAuth, `crate::mcp_oauth` in `arca`).
     /// The target is the client's id; the approval changes nothing in the kernel and is spent at the consent page.
     McpAuthorize,
@@ -94,6 +96,8 @@ impl ArcaAction {
             Self::FunctionCreate => "function_create",
             Self::FunctionRemove => "function_remove",
             Self::HostNetworkRestore => "host_network_restore",
+            Self::InstanceMove => "instance_move",
+            Self::InstanceMoveFinish => "instance_move_finish",
             Self::McpAuthorize => "mcp_authorize",
             Self::RouteAdd => "route_add",
             Self::RouteRemove => "route_remove",
@@ -136,6 +140,8 @@ impl ArcaAction {
             "function_create" => Some(Self::FunctionCreate),
             "function_remove" => Some(Self::FunctionRemove),
             "host_network_restore" => Some(Self::HostNetworkRestore),
+            "instance_move" => Some(Self::InstanceMove),
+            "instance_move_finish" => Some(Self::InstanceMoveFinish),
             "mcp_authorize" => Some(Self::McpAuthorize),
             "route_add" => Some(Self::RouteAdd),
             "route_remove" => Some(Self::RouteRemove),

@@ -1,0 +1,19 @@
+# The Arca Doctor as a dsh agent preset, for dsh-tui (see README, "Doctor in a terminal").
+# The preset composes one plugin, the Doctor, with the same config block as the canvas row in cordis.patch.yml:
+# replace it with your own hosts. Select the preset with DSH_TUI_PRESET=arca-doctor.
+- insert:
+    - id: arca-doctor-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: arca-doctor
+        name: Arca Doctor
+        description: Reads live Arca data and proposes changes for the owner to approve. Changes nothing itself.
+        plugins:
+          - name: arca-canvas-dsh/doctor
+            config:
+              socketPath: /run/arca/arca.sock
+              viewerTokenPath: /path/to/arca-viewer.token
+              pollMs: 5000
+              approvalUrl: ''
+              devicesUrl: ''
+              devicesTokenPath: ''

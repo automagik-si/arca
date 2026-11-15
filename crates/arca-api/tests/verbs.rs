@@ -41,6 +41,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "plan_list",
             "action_propose",
             "plan_decline",
+            "plan_renew",
             "approval_submit",
             "action_approve",
             "peer_keys_sync",
@@ -104,6 +105,10 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "registry_secret_remove",
             "host_network_restore",
             "instance_move_preflight",
+            "instance_move_plan",
+            "instance_move",
+            "instance_move_status",
+            "instance_move_finish",
             "github_oauth_app_set",
             "github_connect",
             "github_connect_status",
@@ -131,6 +136,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("plan_list", VerbClass::L, Scope::Viewer, false, false),
         ("action_propose", VerbClass::L, Scope::Viewer, false, false),
         ("plan_decline", VerbClass::L, Scope::Doctor, true, false),
+        ("plan_renew", VerbClass::L, Scope::Operator, true, false),
         ("approval_submit", VerbClass::L, Scope::Doctor, true, true),
         ("action_approve", VerbClass::L, Scope::Doctor, true, true),
         ("peer_keys_sync", VerbClass::L, Scope::Doctor, true, false),
@@ -217,6 +223,28 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
             false,
         ),
         (
+            "instance_move_plan",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
+        ),
+        ("instance_move", VerbClass::L, Scope::Doctor, true, true),
+        (
+            "instance_move_status",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
+        ),
+        (
+            "instance_move_finish",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            true,
+        ),
+        (
             "github_oauth_app_set",
             VerbClass::L,
             Scope::Doctor,
@@ -271,7 +299,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
 fn ontology_query_schemas_equal_its_table_row() {
     let v = verb("ontology_query").expect("present");
     assert_eq!(
-        (v.params)(),
+        own_params(v),
         closed_with(json!({"id": {"type": "string", "maxLength": 128}}), &["id"])
     );
     let nullable_enum =
@@ -379,6 +407,8 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "function_create",
         "function_remove",
         "host_network_restore",
+        "instance_move",
+        "instance_move_finish",
         "route_add",
         "route_remove",
     ];
@@ -436,7 +466,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
     });
 
     let list = verb("plan_list").expect("present");
-    assert_eq!((list.params)(), closed(json!({})));
+    assert_eq!(own_params(list), closed(json!({})));
     assert_eq!(
         (list.result)(),
         open(
@@ -447,7 +477,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
 
     let propose = verb("action_propose").expect("present");
     assert_eq!(
-        (propose.params)(),
+        own_params(propose),
         closed_with(
             json!({
                 "action": { "type": "string", "enum": action_names },
@@ -492,6 +522,39 @@ fn plan_verb_schemas_equal_their_table_rows() {
             &["plan", "retained"]
         )
     );
+
+    // plan_renew takes nothing and answers with each plan it made again and each lapsed plan it did not, with why.
+    let renew = verb("plan_renew").expect("present");
+    assert_eq!((renew.params)(), closed_with(json!({}), &[]));
+    assert_eq!(
+        (renew.result)(),
+        open(
+            json!({
+                "renewed": { "type": "array", "items": open(
+                    json!({
+                        "plan": hex64(),
+                        "entry": { "type": "string" },
+                        "objects": { "type": "array", "items": obj.clone() },
+                        "createdAt": { "type": "integer" },
+                        "expiresAt": { "type": "integer" },
+                    }),
+                    &["plan", "entry", "objects", "createdAt", "expiresAt"]
+                ) },
+                "notRenewed": { "type": "array", "items": open(
+                    json!({
+                        "plan": hex64(),
+                        "entry": { "type": "string" },
+                        "why": { "type": "string" },
+                    }),
+                    &["plan", "entry", "why"]
+                ) },
+            }),
+            &["renewed", "notRenewed"]
+        )
+    );
+    assert!(!may_call(Scope::Viewer, renew));
+    assert!(!may_call(Scope::Doctor, renew));
+    assert!(may_call(Scope::Operator, renew));
 
     let submit = verb("approval_submit").expect("present");
     assert_eq!(
@@ -578,7 +641,7 @@ fn peer_keys_sync_takes_lines_and_an_optional_signed_statement_and_never_echoes_
 #[test]
 fn arca_status_schemas_equal_its_table_row() {
     let v = verb("arca_status").expect("present");
-    assert_eq!((v.params)(), closed(json!({})));
+    assert_eq!(own_params(v), closed(json!({})));
     assert_eq!(
         (v.result)(),
         open(
@@ -679,7 +742,7 @@ fn arca_status_schemas_equal_its_table_row() {
 #[test]
 fn alerts_list_takes_no_argument_and_requires_every_key_of_its_result_and_events() {
     let v = verb("alerts_list").expect("present");
-    assert_eq!((v.params)(), closed(json!({})));
+    assert_eq!(own_params(v), closed(json!({})));
     let result = (v.result)();
     let event = &result["properties"]["resolvedRecent"]["items"];
     let firing = &result["properties"]["firing"]["items"];
@@ -748,7 +811,7 @@ fn alerts_list_takes_no_argument_and_requires_every_key_of_its_result_and_events
 fn node_metrics_params_and_result_equal_its_table_row() {
     let v = verb("node_metrics").expect("present");
     assert_eq!(
-        (v.params)(),
+        own_params(v),
         closed_with(
             json!({ "minutes": { "type": "integer", "minimum": 1, "maximum": 60 } }),
             &[]
@@ -778,7 +841,7 @@ fn node_metrics_result_has_no_renter_gate_at_any_depth() {
 #[test]
 fn watch_report_schemas_equal_its_table_row() {
     let v = verb("watch_report").expect("present");
-    assert_eq!((v.params)(), closed(json!({})));
+    assert_eq!(own_params(v), closed(json!({})));
     let instance = json!({
         "type": "object",
         "properties": {
@@ -839,7 +902,7 @@ fn watch_report_schemas_equal_its_table_row() {
 #[test]
 fn token_list_schemas_equal_its_table_row() {
     let v = verb("token_list").expect("present");
-    assert_eq!((v.params)(), closed(json!({})));
+    assert_eq!(own_params(v), closed(json!({})));
     assert_eq!(
         (v.result)(),
         open(
@@ -852,7 +915,9 @@ fn token_list_schemas_equal_its_table_row() {
                             "id": { "type": "string" },
                             "scope": { "type": "string", "enum": ["viewer", "doctor", "operator"] },
                             "tools": { "type": "array", "items": { "type": "string" } },
-                            "admin": { "type": "boolean" }
+                            "admin": { "type": "boolean" },
+                            "stored": { "type": "boolean" },
+                            "console": { "type": "boolean" }
                         },
                         "required": ["id", "scope"]
                     }
@@ -1091,6 +1156,16 @@ fn class_and_scope_spell_the_document_values() {
 
 // Expected-schema helpers. They build the same shape the table row names: a closed params object or an open result object.
 
+/// A verb's params without the optional `node` every read takes: the verb's own fields, as its golden row has them.
+/// `node` is checked on its own (`node_is_an_optional_argument_of_every_read_and_of_action_propose_only`).
+fn own_params(v: &arca_api::Verb) -> Value {
+    let mut params = (v.params)();
+    if let Some(properties) = params["properties"].as_object_mut() {
+        properties.remove(arca_api::verbs::NODE);
+    }
+    params
+}
+
 fn closed(props: Value) -> Value {
     closed_with(props, &[])
 }
@@ -1214,6 +1289,95 @@ fn gpu_section() -> Value {
     )
 }
 
+/// The power block: every source with a figure or a reason, the measured sum and what it leaves out.
+fn power() -> Value {
+    let sum = || json!({ "type": ["number", "null"] });
+    let text = || json!({ "type": ["string", "null"] });
+    let mut schema = open(
+        json!({
+            "cpu": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "added": { "type": "boolean" },
+                    "packages": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "zone": { "type": "string" },
+                                "name": { "type": "string" },
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["zone", "name", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "added", "packages"]
+            ),
+            "gpu": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "cards": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "pci": text(),
+                                "card": text(),
+                                "source": { "type": "string", "enum": ["nvidia-smi", "hwmon"] },
+                                "basis": text(),
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["pci", "card", "source", "basis", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "cards"]
+            ),
+            "chip": open(
+                json!({
+                    "powerW": sum(),
+                    "reason": text(),
+                    "added": { "type": "boolean" },
+                    "sensors": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "pci": text(),
+                                "card": text(),
+                                "label": text(),
+                                "wholeChip": { "type": "boolean" },
+                                "basis": { "type": "string" },
+                                "powerW": sum(),
+                                "reason": text()
+                            }),
+                            &["pci", "card", "label", "wholeChip", "basis", "powerW", "reason"]
+                        )
+                    }
+                }),
+                &["powerW", "reason", "added", "sensors"]
+            ),
+            "measuredPowerW": sum(),
+            "notAdded": { "type": "array", "items": { "type": "string" } },
+            "notIncluded": { "type": "array", "items": { "type": "string" } }
+        }),
+        &[
+            "cpu",
+            "gpu",
+            "chip",
+            "measuredPowerW",
+            "notAdded",
+            "notIncluded",
+        ],
+    );
+    schema["description"] = json!(
+        "measuredPowerW holds each part once: every discrete GPU's own figure, and either the whole-chip sensors (which hold the CPU packages) or else the CPU packages. A sensor that may or may not include the CPU is never added. notAdded names what was measured and left out because it overlaps; notIncluded names what the sum does not hold. It is not the machine's power at the wall."
+    );
+    schema
+}
+
 fn host_sample() -> Value {
     json!({
         "type": "object",
@@ -1224,7 +1388,10 @@ fn host_sample() -> Value {
                     "usedPct": { "type": ["number", "null"] },
                     "cores": { "type": "integer" },
                     "coresKnown": { "type": "boolean" },
-                    "reason": { "type": ["string", "null"] }
+                    "reason": { "type": ["string", "null"] },
+                    "threads": { "type": ["integer", "null"] },
+                    "physicalCores": { "type": ["integer", "null"] },
+                    "busyThreads": { "type": ["number", "null"] }
                 }),
                 &["usedPct", "cores", "coresKnown", "reason"]
             ),
@@ -1309,7 +1476,28 @@ fn host_sample() -> Value {
                     &["project", "name", "why"]
                 ),
                 "description": "The running instances whose CPU and memory this sample's tick did not read, and why; in the mean, the newest sample's. Each tick reads every running instance's own live state, one after another, 2 seconds each and 4 seconds for all; the ones asked longest ago go first, so each is read within a few ticks. An instance named here is still counted, with its CPU and memory left out of that tick's export. Empty when every one was read, or when the instance list itself could not be read."
-            }
+            },
+            "power": power(),
+            "instanceCpu": open(
+                json!({
+                    "instances": {
+                        "type": "array",
+                        "items": open(
+                            json!({
+                                "project": { "type": "string" },
+                                "name": { "type": "string" },
+                                "busyThreads": { "type": ["number", "null"] },
+                                "reason": { "type": ["string", "null"] }
+                            }),
+                            &["project", "name", "busyThreads", "reason"]
+                        )
+                    },
+                    "omitted": { "type": "integer" },
+                    "omittedBusyThreads": { "type": "number" },
+                    "reason": { "type": ["string", "null"] }
+                }),
+                &["instances", "omitted", "omittedBusyThreads", "reason"]
+            )
         },
         "required": [
             "at", "cpu", "load", "memory", "psi", "cpuTempC", "gpuBusyPct", "gpu", "pools", "network", "projects",
@@ -1393,7 +1581,7 @@ fn omni_schemas_equal_the_golden_and_every_omni_verb_is_untrusted() {
     for row in rows {
         let v = verb(row["name"].as_str().unwrap()).unwrap();
         assert_eq!(
-            parity_shape(&(v.params)()),
+            parity_shape(&own_params(v)),
             parity_shape(&row["inputSchema"]),
             "{}",
             v.name
@@ -1490,6 +1678,8 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "deploy_rollback",
             "deploy_remove",
             "function_remove",
+            "instance_move",
+            "instance_move_finish",
             "github_disconnect",
         ]
     );
@@ -1703,7 +1893,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 27);
+    assert_eq!(actions.len(), 29);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));
@@ -1851,4 +2041,44 @@ fn a_field_the_kernel_fills_in_is_taken_at_the_door_with_any_value() {
         ),
         Ok(())
     );
+}
+
+/// `node` names a linked node: every read the door serves takes it, and `action_propose`, always optional. The only reads
+/// without it are the `owner_approval_*` ones, whose rows are the calling token's own; no write verb takes it.
+#[test]
+fn node_is_an_optional_argument_of_every_read_and_of_action_propose_only() {
+    use arca_api::verbs::NODE;
+    for v in verbs() {
+        let params = (v.params)();
+        assert_eq!(
+            params["properties"].get(NODE).is_some(),
+            v.takes_node(),
+            "{}",
+            v.name
+        );
+        let required = params["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!(NODE)), "{}", v.name);
+        if v.takes_node() {
+            assert!(!v.writes, "{} writes", v.name);
+            assert_eq!(params["properties"][NODE]["type"], json!("string"));
+        } else {
+            assert!(
+                v.writes || v.name.starts_with("owner_approval_"),
+                "the read {} takes no node",
+                v.name
+            );
+        }
+    }
+    // A relayed answer names its node in `linkedNode`: no result may have that field, so a relayed answer keeps every
+    // field the node wrote and fits the tool's own schema.
+    for v in verbs() {
+        assert!(
+            !mentions_key(&(v.result)(), arca_api::verbs::LINKED_NODE),
+            "{} has a result field named linkedNode",
+            v.name
+        );
+    }
+    assert!(verb("action_propose").expect("present").takes_node());
+    assert!(verb("watch_report").expect("present").takes_node());
+    assert!(verb("route_list").expect("present").takes_node());
 }

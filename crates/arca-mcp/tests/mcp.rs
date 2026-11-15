@@ -467,6 +467,8 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "function_runs",
             "registry_list",
             "instance_move_preflight",
+            "instance_move_plan",
+            "instance_move_status",
             "github_connect_status",
             "github_bindings",
             "github_audit",
@@ -495,6 +497,22 @@ fn a_tools_allowlist_hides_and_refuses_every_verb_outside_it() {
         fx.tool_call(&fx.viewer_tools, "token_list", json!({}))
             .status,
         403
+    );
+}
+
+#[test]
+fn a_limited_token_refused_a_verb_outside_its_list_is_told_which_verb() {
+    let fx = Fixture::start("tools-refusal-names");
+    let reply = fx.tool_call(&fx.viewer_tools, "node_metrics", json!({}));
+    assert_eq!(reply.status, 403);
+    assert!(
+        reply.body.contains("node_metrics"),
+        "the refusal names the verb: {:?}",
+        reply.body
+    );
+    assert!(
+        !reply.body.contains(&fx.viewer_tools),
+        "never the token itself"
     );
 }
 

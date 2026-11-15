@@ -38,6 +38,36 @@ pub fn read_cpu(proc_root: &Path) -> CpuReading {
     parse_stat(&read_text(&proc_root.join("stat")).unwrap_or_default())
 }
 
+/// The physical cores of the online CPUs: the distinct sibling lists under `devices/system/cpu/cpu<N>/topology`
+/// (`core_cpus_list`, or `thread_siblings_list` on a kernel older than 5.7). Two threads of one core share one list, so a
+/// 12-core, 24-thread host has 12 lists. `None` when no CPU has a readable list.
+pub fn read_physical_cores(sys_root: &Path) -> Option<u64> {
+    let cpus = sys_root.join("devices").join("system").join("cpu");
+    let mut lists = std::collections::BTreeSet::new();
+    for name in sorted_names(&cpus) {
+        if !name
+            .strip_prefix("cpu")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let topology = cpus.join(&name).join("topology");
+        let list = read_text(&topology.join("core_cpus_list"))
+            .or_else(|| read_text(&topology.join("thread_siblings_list")));
+        if let Some(list) = list.map(|text| text.trim().to_string())
+            && !list.is_empty()
+        {
+            // The package is part of the key: a sibling list names CPU numbers, which are unique across packages, but
+            // the key keeps two packages apart even on a kernel that numbers them oddly.
+            let package = read_text(&topology.join("physical_package_id"))
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default();
+            lists.insert((package, list));
+        }
+    }
+    (!lists.is_empty()).then(|| u64::try_from(lists.len()).unwrap_or(u64::MAX))
+}
+
 /// The local host name, from `sys/kernel/hostname`. `None` when it is missing or empty.
 pub fn read_hostname(proc_root: &Path) -> Option<String> {
     let text = read_text(&proc_root.join("sys/kernel/hostname"))?;
@@ -229,7 +259,7 @@ fn avg10(text: &str, kind: &str) -> Option<f64> {
         .and_then(parse_finite)
 }
 
-fn is_card(name: &str) -> bool {
+pub(crate) fn is_card(name: &str) -> bool {
     name.strip_prefix("card")
         .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
 }
@@ -248,16 +278,16 @@ fn is_physical(sys_root: &Path, name: &str) -> bool {
         .exists()
 }
 
-fn parse_finite(text: &str) -> Option<f64> {
+pub(crate) fn parse_finite(text: &str) -> Option<f64> {
     text.parse::<f64>().ok().filter(|value| value.is_finite())
 }
 
-fn read_text(path: &Path) -> Option<String> {
+pub(crate) fn read_text(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
 /// The entry names of a directory, sorted. A directory that cannot be read has no entries.
-fn sorted_names(dir: &Path) -> Vec<String> {
+pub(crate) fn sorted_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .map(|entries| {
             entries

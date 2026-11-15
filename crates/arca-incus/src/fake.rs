@@ -239,6 +239,10 @@ struct Shared {
     resources: Mutex<Option<Value>>,
     /// The driver each pool's own document names, by pool, set by [`FakeIncus::set_pool_driver`].
     pool_drivers: Mutex<BTreeMap<String, String>>,
+    /// The migrations this fake receives and sends ([`FakeIncus::link_migration`]).
+    migration: Mutex<MigrationFake>,
+    /// The fake a push from this one lands on, as a target daemon on the network would take it.
+    peer: Mutex<Option<Arc<Shared>>>,
 }
 
 /// The served state: the server document, the pools, every object and every operation.
@@ -283,12 +287,17 @@ struct Lease {
     fixed: bool,
 }
 
-/// What a held operation does when it ends: an object that lands on success, and an object that goes on failure.
+/// What a held operation does when it ends: an object that lands on success, an object that goes on failure, and what
+/// else happens then (a held push lands on its peer), told whether it succeeded and given the operation to finish.
 #[derive(Default)]
 struct Held {
     lands: Option<Stored>,
     reverts: Option<Place>,
+    then: Option<Then>,
 }
+
+/// What else a held operation does when it ends, told whether it succeeded and given the operation to finish.
+type Then = Box<dyn FnOnce(bool, &mut Value) + Send>;
 
 /// An object's place: its kind, its project, its parent and its name, as [`Stored`] keeps them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,6 +374,9 @@ impl Route {
             }
             Route::Object(address) if address.kind == "instance" => {
                 &["GET", "POST", "PUT", "PATCH", "DELETE"]
+            }
+            Route::Object(address) if address.kind == "volume" => {
+                &["GET", "POST", "PATCH", "DELETE"]
             }
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
             Route::InstanceState(_) => &["GET", "PUT"],
@@ -460,6 +472,8 @@ impl Shared {
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
             pool_drivers: Mutex::new(BTreeMap::new()),
+            migration: Mutex::new(MigrationFake::default()),
+            peer: Mutex::new(None),
         }
     }
 
@@ -931,6 +945,40 @@ impl FakeIncus {
         }
     }
 
+    /// Sets the device `device` of the instance `name` in `project` to `body`, as an edit of its devices does. Panics when no
+    /// such instance is held. It records no write.
+    pub fn set_instance_device(&self, project: &str, name: &str, device: &str, body: Value) {
+        let mut store = lock(&self.shared.store);
+        let index = store
+            .objects
+            .iter()
+            .position(|object| {
+                object.kind == "instance" && object.project == project && object.name == name
+            })
+            .unwrap_or_else(|| panic!("no instance {project}/{name} to set {device} of"));
+        store.objects[index].body["devices"][device] = body;
+        store.expand(index, false);
+    }
+
+    /// Sets the status of the instance `name` in `project`, as Incus itself changes it (a freeze for a snapshot): no request
+    /// is answered and no write is recorded. Panics when no such instance is held.
+    pub fn set_instance_status(&self, project: &str, name: &str, status: &str) {
+        let mut store = lock(&self.shared.store);
+        let object = store
+            .objects
+            .iter_mut()
+            .find(|object| {
+                object.kind == "instance" && object.project == project && object.name == name
+            })
+            .unwrap_or_else(|| panic!("no instance {project}/{name} to set the status of"));
+        object.body["status"] = json!(status);
+    }
+
+    /// Replaces the server document `GET /1.0` answers, as a change of the daemon's addresses or certificate does.
+    pub fn set_server(&self, server: Value) {
+        lock(&self.shared.store).server = server;
+    }
+
     fn end_operation(&self, id: &OpId, failure: Option<&str>) {
         let mut guard = lock(&self.shared.store);
         let store: &mut Store = &mut guard;
@@ -946,7 +994,13 @@ impl FakeIncus {
             operation["status"] = json!(status);
             operation["status_code"] = json!(code);
             operation["err"] = json!(err);
+            if let Some(then) = held.then {
+                then(failure.is_none(), operation);
+            }
         }
+        lock(&self.shared.migration)
+            .held_pushes
+            .retain(|held| *held != id.0);
         match failure {
             None => {
                 if let Some(object) = held.lands {
@@ -1647,6 +1701,31 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
             }
             sync(Value::Object(groups))
         }
+        ("GET", Route::Operation(id) | Route::OperationWait(id))
+            if lock(&shared.migration).lingering.contains_key(&id) =>
+        {
+            let mut migration = lock(&shared.migration);
+            let ended = match migration.lingering.get_mut(&id) {
+                Some((reads, _, _)) if *reads > 1 => {
+                    *reads -= 1;
+                    None
+                }
+                _ => migration
+                    .lingering
+                    .remove(&id)
+                    .map(|(_, message, _)| message),
+            };
+            drop(migration);
+            if let (Some(message), Some(operation)) = (ended, store.operations.get_mut(&id)) {
+                operation["status"] = json!("Failure");
+                operation["status_code"] = json!(400);
+                operation["err"] = json!(message);
+            }
+            match store.operations.get(&id) {
+                Some(operation) => sync(operation.clone()),
+                None => (404, String::new(), error_envelope(404, "not found")),
+            }
+        }
         ("GET", Route::Operation(id) | Route::OperationWait(id)) => match store.operations.get(&id)
         {
             Some(operation) => sync(operation.clone()),
@@ -1670,8 +1749,39 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                         *reads -= 1;
                     }
                 }
-                let body = store.objects[index].body.clone();
-                let extra = format!("ETag: {}\r\n", etag_of(&body));
+                let mut body = store.objects[index].body.clone();
+                // A custom volume that an instance mounts names it, as Incus's `used_by` does. The list is not part of
+                // the ETag, which covers the object's own fields.
+                let etag = etag_of(&body);
+                if address.kind == "volume" {
+                    let (pool, name) = (&store.objects[index].parent, &store.objects[index].name);
+                    let users: Vec<Value> = store
+                        .objects
+                        .iter()
+                        .filter(|object| object.kind == "instance")
+                        .filter(|object| {
+                            ["devices", "expanded_devices"].iter().any(|key| {
+                                object.body[*key].as_object().is_some_and(|devices| {
+                                    devices.values().any(|device| {
+                                        device["type"] == "disk"
+                                            && device["pool"].as_str() == Some(pool)
+                                            && device["source"].as_str() == Some(name)
+                                    })
+                                })
+                            })
+                        })
+                        .map(|object| {
+                            json!(format!(
+                                "/1.0/instances/{}?project={}",
+                                object.name, object.project
+                            ))
+                        })
+                        .collect();
+                    if !users.is_empty() {
+                        body["used_by"] = Value::Array(users);
+                    }
+                }
+                let extra = format!("ETag: {etag}\r\n");
                 (200, extra, sync_envelope(body))
             }
             None => (404, String::new(), error_envelope(404, "not found")),
@@ -1711,6 +1821,18 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         }
         ("POST", Route::InstanceBackups(address)) => {
             snapshot_or_backup(shared, store, request, &address, "backup")
+        }
+        ("POST", Route::Object(address)) if address.kind == "volume" => {
+            match serde_json::from_slice::<Value>(&request.body) {
+                Ok(Value::Object(sent)) if sent.get("migration") == Some(&json!(true)) => {
+                    push(shared, store, &address, &sent)
+                }
+                _ => (
+                    400,
+                    String::new(),
+                    error_envelope(400, "the fake takes only a migration push of a volume"),
+                ),
+            }
         }
         ("POST", Route::Object(address)) => move_instance(shared, store, request, &address),
         ("POST", Route::Collection(address)) => create(shared, store, request, &address),
@@ -2181,6 +2303,15 @@ fn create(
         );
     }
     let kind = address.kind;
+    if matches!(kind, "instance" | "volume")
+        && body
+            .get("source")
+            .and_then(|source| source.get("type"))
+            .and_then(Value::as_str)
+            == Some("migration")
+    {
+        return receive(shared, store, address, body);
+    }
     if kind == "acl" {
         for (field, empty) in [
             ("description", json!("")),
@@ -2333,11 +2464,13 @@ fn create(
                 Held {
                     lands: None,
                     reverts: Some(place.clone()),
+                    then: None,
                 }
             }
             Appears::OnCompletion => Held {
                 lands: Some(stored),
                 reverts: None,
+                then: None,
             },
         };
         let operation = running_operation(&armed.id, &place);
@@ -2790,6 +2923,54 @@ fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String
             400,
             String::new(),
             error_envelope(400, "the project is not empty"),
+        );
+    }
+    let held = place_of_stored(&store.objects[index]);
+    // A delete answered busy counts as time passing for the operation that holds the object: it ends after as many
+    // answers, reads and busy deletes together, as `receive_lingers` gave it.
+    let busy = {
+        let mut migration = lock(&shared.migration);
+        let holding = migration
+            .lingering
+            .iter()
+            .find(|(_, (_, _, place))| *place == held)
+            .map(|(id, _)| id.clone());
+        match holding {
+            Some(id) => {
+                if let Some((reads, _, _)) = migration.lingering.get_mut(&id) {
+                    *reads = reads.saturating_sub(1);
+                }
+                if migration
+                    .lingering
+                    .get(&id)
+                    .is_some_and(|(reads, _, _)| *reads == 0)
+                {
+                    let ended = migration
+                        .lingering
+                        .remove(&id)
+                        .map(|(_, message, _)| message);
+                    if let (Some(message), Some(operation)) = (ended, store.operations.get_mut(&id))
+                    {
+                        operation["status"] = json!("Failure");
+                        operation["status_code"] = json!(400);
+                        operation["err"] = json!(message);
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    };
+    if busy {
+        return answered(
+            shared,
+            store,
+            &kind,
+            "DELETE",
+            Err((
+                400,
+                "Instance is busy running a create operation".to_string(),
+            )),
         );
     }
     if kind == "instance" && store.objects[index].body.get("status") == Some(&json!("Running")) {
@@ -3590,6 +3771,22 @@ fn change_state(
     let running = text_of(&store.objects[index].body, "status") == "Running";
     match text_in(&sent, "action").as_str() {
         "start" if running => bad("The instance is already running"),
+        "start"
+            if lock(&shared.migration)
+                .refuse_start
+                .contains(&(address.project.clone(), address.name.clone())) =>
+        {
+            answered(
+                shared,
+                store,
+                "instance",
+                "PUT",
+                Err((
+                    400,
+                    "Failed to start the instance (refused by the test)".to_string(),
+                )),
+            )
+        }
         "start" => {
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
@@ -3789,6 +3986,9 @@ fn move_instance(
     let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
         return bad(400, "the body is not a JSON object");
     };
+    if sent.get("migration") == Some(&json!(true)) {
+        return push(shared, store, address, &sent);
+    }
     let name = text_in(&sent, "name");
     let to = text_in(&sent, "project");
     let plain = sent.keys().all(|key| key == "name" || key == "project");
@@ -4426,4 +4626,529 @@ fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)
     }
     store.operations.insert(id, op.clone());
     Some((200, serde_json::to_vec(&op).unwrap()))
+}
+
+/// What a push from this fake does, taken in order, one per push: by default it lands on the peer at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushPlan {
+    /// The push lands on the peer at once and its operation succeeds.
+    Pass,
+    /// The push fails with this message, and the peer's receiving operation fails with it: nothing lands.
+    Fail(String),
+    /// The push runs until the test ends it ([`FakeIncus::held_pushes`]), showing `processed` bytes moved at `speed`
+    /// bytes a second meanwhile. Released, it lands; failed, nothing lands.
+    Hold { processed: u64, speed: u64 },
+}
+
+/// The migrations a fake receives and sends.
+#[derive(Default)]
+struct MigrationFake {
+    /// Each receiving operation by its id: what lands when the push arrives, and the secrets it must carry.
+    receiving: BTreeMap<String, Receiving>,
+    /// The bytes a push of an object reports, by `instance:<project>/<name>` or `volume:<project>/<pool>/<name>`.
+    sizes: BTreeMap<String, u64>,
+    /// What the next pushes do, in order.
+    plans: std::collections::VecDeque<PushPlan>,
+    /// Every push this fake sent, as `<key> -> <operation url>`.
+    pushes: Vec<String>,
+    /// The held pushes still running, by operation id.
+    held_pushes: Vec<String>,
+    /// The instances whose start is refused, by project and name.
+    refuse_start: std::collections::BTreeSet<(String, String)>,
+    /// The `host:port` addresses this fake, as a target, does not answer a push on.
+    unreachable: std::collections::BTreeSet<String>,
+    /// Whether this fake's pushes leave the guest files behind (a copy whose files differ from the source's).
+    skip_files: bool,
+    /// How many reads a receiving operation whose push failed stays running, holding its instance, before it fails.
+    linger: u32,
+    /// The receiving operations that failed and still run: their reads left, their error, and the object they hold.
+    lingering: BTreeMap<String, (u32, String, Place)>,
+}
+
+/// A receiving operation: the object it lands, and its two secrets.
+struct Receiving {
+    place: Place,
+    body: Value,
+    control: String,
+    fs: String,
+}
+
+impl FakeIncus {
+    /// Makes this fake the source of migrations to `target`: a push names one of `target`'s receiving operations, and
+    /// what it carries lands there, as a target daemon on the network would take it. Guest files go with an instance.
+    pub fn link_migration(&self, target: &FakeIncus) {
+        *lock(&self.shared.peer) = Some(Arc::clone(&target.shared));
+    }
+
+    /// The bytes a push of `key` (`instance:<project>/<name>` or `volume:<project>/<pool>/<name>`) reports moving.
+    pub fn set_push_bytes(&self, key: &str, bytes: u64) {
+        lock(&self.shared.migration)
+            .sizes
+            .insert(key.to_string(), bytes);
+    }
+
+    /// What the next push does; plans are taken in the order they were given.
+    pub fn plan_push(&self, plan: PushPlan) {
+        lock(&self.shared.migration).plans.push_back(plan);
+    }
+
+    /// Every push this fake sent so far, as `<key> -> <the receiving operation's URL>`.
+    pub fn pushes(&self) -> Vec<String> {
+        lock(&self.shared.migration).pushes.clone()
+    }
+
+    /// The held pushes still running.
+    pub fn held_pushes(&self) -> Vec<OpId> {
+        lock(&self.shared.migration)
+            .held_pushes
+            .iter()
+            .cloned()
+            .map(OpId)
+            .collect()
+    }
+
+    /// Does not answer a push sent to `address` (`host:port`): the push fails to connect, and the receiving operation
+    /// keeps waiting for one on another address.
+    pub fn unreachable_at(&self, address: &str) {
+        lock(&self.shared.migration)
+            .unreachable
+            .insert(address.to_string());
+    }
+
+    /// Pushes from now on land without the instance's guest files: the copy's files are not the source's.
+    pub fn push_without_files(&self) {
+        lock(&self.shared.migration).skip_files = true;
+    }
+
+    /// A receiving operation whose push fails stays running for `reads` more reads of it or busy deletes of its object,
+    /// holding its object: a delete of that instance meanwhile is refused as busy, as Incus refuses it while the create
+    /// operation still runs.
+    pub fn receive_lingers(&self, reads: u32) {
+        lock(&self.shared.migration).linger = reads;
+    }
+
+    /// Adds an instance as one created on this host by someone else: `body` names it, its project and its config; it
+    /// is given a uuid of its own.
+    pub fn add_instance(&self, body: Value) {
+        let mut body = body;
+        let uuid = self.shared.next_id();
+        if let Some(object) = body.as_object_mut() {
+            object.entry("config").or_insert_with(|| json!({}));
+            object.entry("status").or_insert_with(|| json!("Stopped"));
+            object.entry("devices").or_insert_with(|| json!({}));
+        }
+        body["config"]["volatile.uuid"] = json!(uuid);
+        let project = body["project"].as_str().unwrap_or("default").to_string();
+        let name = body["name"].as_str().unwrap_or_default().to_string();
+        lock(&self.shared.store).objects.push(Stored {
+            kind: "instance".to_string(),
+            project,
+            name,
+            parent: String::new(),
+            body,
+        });
+    }
+
+    /// Refuses every start of the instance, as Incus refuses one that cannot start here.
+    pub fn refuse_start(&self, project: &str, name: &str) {
+        lock(&self.shared.migration)
+            .refuse_start
+            .insert((project.to_string(), name.to_string()));
+    }
+
+    /// Sets the used and total bytes the pool's resources answer.
+    pub fn set_pool_space(&self, pool: &str, used: u64, total: u64) {
+        let mut store = lock(&self.shared.store);
+        if let Some((_, resources)) = store.pools.iter_mut().find(|(name, _)| name == pool) {
+            *resources = json!({ "space": { "used": used, "total": total } });
+        }
+    }
+
+    /// Adds a custom volume on `pool` in `project` with `body` as its config and description, as one made earlier.
+    pub fn add_volume(&self, project: &str, pool: &str, name: &str, body: Value) {
+        let mut body = body;
+        if let Some(object) = body.as_object_mut() {
+            object.insert("name".to_string(), json!(name));
+            object.insert("project".to_string(), json!(project));
+            object.insert("pool".to_string(), json!(pool));
+            object.entry("type").or_insert_with(|| json!("custom"));
+            object.entry("config").or_insert_with(|| json!({}));
+        }
+        lock(&self.shared.store).objects.push(Stored {
+            kind: "volume".to_string(),
+            project: project.to_string(),
+            name: name.to_string(),
+            parent: pool.to_string(),
+            body,
+        });
+    }
+
+    /// Writes a file into an instance's guest, as the guest wrote it: a read through the file API answers `bytes`.
+    pub fn write_guest_file(&self, project: &str, name: &str, path: &str, bytes: &[u8]) {
+        lock(&self.shared.service)
+            .files
+            .insert(format!("{project}/{name}:{path}"), bytes.to_vec());
+    }
+
+    /// Removes a file from an instance's guest, as the guest removed it: a read through the file API is then 404.
+    pub fn remove_guest_file(&self, project: &str, name: &str, path: &str) {
+        lock(&self.shared.service)
+            .files
+            .remove(&format!("{project}/{name}:{path}"));
+    }
+
+    /// Whether an object of `kind` (`instance` or `volume`) is held under that name.
+    pub fn holds(&self, kind: &str, project: &str, name: &str) -> bool {
+        lock(&self.shared.store)
+            .objects
+            .iter()
+            .any(|object| object.kind == kind && object.project == project && object.name == name)
+    }
+
+    /// The status of the instance, `None` when there is none.
+    pub fn instance_status(&self, project: &str, name: &str) -> Option<String> {
+        lock(&self.shared.store)
+            .objects
+            .iter()
+            .find(|object| {
+                object.kind == "instance" && object.project == project && object.name == name
+            })
+            .map(|object| text_of(&object.body, "status"))
+    }
+}
+
+/// A create whose source is a migration: the receiving side of a push. The object lands only when the push arrives,
+/// through the operation answered here, which holds the secrets the push must carry. A refresh of an object already
+/// held keeps its uuid.
+fn receive(
+    shared: &Shared,
+    store: &mut Store,
+    address: &Address,
+    mut body: Map<String, Value>,
+) -> Answer {
+    let bad = |code: u16, message: &str| (code, String::new(), error_envelope(code, message));
+    let source = body.remove("source").unwrap_or(Value::Null);
+    if source.get("mode").and_then(Value::as_str) != Some("push") {
+        return bad(400, "the fake receives a migration by push only");
+    }
+    let refresh = source.get("refresh") == Some(&json!(true));
+    let name = text_in(&body, "name");
+    if name.is_empty() || name.contains('/') {
+        return bad(400, "the object has no usable name");
+    }
+    let parent = address.parent.clone();
+    if address.kind == "volume" && !store.pools.iter().any(|(pool, _)| *pool == parent) {
+        return bad(404, "the storage pool is not found");
+    }
+    if address.kind == "instance" && store.project_config(&address.project).is_none() {
+        return bad(404, "Project not found");
+    }
+    let place = Place {
+        kind: address.kind.to_string(),
+        project: address.project.clone(),
+        parent: parent.clone(),
+        name: name.clone(),
+    };
+    if !refresh
+        && store
+            .objects
+            .iter()
+            .any(|object| place_of_stored(object) == place)
+    {
+        return bad(409, "the object already exists");
+    }
+    body.insert("project".to_string(), json!(address.project));
+    body.entry("config").or_insert_with(|| json!({}));
+    if address.kind == "instance" {
+        body.insert("status".to_string(), json!("Stopped"));
+    } else {
+        body.insert("pool".to_string(), json!(parent));
+    }
+    let id = shared.next_id();
+    let (control, fs) = (shared.next_id(), shared.next_id());
+    let mut operation = running_operation(&id, &place);
+    operation["class"] = json!("websocket");
+    operation["description"] = json!("Receiving a migration");
+    operation["metadata"] = json!({ "control": control, "fs": fs });
+    store.operations.insert(id.clone(), operation.clone());
+    store.held.insert(id.clone(), Held::default());
+    lock(&shared.migration).receiving.insert(
+        id.clone(),
+        Receiving {
+            place,
+            body: Value::Object(body),
+            control,
+            fs,
+        },
+    );
+    (202, String::new(), async_envelope(&id, operation))
+}
+
+/// A push from this fake: `sent` names the peer's receiving operation and its secrets. What the next [`PushPlan`] says
+/// happens: by default the object lands on the peer at once, with the guest files of an instance.
+fn push(
+    shared: &Shared,
+    store: &mut Store,
+    address: &Address,
+    sent: &Map<String, Value>,
+) -> Answer {
+    let bad = |code: u16, message: &str| (code, String::new(), error_envelope(code, message));
+    let Some(index) = store.find(address) else {
+        return bad(404, "not found");
+    };
+    let target = sent.get("target").cloned().unwrap_or(Value::Null);
+    let url = target
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !url.starts_with("https://") || !url.contains("/1.0/operations/") {
+        return bad(400, "a push names the target's operation by its https URL");
+    }
+    if target
+        .get("certificate")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return bad(400, "a push names the target's certificate");
+    }
+    let receiving = url.rsplit('/').next().unwrap_or("").to_string();
+    let secrets = target
+        .get("secrets")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let object = &store.objects[index];
+    let key = if object.kind == "volume" {
+        format!(
+            "volume:{}/{}/{}",
+            object.project, object.parent, object.name
+        )
+    } else {
+        format!("instance:{}/{}", object.project, object.name)
+    };
+    let prefix = format!("{}/{}:", object.project, object.name);
+    let place = place_of_stored(object);
+    let instance = object.kind == "instance";
+    let (bytes, plan) = {
+        let mut migration = lock(&shared.migration);
+        let inconsistent = if sent.get("allow_inconsistent") == Some(&json!(true)) {
+            " (inconsistent)"
+        } else {
+            ""
+        };
+        migration
+            .pushes
+            .push(format!("{key} -> {url}{inconsistent}"));
+        let bytes = migration.sizes.get(&key).copied().unwrap_or(1024 * 1024);
+        (bytes, migration.plans.pop_front().unwrap_or(PushPlan::Pass))
+    };
+    let files: Vec<(String, Vec<u8>)> = if instance && !lock(&shared.migration).skip_files {
+        lock(&shared.service)
+            .files
+            .iter()
+            .filter(|(path, _)| path.starts_with(&prefix))
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let peer = lock(&shared.peer).clone();
+    // An address the target does not answer on: the push fails to connect, and the receiving operation keeps waiting
+    // for a push on another address, as Incus's does.
+    let host = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    let unreachable = peer
+        .as_ref()
+        .is_some_and(|peer| lock(&peer.migration).unreachable.contains(&host));
+    let plan = if unreachable {
+        lock(&shared.migration).plans.push_front(plan);
+        None
+    } else {
+        Some(plan)
+    };
+    let id = shared.next_id();
+    let mut operation = running_operation(&id, &place);
+    operation["description"] = json!("Migrating");
+    // Incus 7.6 writes the progress of a stream as one text, `fs_progress`: "<volume>: 1.20GB (3.00MB/s)".
+    let stream = object.name.clone();
+    let progress = move |processed: u64, speed: u64| -> Value {
+        json!({ "fs_progress": format!("{stream}: {} ({}/s)", incus_bytes(processed), incus_bytes(speed)) })
+    };
+    let held_progress = progress.clone();
+    let finish = move |operation: &mut Value, outcome: Result<(), String>| match outcome {
+        Ok(()) => {
+            operation["status"] = json!("Success");
+            operation["status_code"] = json!(200);
+            operation["metadata"] = progress(bytes, bytes);
+        }
+        Err(message) => {
+            operation["status"] = json!("Failure");
+            operation["status_code"] = json!(400);
+            operation["err"] = json!(message);
+        }
+    };
+    let land_on = move |peer: Option<Arc<Shared>>, ok: bool, message: &str| -> Result<(), String> {
+        let Some(peer) = peer else {
+            return Err("the target could not be reached".to_string());
+        };
+        land(&peer, &receiving, &secrets, files, ok, message)
+    };
+    match plan {
+        None => {
+            finish(&mut operation, Err(format!("Unable to connect to: {host}")));
+        }
+        Some(PushPlan::Pass) => {
+            let outcome = land_on(peer, true, "");
+            finish(&mut operation, outcome);
+        }
+        Some(PushPlan::Fail(message)) => {
+            let _ = land_on(peer, false, &message);
+            finish(&mut operation, Err(message));
+        }
+        Some(PushPlan::Hold { processed, speed }) => {
+            operation["metadata"] = held_progress(processed, speed);
+            store.held.insert(
+                id.clone(),
+                Held {
+                    then: Some(Box::new(move |ok, operation: &mut Value| {
+                        let outcome = land_on(peer, ok, "the push was failed by the test");
+                        if ok {
+                            finish(operation, outcome);
+                        }
+                    })),
+                    ..Held::default()
+                },
+            );
+            lock(&shared.migration).held_pushes.push(id.clone());
+        }
+    }
+    store.operations.insert(id.clone(), operation.clone());
+    (202, String::new(), async_envelope(&id, operation))
+}
+
+/// Bytes as Incus prints them (`units.GetByteSizeString(n, 2)`): "512B", "1.20GB", in decimal units.
+fn incus_bytes(bytes: u64) -> String {
+    if bytes < 1000 {
+        return format!("{bytes}B");
+    }
+    let mut value = bytes as f64;
+    for unit in ["kB", "MB", "GB", "TB", "PB", "EB"] {
+        value /= 1000.0;
+        if value < 1000.0 {
+            return format!("{value:.2}{unit}");
+        }
+    }
+    format!("{value:.2}EB")
+}
+
+/// Ends the peer's receiving operation `id`: with `ok` the object lands (a refresh of one it holds keeps its uuid and
+/// its state) and the guest files are written; without, nothing lands. Secrets that are not the operation's land nothing.
+fn land(
+    peer: &Shared,
+    id: &str,
+    secrets: &Map<String, Value>,
+    files: Vec<(String, Vec<u8>)>,
+    ok: bool,
+    message: &str,
+) -> Result<(), String> {
+    let mut guard = lock(&peer.store);
+    let store: &mut Store = &mut guard;
+    let receiving = lock(&peer.migration)
+        .receiving
+        .remove(id)
+        .ok_or_else(|| "the target holds no receiving operation by that id".to_string())?;
+    let matches = secrets.get("fs").and_then(Value::as_str) == Some(receiving.fs.as_str())
+        && secrets.get("control").and_then(Value::as_str) == Some(receiving.control.as_str());
+    let outcome = if !matches {
+        Err("the websocket secrets are not the operation's".to_string())
+    } else if !ok {
+        Err(message.to_string())
+    } else {
+        Ok(())
+    };
+    store.held.remove(id);
+    if let Err(message) = &outcome {
+        let mut migration = lock(&peer.migration);
+        if migration.linger > 0 {
+            let reads = migration.linger;
+            migration.lingering.insert(
+                id.to_string(),
+                (reads, message.clone(), receiving.place.clone()),
+            );
+            return outcome;
+        }
+    }
+    if let Some(operation) = store.operations.get_mut(id) {
+        match &outcome {
+            Ok(()) => {
+                operation["status"] = json!("Success");
+                operation["status_code"] = json!(200);
+            }
+            Err(message) => {
+                operation["status"] = json!("Failure");
+                operation["status_code"] = json!(400);
+                operation["err"] = json!(message);
+            }
+        }
+    }
+    outcome.as_ref().map_err(Clone::clone)?;
+    let place = receiving.place;
+    let at = match store
+        .objects
+        .iter()
+        .position(|object| place_of_stored(object) == place)
+    {
+        Some(at) => {
+            let held = &mut store.objects[at].body;
+            let uuid = held.pointer("/config/volatile.uuid").cloned();
+            let status = held.get("status").cloned();
+            for key in [
+                "config",
+                "devices",
+                "profiles",
+                "description",
+                "architecture",
+            ] {
+                if let Some(value) = receiving.body.get(key) {
+                    held[key] = value.clone();
+                }
+            }
+            if let (Some(uuid), Some(config)) =
+                (uuid, held.get_mut("config").and_then(Value::as_object_mut))
+            {
+                config.insert("volatile.uuid".to_string(), uuid);
+            }
+            if let Some(status) = status {
+                held["status"] = status;
+            }
+            at
+        }
+        None => {
+            let mut body = receiving.body;
+            if place.kind == "instance"
+                && let Some(config) = body.get_mut("config").and_then(Value::as_object_mut)
+            {
+                config.insert("volatile.uuid".to_string(), json!(peer.next_id()));
+            }
+            store.objects.push(Stored {
+                kind: place.kind.clone(),
+                project: place.project.clone(),
+                name: place.name.clone(),
+                parent: place.parent.clone(),
+                body,
+            });
+            store.objects.len() - 1
+        }
+    };
+    store.expand(at, false);
+    drop(guard);
+    let mut service = lock(&peer.service);
+    for (path, bytes) in files {
+        service.files.insert(path, bytes);
+    }
+    Ok(())
 }
