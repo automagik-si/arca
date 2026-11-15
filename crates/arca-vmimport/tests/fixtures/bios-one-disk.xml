@@ -1,0 +1,63 @@
+<VM>
+  <ID>7</ID>
+  <UID>0</UID>
+  <NAME>web-1</NAME>
+  <STATE>8</STATE>
+  <LCM_STATE>0</LCM_STATE>
+  <TEMPLATE>
+    <CONTEXT>
+      <DISK_ID><![CDATA[1]]></DISK_ID>
+      <ETH0_DNS><![CDATA[192.0.2.53 198.51.100.53]]></ETH0_DNS>
+      <ETH0_GATEWAY><![CDATA[192.0.2.1]]></ETH0_GATEWAY>
+      <ETH0_IP><![CDATA[192.0.2.10]]></ETH0_IP>
+      <ETH0_MAC><![CDATA[02:00:c0:00:02:0a]]></ETH0_MAC>
+      <ETH0_MASK><![CDATA[255.255.255.0]]></ETH0_MASK>
+      <ETH0_SEARCH_DOMAIN><![CDATA[example.test]]></ETH0_SEARCH_DOMAIN>
+      <NETWORK><![CDATA[YES]]></NETWORK>
+      <PASSWORD><![CDATA[not-a-real-password]]></PASSWORD>
+      <SET_HOSTNAME><![CDATA[web-1]]></SET_HOSTNAME>
+      <SSH_PUBLIC_KEY><![CDATA[ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOne person@example.test
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyTwo other@example.test]]></SSH_PUBLIC_KEY>
+      <TARGET><![CDATA[hda]]></TARGET>
+      <USER_DATA><![CDATA[#cloud-config
+packages:
+  - htop
+runcmd:
+  - echo hello > /tmp/hello]]></USER_DATA>
+    </CONTEXT>
+    <CPU><![CDATA[1]]></CPU>
+    <DISK>
+      <CLONE><![CDATA[NO]]></CLONE>
+      <DEV_PREFIX><![CDATA[vd]]></DEV_PREFIX>
+      <DISK_ID><![CDATA[0]]></DISK_ID>
+      <IMAGE><![CDATA[web-1-root]]></IMAGE>
+      <IMAGE_ID><![CDATA[12]]></IMAGE_ID>
+      <PERSISTENT><![CDATA[YES]]></PERSISTENT>
+      <POOL_NAME><![CDATA[src-pool]]></POOL_NAME>
+      <SIZE><![CDATA[20480]]></SIZE>
+      <SOURCE><![CDATA[src-pool/web-1-root]]></SOURCE>
+      <TARGET><![CDATA[vda]]></TARGET>
+      <TM_MAD><![CDATA[ceph]]></TM_MAD>
+      <TYPE><![CDATA[RBD]]></TYPE>
+    </DISK>
+    <MEMORY><![CDATA[4096]]></MEMORY>
+    <NIC>
+      <BRIDGE><![CDATA[br-lan]]></BRIDGE>
+      <IP><![CDATA[192.0.2.10]]></IP>
+      <MAC><![CDATA[02:00:c0:00:02:0a]]></MAC>
+      <MODEL><![CDATA[virtio]]></MODEL>
+      <NETWORK><![CDATA[lan]]></NETWORK>
+      <NETWORK_ID><![CDATA[3]]></NETWORK_ID>
+      <NIC_ID><![CDATA[0]]></NIC_ID>
+      <VN_MAD><![CDATA[bridge]]></VN_MAD>
+    </NIC>
+    <OS>
+      <ARCH><![CDATA[x86_64]]></ARCH>
+      <BOOT><![CDATA[disk0]]></BOOT>
+      <MACHINE><![CDATA[pc-i440fx-8.2]]></MACHINE>
+    </OS>
+    <VCPU><![CDATA[2]]></VCPU>
+    <VMID><![CDATA[7]]></VMID>
+  </TEMPLATE>
+  <USER_TEMPLATE/>
+</VM>

@@ -57,6 +57,8 @@ pub enum ArcaAction {
     McpAuthorize,
     RouteAdd,
     RouteRemove,
+    InstanceImport,
+    InstanceImportUndo,
 }
 
 impl ArcaAction {
@@ -101,6 +103,8 @@ impl ArcaAction {
             Self::McpAuthorize => "mcp_authorize",
             Self::RouteAdd => "route_add",
             Self::RouteRemove => "route_remove",
+            Self::InstanceImport => "instance_import",
+            Self::InstanceImportUndo => "instance_import_undo",
         }
     }
 
@@ -145,6 +149,8 @@ impl ArcaAction {
             "mcp_authorize" => Some(Self::McpAuthorize),
             "route_add" => Some(Self::RouteAdd),
             "route_remove" => Some(Self::RouteRemove),
+            "instance_import" => Some(Self::InstanceImport),
+            "instance_import_undo" => Some(Self::InstanceImportUndo),
             _ => None,
         }
     }

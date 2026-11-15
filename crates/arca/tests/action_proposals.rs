@@ -371,6 +371,12 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "port": 8080, "reach": "private",
             }),
             ActionKind::RouteRemove => json!({ "hostname": "app.example.com" }),
+            ActionKind::InstanceImport => json!({
+                "name": "web-1", "project": "people", "pool": "remote", "bridge": "br-lan",
+                "cpu": 2, "memoryMib": 8192, "userData": false, "start": true,
+                "source": include_str!("../../arca-vmimport/tests/fixtures/uefi-two-disks-sg.xml"),
+            }),
+            ActionKind::InstanceImportUndo => json!({ "project": "people", "name": "web-1" }),
             ActionKind::InstanceMove => json!({
                 "plan": "ab".repeat(32),
                 "instances": [{ "project": "shop", "name": "web" }],
@@ -593,6 +599,35 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             assert_eq!(value("Env MODE"), "added: two");
             assert!(value("Entrypoint").contains("cd \"$HOME\""));
             assert!(value("Effect").contains("starts it once"));
+            continue;
+        }
+        if action == ActionKind::InstanceImport {
+            // Every argument is on the card in words: the name, the project, the size given, the pool, the bridge,
+            // the user data left out, the start and its read-back, and what the source description says.
+            let shown: String = details
+                .iter()
+                .map(|row| format!("{}={};", row.label, row.value))
+                .collect();
+            for words in [
+                "Instance=web-1;",
+                "Project=people;",
+                "Size=2 CPUs, 8 GiB memory; the source has 4 CPUs and 24 GiB;",
+                "Incus pool remote",
+                "host bridge br-lan",
+                "not the source's user data (userData is false)",
+                "then starts it and reads it back",
+                "build & test (id 21)",
+                "arca-import-web-1",
+                "Power the source off",
+            ] {
+                assert!(shown.contains(words), "{words} is not on the card: {shown}");
+            }
+            continue;
+        }
+        if action == ActionKind::InstanceImportUndo {
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(labels, ["Instance", "Project", "Effect"]);
+            assert!(details[2].value.contains("import mark"));
             continue;
         }
         if matches!(action, ActionKind::RouteAdd | ActionKind::RouteRemove) {
@@ -2238,7 +2273,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(all.len(), 29);
+    assert_eq!(all.len(), 31);
     assert_eq!(
         failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
         format!(

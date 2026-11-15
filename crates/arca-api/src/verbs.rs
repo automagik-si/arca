@@ -164,7 +164,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 88] = [
+static VERBS: [Verb; 90] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1402,7 +1402,196 @@ static VERBS: [Verb; 88] = [
         params: on_node!(empty_params),
         result: route_list_result,
     },
+    Verb {
+        name: "instance_import",
+        summary: "Move one virtual machine from an outside hypervisor into Incus, from an approved proposal. source is the outside hypervisor's own description of the VM (the onevm show -x XML; Arca never talks to the outside hypervisor). With the source powered off, Arca makes the VM with its CPUs, memory, firmware, MACs and inbound rules, copies each Ceph disk from the node's source pool into the Incus pool, seeds cloud-init, starts it and reads it back on port 22. A failure before the start removes what it made; the source is never written. Needs kernel.instanceImport.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_instance_import,
+        cut: no_cut,
+        params: instance_import_params,
+        result: instance_import_result,
+    },
+    Verb {
+        name: "instance_import_undo",
+        summary: "Undo an instance import, from an approved proposal: the imported VM is stopped and deleted with the volumes and ACLs it names that carry the import mark. An instance without the mark is refused. The source in the outside hypervisor is not touched; powering it on again is the operator's step.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_instance_import_undo,
+        cut: no_cut,
+        params: instance_import_undo_params,
+        result: instance_import_undo_result,
+    },
 ];
+
+/// The longest source description `instance_import` takes, in bytes: one MCP request over HTTP carries at most 64 KiB.
+pub const IMPORT_SOURCE_MAX: i64 = 49_152;
+
+fn instance_import_params() -> Value {
+    params(vec![
+        (
+            "name",
+            true,
+            json!({
+                "description": "The new Incus instance's name: a letter, then letters, digits and -, at most 44 characters.",
+                "maxLength": 44,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z][a-zA-Z0-9-]*$",
+                "type": "string"
+            }),
+        ),
+        (
+            "project",
+            true,
+            json!({
+                "description": "The Incus project the VM lands in. It must exist.",
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z0-9_-]+$",
+                "type": "string"
+            }),
+        ),
+        (
+            "source",
+            true,
+            json!({
+                "description": "The outside hypervisor's description of the VM: the onevm show -x XML. Arca reads ID, NAME, STATE and TEMPLATE; HISTORY_RECORDS, MONITORING and USER_TEMPLATE may be left out to fit.",
+                "maxLength": IMPORT_SOURCE_MAX,
+                "minLength": 1,
+                "type": "string"
+            }),
+        ),
+        (
+            "pool",
+            true,
+            json!({
+                "description": "The Incus storage pool, of the ceph driver, the disks are copied into.",
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z0-9_-]+$",
+                "type": "string"
+            }),
+        ),
+        (
+            "bridge",
+            false,
+            json!({
+                "description": "The host bridge every NIC of the VM is on, with the source's MAC. Required when the source has a NIC. A source with security-group rules needs a bridge Incus manages.",
+                "maxLength": 15,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z0-9._-]+$",
+                "type": "string"
+            }),
+        ),
+        (
+            "cpu",
+            false,
+            json!({ "description": "CPUs in place of the source's.", "maximum": 512, "minimum": 1, "type": "integer" }),
+        ),
+        (
+            "memoryMib",
+            false,
+            json!({ "description": "Memory in MiB in place of the source's.", "maximum": 4194304, "minimum": 256, "type": "integer" }),
+        ),
+        (
+            "userData",
+            false,
+            json!({ "description": "Default true: the source's cloud-init user data goes into the seed, and runs again on the first boot. False leaves it out.", "type": "boolean" }),
+        ),
+        (
+            "start",
+            false,
+            json!({ "description": "Default true: start the VM after the copy and read it back. False leaves it stopped.", "type": "boolean" }),
+        ),
+        ("approval", false, approval_schema()),
+    ])
+}
+
+fn instance_import_result() -> Value {
+    result(vec![
+        ("instance", true, string()),
+        ("project", true, string()),
+        (
+            "source",
+            true,
+            result(vec![
+                ("id", true, int()),
+                ("name", true, string()),
+                ("digest", true, string()),
+            ]),
+        ),
+        ("mark", true, string()),
+        ("acls", true, array(string())),
+        ("volumes", true, array(string())),
+        (
+            "disks",
+            true,
+            array(result(vec![
+                ("device", true, string()),
+                ("from", true, string()),
+                ("sizeMib", true, int()),
+            ])),
+        ),
+        ("started", true, boolean()),
+        (
+            "readBack",
+            true,
+            result(vec![
+                ("agent", true, nullable(boolean())),
+                ("address", true, nullable(string())),
+                ("answered", true, nullable(boolean())),
+            ]),
+        ),
+        ("note", true, string()),
+    ])
+}
+
+fn instance_import_undo_params() -> Value {
+    with_confirm(params(vec![
+        (
+            "project",
+            true,
+            json!({ "description": "The Incus project of the imported VM.", "maxLength": 63, "minLength": 1, "pattern": "^[a-zA-Z0-9_-]+$", "type": "string" }),
+        ),
+        (
+            "name",
+            true,
+            json!({ "description": "The imported VM's Incus name.", "maxLength": 44, "minLength": 1, "pattern": "^[a-zA-Z][a-zA-Z0-9-]*$", "type": "string" }),
+        ),
+        ("approval", false, approval_schema()),
+    ]))
+}
+
+fn instance_import_undo_result() -> Value {
+    result(vec![
+        ("instance", true, string()),
+        ("project", true, string()),
+        ("removed", true, array(string())),
+        ("left", true, array(string())),
+        ("note", true, string()),
+    ])
+}
+
+fn summary_instance_import(v: &Value) -> String {
+    v["note"].as_str().unwrap_or("imported").to_string()
+}
+
+fn summary_instance_import_undo(v: &Value) -> String {
+    let removed = v["removed"].as_array().map_or(0, Vec::len);
+    format!(
+        "removed {removed} object{} of the import of {}",
+        if removed == 1 { "" } else { "s" },
+        v["instance"].as_str().unwrap_or("?")
+    )
+}
 
 fn hostname_schema() -> Value {
     json!({
@@ -3210,6 +3399,7 @@ fn not_confirmed(name: &str) -> String {
         "deploy_remove" => "nothing was removed",
         "function_remove" => "nothing was removed",
         "github_disconnect" => "nothing was disconnected",
+        "instance_import_undo" => "nothing was removed",
         "instance_move" => "nothing was moved",
         _ => "nothing was deleted",
     };
@@ -3829,7 +4019,7 @@ fn plan_list_result() -> Value {
 }
 
 /// The twenty-nine verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 29] = [
+const ACTION_NAMES: [&str; 31] = [
     "service_create",
     "service_remove",
     "service_update",
@@ -3859,6 +4049,8 @@ const ACTION_NAMES: [&str; 29] = [
     "instance_move_finish",
     "route_add",
     "route_remove",
+    "instance_import",
+    "instance_import_undo",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -3933,7 +4125,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 29] = [
+const ACTION_EXAMPLES: [(&str, &str); 31] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
@@ -3987,6 +4179,14 @@ const ACTION_EXAMPLES: [(&str, &str); 29] = [
         r#"{"hostname":"app.example.com","instance":"web","port":8080}"#,
     ),
     ("route_remove", r#"{"hostname":"app.example.com"}"#),
+    (
+        "instance_import",
+        r#"{"name":"web-1","project":"people","pool":"remote","bridge":"br0","source":"<VM><ID>7</ID><NAME>web-1</NAME><TEMPLATE><VCPU>2</VCPU><MEMORY>4096</MEMORY><DISK><DISK_ID>0</DISK_ID><IMAGE_ID>12</IMAGE_ID><SIZE>20480</SIZE><SOURCE>src-pool/web-1-root</SOURCE><TM_MAD>ceph</TM_MAD></DISK><NIC><NIC_ID>0</NIC_ID><MAC>02:00:c0:00:02:0a</MAC><BRIDGE>br0</BRIDGE></NIC></TEMPLATE></VM>"}"#,
+    ),
+    (
+        "instance_import_undo",
+        r#"{"project":"people","name":"web-1"}"#,
+    ),
 ];
 
 /// The schema keyword that tells the door's check which branch of an `anyOf` a value is held to: the one whose `title`
