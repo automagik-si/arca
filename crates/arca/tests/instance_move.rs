@@ -2944,13 +2944,13 @@ fn the_recovery_moved_path_leaves_a_target_instance_of_another_uuid_alone() {
     );
     let line = result_line(&rig, "web");
     assert_eq!(line["copyAutostartSet"], false, "{line}");
+    // R8-2: the reason says the instance there is not the recorded copy, and does not send the owner to set it.
+    let reason = line["reason"].as_str().unwrap_or_default();
     assert!(
-        line["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("could not be set back on the copy on node-b"),
+        reason.contains("on node-b is not read as the copy this move recorded"),
         "{line}"
     );
+    assert!(!reason.contains("set it as it was on the source"), "{line}");
 }
 
 /// R6-2: a profile's boot.autostart true on a stopped source counts: the copy-started recovery ending turns it off.
