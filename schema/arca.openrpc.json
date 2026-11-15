@@ -1787,6 +1787,9 @@
                       "createdAt": {
                         "type": "integer"
                       },
+                      "declinedIn": {
+                        "type": "string"
+                      },
                       "details": {
                         "items": {
                           "properties": {
@@ -3253,6 +3256,9 @@
             },
             "createdAt": {
               "type": "integer"
+            },
+            "declinedIn": {
+              "type": "string"
             },
             "details": {
               "items": {
@@ -7654,10 +7660,11 @@
                 "additionalProperties": false,
                 "properties": {
                   "decision": {
-                    "description": "approved: approved and run; refused: approved but not run, with why; left: not approved, still waiting on its card.",
+                    "description": "approved: approved and run; refused: approved but not run, with why; declined: the owner said no, and the plan is declined; left: not decided, still waiting on its card.",
                     "enum": [
                       "approved",
                       "refused",
+                      "declined",
                       "left"
                     ],
                     "type": "string"
@@ -7710,11 +7717,9 @@
                       "additionalProperties": false,
                       "properties": {
                         "label": {
-                          "maxLength": 80,
                           "type": "string"
                         },
                         "value": {
-                          "maxLength": 2000,
                           "type": "string"
                         }
                       },
@@ -7724,7 +7729,6 @@
                       ],
                       "type": "object"
                     },
-                    "maxItems": 64,
                     "type": "array"
                   },
                   "expiresAt": {
@@ -7752,7 +7756,6 @@
                     "type": "string"
                   },
                   "summary": {
-                    "maxLength": 2000,
                     "type": "string"
                   },
                   "why": {
@@ -7798,7 +7801,7 @@
       "summary": "Everything waiting for the owner, whoever made it (a worker's plans too): action plans, delete plans and owner approval requests, with the approval page. In the owner's own signed-in session (an app connected with the approvals scope) whose client declared elicitation, it also asks the owner yes or no for each plan that can be approved there, and answers what was decided; plans that delete or erase, and approval requests, keep the passkey card. The requesters' words are untrusted.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
-      "x-arca-read-only-hint": true,
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },

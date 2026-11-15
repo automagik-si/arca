@@ -414,6 +414,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
             "approvedIn": { "type": "string" },
             "approvedBy": { "type": "string" },
             "approval": { "type": "object" },
+            "declinedIn": { "type": "string" },
         }),
         &[
             "kind",

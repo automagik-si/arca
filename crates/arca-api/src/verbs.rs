@@ -78,8 +78,13 @@ impl Verb {
     /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
     /// `owner_approval_status` hands its requester an approval string, so it is not advertised read-only either (droidd's
     /// `readOnly: false`), and its minimum scope keeps it off viewers.
+    /// `owner_approval_pending` asks the owner's signed-in session about each plan, and a yes approves and runs it.
     pub fn read_only_hint(&self) -> bool {
-        !self.writes && !matches!(self.name, "action_propose" | "owner_approval_status")
+        !self.writes
+            && !matches!(
+                self.name,
+                "action_propose" | "owner_approval_status" | "owner_approval_pending"
+            )
     }
 }
 
@@ -3584,6 +3589,8 @@ fn action_proposal() -> Value {
         ("approvedIn", false, string()),
         ("approvedBy", false, string()),
         ("approval", false, json!({ "type": "object" })),
+        // Set on the answer of an action_propose the owner's signed-in session said no to: the plan is declined.
+        ("declinedIn", false, string()),
     ])
 }
 
@@ -5619,15 +5626,16 @@ fn owner_approval_pending_params() -> Value {
     json!({"additionalProperties": false, "properties": {}, "type": "object"})
 }
 fn owner_approval_pending_result() -> Value {
-    let row = json!({"additionalProperties": false, "properties": {"label": {"maxLength": 80, "type": "string"}, "value": {"maxLength": 2000, "type": "string"}}, "required": ["label", "value"], "type": "object"});
+    // The card's rows as plan_list gives them: no cap on their number or length, so any card a plan has fits.
+    let row = json!({"additionalProperties": false, "properties": {"label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label", "value"], "type": "object"});
     let plan = json!({
         "additionalProperties": false,
         "properties": {
             "id": {"maxLength": 128, "type": "string"},
             "kind": {"description": "action: an action plan; delete: a delete plan of the reconciler; request: an owner approval request.", "enum": ["action", "delete", "request"], "type": "string"},
             "action": {"maxLength": 64, "type": "string"},
-            "summary": {"maxLength": 2000, "type": "string"},
-            "details": {"items": row, "maxItems": 64, "type": "array"},
+            "summary": {"type": "string"},
+            "details": {"items": row, "type": "array"},
             "createdAt": {"description": "Unix milliseconds.", "minimum": 0, "type": "integer"},
             "expiresAt": {"description": "Unix milliseconds, or an ISO time for a request.", "type": ["integer", "string"]},
             "askedHere": {"description": "Whether the owner's signed-in session is asked about it.", "type": "boolean"},
@@ -5641,7 +5649,7 @@ fn owner_approval_pending_result() -> Value {
         "additionalProperties": false,
         "properties": {
             "id": {"maxLength": 128, "type": "string"},
-            "decision": {"description": "approved: approved and run; refused: approved but not run, with why; left: not approved, still waiting on its card.", "enum": ["approved", "refused", "left"], "type": "string"},
+            "decision": {"description": "approved: approved and run; refused: approved but not run, with why; declined: the owner said no, and the plan is declined; left: not decided, still waiting on its card.", "enum": ["approved", "refused", "declined", "left"], "type": "string"},
             "result": {"description": "What the run answered."},
             "message": {"maxLength": 2000, "type": "string"}
         },
@@ -5672,9 +5680,10 @@ pub fn summary_owner_approval_pending(v: &Value) -> String {
     if let Some(decisions) = v["decisions"].as_array() {
         let count = |what: &str| decisions.iter().filter(|d| d["decision"] == what).count();
         text.push_str(&format!(
-            " Asked here: {} approved and run, {} refused, {} left waiting on their cards.",
+            " Asked here: {} approved and run, {} refused, {} declined, {} left waiting on their cards.",
             count("approved"),
             count("refused"),
+            count("declined"),
             count("left")
         ));
     }

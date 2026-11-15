@@ -1659,3 +1659,179 @@ fn the_session_is_asked_only_about_plans_that_do_not_erase_and_others_list_only(
         Err(CallError::Forbidden { .. })
     ));
 }
+
+/// Whether a ninth plan is taken now: the kernel keeps at most eight waiting.
+fn ninth_taken(rig: &Rig) -> bool {
+    let now = rig.now();
+    rig.kernel
+        .lock()
+        .expect("kernel")
+        .propose_action(
+            ActionKind::InstanceStop,
+            json!({ "project": "p1", "instance": "ninth" }),
+            now,
+            None,
+        )
+        .is_ok()
+}
+
+#[test]
+fn held_plans_lapse_a_day_after_they_were_made_so_undecided_plans_never_fill_the_queue_for_good() {
+    let (rig, key) = Rig::new("oauth-hold-bound");
+    let _session = rig.connected(&key, "Owner app", "viewer approvals");
+    let minute = 60 * 1000;
+    for n in 0..arca::action_proposal::MAX_WAITING {
+        rig.propose(
+            ActionKind::InstanceStop,
+            json!({ "project": "p1", "instance": format!("i{n}") }),
+        );
+    }
+    let tick = |times: u64| {
+        for _ in 0..times {
+            rig.advance(10 * minute);
+            rig.kernel.lock().expect("kernel").hold_proposals(rig.now());
+        }
+    };
+    // Held an hour on, with nobody deciding: the queue is still full.
+    tick(6);
+    assert!(
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .owner_session_live(rig.now())
+    );
+    assert!(!ninth_taken(&rig), "held plans still wait an hour on");
+    // A day after they were made the hold ends; they lapse after their last fifteen minutes and the queue takes plans
+    // again, the session still connected.
+    tick(25 * 6 - 6);
+    assert!(
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .owner_session_live(rig.now())
+    );
+    assert!(ninth_taken(&rig), "25 hours on, a ninth plan is taken");
+}
+
+/// When the waiting proposal `id` was made.
+fn created(rig: &Rig, id: &str) -> u64 {
+    rig.kernel
+        .lock()
+        .expect("kernel")
+        .action_proposals()
+        .iter()
+        .find(|proposal| proposal.id == id)
+        .expect("waiting")
+        .created_ms
+}
+
+/// The waiting proposal `id` as `action_propose` answers with it.
+fn proposed(rig: &Rig, id: &str) -> Value {
+    let kernel = rig.kernel.lock().expect("kernel");
+    let proposal = kernel
+        .action_proposals()
+        .iter()
+        .find(|proposal| proposal.id == id)
+        .expect("waiting");
+    json!({
+        "kind": "action", "id": proposal.id, "action": proposal.action, "args": proposal.args,
+        "summary": proposal.summary, "details": [], "createdAt": proposal.created_ms, "expiresAt": proposal.expires_at
+    })
+}
+
+#[test]
+fn a_no_in_the_owners_session_declines_the_plan_and_the_admin_tokens_no_leaves_it_waiting() {
+    let (rig, key) = Rig::new("oauth-decline");
+    let (client, access, refresh) = rig.connected(&key, "Owner app", "viewer approvals");
+    let session = rig.caller(&access);
+    let stop = rig.propose(
+        ActionKind::InstanceStop,
+        json!({ "project": "p1", "instance": "api" }),
+    );
+    let remove = rig.propose(ActionKind::ServiceRemove, json!({ "name": "demo" }));
+    let terminal = rig.terminal();
+    let admin = Caller {
+        token_id: "admin1".to_string(),
+        scope: Scope::Admin,
+        tools: None,
+    };
+    assert!(
+        !terminal.decline(&stop, created(&rig, &stop), &admin),
+        "the admin token's no leaves it waiting"
+    );
+    assert!(
+        !terminal.decline(&stop, created(&rig, &stop) + 1, &session),
+        "another record is not declined"
+    );
+    assert!(
+        !terminal.decline(&remove, created(&rig, &remove), &session),
+        "a plan that erases keeps its card"
+    );
+    assert!(terminal.decline(&stop, created(&rig, &stop), &session));
+    let waiting: Vec<String> = rig
+        .kernel
+        .lock()
+        .expect("kernel")
+        .action_proposals()
+        .iter()
+        .map(|proposal| proposal.id.clone())
+        .collect();
+    assert_eq!(waiting, vec![remove]);
+    let journal = fs::read_to_string(
+        rig.state_dir
+            .parent()
+            .expect("the scratch directory, where the kernel journals")
+            .join(arca::action_proposal::ACTION_PROPOSALS_FILE),
+    )
+    .expect("journal");
+    let line = journal.lines().last().expect("a line");
+    assert!(line.contains("\"declined\""), "{line}");
+    assert!(
+        line.contains(&format!(
+            "declined in the owner's signed-in session {} (passkey ",
+            session.token_id
+        )),
+        "{line}"
+    );
+    // Once its passkey no longer counts, the session's no declines nothing either.
+    let again = rig.propose(
+        ActionKind::InstanceStop,
+        json!({ "project": "p1", "instance": "web" }),
+    );
+    rig.advance(STEP_UP_MS);
+    let renewed = rig.refresh(&client, &refresh, None);
+    assert_eq!(renewed.status, 200, "{}", renewed.text());
+    let session = rig.caller(renewed.json()["access_token"].as_str().expect("access"));
+    assert!(matches!(
+        rig.oauth.session(&session),
+        Session::StepUp { .. }
+    ));
+    assert!(!terminal.decline(&again, created(&rig, &again), &session));
+}
+
+#[test]
+fn the_session_is_never_asked_about_an_erasing_plan_that_action_propose_answers_with() {
+    let (rig, key) = Rig::new("oauth-pending-erase");
+    let (_, access, _) = rig.connected(&key, "Owner app", "viewer approvals");
+    let session = rig.caller(&access);
+    let stop = rig.propose(
+        ActionKind::InstanceStop,
+        json!({ "project": "p1", "instance": "api" }),
+    );
+    let remove = rig.propose(ActionKind::ServiceRemove, json!({ "name": "demo" }));
+    let terminal = rig.terminal();
+    assert!(
+        terminal
+            .pending("action_propose", &proposed(&rig, &remove), &session)
+            .is_none()
+    );
+    let asked = terminal
+        .pending("action_propose", &proposed(&rig, &stop), &session)
+        .expect("a plan that does not erase is asked");
+    assert_eq!(asked.id, stop);
+    assert!(
+        asked.message.contains("No declines it"),
+        "{}",
+        asked.message
+    );
+}

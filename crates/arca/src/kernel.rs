@@ -358,6 +358,32 @@ impl Kernel {
             })
     }
 
+    /// Declines the waiting action proposal `id` made at `created_ms` because the owner's signed-in session said no;
+    /// `by` (the session and its passkey) is journalled. Only a plan that session may approve
+    /// ([`ActionProposal::for_session`]) is declined here: one that erases keeps its card. Answers whether one was.
+    pub fn decline_action_in_session(
+        &mut self,
+        id: &str,
+        by: &str,
+        created_ms: u64,
+    ) -> Result<bool, KernelError> {
+        if !self.action_proposals.waiting().iter().any(|proposal| {
+            proposal.id == id && proposal.created_ms == created_ms && proposal.for_session()
+        }) {
+            return Ok(false);
+        }
+        self.action_proposals
+            .decline_noting(
+                id,
+                &format!("declined in the owner's signed-in session {by}"),
+            )
+            .map(|proposal| proposal.is_some())
+            .map_err(|error| KernelError::Io {
+                path: ACTION_PROPOSALS_FILE.to_string(),
+                why: error.to_string(),
+            })
+    }
+
     /// Checks the owner's approval for the action proposal `id`, spends its nonce, retires the proposal and arms one
     /// execution grant. Nothing runs here: the caller runs the action after the lock is released, then journals its result.
     pub fn approve_action(

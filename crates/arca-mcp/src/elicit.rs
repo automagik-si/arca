@@ -87,6 +87,12 @@ pub trait TerminalApprover: Send + Sync {
     /// the owner decided on the card meanwhile, and proposed again after, is another record with the same id, and is
     /// refused.
     fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError>;
+
+    /// Declines plan `plan`, made at `created_at`, because `caller` answered no. Answers whether it was declined. By
+    /// default nothing is: a no leaves the plan waiting on its card, as the admin token's always did.
+    fn decline(&self, _plan: &str, _created_at: u64, _caller: &Caller) -> bool {
+        false
+    }
 }
 
 /// The server's side of terminal approval.
@@ -339,7 +345,13 @@ pub(crate) fn url_params(message: &str, url: &str, elicitation_id: &str) -> Valu
 pub const STEP_UP_MESSAGE: &str = "Plans are waiting for your approval. Confirm it is you with your passkey on Arca's page first; this session can then ask you about each plan for the next 12 hours.";
 
 /// The `elicitation/create` params that ask the one question: approve, yes or no. A flat object of one enum, as form mode allows.
-pub(crate) fn request_params(message: &str) -> Value {
+/// `declines` says that a no declines the plan (the owner's signed-in session); otherwise only yes counts.
+pub(crate) fn request_params(message: &str, declines: bool) -> Value {
+    let description = if declines {
+        "Choose yes to approve it and run it now, or no to decline it. Closing this leaves it waiting on its card."
+    } else {
+        "Choose yes to approve it and run it now. Anything else leaves it waiting on its card."
+    };
     json!({
         "mode": "form",
         "message": message,
@@ -349,7 +361,7 @@ pub(crate) fn request_params(message: &str) -> Value {
                 "approve": {
                     "type": "string",
                     "title": "Approve this plan?",
-                    "description": "Choose yes to approve it and run it now. Anything else leaves it waiting on its card.",
+                    "description": description,
                     "enum": ["yes", "no"],
                     "default": "no"
                 }
@@ -361,7 +373,30 @@ pub(crate) fn request_params(message: &str) -> Value {
 
 /// Whether a client's answer is an explicit accept with yes.
 pub(crate) fn is_yes(answer: &Value) -> bool {
-    answer["action"] == "accept" && answer["content"]["approve"] == "yes"
+    self::answer(answer) == Answer::Yes
+}
+
+/// What a client's answer to "approve this plan?" says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// An accept with yes: approve and run it.
+    Yes,
+    /// An accept with no: decline it, where the node declines on a no ([`TerminalApprover::decline`]).
+    No,
+    /// A decline, a cancel, no answer or anything else: it waits on its card.
+    Left,
+}
+
+/// Reads a client's answer.
+pub(crate) fn answer(answer: &Value) -> Answer {
+    if answer["action"] != "accept" {
+        return Answer::Left;
+    }
+    match answer["content"]["approve"].as_str() {
+        Some("yes") => Answer::Yes,
+        Some("no") => Answer::No,
+        _ => Answer::Left,
+    }
 }
 
 /// The digest of a call, for a state to name it: the verb and its arguments.

@@ -1520,7 +1520,7 @@ pub(crate) fn list_plans(
     {
         let mut plan = action_json(kernel.host(), proposal, now, action_statements)?;
         // The card says it stays open while the owner's signed-in session is connected, instead of lapsing.
-        if proposal.for_session() && kernel.owner_session_live(now) {
+        if proposal.held(now) && kernel.owner_session_live(now) {
             plan["heldForSession"] = json!(true);
         }
         plans.push(plan);
@@ -2493,6 +2493,24 @@ impl arca_mcp::TerminalApprover for TerminalApproval {
                 .map_err(action_approval_failure)
         })
     }
+
+    fn decline(&self, plan: &str, created_at: u64, caller: &Caller) -> bool {
+        // Only the owner's signed-in session, whose passkey still counts, declines with a no; the admin token's no leaves
+        // the plan waiting, as it always did.
+        if !caller.is_issued() {
+            return false;
+        }
+        let crate::mcp_oauth::Session::Ready { key } = self.session(caller) else {
+            return false;
+        };
+        let by = format!("{} (passkey {key})", caller.token_id);
+        let Ok(mut kernel) = self.kernel.lock() else {
+            return false;
+        };
+        kernel
+            .decline_action_in_session(plan, &by, created_at)
+            .unwrap_or(false)
+    }
 }
 
 /// The question the terminal is asked for a waiting proposal, in the card's words: what it does, where, and until when.
@@ -2515,7 +2533,7 @@ fn terminal_question(proposal: &Value, session: bool) -> String {
         ));
     }
     text.push_str(if session {
-        "Approving here is recorded as approved in your signed-in session, which your passkey confirmed."
+        "Approving here is recorded as approved in your signed-in session, which your passkey confirmed. No declines it."
     } else {
         "Approving here is recorded as approved in the terminal by the admin token, not by the owner's passkey."
     });
@@ -2573,7 +2591,7 @@ impl ToolHandler for OwnerApprovalPending {
                 "createdAt": proposal.created_ms,
                 "expiresAt": proposal.expires_at,
                 "askedHere": asks && !passkey_only,
-                "heldForSession": held && proposal.for_session(),
+                "heldForSession": held && proposal.held(now),
             });
             if passkey_only {
                 row["why"] = json!(

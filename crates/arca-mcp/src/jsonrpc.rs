@@ -312,16 +312,20 @@ async fn call_tool(
             crate::elicit::State::StepUp => stepped = true,
             crate::elicit::State::Many { plans, listing } => {
                 let responses = params.get("inputResponses");
-                let yes: Vec<bool> = plans
+                let said: Vec<crate::elicit::Answer> = plans
                     .iter()
                     .map(|(plan, _)| {
                         responses
                             .and_then(|responses| responses.get(plan))
-                            .is_some_and(crate::elicit::is_yes)
+                            .map_or(crate::elicit::Answer::Left, crate::elicit::answer)
                     })
                     .collect();
-                // A state is spent once, by the first answer that approves anything: a second use is as a forged one.
-                if yes.contains(&true) && !terminal.claim(state, now_seconds()) {
+                // A state is spent once, by the first answer that decides anything: a second use is as a forged one.
+                if said
+                    .iter()
+                    .any(|answer| *answer != crate::elicit::Answer::Left)
+                    && !terminal.claim(state, now_seconds())
+                {
                     return Ok(Some(error_reply(
                         id,
                         INVALID_PARAMS,
@@ -330,8 +334,8 @@ async fn call_tool(
                     )));
                 }
                 let mut decisions = Vec::new();
-                for ((plan, created_at), yes) in plans.iter().zip(yes) {
-                    decisions.push(decide(terminal, caller, plan, *created_at, yes).await);
+                for ((plan, created_at), answer) in plans.iter().zip(said) {
+                    decisions.push(decide(terminal, caller, plan, *created_at, answer).await);
                 }
                 let approving = Approving {
                     verb: *verb,
@@ -366,6 +370,28 @@ async fn call_tool(
                     return Ok(Some(
                         approved_reply(terminal, caller, id, &plan, approving).await,
                     ));
+                }
+                // A no from the owner's signed-in session declines the plan: the state is spent, and the answer is the
+                // proposal the question stated, declined. The call is not run again, so it does not propose it anew.
+                if answer.map(crate::elicit::answer) == Some(crate::elicit::Answer::No) {
+                    if !terminal.claim(state, now_seconds()) {
+                        return Ok(Some(error_reply(
+                            id,
+                            INVALID_PARAMS,
+                            "requestState is not valid for this call",
+                            None,
+                        )));
+                    }
+                    let created_at = proposal["createdAt"].as_u64().unwrap_or(0);
+                    if decline(terminal, caller, &plan, created_at).await {
+                        let approving = Approving {
+                            verb: *verb,
+                            proposal,
+                            only_looks: server.only_looks,
+                            log: Arc::clone(&server.log),
+                        };
+                        return Ok(Some(declined_reply(id, caller, approving)));
+                    }
                 }
                 // A decline, a cancel or no answer leaves the plan waiting: the call answers as it would without asking.
                 asking = false;
@@ -453,7 +479,7 @@ async fn call_tool(
                             &call,
                             now_seconds(),
                         );
-                        result_reply(id, many_required(&many, &state))
+                        result_reply(id, many_required(&many, &state, caller.is_issued()))
                     }
                     (Era::Legacy, step_up) => {
                         let asking = ManyAsk {
@@ -492,7 +518,7 @@ async fn call_tool(
                     );
                     Ok(Some(result_reply(
                         id,
-                        input_required(&plan.message, &state),
+                        input_required(&plan.message, &state, caller.is_issued()),
                     )))
                 }
                 Era::Legacy => {
@@ -570,7 +596,7 @@ fn terminal_for<'a>(
 }
 
 /// The `2026-07-28` result that asks about several plans at once: one form request each, keyed by the plan's id.
-fn many_required(plans: &[PendingPlan], state: &str) -> Value {
+fn many_required(plans: &[PendingPlan], state: &str, declines: bool) -> Value {
     let requests: serde_json::Map<String, Value> = plans
         .iter()
         .map(|plan| {
@@ -578,7 +604,7 @@ fn many_required(plans: &[PendingPlan], state: &str) -> Value {
                 plan.id.clone(),
                 json!({
                     "method": "elicitation/create",
-                    "params": crate::elicit::request_params(&plan.message)
+                    "params": crate::elicit::request_params(&plan.message, declines)
                 }),
             )
         })
@@ -689,7 +715,7 @@ fn ask_many_on_stream(
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "elicitation/create",
-                "params": crate::elicit::request_params(&plan.message)
+                "params": crate::elicit::request_params(&plan.message, caller.is_issued())
             });
             if tx.send(request).await.is_err() {
                 terminal.forget(&request_id);
@@ -703,8 +729,10 @@ fn ask_many_on_stream(
                 }
             };
             terminal.forget(&request_id);
-            let yes = answered.is_some_and(|response| crate::elicit::is_yes(&response["result"]));
-            decisions.push(decide(terminal, &caller, &plan.id, plan.created_at, yes).await);
+            let said = answered.map_or(crate::elicit::Answer::Left, |response| {
+                crate::elicit::answer(&response["result"])
+            });
+            decisions.push(decide(terminal, &caller, &plan.id, plan.created_at, said).await);
         }
         let _ = tx.send(many_reply(id, approving, decisions)).await;
     });
@@ -712,15 +740,64 @@ fn ask_many_on_stream(
 }
 
 /// What became of one plan asked about: approved and run, refused when approved, or left waiting on its card.
+/// Asks the node to decline `plan`, made at `created_at`, after `caller` said no. Answers whether it was declined.
+async fn decline(
+    terminal: &crate::elicit::Terminal,
+    caller: &Caller,
+    plan: &str,
+    created_at: u64,
+) -> bool {
+    let approver = Arc::clone(&terminal.approver);
+    let (owned_caller, owned_plan) = (caller.clone(), plan.to_string());
+    tokio::task::spawn_blocking(move || approver.decline(&owned_plan, created_at, &owned_caller))
+        .await
+        .unwrap_or(false)
+}
+
+/// The reply of a call whose plan the owner's signed-in session said no to, and the node declined: the proposal as the
+/// question showed it, with `declinedIn`. It passes the same result check as any answer.
+fn declined_reply(id: Value, caller: &Caller, approving: Approving) -> Value {
+    let Approving {
+        verb,
+        mut proposal,
+        only_looks,
+        log,
+    } = approving;
+    proposal["declinedIn"] = json!("terminal");
+    if let Err(why) = conforms(&(verb.result)(), &proposal) {
+        log(&internal_line(
+            verb.name,
+            &format!("its declined answer does not fit the verb's result schema ({why})"),
+        ));
+        return result_reply(id, tool_failure("internal", "the tool failed"));
+    }
+    let summary = (verb.summary_text)(&proposal);
+    let mut result = tool_result(&verb, proposal, None, only_looks);
+    result["content"][0]["text"] = json!(format!(
+        "declined in the owner's signed-in session {}: {summary}",
+        caller.token_id
+    ));
+    result_reply(id, result)
+}
+
 async fn decide(
     terminal: &crate::elicit::Terminal,
     caller: &Caller,
     plan: &str,
     created_at: u64,
-    yes: bool,
+    answer: crate::elicit::Answer,
 ) -> Value {
-    if !yes {
-        return json!({ "id": plan, "decision": "left" });
+    match answer {
+        crate::elicit::Answer::Yes => {}
+        crate::elicit::Answer::No => {
+            let decision = if decline(terminal, caller, plan, created_at).await {
+                "declined"
+            } else {
+                "left"
+            };
+            return json!({ "id": plan, "decision": decision });
+        }
+        crate::elicit::Answer::Left => return json!({ "id": plan, "decision": "left" }),
     }
     let approver = Arc::clone(&terminal.approver);
     let (owned_caller, owned_plan) = (caller.clone(), plan.to_string());
@@ -759,13 +836,13 @@ fn many_reply(id: Value, approving: Approving, decisions: Vec<Value>) -> Value {
 }
 
 /// The `2026-07-28` result that asks for input: one elicitation request and the state the client sends back with its answer.
-fn input_required(message: &str, state: &str) -> Value {
+fn input_required(message: &str, state: &str, declines: bool) -> Value {
     json!({
         "resultType": "input_required",
         "inputRequests": {
             crate::elicit::APPROVE_KEY: {
                 "method": "elicitation/create",
-                "params": crate::elicit::request_params(message)
+                "params": crate::elicit::request_params(message, declines)
             }
         },
         "requestState": state
@@ -790,7 +867,7 @@ fn ask_on_stream(
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "elicitation/create",
-        "params": crate::elicit::request_params(&plan.message)
+        "params": crate::elicit::request_params(&plan.message, caller.is_issued())
     });
     if tx.try_send(request).is_err() {
         terminal.forget(&request_id);
@@ -807,9 +884,17 @@ fn ask_on_stream(
             () = tx.closed() => None,
         };
         terminal.forget(&request_id);
-        let reply = match decision {
-            Some(response) if crate::elicit::is_yes(&response["result"]) => {
+        let said = decision.map_or(crate::elicit::Answer::Left, |response| {
+            crate::elicit::answer(&response["result"])
+        });
+        let reply = match said {
+            crate::elicit::Answer::Yes => {
                 approved_reply(terminal, &caller, id, &plan.id, approving).await
+            }
+            crate::elicit::Answer::No
+                if decline(terminal, &caller, &plan.id, plan.created_at).await =>
+            {
+                declined_reply(id, &caller, approving)
             }
             _ => normal,
         };

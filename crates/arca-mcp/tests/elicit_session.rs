@@ -77,6 +77,7 @@ impl ToolHandler for Pending {
 struct Approver {
     mode: AtomicU8,
     approved: Mutex<Vec<(String, u64, String)>>,
+    declined: Mutex<Vec<(String, u64, String)>>,
 }
 
 impl TerminalApprover for Approver {
@@ -130,6 +131,18 @@ impl TerminalApprover for Approver {
         ));
         Ok(json!({ "plan": plan, "result": { "stopped": true } }))
     }
+
+    fn decline(&self, plan: &str, created_at: u64, caller: &Caller) -> bool {
+        if self.may_ask(caller) != Asking::Yes {
+            return false;
+        }
+        self.declined.lock().expect("lock").push((
+            plan.to_string(),
+            created_at,
+            caller.token_id.clone(),
+        ));
+        true
+    }
 }
 
 struct Fixture {
@@ -168,6 +181,10 @@ impl Fixture {
 
     fn approvals(&self) -> Vec<(String, u64, String)> {
         self.approver.approved.lock().expect("lock").clone()
+    }
+
+    fn declines(&self) -> Vec<(String, u64, String)> {
+        self.approver.declined.lock().expect("lock").clone()
     }
 
     fn post(&self, body: &[u8], extra: &[(String, String)]) -> Reply {
@@ -455,4 +472,66 @@ fn legacy_the_step_up_completes_on_the_stream_and_the_plans_are_asked_after_it()
     let reply = call.nth(5);
     assert_fits(&reply["result"]["structuredContent"]);
     assert_eq!(fixture.approvals().len(), 2);
+}
+
+fn no() -> Value {
+    json!({ "action": "accept", "content": { "approve": "no" } })
+}
+
+#[test]
+fn legacy_a_no_in_the_session_declines_that_plan() {
+    let fixture = Fixture::start("session-legacy-no", 1);
+    fixture.initialize(form());
+    let mut call = Stream::open(&fixture);
+    let first = call.nth(1);
+    let description =
+        first["params"]["requestedSchema"]["properties"]["approve"]["description"].to_string();
+    assert!(description.contains("or no to decline it"), "{description}");
+    assert_eq!(fixture.answer(&first["id"], no()).status, 202);
+    let second = call.nth(2);
+    assert_eq!(
+        fixture
+            .answer(&second["id"], json!({ "action": "cancel" }))
+            .status,
+        202
+    );
+    let reply = call.nth(3);
+    let structured = &reply["result"]["structuredContent"];
+    assert_eq!(
+        structured["decisions"],
+        json!([{ "id": FIRST, "decision": "declined" }, { "id": SECOND, "decision": "left" }])
+    );
+    assert_fits(structured);
+    assert_eq!(
+        fixture.declines(),
+        vec![(FIRST.to_string(), 1, SESSION_ID.to_string())]
+    );
+    assert!(fixture.approvals().is_empty());
+    let text = reply["result"]["content"].to_string();
+    assert!(text.contains("1 declined"), "{text}");
+}
+
+#[test]
+fn modern_a_no_in_the_session_declines_that_plan_and_spends_the_state() {
+    let fixture = Fixture::start("session-modern-no", 1);
+    let first = fixture.modern(form(), json!({}));
+    let state = first["result"]["requestState"]
+        .as_str()
+        .expect("a state")
+        .to_string();
+    let answers = json!({ "requestState": state, "inputResponses": { FIRST: no(), SECOND: { "action": "decline" } } });
+    let done = fixture.modern(form(), answers.clone());
+    let structured = &done["result"]["structuredContent"];
+    assert_eq!(
+        structured["decisions"],
+        json!([{ "id": FIRST, "decision": "declined" }, { "id": SECOND, "decision": "left" }])
+    );
+    assert_fits(structured);
+    assert_eq!(
+        fixture.declines(),
+        vec![(FIRST.to_string(), 1, SESSION_ID.to_string())]
+    );
+    let replay = fixture.modern(form(), answers);
+    assert_eq!(replay["error"]["code"], -32602, "{replay}");
+    assert_eq!(fixture.declines().len(), 1);
 }
