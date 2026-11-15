@@ -1945,12 +1945,14 @@ impl ToolHandler for ActionPropose {
             _ => None,
         };
         // The version the digest of a create or an update is, as its registry's tags name it, for the card's `Version`
-        // row: a label, read now and never again, with no lock held. It never refuses: a miss is "version unknown".
+        // row: a label, read now and never again, with no lock held. It never refuses: a miss is "version unknown". A
+        // create is at the digest its image names: the one it asks for, or else its template's pin.
         let version = match (action, &self.node, payload["digest"].as_str()) {
-            (ActionKind::ServiceCreate, Some(_), Some(digest)) => payload["image"]
+            (ActionKind::ServiceCreate, Some(_), _) => payload["image"]
                 .as_str()
                 .and_then(|image| image.split_once('@'))
-                .and_then(|(image, _)| self.versions.row(image, digest)),
+                .filter(|(_, digest)| service_update::digest_ok(digest))
+                .and_then(|(image, digest)| self.versions.row(image, digest)),
             (ActionKind::ServiceUpdate, Some(node), Some(digest)) => {
                 let image = {
                     let entries = lock(&self.kernel)?.entries().to_vec();

@@ -7,6 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
+`service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`
+row, the node asks anonymously over HTTPS for a pull token, the repository's tags (at most 5 pages) and the digests of
+the newest 50 version tags. Nothing else is sent, no redirect is followed, and one round ends within 5 seconds. The
+answer is kept as one map for at most ten minutes, so a node asks at most once a minute when unnamed digests are
+proposed, and otherwise once every ten minutes. A node that cannot reach ghcr.io shows `version unknown` and refuses
+nothing; a node with an egress allowlist that should name versions must allow `ghcr.io:443`, which Incus already uses
+to pull the image.
+
 One MCP door reaches the whole fleet: every read the door serves, and `action_propose`, take an optional `node`, the
 name of one of `approval.linkedHosts` (`arca_status` lists them). The caller is checked on this kernel first, as for a
 call of its own; the call then runs on that node with its linked token, and its answer comes back as the node gave it,

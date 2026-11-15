@@ -1741,10 +1741,13 @@ pins, as before. Either way the digest must be `sha256:` and 64 lower-case hex d
 template's, by the same rule; a create's digest is in the owner's card, the approval and the service's record, as an
 update's is. The digest is passed to Incus as it is: Omni's digest names an image index, and each node pulls its own
 architecture from it, so the image's fingerprint in Incus differs from node to node and from the digest. When either
-is proposed with `action_propose`, the card's `Version` row names the build (`Omni v2.261024.2 (sha256:...)`), read
-once from ghcr.io's tags when the proposal is made; it is a label, not part of what the owner approves, and says
-`version unknown` when no tag among the newest 50 names the digest or ghcr.io does not answer within 5 seconds. Nothing
-is refused for it.
+is proposed with `action_propose`, a create without `digest` too, the card's `Version` row names the build
+(`Omni v2.261024.2 (sha256:...)`). The name comes from ghcr.io's tags as the node last read them, at most ten minutes
+before the proposal: one map of the newest 50 version tags and their digests, read again when it is ten minutes old,
+or when a digest it does not name is proposed and it is over a minute old. A tag that moved inside those ten minutes can
+still be shown for the digest it named before; the row is a label, not part of what the owner approves, and the approval binds the
+digest. It says `version unknown` when the map names no tag for the digest or ghcr.io does not answer within 5
+seconds. Nothing is refused for it.
 
 #### A service that keeps its data inside the container
 
