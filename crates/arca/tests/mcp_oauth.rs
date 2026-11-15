@@ -2581,6 +2581,12 @@ fn the_owner_picks_a_scope_the_passkey_binds_and_never_more_than_asked() {
         );
         assert_eq!(refused.status, 400, "{above}: {}", refused.text());
     }
+    // The passkey binds the level picked, below the most the client asked.
+    let page = rig.authorize(
+        &client,
+        &[("scope", Some("viewer doctor operator approvals"))],
+    );
+    let id = Rig::request_id(&page);
     let begun = rig.page_post(
         "/oauth/authorize/begin",
         json!({ "id": id, "scope": "doctor" }),
@@ -2597,7 +2603,12 @@ fn the_owner_picks_a_scope_the_passkey_binds_and_never_more_than_asked() {
         statement["paramsDigest"],
         json!(arca_kernel::canon::params_digest(&bound).expect("digest"))
     );
-    let code = rig.code_picking(&key, &client, "viewer doctor approvals", Some("doctor"));
+    let code = rig.code_picking(
+        &key,
+        &client,
+        "viewer doctor operator approvals",
+        Some("doctor"),
+    );
     let reply = rig.exchange(&client, &code);
     assert_eq!(
         reply.json()["scope"],
