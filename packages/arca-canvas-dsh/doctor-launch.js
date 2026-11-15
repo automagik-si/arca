@@ -18,23 +18,46 @@ const DOCTOR_PLUGIN = 'arca-canvas-dsh/doctor';
 
 const value = (text) => text.trim().replace(/^(['"])(.*)\1$/, '$2');
 
-// The composed tree as `dsh --dump-config` prints it: one top-level row per `- ` line, two-space keys inside.
-// A row counts only when it is the preset package, its config id is arca-doctor, it composes the Doctor plugin, and
-// it is not disabled (a disabled key that is anything but a plain false counts as disabled: it cannot be evaluated
-// here).
-export function findDoctorPreset(dump) {
-  const rows = `\n${dump}`.split(/\n(?=- )/).slice(1);
-  for (const row of rows) {
-    const lines = row.split('\n');
-    const after = (line) => value(line.slice(line.indexOf(':') + 1));
-    if (!lines.some((line) => /^(- | {2})name:/.test(line) && after(line) === PRESET_PACKAGE)) continue;
-    if (!lines.some((line) => /^ {4}id:/.test(line) && after(line) === PRESET_ID)) continue;
-    if (!lines.some((line) => /^\s+- name:/.test(line) && after(line) === DOCTOR_PLUGIN)) continue;
-    if (lines.some((line) => /^(- | {2})disabled:/.test(line) && after(line) !== 'false')) continue;
-    return true;
+// The composed tree as `dsh --dump-config` prints it: one top-level row per `- ` line, two-space keys inside. A
+// disabled key that is anything but a plain false counts as disabled: it cannot be evaluated here.
+const switchedOff = (line, at) => new RegExp(`^ {${at}}disabled:`).test(line) && after(line) !== 'false';
+const after = (line) => value(line.slice(line.indexOf(':') + 1));
+const indent = (line) => line.length - line.trimStart().length;
+
+// The plugin entries of one row: each `- name:` item and the lines indented under it.
+function children(lines) {
+  const found = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^(\s+)- name:/.exec(lines[index]);
+    if (!match) continue;
+    const at = match[1].length;
+    const block = [lines[index]];
+    for (let next = index + 1; next < lines.length && (lines[next].trim() === '' || indent(lines[next]) > at); next += 1) {
+      block.push(lines[next]);
+    }
+    found.push({ name: after(lines[index]), at: at + 2, block });
   }
-  return false;
+  return found;
 }
+
+// Why the profile cannot start the Doctor, or '' when it can. It can when exactly one switched-on preset row has
+// the config id arca-doctor, and that row composes the Doctor plugin switched on.
+export function doctorPresetProblem(dump) {
+  const rows = `\n${dump}`.split(/\n(?=- )/).slice(1).map((row) => row.split('\n'));
+  const presets = rows.filter((lines) => lines.some((line) => /^(- | {2})name:/.test(line) && after(line) === PRESET_PACKAGE)
+    && lines.some((line) => /^ {4}id:/.test(line) && after(line) === PRESET_ID)
+    && !lines.some((line) => switchedOff(line.replace(/^- /, '  '), 2)));
+  if (presets.length === 0) return `has no ${PRESET_ID} preset switched on`;
+  if (presets.length > 1) return `has ${presets.length} ${PRESET_ID} presets switched on, and only one may be`;
+  const doctor = children(presets[0]).filter((child) => child.name === DOCTOR_PLUGIN);
+  if (doctor.length === 0) return `has an ${PRESET_ID} preset without the ${DOCTOR_PLUGIN} plugin`;
+  if (doctor.every((child) => child.block.some((line) => switchedOff(line, child.at)))) {
+    return `has an ${PRESET_ID} preset whose ${DOCTOR_PLUGIN} plugin is switched off`;
+  }
+  return '';
+}
+
+export const findDoctorPreset = (dump) => doctorPresetProblem(dump) === '';
 
 export function parseArgs(argv) {
   const host = [];
@@ -74,8 +97,9 @@ export function main(argv = process.argv.slice(2), env = process.env) {
     say(`could not read profile "${args.profile}" with ${dsh}, so the Doctor was not started.`);
     return 1;
   }
-  if (!findDoctorPreset(dump.stdout)) {
-    say(`profile "${args.profile}" has no ${PRESET_ID} preset switched on, so the Doctor was not started.`);
+  const problem = doctorPresetProblem(dump.stdout);
+  if (problem) {
+    say(`profile "${args.profile}" ${problem}, so the Doctor was not started.`);
     say('Add doctor.patch.yml to the profile\'s cordis.patch.yml (see the arca-canvas-dsh README).');
     return 2;
   }

@@ -612,10 +612,12 @@ arca-doctor --profile <profile>
 # or, from the profile: node <profile dir>/node_modules/arca-canvas-dsh/doctor-launch.js --profile <profile>
 ```
 
-The launcher reads the profile's composed config first and starts dsh-tui on the
-`arca-doctor` preset only when that preset is in it and switched on. Otherwise it exits
-non-zero and says why. Use it for a bot. dsh-tui itself treats an unknown
-`DSH_TUI_PRESET` as no preset, and the session then starts as a full coding agent.
+The launcher reads the profile's composed config first. It starts dsh-tui on the
+`arca-doctor` preset only when exactly one such preset is switched on and its
+`arca-canvas-dsh/doctor` plugin is switched on too. Otherwise it exits non-zero and says
+why. Use it for a bot. dsh-tui itself treats an unknown `DSH_TUI_PRESET` as no preset.
+In dsh-tui 0.19.0 such a session has almost no tools, but it is not the Doctor either:
+no Doctor prompt, no fences and no model pin.
 `--patch <file>` is passed through, and `--check` reads the profile and exits.
 
 Either way into the preset gets the Doctor's fences: a session started on it, and a
@@ -630,7 +632,8 @@ canvas's limits apply to each terminal session:
 - a turn stops at 40 tool calls, past 64k output tokens, or after 9 minutes;
 - the daily token budget (`dailyTokenBudget`, default 1,000,000) is counted in
   `arca-doctor-terminal.json`, beside `chatStatePath` when that is set, else in
-  `$DSH_HOME/storages`. Once it is spent, the next step is refused until the next day.
+  `$DSH_HOME/storages`. Doctors sharing that file count into it under a lock file. Once
+  the budget is spent, the next step is refused until the next day.
 
 `chatEnabled: false` keeps the terminal Doctor from starting.
 
@@ -655,6 +658,9 @@ One test runs against a real DSH and is skipped unless it is given one:
 ```sh
 ARCA_REAL_DSH_PROOF=/path/to/dsh npx -y node@24.11.0 --test test/real-host.test.js
 ```
+
+`test/doctor-preset-real-dsh.test.js` runs the terminal Doctor on a real DSH. It uses
+`ARCA_REAL_DSH_PROOF`, else `dsh` on PATH, and is skipped without either.
 
 `pnpm` must be beside that `dsh` or on `PATH`. The test installs this package's
 shipped files into a profile in a temporary home, starts the harness on a free

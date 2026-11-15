@@ -652,7 +652,8 @@ export function createDoctorChat(options = {}) {
       if (run.cancelled) return;
       run.cancelled = true;
       try {
-        doctorAgent?.cancel?.(reason);
+        // DSH takes a cancel cause, never a bare string: the turn's saved turn/end carries it.
+        doctorAgent?.cancel?.({ kind: 'hook', reason });
       } catch { /* already quiescent */ }
       // The loop appends turn/end in its finally. If that never arrives, drop the agent so a stale run cannot
       // accept another turn, then release the response.
@@ -895,7 +896,7 @@ export function createDoctorChat(options = {}) {
     }
     toolDisposers = [];
     try {
-      agent?.cancel?.('disposed');
+      agent?.cancel?.({ kind: 'disposed' });
     } catch { /* already quiescent */ }
     settleTurn();
     try {

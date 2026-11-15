@@ -5,6 +5,7 @@
 // Nothing here defines the Doctor: the prompt, the tools, the allow-list, the restriction, pre-execute policy and
 // guard, the model, the limits and the hosts config all come from src/doctor-session.js, the module the canvas chat
 // uses. This file only attaches them to each terminal agent and counts the canvas's limits against it.
+import { mkdir, open, rm, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { ChatStore } from './src/chat.js';
@@ -29,16 +30,63 @@ export function terminalStatePath(config, env = process.env) {
   return join(home, 'storages', 'arca-doctor-terminal.json');
 }
 
+// One exclusive lock file per counter, so terminal Doctors in several processes sharing one DSH home count every
+// token: ChatStore serialises writes only inside one process. A lock older than staleMs belongs to a process that
+// died holding it and is removed. A lock that cannot be taken within waitMs fails the update.
+export async function withFileLock(path, work, { waitMs = 15_000, staleMs = 10_000 } = {}) {
+  const lock = `${path}.lock`;
+  const deadline = Date.now() + waitMs;
+  let handle;
+  let made = false;
+  for (let pause = 2; ; pause = Math.min(pause * 2, 50)) {
+    try {
+      handle = await open(lock, 'wx', 0o600);
+      break;
+    } catch (error) {
+      if (error?.code === 'ENOENT' && !made) {
+        made = true;
+        await mkdir(dirname(lock), { recursive: true });
+        continue;
+      }
+      if (error?.code !== 'EEXIST') throw error;
+      const held = await stat(lock).catch(() => null);
+      if (held && Date.now() - held.mtimeMs > staleMs) {
+        await rm(lock, { force: true });
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error(`The Doctor's daily counter is locked (${lock}).`);
+      await new Promise((resolve) => setTimeout(resolve, pause + Math.random() * pause));
+    }
+  }
+  try {
+    return await work();
+  } finally {
+    await handle.close().catch(() => {});
+    await rm(lock, { force: true });
+  }
+}
+
+// The terminal's daily counter: ChatStore's atomic document, each update read and written under the lock.
+export function dailyCounter(path, options = {}) {
+  const store = new ChatStore(path, options);
+  return {
+    read: () => store.read(),
+    add: (tokens) => withFileLock(path, () => store.patch((state) => ({ ...state, dailyTokens: state.dailyTokens + tokens }))),
+    exhaust: () => store.exhaust(),
+  };
+}
+
 export function apply(ctx, config) {
   if (config.chatEnabled === false) {
     throw new Error('The Doctor is switched off in this config (chatEnabled: false), so the terminal Doctor does not start.');
   }
   const log = (message) => ctx.logger?.warn?.(`Arca Doctor: ${message}`);
   const budget = config.dailyTokenBudget ?? DOCTOR_LIMITS.dailyTokenBudget;
-  const daily = new ChatStore(terminalStatePath(config));
+  const daily = dailyCounter(terminalStatePath(config));
   const options = doctorOptions(config, createHostReaders(config));
   const fenced = new WeakSet();
   const installing = new WeakSet();
+  const failed = new WeakSet();
   const turns = new WeakMap();
 
   // A per-turn counter, as the canvas keeps one per answer: tool calls, output tokens and a deadline.
@@ -54,7 +102,8 @@ export function apply(ctx, config) {
     } else {
       log('The Doctor took too long and the answer was stopped.');
     }
-    try { agent.cancel?.(reason); } catch { /* already quiescent */ }
+    // DSH takes a cancel cause, never a bare string: the turn's saved turn/end carries it.
+    try { agent.cancel?.({ kind: 'hook', reason }); } catch { /* already quiescent */ }
   }
 
   function onCall({ agent }) {
@@ -108,7 +157,7 @@ export function apply(ctx, config) {
         const total = Number(usage.totalTokens) > 0
           ? Number(usage.totalTokens)
           : (Number(usage.inputTokens) || 0) + output;
-        void daily.patch((state) => ({ ...state, dailyTokens: state.dailyTokens + total })).then((state) => {
+        void daily.add(total).then((state) => {
           if (state.dailyTokens >= budget) stop(agent, 'budget');
         }, () => {
           // A count that cannot be written spends the rest of the day, as on the canvas.
@@ -151,10 +200,13 @@ export function apply(ctx, config) {
   // A live agent can join the preset without a creation edge: a blank session switched with /preset is rebound to
   // the preset and DSH emits only tools/change. Nothing can roll that agent back, so a failure there closes it: a
   // guard that refuses every call, and the Doctor's tools stay out of its steps.
+  // One attempt per agent: a failed agent keeps its one refuse-all guard and is not retried on later changes.
   function installLive(agent) {
+    if (!agent || failed.has(agent)) return;
     try {
       install(agent);
     } catch (error) {
+      failed.add(agent);
       log(`${SETUP_FAILED} (${error?.message ?? error})`);
       try { agent.ctx.tools.guard(() => SETUP_FAILED); } catch { /* the tools never reach it: they need the fences */ }
     }
