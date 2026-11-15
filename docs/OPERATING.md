@@ -2583,8 +2583,9 @@ move is finished. The proposal's late result is `MoveVerified`, `MovePartlyRolle
 
 **A stopped kernel.** A move the kernel left unfinished (a `begin` with no `end`) is not resumed. On the next start in
 kernel mode each instance without a result is settled: one whose checks passed (a `verify` line with `ok`) is recorded as
-`moved` and nothing is deleted (its copy takes the source's `boot.autostart` and the source's is turned off, as at the
-end of a run, with the same reason and late result when either fails); one whose copy had been started is left as it stands, with the source stopped, and is
+`moved` and nothing is deleted (its copy takes the source's `boot.autostart`, only when the target's instance of the
+name reads the uuid the move recorded, and the source's is turned off, as at the end of a run, with the same reason and
+late result when either is not done); one whose copy had been started is left as it stands, with the source stopped, and is
 `failed` for the owner (the copy may have served writes; the reason says how to keep one of them, and no other move
 takes the instance while that copy may run), with the source's `boot.autostart` kept off as above; any other is rolled back as above, with the reason "the kernel
 stopped during the move". The move ends `interrupted`, and the proposal gets its late result.

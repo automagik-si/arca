@@ -2452,10 +2452,22 @@ impl Moves {
                                 .to_string()
                         })
                 });
+                // Only the copy this move recorded is written: another instance of the name on the target (another
+                // uuid, or a copy with no recorded uuid) is left alone, and the copy's key is reported not set.
                 let copy_set = match (&target, &value) {
-                    (Ok(target), Some(value)) => MoveWriter::new(target.socket.clone())
-                        .set_autostart(&instance.project, &instance.name, value)
-                        .is_ok(),
+                    (Ok(target), Some(value)) => {
+                        let dest = MoveWriter::new(target.socket.clone());
+                        let ours = instance.target_uuid.is_some()
+                            && dest
+                                .get(&instance_path(&instance.project, &instance.name))
+                                .ok()
+                                .as_ref()
+                                .and_then(uuid_of)
+                                == instance.target_uuid;
+                        ours && dest
+                            .set_autostart(&instance.project, &instance.name, value)
+                            .is_ok()
+                    }
                     _ => false,
                 };
                 let autostart_off = source
