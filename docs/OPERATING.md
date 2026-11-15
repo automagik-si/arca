@@ -2095,7 +2095,8 @@ confirms it is the owner. A refresh cannot add `approvals` to a grant that was a
   approval page says **Waiting for your signed-in session**. The card still approves as before. A plan is held at most 24
   hours after it was made, then lapses as any other, so plans nobody decides never keep the node's eight waiting places
   full. Once no such grant is live (revoked, disconnected, or its refresh token expired), they lapse after their last
-  fifteen minutes.
+  fifteen minutes. The node keeps the moved expiry in memory: after a restart, a plan held past its first fifteen minutes
+  lapses.
 
 Every approval and decline is journalled as the session and the passkey that confirmed it: `action-proposals.jsonl` says
 `approved in the owner's signed-in session oauth:<client id>/<grant id> (passkey <key>)`, or `declined in …`. A session's `accept` is still an answer of
