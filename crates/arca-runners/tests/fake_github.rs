@@ -727,6 +727,15 @@ async fn a_busy_runner_survives_a_long_run_of_failed_reads() {
     .await;
     let finished = rig.github.finished();
     assert_eq!(finished[0].result, "succeeded", "{finished:?}");
+    // The pool never tried to give it up: it did not even ask GitHub to remove it.
+    let removals: Vec<String> = rig
+        .github
+        .calls()
+        .into_iter()
+        .filter(|call| call.method == "DELETE" && call.path.contains("/agents/"))
+        .map(|call| call.path)
+        .collect();
+    assert!(removals.is_empty(), "{removals:?}");
     rig.finish().await;
 }
 
