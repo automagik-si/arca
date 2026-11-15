@@ -2340,3 +2340,40 @@ fn a_revoked_clients_waiting_device_code_ends_at_once() {
     rig.advance(5_000);
     assert_eq!(error_of(&rig.poll(&client, &code)), "invalid_grant");
 }
+
+#[test]
+fn a_device_grant_with_approvals_is_the_owners_session_as_the_code_flows_is() {
+    let (rig, key) = Rig::new("oauth-device-approvals");
+    let client = rig.device_client("Codex on a server");
+    let device = rig.device_code(&client, "viewer approvals");
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    assert!(page.text().contains("id=\"approvals\""), "{}", page.text());
+    let approved = rig.approve_with(&key, &Rig::request_id(&page));
+    assert_eq!(approved.status, 200, "{}", approved.text());
+    // The agent polls a little later: the passkey still counts from the moment it approved.
+    rig.advance(10_000);
+    let reply = rig.poll(
+        &client,
+        device["device_code"].as_str().expect("a device code"),
+    );
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(reply.json()["scope"], json!("viewer approvals"));
+    let session = rig.caller(reply.json()["access_token"].as_str().expect("access"));
+    assert!(matches!(rig.oauth.session(&session), Session::Ready { .. }));
+    assert!(
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .owner_session_live(rig.now())
+    );
+    // Twelve hours after the passkey (not after the poll), it is asked to step up, as the code flow's is.
+    rig.advance(STEP_UP_MS - 10_000);
+    assert!(matches!(
+        rig.oauth.session(&session),
+        Session::StepUp { .. }
+    ));
+}
