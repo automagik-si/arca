@@ -108,7 +108,7 @@ pub const LINKED_NODE: &str = "linkedNode";
 
 /// The verbs that take [`NODE`]: every read the MCP door serves, and `action_propose`. Not the three `owner_approval_*`
 /// reads: their rows are the calling token's own requests, and a relayed call is the linked token's, never the caller's.
-pub const NODE_VERBS: [&str; 28] = [
+pub const NODE_VERBS: [&str; 30] = [
     "arca_status",
     "node_metrics",
     "watch_report",
@@ -132,6 +132,8 @@ pub const NODE_VERBS: [&str; 28] = [
     "function_runs",
     "registry_list",
     "instance_move_preflight",
+    "instance_move_plan",
+    "instance_move_status",
     "github_connect_status",
     "github_bindings",
     "github_audit",
@@ -1173,7 +1175,7 @@ static VERBS: [Verb; 87] = [
         output_key: None,
         summary_text: summary_move_plan,
         cut: no_cut,
-        params: instance_move_plan_params,
+        params: on_node!(instance_move_plan_params),
         result: instance_move_plan_result,
     },
     Verb {
@@ -1201,7 +1203,7 @@ static VERBS: [Verb; 87] = [
         output_key: None,
         summary_text: summary_move_status,
         cut: no_cut,
-        params: instance_move_status_params,
+        params: on_node!(instance_move_status_params),
         result: instance_move_status_result,
     },
     Verb {

@@ -686,14 +686,30 @@ fn keep_down(source: &MoveWriter, project: &str, name: &str, uuid: Option<&str>)
     }
 }
 
+/// What became of a verified copy's `boot.autostart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyAutostart {
+    /// It was set to the source's.
+    Set,
+    /// The write to the copy failed: the copy keeps the `false` it was made with.
+    Failed,
+    /// The target's instance of the name is not read as the copy this move recorded (another uuid, or not read), so
+    /// nothing was written to it.
+    NotTheCopy,
+}
+
 /// The reason of a `moved` result that could not set the copy's `boot.autostart` to the source's, or turn the kept
 /// source's off; `None` when both were done.
-fn moved_trouble(copy_set: bool, autostart_off: bool, target: &str) -> Option<String> {
+fn moved_trouble(copy: CopyAutostart, autostart_off: bool, target: &str) -> Option<String> {
     let mut trouble = Vec::new();
-    if !copy_set {
-        trouble.push(format!(
+    match copy {
+        CopyAutostart::Set => {}
+        CopyAutostart::Failed => trouble.push(format!(
             "boot.autostart could not be set back on the copy on {target}: it stays false, so a restart of {target} leaves the moved instance stopped; set it as it was on the source"
-        ));
+        )),
+        CopyAutostart::NotTheCopy => trouble.push(format!(
+            "the instance of this name on {target} is not read as the copy this move recorded (another uuid, or it could not be read), so its boot.autostart was left as it is; check which instance that is before you change it"
+        )),
     }
     if !autostart_off {
         trouble.push(
@@ -1635,15 +1651,21 @@ impl Moves {
             Ok(downtime) => {
                 // The verified copy takes the source's own boot.autostart (it was made with it off), and the kept source
                 // must not come back by itself on a reboot of this host, next to its copy.
-                let copy_set = dest
+                let copy = if dest
                     .set_autostart(
                         &project,
                         &name,
                         made.source_autostart.as_deref().unwrap_or_default(),
                     )
-                    .is_ok();
+                    .is_ok()
+                {
+                    CopyAutostart::Set
+                } else {
+                    CopyAutostart::Failed
+                };
+                let copy_set = copy == CopyAutostart::Set;
                 let autostart_off = source.disable_autostart(&project, &name).is_ok();
-                let reason = moved_trouble(copy_set, autostart_off, target_name)
+                let reason = moved_trouble(copy, autostart_off, target_name)
                     .map(|trouble| format!("moved, but {trouble}"));
                 self.note(json!({
                     "event": "result", "at": self.now(), "move": id, "project": project, "name": name,
@@ -2454,7 +2476,7 @@ impl Moves {
                 });
                 // Only the copy this move recorded is written: another instance of the name on the target (another
                 // uuid, or a copy with no recorded uuid) is left alone, and the copy's key is reported not set.
-                let copy_set = match (&target, &value) {
+                let copy = match (&target, &value) {
                     (Ok(target), Some(value)) => {
                         let dest = MoveWriter::new(target.socket.clone());
                         let ours = instance.target_uuid.is_some()
@@ -2464,19 +2486,27 @@ impl Moves {
                                 .as_ref()
                                 .and_then(uuid_of)
                                 == instance.target_uuid;
-                        ours && dest
+                        if !ours {
+                            CopyAutostart::NotTheCopy
+                        } else if dest
                             .set_autostart(&instance.project, &instance.name, value)
                             .is_ok()
+                        {
+                            CopyAutostart::Set
+                        } else {
+                            CopyAutostart::Failed
+                        }
                     }
-                    _ => false,
+                    _ => CopyAutostart::Failed,
                 };
+                let copy_set = copy == CopyAutostart::Set;
                 let autostart_off = source
                     .disable_autostart(&instance.project, &instance.name)
                     .is_ok();
                 let reason = format!(
                     "{stopped} after the copy passed its checks; the next start recorded it as moved"
                 );
-                let reason = match moved_trouble(copy_set, autostart_off, &record.target) {
+                let reason = match moved_trouble(copy, autostart_off, &record.target) {
                     Some(trouble) => format!("{reason}, but {trouble}"),
                     None => reason,
                 };
