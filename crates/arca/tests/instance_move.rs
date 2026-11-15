@@ -1292,6 +1292,49 @@ fn a_virtual_machine_started_after_its_plan_is_not_moved() {
     assert!(!rig.target.holds("instance", "shop", "db"));
 }
 
+/// A virtual machine started after the owner approved (the approval's own checks read it Stopped) fails at the run's
+/// first read of it: nothing is copied or made, and the source is not touched. The approval's checks read the machine
+/// a number of times this test does not fix, so it starts the machine at each read in turn, on a fresh rig, until the
+/// approval passes and the run is the first to see it Running.
+#[test]
+fn a_virtual_machine_started_after_its_approval_is_not_moved() {
+    let reads = |rig: &Rig| {
+        rig.source
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.method == "GET" && request.path.starts_with("/1.0/instances/db")
+            })
+            .count() as u32
+    };
+    let (probe, _) = ceph_rig(vm());
+    let before = reads(&probe);
+    assert_eq!(probe.plan(&["db"])["go"], true);
+    let by_plan = reads(&probe) - before;
+    for at in 0..=by_plan + 4 {
+        let (rig, ceph) = ceph_rig(vm());
+        let plan = rig.plan(&["db"]);
+        let proposal = rig.propose_move(&plan).expect("proposed");
+        rig.source.started_after_reads("shop", "db", at);
+        let Ok(started) = rig.approve(&proposal) else {
+            continue; // the approval's own checks saw it Running
+        };
+        let status = rig.wait(started["move"].as_str().unwrap());
+        let one = &status["instances"][0];
+        assert_ne!(one["result"], "moved", "{status}");
+        let reason = one["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("the virtual machine reads Running, not Stopped"),
+            "the run's first read, not a later check, must see it Running: {status}"
+        );
+        assert!(ceph.calls().is_empty(), "{:?}", ceph.calls());
+        assert!(!rig.target.holds("instance", "shop", "db"));
+        assert!(rig.source.writes().is_empty(), "{:?}", rig.source.writes());
+        return;
+    }
+    panic!("no read of the machine let the approval pass and the run see it Running");
+}
+
 /// A failed copy of a machine with a custom volume deletes the volume the move made on node-b; the source's volume is
 /// kept and only read.
 #[test]

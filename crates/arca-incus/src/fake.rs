@@ -228,6 +228,9 @@ struct Shared {
     exit_plans: Mutex<BTreeMap<(String, String), (u32, String)>>,
     /// The exits armed by a start that has not ended yet.
     exits: Mutex<BTreeMap<(String, String), (u32, String)>>,
+    /// Instances something outside the kernel starts, by project and name: how many reads of the instance it still
+    /// reads as it is before it reads Running.
+    outside_starts: Mutex<BTreeMap<(String, String), u32>>,
     /// The rebuilds each instance took, in order: `store` for the store's copy, `registry` for a registry's.
     rebuilds: Mutex<BTreeMap<(String, String), Vec<String>>>,
     /// The instances whose rebuild from the store's copy is refused, and whether one from a registry is refused too.
@@ -466,6 +469,7 @@ impl Shared {
             console: Mutex::new(BTreeMap::new()),
             exit_plans: Mutex::new(BTreeMap::new()),
             exits: Mutex::new(BTreeMap::new()),
+            outside_starts: Mutex::new(BTreeMap::new()),
             rebuilds: Mutex::new(BTreeMap::new()),
             rebuild_refusals: Mutex::new(BTreeMap::new()),
             restores: Mutex::new(BTreeMap::new()),
@@ -525,6 +529,12 @@ impl FakeIncus {
             (project.to_string(), name.to_string()),
             (reads, output.to_string()),
         );
+    }
+
+    /// Makes the instance `name` in `project` read Running from its `reads`-th read on (0: the next read), as an
+    /// owner's start from elsewhere does. It records no write.
+    pub fn started_after_reads(&self, project: &str, name: &str, reads: u32) {
+        lock(&self.shared.outside_starts).insert((project.to_string(), name.to_string()), reads);
     }
 
     /// Takes back [`FakeIncus::exit_after_start`]: the instance runs until it is stopped.
@@ -1779,13 +1789,24 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                     let left = exits.get(&key).map(|(reads, _)| *reads);
                     if left == Some(0) {
                         if let Some((_, output)) = exits.remove(&key) {
-                            lock(&shared.console).insert(key, output);
+                            lock(&shared.console).insert(key.clone(), output);
                         }
                         if let Some(body) = store.objects[index].body.as_object_mut() {
                             body.insert("status".to_string(), json!("Stopped"));
                         }
                     } else if let Some((reads, _)) = exits.get_mut(&key) {
                         *reads -= 1;
+                    }
+                    let mut starts = lock(&shared.outside_starts);
+                    match starts.get_mut(&key) {
+                        Some(0) => {
+                            starts.remove(&key);
+                            if let Some(body) = store.objects[index].body.as_object_mut() {
+                                body.insert("status".to_string(), json!("Running"));
+                            }
+                        }
+                        Some(reads) => *reads -= 1,
+                        None => {}
                     }
                 }
                 let mut body = store.objects[index].body.clone();
