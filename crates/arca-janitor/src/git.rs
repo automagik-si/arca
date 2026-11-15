@@ -8,7 +8,8 @@
 //! The check only reads, and runs no command a scanned repository's config names: a repository whose own config sets
 //! a filter command is kept unchecked, since `git status` would run that command; submodules' work trees are left to
 //! their own check, never entered by an outer `status`; and a stash is found by its ref, not by `git log`, which could
-//! run `gpg.program`.
+//! run `gpg.program`; no git call fetches a missing object from a partial clone's promisor remote, which would run
+//! the transport command the config names.
 //!
 //! The check honours the job: its walk and every git command wait for a pause under pressure and stop on cancel or
 //! at the budget.
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::jobs::{Ctx, Stop};
-use crate::util::{CmdOutput, on_path, run_cmd};
+use crate::util::{CmdOutput, on_path, run_cmd_env};
 use crate::walk::{Visit, Walk};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -146,8 +147,11 @@ struct Check<'a> {
 }
 
 impl Check<'_> {
-    /// Run git in `dir`, once the job may go on. No optional locks (status would write the index otherwise), and no
-    /// fsmonitor hook from the repository's config.
+    /// Run git in `dir`, once the job may go on. No optional locks (status would write the index otherwise), no
+    /// fsmonitor hook from the repository's config, and no lazy fetch: in a partial clone a missing object would make
+    /// git fetch it from the promisor remote, which runs the transport command the repository's config names
+    /// (`core.sshCommand`, `remote.<name>.uploadpack`, an `ext::` URL). Git reads the variable since 2.45 and an older
+    /// git ignores it; the `--no-lazy-fetch` option would instead make an older git fail every call.
     fn git(&self, dir: &Path, args: &[&str]) -> Result<Option<CmdOutput>, Stop> {
         if let Some(ctx) = self.ctx {
             ctx.checkpoint()?;
@@ -162,7 +166,7 @@ impl Check<'_> {
             &dir,
         ];
         argv.extend_from_slice(args);
-        Ok(run_cmd(&argv, TIMEOUT))
+        Ok(run_cmd_env(&argv, &[("GIT_NO_LAZY_FETCH", "1")], TIMEOUT))
     }
 
     /// Git's output in `dir`, when it succeeded.

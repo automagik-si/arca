@@ -82,7 +82,9 @@ repositories and worktrees are checked too, even when the outer repository ignor
 inside a bare repository's folder. The check runs no command a scanned repository's config names: a repository whose
 own config sets a git filter command (directly, through an include, or in a worktree's own config) is kept without
 running `git status` there; status never enters a submodule's work tree, which is checked on its own; and a stash is
-found by its ref, not through `git log`, which could run `gpg.program`. The check pauses under pressure and stops on
+found by its ref, not through `git log`, which could run `gpg.program`; and git never fetches a missing object from
+a partial clone's promisor remote, which would run the transport command its config names (such a repository reads
+as unreadable and is kept). The check pauses under pressure and stops on
 cancel or at the job's budget like any other work, and a check cut short stops the job; it never counts as a refusal.
 
 macOS: `caches` (brew, npm, pnpm, yarn, pip, uv, go, CocoaPods, cargo, node-gyp), `xcode` (DerivedData, unavailable

@@ -511,8 +511,9 @@ fn stale_scratch_with_git_work_found_nowhere_else_is_never_moved() {
 }
 
 /// A repository's own config can name commands git runs: a filter driver (set directly, through an include, in one
-/// worktree's own config, or in a submodule's config) and `gpg.program`. The check reads such a repository without
-/// running any of them, and keeps it.
+/// worktree's own config, or in a submodule's config), `gpg.program`, and the transport command of a partial clone's
+/// promisor remote, which git runs to fetch a missing object. The check reads such a repository without running any
+/// of them, and keeps it.
 #[test]
 fn commands_named_in_a_scanned_repositorys_config_are_never_run() {
     if !arca_janitor::util::on_path("git") {
@@ -631,6 +632,30 @@ fn commands_named_in_a_scanned_repositorys_config_are_never_run() {
     fs::set_permissions(&gpg, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     git(&r, &["config", "gpg.program", gpg.to_str().unwrap()]);
     git(&r, &["config", "log.showSignature", "true"]);
+
+    // A partial clone whose HEAD tree is missing, with an upload-pack command for its promisor remote: a lazy fetch
+    // of the tree would run it.
+    let r = scratch.join("promisor");
+    repo(&r);
+    git(&r, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(&r, &["push", "-q", "origin", "main:promisor"]);
+    git(&r, &["fetch", "-q", "origin"]);
+    for (key, value) in [
+        ("core.repositoryformatversion", "1".to_string()),
+        ("extensions.partialClone", "origin".to_string()),
+        ("remote.origin.promisor", "true".to_string()),
+        (
+            "remote.origin.uploadpack",
+            format!(
+                "touch {}; git-upload-pack",
+                markers.join("promisor").display()
+            ),
+        ),
+    ] {
+        git(&r, &["config", key, &value]);
+    }
+    let tree = git_with(&r, &["rev-parse", "HEAD^{tree}"], None);
+    fs::remove_file(r.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
     age_tree(&home, 30);
 
     let plan = plan_only(&config(&home), "stale-scratch");
@@ -649,6 +674,7 @@ fn commands_named_in_a_scanned_repositorys_config_are_never_run() {
         ("wtconfig", "filter"),
         ("submodule", "filter"),
         ("signed-stash", "stash"),
+        ("promisor", "cannot be read"),
     ] {
         assert!(
             plan.skipped
