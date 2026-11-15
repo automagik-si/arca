@@ -680,7 +680,7 @@ fn build_outputs(env: &Env, found: &mut Found) -> Result<(), Stop> {
             guards,
             origin,
         );
-        if let Err(reason) = crate::jobs::clean::check(&candidate, env) {
+        if let Err(reason) = crate::jobs::clean::check_or_stop(&candidate, env)? {
             found.skip("build-outputs", &out.display().to_string(), 0, reason);
             continue;
         }
@@ -784,7 +784,7 @@ fn stale_scratch(env: &Env, found: &mut Found) -> Result<(), Stop> {
                 guards,
                 origin_of(&d.join("x"), "scratch", None, &env.config.home),
             );
-            if let Err(reason) = crate::jobs::clean::check(&candidate, env) {
+            if let Err(reason) = crate::jobs::clean::check_or_stop(&candidate, env)? {
                 found.skip("stale-scratch", &d.display().to_string(), 0, reason);
                 continue;
             }
@@ -841,7 +841,7 @@ fn app_caches(env: &Env, found: &mut Found) -> Result<(), Stop> {
             vec![Guard::NotLive, Guard::Untouched { days: 30 }],
             simple_origin("app-cache", Some(&name)),
         );
-        if let Err(reason) = crate::jobs::clean::check(&candidate, env) {
+        if let Err(reason) = crate::jobs::clean::check_or_stop(&candidate, env)? {
             found.skip("app-caches", &d.display().to_string(), 0, reason);
             continue;
         }

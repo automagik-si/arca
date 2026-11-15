@@ -79,8 +79,11 @@ Linux: `caches` (npm, pnpm and uv through their own commands; go-build, node-gyp
 it is or holds, at any depth, a git repository, worktree or bare repository with changes not committed, files not
 tracked, a stash, commits no remote has on any ref or worktree HEAD, or a worktree kept outside the folder). Nested
 repositories and worktrees are checked too, even when the outer repository ignores them, and so are worktrees kept
-inside a bare repository's folder. A repository whose own config sets a git filter command is kept without running
-`git status` there, since status would run that command.
+inside a bare repository's folder. The check runs no command a scanned repository's config names: a repository whose
+own config sets a git filter command (directly, through an include, or in a worktree's own config) is kept without
+running `git status` there; status never enters a submodule's work tree, which is checked on its own; and a stash is
+found by its ref, not through `git log`, which could run `gpg.program`. The check pauses under pressure and stops on
+cancel or at the job's budget like any other work, and a check cut short stops the job; it never counts as a refusal.
 
 macOS: `caches` (brew, npm, pnpm, yarn, pip, uv, go, CocoaPods, cargo, node-gyp), `xcode` (DerivedData, unavailable
 simulators), `docker`, `claude-versions`, `app-caches` (`~/Library/Caches` folders untouched for 30 days, Apple's
