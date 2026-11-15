@@ -45,6 +45,25 @@ impl Caller {
     }
 }
 
+/// The prefix of the caller id of every token an authorization server issued ([`IssuedTokens`]). A stored token's id is
+/// lowercase letters, digits and hyphens, so no static token can carry it.
+pub const ISSUED_PREFIX: &str = "oauth:";
+
+/// Tokens an OAuth authorization server issued for this MCP server (MCP authorization, 2025-11-25). The server asks it
+/// about a bearer the static store does not know. An implementation answers only for a live token whose audience is this
+/// server, and names the caller `oauth:<client id>` ([`ISSUED_PREFIX`]), so a static token's id is never shadowed.
+pub trait IssuedTokens: Send + Sync {
+    /// The caller a bearer authenticates as, or `None`.
+    fn lookup(&self, bearer: &str) -> Option<Caller>;
+}
+
+impl Caller {
+    /// Whether this caller holds an issued (OAuth) token rather than a stored one.
+    pub fn is_issued(&self) -> bool {
+        self.token_id.starts_with(ISSUED_PREFIX)
+    }
+}
+
 /// Why a token directory will not load. Each variant names one file, never the file's content. `UnsafeDir` names the
 /// directory itself, with a fixed phrase for its reason: a symlink, a uid other than the server's, or a group or other
 /// write bit.

@@ -1,0 +1,1287 @@
+//! MCP authorization: the approval page as the OAuth 2.1 authorization server of the MCP door, end to end over one unix
+//! socket that carries the MCP routes, the page and the OAuth routes merged as `serve` merges them. The owner is the
+//! software P-256 passkey of the page tests; the clock is the test's own.
+//!
+//! The security checks each have a test that fails when the check is taken out: PKCE, the resource, the redirect, the
+//! scope ceiling, refresh rotation and reuse, code reuse, revocation, expiry and the owner's passkey.
+
+mod common;
+#[path = "../../arca-approval/tests/common/webauthn.rs"]
+mod webauthn;
+
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use arca::approve_page::{self, SetupCodeDisplay};
+use arca::handlers::Clock;
+use arca::mcp_oauth::OAuth;
+use arca_api::Scope;
+use arca_mcp::{IssuedTokens, Server, TokenStore, serve_unix};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use common::*;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::runtime::Runtime;
+use webauthn::{Assert, ORIGIN, SoftPasskey};
+
+const RP: &str = "box1.example.com";
+const REDIRECT: &str = "http://127.0.0.1:33418/callback";
+const VERIFIER: &str = "a-pkce-verifier-of-fifty-characters-0123456789abcd";
+const HOUR: u64 = 60 * 60 * 1000;
+const DAY: u64 = 24 * HOUR;
+
+struct NoDisplay;
+
+impl SetupCodeDisplay for NoDisplay {
+    fn show(&self, _code: &str) -> Result<(), String> {
+        Err("no screen".to_string())
+    }
+}
+
+struct Rig {
+    _scratch: Scratch,
+    _fake: arca_incus::FakeIncus,
+    socket: PathBuf,
+    state_dir: PathBuf,
+    clock: Arc<AtomicU64>,
+    oauth: Arc<OAuth>,
+    kernel: Arc<Mutex<arca::kernel::Kernel>>,
+    viewer: String,
+    _runtime: Runtime,
+}
+
+struct Reply {
+    status: u16,
+    head: String,
+    body: Vec<u8>,
+}
+
+impl Reply {
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+
+    fn header(&self, name: &str) -> Option<String> {
+        self.head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+}
+
+fn challenge_of(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn form(pairs: &[(&str, &str)]) -> String {
+    let encode = |text: &str| -> String {
+        text.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={}", encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// A query parameter of a URL, decoded.
+fn param(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| {
+            let bytes = v.as_bytes();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() + 1 {
+                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).expect("hex");
+                    out.push(u8::from_str_radix(hex, 16).expect("a hex byte"));
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            String::from_utf8(out).expect("utf-8")
+        })
+    })
+}
+
+impl Rig {
+    fn new(tag: &str) -> (Rig, SoftPasskey) {
+        let scratch = Scratch::new(tag);
+        let fake = start_fake(&scratch);
+        let key = SoftPasskey::from_seed(1);
+        let verifier =
+            verifier_with_passkeys(&scratch, &[], &format!("{}\n", key.line(NAMESPACE)), tag);
+        let kernel = Arc::new(Mutex::new(
+            kernel(&scratch, &fake, verifier, NOW).expect("the kernel opens"),
+        ));
+        let tokens_dir = scratch.path("tokens");
+        fs::create_dir(&tokens_dir).expect("the token directory");
+        fs::set_permissions(&tokens_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+        let (viewer, text) = arca_mcp::mint(Scope::Viewer);
+        let file = tokens_dir.join("viewer.hash");
+        fs::write(&file, text).expect("the hash file");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).expect("mode 0400");
+        let tokens = TokenStore::load(&tokens_dir).expect("the token store loads");
+        let state_dir = scratch.path("state");
+        fs::create_dir(&state_dir).expect("the state directory");
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+        let clock = Arc::new(AtomicU64::new(NOW));
+        let ticks = Arc::clone(&clock);
+        let clock_fn: Clock = Arc::new(move || ticks.load(Ordering::SeqCst));
+        let page = approve_page::Page::new(
+            ORIGIN.to_string(),
+            Arc::clone(&kernel),
+            clock_fn.clone(),
+            state_dir.clone(),
+            Arc::new(NoDisplay),
+        )
+        .with_log(Arc::new(|_| {}));
+        let oauth = Arc::new(
+            OAuth::open(ORIGIN, RP, Arc::clone(&kernel), clock_fn, &state_dir)
+                .expect("the store opens")
+                .with_log(Arc::new(|_| {})),
+        );
+        // The unix socket's router exactly as `serve` merges it.
+        let router = Server::new(arca_api::verbs(), tokens)
+            .oauth(
+                Arc::clone(&oauth) as Arc<dyn IssuedTokens>,
+                oauth.resource_metadata_url(),
+            )
+            .router()
+            .merge(page.router(false))
+            .merge(oauth.router())
+            .merge(page.local_router())
+            .merge(oauth.local_router());
+        let socket = scratch.path("serve.sock");
+        let runtime = Runtime::new().expect("a runtime");
+        let served = socket.clone();
+        runtime.spawn(async move {
+            let _ = serve_unix(router, &served).await;
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(Instant::now() < until, "the test server started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let rig = Rig {
+            _scratch: scratch,
+            _fake: fake,
+            socket,
+            state_dir,
+            clock,
+            oauth,
+            kernel,
+            viewer,
+            _runtime: runtime,
+        };
+        (rig, key)
+    }
+
+    fn advance(&self, millis: u64) {
+        self.clock.fetch_add(millis, Ordering::SeqCst);
+    }
+
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        content_type: &str,
+        body: &[u8],
+    ) -> Reply {
+        let mut stream = UnixStream::connect(&self.socket).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if !body.is_empty() {
+            head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        }
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        let mut bytes = head.into_bytes();
+        bytes.extend_from_slice(body);
+        stream.write_all(&bytes).expect("write");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read");
+        let split = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a response head");
+        let head = String::from_utf8_lossy(&raw[..split]).to_string();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse().ok())
+            .expect("a status");
+        Reply {
+            status,
+            head,
+            body: raw[split + 4..].to_vec(),
+        }
+    }
+
+    fn get(&self, path: &str) -> Reply {
+        self.send("GET", path, &[], "", b"")
+    }
+
+    fn page_post(&self, path: &str, body: Value) -> Reply {
+        self.send(
+            "POST",
+            path,
+            &[("Origin", ORIGIN)],
+            "application/json",
+            body.to_string().as_bytes(),
+        )
+    }
+
+    fn token(&self, pairs: &[(&str, &str)]) -> Reply {
+        self.send(
+            "POST",
+            "/oauth/token",
+            &[],
+            "application/x-www-form-urlencoded",
+            form(pairs).as_bytes(),
+        )
+    }
+
+    /// One MCP request with `bearer`, or none.
+    fn mcp(&self, bearer: Option<&str>, body: Value) -> Reply {
+        let auth = bearer.map(|token| format!("Bearer {token}"));
+        let headers: Vec<(&str, &str)> = auth
+            .as_deref()
+            .map(|value| vec![("Authorization", value)])
+            .unwrap_or_default();
+        self.send(
+            "POST",
+            "/mcp",
+            &headers,
+            "application/json",
+            body.to_string().as_bytes(),
+        )
+    }
+
+    fn tools(&self, bearer: &str) -> Vec<String> {
+        let reply = self.mcp(
+            Some(bearer),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        );
+        assert_eq!(reply.status, 200, "tools/list: {}", reply.text());
+        reply.json()["result"]["tools"]
+            .as_array()
+            .expect("a tool list")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("a name").to_string())
+            .collect()
+    }
+
+    fn register(&self, name: &str, redirects: &[&str]) -> Reply {
+        self.send(
+            "POST",
+            "/oauth/register",
+            &[],
+            "application/json",
+            json!({ "client_name": name, "redirect_uris": redirects, "token_endpoint_auth_method": "none" })
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
+    fn client(&self, name: &str) -> String {
+        let reply = self.register(name, &[REDIRECT]);
+        assert_eq!(reply.status, 201, "register: {}", reply.text());
+        reply.json()["client_id"]
+            .as_str()
+            .expect("a client id")
+            .to_string()
+    }
+
+    /// `GET /oauth/authorize` with the usual parameters, `changes` replacing or (with `None`) removing some.
+    fn authorize(&self, client: &str, changes: &[(&str, Option<&str>)]) -> Reply {
+        let challenge = challenge_of(VERIFIER);
+        let mut params: Vec<(&str, String)> = vec![
+            ("response_type", "code".to_string()),
+            ("client_id", client.to_string()),
+            ("redirect_uri", REDIRECT.to_string()),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256".to_string()),
+            ("state", "xyz-state".to_string()),
+            ("scope", "viewer".to_string()),
+            ("resource", format!("{ORIGIN}/mcp")),
+        ];
+        for (key, value) in changes {
+            params.retain(|(k, _)| k != key);
+            if let Some(value) = value {
+                params.push((key, value.to_string()));
+            }
+        }
+        let pairs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.get(&format!("/oauth/authorize?{}", form(&pairs)))
+    }
+
+    /// The consent request id a consent page carries.
+    fn request_id(reply: &Reply) -> String {
+        assert_eq!(reply.status, 200, "the consent page: {}", reply.text());
+        let text = reply.text();
+        let at = text.find("data-request=\"").expect("a request id") + 14;
+        text[at..at + text[at..].find('"').expect("its end")].to_string()
+    }
+
+    /// Begins and approves the consent request `id` with `key`; the page's answer.
+    fn approve_with(&self, key: &SoftPasskey, id: &str) -> Reply {
+        let begun = self.page_post("/oauth/authorize/begin", json!({ "id": id }));
+        assert_eq!(begun.status, 200, "begin: {}", begun.text());
+        let statement = begun.json()["statement"]
+            .as_str()
+            .expect("a statement")
+            .to_string();
+        let proof = key.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+        self.page_post(
+            "/oauth/authorize/approve",
+            json!({ "id": id, "statement": statement, "proof": proof }),
+        )
+    }
+
+    /// The whole flow for `client` at `scope`: consent, passkey, code. The code.
+    fn code(&self, key: &SoftPasskey, client: &str, scope: &str) -> String {
+        let page = self.authorize(client, &[("scope", Some(scope))]);
+        let id = Rig::request_id(&page);
+        let approved = self.approve_with(key, &id);
+        assert_eq!(approved.status, 200, "approve: {}", approved.text());
+        let redirect = approved.json()["redirect"]
+            .as_str()
+            .expect("a redirect")
+            .to_string();
+        assert!(redirect.starts_with(REDIRECT), "{redirect}");
+        assert_eq!(param(&redirect, "state").as_deref(), Some("xyz-state"));
+        assert_eq!(param(&redirect, "iss").as_deref(), Some(ORIGIN));
+        param(&redirect, "code").expect("a code")
+    }
+
+    fn exchange(&self, client: &str, code: &str) -> Reply {
+        self.token(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", client),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", VERIFIER),
+            ("resource", &format!("{ORIGIN}/mcp")),
+        ])
+    }
+
+    /// Access and refresh tokens for a new client at `scope`.
+    fn connected(&self, key: &SoftPasskey, name: &str, scope: &str) -> (String, String, String) {
+        let client = self.client(name);
+        let code = self.code(key, &client, scope);
+        let reply = self.exchange(&client, &code);
+        assert_eq!(reply.status, 200, "exchange: {}", reply.text());
+        let body = reply.json();
+        (
+            client,
+            body["access_token"].as_str().expect("access").to_string(),
+            body["refresh_token"].as_str().expect("refresh").to_string(),
+        )
+    }
+
+    fn refresh(&self, client: &str, refresh: &str, scope: Option<&str>) -> Reply {
+        let mut pairs = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("client_id", client),
+        ];
+        if let Some(scope) = scope {
+            pairs.push(("scope", scope));
+        }
+        self.token(&pairs)
+    }
+
+    /// The store as a restart reads it from disk.
+    fn reopened(&self) -> OAuth {
+        let ticks = Arc::clone(&self.clock);
+        OAuth::open(
+            ORIGIN,
+            RP,
+            Arc::clone(&self.kernel),
+            Arc::new(move || ticks.load(Ordering::SeqCst)),
+            &self.state_dir,
+        )
+        .expect("the store reopens")
+        .with_log(Arc::new(|_| {}))
+    }
+
+    /// `POST /oauth/revoke` of `token` for `client`.
+    fn revoke(&self, client: &str, token: &str) -> Reply {
+        self.send(
+            "POST",
+            "/oauth/revoke",
+            &[],
+            "application/x-www-form-urlencoded",
+            form(&[("token", token), ("client_id", client)]).as_bytes(),
+        )
+    }
+
+    fn journal(&self) -> String {
+        fs::read_to_string(self.state_dir.join(arca::mcp_oauth::JOURNAL_FILE)).unwrap_or_default()
+    }
+}
+
+fn error_of(reply: &Reply) -> String {
+    reply.json()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn an_mcp_client_given_only_the_url_is_told_where_to_ask_and_the_metadata_names_every_endpoint() {
+    let (rig, _) = Rig::new("oauth-discovery");
+    let reply = rig.mcp(
+        None,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert_eq!(reply.status, 401);
+    let challenge = reply.header("www-authenticate").expect("a challenge");
+    assert_eq!(
+        challenge,
+        format!(
+            "Bearer resource_metadata=\"{ORIGIN}/.well-known/oauth-protected-resource/mcp\", scope=\"viewer\""
+        )
+    );
+    // A token that is presented and not taken is told so (RFC 6750 3.1); with no token, the challenge stays bare.
+    let dead = rig.mcp(
+        Some("arca_at_0123456789012345678901234567890123456789012"),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert_eq!(dead.status, 401);
+    assert_eq!(
+        dead.header("www-authenticate").expect("a challenge"),
+        format!(
+            "Bearer error=\"invalid_token\", resource_metadata=\"{ORIGIN}/.well-known/oauth-protected-resource/mcp\", scope=\"viewer\""
+        )
+    );
+    for path in [
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource",
+    ] {
+        let metadata = rig.get(path);
+        assert_eq!(metadata.status, 200, "{path}");
+        let body = metadata.json();
+        assert_eq!(body["resource"], json!(format!("{ORIGIN}/mcp")));
+        assert_eq!(body["authorization_servers"], json!([ORIGIN]));
+        assert_eq!(
+            body["scopes_supported"],
+            json!(["viewer", "doctor", "operator"])
+        );
+    }
+    let server = rig.get("/.well-known/oauth-authorization-server").json();
+    assert_eq!(server["issuer"], json!(ORIGIN));
+    assert_eq!(
+        server["authorization_endpoint"],
+        json!(format!("{ORIGIN}/oauth/authorize"))
+    );
+    assert_eq!(
+        server["token_endpoint"],
+        json!(format!("{ORIGIN}/oauth/token"))
+    );
+    assert_eq!(
+        server["registration_endpoint"],
+        json!(format!("{ORIGIN}/oauth/register"))
+    );
+    assert_eq!(server["code_challenge_methods_supported"], json!(["S256"]));
+    assert_eq!(
+        server["token_endpoint_auth_methods_supported"],
+        json!(["none"])
+    );
+    assert_eq!(
+        server["authorization_response_iss_parameter_supported"],
+        json!(true)
+    );
+    // A browser client may read the metadata and register.
+    let preflight = rig.send(
+        "OPTIONS",
+        "/oauth/token",
+        &[("Origin", "https://inspector.example.com")],
+        "",
+        b"",
+    );
+    assert_eq!(preflight.status, 204);
+    assert_eq!(
+        preflight.header("access-control-allow-origin").as_deref(),
+        Some("*")
+    );
+}
+
+#[test]
+fn the_full_flow_registers_asks_the_owner_and_the_issued_token_calls_mcp_with_its_scope() {
+    let (rig, key) = Rig::new("oauth-flow");
+    let client = rig.client("Claude Code");
+    let page = rig.authorize(&client, &[]);
+    let text = page.text();
+    assert!(text.contains("Claude Code"), "the name is shown");
+    assert!(
+        text.contains("<strong id=\"redirect-host\">127.0.0.1</strong>"),
+        "the redirect host is shown"
+    );
+    assert!(text.contains("<strong id=\"scope\">viewer</strong>"));
+    assert!(!text.contains("name-shared"), "the name is unique");
+    assert!(
+        page.header("content-security-policy")
+            .is_some_and(|csp| csp.contains("script-src 'self'"))
+    );
+    let id = Rig::request_id(&page);
+    let approved = rig.approve_with(&key, &id);
+    assert_eq!(approved.status, 200, "{}", approved.text());
+    let redirect = approved.json()["redirect"]
+        .as_str()
+        .expect("a redirect")
+        .to_string();
+    let code = param(&redirect, "code").expect("a code");
+    let reply = rig.exchange(&client, &code);
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(reply.header("cache-control").as_deref(), Some("no-store"));
+    let body = reply.json();
+    assert_eq!(body["token_type"], json!("Bearer"));
+    assert_eq!(body["expires_in"], json!(3600));
+    assert_eq!(body["scope"], json!("viewer"));
+    let access = body["access_token"].as_str().expect("access").to_string();
+    let refresh = body["refresh_token"].as_str().expect("refresh").to_string();
+    assert!(access.starts_with("arca_at_") && refresh.starts_with("arca_rt_"));
+
+    // The issued viewer token sees exactly what the stored viewer token sees.
+    assert_eq!(rig.tools(&access), rig.tools(&rig.viewer));
+    // A verb above its scope is refused with a step-up challenge naming the scope it needs.
+    let refused = rig.mcp(
+        Some(&access),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "service_remove", "arguments": { "name": "nats" } } }),
+    );
+    assert_eq!(refused.status, 403);
+    let challenge = refused.header("www-authenticate").expect("a challenge");
+    assert!(
+        challenge.starts_with("Bearer error=\"insufficient_scope\", scope=\"doctor\""),
+        "{challenge}"
+    );
+
+    // The store keeps digests only; the journal names the grant and no secret.
+    let store =
+        fs::read_to_string(rig.state_dir.join(arca::mcp_oauth::STORE_FILE)).expect("the store");
+    for secret in [&access, &refresh, &code] {
+        assert!(!store.contains(secret.as_str()));
+        assert!(!rig.journal().contains(secret.as_str()));
+    }
+    let mode = fs::metadata(rig.state_dir.join(arca::mcp_oauth::STORE_FILE))
+        .expect("the store")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let journal = rig.journal();
+    assert!(journal.contains("\"event\":\"registered\""));
+    assert!(journal.contains("\"event\":\"granted\""));
+
+    // The owner's list shows it connected.
+    let list = rig.get("/approve/oauth/clients").json();
+    let app = &list["clients"][0];
+    assert_eq!(app["clientId"], json!(client));
+    assert_eq!(app["connected"], json!(true));
+    assert_eq!(app["redirectHosts"], json!(["127.0.0.1"]));
+    assert_eq!(app["grants"][0]["scope"], json!("viewer"));
+    assert!(app["grants"][0]["lastUsedAt"].is_string());
+}
+
+#[test]
+fn an_operator_grant_sees_operator_verbs_and_a_tool_list_narrows_it() {
+    let (rig, key) = Rig::new("oauth-operator");
+    let (_, operator, _) = rig.connected(&key, "Desktop", "viewer operator");
+    let tools = rig.tools(&operator);
+    assert!(tools.iter().any(|tool| tool == "token_list"));
+    assert!(tools.len() > rig.tools(&rig.viewer).len());
+    let (_, narrow, _) = rig.connected(&key, "Narrow", "operator tool:service_list");
+    assert_eq!(rig.tools(&narrow), vec!["service_list".to_string()]);
+}
+
+#[test]
+fn stored_tokens_work_exactly_as_before() {
+    let (rig, _) = Rig::new("oauth-static");
+    let tools = rig.tools(&rig.viewer);
+    assert!(tools.iter().any(|tool| tool == "arca_status"));
+    let refused = rig.mcp(
+        Some(&rig.viewer),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "service_remove", "arguments": { "name": "nats" } } }),
+    );
+    assert_eq!(refused.status, 403);
+    assert_eq!(
+        refused.header("www-authenticate"),
+        None,
+        "a stored token gets the bare 403"
+    );
+    // A stored token is not an issued one, and an issued-looking string is not a stored one.
+    assert!(rig.oauth.lookup(&rig.viewer).is_none());
+    let fake = format!("arca_at_{}", "A".repeat(43));
+    assert_eq!(
+        rig.mcp(
+            Some(&fake),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })
+        )
+        .status,
+        401
+    );
+}
+
+#[test]
+fn pkce_is_required_and_a_wrong_verifier_gets_no_token() {
+    let (rig, key) = Rig::new("oauth-pkce");
+    let client = rig.client("App");
+    let bad_pkce = [
+        vec![("code_challenge", None)],
+        vec![("code_challenge_method", Some("plain"))],
+        vec![("code_challenge_method", None)],
+        vec![("code_challenge", Some("short"))],
+    ];
+    // Before the owner approved the client, its redirect is not trusted: the error stays on the page.
+    for changes in &bad_pkce {
+        let reply = rig.authorize(&client, changes);
+        assert_eq!(reply.status, 400, "{changes:?}");
+        assert_eq!(reply.header("location"), None);
+        assert!(reply.text().contains("PKCE"), "{}", reply.text());
+    }
+    let first = rig.code(&key, &client, "viewer");
+    assert_eq!(rig.exchange(&client, &first).status, 200);
+    // Once the owner approved it, the error goes back to the client, with its state.
+    for changes in &bad_pkce {
+        let reply = rig.authorize(&client, changes);
+        assert_eq!(reply.status, 302, "{changes:?}");
+        let location = reply.header("location").expect("a redirect");
+        assert!(location.starts_with(REDIRECT));
+        assert_eq!(
+            param(&location, "error").as_deref(),
+            Some("invalid_request")
+        );
+        assert_eq!(param(&location, "state").as_deref(), Some("xyz-state"));
+    }
+    let code = rig.code(&key, &client, "viewer");
+    let wrong = rig.token(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("client_id", &client),
+        ("redirect_uri", REDIRECT),
+        (
+            "code_verifier",
+            "another-verifier-of-fifty-characters-0123456789abc",
+        ),
+    ]);
+    assert_eq!(wrong.status, 400);
+    assert_eq!(error_of(&wrong), "invalid_grant");
+    let missing = rig.token(&[
+        ("grant_type", "authorization_code"),
+        ("code", &rig.code(&key, &client, "viewer")),
+        ("client_id", &client),
+        ("redirect_uri", REDIRECT),
+    ]);
+    assert_eq!(error_of(&missing), "invalid_grant");
+}
+
+#[test]
+fn a_token_for_another_resource_is_never_issued() {
+    let (rig, key) = Rig::new("oauth-resource");
+    let client = rig.client("App");
+    let reply = rig.authorize(
+        &client,
+        &[("resource", Some("https://other.example.com/mcp"))],
+    );
+    assert_eq!(reply.status, 400);
+    assert_eq!(reply.header("location"), None);
+    assert!(
+        reply.text().contains("issues tokens for"),
+        "{}",
+        reply.text()
+    );
+    // The canonical form of this resource is accepted.
+    let fine = rig.authorize(
+        &client,
+        &[("resource", Some("HTTPS://BOX1.example.com:8443/mcp/"))],
+    );
+    assert_eq!(fine.status, 200, "{}", fine.text());
+    let code = rig.code(&key, &client, "viewer");
+    let wrong = rig.token(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("client_id", &client),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", VERIFIER),
+        ("resource", "https://other.example.com/mcp"),
+    ]);
+    assert_eq!(error_of(&wrong), "invalid_target");
+}
+
+#[test]
+fn redirects_are_exact_and_loopback_or_https() {
+    let (rig, key) = Rig::new("oauth-redirect");
+    for bad in [
+        "http://app.example.com/callback",
+        "javascript:alert(1)",
+        "https://app.example.com/cb#frag",
+        "http://127.0.0.1.example.com/cb",
+        "http://user@127.0.0.1/cb",
+    ] {
+        let reply = rig.register("Bad", &[bad]);
+        assert_eq!(reply.status, 400, "{bad}");
+        assert_eq!(error_of(&reply), "invalid_redirect_uri");
+    }
+    for good in [
+        "http://localhost:4567/cb",
+        "http://[::1]:4567/cb",
+        "https://app.example.com/oauth/cb",
+    ] {
+        assert_eq!(rig.register("Good", &[good]).status, 201, "{good}");
+    }
+    let client = rig.client("App");
+    let reply = rig.authorize(
+        &client,
+        &[("redirect_uri", Some("http://127.0.0.1:33419/callback"))],
+    );
+    assert_eq!(
+        reply.status, 400,
+        "a redirect it did not register is answered on the page"
+    );
+    assert!(reply.header("location").is_none());
+    let unknown = rig.authorize("mcpc-000000000000000000000000", &[]);
+    assert_eq!(unknown.status, 400);
+    assert!(unknown.header("location").is_none());
+    // The token request must name the redirect the code went to.
+    let code = rig.code(&key, &client, "viewer");
+    let other = rig.token(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("client_id", &client),
+        ("redirect_uri", "http://127.0.0.1:33419/callback"),
+        ("code_verifier", VERIFIER),
+    ]);
+    assert_eq!(error_of(&other), "invalid_grant");
+}
+
+#[test]
+fn only_the_owners_passkey_over_the_begun_statement_approves() {
+    let (rig, key) = Rig::new("oauth-passkey");
+    let client = rig.client("App");
+    let id = Rig::request_id(&rig.authorize(&client, &[]));
+    // Another passkey is refused, and nothing is approved.
+    let stranger = SoftPasskey::from_seed(2);
+    let refused = rig.approve_with(&stranger, &id);
+    assert_eq!(refused.status, 403, "{}", refused.text());
+    // A statement that is not the one begun is refused.
+    let begun = rig.page_post("/oauth/authorize/begin", json!({ "id": id }));
+    let statement = begun.json()["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let other = statement.replace("mcp_authorize", "service_remove");
+    let proof = key.proof_value(&Assert::over(NAMESPACE, other.as_bytes()));
+    let stale = rig.page_post(
+        "/oauth/authorize/approve",
+        json!({ "id": id, "statement": other, "proof": proof }),
+    );
+    assert_eq!(stale.status, 409);
+    // Without the page's Origin the consent POSTs are refused.
+    let no_origin = rig.send(
+        "POST",
+        "/oauth/authorize/begin",
+        &[],
+        "application/json",
+        json!({ "id": id }).to_string().as_bytes(),
+    );
+    assert_eq!(no_origin.status, 403);
+    // The owner's passkey approves once; the same request cannot be approved again.
+    let approved = rig.approve_with(&key, &id);
+    assert_eq!(approved.status, 200, "{}", approved.text());
+    let again = rig.page_post("/oauth/authorize/begin", json!({ "id": id }));
+    assert_eq!(again.status, 404);
+    // Deny sends access_denied back with the state.
+    let id = Rig::request_id(&rig.authorize(&client, &[]));
+    let denied = rig.page_post("/oauth/authorize/deny", json!({ "id": id }));
+    let redirect = denied.json()["redirect"]
+        .as_str()
+        .expect("a redirect")
+        .to_string();
+    assert_eq!(param(&redirect, "error").as_deref(), Some("access_denied"));
+    assert_eq!(param(&redirect, "state").as_deref(), Some("xyz-state"));
+}
+
+#[test]
+fn admin_is_never_granted_and_a_refresh_never_widens_the_scope() {
+    let (rig, key) = Rig::new("oauth-scope");
+    let client = rig.client("App");
+    let reply = rig.authorize(&client, &[("scope", Some("operator admin"))]);
+    assert_eq!(reply.status, 400);
+    assert!(
+        reply.text().contains("admin is never granted"),
+        "{}",
+        reply.text()
+    );
+
+    let (client, _, refresh) = rig.connected(&key, "Viewer app", "viewer");
+    let wider = rig.refresh(&client, &refresh, Some("doctor"));
+    assert_eq!(wider.status, 400);
+    assert_eq!(error_of(&wider), "invalid_scope");
+    // The refused refresh token still works, once.
+    let same = rig.refresh(&client, &refresh, Some("viewer"));
+    assert_eq!(same.status, 200, "{}", same.text());
+
+    let (client, _, refresh) = rig.connected(&key, "Tool app", "doctor tool:service_list");
+    let more = rig.refresh(
+        &client,
+        &refresh,
+        Some("doctor tool:service_list tool:node_metrics"),
+    );
+    assert_eq!(error_of(&more), "invalid_scope");
+    let narrower = rig.refresh(&client, &refresh, Some("viewer"));
+    assert_eq!(narrower.status, 200, "{}", narrower.text());
+    assert_eq!(narrower.json()["scope"], json!("viewer tool:service_list"));
+    // A narrowing refresh narrows that token pair only: a refresh with no scope gets what the owner approved back
+    // (RFC 6749 6), and asking for it again is no widening.
+    let next = narrower.json()["refresh_token"]
+        .as_str()
+        .expect("a refresh")
+        .to_string();
+    let back = rig.refresh(&client, &next, None);
+    assert_eq!(back.status, 200, "{}", back.text());
+    assert_eq!(back.json()["scope"], json!("doctor tool:service_list"));
+    let next = back.json()["refresh_token"]
+        .as_str()
+        .expect("a refresh")
+        .to_string();
+    let again = rig.refresh(&client, &next, Some("doctor"));
+    assert_eq!(again.status, 200, "{}", again.text());
+    assert_eq!(again.json()["scope"], json!("doctor tool:service_list"));
+}
+
+#[test]
+fn the_owners_list_shows_the_most_an_app_may_do_and_its_latest_use_after_a_step_up() {
+    let (rig, key) = Rig::new("oauth-two-grants");
+    // The documented path: the app connects as viewer, a doctor verb answers insufficient_scope, the owner approves doctor.
+    let client = rig.client("App");
+    let viewer = rig.exchange(&client, &rig.code(&key, &client, "viewer"));
+    assert_eq!(viewer.status, 200);
+    let viewer_access = viewer.json()["access_token"]
+        .as_str()
+        .expect("access")
+        .to_string();
+    assert_eq!(rig.tools(&viewer_access), rig.tools(&rig.viewer));
+    rig.advance(60_000);
+    let doctor = rig.exchange(&client, &rig.code(&key, &client, "doctor"));
+    assert_eq!(doctor.status, 200);
+    let doctor_access = doctor.json()["access_token"]
+        .as_str()
+        .expect("access")
+        .to_string();
+    rig.advance(60_000);
+    rig.tools(&doctor_access);
+    let list = rig.get("/approve/oauth/clients").json();
+    let app = &list["clients"][0];
+    assert_eq!(app["grants"].as_array().map(Vec::len), Some(2));
+    assert_eq!(app["grants"][0]["scope"], json!("viewer"));
+    assert_eq!(app["scope"], json!("doctor"));
+    assert_eq!(app["lastUsedAt"], app["grants"][1]["lastUsedAt"]);
+    assert_ne!(app["lastUsedAt"], app["grants"][0]["lastUsedAt"]);
+    // The card reads the app's own fields, never the first grant's.
+    let page = include_str!("../src/approve_page.html");
+    assert!(page.contains("fact(\"Allowed\", String(app.scope))"));
+    assert!(!page.contains("app.grants[0]"));
+}
+
+#[test]
+fn a_revocation_that_cannot_be_saved_is_refused_with_503_and_still_ends_the_grant_now() {
+    let (rig, key) = Rig::new("oauth-unsaved");
+    let (client, access, refresh) = rig.connected(&key, "App", "viewer");
+    let mode = |bits| {
+        fs::set_permissions(&rig.state_dir, fs::Permissions::from_mode(bits)).expect("chmod")
+    };
+    mode(0o500);
+    let reply = rig.send(
+        "POST",
+        "/oauth/revoke",
+        &[],
+        "application/x-www-form-urlencoded",
+        form(&[("token", &refresh), ("client_id", &client)]).as_bytes(),
+    );
+    mode(0o700);
+    assert_eq!(reply.status, 503, "{}", reply.text());
+    assert_eq!(error_of(&reply), "temporarily_unavailable");
+    let call = rig.mcp(
+        Some(&access),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert_eq!(call.status, 401);
+    // The journal says it, unsaved, and the store on disk still holds the grant.
+    assert!(
+        rig.journal().contains("\"event\":\"revoked\""),
+        "{}",
+        rig.journal()
+    );
+    assert!(
+        rig.journal().contains("\"saved\":false"),
+        "{}",
+        rig.journal()
+    );
+    assert!(rig.reopened().lookup(&access).is_some(), "not saved yet");
+    // The client's retry saves it, then answers 200: a restart no longer brings the grant back.
+    let retry = rig.revoke(&client, &refresh);
+    assert_eq!(retry.status, 200, "{}", retry.text());
+    assert!(
+        rig.reopened().lookup(&access).is_none(),
+        "saved by the retry"
+    );
+    assert!(
+        rig.journal().contains("\"event\":\"saved\""),
+        "{}",
+        rig.journal()
+    );
+}
+
+#[test]
+fn a_reused_code_or_refresh_token_that_cannot_be_saved_is_journalled_and_saved_by_the_next_revoke()
+{
+    let (rig, key) = Rig::new("oauth-unsaved-reuse");
+    let mode = |bits| {
+        fs::set_permissions(&rig.state_dir, fs::Permissions::from_mode(bits)).expect("chmod")
+    };
+    // A code used twice while the store cannot be written.
+    let client = rig.client("App");
+    let code = rig.code(&key, &client, "viewer");
+    let first = rig.exchange(&client, &code);
+    let access = first.json()["access_token"]
+        .as_str()
+        .expect("access")
+        .to_string();
+    mode(0o500);
+    let reused = rig.exchange(&client, &code);
+    mode(0o700);
+    assert_eq!(reused.status, 503, "{}", reused.text());
+    assert!(
+        rig.journal().contains("\"event\":\"code_reused\""),
+        "{}",
+        rig.journal()
+    );
+    assert!(rig.reopened().lookup(&access).is_some(), "not saved yet");
+    assert_eq!(rig.revoke(&client, "not-a-token").status, 200);
+    assert!(
+        rig.reopened().lookup(&access).is_none(),
+        "saved by the next revoke"
+    );
+    // A rotated refresh token used again while the store cannot be written.
+    let (client, access, first) = rig.connected(&key, "App 2", "viewer");
+    let rotated = rig.refresh(&client, &first, None);
+    assert_eq!(rotated.status, 200);
+    mode(0o500);
+    let reused = rig.refresh(&client, &first, None);
+    mode(0o700);
+    assert_eq!(reused.status, 503, "{}", reused.text());
+    let lines = rig.journal();
+    let line = lines
+        .lines()
+        .find(|line| line.contains("\"event\":\"refresh_reused\""))
+        .expect("journalled");
+    assert!(line.contains("\"saved\":false"), "{line}");
+    assert!(rig.reopened().lookup(&access).is_some(), "not saved yet");
+    assert_eq!(rig.revoke(&client, "not-a-token").status, 200);
+    assert!(
+        rig.reopened().lookup(&access).is_none(),
+        "saved by the next revoke"
+    );
+    let current = rotated.json()["refresh_token"]
+        .as_str()
+        .expect("refresh")
+        .to_string();
+    assert_eq!(
+        error_of(&rig.refresh(&client, &current, None)),
+        "invalid_grant"
+    );
+}
+
+#[test]
+fn refresh_tokens_rotate_and_one_used_again_ends_the_grant() {
+    let (rig, key) = Rig::new("oauth-rotate");
+    let (client, access, first) = rig.connected(&key, "App", "viewer");
+    let rotated = rig.refresh(&client, &first, None);
+    assert_eq!(rotated.status, 200, "{}", rotated.text());
+    let second = rotated.json()["refresh_token"]
+        .as_str()
+        .expect("a refresh")
+        .to_string();
+    let access2 = rotated.json()["access_token"]
+        .as_str()
+        .expect("an access")
+        .to_string();
+    assert_ne!(second, first);
+    assert_eq!(rig.tools(&access2), rig.tools(&rig.viewer));
+    // The first refresh token, used again: refused, and the whole grant ends.
+    let reused = rig.refresh(&client, &first, None);
+    assert_eq!(error_of(&reused), "invalid_grant");
+    assert_eq!(
+        error_of(&rig.refresh(&client, &second, None)),
+        "invalid_grant"
+    );
+    for token in [&access, &access2] {
+        let reply = rig.mcp(
+            Some(token),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        );
+        assert_eq!(reply.status, 401);
+    }
+    assert!(rig.journal().contains("\"event\":\"refresh_reused\""));
+}
+
+#[test]
+fn access_tokens_expire_in_an_hour_and_refresh_tokens_in_thirty_days() {
+    let (rig, key) = Rig::new("oauth-expiry");
+    let (client, access, refresh) = rig.connected(&key, "App", "viewer");
+    rig.advance(HOUR - 1000);
+    assert_eq!(rig.tools(&access), rig.tools(&rig.viewer));
+    rig.advance(2000);
+    let expired = rig.mcp(
+        Some(&access),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert_eq!(expired.status, 401);
+    let fresh = rig.refresh(&client, &refresh, None);
+    assert_eq!(fresh.status, 200);
+    let refresh = fresh.json()["refresh_token"]
+        .as_str()
+        .expect("a refresh")
+        .to_string();
+    rig.advance(30 * DAY + 1000);
+    assert_eq!(
+        error_of(&rig.refresh(&client, &refresh, None)),
+        "invalid_grant"
+    );
+    // A code lives a minute.
+    let client = rig.client("Late");
+    let code = rig.code(&key, &client, "viewer");
+    rig.advance(61_000);
+    assert_eq!(error_of(&rig.exchange(&client, &code)), "invalid_grant");
+}
+
+#[test]
+fn a_code_works_once_and_one_used_again_ends_what_it_made() {
+    let (rig, key) = Rig::new("oauth-code");
+    let client = rig.client("App");
+    let code = rig.code(&key, &client, "viewer");
+    let first = rig.exchange(&client, &code);
+    assert_eq!(first.status, 200);
+    let access = first.json()["access_token"]
+        .as_str()
+        .expect("access")
+        .to_string();
+    let second = rig.exchange(&client, &code);
+    assert_eq!(error_of(&second), "invalid_grant");
+    let reply = rig.mcp(
+        Some(&access),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert_eq!(reply.status, 401);
+    // A code is bound to its client.
+    let other = rig.client("Other");
+    let code = rig.code(&key, &client, "viewer");
+    let stolen = rig.token(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("client_id", &other),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", VERIFIER),
+    ]);
+    assert_eq!(error_of(&stolen), "invalid_grant");
+}
+
+#[test]
+fn a_revoked_client_loses_its_tokens_its_refresh_and_its_consent() {
+    let (rig, key) = Rig::new("oauth-revoke");
+    let (client, access, refresh) = rig.connected(&key, "App", "viewer");
+    // The page's revoke needs the page's Origin.
+    let no_origin = rig.send(
+        "POST",
+        "/approve/oauth/revoke",
+        &[],
+        "application/json",
+        json!({ "clientId": client }).to_string().as_bytes(),
+    );
+    assert_eq!(no_origin.status, 403);
+    assert_eq!(rig.tools(&access), rig.tools(&rig.viewer));
+    let revoked = rig.page_post("/approve/oauth/revoke", json!({ "clientId": client }));
+    assert_eq!(revoked.status, 200, "{}", revoked.text());
+    let reply = rig.mcp(
+        Some(&access),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert_eq!(reply.status, 401);
+    assert_eq!(
+        error_of(&rig.refresh(&client, &refresh, None)),
+        "invalid_grant"
+    );
+    assert_eq!(rig.authorize(&client, &[]).status, 400);
+    assert!(rig.journal().contains("\"event\":\"revoked\""));
+    let list = rig.get("/approve/oauth/clients").json();
+    assert_eq!(list["clients"], json!([]));
+}
+
+#[test]
+fn the_client_revokes_its_own_tokens_with_rfc_7009() {
+    let (rig, key) = Rig::new("oauth-7009");
+    let (client, access, refresh) = rig.connected(&key, "App", "viewer");
+    let revoke = |token: &str| {
+        rig.send(
+            "POST",
+            "/oauth/revoke",
+            &[],
+            "application/x-www-form-urlencoded",
+            form(&[("token", token), ("client_id", &client)]).as_bytes(),
+        )
+    };
+    assert_eq!(revoke(&access).status, 200);
+    let reply = rig.mcp(
+        Some(&access),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert_eq!(reply.status, 401);
+    // The refresh token still works after its access token is revoked; revoking it ends the grant.
+    let fresh = rig.refresh(&client, &refresh, None);
+    assert_eq!(fresh.status, 200);
+    let refresh = fresh.json()["refresh_token"]
+        .as_str()
+        .expect("a refresh")
+        .to_string();
+    assert_eq!(revoke(&refresh).status, 200);
+    assert_eq!(
+        error_of(&rig.refresh(&client, &refresh, None)),
+        "invalid_grant"
+    );
+    assert_eq!(revoke("not-a-token").status, 200);
+}
+
+#[test]
+fn two_clients_with_one_name_are_marked_on_the_consent_page() {
+    let (rig, _) = Rig::new("oauth-names");
+    let first = rig.client("Claude Code");
+    let page = rig.authorize(&first, &[]);
+    assert!(!page.text().contains("name-shared"));
+    let _second = rig.client("claude code ");
+    let page = rig.authorize(&first, &[]);
+    assert!(
+        page.text().contains("id=\"name-shared\""),
+        "{}",
+        page.text()
+    );
+    // A name is shown as text, never as markup.
+    let tricky = rig.client("<img src=x>");
+    let page = rig.authorize(&tricky, &[]);
+    assert!(page.text().contains("&lt;img src=x&gt;"));
+    assert!(!page.text().contains("<img src=x>"));
+}
+
+#[test]
+fn the_terminal_lists_and_revokes_with_its_proof_file_only() {
+    let (rig, key) = Rig::new("oauth-terminal");
+    let (client, access, _) = rig.connected(&key, "App", "viewer");
+    let proof = "0123456789abcdef0123456789abcdef";
+    let without = rig.send(
+        "POST",
+        "/local/oauth/clients",
+        &[],
+        "application/json",
+        json!({ "proof": proof }).to_string().as_bytes(),
+    );
+    assert_eq!(without.status, 403);
+    let write_proof = || {
+        let path = rig
+            .state_dir
+            .join(format!("{}{proof}", approve_page::LOCAL_PROOF_PREFIX));
+        fs::write(&path, b"").expect("the proof file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode 0600");
+    };
+    write_proof();
+    let list = rig.send(
+        "POST",
+        "/local/oauth/clients",
+        &[],
+        "application/json",
+        json!({ "proof": proof }).to_string().as_bytes(),
+    );
+    assert_eq!(list.status, 200, "{}", list.text());
+    assert_eq!(list.json()["clients"][0]["clientId"], json!(client));
+    write_proof();
+    let revoked = rig.send(
+        "POST",
+        "/local/oauth/revoke",
+        &[],
+        "application/json",
+        json!({ "proof": proof, "clientId": client })
+            .to_string()
+            .as_bytes(),
+    );
+    assert_eq!(revoked.status, 200, "{}", revoked.text());
+    let reply = rig.mcp(
+        Some(&access),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert_eq!(reply.status, 401);
+}
+
+#[test]
+fn grants_survive_a_restart_of_the_store() {
+    let (rig, key) = Rig::new("oauth-restart");
+    let (_, access, _) = rig.connected(&key, "App", "viewer");
+    let ticks = Arc::clone(&rig.clock);
+    let reopened = OAuth::open(
+        ORIGIN,
+        RP,
+        Arc::clone(&rig.kernel),
+        Arc::new(move || ticks.load(Ordering::SeqCst)),
+        &rig.state_dir,
+    )
+    .expect("the store opens again");
+    let caller = reopened.lookup(&access).expect("the token still works");
+    assert_eq!(caller.scope, Scope::Viewer);
+    assert!(caller.token_id.starts_with("oauth:mcpc-"));
+    // The audience: a server for another resource never accepts it (RFC 8707).
+    let ticks = Arc::clone(&rig.clock);
+    let elsewhere = OAuth::open(
+        "https://other.example.com",
+        "other.example.com",
+        Arc::clone(&rig.kernel),
+        Arc::new(move || ticks.load(Ordering::SeqCst)),
+        &rig.state_dir,
+    )
+    .expect("the store opens for another origin");
+    assert!(
+        elsewhere.lookup(&access).is_none(),
+        "a token is for its resource only"
+    );
+}

@@ -48,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arca_approval::load_state_passkeys;
 use arca_incus::{FakeIncus, FakeState, IncusRead as _};
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -1388,6 +1388,10 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only:
     );
     assert!(instance_exists(&fake, "nats"), "the approved change ran");
 
+    // 3b. An MCP client given only the URL: it registers, the owner approves it on the consent page with the same
+    //     passkey, the browser is sent back to the client with a code, and the code's token calls the MCP door.
+    connect_an_mcp_client(&mut chrome, &socket, &origin, &serve);
+
     // 4. The same page under the IP address is another origin: its POSTs are refused, and the browser itself refuses a
     //    passkey there, because an IP address is no relying party.
     chrome.page(
@@ -1421,4 +1425,164 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only:
 
     drop(chrome);
     assert_eq!(serve.terminate(), Some(0), "serve exits 0 on SIGTERM");
+}
+
+/// One request on the node's unix socket: its status and body.
+fn http(
+    socket: &Path,
+    path: &str,
+    content_type: &str,
+    body: &str,
+    bearer: Option<&str>,
+) -> (u16, String) {
+    let mut stream = UnixStream::connect(socket).expect("connect");
+    stream.set_read_timeout(Some(WAIT)).expect("a deadline");
+    let auth = bearer
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: arca\r\nContent-Type: {content_type}\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("send");
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).expect("read");
+    let status = reply
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status");
+    let text = reply
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or_default();
+    (status, text.to_string())
+}
+
+fn percent(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The MCP authorization flow with a real browser and a real authenticator: registration, the consent page, the
+/// passkey, the redirect to the client's loopback port, the code exchange and one MCP call with the issued token.
+fn connect_an_mcp_client(chrome: &mut Chrome, socket: &Path, origin: &str, serve: &Serve) {
+    let callback = std::net::TcpListener::bind("127.0.0.1:0").expect("the client's callback port");
+    let redirect = format!(
+        "http://127.0.0.1:{}/callback",
+        callback.local_addr().expect("addr").port()
+    );
+    let (status, body) = http(
+        socket,
+        "/oauth/register",
+        "application/json",
+        &json!({ "client_name": "Claude Code", "redirect_uris": [redirect] }).to_string(),
+        None,
+    );
+    assert_eq!(status, 201, "the client registers: {body}");
+    let client = serde_json::from_str::<Value>(&body).expect("JSON")["client_id"]
+        .as_str()
+        .expect("a client id")
+        .to_string();
+    let verifier = "a-browser-pkce-verifier-of-fifty-one-characters-012";
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let (sent, back) = mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = callback.accept() {
+            let mut buf = [0u8; 8192];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let line = String::from_utf8_lossy(&buf[..read])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = sent.send(line);
+        }
+    });
+    let url = format!(
+        "{origin}/oauth/authorize?response_type=code&client_id={client}&redirect_uri={}&code_challenge={challenge}&code_challenge_method=S256&state=browser-state&scope=viewer&resource={}",
+        percent(&redirect),
+        percent(&format!("{origin}/mcp"))
+    );
+    chrome.page("Page.navigate", json!({ "url": url }));
+    let deadline = Instant::now() + WAIT;
+    while chrome.eval("document.readyState === 'complete' && !!document.getElementById('approve')")
+        != json!(true)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the consent page loads; server log:\n{}",
+            serve.log_text()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        chrome.eval(
+            "[document.getElementById('client-name').textContent, document.getElementById('redirect-host').textContent, document.getElementById('scope').textContent, !!document.getElementById('name-shared')]"
+        ),
+        json!(["Claude Code", "127.0.0.1", "viewer", false]),
+        "the consent page names the app, where its answer goes and what it asks"
+    );
+    chrome.click("#approve");
+    let line = back.recv_timeout(WAIT).unwrap_or_else(|_| {
+        panic!(
+            "the browser is sent back to the app; the page says {}; server log:\n{}",
+            chrome.eval(
+                "document.getElementById('status') && document.getElementById('status').textContent"
+            ),
+            serve.log_text()
+        )
+    });
+    let query = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|target| target.split_once('?'))
+        .map(|(_, query)| query.to_string())
+        .expect("the callback has a query");
+    let field = |key: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{key}=")))
+            .map(str::to_string)
+    };
+    assert_eq!(field("state").as_deref(), Some("browser-state"));
+    let code = field("code").expect("a code");
+    let form = format!(
+        "grant_type=authorization_code&code={code}&client_id={client}&redirect_uri={}&code_verifier={verifier}&resource={}",
+        percent(&redirect),
+        percent(&format!("{origin}/mcp"))
+    );
+    let (status, body) = http(
+        socket,
+        "/oauth/token",
+        "application/x-www-form-urlencoded",
+        &form,
+        None,
+    );
+    assert_eq!(status, 200, "the code becomes a token: {body}");
+    let access = serde_json::from_str::<Value>(&body).expect("JSON")["access_token"]
+        .as_str()
+        .expect("an access token")
+        .to_string();
+    let (status, body) = http(
+        socket,
+        "/mcp",
+        "application/json",
+        &json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/list" }).to_string(),
+        Some(&access),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("\"arca_status\""),
+        "the issued viewer token lists the viewer's tools"
+    );
 }

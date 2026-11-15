@@ -1970,7 +1970,70 @@ What this is not: a client's `accept` is the client's answer. A hook of the clie
 can answer a form with no dialog) can give it with no person at the keyboard, so the admin token is a standing right to
 approve, held by whoever holds the token and its client. Keep it to the one terminal that should have it, and `arca
 token mint --replace` when it moves. Step-up authorization (a `403 insufficient_scope` that sends the person to the
-authorization server) would put the approval where the server can tell a person approved; it is not built here.
+authorization server) puts the approval where the server can tell a person approved; it is built for apps connected by
+their URL (next section), and never grants `admin`.
+
+### Connecting an app by its URL (MCP authorization)
+
+A node with an approval page (`approvalOrigin`) is also the OAuth 2.1 authorization server of its own MCP door, as the MCP
+specification's authorization chapter asks (revision 2025-11-25; 2026-07-28 keeps it). An MCP client such as Claude Code
+or Claude Desktop is given only the URL, `<approvalOrigin>/mcp`. Nobody copies a token.
+
+```text
+claude mcp add --transport http arca https://arca.example.com/mcp
+```
+
+In Claude Desktop, add a custom connector with the same URL. Then, in the client, connect (Claude Code: `/mcp`, pick
+`arca`, Authenticate). The browser opens Arca's consent page, which shows:
+
+- the app's name, as the app registered it, and a warning when another app registered the same name;
+- the host its answer goes to (`127.0.0.1` for an app on the computer you are using);
+- the scope it asks for, in words: `viewer` looks, `doctor` also creates, changes, starts and stops (what erases
+  still waits for your passkey), `operator` also lists tokens and settles plans.
+
+**Approve with passkey** signs you in and approves in one tap: the passkey signs a statement (action `mcp_authorize`, the
+app's client id, a digest of the whole request) that the kernel checks as it checks every approval, owner passkeys only,
+and spends once. **Don't allow** sends the app `access_denied`. A request that is wrong before you see it (no PKCE, a
+foreign `resource`, `admin`) is answered on the page itself while the app has never been approved, and sent back to the
+app only once you approved it before, so the page's address never becomes a link to a stranger's site.
+
+The app then holds an access token for one hour and a refresh token for thirty days. Each refresh token works once and is
+replaced at each refresh; one used a second time ends the grant, since someone holds a copy. A refresh may narrow the scope
+and never widen it past what you approved. Narrowing applies to the whole grant, its live tokens included, until a
+refresh that names no scope puts back what you approved. A token that is
+expired or revoked is answered `401` with `error="invalid_token"`. An app asks for `viewer` first; when it calls a verb above its scope, the door answers `403` with
+`WWW-Authenticate: Bearer error="insufficient_scope", scope="<scope the verb needs>"`, and the app asks you again for that
+scope. `admin` is never granted to an app: the admin token stays a stored one.
+
+The approval page lists the connected apps under **Connected apps**, each with the most it may do across its approvals
+and when it was last used, and **Disconnect**. On the node's own terminal:
+
+```text
+arca oauth list [--config <file>]
+arca oauth revoke <client id> [--config <file>]
+```
+
+Both act at once: the app's tokens stop working, and it must be approved again. Stored tokens (`arca token mint`) work
+exactly as before, beside the apps.
+
+What the node serves, all on `approvalOrigin`:
+
+| Path | What |
+| --- | --- |
+| `GET /.well-known/oauth-protected-resource/mcp` (and without `/mcp`) | RFC 9728 metadata: the resource `<origin>/mcp`, this issuer, the scopes |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata: `code` with PKCE `S256` only, public clients (`none`), the RFC 9207 `iss` |
+| `POST /oauth/register` | RFC 7591 registration: redirect URIs are exact, and `https`, or `http` on `127.0.0.1`, `[::1]` or `localhost` |
+| `GET /oauth/authorize` | the consent page; `resource` (RFC 8707) must be `<origin>/mcp` |
+| `POST /oauth/token` | `authorization_code` with the PKCE verifier, `refresh_token` with rotation |
+| `POST /oauth/revoke` | RFC 7009: an access token alone, or a refresh token and its grant; `503` when the revocation could not be saved (the grant has ended, and the journal says `"saved":false`); the retry saves it before it answers `200` |
+
+Files in the state directory: `mcp-oauth.json` (the apps and their grants, with only the SHA-256 of each token, mode 0600)
+and `mcp-oauth-journal.jsonl` (each registration, grant, denial and revocation, and each refresh token or code used twice;
+never a token). Consent requests (ten minutes) and codes (one minute, one use) are kept in memory only.
+
+The node must be reached at `approvalOrigin` by the app too: the reverse proxy or the tailnet listener that serves the
+page serves these routes and `/mcp` under the same name. A page at `http://localhost:<port>` serves an app on the same
+machine.
 
 ### Protocol versions
 

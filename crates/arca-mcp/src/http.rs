@@ -50,7 +50,7 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::StreamExt as _;
 
-use crate::auth::{Caller, TokenStore};
+use crate::auth::{Caller, IssuedTokens, TokenStore};
 use crate::elicit::TerminalApprover;
 use crate::fresh::{fresh_dir, process_uid};
 use crate::jsonrpc;
@@ -97,6 +97,8 @@ pub struct Server {
     terminal_timeout: Duration,
     /// Built by [`Server::router`] from the two above.
     pub(crate) terminal: Option<crate::elicit::Terminal>,
+    /// The authorization server's tokens and the URL of this server's protected resource metadata ([`Server::oauth`]).
+    oauth: Option<(Arc<dyn IssuedTokens>, String)>,
 }
 
 /// Answers one GET route with a body. The server runs it on a blocking thread, after the bearer check.
@@ -136,7 +138,73 @@ impl Server {
             approver: None,
             terminal_timeout: crate::elicit::DEFAULT_TIMEOUT,
             terminal: None,
+            oauth: None,
         }
+    }
+
+    /// Accepts the tokens an OAuth authorization server issued for this server, besides the stored ones, and names
+    /// `resource_metadata`, the URL of this server's protected resource metadata (RFC 9728), in every `401`:
+    /// `WWW-Authenticate: Bearer resource_metadata="<url>", scope="viewer"`, so an MCP client given only this server's URL
+    /// finds where to ask. A caller with an issued token refused a verb for its scope gets `403` with
+    /// `error="insufficient_scope"` and the scope the verb needs, so its client can ask the owner again. A stored token is
+    /// checked first and answered exactly as without this.
+    pub fn oauth(mut self, issued: Arc<dyn IssuedTokens>, resource_metadata: String) -> Self {
+        self.oauth = Some((issued, resource_metadata));
+        self
+    }
+
+    /// The caller of a request: a stored token first, then one the authorization server issued.
+    fn authenticate(&self, headers: &HeaderMap) -> Option<Caller> {
+        let token = bearer(headers)?;
+        self.tokens.lookup(token).or_else(|| {
+            self.oauth
+                .as_ref()
+                .and_then(|(issued, _)| issued.lookup(token))
+                .filter(Caller::is_issued)
+        })
+    }
+
+    /// `401`, naming the protected resource metadata when there is an authorization server. A request that presented a
+    /// token this server does not take (unknown, expired or revoked) is also told `invalid_token` (RFC 6750 3.1).
+    fn unauthorized(&self, headers: &HeaderMap) -> Response {
+        match &self.oauth {
+            Some((_, metadata)) => {
+                let error = if bearer(headers).is_some() {
+                    "error=\"invalid_token\", "
+                } else {
+                    ""
+                };
+                challenge(
+                    StatusCode::UNAUTHORIZED,
+                    &format!("Bearer {error}resource_metadata=\"{metadata}\", scope=\"viewer\""),
+                )
+            }
+            None => unauthorized(),
+        }
+    }
+
+    /// `403` for a caller the verb `name` does not admit: with `insufficient_scope` and the verb's scope for an issued
+    /// token, bare for a stored one.
+    fn forbidden(&self, caller: &Caller, name: &str) -> Response {
+        let (Some((_, metadata)), true) = (&self.oauth, caller.is_issued()) else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        let Some(verb) = self.verbs.iter().find(|verb| verb.name == name) else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        let mut scope = verb.min_scope.max(caller.scope).as_str().to_string();
+        if let Some(tools) = &caller.tools {
+            for tool in tools.iter().map(String::as_str).chain([verb.name]) {
+                scope.push_str(" tool:");
+                scope.push_str(tool);
+            }
+        }
+        challenge(
+            StatusCode::FORBIDDEN,
+            &format!(
+                "Bearer error=\"insufficient_scope\", scope=\"{scope}\", resource_metadata=\"{metadata}\""
+            ),
+        )
     }
 
     /// Lets the node's one `admin` token approve a waiting plan from the terminal of a client that declared MCP
@@ -250,8 +318,8 @@ async fn not_found() -> StatusCode {
 }
 
 async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes) -> Response {
-    let Some(caller) = bearer(&headers).and_then(|token| server.tokens.lookup(token)) else {
-        return unauthorized();
+    let Some(caller) = server.authenticate(&headers) else {
+        return server.unauthorized(&headers);
     };
     let mirrors = Mirrors {
         version: mirrored(&headers, "mcp-protocol-version"),
@@ -273,8 +341,8 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
         Ok(Some(answer)) if answer.stream.is_some() => sse(answer),
         Ok(Some(answer)) => (answer.status, Json(answer.body)).into_response(),
         Ok(None) => StatusCode::ACCEPTED.into_response(),
-        Err(CallError::Forbidden { .. }) => StatusCode::FORBIDDEN.into_response(),
-        Err(CallError::Unauthenticated) => unauthorized(),
+        Err(CallError::Forbidden { verb }) => server.forbidden(&caller, &verb),
+        Err(CallError::Unauthenticated) => server.unauthorized(&headers),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -307,8 +375,8 @@ async fn serve_get(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let Some(caller) = bearer(&headers).and_then(|token| server.tokens.lookup(token)) else {
-        return unauthorized();
+    let Some(caller) = server.authenticate(&headers) else {
+        return server.unauthorized(&headers);
     };
     // The route is its verb's reading over GET: a token the verb does not admit, by scope or by tool list, is refused
     // here as a `tools/call` of the verb is.
@@ -318,7 +386,7 @@ async fn serve_get(
         .find(|verb| verb.name == tool)
         .is_some_and(|verb| may_call(caller.scope, verb) && caller.allows_tool(verb.name));
     if !admitted {
-        return StatusCode::FORBIDDEN.into_response();
+        return server.forbidden(&caller, tool);
     }
     let query = uri.query().map(str::to_string);
     let outcome = tokio::task::spawn_blocking(move || handler.get(query.as_deref(), &caller)).await;
@@ -326,7 +394,7 @@ async fn serve_get(
         Ok(Ok(reply)) => ([(header::CONTENT_TYPE, reply.content_type)], reply.body).into_response(),
         Ok(Err(CallError::Invalid(_))) => StatusCode::BAD_REQUEST.into_response(),
         Ok(Err(CallError::Forbidden { .. })) => StatusCode::FORBIDDEN.into_response(),
-        Ok(Err(CallError::Unauthenticated)) => unauthorized(),
+        Ok(Err(CallError::Unauthenticated)) => server.unauthorized(&headers),
         Ok(Err(CallError::NotFound)) => StatusCode::NOT_FOUND.into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -338,6 +406,13 @@ fn unauthorized() -> Response {
         [(header::WWW_AUTHENTICATE, "Bearer")],
     )
         .into_response()
+}
+
+/// `status` with one `WWW-Authenticate` challenge. A value that is no header falls back to the bare scheme.
+fn challenge(status: StatusCode, value: &str) -> Response {
+    let value = header::HeaderValue::from_str(value)
+        .unwrap_or_else(|_| header::HeaderValue::from_static("Bearer"));
+    (status, [(header::WWW_AUTHENTICATE, value)]).into_response()
 }
 
 /// The header `name` of a request, which mirrors a field of its body. A header sent twice has no one value.
