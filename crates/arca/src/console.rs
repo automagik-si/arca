@@ -282,8 +282,9 @@ mod tests {
             is_leftover(&path, &seen, own_uid()),
             "the file the lstat saw"
         );
-        // Another file of the same shape in its place.
-        fs::remove_file(&path).expect("remove");
+        // Another file of the same shape in its place. The first is kept aside, not removed, so its inode stays in use and
+        // the substitute cannot be given the same one (ext4 reuses a freed inode at once).
+        fs::rename(&path, scratch.0.join("aside")).expect("set the first aside");
         let other = scratch.0.join("other");
         leftover(&other);
         fs::rename(&other, &path).expect("swap in a file");
@@ -349,8 +350,9 @@ mod tests {
             caller.tools,
             Some(CONSOLE_TOOLS.iter().map(|t| t.to_string()).collect())
         );
-        // Another file put in its place is not this process's, and a stop leaves it.
-        fs::remove_file(&path).expect("remove");
+        // Another file put in its place is not this process's, and a stop leaves it. The written file is kept aside, not
+        // removed, so its inode stays in use and the other file cannot be given the same one.
+        fs::rename(&path, scratch.0.join("aside")).expect("set the written file aside");
         fs::write(&path, "other\n").expect("other");
         console.remove_own();
         assert_eq!(fs::read_to_string(&path).expect("kept"), "other\n");
