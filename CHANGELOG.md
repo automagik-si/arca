@@ -10,11 +10,11 @@ Write under this comment only what a reader needs beyond those lines; the releas
 One MCP door reaches the whole fleet: every read the door serves, and `action_propose`, take an optional `node`, the
 name of one of `approval.linkedHosts` (`arca_status` lists them). The caller is checked on this kernel first, as for a
 call of its own; the call then runs on that node with its linked token, and its answer comes back as the node gave it,
-with `node` naming it. A proposal made this way waits on that node, and this kernel's approval page shows it with the
+with `linkedNode` naming it (every field the node wrote is kept, so the answer fits the tool's own schema). A proposal made this way waits on that node, and this kernel's approval page shows it with the
 machine named on the card. A name that is not linked is an invalid argument listing the linked names; a node that does
 not answer is refused `Unreachable`, and one that refuses the token `LinkToken`. Without `node` nothing changes. The
-linked kernel's token must admit the relayed verbs: the page's three-verb token does not (see "Asking a linked node" in
-OPERATING.md).
+linked kernel's token must admit the relayed verbs: the page's three-verb token does not. OPERATING.md ("Asking a linked
+node") gives the one `--tools` line to mint it with; never mint it without `--tools`.
 
 The `github-runner-pool` controller builds one runner image on its machine before it begins any slot: the pinned
 runner image with the Ubuntu packages of a new setting, `aptPackages` (by default `libatomic1`, `build-essential`,

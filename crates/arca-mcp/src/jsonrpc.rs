@@ -9,7 +9,7 @@
 //! method without an id is refused as an invalid request, so a write never runs with no answer to its caller. An `id` is
 //! a string or a number; a `null` id is invalid.
 
-use arca_api::verbs::{NODE, NOT_CONFIRMED, take_confirm};
+use arca_api::verbs::{LINKED_NODE, NODE, NOT_CONFIRMED, take_confirm};
 use std::sync::Arc;
 
 use arca_api::{Verb, conforms, may_call};
@@ -572,10 +572,11 @@ async fn call_tool(
     }
 }
 
-/// One call relayed to the linked node `node`: that node's reply as it wrote it, with `node` naming it in a result's
-/// structured content (a field the node wrote there under that key is kept as `nodeId`) or in a refusal's `data`, and a
-/// last text block naming it on a tool result that carries no structured content. A name that is not linked is an
-/// invalid argument; a node that cannot be asked is a refusal that names it.
+/// One call relayed to the linked node `node`: that node's reply as it wrote it, with [`LINKED_NODE`] naming it in a
+/// result's structured content or in a refusal's `data`, and a last text block naming it on a tool result that carries no
+/// structured content. Every field the node wrote is left as it wrote it, so the answer still fits the tool's own
+/// `outputSchema`. A name that is not linked is an invalid argument; a node that cannot be asked is a refusal that names
+/// it.
 async fn relay_to_node(
     server: &Arc<Server>,
     id: Value,
@@ -599,7 +600,7 @@ async fn relay_to_node(
         Ok(Err(refused)) if refused.refusal().is_some() => {
             let message = refused.refusal().map_or("", |(_, message)| message);
             let mut data = refused.refusal_data().unwrap_or_else(|| json!({}));
-            data[NODE] = json!(node);
+            data[LINKED_NODE] = json!(node);
             error_reply(id, REFUSED, message, Some(data))
         }
         Ok(Err(other)) => {
@@ -619,7 +620,7 @@ async fn relay_to_node(
     }
 }
 
-/// A linked node's JSON-RPC `reply` under this request's `id`, with `node` added (see [`relay_to_node`]).
+/// A linked node's JSON-RPC `reply` under this request's `id`, with [`LINKED_NODE`] added (see [`relay_to_node`]).
 fn relayed_reply(id: Value, node: &str, mut reply: Value) -> Value {
     if let Some(error) = reply.get_mut("error").filter(|error| error.is_object()) {
         let code = error["code"].as_i64().unwrap_or(REFUSED);
@@ -628,7 +629,7 @@ fn relayed_reply(id: Value, node: &str, mut reply: Value) -> Value {
             Some(Value::Object(data)) => data,
             _ => serde_json::Map::new(),
         };
-        data.insert(NODE.to_string(), json!(node));
+        data.insert(LINKED_NODE.to_string(), json!(node));
         return error_reply(id, code, &message, Some(Value::Object(data)));
     }
     let mut result = reply
@@ -639,13 +640,9 @@ fn relayed_reply(id: Value, node: &str, mut reply: Value) -> Value {
         .get_mut("structuredContent")
         .and_then(Value::as_object_mut)
     {
-        if let Some(own) = structured.insert(NODE.to_string(), json!(node))
-            && own != json!(node)
-        {
-            structured.insert("nodeId".to_string(), own);
-        }
+        structured.insert(LINKED_NODE.to_string(), json!(node));
     } else if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
-        content.push(json!({ "type": "text", "text": format!("{NODE}: {node}") }));
+        content.push(json!({ "type": "text", "text": format!("{LINKED_NODE}: {node}") }));
     }
     result_reply(id, result)
 }

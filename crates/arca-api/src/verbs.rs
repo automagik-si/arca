@@ -97,6 +97,11 @@ impl Verb {
 /// takes the argument out and relays the rest of the call to that node; absent, the call is this kernel's own.
 pub const NODE: &str = "node";
 
+/// The field that names the linked node a relayed answer came from: in a result's structured content, or in a refusal's
+/// `data`. No verb's result has a field of this name, so a relayed answer keeps every field the node wrote and still fits
+/// the tool's own `outputSchema`.
+pub const LINKED_NODE: &str = "linkedNode";
+
 /// The verbs that take [`NODE`]: every read the MCP door serves, and `action_propose`. Not the three `owner_approval_*`
 /// reads: their rows are the calling token's own requests, and a relayed call is the linked token's, never the caller's.
 pub const NODE_VERBS: [&str; 28] = [
@@ -133,7 +138,7 @@ pub const NODE_VERBS: [&str; 28] = [
 /// `schema` with the optional [`NODE`] property.
 fn with_node(mut schema: Value) -> Value {
     schema["properties"][NODE] = json!({
-        "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with node naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+        "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
         "maxLength": 253,
         "minLength": 1,
         "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",

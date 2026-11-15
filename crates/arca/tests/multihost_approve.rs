@@ -821,6 +821,8 @@ struct Fleet {
     agent: String,
     /// A viewer token of alpha's door that may read, and may not propose.
     reader: String,
+    /// A doctor token of alpha's door, for the writes no linked node is asked.
+    doctor: String,
     _scratch: Scratch,
     _runtime: Runtime,
 }
@@ -841,7 +843,8 @@ impl Fleet {
             arca_api::verbs(),
             TokenStore::load(&beta_tokens).expect("beta's tokens"),
         )
-        .handle("watch_report", Arc::new(Report("beta-web")));
+        .handle("watch_report", Arc::new(Report("beta-web")))
+        .handle("arca_status", Arc::new(status_of(&"b".repeat(64))));
         for (verb, handler) in plan_handlers_with(
             Arc::clone(&pair.beta),
             Arc::clone(&clock),
@@ -859,6 +862,8 @@ impl Fleet {
         let reads = ["watch_report".to_string(), "plan_list".to_string()];
         let (reader, reader_hash) = mint_with_tools(Scope::Viewer, Some(&reads));
         write_mode(&alpha_tokens.join("reader.hash"), &reader_hash, 0o400);
+        let (doctor, doctor_hash) = mint_with_tools(Scope::Doctor, None);
+        write_mode(&alpha_tokens.join("doctor.hash"), &doctor_hash, 0o400);
         let beta_socket = scratch.path("beta-fleet.sock");
         let mut alpha_door = Server::new(
             arca_api::verbs(),
@@ -877,6 +882,13 @@ impl Fleet {
                     name: "gamma".to_string(),
                     socket: scratch.path("gamma.sock"),
                     token_file: relay_file,
+                    incus_socket: None,
+                },
+                // Beta's page door, with the page's token: it admits only the three verbs the page relays.
+                LinkedHost {
+                    name: "beta-page".to_string(),
+                    socket: pair._beta_scratch.path("beta.sock"),
+                    token_file: pair.token_file.clone(),
                     incus_socket: None,
                 },
             ],
@@ -912,6 +924,7 @@ impl Fleet {
             door,
             agent,
             reader,
+            doctor,
             _scratch: scratch,
             _runtime: runtime,
         }
@@ -919,13 +932,17 @@ impl Fleet {
 
     /// One `tools/call` of `verb` on alpha's door with `token`: the HTTP status and the JSON-RPC reply.
     fn call(&self, token: &str, verb: &str, arguments: Value) -> (u16, Value) {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": { "name": verb, "arguments": arguments },
-        })
-        .to_string();
+        self.rpc(
+            token,
+            "tools/call",
+            json!({ "name": verb, "arguments": arguments }),
+        )
+    }
+
+    /// One JSON-RPC request of `method` on alpha's door with `token`: the HTTP status and the reply.
+    fn rpc(&self, token: &str, method: &str, params: Value) -> (u16, Value) {
+        let payload =
+            json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": params }).to_string();
         let request = format!(
             "POST /mcp HTTP/1.1\r\nHost: arca\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
@@ -954,9 +971,13 @@ impl Fleet {
     }
 
     fn propose_on(&self, token: &str, node: Option<&str>) -> (u16, Value) {
+        self.propose_named(token, node, "nats")
+    }
+
+    fn propose_named(&self, token: &str, node: Option<&str>, name: &str) -> (u16, Value) {
         let mut arguments = json!({
             "action": "service_create",
-            "args": { "name": "nats", "template": "nats", "templateDigest": "ab".repeat(32) },
+            "args": { "name": name, "template": "nats", "templateDigest": "ab".repeat(32) },
         });
         if let Some(node) = node {
             arguments["node"] = json!(node);
@@ -976,7 +997,7 @@ fn a_read_that_names_a_linked_node_answers_with_that_nodes_instances_and_names_i
         json!("beta-web"),
         "{reply}"
     );
-    assert_eq!(structured["node"], json!("beta"));
+    assert_eq!(structured["linkedNode"], json!("beta"));
 
     // Without `node` the call is this kernel's own, as it always was: no field is added.
     let (status, reply) = fleet.call(&fleet.agent, "watch_report", json!({}));
@@ -986,7 +1007,7 @@ fn a_read_that_names_a_linked_node_answers_with_that_nodes_instances_and_names_i
         structured["projects"][0]["instances"][0]["name"],
         json!("alpha-web")
     );
-    assert!(structured.get("node").is_none(), "{reply}");
+    assert!(structured.get("linkedNode").is_none(), "{reply}");
 }
 
 #[test]
@@ -996,7 +1017,7 @@ fn a_proposal_on_a_linked_node_waits_there_and_the_owner_approves_it_on_this_pag
     let (status, reply) = fleet.propose_on(&fleet.agent, Some("beta"));
     assert_eq!(status, 200, "{reply}");
     let proposal = &reply["result"]["structuredContent"];
-    assert_eq!(proposal["node"], json!("beta"), "{reply}");
+    assert_eq!(proposal["linkedNode"], json!("beta"), "{reply}");
     let id = proposal["id"].as_str().expect("an id").to_string();
     assert!(Pair::waiting(&pair.beta, &id), "it waits on beta");
     assert!(!Pair::waiting(&pair.alpha, &id), "nothing waits on alpha");
@@ -1032,7 +1053,10 @@ fn a_node_that_is_not_linked_is_an_invalid_argument_naming_the_linked_nodes() {
         text.starts_with("invalid_arguments: /node: not a linked node"),
         "{text}"
     );
-    assert!(text.ends_with("the linked nodes are beta, gamma"), "{text}");
+    assert!(
+        text.ends_with("the linked nodes are beta, gamma, beta-page"),
+        "{text}"
+    );
     assert!(
         !text.contains("delta"),
         "the refusal never echoes the value"
@@ -1048,7 +1072,7 @@ fn a_linked_node_that_does_not_answer_is_a_refusal_naming_it_never_this_kernels_
     assert!(reply.get("result").is_none(), "{reply}");
     assert_eq!(reply["error"]["code"], json!(-32000));
     assert_eq!(reply["error"]["data"]["refusal"], json!("Unreachable"));
-    assert_eq!(reply["error"]["data"]["node"], json!("gamma"));
+    assert_eq!(reply["error"]["data"]["linkedNode"], json!("gamma"));
     assert!(
         reply["error"]["message"]
             .as_str()
@@ -1078,5 +1102,146 @@ fn a_caller_that_may_not_propose_here_may_not_propose_on_a_linked_node() {
     // The reader still reads beta.
     let (status, reply) = fleet.call(&fleet.reader, "watch_report", json!({ "node": "beta" }));
     assert_eq!(status, 200);
-    assert_eq!(reply["result"]["structuredContent"]["node"], json!("beta"));
+    assert_eq!(
+        reply["result"]["structuredContent"]["linkedNode"],
+        json!("beta")
+    );
+}
+
+/// A status handler for a kernel whose node id is `node`, with no Incus to reach.
+fn status_of(node: &str) -> StatusHandler {
+    StatusHandler {
+        node: node.to_string(),
+        mode: "kernel",
+        applied_seq: AppliedSeq::default(),
+        started: Instant::now(),
+        socket: PathBuf::from("/nonexistent/incus.sock"),
+        metrics_source: Arc::new(Mutex::new(HostModeChoice {
+            mode: HostMode::Local,
+            reason: "the test names the local mode".to_string(),
+            provisional: false,
+        })),
+        approval: None,
+        loopback: None,
+        page: None,
+    }
+}
+
+/// A relayed answer keeps every field the node wrote, its own `node` id among them, and names the linked node in a field
+/// no result has: it fits the tool's advertised `outputSchema` and the verb's own result schema, so an SDK client that
+/// checks structured content against the schema accepts it.
+#[test]
+fn a_relayed_answer_fits_its_tools_output_schema_and_keeps_the_nodes_own_fields() {
+    let fleet = Fleet::new("mh-node-schema");
+    let (status, listed) = fleet.rpc(&fleet.agent, "tools/list", json!({}));
+    assert_eq!(status, 200, "{listed}");
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+    for verb in ["arca_status", "watch_report"] {
+        let advertised = tools
+            .iter()
+            .find(|tool| tool["name"] == json!(verb))
+            .map(|tool| tool["outputSchema"].clone())
+            .expect("the tool is listed");
+        let (status, reply) = fleet.call(&fleet.agent, verb, json!({ "node": "beta" }));
+        assert_eq!(status, 200, "{reply}");
+        let structured = &reply["result"]["structuredContent"];
+        assert_eq!(structured["linkedNode"], json!("beta"), "{reply}");
+        assert_eq!(
+            arca_api::conforms(&advertised, structured),
+            Ok(()),
+            "{verb}: the relayed answer fits the advertised outputSchema"
+        );
+        let own = (arca_api::verb(verb).expect("the verb").result)();
+        assert_eq!(
+            arca_api::conforms(&own, structured),
+            Ok(()),
+            "{verb}: the relayed answer fits the verb's result schema"
+        );
+    }
+    let (_, reply) = fleet.call(&fleet.agent, "arca_status", json!({ "node": "beta" }));
+    let structured = &reply["result"]["structuredContent"];
+    assert_eq!(
+        structured["node"],
+        json!("b".repeat(64)),
+        "beta's own node id"
+    );
+    assert!(structured.get("nodeId").is_none());
+}
+
+/// A refusal of the linked node's own comes back as it wrote it, its code and words, with the node named in `data`.
+#[test]
+fn a_refusal_of_the_linked_node_is_passed_on_with_the_node_named() {
+    let fleet = Fleet::new("mh-node-refusal");
+    // Eight proposals may wait on a kernel; beta refuses a ninth with its own code.
+    for n in 1..=8 {
+        let (status, reply) = fleet.propose_named(&fleet.agent, Some("beta"), &format!("nats{n}"));
+        assert_eq!(status, 200, "{reply}");
+        assert!(reply.get("result").is_some(), "{reply}");
+    }
+    let (status, reply) = fleet.propose_named(&fleet.agent, Some("beta"), "nats9");
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["error"]["code"], json!(-32000), "{reply}");
+    assert_eq!(reply["error"]["data"]["refusal"], json!("TooManyProposals"));
+    assert_eq!(reply["error"]["data"]["linkedNode"], json!("beta"));
+    assert_eq!(
+        fleet
+            .pair
+            .beta
+            .lock()
+            .expect("the kernel lock")
+            .action_proposals()
+            .len(),
+        8
+    );
+    assert!(
+        fleet
+            .pair
+            .alpha
+            .lock()
+            .expect("the kernel lock")
+            .action_proposals()
+            .is_empty(),
+        "nothing waits on alpha"
+    );
+}
+
+/// A linked node that refuses the token for the verb (the page's token admits three verbs) is refused `LinkToken`,
+/// naming it: never this kernel's own answer.
+#[test]
+fn a_linked_node_that_refuses_the_token_is_refused_link_token_naming_it() {
+    let fleet = Fleet::new("mh-node-token");
+    let (status, reply) = fleet.call(&fleet.agent, "watch_report", json!({ "node": "beta-page" }));
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply.get("result").is_none(), "{reply}");
+    assert_eq!(reply["error"]["code"], json!(-32000));
+    assert_eq!(reply["error"]["data"]["refusal"], json!("LinkToken"));
+    assert_eq!(reply["error"]["data"]["linkedNode"], json!("beta-page"));
+    let message = reply["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.contains("beta-page") && message.contains("watch_report"),
+        "{message}"
+    );
+}
+
+/// No write takes `node`: a write that names one is refused at this kernel's argument check, and nothing is relayed.
+#[test]
+fn a_write_that_names_a_node_is_refused_here_and_relays_nothing() {
+    let fleet = Fleet::new("mh-node-write");
+    let id = Pair::propose(&fleet.pair.beta);
+    let (status, reply) = fleet.call(
+        &fleet.doctor,
+        "plan_decline",
+        json!({ "plan": id, "node": "beta" }),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .expect("a text");
+    assert!(text.starts_with("invalid_arguments: "), "{text}");
+    assert!(text.contains("node"), "{text}");
+    assert!(
+        Pair::waiting(&fleet.pair.beta, &id),
+        "beta's plan still waits"
+    );
 }

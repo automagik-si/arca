@@ -1889,6 +1889,15 @@ fn node_is_an_optional_argument_of_every_read_and_of_action_propose_only() {
             );
         }
     }
+    // A relayed answer names its node in `linkedNode`: no result may have that field, so a relayed answer keeps every
+    // field the node wrote and fits the tool's own schema.
+    for v in verbs() {
+        assert!(
+            !mentions_key(&(v.result)(), arca_api::verbs::LINKED_NODE),
+            "{} has a result field named linkedNode",
+            v.name
+        );
+    }
     assert!(verb("action_propose").expect("present").takes_node());
     assert!(verb("watch_report").expect("present").takes_node());
     assert!(verb("route_list").expect("present").takes_node());
