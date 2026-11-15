@@ -1128,3 +1128,71 @@ fn snapshots_that_do_not_fit_leave_a_second_figure_that_says_it_fits_without_the
     assert!(detail.contains("fits without snapshots"), "{detail}");
     rig.assert_only_reads();
 }
+
+/// A stopped virtual machine `db` on pool `default` with a root disk of `size` (none when `None`).
+fn virtual_machine(size: Option<&str>) -> Value {
+    let mut root = json!({ "type": "disk", "path": "/", "pool": "default" });
+    if let Some(size) = size {
+        root["size"] = json!(size);
+    }
+    json!({
+        "name": "db", "project": "shop", "type": "virtual-machine", "status": "Stopped", "architecture": "x86_64",
+        "profiles": ["default"],
+        "config": { "volatile.eth0.hwaddr": "00:16:3e:00:00:09" },
+        "devices": { "root": root, "eth0": { "type": "nic", "network": "arcabr0" } }
+    })
+}
+
+/// A virtual machine's block disk cannot be walked: its size is the one Incus gives it (its root device's, else the
+/// pool's `volume.size`), counted whole, and a disk with no size Incus names is not measured. Nothing is written.
+#[test]
+fn a_virtual_machines_block_disk_is_sized_from_incus_and_counted_whole() {
+    for (driver, size, pool_size, expect) in [
+        ("ceph", Some("3GiB"), None, Some(3 * 1024 * MIB)),
+        ("zfs", Some("2147483648"), None, Some(2 * 1024 * MIB)),
+        ("lvm", None, Some("512MiB"), Some(512 * MIB)),
+        ("ceph", None, None, None),
+    ] {
+        let mut source = Host::new(false, "203.0.113.10");
+        source.instances = vec![virtual_machine(size)];
+        source.pools = vec![("default", driver, 0, 100 * 1024 * MIB)];
+        let mut target = Host::new(false, "203.0.113.20");
+        target.pools = vec![("default", driver, 0, 100 * 1024 * MIB)];
+        let rig = Rig::new(source, target);
+        if let Some(pool_size) = pool_size {
+            rig.source
+                .set_pool_config("default", json!({ "volume.size": pool_size }));
+        }
+        let answer = rig.preflight(&["db"]);
+        let size_check = check(&answer["rows"][0], "size");
+        match expect {
+            Some(bytes) => {
+                assert_eq!(size_check["ok"], true, "{driver}: {size_check:#}");
+                assert_eq!(size_check["measure"]["method"], "incus");
+                assert_eq!(size_check["measure"]["instanceBytes"], bytes);
+                assert_eq!(size_check["measure"]["neededBytes"], bytes + bytes / 10);
+                let detail = size_check["detail"].as_str().unwrap();
+                assert!(
+                    detail.contains(&format!(
+                        "from the sizes Incus gives: the virtual machine's {driver} disk"
+                    )),
+                    "{detail}"
+                );
+                assert!(
+                    size_check["risks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|risk| risk.as_str().unwrap().contains("counted at its whole size")),
+                    "{size_check:#}"
+                );
+            }
+            None => {
+                assert_eq!(size_check["ok"], false, "{size_check:#}");
+                let why = size_check["measure"]["notMeasured"].as_str().unwrap();
+                assert!(why.contains("has no size Incus names"), "{why}");
+            }
+        }
+        rig.assert_only_reads();
+    }
+}

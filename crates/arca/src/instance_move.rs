@@ -1,6 +1,6 @@
-//! Moving containers to a linked host: a frozen plan, one owner card, copy rounds while the container runs, a short
-//! cutover, checks, a measured downtime, and a rollback. The source is never deleted by the move; the owner finishes a
-//! verified move with a card of its own.
+//! Moving containers, and stopped virtual machines, to a linked host: a frozen plan, one owner card, copy rounds while
+//! the container runs, a short cutover, checks, a measured downtime, and a rollback. The source is never deleted by the
+//! move; the owner finishes a verified move with a card of its own.
 //!
 //! The rule above all: no path deletes the only copy of an instance, and no path leaves the source and its copy both
 //! running. A rollback and a finish act only on objects whose uuid this move recorded, after reading the other side
@@ -8,11 +8,12 @@
 //! source again only when the copy is read back gone or stopped; a finish deletes the source only when the copy is read
 //! back on the target with the uuid this move recorded when it made it.
 //!
-//! - `instance_move_plan` runs the whole `instance_move_preflight` again and freezes, for containers that all pass, a
+//! - `instance_move_plan` runs the whole `instance_move_preflight` again and freezes, for instances that all pass, a
 //!   plan named by its digest: a SHA-256 over the canonical plan without its times. A source that changes (its uuid,
 //!   devices, config, profiles or measured size) gives another digest. A no-go blocks the plan with the preflight's own
-//!   reasons; a virtual machine is not movable yet, and an ephemeral container, which Incus deletes when it stops, is
-//!   not movable at all. Nor is an instance while a copy an earlier move recorded may still run, read on its target. Plans are kept one file each in `instance-move-plans/`, and pruned a day after they expire.
+//!   reasons; a virtual machine that is not stopped is not movable yet, and an ephemeral container, which Incus deletes
+//!   when it stops, is not movable at all. Nor is an instance while a copy an earlier move recorded may still run, read
+//!   on its target. Plans are kept one file each in `instance-move-plans/`, and pruned a day after they expire.
 //! - The card is the action `instance_move` (`action_propose`), whose arguments carry the digest, the instances and the
 //!   target; the owner's passkey approves that digest, and the grant it arms is spent once.
 //! - `instance_move` (the approved run) refuses an expired, unknown, altered or already-run plan, an instance another
@@ -30,6 +31,29 @@
 //! secret: no websocket secret and no certificate, only the target certificate's fingerprint. A torn last line is
 //! skipped, and the next append starts on a new line. A move cannot begin unless its `plan` and `begin` lines are
 //! written, and an instance cannot go past its first round unless the `created` line (the uuid of the copy) is.
+//!
+//! A stopped virtual machine moves with no round while it runs and no stop: nothing here starts or stops it. Its copy is
+//! made once, consistent, and the same journal lines (`created`, `cutover`, `round`, `verify`, `result`) carry it, so the
+//! rollback, the recovery after a stopped kernel and the finish are the containers' own. It is copied one of two ways,
+//! fixed in the plan (`copy`):
+//!
+//! - `incus`: Incus on this host pushes it, with its snapshots and custom volumes, as it pushes a container's last round.
+//!   This needs the target to listen on the network, and is the way whenever the linked host names no Ceph cluster, or the
+//!   machine's pool is not Ceph on both sides (one Ceph cluster, or none).
+//! - `ceph`: the linked host names its Ceph cluster as this node reaches it (`approval.linkedHosts[].ceph`), and the
+//!   machine's pool here and its pool there are both Ceph pools: two clusters, either way (see [`crate::move_rbd`]). The
+//!   plan freezes, per Incus pool, the cluster, client and OSD pool each side is read or written with. The run reads every
+//!   source image first (who holds it open: anyone does, and nothing is made; and its size), then, per custom volume and
+//!   then for the machine, asks Incus on the target to make it empty at the source's exact size, journals its uuid, reads
+//!   the image Incus made back at that size, and copies with `rbd export-diff | rbd import-diff`. The source's cluster is
+//!   only read. Snapshots are not copied, and the machine gets a fresh UEFI variable store: a guest that boots only from
+//!   an NVRAM entry, with no fallback boot file, does not come up, fails its checks and is rolled back. Two sides naming
+//!   one OSD pool of one cluster are refused: Incus would make the copy's image beside the source's own.
+//!
+//! The copy then starts on the target once the source still reads Stopped, and counts only when its guest answers: its
+//! Incus agent, or an address on one of its network cards, within five times the checks' wait. A stopped machine's files
+//! cannot be read, so the spot-check stands on that answer. The source is never deleted by the move; on a failure the
+//! copy is deleted as for a container, and the source, never started, stopped or written, stays as it was.
 //!
 //! A move a stopped kernel left unfinished is not resumed. On the next start each instance without a result is settled:
 //! one whose checks passed is recorded as moved; one whose copy had been started is left as it stands (the copy may have
@@ -52,10 +76,11 @@ use arca_mcp::{CallError, Caller, ToolHandler};
 use serde_json::{Map, Value, json};
 
 use crate::action_proposal::ActionKind;
-use crate::config::{NodeConfig, host_name_ok};
+use crate::config::{LinkedCeph, NodeConfig, host_name_ok};
 use crate::handlers::Clock;
 use crate::kernel::Kernel;
 use crate::move_preflight::{MovePreflightHandler, human, instance_ok, project_ok, seg};
+use crate::move_rbd::{self, ProcessRunner, RbdImage, Runner};
 
 /// The move journal's file name in the state directory.
 pub const MOVES_FILE: &str = "instance-moves.jsonl";
@@ -86,6 +111,9 @@ const BUSY_RETRY: Duration = Duration::from_secs(30);
 const ASSUMED_RATE: u64 = 50 * 1024 * 1024;
 /// The seconds a card's estimate gives the stop, the start and the checks.
 const ASSUMED_STOP_START_SECONDS: u64 = 30;
+/// How long a moved virtual machine's guest is given to answer, five times the checks' own wait: a machine boots slower
+/// than a container starts.
+const VM_ANSWER_FACTOR: u32 = 5;
 
 fn refused(code: &str, message: impl Into<String>) -> CallError {
     CallError::Refused {
@@ -117,6 +145,11 @@ fn digest_ok(digest: &str) -> bool {
 /// Whether an instance may run, as its document reads: anything but Stopped (Running, Frozen, a status in between).
 fn running(doc: &Value) -> bool {
     doc.get("status") != Some(&json!("Stopped"))
+}
+
+/// Whether a plan's instance, or an Incus document, is a virtual machine.
+fn is_vm(doc: &Value) -> bool {
+    doc.get("type") == Some(&json!("virtual-machine"))
 }
 
 /// The append-only move journal.
@@ -439,9 +472,11 @@ fn config_digest(doc: &Value) -> String {
     digest_of(&Value::Object(kept))
 }
 
-/// A target's Incus, as this node reaches it: the socket the linked host's config names.
+/// A target's Incus, as this node reaches it: the socket the linked host's config names, and its Ceph cluster when the
+/// config names one.
 struct Target {
     socket: PathBuf,
+    ceph: Option<LinkedCeph>,
 }
 
 fn linked_target(cfg: &NodeConfig, name: &str) -> Result<Target, String> {
@@ -455,7 +490,10 @@ fn linked_target(cfg: &NodeConfig, name: &str) -> Result<Target, String> {
             "the linked host {name} has no incusSocket, so its Incus cannot be written from here"
         )
     })?;
-    Ok(Target { socket })
+    Ok(Target {
+        socket,
+        ceph: linked.ceph.clone(),
+    })
 }
 
 /// The transport facts of a target read from its server document: every address it listens on, in its order, and its
@@ -589,6 +627,213 @@ fn no_go_reasons(row: &Value, moved: &[String]) -> Vec<String> {
 /// counts all of `bytes`. The move measures the real one.
 fn estimated_downtime(bytes: u64) -> u64 {
     ASSUMED_STOP_START_SECONDS + bytes.div_ceil(ASSUMED_RATE)
+}
+
+/// A plan's rounds for one instance: `rounds` copy rounds while a container runs; none for a stopped virtual machine,
+/// whose one copy is its last round.
+fn rounds_of(vm: bool, rounds: u64) -> Value {
+    if vm {
+        return json!({ "preCopy": 0, "order": [] });
+    }
+    json!({
+        "preCopy": rounds,
+        "order": (1..=rounds)
+            .map(|round| if round == 1 {
+                "a full copy while it runs, not frozen, with its snapshots and custom volumes".to_string()
+            } else {
+                format!("refresh {} while it runs, not frozen (today Incus resends the whole volume: the hosts share no snapshot)", round - 1)
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// A plan's cutover for one instance, in order.
+fn cutover_of(vm: bool, by_ceph: bool, target: &str) -> Value {
+    if !vm {
+        return json!([
+            "stop the source",
+            "send the last round, consistent: the whole volume today",
+            "read the source back stopped",
+            "start the copy on the target"
+        ]);
+    }
+    let copy = if by_ceph {
+        format!(
+            "Incus on {target} makes the virtual machine and its custom volumes empty, of the source's sizes, and this node copies each disk by rbd export-diff | rbd import-diff, reading the source only"
+        )
+    } else {
+        "Incus pushes the virtual machine, with its snapshots and custom volumes, consistent: it is stopped".to_string()
+    };
+    json!([
+        "the virtual machine stays stopped: nothing here starts it",
+        copy,
+        "read the source back stopped",
+        "start the copy on the target"
+    ])
+}
+
+/// What a plan says it checks on one moved instance.
+fn verify_of(vm: bool, spot_check: &str) -> Value {
+    if vm {
+        return json!([
+            "the copy runs, and still runs after the checks",
+            "its guest answers: its Incus agent, or an address on one of its network cards",
+            "each custom volume is attached",
+        ]);
+    }
+    json!([
+        "the copy runs, and still runs after the checks",
+        "each network card that had an address has one",
+        "each TCP proxy on every address that answered here answers on the target",
+        "each custom volume is attached",
+        format!("the file {spot_check} is the same on both"),
+    ])
+}
+
+/// A stopped virtual machine's card row: the two nodes, its disk's size, what it needs there, that it stays stopped,
+/// and how it is copied.
+fn vm_row(instance: &Value, source: &str, target: &str) -> (String, String) {
+    let volumes = instance["volumes"].as_array().map_or(0, Vec::len);
+    let how = if instance["copy"] == "ceph" {
+        "by Ceph (rbd), disk by disk, without its snapshots"
+    } else {
+        "by an Incus push from this node, with its snapshots"
+    };
+    (
+        format!(
+            "Move {}/{} (virtual machine, stopped)",
+            instance["project"].as_str().unwrap_or("?"),
+            instance["name"].as_str().unwrap_or("?")
+        ),
+        format!(
+            "from {source} to {target}; its disk is {}{}; it needs {} on {target}'s pool {}; it stays stopped for the move and is copied {how}; about {} s at 50 MiB/s (the move measures the real time)",
+            human(instance["bytes"]["instance"].as_u64().unwrap_or(0)),
+            if volumes == 0 {
+                String::new()
+            } else {
+                format!(", with {volumes} custom volume(s)")
+            },
+            human(instance["bytes"]["needed"].as_u64().unwrap_or(0)),
+            instance["targetPool"].as_str().unwrap_or("?"),
+            instance["estimatedDowntimeSeconds"].as_u64().unwrap_or(0)
+        ),
+    )
+}
+
+/// The card's Ceph row: per virtual machine copied by Ceph, each pool's cluster, OSD pool and client on both sides.
+fn ceph_words(instances: &[&&Value], target: &str) -> String {
+    let side = |facts: &Value| {
+        format!(
+            "the cluster {}, pool {}, as client.{}",
+            facts["cluster"].as_str().unwrap_or("?"),
+            facts["pool"].as_str().unwrap_or("?"),
+            facts["client"].as_str().unwrap_or("?")
+        )
+    };
+    let mut words = Vec::new();
+    for instance in instances {
+        for (pool, facts) in instance["ceph"].as_object().into_iter().flatten() {
+            words.push(format!(
+                "{}/{} (pool {pool}): read only from {} here, written into {} for {target}",
+                instance["project"].as_str().unwrap_or("?"),
+                instance["name"].as_str().unwrap_or("?"),
+                side(&facts["from"]),
+                side(&facts["to"])
+            ));
+        }
+    }
+    format!(
+        "{}. rbd export-diff | rbd import-diff, two processes and a pipe on this node; the source is never written",
+        words.join("; ")
+    )
+}
+
+/// One Incus pool's Ceph facts, as its document says: its OSD pool, the client Incus uses, and its cluster. `None` when
+/// the pool cannot be read or is not a Ceph pool.
+fn ceph_side(writer: &MoveWriter, pool: &str) -> Option<(String, String, String)> {
+    let doc = writer
+        .get(&format!("/1.0/storage-pools/{}", seg(pool)))
+        .ok()?;
+    if text(&doc, "driver") != Some("ceph") {
+        return None;
+    }
+    let config = |key: &str, default: &str| {
+        doc["config"][key]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    };
+    Some((
+        config("ceph.osd.pool_name", pool),
+        config("ceph.user.name", "admin"),
+        config("ceph.cluster_name", "ceph"),
+    ))
+}
+
+/// How a stopped virtual machine is copied: by Ceph when the linked host names its Ceph cluster (`linked`) and the
+/// machine's pool here and its target pool there are both Ceph pools, by an Incus push otherwise (`Ok(Null)`). By Ceph,
+/// answers the facts per Incus pool here (its root's, and each custom volume's): the target pool, and the cluster, client
+/// and OSD pool each side is read or written with. The reasons a copy by Ceph cannot be made are the errors: a custom
+/// volume on a pool that is not Ceph on both hosts, or two sides that name one OSD pool of one cluster (Incus making the
+/// copy's image there would meet the source's own).
+fn ceph_plan(
+    source: &MoveWriter,
+    dest: Option<&MoveWriter>,
+    linked: Option<&LinkedCeph>,
+    (root_pool, root_target): (&str, &str),
+    volumes: &[Value],
+    target_name: &str,
+) -> Result<Value, Vec<String>> {
+    let (Some(linked), Some(dest)) = (linked, dest) else {
+        return Ok(Value::Null);
+    };
+    let (Some(_), Some(_)) = (ceph_side(source, root_pool), ceph_side(dest, root_target)) else {
+        return Ok(Value::Null);
+    };
+    let mut pools = vec![(root_pool.to_string(), root_target.to_string())];
+    for volume in volumes {
+        let pool = volume["pool"].as_str().unwrap_or_default().to_string();
+        if !pools.iter().any(|(here, _)| *here == pool) {
+            pools.push((pool.clone(), pool));
+        }
+    }
+    let mut plan = Map::new();
+    let mut reasons = Vec::new();
+    for (here, there) in pools {
+        let (Some(from), Some(to)) = (ceph_side(source, &here), ceph_side(dest, &there)) else {
+            reasons.push(format!(
+                "the custom volume pool {here} is not a Ceph pool on both this node and {target_name}: a virtual machine copied by Ceph takes Ceph images only"
+            ));
+            continue;
+        };
+        let (from_pool, from_client, from_cluster) = from;
+        let (to_pool, to_client, _) = to;
+        let from = json!({
+            "cluster": from_cluster,
+            "client": linked.read_client.clone().unwrap_or(from_client),
+            "pool": from_pool,
+        });
+        let to = json!({
+            "cluster": linked.cluster,
+            "client": linked.client.clone().unwrap_or(to_client),
+            "pool": to_pool,
+        });
+        if from["cluster"] == to["cluster"] && from["pool"] == to["pool"] {
+            reasons.push(format!(
+                "this node's pool {here} and {target_name}'s pool {there} name one OSD pool, {}, of one Ceph cluster, {}: the copy's images would be made beside the source's own",
+                to["pool"].as_str().unwrap_or("?"),
+                to["cluster"].as_str().unwrap_or("?")
+            ));
+            continue;
+        }
+        plan.insert(here, json!({ "targetPool": there, "from": from, "to": to }));
+    }
+    if reasons.is_empty() {
+        Ok(Value::Object(plan))
+    } else {
+        Err(reasons)
+    }
 }
 
 /// The TCP port of a proxy that listens on every address of its host (`0.0.0.0` or `::`).
@@ -899,6 +1144,8 @@ pub struct Moves {
     starting: Mutex<()>,
     poll: Duration,
     verify_wait: Duration,
+    /// What runs `rbd` for a virtual machine copied by Ceph.
+    ceph: Arc<dyn Runner>,
 }
 
 /// How a running copy stands.
@@ -949,7 +1196,14 @@ impl Moves {
             starting: Mutex::new(()),
             poll: Duration::from_secs(2),
             verify_wait: Duration::from_secs(60),
+            ceph: Arc::new(ProcessRunner),
         }
+    }
+
+    /// The same, running `rbd` through `runner` for the virtual machines it copies by Ceph.
+    pub fn with_ceph_runner(mut self, runner: Arc<dyn Runner>) -> Self {
+        self.ceph = runner;
+        self
     }
 
     /// The same, measuring the instances' storage folders under `root` (the folder that holds `storage-pools`).
@@ -1036,9 +1290,17 @@ impl Moves {
             .unwrap_or((Vec::new(), None));
         let mut blocked = Vec::new();
         let mut instances = Vec::new();
+        // The instances Incus pushes (every one not copied by Ceph): they need the target to listen.
+        let mut pushed = Vec::new();
         let records = fold(&self.journal.lines());
         for (index, one) in wanted.iter().enumerate() {
             let row = &preflight["rows"][index];
+            let size = row["checks"]
+                .as_array()
+                .and_then(|checks| checks.iter().find(|check| check["check"] == "size"))
+                .map(|check| check["measure"].clone())
+                .unwrap_or(Value::Null);
+            let mut ceph = Value::Null;
             let doc = source.get(&instance_path(&one.project, &one.name)).ok();
             let volumes = doc
                 .as_ref()
@@ -1050,10 +1312,14 @@ impl Moves {
                 .collect();
             let mut reasons = no_go_reasons(row, &moved);
             if let Some(doc) = &doc {
-                if text(doc, "type") == Some("virtual-machine") {
+                let vm = is_vm(doc);
+                if vm && text(doc, "status") != Some("Stopped") {
                     reasons.insert(
                         0,
-                        "virtual machines are not movable yet: this build moves containers only; a virtual machine's move (not live first) comes later".to_string(),
+                        format!(
+                            "the virtual machine is {}: this build moves a virtual machine only while it is stopped; stop it first (a running virtual machine's move comes later)",
+                            text(doc, "status").unwrap_or("in no status Incus names")
+                        ),
                     );
                 }
                 if doc.get("ephemeral") == Some(&json!(true)) {
@@ -1063,7 +1329,7 @@ impl Moves {
                 }
                 if uuid_of(doc).is_none() {
                     reasons.push(
-                        "the container has no volatile.uuid, so the move could not tell it from another of its name".to_string(),
+                        "the instance has no volatile.uuid, so the move could not tell it from another of its name".to_string(),
                     );
                 }
                 let probe = |target: &str, project: &str, name: &str, uuid: &str| {
@@ -1089,8 +1355,11 @@ impl Moves {
                         ));
                     }
                 }
-                // The spot-check file must be there now: a check that could never compare would always pass.
-                if let Err(error) = source.read_file(&one.project, &one.name, &one.spot_check) {
+                // The spot-check file must be there now: a check that could never compare would always pass. A stopped
+                // virtual machine's files cannot be read: its guest's answer stands for the check.
+                if !vm
+                    && let Err(error) = source.read_file(&one.project, &one.name, &one.spot_check)
+                {
                     reasons.push(format!(
                         "the spot-check file {} cannot be read in {}/{} ({error}); name a file the container holds",
                         one.spot_check, one.project, one.name
@@ -1118,6 +1387,23 @@ impl Moves {
                         }
                     }
                 }
+                if vm {
+                    let pools = (
+                        size["sourcePool"].as_str().unwrap_or_default(),
+                        size["targetPool"].as_str().unwrap_or_default(),
+                    );
+                    match ceph_plan(
+                        &source,
+                        target_writer.as_ref(),
+                        target.as_ref().ok().and_then(|t| t.ceph.as_ref()),
+                        pools,
+                        &volumes,
+                        target_name,
+                    ) {
+                        Ok(plan) => ceph = plan,
+                        Err(why) => reasons.extend(why),
+                    }
+                }
             }
             if !reasons.is_empty() {
                 blocked
@@ -1131,11 +1417,10 @@ impl Moves {
                 }));
                 continue;
             };
-            let size = row["checks"]
-                .as_array()
-                .and_then(|checks| checks.iter().find(|check| check["check"] == "size"))
-                .map(|check| check["measure"].clone())
-                .unwrap_or(Value::Null);
+            let vm = is_vm(&doc);
+            if ceph.is_null() {
+                pushed.push(json!({ "project": one.project, "name": one.name }));
+            }
             let driver = row["checks"]
                 .as_array()
                 .and_then(|checks| {
@@ -1179,24 +1464,11 @@ impl Moves {
                     "needed": size["neededBytes"],
                 },
                 "volumes": volumes,
-                "rounds": {
-                    "preCopy": rounds,
-                    "order": (1..=rounds)
-                        .map(|round| if round == 1 {
-                            "a full copy while it runs, not frozen, with its snapshots and custom volumes".to_string()
-                        } else {
-                            format!("refresh {} while it runs, not frozen (today Incus resends the whole volume: the hosts share no snapshot)", round - 1)
-                        })
-                        .collect::<Vec<_>>(),
-                },
-                "cutover": ["stop the source", "send the last round, consistent: the whole volume today", "read the source back stopped", "start the copy on the target"],
-                "verify": [
-                    "the copy runs, and still runs after the checks",
-                    "each network card that had an address has one",
-                    "each TCP proxy on every address that answered here answers on the target",
-                    "each custom volume is attached",
-                    format!("the file {} is the same on both", one.spot_check),
-                ],
+                "copy": if ceph.is_null() { "incus" } else { "ceph" },
+                "ceph": ceph,
+                "rounds": rounds_of(vm, rounds),
+                "cutover": cutover_of(vm, !ceph.is_null(), target_name),
+                "verify": verify_of(vm, &one.spot_check),
                 "spotCheck": one.spot_check,
                 "spotCheckOnVolume": on_volume,
                 "estimatedDowntimeSeconds": estimated_downtime(measured),
@@ -1220,7 +1492,7 @@ impl Moves {
                 "fallbackAvailable": false,
             }),
         };
-        if blocked.is_empty() && transport["mode"] == "relay" {
+        if blocked.is_empty() && transport["mode"] == "relay" && !pushed.is_empty() {
             let why = match &target {
                 Err(why) => why.clone(),
                 Ok(_) if server.is_none() => format!("{target_name}'s Incus could not be read"),
@@ -1228,9 +1500,9 @@ impl Moves {
                     "{target_name}'s Incus does not listen on the network (no core.https_address), so this host cannot push to it"
                 ),
             };
-            for one in wanted {
+            for one in pushed {
                 blocked.push(json!({
-                    "project": one.project, "name": one.name,
+                    "project": one["project"], "name": one["name"],
                     "reasons": [format!("{why}; a relay through this kernel is the fallback, and it is not available yet")],
                 }));
             }
@@ -1275,8 +1547,14 @@ impl Moves {
     /// The rows of a plan's card: one per instance, then the transport, the credential and the rollback.
     pub fn card_rows(plan: &Value) -> Vec<(String, String)> {
         let target = plan["target"]["name"].as_str().unwrap_or("?");
+        let source = plan["source"]["node"].as_str().unwrap_or("this node");
         let mut rows = Vec::new();
-        for instance in plan["instances"].as_array().into_iter().flatten() {
+        let instances: Vec<&Value> = plan["instances"].as_array().into_iter().flatten().collect();
+        for instance in &instances {
+            if is_vm(instance) {
+                rows.push(vm_row(instance, source, target));
+                continue;
+            }
             let needed = instance["bytes"]["needed"].as_u64().unwrap_or(0);
             let rounds = instance["rounds"]["preCopy"].as_u64().unwrap_or(0);
             let volumes = instance["volumes"].as_array().map_or(0, Vec::len);
@@ -1299,9 +1577,17 @@ impl Moves {
                 ),
             ));
         }
+        let pushes = instances.iter().any(|one| one["copy"] != "ceph");
+        let by_ceph: Vec<&&Value> = instances
+            .iter()
+            .filter(|one| one["copy"] == "ceph")
+            .collect();
         rows.push((
             "Transport".to_string(),
             match plan["transport"]["mode"].as_str() {
+                _ if !pushes => format!(
+                    "no Incus push: this node copies each disk by Ceph, and writes to {target}'s Incus only to make the empty virtual machine and to start it"
+                ),
                 Some("push") => format!(
                     "Incus on this host pushes to {target}'s Incus at {}",
                     plan["transport"]["addresses"]
@@ -1316,11 +1602,22 @@ impl Moves {
                 _ => "a relay through this kernel (not available yet)".to_string(),
             },
         ));
+        if !by_ceph.is_empty() {
+            rows.push(("Ceph".to_string(), ceph_words(&by_ceph, target)));
+        }
         rows.push((
             "Credential".to_string(),
             plan["credential"].as_str().unwrap_or_default().to_string(),
         ));
         rows.push(("Rollback".to_string(), ROLLBACK_PROMISE.to_string()));
+        if instances.iter().any(|one| is_vm(one)) {
+            rows.push((
+                "Stopped virtual machines".to_string(),
+                format!(
+                    "each stays stopped for its move: nothing here starts it, and its copy on {target} is started only once every disk is copied and the source still reads stopped. The move counts only when the copy runs and its guest answers; otherwise the copy is deleted and the source is left as it was"
+                ),
+            ));
+        }
         rows.push((
             "Source".to_string(),
             "kept, stopped, with boot.autostart off, on this host after a verified move: it is deleted only when you finish the move".to_string(),
@@ -1371,6 +1668,8 @@ impl Moves {
                 ("volumes", "its custom volumes"),
                 ("targetPool", "the target pool"),
                 ("spotCheckOnVolume", "where its spot-check file lives"),
+                ("copy", "how it is copied (an Incus push or Ceph)"),
+                ("ceph", "its Ceph clusters, pools or clients"),
             ] {
                 if a[key] != b[key] {
                     out.push(format!("{label}: {words}"));
@@ -1729,29 +2028,16 @@ impl Moves {
         dest: &MoveWriter,
         made: &mut Made,
     ) -> Result<u64, String> {
+        if is_vm(one) {
+            return self.attempt_vm(id, plan, one, source, dest, made);
+        }
         let project = one["project"].as_str().unwrap_or_default();
         let name = one["name"].as_str().unwrap_or_default();
         let pool = one["targetPool"].as_str().unwrap_or_default();
         let pre = one["rounds"]["preCopy"].as_u64().unwrap_or(DEFAULT_ROUNDS);
         let total_rounds = pre + 1;
         let target_name = plan["target"]["name"].as_str().unwrap_or("the target");
-        let server = dest
-            .get("/1.0")
-            .map_err(|error| format!("{target_name}'s Incus could not be read: {error}"))?;
-        let (addresses, certificate) = transport_facts(&server);
-        let Some(certificate) = certificate.filter(|_| !addresses.is_empty()) else {
-            return Err(format!(
-                "{target_name}'s Incus no longer listens on the network, so this host cannot push to it"
-            ));
-        };
-        if Some(Digest::of(certificate.as_bytes()).to_hex().as_str())
-            != plan["transport"]["certificateFingerprint"].as_str()
-        {
-            return Err(format!(
-                "{target_name}'s Incus certificate is not the one the plan named"
-            ));
-        }
-        let mut addresses = addresses;
+        let (mut addresses, certificate) = push_facts(plan, dest, target_name)?;
         let needed = one["bytes"]["needed"].as_u64().unwrap_or(0);
         let headroom = needed.saturating_sub(one["bytes"]["measured"].as_u64().unwrap_or(0));
         let addressed = nics_with_addresses(source, project, name);
@@ -1813,6 +2099,34 @@ impl Moves {
             (round, total_rounds),
             made,
         )?;
+        let target_host = host_of(&addresses);
+        self.start_and_check(
+            id,
+            plan,
+            one,
+            (source, dest),
+            made,
+            began,
+            (&target_host, &addressed, &before),
+        )
+    }
+
+    /// The end of an instance's move, once its last copy landed: the source read back Stopped, the copy started on the
+    /// target and checked. Answers the downtime from `began`, or why it failed.
+    #[allow(clippy::too_many_arguments)]
+    fn start_and_check(
+        &self,
+        id: &str,
+        plan: &Value,
+        one: &Value,
+        (source, dest): (&MoveWriter, &MoveWriter),
+        made: &Made,
+        began: Instant,
+        (target_host, addressed, before): (&str, &[String], &Before),
+    ) -> Result<u64, String> {
+        let project = one["project"].as_str().unwrap_or_default();
+        let name = one["name"].as_str().unwrap_or_default();
+        let target_name = plan["target"]["name"].as_str().unwrap_or("the target");
         if made.target_uuid.is_none() {
             return Err(
                 "the copy on the target was never recorded, so it is not started".to_string(),
@@ -1846,16 +2160,7 @@ impl Moves {
         self.set_live(id, project, name, |progress| {
             progress.phase = "verifying".to_string()
         });
-        let target_host = addresses
-            .first()
-            .and_then(|address| address.rsplit_once(':'))
-            .map(|(host, _)| {
-                host.trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_string()
-            })
-            .unwrap_or_default();
-        let checks = self.verify(source, dest, one, &target_host, &addressed, &before);
+        let checks = self.verify(source, dest, one, target_host, addressed, before);
         let ok = checks.iter().all(|check| check["ok"] == true);
         let downtime = began.elapsed().as_millis() as u64;
         let verified = self.note(json!({
@@ -1884,6 +2189,248 @@ impl Moves {
             return Err("the move journal could not record the passed checks".to_string());
         }
         Ok(downtime)
+    }
+
+    /// A stopped virtual machine's move: no rounds while it runs (it does not), one consistent copy, by an Incus push or
+    /// by Ceph as the plan says, then the start and the checks. Nothing here starts or stops the source: one that does not
+    /// read Stopped now fails before anything is made.
+    fn attempt_vm(
+        &self,
+        id: &str,
+        plan: &Value,
+        one: &Value,
+        source: &MoveWriter,
+        dest: &MoveWriter,
+        made: &mut Made,
+    ) -> Result<u64, String> {
+        let project = one["project"].as_str().unwrap_or_default();
+        let name = one["name"].as_str().unwrap_or_default();
+        let pool = one["targetPool"].as_str().unwrap_or_default();
+        let target_name = plan["target"]["name"].as_str().unwrap_or("the target");
+        self.set_live(id, project, name, |progress| {
+            progress.phase = "cutover".to_string();
+            progress.round = 1;
+        });
+        let status = source
+            .get(&instance_path(project, name))
+            .ok()
+            .and_then(|doc| text(&doc, "status").map(str::to_string))
+            .ok_or_else(|| "the source could not be read".to_string())?;
+        if status != "Stopped" {
+            return Err(format!(
+                "the virtual machine reads {status}, not Stopped: it moves only while it is stopped, so nothing was copied or made"
+            ));
+        }
+        let began = Instant::now();
+        if !self.note(json!({
+            "event": "cutover", "at": self.now(), "move": id, "project": project, "name": name,
+            "step": "stopped", "wasRunning": false,
+        })) {
+            return Err(
+                "the move journal could not record the cutover, so the move stops here".to_string(),
+            );
+        }
+        let needed = one["bytes"]["needed"].as_u64().unwrap_or(0);
+        self.check_room(dest, pool, needed, target_name)?;
+        let target_host = if one["copy"] == "ceph" {
+            self.copy_by_ceph(id, one, (source, dest), made)?;
+            String::new()
+        } else {
+            let (mut addresses, certificate) = push_facts(plan, dest, target_name)?;
+            self.copy_round(
+                id,
+                one,
+                (source, dest),
+                &mut addresses,
+                &certificate,
+                (1, 1),
+                made,
+            )?;
+            host_of(&addresses)
+        };
+        self.start_and_check(
+            id,
+            plan,
+            one,
+            (source, dest),
+            made,
+            began,
+            (&target_host, &[], &Before::default()),
+        )
+    }
+
+    /// Copies a stopped virtual machine and its custom volumes by Ceph. Every source image is read first: none may be
+    /// held open (a machine that runs somewhere holds its disk), and each one's size is read. Then, each custom volume and
+    /// then the machine: Incus on the target makes it empty, of its source's size; its uuid is journaled; the image Incus
+    /// made is read back at that size; and `rbd export-diff | rbd import-diff` copies the source's into it. The source is
+    /// only read.
+    fn copy_by_ceph(
+        &self,
+        id: &str,
+        one: &Value,
+        (source, dest): (&MoveWriter, &MoveWriter),
+        made: &mut Made,
+    ) -> Result<(), String> {
+        let project = one["project"].as_str().unwrap_or_default();
+        let name = one["name"].as_str().unwrap_or_default();
+        let started = Instant::now();
+        self.set_live(id, project, name, |progress| {
+            progress.done = 0;
+            progress.processed = None;
+            progress.speed = None;
+        });
+        let runner = self.ceph.as_ref();
+        let ceph = &one["ceph"];
+        let image = |pool: &str, side: &str, name: String| -> Result<RbdImage, String> {
+            let facts = &ceph[pool][side];
+            let field = |key: &str| {
+                facts[key]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("the plan names no Ceph {key} for the pool {pool}"))
+            };
+            Ok(RbdImage {
+                cluster: field("cluster")?,
+                client: field("client")?,
+                pool: field("pool")?,
+                image: name,
+            })
+        };
+        // What to copy: each custom volume, then the machine's own disk, with its source image.
+        let mut volumes = Vec::new();
+        for volume in one["volumes"].as_array().into_iter().flatten() {
+            let pool = volume["pool"].as_str().unwrap_or_default();
+            let volume_name = volume["name"].as_str().unwrap_or_default();
+            let here = volume["project"].as_str().unwrap_or("default");
+            let what = format!("the custom volume {pool}/{volume_name}");
+            let doc = source
+                .get(&volume_path(pool, volume_name, here))
+                .map_err(|error| format!("{what} could not be read here: {error}"))?;
+            let block = doc["content_type"] == "block";
+            let from = image(
+                pool,
+                "from",
+                move_rbd::incus_image("custom", here, volume_name, block),
+            )?;
+            volumes.push((volume, doc, block, from, what));
+        }
+        let root_pool = one["sourcePool"].as_str().unwrap_or_default();
+        let root = image(
+            root_pool,
+            "from",
+            move_rbd::incus_image("virtual-machine", project, name, true),
+        )?;
+        let mut sizes = Vec::new();
+        for from in volumes
+            .iter()
+            .map(|(_, _, _, from, _)| from)
+            .chain(std::iter::once(&root))
+        {
+            let held = move_rbd::watchers(runner, from)
+                .map_err(|why| format!("who holds {} could not be read: {why}", from.spec()))?;
+            if !held.is_empty() {
+                return Err(format!(
+                    "the image {} is held open by {}: the virtual machine may run somewhere, so nothing was copied or made",
+                    from.spec(),
+                    held.join(", ")
+                ));
+            }
+            sizes.push(
+                move_rbd::size(runner, from).map_err(|why| {
+                    format!("the size of {} could not be read: {why}", from.spec())
+                })?,
+            );
+        }
+        let mut moved = 0u64;
+        for ((volume, doc, block, from, what), bytes) in volumes.iter().zip(&sizes) {
+            let pool = volume["pool"].as_str().unwrap_or_default();
+            let volume_name = volume["name"].as_str().unwrap_or_default();
+            let there = volume["targetProject"].as_str().unwrap_or("default");
+            dest.create_empty_volume(there, pool, volume_name, doc, *bytes)
+                .map_err(|error| format!("the target did not make {what}: {error}"))?;
+            self.record(id, one, dest, made, Some(volume))?;
+            let to = image(
+                pool,
+                "to",
+                move_rbd::incus_image("custom", there, volume_name, *block),
+            )?;
+            self.copy_image(from, &to, *bytes, what)?;
+            moved += bytes;
+            self.set_live(id, project, name, |progress| progress.done = moved);
+        }
+        let what = format!("the virtual machine {project}/{name}");
+        let doc = source
+            .get(&instance_path(project, name))
+            .map_err(|error| format!("{what} could not be read here: {error}"))?;
+        made.source_autostart = Some(
+            doc["config"]["boot.autostart"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let (root_device, root_disk) = ["expanded_devices", "devices"]
+            .iter()
+            .filter_map(|key| doc[*key].as_object())
+            .flat_map(|devices| devices.iter())
+            .find(|(_, device)| is_root(device))
+            .map(|(device_name, device)| (device_name.clone(), device.clone()))
+            .ok_or_else(|| format!("{what} has no root disk device"))?;
+        let bytes = sizes.last().copied().unwrap_or(0);
+        let target_pool = ceph[root_pool]["targetPool"].as_str().unwrap_or(root_pool);
+        dest.create_empty_vm(
+            project,
+            name,
+            &doc,
+            (&root_device, &root_disk),
+            (target_pool, bytes),
+        )
+        .map_err(|error| format!("the target did not make {what}: {error}"))?;
+        self.record(id, one, dest, made, None)?;
+        let to = image(
+            root_pool,
+            "to",
+            move_rbd::incus_image("virtual-machine", project, name, true),
+        )?;
+        self.copy_image(&root, &to, bytes, &format!("{what}'s disk"))?;
+        moved += bytes;
+        let elapsed = started.elapsed().as_millis() as u64;
+        let rate = (elapsed > 0).then(|| moved.saturating_mul(1000) / elapsed.max(1));
+        self.note(json!({
+            "event": "round", "at": self.now(), "move": id, "project": project, "name": name,
+            "round": 1, "of": 1, "refresh": false, "final": true, "copy": "ceph",
+            "bytes": moved, "elapsedMs": elapsed, "rateBytesPerSecond": rate, "timeLeftMs": 0,
+        }));
+        Ok(())
+    }
+
+    /// Reads the image Incus made back at `bytes`, then copies `from` into it.
+    fn copy_image(
+        &self,
+        from: &RbdImage,
+        to: &RbdImage,
+        bytes: u64,
+        what: &str,
+    ) -> Result<(), String> {
+        let runner = self.ceph.as_ref();
+        let made = move_rbd::size(runner, to).map_err(|why| {
+            format!(
+                "the image {} Incus made for {what} could not be read: {why}",
+                to.spec()
+            )
+        })?;
+        if made != bytes {
+            return Err(format!(
+                "the image {} Incus made for {what} is {made} bytes and the source's {bytes}: nothing was copied into it",
+                to.spec()
+            ));
+        }
+        move_rbd::copy(runner, from, to).map_err(|why| {
+            format!(
+                "the copy of {what} from {} into {} failed: {why}",
+                from.spec(),
+                to.spec()
+            )
+        })
     }
 
     /// Records an object the first round made on the target, as soon as it landed: the copy's uuid, or a custom
@@ -2055,7 +2602,12 @@ impl Moves {
                 progress.processed = None;
             });
         }
-        let what = format!("the container {project}/{name}");
+        let kind = if is_vm(one) {
+            "virtual machine"
+        } else {
+            "container"
+        };
+        let what = format!("the {kind} {project}/{name}");
         let doc = source
             .get(&instance_path(project, name))
             .map_err(|error| format!("{what} could not be read here: {error}"))?;
@@ -2328,11 +2880,46 @@ impl Moves {
                 format!("port(s) {} answered here before the stop and do not answer on {target_host}{unprobed}", closed.join(", "))
             },
         }));
-        // A container has no guest agent.
-        checks.push(json!({
-            "check": "guestAgent", "ok": true,
-            "detail": "a container has no guest agent: not applicable",
-        }));
+        // A container has no guest agent. A virtual machine's guest must answer: its Incus agent, or an address on one of
+        // its cards (Incus reads a machine's leases without the agent), given five times the checks' wait to boot.
+        let vm = is_vm(one);
+        if vm {
+            let answer_until = Instant::now() + self.verify_wait * VM_ANSWER_FACTOR;
+            let mut answered = None;
+            loop {
+                if let Ok(state) = dest.get(&state_path) {
+                    if state["processes"].as_i64().is_some_and(|count| count > 0) {
+                        answered = Some("its Incus agent answers".to_string());
+                    } else if let Some(card) = state["network"]
+                        .as_object()
+                        .into_iter()
+                        .flat_map(|cards| cards.keys())
+                        .find(|card| card.as_str() != "lo" && has_global_address(&state, card))
+                    {
+                        answered = Some(format!("{card} has an address"));
+                    }
+                }
+                if answered.is_some() || Instant::now() >= answer_until {
+                    break;
+                }
+                std::thread::sleep(self.poll.min(Duration::from_millis(500)));
+            }
+            checks.push(json!({
+                "check": "guestAgent", "ok": answered.is_some(),
+                "detail": match answered {
+                    Some(how) => format!("the guest answers: {how}"),
+                    None => format!(
+                        "the guest did not answer within {} s: no Incus agent, and no address on any network card",
+                        (self.verify_wait * VM_ANSWER_FACTOR).as_secs()
+                    ),
+                },
+            }));
+        } else {
+            checks.push(json!({
+                "check": "guestAgent", "ok": true,
+                "detail": "a container has no guest agent: not applicable",
+            }));
+        }
         // The custom volumes are there and attached.
         let doc = dest.get(&path_of).ok();
         let mut detached = Vec::new();
@@ -2361,7 +2948,7 @@ impl Moves {
         checks.push(json!({
             "check": "volumes", "ok": detached.is_empty(),
             "detail": if volumes == 0 {
-                "the container has no custom volume".to_string()
+                format!("the {} has no custom volume", if vm { "virtual machine" } else { "container" })
             } else if detached.is_empty() {
                 format!("{volumes} custom volume(s) on the target and attached")
             } else {
@@ -2369,13 +2956,19 @@ impl Moves {
             },
         }));
         // The spot-check file is the same on both sides: the source's as read after the stop, or, for a file on a
-        // custom volume (a stopped container's volumes are not mounted), as read just before it.
+        // custom volume (a stopped container's volumes are not mounted), as read just before it. A stopped virtual
+        // machine's files cannot be read: its guest's answer stands for this check.
         let path = one["spotCheck"].as_str().unwrap_or(DEFAULT_SPOT_CHECK);
         let (reference, when) = match source.read_file(project, name, path) {
+            _ if vm => (None, ""),
             Ok(after) => (Some(after), "after the stop"),
             Err(_) => (before.spot.clone(), "just before the stop"),
         };
         let (ok, detail) = match reference {
+            None if vm => (
+                true,
+                "a stopped virtual machine's files cannot be read, so there is nothing to compare: its guest's answer stands for it".to_string(),
+            ),
             None => (
                 false,
                 format!(
@@ -2657,6 +3250,45 @@ fn refs_pairs(plan: &Value) -> Vec<MoveRef> {
             )
         })
         .collect()
+}
+
+/// The addresses the target's Incus listens on and its certificate, read now: the certificate must be the one the plan
+/// named, and the target must still listen.
+fn push_facts(
+    plan: &Value,
+    dest: &MoveWriter,
+    target_name: &str,
+) -> Result<(Vec<String>, String), String> {
+    let server = dest
+        .get("/1.0")
+        .map_err(|error| format!("{target_name}'s Incus could not be read: {error}"))?;
+    let (addresses, certificate) = transport_facts(&server);
+    let Some(certificate) = certificate.filter(|_| !addresses.is_empty()) else {
+        return Err(format!(
+            "{target_name}'s Incus no longer listens on the network, so this host cannot push to it"
+        ));
+    };
+    if Some(Digest::of(certificate.as_bytes()).to_hex().as_str())
+        != plan["transport"]["certificateFingerprint"].as_str()
+    {
+        return Err(format!(
+            "{target_name}'s Incus certificate is not the one the plan named"
+        ));
+    }
+    Ok((addresses, certificate))
+}
+
+/// The host part of the first address (`host:port`, `[v6]:port`), the one the checks probe.
+fn host_of(addresses: &[String]) -> String {
+    addresses
+        .first()
+        .and_then(|address| address.rsplit_once(':'))
+        .map(|(host, _)| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// The free bytes of a pool, as its resources say.
@@ -3232,7 +3864,7 @@ impl ToolHandler for MovePlanHandler {
         });
         let message = if planned.go {
             format!(
-                "planned {} container(s) to {target}: propose it with action_propose instance_move and the digest; the plan expires an hour after it was first made",
+                "planned {} instance(s) to {target}: propose it with action_propose instance_move and the digest; the plan expires an hour after it was first made",
                 wanted.len()
             )
         } else {

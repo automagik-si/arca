@@ -241,6 +241,8 @@ struct Shared {
     resources: Mutex<Option<Value>>,
     /// The driver each pool's own document names, by pool, set by [`FakeIncus::set_pool_driver`].
     pool_drivers: Mutex<BTreeMap<String, String>>,
+    /// The `config` a pool's document answers, by pool: `{}` when none was set.
+    pool_configs: Mutex<BTreeMap<String, Value>>,
     /// The migrations this fake receives and sends ([`FakeIncus::link_migration`]).
     migration: Mutex<MigrationFake>,
     /// The fake a push from this one lands on, as a target daemon on the network would take it.
@@ -268,6 +270,8 @@ struct Store {
     live: BTreeMap<(String, String), Value>,
     /// The root disk usage, in bytes, an instance reports in its state, by project and name.
     disk_usage: BTreeMap<(String, String), u64>,
+    /// The instances, by project and name, whose guest has no Incus agent: a running one reports `processes: -1`.
+    agentless: std::collections::BTreeSet<(String, String)>,
 }
 
 /// One DHCP lease: the network, the MAC that holds it and its address, and whether a device's `ipv4.address` pinned it.
@@ -431,6 +435,7 @@ impl Shared {
             usage: BTreeMap::new(),
             live: BTreeMap::new(),
             disk_usage: BTreeMap::new(),
+            agentless: std::collections::BTreeSet::new(),
         };
         for index in 0..store.objects.len() {
             store.expand(index, false);
@@ -461,6 +466,7 @@ impl Shared {
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
             pool_drivers: Mutex::new(BTreeMap::new()),
+            pool_configs: Mutex::new(BTreeMap::new()),
             migration: Mutex::new(MigrationFake::default()),
             peer: Mutex::new(None),
         }
@@ -584,6 +590,11 @@ impl FakeIncus {
     /// holds answers `dir` until a test names another; a pool it does not hold answers 404. It records no write.
     pub fn set_pool_driver(&self, pool: &str, driver: &str) {
         lock(&self.shared.pool_drivers).insert(pool.to_string(), driver.to_string());
+    }
+
+    /// Sets the `config` the pool's document answers (`ceph.osd.pool_name`, `volume.size`, ...). It records no write.
+    pub fn set_pool_config(&self, pool: &str, config: Value) {
+        lock(&self.shared.pool_configs).insert(pool.to_string(), config);
     }
 
     /// Puts a network ACL in `project`, as a create by hand would. It records no write.
@@ -842,6 +853,15 @@ impl FakeIncus {
         store
             .disk_usage
             .insert((project.to_string(), name.to_string()), bytes);
+    }
+
+    /// The instance `name` in `project`, held now or made later (a move's copy), has no Incus agent in its guest: running,
+    /// its `state` reports `processes: -1`, as Incus does for a virtual machine whose agent does not answer. Every other
+    /// running instance reports one process. It records no write.
+    pub fn agentless(&self, project: &str, name: &str) {
+        lock(&self.shared.store)
+            .agentless
+            .insert((project.to_string(), name.to_string()));
     }
 
     /// Sets the network cards the running instance `name` in `project` reports in its live state, as a guest's agent does:
@@ -1642,7 +1662,13 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                     .get(&pool)
                     .cloned()
                     .unwrap_or_else(|| "dir".to_string());
-                sync(json!({ "name": pool, "driver": driver, "status": "Created", "config": {} }))
+                let config = lock(&shared.pool_configs)
+                    .get(&pool)
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                sync(
+                    json!({ "name": pool, "driver": driver, "status": "Created", "config": config }),
+                )
             } else {
                 (404, String::new(), error_envelope(404, "not found"))
             }
@@ -3581,9 +3607,20 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
         .copied()
         .filter(|_| running)
         .unwrap_or((0, 0));
+    let processes: i64 = if !running {
+        0
+    } else if store
+        .agentless
+        .contains(&(object.project.clone(), object.name.clone()))
+    {
+        -1
+    } else {
+        1
+    };
     let mut state = json!({
         "status": status,
         "status_code": if running { 103 } else { 102 },
+        "processes": processes,
         "network": network,
         "cpu": { "usage": cpu_ns },
         "memory": { "usage": memory },

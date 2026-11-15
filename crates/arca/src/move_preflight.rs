@@ -482,6 +482,14 @@ fn measure_path(path: &Path) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// The bytes a size Incus writes names: a plain count of bytes, or a count with a unit (`10GiB`, `512MB`).
+fn size_of(text: &str) -> Option<u64> {
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        return text.parse().ok();
+    }
+    crate::service::size_bytes(text).and_then(|bytes| u64::try_from(bytes).ok())
+}
+
 /// Whether `path` is where a file system is mounted: its device is not its parent's. A zfs, lvm or ceph volume of a
 /// container is there only while Incus has it mounted.
 fn is_mount_point(path: &Path) -> bool {
@@ -581,6 +589,9 @@ fn baseline(architecture: &str, flags: &BTreeSet<String>) -> Option<String> {
 /// What the size check measured, part by part. A part is `None` when the measuring stopped before it.
 #[derive(Default)]
 struct Parts {
+    /// How the size was found: `walked` (the folders here) or `incus` (a virtual machine's block disk, by its size in
+    /// Incus).
+    method: Option<&'static str>,
     path: Option<String>,
     instance: Option<u64>,
     snapshots: Option<u64>,
@@ -754,7 +765,7 @@ impl Run<'_> {
                 return check;
             }
         };
-        measure["method"] = json!("walked");
+        measure["method"] = json!(parts.method.unwrap_or("walked"));
         let headroom = bytes / 10;
         let needed = bytes.saturating_add(headroom);
         measure["measuredBytes"] = json!(bytes);
@@ -862,7 +873,8 @@ impl Run<'_> {
 
     /// The bytes of one volume's folder at `path` on the pool `pool`: walked on btrfs and dir, walked on zfs, lvm and ceph
     /// only where Incus has the volume mounted, and never Incus's own usage figure, which leaves out data a zfs clone
-    /// shares with its image. A virtual machine's disk on a block driver, and an unknown driver, are not measured.
+    /// shares with its image. A virtual machine's disk on a block driver is not walked ([`Run::vm_disk_bytes`] sizes it), and
+    /// an unknown driver is not measured.
     fn measure_volume(&self, path: &Path, pool: &str, vm: bool, what: &str) -> Result<u64, String> {
         match self.pool_driver(pool).as_deref() {
             Some("btrfs" | "dir") => measure_path(path),
@@ -901,6 +913,10 @@ impl Run<'_> {
         let source_pool = Self::source_pool(instance)
             .ok_or_else(|| "the instance has no root disk with a pool here".to_string())?;
         let vm = text(instance, "type") == Some("virtual-machine");
+        let driver = self.pool_driver(&source_pool);
+        // A virtual machine's disk on a block driver is one block volume this host cannot walk: its size is the one
+        // Incus gives it, the most it can hold.
+        let block_vm = vm && matches!(driver.as_deref(), Some("zfs" | "lvm" | "ceph"));
         let (folder, snapshot_folder) = if vm {
             ("virtual-machines", "virtual-machines-snapshots")
         } else {
@@ -912,9 +928,31 @@ impl Run<'_> {
             .join(folder)
             .join(stored(project, name));
         parts.path = Some(path.display().to_string());
-        let own = self.measure_volume(&path, &source_pool, vm, &label)?;
+        let (own, first) = if block_vm {
+            let (bytes, from) =
+                self.vm_disk_bytes(project, name, &source_pool, instance, &label)?;
+            parts.method = Some("incus");
+            parts.risks.push(
+                "a virtual machine's block disk is counted at its whole size, the most its copy can take; a thin copy takes less"
+                    .to_string(),
+            );
+            (
+                bytes,
+                format!(
+                    "the virtual machine's {} disk {} ({from})",
+                    driver.as_deref().unwrap_or("block"),
+                    human(bytes)
+                ),
+            )
+        } else {
+            let own = self.measure_volume(&path, &source_pool, vm, &label)?;
+            (
+                own,
+                format!("the instance {} at {}", human(own), path.display()),
+            )
+        };
         parts.instance = Some(own);
-        let mut words = vec![format!("the instance {} at {}", human(own), path.display())];
+        let mut words = vec![first];
 
         let listed = self
             .source
@@ -942,6 +980,8 @@ impl Run<'_> {
                 ));
             }
             _ if listed == 0 => 0,
+            // Each snapshot of a block disk is counted at the disk's whole size: the most it can take.
+            _ if block_vm => own.saturating_mul(listed as u64),
             _ if walkable => {
                 return Err(format!(
                     "Incus lists {listed} snapshot(s) of {label}, but {} is not there",
@@ -1017,12 +1057,41 @@ impl Run<'_> {
                     .join(volume_pool)
                     .join("custom")
                     .join(format!("{volume_project}_{source}"));
-                let bytes = self.measure_volume(
-                    &volume_path,
-                    volume_pool,
-                    false,
-                    &format!("the custom volume {volume_pool}/{source}"),
-                )?;
+                let what = format!("the custom volume {volume_pool}/{source}");
+                let block_pool = matches!(
+                    self.pool_driver(volume_pool).as_deref(),
+                    Some("zfs" | "lvm" | "ceph")
+                );
+                // A stopped virtual machine's volume on a block driver is not mounted: its size is the one Incus gives.
+                let bytes = if vm && block_pool {
+                    let configured = |path: String, key: &str| {
+                        self.source
+                            .opt(&path)
+                            .and_then(|doc| doc.get("config")?.get(key)?.as_str().and_then(size_of))
+                    };
+                    configured(
+                        format!(
+                            "/1.0/storage-pools/{}/volumes/custom/{}?project={}",
+                            seg(volume_pool),
+                            seg(source),
+                            seg(volume_project)
+                        ),
+                        "size",
+                    )
+                    .or_else(|| {
+                        configured(
+                            format!("/1.0/storage-pools/{}", seg(volume_pool)),
+                            "volume.size",
+                        )
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "{what} of the virtual machine {label} has no size Incus names (its own size or the pool's volume.size)"
+                        )
+                    })?
+                } else {
+                    self.measure_volume(&volume_path, volume_pool, false, &what)?
+                };
                 volumes = volumes.saturating_add(bytes);
                 words.push(format!(
                     "the custom volume {source} {} at {}",
@@ -1047,10 +1116,67 @@ impl Run<'_> {
         Ok((
             total,
             format!(
-                "measured {} ({total} bytes) by walking {}",
+                "measured {} ({total} bytes) {} {}",
                 human(total),
+                if block_vm {
+                    "from the sizes Incus gives:"
+                } else {
+                    "by walking"
+                },
                 words.join(", ")
             ),
+        ))
+    }
+
+    /// The size of a virtual machine's block disk on the pool `pool` here, and where it was read: its volume's `size`, else
+    /// its root disk device's `size`, else the size its volume's state reports, else the pool's `volume.size`. It is the
+    /// disk's whole size (what the copy may take), not what the guest has written.
+    fn vm_disk_bytes(
+        &self,
+        project: &str,
+        name: &str,
+        pool: &str,
+        instance: &Value,
+        label: &str,
+    ) -> Result<(u64, &'static str), String> {
+        let volume = format!(
+            "/1.0/storage-pools/{}/volumes/virtual-machine/{}",
+            seg(pool),
+            seg(name)
+        );
+        let query = format!("?project={}", seg(project));
+        let configured = |doc: Option<Value>, key: &str| {
+            doc.and_then(|doc| doc.get("config")?.get(key)?.as_str().and_then(size_of))
+        };
+        if let Some(bytes) = configured(self.source.opt(&format!("{volume}{query}")), "size") {
+            return Ok((bytes, "its volume's size"));
+        }
+        let root = instance
+            .get("expanded_devices")
+            .and_then(Value::as_object)
+            .and_then(|devices| devices.values().find(|device| is_root_disk(device)))
+            .and_then(|device| text(device, "size"))
+            .and_then(size_of);
+        if let Some(bytes) = root {
+            return Ok((bytes, "its root disk device's size"));
+        }
+        let total = self
+            .source
+            .opt(&format!("{volume}/state{query}"))
+            .and_then(|state| state.pointer("/usage/total")?.as_u64())
+            .filter(|bytes| *bytes > 0);
+        if let Some(bytes) = total {
+            return Ok((bytes, "the size its volume's state reports"));
+        }
+        if let Some(bytes) = configured(
+            self.source
+                .opt(&format!("/1.0/storage-pools/{}", seg(pool))),
+            "volume.size",
+        ) {
+            return Ok((bytes, "the pool's volume.size"));
+        }
+        Err(format!(
+            "{label} is a virtual machine whose disk on pool {pool} has no size Incus names (its volume, its root disk device, its volume's state and the pool's volume.size say none)"
         ))
     }
 

@@ -229,6 +229,7 @@ impl Pair {
             socket: beta_socket.clone(),
             token_file: token_file.clone(),
             incus_socket: None,
+            ceph: None,
         }]);
         let alpha_tokens = alpha_scratch.path("alpha-tokens");
         private_dir(&alpha_tokens);
@@ -877,12 +878,14 @@ impl Fleet {
                     socket: beta_socket.clone(),
                     token_file: relay_file.clone(),
                     incus_socket: None,
+                    ceph: None,
                 },
                 LinkedHost {
                     name: "gamma".to_string(),
                     socket: scratch.path("gamma.sock"),
                     token_file: relay_file,
                     incus_socket: None,
+                    ceph: None,
                 },
                 // Beta's page door, with the page's token: it admits only the three verbs the page relays.
                 LinkedHost {
@@ -890,6 +893,7 @@ impl Fleet {
                     socket: pair._beta_scratch.path("beta.sock"),
                     token_file: pair.token_file.clone(),
                     incus_socket: None,
+                    ceph: None,
                 },
             ],
         }));

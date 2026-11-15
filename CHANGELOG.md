@@ -7,6 +7,20 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`instance_move` now moves a stopped virtual machine, where every virtual machine was refused before. It stays stopped:
+nothing starts or stops it here, its copy is made once and started on the target, and the move counts only once the
+copy's guest answers (its Incus agent, or an address on a network card); otherwise the copy is deleted and the source is
+left as it was. A virtual machine that runs is still refused, with the words to stop it first. When the linked host's
+entry names its Ceph cluster (`approval.linkedHosts[].ceph`: `cluster`, and optionally `client` and `readClient`) and
+the machine's pools are Ceph on both hosts, the disks go by `rbd export-diff | rbd import-diff` from this node into an
+empty machine Incus makes there at the source's exact size, between two Ceph clusters in either direction, reading the
+source's cluster only; otherwise Incus pushes it, as before for a container. The preflight now sizes a virtual
+machine's Ceph, zfs or lvm disk from what Incus says (its volume's size, its root device's, its volume state's or the
+pool's `volume.size`), counted whole, where it said the disk could not be measured. The card names both nodes, the
+disk's size, that the machine stays stopped, and for a copy by Ceph each side's cluster, pool and client.
+OPERATING.md ("Stopped virtual machines") says what a copy by Ceph needs on the node. Not yet run between two real Ceph
+clusters.
+
 `action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
 `service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`
 row, the node asks anonymously over HTTPS for a pull token, the repository's tags (at most 5 pages) and the digests of

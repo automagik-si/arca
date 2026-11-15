@@ -187,7 +187,7 @@ refused without the value being echoed back.
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
 | `approval.trustOwnerKeysFrom` | no | Absolute paths of other kernels' owner passkeys files on this machine, which this kernel also trusts, read-only, for action approvals only (never to change its own passkeys). See "Approving on another kernel of this machine". |
 | `approval.origins` | with `trustOwnerKeysFrom` | The page origins (`approvalOrigin` form) a passkey from those files may answer from. A line for any other origin is not trusted. |
-| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>", "incusSocket": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. The optional `incusSocket` is that host's Incus socket on this machine (local, or forwarded to a path here); `instance_move_preflight` reads the host through it, with GETs only, and an approved `instance_move` writes through it (the copy it receives, its start, and its removal on a rollback). |
+| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>", "incusSocket": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. The optional `incusSocket` is that host's Incus socket on this machine (local, or forwarded to a path here); `instance_move_preflight` reads the host through it, with GETs only, and an approved `instance_move` writes through it (the copy it receives, its start, and its removal on a rollback). The optional `ceph` (`{ "cluster": "<name>", "client": "<name>", "readClient": "<name>" }`) names that host's Ceph cluster as this machine reaches it; a stopped virtual machine on Ceph then moves there by `rbd` from this machine (see [Stopped virtual machines](#moving-containers-and-stopped-virtual-machines-to-a-linked-host-instance_move)). |
 
 The config is refused, with exit 2, when:
 
@@ -2788,9 +2788,9 @@ The operator re-points the proxy, then asks again; `go` turns true. Several inst
 another against the same pool: an earlier one that fits counts as pending for the later ones, and its name is in their
 `detail` and in `measure.pendingFor`.
 
-## Moving containers to a linked host: `instance_move`
+## Moving containers and stopped virtual machines to a linked host: `instance_move`
 
-A move takes containers from this node to a linked host with one owner card. The owner approves once; Incus does the
+A move takes containers, and stopped virtual machines, from this node to a linked host with one owner card. The owner approves once; Incus does the
 copy; the kernel orchestrates the rounds, journals them, measures the downtime, and rolls back what fails. The source is
 never deleted by the move: the owner finishes a verified move with a second card, whenever they choose.
 
@@ -2807,7 +2807,8 @@ plan names; it is not built yet, so a target that does not listen blocks the pla
 file, `/etc/hostname` when it does not), the `target`, and `rounds` (1 to 5 copy rounds while the container runs, 2 when
 absent). It runs the whole `instance_move_preflight` again. Any no-go blocks the whole plan, with the preflight's own
 reasons per instance in `blocked`: remove or fix those and plan again. Beyond the preflight, the plan blocks a virtual
-machine (`virtual machines are not movable yet`: this build moves containers only), an ephemeral container (Incus deletes
+machine that is not stopped (`the virtual machine is Running: this build moves a virtual machine only while it is
+stopped`: stop it first; see **Stopped virtual machines** below), an ephemeral container (Incus deletes
 it when it stops, so the cutover would delete the source: make it non-ephemeral first), a host folder (Incus does not copy
 it: move its data into a custom volume first), a spot-check file that cannot be read in the container now (a check that
 could never compare would always pass), and a name the target already holds, instance or custom volume (a move never
@@ -2890,6 +2891,51 @@ goes on in the background, one instance after the other:
   `moved`, but its reason says so (set `boot.autostart` by hand, or finish the move), and the proposal's late result is
   `MoveNeedsOwner`.
 
+**Stopped virtual machines.** A virtual machine moves only while it is stopped, and stays stopped: nothing here starts
+or stops it, and its copy on the target is started only once every disk is copied and the source still reads
+`Stopped`. Its plan has no round while it runs (`rounds.preCopy` 0, one round in all), and the plan says how it is copied
+(`copy`):
+
+- `incus`: Incus on this host pushes it once, consistent, with its snapshots and custom volumes, as a container's last
+  round. The target must listen on the network, as for a container. This is the way when the linked host names no Ceph
+  cluster, or when the machine's pool is not a Ceph pool on both hosts.
+- `ceph`: the linked host's entry names its Ceph cluster (`approval.linkedHosts[].ceph`), and the machine's pool here
+  and its target pool there are Ceph pools: two Ceph clusters, in either direction. Incus on the target makes the
+  machine and each custom volume empty, at the source image's exact size (the root disk gets that size on the copy's own
+  root device), and this machine copies each image with `rbd export-diff <source> - | rbd import-diff - <target>`, two
+  processes and a pipe. The target does not need to listen. The plan's `ceph` names, per Incus pool, the cluster, client
+  and OSD pool of each side, and the card's `Ceph` row shows them. Before anything is made, each source image is read:
+  one that anyone holds open (a machine that runs somewhere) fails the move with nothing made; its size is read too. The
+  image Incus made is read back at that size before the copy writes it. The source's cluster is only read (`rbd status`,
+  `rbd info`, `rbd export-diff`). Snapshots are not copied. The copy gets a fresh UEFI variable store: a guest that boots
+  only from an NVRAM boot entry, with no fallback boot file (`EFI/BOOT/BOOTX64.EFI`), does not come up and is rolled
+  back. Two sides that name one OSD pool of one Ceph cluster are refused (Incus would make the copy's image beside the
+  source's).
+
+The preflight sizes a virtual machine's block disk (Ceph, zfs or lvm) from Incus, not by walking: its volume's `size`,
+else its root disk device's `size`, else its volume state's total, else the pool's `volume.size`; a disk with none of
+these is not measured, and the plan says so. The size is the whole disk, the most its copy can take; each snapshot is
+counted at that size too. A stopped machine's custom volume on a block driver is sized the same way (its own `size`, else
+the pool's `volume.size`).
+
+The checks are the copy's: it runs, and still runs after them; its guest answers, by its Incus agent (its state counts
+processes) or an address on one of its network cards, waited for five times the checks' wait (five minutes by default),
+since a machine boots slower than a container starts; and each custom volume is attached. A stopped machine's files
+cannot be read, so the spot-check stands on the guest's answer, and there is no network card or proxy to compare. A copy
+whose guest does not answer is deleted, and the source is left as it was: never started, stopped or written. A verified
+source is kept, stopped, with `boot.autostart` off, and `instance_move_finish` deletes it as a container's.
+
+What a copy by Ceph needs on this machine: the `rbd` command; the target cluster's config at
+`/etc/ceph/<cluster>.conf` and the writing client's keyring beside it (`/etc/ceph/<cluster>.client.<client>.keyring`);
+the source cluster's (the source pool's `ceph.cluster_name`, `ceph` unless set) with the reading client's keyring, both
+readable by the kernel's user; and the network to the target cluster's monitors and OSDs. `client` defaults to the
+target pool's `ceph.user.name`, `readClient` to the source pool's; a reading client limited to read-only access on the
+source pool is enough. The copy streams: the node holds no more of a disk than the pipe and the two processes' buffers,
+and a thin source copies only what it holds, but its time is that of the whole data at the slower cluster's speed. A
+kernel stopped during a copy may leave an `rbd import-diff` running: the next start's rollback may then fail to delete
+the copy while it holds the image, and the instance is then `failed` for the owner, the source still stopped and
+untouched.
+
 **Failure and rollback.** Any failure before the checks pass rolls that instance back, under the rule above. A failed
 push first waits (up to a minute) for the target's receiving operation to end, and a delete Incus answers as busy is
 tried again for 30 s. Then the source is read back: only when it is here with the plan's `volatile.uuid` is the copy on
@@ -2942,6 +2988,10 @@ SHA-256. It is read line by line with no size cap; a torn last line is skipped, 
 a line over 8 MiB is skipped and said on the log.
 
 **What the tests prove, and a real run.** The tests run two fake Incus daemons linked so that a push lands on the target.
+For a stopped virtual machine they prove one consistent push and no `rbd` on one cluster, and, with `rbd` recorded, a
+copy by Ceph in both directions (the source cluster only read, each side naming its own cluster, client and OSD pool),
+a failed copy that leaves the source unwritten, a disk held open that stops the move before anything is made, and a
+copy whose guest does not answer being removed. The copy by Ceph has not been run against two real Ceph clusters yet.
 `crates/arca/tests/instance_move_live.rs` (ignored by default) runs the same verbs, card and grant against two live Incus
 daemons. Run between two Incus 7.6 hosts on btrfs, it moved a running container with a 300 MB data file: three rounds,
 the progress read live from `fs_progress`, all six checks passed (the proxy port probed at the target's address), about
@@ -3336,7 +3386,7 @@ service, database, GPU, storage, snapshot, instance, function or tenant verbs: `
 `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and
 `deploy_remove` (see [Tenants](#tenants)), and `route_add` and `route_remove` (see
 [Routes](#routes-names-for-your-instances-served-by-the-nodes-edge)), and `instance_move` and `instance_move_finish`
-(see [Moving containers to a linked host](#moving-containers-to-a-linked-host-instance_move)), are proposed the same
+(see [Moving containers and stopped virtual machines to a linked host](#moving-containers-and-stopped-virtual-machines-to-a-linked-host-instance_move)), are proposed the same
 way. The canvas Doctor proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`,
 `route_add`, `route_remove`, `instance_move` or `instance_move_finish`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
 came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a

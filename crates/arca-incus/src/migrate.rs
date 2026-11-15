@@ -6,6 +6,10 @@
 //! volume to that operation, over the network, with the target's certificate. The kernel moves no byte itself: it starts
 //! the two operations, follows their progress, and reads what landed.
 //!
+//! A stopped virtual machine on Ceph that moves to a linked host on its own Ceph cluster is copied by `rbd`, not by Incus:
+//! the writer then asks the target to create the machine and its custom volumes empty (`source: none`), of the source's
+//! exact sizes, for the kernel's copy to fill.
+//!
 //! Besides the copy the writer starts and stops an instance, reads a file inside one (the spot-check), sets
 //! `boot.autostart` (off on a kept source, the source's own value on a verified copy), and deletes an instance or a custom volume: a target copy when a move is rolled back,
 //! and a source when the owner finishes a move.
@@ -88,11 +92,11 @@ pub struct MoveWriter {
 /// Whether a request is one this module may send. Every GET may; a write must be one of these, with plain names and
 /// `project=<plain>` as its only query:
 ///
-/// - `POST /1.0/instances` (a create whose source is a migration push: the receiving side)
+/// - `POST /1.0/instances` (a create whose source is a migration push: the receiving side; or an empty virtual machine)
 /// - `POST /1.0/instances/<name>` (a push: the sending side)
 /// - `PUT /1.0/instances/<name>/state` (a start or a stop)
 /// - `DELETE /1.0/instances/<name>`
-/// - `POST /1.0/storage-pools/<pool>/volumes/custom` (a custom volume received by a migration push)
+/// - `POST /1.0/storage-pools/<pool>/volumes/custom` (a custom volume received by a migration push, or made empty)
 /// - `POST /1.0/storage-pools/<pool>/volumes/custom/<name>` (a custom volume pushed)
 /// - `DELETE /1.0/storage-pools/<pool>/volumes/custom/<name>`
 pub fn write_allowed(method: &str, target: &str) -> bool {
@@ -218,8 +222,9 @@ impl MoveWriter {
         refresh: bool,
     ) -> Result<Receive, IncusError> {
         names_ok(&[project, name])?;
-        if source.get("type").and_then(Value::as_str) != Some("container") {
-            return Err(refused("only a container is moved"));
+        let kind = source.get("type").and_then(Value::as_str);
+        if !matches!(kind, Some("container" | "virtual-machine")) {
+            return Err(refused("only a container or a virtual machine is moved"));
         }
         let mut config = source
             .get("config")
@@ -229,7 +234,7 @@ impl MoveWriter {
         config.insert("boot.autostart".to_string(), json!("false"));
         let body = json!({
             "name": name,
-            "type": "container",
+            "type": kind,
             "architecture": source.get("architecture").cloned().unwrap_or(json!("")),
             "config": config,
             "devices": source.get("devices").cloned().unwrap_or(json!({})),
@@ -286,6 +291,96 @@ impl MoveWriter {
             &format!("/1.0/storage-pools/{pool}/volumes/custom?project={project}"),
             &body,
         )
+    }
+
+    /// Creates the virtual machine `name` in `project` empty (`source: none`), stopped, for a disk copy by Ceph: the
+    /// source's architecture, own config (see [`moved_config`]), devices, profiles and description, `boot.autostart`
+    /// false as in [`MoveWriter::receive_instance`], and its root disk (the device `root_device` of its expanded devices,
+    /// `root`) on `pool` with the exact size `bytes`, so the empty disk Incus makes is the size of the one copied into it.
+    pub fn create_empty_vm(
+        &self,
+        project: &str,
+        name: &str,
+        source: &Value,
+        (root_device, root): (&str, &Value),
+        (pool, bytes): (&str, u64),
+    ) -> Result<(), IncusError> {
+        names_ok(&[project, name, root_device, pool])?;
+        if source.get("type").and_then(Value::as_str) != Some("virtual-machine") {
+            return Err(refused("only a virtual machine is made empty"));
+        }
+        let mut config = source
+            .get("config")
+            .and_then(Value::as_object)
+            .map(moved_config)
+            .unwrap_or_default();
+        config.insert("boot.autostart".to_string(), json!("false"));
+        let mut devices = source
+            .get("devices")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut disk = root.as_object().cloned().unwrap_or_default();
+        disk.insert("type".to_string(), json!("disk"));
+        disk.insert("path".to_string(), json!("/"));
+        disk.insert("pool".to_string(), json!(pool));
+        disk.insert("size".to_string(), json!(format!("{bytes}B")));
+        devices.insert(root_device.to_string(), Value::Object(disk));
+        let body = json!({
+            "name": name,
+            "type": "virtual-machine",
+            "architecture": source.get("architecture").cloned().unwrap_or(json!("")),
+            "config": config,
+            "devices": devices,
+            "profiles": source.get("profiles").cloned().unwrap_or(json!([])),
+            "description": source.get("description").cloned().unwrap_or(json!("")),
+            "ephemeral": false,
+            "source": { "type": "none" },
+        });
+        let envelope = self.send(
+            "POST",
+            &format!("/1.0/instances?project={project}"),
+            Some(&body),
+        )?;
+        self.finish(&envelope, Duration::from_secs(300))
+    }
+
+    /// Creates the custom volume `name` on `pool` in `project` empty, for a disk copy by Ceph: the source volume's
+    /// content type, description and own config (no volatile key), with the exact size `bytes`.
+    pub fn create_empty_volume(
+        &self,
+        project: &str,
+        pool: &str,
+        name: &str,
+        source: &Value,
+        bytes: u64,
+    ) -> Result<(), IncusError> {
+        names_ok(&[project, pool, name])?;
+        let mut config: Map<String, Value> = source
+            .get("config")
+            .and_then(Value::as_object)
+            .map(|config| {
+                config
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with("volatile."))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        config.insert("size".to_string(), json!(format!("{bytes}B")));
+        let body = json!({
+            "name": name,
+            "type": "custom",
+            "content_type": source.get("content_type").cloned().unwrap_or(json!("filesystem")),
+            "config": config,
+            "description": source.get("description").cloned().unwrap_or(json!("")),
+        });
+        let envelope = self.send(
+            "POST",
+            &format!("/1.0/storage-pools/{pool}/volumes/custom?project={project}"),
+            Some(&body),
+        )?;
+        self.finish(&envelope, Duration::from_secs(300))
     }
 
     fn receive(&self, path: &str, body: &Value) -> Result<Receive, IncusError> {

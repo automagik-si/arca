@@ -242,6 +242,25 @@ pub struct LinkedHost {
     pub token_file: PathBuf,
     #[serde(default)]
     pub incus_socket: Option<PathBuf>,
+    /// The linked host's Ceph cluster, as this node reaches it. Set, a stopped virtual machine on a Ceph pool here moves to
+    /// a Ceph pool there by `rbd` from this node, not by an Incus push (see [`LinkedCeph`]).
+    #[serde(default)]
+    pub ceph: Option<LinkedCeph>,
+}
+
+/// The `ceph` key of a linked host. `cluster` is the linked host's Ceph cluster by the name of its config file on this node
+/// (`/etc/ceph/<cluster>.conf`); it may be another cluster than this node's, or the same. `client` (default: the target
+/// pool's `ceph.user.name`) is the Ceph client, without its `client.` prefix, that writes the target pool there, its keyring
+/// at `/etc/ceph/<cluster>.client.<client>.keyring`. `readClient` (default: this node's pool's `ceph.user.name`) is the
+/// client that reads the source pool here, on this node's own cluster (the source pool's `ceph.cluster_name`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkedCeph {
+    pub cluster: String,
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub read_client: Option<String>,
 }
 
 /// Where Incus listens, and which storage pools the sampler reports. The pools come from Incus's own pool list. `pools` is an
@@ -886,6 +905,19 @@ fn check_approval(approval: &ApprovalConfig) -> Result<(), ConfigError> {
             return Err(ConfigError::Approval(
                 "each linked host's socket and tokenFile must be absolute paths",
             ));
+        }
+        if let Some(ceph) = &host.ceph {
+            let names = std::iter::once(&ceph.cluster)
+                .chain(ceph.client.iter())
+                .chain(ceph.read_client.iter());
+            if !names
+                .into_iter()
+                .all(|name| crate::move_rbd::ceph_name_ok(name))
+            {
+                return Err(ConfigError::Approval(
+                    "a linked host's ceph cluster, client and readClient are plain Ceph names: letters, digits, dots, underscores and hyphens",
+                ));
+            }
         }
     }
     Ok(())
