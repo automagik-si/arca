@@ -27,6 +27,7 @@ arca-netproject = { path = "crates/arca-netproject" }
 arca-postgres = { path = "crates/arca-postgres" }
 arca-providers = { path = "crates/arca-providers" }
 arca-reconcile = { path = "crates/arca-reconcile" }
+arca-runners = { path = "crates/arca-runners" }
 arca-store = { path = "crates/arca-store" }
 arca-vm = { path = "crates/arca-vm" }
 arca-watch = { path = "crates/arca-watch" }
@@ -42,9 +43,9 @@ iroh = { version = "=1.4.1", features = ["unstable-custom-transports"] }
 iroh-tickets = "=1.0.0"
 qrcodegen = "=1.8.0"
 regex = "=1.13.1"
-# The GitHub signer's outbound HTTPS client (api.github.com and the Actions service). In the lock already through
-# iroh-relay with the same feature; the crypto provider is ring through `rustls` below, never aws-lc, and the roots are
-# webpki-roots, so a static binary needs no system certificate store.
+# The GitHub signer's and the runner pools' outbound HTTPS client (api.github.com and the Actions service). In the
+# lock already through iroh-relay with the same feature; the crypto provider is ring through `rustls` below, never
+# aws-lc, and the roots are webpki-roots, so a static binary needs no system certificate store.
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider"] }
 webpki-roots = "=1.0.11"
 # RS256 passkeys (some Windows Hello and TPM authenticators): RSASSA-PKCS1-v1_5 verification. In the lock already through

@@ -7,6 +7,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+One MCP door reaches the whole fleet: every read the door serves, and `action_propose`, take an optional `node`, the
+name of one of `approval.linkedHosts` (`arca_status` lists them). The caller is checked on this kernel first, as for a
+call of its own; the call then runs on that node with its linked token, and its answer comes back as the node gave it,
+with `linkedNode` naming it (every field the node wrote is kept, so the answer fits the tool's own schema). A proposal made this way waits on that node, and this kernel's approval page shows it with the
+machine named on the card. A name that is not linked is an invalid argument listing the linked names; a node that does
+not answer is refused `Unreachable`, and one that refuses the token `LinkToken`. Without `node` nothing changes. The
+linked kernel's token must admit the relayed verbs: the page's three-verb token does not. OPERATING.md ("Asking a linked
+node") gives the one `--tools` line to mint it with; never mint it without `--tools`.
+
 `node_metrics` and `arca metrics --json` say what the machine's compute and power are, as additions; no field a client
 reads today changes. `cpu.threads`, `cpu.physicalCores` and `cpu.busyThreads` tell the logical CPUs, the physical cores
 and how many threads were busy apart: `cpu.cores` keeps counting logical CPUs, so a 12-core, 24-thread machine still
@@ -52,6 +61,12 @@ declare `rawLxc` lines (`lxc.sched.core=0`, say) that Arca keeps in `raw.lxc` be
 reconcile; a service without them is reconciled as before. The create and reconfigure cards show `raw.lxc` whole, and
 give every line but `lxc.sched.core` and `lxc.no_new_privs=1` a plain-words row saying it may loosen the container's
 isolation.
+
+`images/github-runner/` builds GitHub's `ubuntu-latest` runner image as an Incus virtual-machine image from GitHub's
+own scripts (actions/runner-images, pinned to one release per Ubuntu line, 24.04 and 26.04), with the runner program,
+the `runner` user, GitHub's environment and a filled toolcache inside, and one just-in-time job per machine.
+`check-release.sh` follows GitHub's releases; each build publishes what differs from GitHub's image in
+`docs/runner-image/<tag>/`; `compat/` runs the same jobs on GitHub's runner and ours and compares them.
 
 `service_update` now moves a running container service made from a local image pinned by fingerprint, as it already
 moves one made from an image by digest on a registry: the call's `digest` is the new image's fingerprint, the image

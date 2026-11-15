@@ -845,6 +845,12 @@ impl Signer {
         Err(github(&answer))
     }
 
+    /// Drops the binding's cached Actions service connection: a runner pool calls this when the service refused its
+    /// admin token, so the next connection is a new one.
+    pub fn forget_actions_connection(&self, binding: &str) {
+        self.lock().actions.remove(binding);
+    }
+
     /// The Actions service connection of an App binding: a registration token from the installation token, exchanged at
     /// GitHub's runner-registration call for the service's address and admin token. Kept until five minutes before it
     /// ends. In-process only.

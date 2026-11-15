@@ -686,10 +686,23 @@ fn g6_no_other_route_is_reachable_three_tools_no_path_input() {
         assert!(r.rig.handlers.contains_key(n), "{n} is served");
         let params = (arca_api::verb(n).unwrap().params)();
         for p in params["properties"].as_object().unwrap().keys() {
+            // `node` names a linked kernel: the door takes it out before any handler runs, so it never reaches Omni,
+            // and its pattern holds no path.
             assert!(
-                ["name", "instance", "channel"].contains(&p.as_str()),
+                ["name", "instance", "channel", arca_api::verbs::NODE].contains(&p.as_str()),
                 "{n}: {p}"
             );
+        }
+        if let Some(node) = params["properties"].get(arca_api::verbs::NODE) {
+            let mut only_node =
+                json!({ "type": "object", "properties": {}, "additionalProperties": false });
+            only_node["properties"][arca_api::verbs::NODE] = node.clone();
+            for path in ["/api/v2/instances", "beta/logout", "http://beta"] {
+                assert!(
+                    arca_api::conforms(&only_node, &json!({ "node": path })).is_err(),
+                    "{n}: node takes no path ({path})"
+                );
+            }
         }
     }
     // A field the schema does not name is refused before anything is read.

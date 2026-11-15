@@ -406,6 +406,8 @@ fn inputs_at(at: u64, sample: &HostSample) -> Inputs {
                 ]),
             },
         }),
+        // A node with no runner pools reads an empty board, as the ticker does.
+        runner_signin: Some(Timed { at, value: vec![] }),
         ..Inputs::default()
     }
 }

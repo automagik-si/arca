@@ -9,6 +9,7 @@ mod incus;
 mod mode;
 mod osd;
 pub mod power;
+pub use osd::rfc3339_ms;
 pub mod probe;
 mod procfs;
 mod sample;

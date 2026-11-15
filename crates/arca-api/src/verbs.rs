@@ -78,12 +78,87 @@ impl Verb {
     /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
     /// `owner_approval_status` hands its requester an approval string, so it is not advertised read-only either (droidd's
     /// `readOnly: false`), and its minimum scope keeps it off viewers.
+    /// `owner_approval_pending` asks the owner's signed-in session about each plan, and a yes approves and runs it.
     pub fn read_only_hint(&self) -> bool {
-        !self.writes && !matches!(self.name, "action_propose" | "owner_approval_status")
+        !self.writes
+            && !matches!(
+                self.name,
+                "action_propose" | "owner_approval_status" | "owner_approval_pending"
+            )
+    }
+
+    /// Whether the verb takes [`NODE`]: a call that names a linked node is relayed to it by the MCP door.
+    pub fn takes_node(&self) -> bool {
+        NODE_VERBS.contains(&self.name)
     }
 }
 
-static VERBS: [Verb; 82] = [
+/// The optional argument that names a linked node (one of `approval.linkedHosts`). The MCP door checks the caller here,
+/// takes the argument out and relays the rest of the call to that node; absent, the call is this kernel's own.
+pub const NODE: &str = "node";
+
+/// The field that names the linked node a relayed answer came from: in a result's structured content, or in a refusal's
+/// `data`. No verb's result has a field of this name, so a relayed answer keeps every field the node wrote and still fits
+/// the tool's own `outputSchema`.
+pub const LINKED_NODE: &str = "linkedNode";
+
+/// The verbs that take [`NODE`]: every read the MCP door serves, and `action_propose`. Not the three `owner_approval_*`
+/// reads: their rows are the calling token's own requests, and a relayed call is the linked token's, never the caller's.
+pub const NODE_VERBS: [&str; 28] = [
+    "arca_status",
+    "node_metrics",
+    "watch_report",
+    "token_list",
+    "journal_list",
+    "plan_list",
+    "action_propose",
+    "alerts_list",
+    "postgres_list",
+    "ontology_query",
+    "service_list",
+    "service_status",
+    "service_logs",
+    "omni_status",
+    "storage_list",
+    "snapshot_list",
+    "tenant_list",
+    "tenant_status",
+    "tenant_usage",
+    "function_list",
+    "function_runs",
+    "registry_list",
+    "instance_move_preflight",
+    "github_connect_status",
+    "github_bindings",
+    "github_audit",
+    "os_update",
+    "route_list",
+];
+
+/// `schema` with the optional [`NODE`] property.
+fn with_node(mut schema: Value) -> Value {
+    schema["properties"][NODE] = json!({
+        "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+        "maxLength": 253,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+        "type": "string"
+    });
+    schema
+}
+
+/// The params of a verb that may run on a linked node: `$params` with the optional [`NODE`] beside its own fields. A table
+/// entry holds a plain function, so each use makes one that adds the field.
+macro_rules! on_node {
+    ($params:ident) => {{
+        fn on_node() -> Value {
+            with_node($params())
+        }
+        on_node
+    }};
+}
+
+static VERBS: [Verb; 83] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -95,7 +170,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_status,
         cut: no_cut,
-        params: arca_status_params,
+        params: on_node!(arca_status_params),
         result: arca_status_result,
     },
     Verb {
@@ -109,7 +184,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_metrics,
         cut: no_cut,
-        params: node_metrics_params,
+        params: on_node!(node_metrics_params),
         result: node_metrics_result,
     },
     Verb {
@@ -123,7 +198,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_watch_report,
         cut: no_cut,
-        params: watch_report_params,
+        params: on_node!(watch_report_params),
         result: watch_report_result,
     },
     Verb {
@@ -137,7 +212,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_tokens,
         cut: no_cut,
-        params: token_list_params,
+        params: on_node!(token_list_params),
         result: token_list_result,
     },
     Verb {
@@ -151,7 +226,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_journal,
         cut: no_cut,
-        params: journal_list_params,
+        params: on_node!(journal_list_params),
         result: journal_list_result,
     },
     Verb {
@@ -165,7 +240,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_plans,
         cut: no_cut,
-        params: plan_list_params,
+        params: on_node!(plan_list_params),
         result: plan_list_result,
     },
     Verb {
@@ -179,7 +254,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_action_propose,
         cut: no_cut,
-        params: action_propose_params,
+        params: on_node!(action_propose_params),
         result: action_propose_result,
     },
     Verb {
@@ -249,7 +324,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_alerts,
         cut: no_cut,
-        params: alerts_list_params,
+        params: on_node!(alerts_list_params),
         result: alerts_list_result,
     },
     Verb {
@@ -277,7 +352,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_pg_list,
         cut: no_cut,
-        params: postgres_list_params,
+        params: on_node!(postgres_list_params),
         result: postgres_list_result,
     },
     Verb {
@@ -333,7 +408,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_ontology,
         cut: no_cut,
-        params: ontology_query_params,
+        params: on_node!(ontology_query_params),
         result: ontology_query_result,
     },
     Verb {
@@ -361,7 +436,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_service_list,
         cut: cut_service_list,
-        params: service_list_params,
+        params: on_node!(service_list_params),
         result: service_list_result,
     },
     Verb {
@@ -375,7 +450,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_service_status,
         cut: no_cut,
-        params: service_status_params,
+        params: on_node!(service_status_params),
         result: service_status_result,
     },
     Verb {
@@ -389,7 +464,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_service_logs,
         cut: cut_service_logs,
-        params: service_logs_params,
+        params: on_node!(service_logs_params),
         result: service_logs_result,
     },
     Verb {
@@ -604,7 +679,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_omni_status,
         cut: no_cut,
-        params: omni_status_params,
+        params: on_node!(omni_status_params),
         result: omni_status_result,
     },
     Verb {
@@ -648,6 +723,20 @@ static VERBS: [Verb; 82] = [
         cut: no_cut,
         params: owner_approval_list_params,
         result: owner_approval_list_result,
+    },
+    Verb {
+        name: "owner_approval_pending",
+        summary: "Everything waiting for the owner, whoever made it (a worker's plans too): action plans, delete plans and owner approval requests, with the approval page. In the owner's own signed-in session (an app connected with the approvals scope) whose client declared elicitation, it also asks the owner yes or no for each plan that can be approved there, and answers what was decided; plans that delete or erase, and approval requests, keep the passkey card. The requesters' words are untrusted.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_owner_approval_pending,
+        cut: no_cut,
+        params: owner_approval_pending_params,
+        result: owner_approval_pending_result,
     },
     Verb {
         name: "enroll_confirm",
@@ -702,7 +791,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_storage_list,
         cut: no_cut,
-        params: empty_params,
+        params: on_node!(empty_params),
         result: storage_list_result,
     },
     Verb {
@@ -744,7 +833,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_snapshot_list,
         cut: no_cut,
-        params: snapshot_list_params,
+        params: on_node!(snapshot_list_params),
         result: snapshot_list_result,
     },
     Verb {
@@ -828,7 +917,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_tenant_list,
         cut: no_cut,
-        params: empty_params,
+        params: on_node!(empty_params),
         result: tenant_list_result,
     },
     Verb {
@@ -842,7 +931,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_tenant,
         cut: no_cut,
-        params: tenant_id_params,
+        params: on_node!(tenant_id_params),
         result: tenant_status_result,
     },
     Verb {
@@ -856,7 +945,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_tenant_usage,
         cut: no_cut,
-        params: tenant_id_params,
+        params: on_node!(tenant_id_params),
         result: tenant_usage_result,
     },
     Verb {
@@ -968,7 +1057,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_function_list,
         cut: no_cut,
-        params: empty_params,
+        params: on_node!(empty_params),
         result: function_list_result,
     },
     Verb {
@@ -996,7 +1085,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_function_runs,
         cut: no_cut,
-        params: function_runs_params,
+        params: on_node!(function_runs_params),
         result: function_runs_result,
     },
     Verb {
@@ -1024,7 +1113,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_registry_list,
         cut: no_cut,
-        params: empty_params,
+        params: on_node!(empty_params),
         result: registry_list_result,
     },
     Verb {
@@ -1066,7 +1155,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_move_preflight,
         cut: no_cut,
-        params: instance_move_preflight_params,
+        params: on_node!(instance_move_preflight_params),
         result: instance_move_preflight_result,
     },
     Verb {
@@ -1108,7 +1197,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_github_connect,
         cut: no_cut,
-        params: github_connect_status_params,
+        params: on_node!(github_connect_status_params),
         result: github_flow_result,
     },
     Verb {
@@ -1122,7 +1211,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_github_bindings,
         cut: no_cut,
-        params: github_bindings_params,
+        params: on_node!(github_bindings_params),
         result: github_bindings_result,
     },
     Verb {
@@ -1136,7 +1225,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_github_audit,
         cut: no_cut,
-        params: github_audit_params,
+        params: on_node!(github_audit_params),
         result: github_audit_result,
     },
     Verb {
@@ -1192,7 +1281,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_os_update,
         cut: no_cut,
-        params: os_update_params,
+        params: on_node!(os_update_params),
         result: os_update_result,
     },
     Verb {
@@ -1234,7 +1323,7 @@ static VERBS: [Verb; 82] = [
         output_key: None,
         summary_text: summary_route_list,
         cut: no_cut,
-        params: empty_params,
+        params: on_node!(empty_params),
         result: route_list_result,
     },
 ];
@@ -3664,10 +3753,14 @@ fn action_proposal() -> Value {
         ("expiresAt", true, int()),
         ("statement", false, string()),
         ("host", false, string()),
-        // Set on the answer of an action_propose that the admin token approved in the terminal.
+        // Set while the owner's signed-in session is connected: the proposal stays open for it instead of lapsing.
+        ("heldForSession", false, boolean()),
+        // Set on the answer of an action_propose approved in the terminal (the admin token's or the owner's session's).
         ("approvedIn", false, string()),
         ("approvedBy", false, string()),
         ("approval", false, json!({ "type": "object" })),
+        // Set on the answer of an action_propose the owner's signed-in session said no to: the plan is declined.
+        ("declinedIn", false, string()),
     ])
 }
 
@@ -5700,6 +5793,91 @@ fn owner_approval_list_result() -> Value {
     })
 }
 
+fn owner_approval_pending_params() -> Value {
+    json!({"additionalProperties": false, "properties": {}, "type": "object"})
+}
+fn owner_approval_pending_result() -> Value {
+    // The card's rows as plan_list gives them: no cap on their number or length, so any card a plan has fits.
+    let row = json!({"additionalProperties": false, "properties": {"label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label", "value"], "type": "object"});
+    let plan = json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": {"maxLength": 128, "type": "string"},
+            "kind": {"description": "action: an action plan; delete: a delete plan of the reconciler; request: an owner approval request.", "enum": ["action", "delete", "request"], "type": "string"},
+            "action": {"maxLength": 64, "type": "string"},
+            "summary": {"type": "string"},
+            "details": {"items": row, "type": "array"},
+            "createdAt": {"description": "Unix milliseconds.", "minimum": 0, "type": "integer"},
+            "expiresAt": {"description": "Unix milliseconds, or an ISO time for a request.", "type": ["integer", "string"]},
+            "askedHere": {"description": "Whether the owner's signed-in session is asked about it.", "type": "boolean"},
+            "heldForSession": {"description": "Whether it stays open past its fifteen minutes because the owner's signed-in session is connected.", "type": "boolean"},
+            "why": {"description": "Why it is not asked here, when it is not.", "maxLength": 300, "type": "string"}
+        },
+        "required": ["id", "kind", "summary", "createdAt", "askedHere"],
+        "type": "object"
+    });
+    let decision = json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": {"maxLength": 128, "type": "string"},
+            "decision": {"description": "approved: approved and run; refused: approved but not run, with why; declined: the owner said no, and the plan is declined; left: not decided, still waiting on its card.", "enum": ["approved", "refused", "declined", "left"], "type": "string"},
+            "result": {"description": "What the run answered."},
+            "message": {"maxLength": 2000, "type": "string"}
+        },
+        "required": ["id", "decision"],
+        "type": "object"
+    });
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "plans": {"items": plan, "maxItems": 100, "type": "array"},
+            "session": {"description": "asks: this session is asked about each plan; step-up: it is asked once the owner confirms with a passkey at stepUp; none: it is never asked (it lists only).", "enum": ["asks", "step-up", "none"], "type": "string"},
+            "stepUp": {"description": "The page where one passkey tap lets this session be asked for the next 12 hours.", "maxLength": 600, "type": "string"},
+            "page": {"description": "The approval page, where every card waits.", "maxLength": 600, "type": "string"},
+            "decisions": {"items": decision, "maxItems": 100, "type": "array"}
+        },
+        "required": ["plans", "session"],
+        "type": "object"
+    })
+}
+
+pub fn summary_owner_approval_pending(v: &Value) -> String {
+    let plans = v["plans"].as_array().map_or(&[][..], Vec::as_slice);
+    let asked = plans.iter().filter(|p| p["askedHere"] == true).count();
+    let mut text = format!(
+        "{} plan(s) and request(s) wait for the owner; {asked} can be approved in this session.",
+        plans.len()
+    );
+    if let Some(decisions) = v["decisions"].as_array() {
+        let count = |what: &str| decisions.iter().filter(|d| d["decision"] == what).count();
+        text.push_str(&format!(
+            " Asked here: {} approved and run, {} refused, {} declined, {} left waiting on their cards.",
+            count("approved"),
+            count("refused"),
+            count("declined"),
+            count("left")
+        ));
+    }
+    match v["session"].as_str() {
+        Some("step-up") => {
+            if let Some(url) = v["stepUp"].as_str() {
+                text.push_str(&format!(
+                    " Confirm with your passkey at {url} so this session can ask you."
+                ));
+            }
+        }
+        Some("none") => {
+            text.push_str(" This session is not asked: approve them on the approval page.")
+        }
+        _ => {}
+    }
+    if let Some(page) = v["page"].as_str()
+        && plans.iter().any(|p| p["askedHere"] != true)
+    {
+        text.push_str(&format!(" The others wait on {page}."));
+    }
+    text
+}
 pub fn summary_owner_approval_request(v: &Value) -> String {
     let page = v["dashboard"]
         .as_str()

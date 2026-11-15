@@ -200,6 +200,7 @@
   }
   .expiry { display: inline-flex; align-items: center; gap: 6px; color: var(--arca-muted); font-size: var(--arca-text-sm); }
   .expiry.soon { color: var(--arca-warn-ink); }
+  .expiry.held { color: var(--arca-accent); }
   .plan h3 { margin: var(--arca-space-3) 0 var(--arca-space-2); font-size: var(--arca-text-lg); line-height: var(--arca-leading-tight); letter-spacing: -.01em; }
   .objects { list-style: none; padding: 0; margin-bottom: var(--arca-space-4); }
   .objects li {
@@ -701,8 +702,15 @@ function actionCard(plan) {
   const expiry = el("time", "expiry");
   expiry.dateTime = new Date(plan.expiresAt).toISOString();
   expiry.title = new Date(plan.expiresAt).toLocaleString();
-  if (plan.expiresAt - Date.now() < 5 * 60000) expiry.classList.add("soon");
-  expiry.append(icon("clock"), expiryText(plan.expiresAt));
+  if (plan.heldForSession) {
+    // Held forward: it stays open while the owner's signed-in session (a connected app) can be asked about it.
+    expiry.append(icon("clock"), "Waiting for your signed-in session");
+    expiry.title = "It stays open while an app you connected for approvals is signed in. You can also approve it here.";
+    expiry.classList.add("held");
+  } else {
+    if (plan.expiresAt - Date.now() < 5 * 60000) expiry.classList.add("soon");
+    expiry.append(icon("clock"), expiryText(plan.expiresAt));
+  }
   meta.append(el("span", "badge", "Action"), expiry);
 
   // One sentence first: what the assistant wants, in the kernel's words for it.
@@ -718,6 +726,8 @@ function actionCard(plan) {
   };
   const more = moreDetails(plan.summary);
   const audit = more.add;
+  // A plan that waits on a linked machine names it first: approving it here changes that machine, not this one.
+  if (plan.linkedHost) fact("Machine", String(plan.linkedHost));
   const details = Array.isArray(plan.details) ? plan.details : [];
   for (const detail of details) (folded(detail) ? audit : fact)(detail.label, detail.value);
   if (plan.uses) fact("Uses", plan.uses);
@@ -1200,6 +1210,7 @@ function appCard(app) {
   // holds a grant for each approval.
   fact("Answers go to", (app.redirectHosts || []).join(", "));
   fact("Allowed", String(app.scope));
+  if (app.approvals) fact("Approvals", "asks you about waiting plans in its own window");
   fact("Last used", app.lastUsedAt ? new Date(app.lastUsedAt).toLocaleString() : "not since Arca started");
   fact("Client id", String(app.clientId));
   card.append(facts);

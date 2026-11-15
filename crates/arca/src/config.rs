@@ -74,6 +74,18 @@ pub struct NodeConfig {
     /// places the install writes.
     #[serde(default)]
     pub host_network: HostNetworkConfig,
+    /// The GitHub Actions runner pools this node runs: one fresh virtual machine per job (`docs/RUNNERS.md`). Absent,
+    /// none. Served only by a kernel-mode node.
+    #[serde(default)]
+    pub runners: Option<RunnersConfig>,
+}
+
+/// The `runners` key.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunnersConfig {
+    /// The pools. Each signs in with the GitHub signer's connection its `binding` names.
+    pub pools: Vec<arca_runners::PoolConfig>,
 }
 
 /// The `hostNetwork` key: the socket and the status file of the root part (`arca host-network run`).
@@ -204,8 +216,9 @@ pub struct PeerKeysConfig {
     pub origins: Vec<String>,
 }
 
-/// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token the page relays
-/// with (scope `doctor`, and ideally limited to `plan_list`, `action_approve` and `plan_decline`). `incusSocket`, when set,
+/// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token this kernel relays
+/// with: the approval page (`plan_list`, `action_approve`, `plan_decline`) and the MCP door's calls that name it with
+/// `node` (the reads and `action_propose`). Scope `doctor`, limited to the verbs relayed with it. `incusSocket`, when set,
 /// is that machine's Incus socket on this one (local, or forwarded to a path here): `instance_move_preflight` reads the
 /// linked host's facts through it, with GETs only.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -503,6 +516,8 @@ pub enum ConfigError {
     FollowInterval,
     /// `hostNetwork.socket` or `hostNetwork.status` is not an absolute path.
     HostNetworkPath,
+    /// A runner pool breaks a rule; the rule is named.
+    Runners(String),
     /// The approval origin is not an https origin with a host name and at most a non-443 port, nor the localhost origin.
     /// The value is left out.
     ApprovalOrigin,
@@ -593,6 +608,7 @@ impl fmt::Display for ConfigError {
                 f,
                 "follow.intervalSeconds is refused: it must be a whole number of seconds from 60 to 86400"
             ),
+            Self::Runners(rule) => write!(f, "runners is refused: {rule}"),
             Self::HostNetworkPath => write!(
                 f,
                 "hostNetwork.socket and hostNetwork.status are refused: each must be an absolute path"
@@ -716,6 +732,15 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     }
     if !config.host_network.socket.is_absolute() || !config.host_network.status.is_absolute() {
         return Err(ConfigError::HostNetworkPath);
+    }
+    if let Some(runners) = &config.runners {
+        let mut names = std::collections::BTreeSet::new();
+        for pool in &runners.pools {
+            pool.check().map_err(ConfigError::Runners)?;
+            if !names.insert(pool.name.as_str()) {
+                return Err(ConfigError::Runners("two pools share a name".to_string()));
+            }
+        }
     }
     if let Some(host) = &config.approval_host
         && !host_name_ok(host)

@@ -1796,6 +1796,8 @@ shows `follow` for a service that can.
 `tools/list` shows a caller only the verbs it may call.
 
 `action_propose` records a durable proposal, so its MCP annotation advertises `readOnlyHint: false` even though it changes no desired state.
+`owner_approval_pending` asks the owner's signed-in session about each plan, and a yes approves and runs it, so it
+advertises `readOnlyHint: false` too, although it needs only `viewer`.
 
 #### The OpenRPC method flags
 
@@ -1896,6 +1898,48 @@ in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, 
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
+
+### Asking a linked node: `node`
+
+One door reaches every kernel this one is linked to (`approval.linkedHosts`, see
+[Approving on another kernel of this machine](#approving-on-another-kernel-of-this-machine)). Every read the door serves,
+and `action_propose`, take an optional `node`: the `name` of one linked host. `arca_status` lists the names under
+`approval.linkedHosts`. Without `node` a call is this kernel's own, exactly as before.
+
+With `node` set, the door first checks the caller here, exactly as for a call of its own: its scope and its tool list. A
+caller that may not make the call on this kernel may not make it on a linked node, whatever the linked token holds. The
+door then takes `node` out and sends the rest of the call to that host's `socket` with the token in its `tokenFile`, the
+way the approval page relays, and returns the host's answer as the host gave it, with `linkedNode` naming it: in the
+structured content of a result, in `data` of a refusal, and as a last text line of a tool error. Every field the host
+wrote is left as it wrote it (a relayed `arca_status` keeps that host's own `node` id), and no result has a field named
+`linkedNode`, so a relayed answer fits the tool's own `outputSchema` and an MCP client that checks it accepts it. So `watch_report` with `"node": "beta"` answers with beta's instances, and `action_propose`
+with `"node": "beta"` records the proposal on beta: it waits in beta's plans, this kernel's approval page lists it under
+beta with the machine named on the card, and the owner's passkey approval goes to beta, which checks it itself. This
+kernel's terminal is never asked about a plan that waits on another node.
+
+- A `node` that is not linked is an invalid argument (`invalid_arguments: /node: not a linked node of this kernel; the
+  linked nodes are beta, gamma`). On a kernel with no linked hosts it says so.
+- A linked host that does not answer is refused `Unreachable`, naming it; one that refuses the token for that verb is
+  refused `LinkToken`, naming it. Neither is ever answered by this kernel instead. A refusal of the host's own (say
+  `TooManyProposals`) comes back with its code and words, and `linkedNode` in its `data`.
+- A write never takes `node`: one that names it is refused at this kernel's argument check, and nothing is relayed.
+
+The three `owner_approval_*` reads take no `node`: their rows are the calling token's own requests, and a relayed call
+is made with the linked token. The token in `tokenFile` must admit each verb relayed: the page's token minted with
+`--tools plan_list,action_approve,plan_decline` admits only those, so `watch_report` through it is refused `LinkToken`.
+To read and propose through the door as well, mint the linked kernel's token with the page's verbs, `action_propose` and
+the reads, and nothing else (never without `--tools`: that token would hold every `doctor` write on the linked kernel,
+and the door relays none of them):
+
+```sh
+arca token mint --scope doctor --id relay-alpha \
+  --tools plan_list,action_approve,plan_decline,action_propose,arca_status,node_metrics,watch_report,journal_list,alerts_list,postgres_list,ontology_query,service_list,service_status,service_logs,omni_status,storage_list,snapshot_list,tenant_list,tenant_status,tenant_usage,function_list,function_runs,registry_list,instance_move_preflight,github_connect_status,github_bindings,github_audit,os_update,route_list \
+  --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
+```
+
+For a linked kernel on another machine, add `peer_keys_sync` (see [Approving on another machine](#approving-on-another-machine)).
+`token_list` takes `node` too, but it is an `operator` verb and a `doctor` token cannot list it, so through this token it is
+refused `LinkToken`.
 
 ### When Incus does not answer, and when the answer is "internal"
 
@@ -2031,6 +2075,7 @@ What the node serves, all on `approvalOrigin`:
 | `POST /oauth/register` | RFC 7591 registration: redirect URIs are exact, and `https`, or `http` on `127.0.0.1`, `[::1]` or `localhost` |
 | `GET /oauth/authorize` | the consent page; `resource` (RFC 8707) must be `<origin>/mcp` |
 | `POST /oauth/token` | `authorization_code` with the PKCE verifier, `refresh_token` with rotation |
+| `GET /oauth/step-up?grant=<id>` | the step-up page of a session with `approvals`: one tap of the owner's passkey (`POST /oauth/step-up/begin`, then `/approve`) |
 | `POST /oauth/revoke` | RFC 7009: an access token alone, or a refresh token and its grant; `503` when the revocation could not be saved (the grant has ended, and the journal says `"saved":false`); the retry saves it before it answers `200` |
 
 Files in the state directory: `mcp-oauth.json` (the apps and their grants, with only the SHA-256 of each token, mode 0600)
@@ -2040,6 +2085,40 @@ never a token). Consent requests (ten minutes) and codes (one minute, one use) a
 The node must be reached at `approvalOrigin` by the app too: the reverse proxy or the tailnet listener that serves the
 page serves these routes and `/mcp` under the same name. A page at `http://localhost:<port>` serves an app on the same
 machine.
+
+### Approving in your own signed-in session
+
+An app connected by its URL can also be the owner's signed-in session for approvals: the plans waiting for the owner come
+to the owner in that app's own conversation, with no page to find. The app asks for the scope word `approvals` beside its
+level (`viewer approvals`); the consent page says so in its own block, and the passkey tap that approves the app also
+confirms it is the owner. A refresh cannot add `approvals` to a grant that was approved without it.
+
+- **The passkey counts for 12 hours**, from the consent and then from each step-up. After that the session is asked to
+  confirm again: the door sends a URL-mode elicitation (`2025-11-25`: an `elicitation/create` on the call's stream, then
+  `notifications/elicitation/complete` once confirmed; `2026-07-28`: `input_required` with a URL request) to
+  `/oauth/step-up?grant=<id>`, where one tap of the passkey confirms it for another 12 hours (journal: `stepped_up`).
+- **`owner_approval_pending`** (a `viewer` verb, no arguments) lists everything waiting for the owner: action plans,
+  delete plans and approval requests, whoever made them. Each row says whether this session is asked about it
+  (`askedHere`) and, if not, `why`; the answer also names the page (`page`). In a session that may be asked, the door then
+  asks yes or no about each action plan, one question per plan (`2025-11-25`: one `elicitation/create` after another on the
+  call's stream; `2026-07-28`: one `inputRequests` entry per plan, keyed by its id). A `yes` approves and runs it as the card's approval would; a `no`
+  declines it, as **Decline** on the card does; a decline, a cancel or no answer leaves it waiting on its card. The
+  answer's `decisions` says what each plan did (`approved`, `refused`, `declined`, `left`). The same holds for the one
+  question an `action_propose` answer asks in the session: a `no` declines that plan, and the answer says `declinedIn`.
+- **Plans that delete or erase keep the passkey card.** A delete plan, an approval request and an action that erases
+  (`service_remove`, `snapshot_delete`, `tenant_remove`, `deploy_remove`, `function_remove`, `storage_add`, and
+  `service_update` with `eraseData`) are listed with the page link and never asked in the session.
+- **Waiting plans stay open, for up to a day.** While a grant with `approvals` is live, the action plans the session may
+  approve do not lapse after their fifteen minutes: the node moves their expiry forward each minute, and their card on the
+  approval page says **Waiting for your signed-in session**. The card still approves as before. A plan is held at most 24
+  hours after it was made, then lapses as any other, so plans nobody decides never keep the node's eight waiting places
+  full. Once no such grant is live (revoked, disconnected, or its refresh token expired), they lapse after their last
+  fifteen minutes.
+
+Every approval and decline is journalled as the session and the passkey that confirmed it: `action-proposals.jsonl` says
+`approved in the owner's signed-in session oauth:<client id>/<grant id> (passkey <key>)`, or `declined in …`. A session's `accept` is still an answer of
+the client, as in the terminal path above; what it adds is that a passkey of the owner confirmed that client within the
+last 12 hours, and **Disconnect** ends it at once. Calls of the admin token are asked as before.
 
 ### Protocol versions
 
@@ -3354,7 +3433,9 @@ the file holding a token for it:
 ```
 
 `name` is the name the canvas knows that machine by (its `hosts[].name` in the canvas config). The token is minted on the
-linked kernel with scope `doctor`, limited to the three verbs the page relays:
+linked kernel with scope `doctor`, limited to the verbs relayed with it. For the page alone that is its three verbs; to
+read and propose on that kernel through this kernel's MCP door as well, list those verbs too (see
+[Asking a linked node: `node`](#asking-a-linked-node-node)):
 
 ```sh
 arca token mint --scope doctor --id relay-alpha --tools plan_list,action_approve,plan_decline \
@@ -4126,7 +4207,7 @@ already as declared, so the owner is never asked for an action that cannot run o
 
 ## Alerts
 
-On every 5-second tick, `serve` reads the node, evaluates eleven rules and writes the points and any alert events to
+On every 5-second tick, `serve` reads the node, evaluates twelve rules and writes the points and any alert events to
 `arca.db` (see "The store"). The thresholds come from `alerts.json` in the state directory. Alerts never write anything to
 Incus or to the desired state.
 
@@ -4176,6 +4257,7 @@ default is `forS` 60 and `clearForS` 120, so a condition that lasts 59 seconds n
 | `gpu-vram-high` | each card's used VRAM, in percent of its total, keyed by PCI address | 95 | 5 | warning |
 | `gpu-gone` | 1 for each card that was in the inventory and is gone from it now | 0 | 0 | critical |
 | `host-network-drift` | 1 for each item of the host's declared forwarding and firewall that is not as declared, keyed by `item`, from the root part's status file (see "Host forwarding and the firewall") | 0 | 0 | critical |
+| `runner-signin` | 1 for each runner pool whose last exchange with GitHub failed for a credential reason (401 bad credentials, 404 App not installed, 403 forbidden, or no credential in the kernel), keyed by `pool` (see [`RUNNERS.md`](RUNNERS.md)) | 0 | 0 | critical |
 
 A yes-or-no rule reads 1 when it is bad and 0 when it is fine, so its threshold of 0 fires on 1. The thresholds are a
 starting point. Tune them after a week of data.

@@ -364,6 +364,7 @@ pub struct Ticker<S: TickStore> {
     watch: Option<Arc<WatchHandler>>,
     host_network: Option<std::path::PathBuf>,
     os_update: Option<OsUpdatePublished>,
+    runners: Option<arca_runners::SignInBoard>,
 }
 
 impl<S: TickStore> Ticker<S> {
@@ -382,12 +383,19 @@ impl<S: TickStore> Ticker<S> {
             watch: None,
             host_network: None,
             os_update: None,
+            runners: None,
         }
     }
 
     /// The same ticker, which publishes the sampler's newest update state to `cell` on each tick, for `os_update`.
     pub fn with_os_update(mut self, cell: OsUpdatePublished) -> Self {
         self.os_update = Some(cell);
+        self
+    }
+
+    /// The same ticker, which reads the runner pools' sign-in board on each tick for the `runner-signin` rule.
+    pub fn with_runners(mut self, board: arca_runners::SignInBoard) -> Self {
+        self.runners = Some(board);
         self
     }
 
@@ -436,6 +444,8 @@ impl<S: TickStore> Ticker<S> {
         if let Some(path) = &self.host_network {
             inputs.host_network = crate::host_network::alert_input(path);
         }
+        // A node without pools has a known, empty list: the rule is never unknown there.
+        inputs.runner_signin = Some(crate::runners::alert_input(self.runners.as_ref(), now_ms));
         let points = export::points(&self.sampler, &inputs);
         let mut snapshot = self.engine.tick(&inputs, points, now_ms);
         snapshot.sample_at = self.sampler.latest().map(|sample| sample.at);
@@ -1518,12 +1528,12 @@ pub(crate) fn list_plans(
         .iter()
         .filter(|proposal| !proposal.expired(now))
     {
-        plans.push(action_json(
-            kernel.host(),
-            proposal,
-            now,
-            action_statements,
-        )?);
+        let mut plan = action_json(kernel.host(), proposal, now, action_statements)?;
+        // The card says it stays open while the owner's signed-in session is connected, instead of lapsing.
+        if proposal.held(now) && kernel.owner_session_live(now) {
+            plan["heldForSession"] = json!(true);
+        }
+        plans.push(plan);
     }
     Ok(json!({ "plans": plans }))
 }
@@ -2367,46 +2377,154 @@ fn run_approved(
     })
 }
 
-/// Approval from the terminal of the admin token (see `arca_mcp::elicit`): what is asked, and what an accept runs.
+/// Approval from the terminal (see `arca_mcp::elicit`): of the admin token, and of the owner's signed-in session, an app
+/// the owner connected with the `approvals` scope ([`crate::mcp_oauth`]). What is asked, and what an accept runs.
 pub struct TerminalApproval {
     pub kernel: Arc<Mutex<Kernel>>,
     pub clock: Clock,
     pub actions: ActionExecutor,
+    /// The MCP authorization server, which says whether a caller is the owner's signed-in session.
+    pub oauth: Option<Arc<crate::mcp_oauth::OAuth>>,
+}
+
+impl TerminalApproval {
+    /// Whether `caller` approves as the owner's signed-in session, and the words its approvals are journalled under.
+    fn session(&self, caller: &Caller) -> crate::mcp_oauth::Session {
+        match &self.oauth {
+            Some(oauth) if caller.is_issued() => oauth.session(caller),
+            _ => crate::mcp_oauth::Session::None,
+        }
+    }
+}
+
+/// Whether a listed or proposed action deletes or erases: such a plan keeps the owner's passkey card.
+fn erases(action: &Value, args: &Value) -> bool {
+    action
+        .as_str()
+        .and_then(ActionKind::from_name)
+        .is_none_or(|kind| kind.erases(args))
 }
 
 impl arca_mcp::TerminalApprover for TerminalApproval {
-    fn pending(&self, verb: &str, result: &Value) -> Option<arca_mcp::PendingPlan> {
+    fn may_ask(&self, caller: &Caller) -> arca_mcp::Asking {
+        if caller.scope == Scope::Admin && !caller.is_issued() {
+            return arca_mcp::Asking::Yes;
+        }
+        match self.session(caller) {
+            crate::mcp_oauth::Session::Ready { .. } => arca_mcp::Asking::Yes,
+            crate::mcp_oauth::Session::StepUp { url } => arca_mcp::Asking::StepUp { url },
+            crate::mcp_oauth::Session::None => arca_mcp::Asking::No,
+        }
+    }
+
+    fn pending(
+        &self,
+        verb: &str,
+        result: &Value,
+        caller: &Caller,
+    ) -> Option<arca_mcp::PendingPlan> {
         if verb != "action_propose" || result["kind"] != "action" {
+            return None;
+        }
+        // The owner's signed-in session is never asked about a plan that deletes or erases: it keeps its passkey card.
+        if caller.is_issued() && erases(&result["action"], &result["args"]) {
             return None;
         }
         let id = result["id"].as_str().filter(|id| id.starts_with("act-"))?;
         Some(arca_mcp::PendingPlan {
             id: id.to_string(),
-            message: terminal_question(result),
+            message: terminal_question(result, caller.is_issued()),
+            created_at: result["createdAt"].as_u64().unwrap_or_default(),
         })
     }
 
+    fn waiting(&self, verb: &str, result: &Value, caller: &Caller) -> Vec<arca_mcp::PendingPlan> {
+        if verb != OWNER_APPROVAL_PENDING {
+            return Vec::new();
+        }
+        result["plans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|plan| plan["askedHere"] == true && plan["kind"] == "action")
+            .filter_map(|plan| {
+                Some(arca_mcp::PendingPlan {
+                    id: plan["id"]
+                        .as_str()
+                        .filter(|id| id.starts_with("act-"))?
+                        .to_string(),
+                    message: terminal_question(plan, caller.is_issued()),
+                    created_at: plan["createdAt"].as_u64()?,
+                })
+            })
+            .collect()
+    }
+
     fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError> {
-        // Only the admin token approves here, whoever else reaches this.
-        if caller.scope != Scope::Admin {
-            return Err(CallError::Forbidden {
-                verb: "action_propose".to_string(),
-            });
+        let forbidden = || CallError::Forbidden {
+            verb: "action_propose".to_string(),
+        };
+        // Only the admin token, or the owner's signed-in session whose passkey still counts, approves here, whoever else
+        // reaches this.
+        let by = if caller.scope == Scope::Admin && !caller.is_issued() {
+            caller.token_id.clone()
+        } else {
+            match self.session(caller) {
+                crate::mcp_oauth::Session::Ready { key } => {
+                    format!("{} (passkey {key})", caller.token_id)
+                }
+                _ => return Err(forbidden()),
+            }
+        };
+        if caller.is_issued() {
+            let kernel = self.kernel.lock().map_err(|_| internal())?;
+            let proposal = kernel
+                .action_proposals()
+                .iter()
+                .find(|proposal| proposal.id == plan)
+                .cloned();
+            drop(kernel);
+            if let Some(proposal) = proposal
+                && erases(&json!(proposal.action), &proposal.args)
+            {
+                return Err(CallError::Refused {
+                    code: "PasskeyOnly".to_string(),
+                    message: "this plan deletes or erases: it waits for the owner's passkey on the approval page".to_string(),
+                });
+            }
         }
         let now = (self.clock)();
         // The run is made under a caller of its own, so every journal it writes says terminal approval, never the owner's.
-        // No token id holds a colon, so no token is ever this caller.
+        // No stored token id holds a colon, so no stored token is ever this caller.
         let run_as = format!("{TERMINAL_CALLER}{}", caller.token_id);
         run_approved(&self.kernel, &self.actions, &run_as, |kernel| {
             kernel
-                .approve_action_in_terminal(plan, &caller.token_id, created_at, now)
+                .approve_action_in_terminal(plan, &by, created_at, now)
                 .map_err(action_approval_failure)
         })
+    }
+
+    fn decline(&self, plan: &str, created_at: u64, caller: &Caller) -> bool {
+        // Only the owner's signed-in session, whose passkey still counts, declines with a no; the admin token's no leaves
+        // the plan waiting, as it always did.
+        if !caller.is_issued() {
+            return false;
+        }
+        let crate::mcp_oauth::Session::Ready { key } = self.session(caller) else {
+            return false;
+        };
+        let by = format!("{} (passkey {key})", caller.token_id);
+        let Ok(mut kernel) = self.kernel.lock() else {
+            return false;
+        };
+        kernel
+            .decline_action_in_session(plan, &by, created_at)
+            .unwrap_or(false)
     }
 }
 
 /// The question the terminal is asked for a waiting proposal, in the card's words: what it does, where, and until when.
-fn terminal_question(proposal: &Value) -> String {
+fn terminal_question(proposal: &Value, session: bool) -> String {
     let mut text = format!(
         "Approve this plan? {}\n",
         proposal["summary"].as_str().unwrap_or("(no summary)")
@@ -2424,10 +2542,149 @@ fn terminal_question(proposal: &Value) -> String {
             seconds / 60 % 60
         ));
     }
-    text.push_str(
-        "Approving here is recorded as approved in the terminal by the admin token, not by the owner's passkey.",
-    );
+    text.push_str(if session {
+        "Approving here is recorded as approved in your signed-in session, which your passkey confirmed. No declines it."
+    } else {
+        "Approving here is recorded as approved in the terminal by the admin token, not by the owner's passkey."
+    });
     text
+}
+
+/// The verb that lists everything waiting for the owner and asks the owner's signed-in session about each plan.
+pub const OWNER_APPROVAL_PENDING: &str = "owner_approval_pending";
+
+/// `owner_approval_pending`: every action plan, delete plan and owner approval request that waits for the owner,
+/// whoever made it, with whether this caller's session is asked about it. The asking itself is the door's
+/// ([`arca_mcp::TerminalApprover::waiting`]).
+pub struct OwnerApprovalPending {
+    pub kernel: Arc<Mutex<Kernel>>,
+    pub clock: Clock,
+    pub requests: Arc<crate::approval_requests::ApprovalRequests>,
+    pub oauth: Option<Arc<crate::mcp_oauth::OAuth>>,
+    /// The approval page, where every card waits.
+    pub page: Option<String>,
+}
+
+/// The most rows `owner_approval_pending` answers with.
+const PENDING_MAX: usize = 100;
+
+impl ToolHandler for OwnerApprovalPending {
+    fn call(&self, _args: Value, caller: &Caller) -> Result<Value, CallError> {
+        let now = (self.clock)();
+        let (session, step_up) = match (&self.oauth, caller.is_issued()) {
+            (Some(oauth), true) => match oauth.session(caller) {
+                crate::mcp_oauth::Session::Ready { .. } => ("asks", None),
+                crate::mcp_oauth::Session::StepUp { url } => ("step-up", Some(url)),
+                crate::mcp_oauth::Session::None => ("none", None),
+            },
+            _ if caller.scope == Scope::Admin => ("asks", None),
+            _ => ("none", None),
+        };
+        let asks = session != "none";
+        let mut plans = Vec::new();
+        let mut kernel = self.kernel.lock().map_err(|_| internal())?;
+        kernel.hold_proposals(now);
+        let held = kernel.owner_session_live(now);
+        for proposal in kernel
+            .action_proposals()
+            .iter()
+            .filter(|proposal| !proposal.expired(now))
+        {
+            let passkey_only =
+                caller.is_issued() && erases(&json!(proposal.action), &proposal.args);
+            let mut row = json!({
+                "id": proposal.id,
+                "kind": "action",
+                "action": proposal.action,
+                "summary": proposal.summary,
+                "details": proposal.details,
+                "createdAt": proposal.created_ms,
+                "expiresAt": proposal.expires_at,
+                "askedHere": asks && !passkey_only,
+                "heldForSession": held && proposal.held(now),
+            });
+            if passkey_only {
+                row["why"] = json!(
+                    "it deletes or erases: it waits for the owner's passkey on the approval page"
+                );
+            } else if !asks {
+                row["why"] = json!(
+                    "this session is not the owner's signed-in session: approve it on the approval page"
+                );
+            }
+            plans.push(row);
+        }
+        for plan in kernel
+            .pending_plans()
+            .iter()
+            .filter(|plan| now.saturating_sub(plan.created_ms) <= PLAN_TTL_MS)
+        {
+            plans.push(json!({
+                "id": format!("plan-{}", plan.digest.to_hex()),
+                "kind": "delete",
+                "summary": format!("Delete {} object(s) the desired state no longer names", plan.objects.len()),
+                "createdAt": plan.created_ms,
+                "expiresAt": plan.created_ms.saturating_add(PLAN_TTL_MS),
+                "askedHere": false,
+                "why": "a delete plan waits for the owner's passkey on the approval page",
+            }));
+        }
+        let requests = self.requests.list(&kernel, now)?;
+        drop(kernel);
+        for request in requests
+            .iter()
+            .filter(|request| request["state"] == "pending")
+        {
+            let fields = &request["fields"];
+            plans.push(json!({
+                "id": request["id"],
+                "kind": "request",
+                "action": fields["action"].as_str().unwrap_or_default().chars().take(64).collect::<String>(),
+                "summary": format!(
+                    "{} asks the owner to approve {} on {}",
+                    request["requester"]["name"].as_str().unwrap_or("someone"),
+                    fields["action"].as_str().unwrap_or("an action"),
+                    fields["target"].as_str().unwrap_or("this node"),
+                ).chars().take(2000).collect::<String>(),
+                "createdAt": iso_ms(request["createdAt"].as_str()).unwrap_or_default(),
+                "expiresAt": request["expiresAt"],
+                "askedHere": false,
+                "why": "an approval request hands its requester a passkey-signed approval: it waits on the approval page",
+            }));
+        }
+        plans.truncate(PENDING_MAX);
+        let mut answer = json!({ "plans": plans, "session": session });
+        if let Some(url) = step_up {
+            answer["stepUp"] = json!(url);
+        }
+        if let Some(page) = &self.page {
+            answer["page"] = json!(page);
+        }
+        Ok(answer)
+    }
+}
+
+/// The unix milliseconds of a time [`iso_utc`] wrote (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+fn iso_ms(text: Option<&str>) -> Option<u64> {
+    let text = text?.strip_suffix('Z')?;
+    let (date, time) = text.split_once('T')?;
+    let mut date = date.splitn(3, '-').map(str::parse::<i64>);
+    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
+    let (time, millis) = time.split_once('.').unwrap_or((time, "0"));
+    let mut time = time.splitn(3, ':').map(str::parse::<u64>);
+    let (hour, minute, second) = (time.next()?.ok()?, time.next()?.ok()?, time.next()?.ok()?);
+    // Howard Hinnant's days_from_civil, the inverse of `civil_from_days`.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = u64::try_from(era * 146_097 + doe - 719_468).ok()?;
+    Some(
+        ((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000)
+            + millis.parse::<u64>().ok()?,
+    )
 }
 
 /// How the message of an approved action that failed begins. The approval page shows a message that begins so in full,
