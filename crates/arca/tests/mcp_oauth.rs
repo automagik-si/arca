@@ -1983,6 +1983,10 @@ fn an_agent_away_from_the_browser_shows_a_link_and_a_code_and_polls_for_its_toke
     assert!(text.contains("<strong id=\"scope\">doctor</strong>"));
     assert!(text.contains("another device"), "{text}");
     assert!(
+        text.contains("id=\"device-note\""),
+        "the warning not to approve a code someone sent: {text}"
+    );
+    assert!(
         !text.contains("redirect-host"),
         "a device request has no redirect"
     );
@@ -2210,4 +2214,129 @@ fn the_metadata_names_the_device_endpoint_and_grant() {
         grants.contains(&json!("authorization_code")),
         "the code flow stays"
     );
+}
+
+#[test]
+fn device_codes_are_bounded_even_when_each_request_is_denied_at_once() {
+    let (rig, _key) = Rig::new("oauth-device-bound");
+    let client = rig.device_client("Churn");
+    for _ in 0..50 {
+        rig.device_code(&client, "viewer");
+    }
+    let refused = rig.device_authorization(&[("client_id", &client)]);
+    assert_eq!(refused.status, 429, "{}", refused.text());
+    assert_eq!(error_of(&refused), "temporarily_unavailable");
+    // The requests lapse; a loop that denies each new one at once frees its request, and still meets a bound on the
+    // device codes it leaves behind.
+    rig.advance(600_001);
+    let mut taken = 0;
+    let mut bounded = None;
+    for _ in 0..200 {
+        let reply = rig.device_authorization(&[("client_id", &client)]);
+        if reply.status == 429 {
+            bounded = Some(error_of(&reply));
+            break;
+        }
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        taken += 1;
+        let page = rig.get(&on_origin(
+            reply.json()["verification_uri_complete"]
+                .as_str()
+                .expect("a link"),
+        ));
+        let denied = rig.page_post(
+            "/oauth/authorize/deny",
+            json!({ "id": Rig::request_id(&page) }),
+        );
+        assert_eq!(denied.status, 200, "{}", denied.text());
+    }
+    assert_eq!(
+        bounded.as_deref(),
+        Some("temporarily_unavailable"),
+        "refused after {taken}"
+    );
+    assert!(taken <= 50, "{taken} device codes past the first fifty");
+    // Once the held ones are swept, device codes are given again.
+    rig.advance(20 * 60 * 1000);
+    assert_eq!(
+        rig.device_authorization(&[("client_id", &client)]).status,
+        200
+    );
+}
+
+#[test]
+fn a_client_registered_for_its_redirect_alone_cannot_start_a_device_flow() {
+    let (rig, _key) = Rig::new("oauth-device-code-only");
+    let desktop = rig.client("Claude Desktop");
+    let refused = rig.device_authorization(&[("client_id", &desktop), ("scope", "operator")]);
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    assert_eq!(error_of(&refused), "unauthorized_client");
+    // One that registered both may use both.
+    let both = rig.send(
+        "POST",
+        "/oauth/register",
+        &[],
+        "application/json",
+        json!({ "client_name": "Both", "redirect_uris": [REDIRECT], "grant_types": ["authorization_code", DEVICE_GRANT, "refresh_token"], "token_endpoint_auth_method": "none" })
+            .to_string()
+            .as_bytes(),
+    );
+    assert_eq!(both.status, 201, "{}", both.text());
+    let body = both.json();
+    assert_eq!(
+        body["grant_types"],
+        json!(["authorization_code", DEVICE_GRANT, "refresh_token"])
+    );
+    let id = body["client_id"].as_str().expect("a client id").to_string();
+    assert_eq!(rig.device_authorization(&[("client_id", &id)]).status, 200);
+    assert!(rig.authorize(&id, &[]).text().contains("data-request"));
+    // The grant types survive a restart of the store.
+    let reopened = rig.reopened();
+    drop(reopened);
+    let store =
+        fs::read_to_string(rig.state_dir.join(arca::mcp_oauth::STORE_FILE)).expect("the store");
+    assert!(store.contains(DEVICE_GRANT), "{store}");
+}
+
+#[test]
+fn the_passkey_statement_of_a_device_request_binds_its_user_code() {
+    let (rig, _key) = Rig::new("oauth-device-binds");
+    let client = rig.device_client("Bound");
+    let device = rig.device_code(&client, "doctor");
+    let page = rig.get(&on_origin(
+        device["verification_uri_complete"]
+            .as_str()
+            .expect("a link"),
+    ));
+    let id = Rig::request_id(&page);
+    let begun = rig.page_post("/oauth/authorize/begin", json!({ "id": id }));
+    assert_eq!(begun.status, 200, "{}", begun.text());
+    let statement: Value =
+        serde_json::from_str(begun.json()["statement"].as_str().expect("a statement"))
+            .expect("json");
+    let bound = json!({
+        "request": id, "client": client, "name": "Bound", "redirectUri": "", "scope": "doctor",
+        "resource": format!("{ORIGIN}/mcp"), "codeChallenge": "", "userCode": device["user_code"],
+    });
+    assert_eq!(statement["action"], json!("mcp_authorize"));
+    assert_eq!(statement["target"], json!(client));
+    assert_eq!(
+        statement["paramsDigest"],
+        json!(arca_kernel::canon::params_digest(&bound).expect("digest"))
+    );
+}
+
+#[test]
+fn a_revoked_clients_waiting_device_code_ends_at_once() {
+    let (rig, _key) = Rig::new("oauth-device-revoked");
+    let client = rig.device_client("Gone");
+    let device = rig.device_code(&client, "viewer");
+    let code = device["device_code"]
+        .as_str()
+        .expect("a device code")
+        .to_string();
+    assert_eq!(error_of(&rig.poll(&client, &code)), "authorization_pending");
+    rig.oauth.revoke_client(&client, "test").expect("revoked");
+    rig.advance(5_000);
+    assert_eq!(error_of(&rig.poll(&client, &code)), "invalid_grant");
 }

@@ -2031,7 +2031,9 @@ door names). **Don't allow** tells the agent no. A code lasts ten minutes and wo
 sent you: whoever started that request gets the access.
 
 Apps on the computer you are using keep the redirect flow above, with PKCE. A client registers for the device grant by
-naming `urn:ietf:params:oauth:grant-type:device_code` in `grant_types`, and then needs no redirect URI.
+naming `urn:ietf:params:oauth:grant-type:device_code` in `grant_types`, and then needs no redirect URI; a client that
+did not name it is answered `unauthorized_client`, so nobody starts a code under the id of an app you approved for its
+redirect. At most a hundred device codes are held at once; past that the node answers `429 temporarily_unavailable`.
 
 The approval page lists the connected apps under **Connected apps**, each with the most it may do across its approvals
 and when it was last used, and **Disconnect**. On the node's own terminal:

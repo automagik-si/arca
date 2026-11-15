@@ -43,10 +43,11 @@
 //! card. While a grant with `approvals` is live, the waiting action plans stay open past their fifteen minutes. An access
 //! token lives one hour and a refresh token thirty days; a code lives sixty seconds.
 //!
-//! Tokens and device codes are opaque: `arca_at_`, `arca_rt_` or `arca_dc_` and 43 base64url characters (256 random bits). The state directory keeps
-//! only their SHA-256, in `mcp-oauth.json` (mode 0600, written whole and renamed). Codes, device codes and consent
-//! requests live in memory only. `mcp-oauth-journal.jsonl` records each registration, grant, denial and revocation, and each refresh
-//! token or code used twice. No token, code, verifier or proof reaches the journal, a log line or an error.
+//! Tokens and device codes are opaque: `arca_at_`, `arca_rt_` or `arca_dc_` and 43 base64url characters (256 random
+//! bits). The state directory keeps only their SHA-256, in `mcp-oauth.json` (mode 0600, written whole and renamed).
+//! Codes, device codes and consent requests live in memory only. `mcp-oauth-journal.jsonl` records each registration,
+//! grant, denial and revocation, and each refresh token or code used twice. No token, code, verifier or proof reaches
+//! the journal, a log line or an error.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -130,6 +131,9 @@ const UNAPPROVED_MAX: usize = 100;
 const UNAPPROVED_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// Consent requests waiting at once.
 const PENDING_MAX: usize = 50;
+/// Device codes held at once. One outlives its consent request (a denied one waits for its agent's poll), so it has its
+/// own bound, and legitimate use never comes near it.
+const DEVICES_MAX: usize = 2 * PENDING_MAX;
 /// The longest client name kept, in characters, and the longest redirect URI, in bytes.
 const NAME_MAX: usize = 80;
 const REDIRECT_MAX: usize = 512;
@@ -150,6 +154,9 @@ struct Client {
     id: String,
     name: String,
     redirect_uris: Vec<String>,
+    /// The grant types it registered. Empty for a client saved before they were kept: the code flow alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    grant_types: Vec<String>,
     registered_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revoked_at: Option<u64>,
@@ -707,10 +714,23 @@ impl OAuth {
             )
             .status(StatusCode::TOO_MANY_REQUESTS));
         }
+        let grant_types: Vec<String> = match (uris.is_empty(), device) {
+            (true, _) => vec![DEVICE_GRANT.to_string(), "refresh_token".to_string()],
+            (false, true) => vec![
+                "authorization_code".to_string(),
+                DEVICE_GRANT.to_string(),
+                "refresh_token".to_string(),
+            ],
+            (false, false) => vec![
+                "authorization_code".to_string(),
+                "refresh_token".to_string(),
+            ],
+        };
         let client = Client {
             id: format!("mcpc-{}", random_hex(12)),
             name,
             redirect_uris: uris,
+            grant_types,
             registered_at: now,
             revoked_at: None,
         };
@@ -726,23 +746,17 @@ impl OAuth {
             "registered",
             json!({ "client": client.id, "name": client.name, "redirects": client.redirect_uris.iter().map(|uri| redirect_host(uri)).collect::<Vec<_>>() }),
         );
-        let (grant_types, response_types) = match (client.redirect_uris.is_empty(), device) {
-            (true, _) => (json!([DEVICE_GRANT, "refresh_token"]), json!([])),
-            (false, true) => (
-                json!(["authorization_code", DEVICE_GRANT, "refresh_token"]),
-                json!(["code"]),
-            ),
-            (false, false) => (
-                json!(["authorization_code", "refresh_token"]),
-                json!(["code"]),
-            ),
+        let response_types = if client.redirect_uris.is_empty() {
+            json!([])
+        } else {
+            json!(["code"])
         };
         Ok(json!({
             "client_id": client.id,
             "client_id_issued_at": now / 1000,
             "client_name": client.name,
             "redirect_uris": client.redirect_uris,
-            "grant_types": grant_types,
+            "grant_types": client.grant_types,
             "response_types": response_types,
             "token_endpoint_auth_method": "none",
         }))
@@ -1300,6 +1314,14 @@ impl OAuth {
                     "Arca does not know this app: register it first",
                 )
             })?;
+        // Only a client that registered the device grant starts one, so nobody starts a device flow under the id of an
+        // app the owner approved for its redirect (RFC 6749 5.2).
+        if !client.grant_types.iter().any(|grant| grant == DEVICE_GRANT) {
+            return Err(OAuthError::new(
+                "unauthorized_client",
+                format!("this app did not register the grant type {DEVICE_GRANT}"),
+            ));
+        }
         let resource = match param("resource") {
             None => self.resource.clone(),
             Some(asked) if canonical_resource(asked) == canonical_resource(&self.resource) => {
@@ -1314,7 +1336,7 @@ impl OAuth {
         };
         let (scope, tools, approvals) = parse_scope(param("scope").unwrap_or_default())
             .map_err(|why| OAuthError::new("invalid_scope", why))?;
-        if inner.pending.len() >= PENDING_MAX {
+        if inner.pending.len() >= PENDING_MAX || inner.devices.len() >= DEVICES_MAX {
             return Err(OAuthError::new(
                 "temporarily_unavailable",
                 "too many requests are waiting for the owner",
@@ -1906,6 +1928,8 @@ impl OAuth {
         }
         inner.pending.retain(|pending| pending.client_id != id);
         inner.codes.retain(|_, code| code.client_id != id);
+        // Its device codes go too: a poll answers invalid_grant at once instead of waiting out ten minutes.
+        inner.devices.retain(|_, device| device.client_id != id);
         if self.persist(&inner).is_err() {
             inner.stored = before;
             return Err(internal());
@@ -2240,7 +2264,6 @@ fn random_hex(bytes: usize) -> String {
         .collect()
 }
 
-/// A new secret: `prefix` and 43 base64url characters of 32 random bytes.
 /// A new user code: eight of [`USER_CODE_LETTERS`], each from an unbiased random byte, shown as `XXXX-XXXX`.
 fn user_code() -> String {
     let mut letters = Vec::with_capacity(8);
@@ -2256,6 +2279,7 @@ fn user_code() -> String {
     format!("{}-{}", &text[..4], &text[4..])
 }
 
+/// A new secret: `prefix` and 43 base64url characters of 32 random bytes.
 fn secret(prefix: &str) -> String {
     format!("{prefix}{}", URL_SAFE_NO_PAD.encode(random_bytes::<32>()))
 }
