@@ -272,6 +272,11 @@ used=$(in_vm -- df -B1 --output=used / | tail -1 | tr -d ' ')
 incus stop "$vm" --project "$PROJECT"
 # The build user's cloud-init data must not go with the image: cloud-init would make that user again on every machine.
 incus config unset "$vm" cloud-init.user-data --project "$PROJECT"
+# Nor the build's pinned address (a copy would not start: the address is taken) or its disk throttle (a job machine
+# gets its class's limits, not the build's).
+incus config device unset "$vm" "$nic" ipv4.address --project "$PROJECT" 2>/dev/null || true
+incus config device unset "$vm" root limits.read --project "$PROJECT"
+incus config device unset "$vm" root limits.write --project "$PROJECT"
 t_final=$(date +%s)
 
 # --- 7. the image -------------------------------------------------------------------------------------------------

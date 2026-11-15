@@ -201,3 +201,4 @@ Our full software list is [software-report.md](software-report.md) (GitHub's gen
   resource-disk mount setting removed, and Ubuntu's LXD agent loader masked.
 - The image was kept as the stopped machine with a snapshot, not published: publishing needs about twice its size free
   under `/var/lib/incus` on the build host.
+- Its snapshot was made again later without the build's disk throttle, which had gone with it to every copy.
