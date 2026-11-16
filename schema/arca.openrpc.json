@@ -15300,7 +15300,19 @@
     },
     {
       "name": "reach_list",
-      "params": [],
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {

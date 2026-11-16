@@ -1388,7 +1388,7 @@ static VERBS: [Verb; 96] = [
         output_key: Some("connectors"),
         summary_text: summary_reach,
         cut: no_cut,
-        params: empty_params,
+        params: on_node!(empty_params),
         result: reach_list_result,
     },
     Verb {

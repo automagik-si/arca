@@ -238,7 +238,7 @@ fn login_link(url: &str) -> bool {
 /// Hide exactly the vendor's node-login URL shape; preserve punctuation, admin URLs and other text.
 pub(crate) fn redact_login_links(text: &str) -> String {
     static LINKS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"https://login\.tailscale\.com/a/[A-Za-z0-9_-]+\b")
+        regex::Regex::new(r"https://login\.tailscale\.com/a/[A-Za-z0-9_-]+")
             .expect("fixed login-link pattern")
     });
     LINKS.replace_all(text, "[sign-in link]").into_owned()
@@ -247,6 +247,22 @@ pub(crate) fn redact_login_links(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn login_link_redaction_keeps_punctuation_and_hides_the_whole_identifier() {
+        assert_eq!(
+            redact_login_links("visit https://login.tailscale.com/a/synthetic-id- now"),
+            "visit [sign-in link] now"
+        );
+        assert_eq!(
+            redact_login_links("(https://login.tailscale.com/a/synthetic_123)."),
+            "([sign-in link])."
+        );
+        assert_eq!(
+            redact_login_links("https://login.tailscale.com/admin/machines"),
+            "https://login.tailscale.com/admin/machines"
+        );
+    }
+
     #[test]
     fn status_drops_auth_url_and_tolerates_missing_fields() {
         let status: Status = serde_json::from_value(json!({"AuthURL":"https://login.tailscale.com/a/synthetic", "BackendState":"NeedsLogin", "NewField":true})).unwrap();
