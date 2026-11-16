@@ -13,7 +13,7 @@ use arca::action_proposal::ActionKind;
 use arca::config::NodeConfig;
 use arca::handlers::{ActionExecutor, ActionSlot, plan_handlers_served};
 use arca::kernel::Kernel;
-use arca::vm_import::{ImportBackend, handlers as import_handlers};
+use arca::vm_import::{ImportBackend, handlers as import_handlers, reword_waiting_imports};
 use arca_mcp::{CallError, ToolHandler};
 use arca_vmimport::{FakeCopy, Probe};
 use common::*;
@@ -244,14 +244,13 @@ fn after_a_restart_the_card_names_the_source_cluster_the_run_reads() {
     // `serve` starts again with `import` as its config: the waiting card, as the approval page reads it.
     let reopened = |import: Option<Value>| -> Value {
         let verifier = verifier_for(&scratch, &[&key], tag);
-        let kernel = Arc::new(Mutex::new(
-            kernel_with_image(&scratch, &fake, verifier, NOW, None).expect("the kernel opens"),
-        ));
-        let handlers = served(
-            &kernel,
-            Arc::new(AtomicU64::new(NOW)),
-            node(&scratch, &fake, import),
-        );
+        let mut kernel =
+            kernel_with_image(&scratch, &fake, verifier, NOW, None).expect("the kernel opens");
+        let node = node(&scratch, &fake, import);
+        // What `serve` does once the kernel opens, before it shares it.
+        reword_waiting_imports(&mut kernel, &node);
+        let kernel = Arc::new(Mutex::new(kernel));
+        let handlers = served(&kernel, Arc::new(AtomicU64::new(NOW)), node);
         let waiting = kernel.lock().expect("the kernel lock").action_proposals()[0].clone();
         drop((handlers, kernel));
         assert_eq!(
@@ -284,6 +283,42 @@ fn after_a_restart_the_card_names_the_source_cluster_the_run_reads() {
             .all(|row| row["label"] != "Ceph"),
         "{off}"
     );
+}
+
+#[test]
+fn the_handlers_are_made_while_another_thread_holds_the_kernel_lock() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let key = SkKey::from_seed(46);
+    let tag = "import-lock-held";
+    let rig = rig(tag, &key);
+    rig.propose("instance_import", import_args())
+        .expect("proposed");
+    let Rig {
+        _scratch: scratch,
+        fake,
+        kernel,
+        ..
+    } = rig;
+    // Another call owns the kernel while the handlers are made, with an import config that differs from the card's.
+    let held = kernel.lock().expect("the kernel lock");
+    let (made, answer) = mpsc::channel();
+    let builder = {
+        let kernel = Arc::clone(&kernel);
+        let node = node(
+            &scratch,
+            &fake,
+            Some(json!({ "sourcePool": "src-pool", "cephCluster": "source-c" })),
+        );
+        std::thread::spawn(move || {
+            let handlers = served(&kernel, Arc::new(AtomicU64::new(NOW)), node);
+            made.send(handlers.len()).expect("report the handlers");
+        })
+    };
+    let count = answer.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    builder.join().expect("the builder thread");
+    assert!(count.expect("the handlers are made without waiting on the kernel lock") > 0);
 }
 
 fn import_args() -> Value {
