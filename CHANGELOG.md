@@ -4,6 +4,19 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
+its old values may precede a late synchronous PATCH: Arca keeps the original values as its inverse and retries the
+entry on the next document, rather than claiming the change did not land. Gateway errors (502/503/504) also leave the
+answer uncertain for config and ACL array PATCHes and synchronous creates; ACL array PATCHes keep their original rules
+as the inverse when an uncertain answer still reads as the old rules. Runtime recovery polls open intents without
+waiting on Incus operations, with one 5 s Incus I/O budget; an absent synchronous create stays open until it can be read
+back present or restart recovery settles it. PATCH requests get 30 seconds, and service config errors include the
+kernel's reason in the answer and log.
+
+The effect journal supports a binding record from this release; once one is written, older Arca versions refuse the journal.
+
+## 0.34.0 (2026-11-16)
+
 Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
 `TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:
 a connector may start with no key, and an unset optional secret is absent from the container's environment. Other
@@ -68,16 +81,14 @@ the create are kept. Unset caps leave the old behaviour unchanged.
 `service_status` shows the recorded limits under `settings.limits`. See "Service disk and network limits" in
 docs/OPERATING.md for units and storage-driver requirements.
 
-A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
-its old values may precede a late synchronous PATCH: Arca keeps the original values as its inverse and retries the
-entry on the next document, rather than claiming the change did not land. Gateway errors (502/503/504) also leave the
-answer uncertain for config and ACL array PATCHes and synchronous creates; ACL array PATCHes keep their original rules
-as the inverse when an uncertain answer still reads as the old rules. Runtime recovery polls open intents without
-waiting on Incus operations, with one 5 s Incus I/O budget; an absent synchronous create stays open until it can be read
-back present or restart recovery settles it. PATCH requests get 30 seconds, and service config errors include the
-kernel's reason in the answer and log.
-
-The effect journal supports a binding record from this release; once one is written, older Arca versions refuse the journal.
+- Merge feat/service-io-limits (PR 220): per-service disk read/write and network ingress/egress caps; a fresh capped create whose first start fails rolls back everything it added
+- Merge fix/console-token-before-ready (PR 223): the node writes and syncs the console token before it publishes its pid, so a reader keyed on the pid never sees a stale token
+- Merge feat/workspace-homes (PR 218): one Automagik workspace per project gets explicit persistent homes on /data for uid 1000 and a required pnpm path
+- Merge fix/storage-mapped-devices (PR 217): storage_list and storage_add never offer mapped RBD/NBD/loop/dm/zvol/DRBD/zram devices; native NVMe multipath stays a machine disk
+- Merge feat/reach-g2 (PR 216): linking a tailscale connector to the edge supplies its forward target; TS_TARGET/TS_AUTHKEY optional
+- Merge origin/dev (v0.33.0 release) into dev
+- Merge feat/token-service-scope: a token can be limited to named services and a time
+- Merge feat/instance-move-stopped-vm: a stopped VM moves between hosts, Ceph moves size without snapshots
 
 ## 0.33.0 (2026-11-16)
 
