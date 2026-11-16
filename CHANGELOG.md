@@ -7,6 +7,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 An owner-approved `instance_start` card now starts an instance inside a tenant even when the proposing token's tool
 allowlist omits `instance_start`. Direct tenant starts still require the verb in the token's tool allowlist.
 
+Service adoption rechecks an instance under the kernel lock before recording it, so an overlapping removal cannot
+bring its record back; a failed candidate read is skipped until a later service call. An owner-approved
+`service_release` can forget a missing adopted instance without an import allowlist entry, freeing its name and
+address for `service_create`.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows

@@ -6957,12 +6957,16 @@ fn adoption_subnet(cfg: &NodeConfig, row: &Value, cidr: &str, gateway: &str) -> 
 fn adopt_services(
     kernel: &Mutex<Kernel>,
     cfg: &NodeConfig,
-    entries: &[arca_kernel::desired::Entry],
     rows: &[Value],
     cidr: &str,
     gateway: &str,
     now: u64,
 ) -> Result<(), CallError> {
+    // Writing callers already hold the write gate. Never acquire it after the kernel lock.
+    // Removal owns this same lock through its instance deletion and journal settlement.
+    let mut kernel = lock(kernel)?;
+    let read = UnixIncus::new(cfg.incus.socket.clone());
+    let entries = kernel.entries().to_vec();
     let mut changes = Vec::new();
     for row in rows {
         if !service_owned(row) {
@@ -7006,6 +7010,36 @@ fn adopt_services(
             }
             continue;
         }
+        // The listing may precede a completed removal. Re-read only a valid candidate without
+        // a record, and build its record from the fresh answer while the lock is still held.
+        let path = format!(
+            "/1.0/instances/{}?project={}",
+            config.instance, config.project
+        );
+        let mut row = match read.get(&path) {
+            Ok(row) => row,
+            Err(arca_incus::IncusError::Status { code: 404, .. }) => continue,
+            Err(_) => {
+                // Never log the error body: the instance's response may contain secrets.
+                eprintln!(
+                    "arca: skipped adoption of {}/{}: instance read failed; a later service call will retry",
+                    config.project, config.instance
+                );
+                continue;
+            }
+        };
+        // A single-instance response need not carry the project, unlike the all-projects listing.
+        row["project"] = json!(config.project);
+        if !service_owned(&row) {
+            continue;
+        }
+        let (cidr, gateway) = adoption_subnet(cfg, &row, &cidr, &gateway);
+        let Some(mut config) = adopted_config(&row, rows, &cidr, &gateway, now) else {
+            continue;
+        };
+        config.kernel_access = config
+            .kernel_access
+            .filter(|link| cfg.kernel_access().as_deref() == Some(link.connect.as_str()));
         changes.push(crate::desired_store::EntryChange::Put(service_entry(
             &id,
             "arca.service",
@@ -7013,9 +7047,7 @@ fn adopt_services(
         )));
     }
     if !changes.is_empty() {
-        lock(kernel)?
-            .propose(changes, now)
-            .map_err(|_| internal())?;
+        kernel.propose(changes, now).map_err(|_| internal())?;
     }
     Ok(())
 }
@@ -7810,15 +7842,7 @@ impl ServiceHandler {
         // Adopting writes a record into the desired state, which a node that only looks never does: an instance it holds
         // no record of is shown as it is, and marked.
         if managed && tenant.is_none() && !only_looks {
-            adopt_services(
-                &self.kernel,
-                &self.cfg,
-                &entries,
-                &rows,
-                &cidr,
-                &gateway,
-                now,
-            )?;
+            adopt_services(&self.kernel, &self.cfg, &rows, &cidr, &gateway, now)?;
             entries = {
                 let kernel = lock(&self.kernel)?;
                 kernel.entries().to_vec()
@@ -8283,15 +8307,7 @@ impl ServiceHandler {
                         ));
                     }
                 };
-                adopt_services(
-                    &self.kernel,
-                    &self.cfg,
-                    &entries,
-                    &rows,
-                    &cidr,
-                    &gateway,
-                    now,
-                )?;
+                adopt_services(&self.kernel, &self.cfg, &rows, &cidr, &gateway, now)?;
                 let entries = lock(&self.kernel)?.entries().to_vec();
                 let Some((_, config)) = service_entries(&entries)
                     .into_iter()
@@ -8315,7 +8331,8 @@ impl ServiceHandler {
                 if !preapproved {
                     return Err(import_not_approved());
                 }
-                let record = service_entries(&entries)
+                let mut kernel = lock(&self.kernel)?;
+                let record = service_entries(kernel.entries())
                     .into_iter()
                     .find(|(_, config)| config.name == name);
                 let Some((entry, config)) = record else {
@@ -8327,8 +8344,14 @@ impl ServiceHandler {
                     )));
                 }
                 // The key goes first: while the instance carries it, the next call would make the record again.
+                // Keep the absence read and record removal under the same lock as service removal.
+                let unlisted = self
+                    .cfg
+                    .kernel
+                    .import_service(&name, &config.project)
+                    .is_none();
                 let done = crate::service_import::release(&self.cfg, &name, &config.project)?;
-                let outcomes = lock(&self.kernel)?
+                let outcomes = kernel
                     .propose(
                         vec![crate::desired_store::EntryChange::Remove(entry.id.clone())],
                         now,
@@ -8339,11 +8362,15 @@ impl ServiceHandler {
                         "release service {name}: the instance is released, but Arca's record of it could not be removed"
                     )));
                 }
-                Ok(json!({
+                let mut result = json!({
                     "released": true,
                     "restored": done.restored,
                     "preImage": done.image,
-                }))
+                });
+                if unlisted {
+                    result["alreadyGone"] = json!(true);
+                }
+                Ok(result)
             }
             "service_create" => {
                 let name = service_name(&args)?;

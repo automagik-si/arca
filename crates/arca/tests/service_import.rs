@@ -914,6 +914,140 @@ fn a_release_refuses_in_plain_words_when_the_inverse_is_not_safe() {
 }
 
 #[test]
+fn release_forgets_a_missing_adopted_instance_without_an_allowlist_entry() {
+    let mut rig = standard();
+    rig.approved("service_import", "db1").unwrap();
+    rig.edit(
+        "PUT",
+        "/1.0/instances/db1/state?project=app1",
+        json!({"action":"stop"}),
+    );
+    rig.edit("DELETE", DB1, json!({}));
+    rig.close();
+    rig.open(json!([]));
+    let writes = rig.fake.writes();
+    let released = rig
+        .approved("service_release", "db1")
+        .expect("forget the missing instance");
+    assert_eq!(
+        released,
+        json!({"released":true,"restored":false,"preImage":null,"alreadyGone":true})
+    );
+    assert!(rig.entry("service-db1").is_none());
+    assert_eq!(
+        rig.fake.writes(),
+        writes,
+        "forgetting writes nothing to Incus"
+    );
+}
+
+#[test]
+fn release_forgets_a_missing_adopted_service_in_the_managed_project() {
+    let rig = Rig::new(
+        "release-managed-gone",
+        vec![foreign_service("db1", PROJECT, "192.0.2.10", UUID)],
+        json!([]),
+    );
+    rig.call("service_list", json!({})).unwrap();
+    assert_eq!(rig.entry("service-db1").unwrap()["adopted"], true);
+    let path = format!("/1.0/instances/db1?project={PROJECT}");
+    rig.edit(
+        "PUT",
+        &format!("/1.0/instances/db1/state?project={PROJECT}"),
+        json!({"action":"stop"}),
+    );
+    rig.edit("DELETE", &path, json!({}));
+    let writes = rig.fake.writes();
+    let result = rig
+        .approved("service_release", "db1")
+        .expect("forget without an import allowance");
+    assert_eq!(result["alreadyGone"], true);
+    assert!(rig.entry("service-db1").is_none());
+    assert_eq!(rig.fake.writes(), writes);
+}
+
+#[test]
+fn one_approved_release_clears_an_old_phantom_and_frees_its_name_and_address() {
+    let rig = Rig::new("release-phantom", vec![], json!([]));
+    fs::create_dir_all(rig.state_dir().join("templates")).unwrap();
+    fs::write(
+        rig.state_dir().join("templates/nats.json"),
+        json!({
+            "name":"nats", "kind":"oci", "image":"docker.io/library/nats",
+            "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ports":[4222], "env":{}, "publishable":false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // A stopped fixture leaves no separate DHCP lease holding its address after deletion.
+    rig.call(
+        "service_create",
+        json!({"name":"nats","template":"nats","start":false}),
+    )
+    .unwrap();
+    assert!(rig.fake.leases().is_empty());
+    let mut phantom = rig
+        .node()
+        .kernel
+        .lock()
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|entry| entry.id.0 == "service-nats")
+        .unwrap()
+        .clone();
+    let address = phantom.config["ipv4"].clone();
+    rig.approved("service_remove", "nats").unwrap();
+    // The record an older build made from the stale listing after its approved removal.
+    phantom.config["adopted"] = json!(true);
+    phantom.config["source"] = json!({});
+    phantom.config["start"] = json!(false);
+    phantom.config["pool"] = json!("");
+    phantom.config["bridge"] = json!("");
+    phantom.config["autostart"] = json!(false);
+    rig.node()
+        .kernel
+        .lock()
+        .unwrap()
+        .propose(vec![arca::desired_store::EntryChange::Put(phantom)], NOW)
+        .unwrap();
+    let writes = rig.fake.writes();
+    let released = rig
+        .approved("service_release", "nats")
+        .expect("one approved release forgets the old phantom");
+    assert_eq!(
+        released,
+        json!({"released":true,"restored":false,"preImage":null,"alreadyGone":true})
+    );
+    assert!(rig.entry("service-nats").is_none());
+    assert_eq!(
+        rig.fake.writes(),
+        writes,
+        "the release writes nothing to Incus"
+    );
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("the released name can be used again");
+    assert_eq!(rig.entry("service-nats").unwrap()["ipv4"], address);
+}
+
+#[test]
+fn release_of_a_present_unlisted_instance_keeps_the_exact_refusal() {
+    let mut rig = standard();
+    rig.approved("service_import", "db1").unwrap();
+    rig.close();
+    rig.open(json!([]));
+    let writes = rig.fake.writes();
+    let (_, words) = refusal(rig.approved("service_release", "db1"));
+    assert_eq!(
+        words,
+        "The approval was accepted, but service_release did not complete: release service db1: kernel.importServices no longer lists it, so Arca may not write to its instance; list it again with the same name, project and cidr, then release it. Nothing was written"
+    );
+    assert!(rig.entry("service-db1").is_some());
+    assert_eq!(rig.fake.writes(), writes);
+}
+
+#[test]
 fn a_restart_reads_the_imported_record_back_and_writes_nothing() {
     let mut rig = standard();
     rig.approved("service_import", "db1").expect("the import");

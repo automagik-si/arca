@@ -2457,7 +2457,21 @@ fn adoption_reads_the_exact_user_arca_keys_and_leaves_them_as_they_are() {
         vec![PROJECT.to_string(), "arca".into()],
         Some("192.0.2.0/24"),
     );
+    let requests_before = rig.fake.requests().len();
     let listed = rig.call("service_list", json!({})).expect("list");
+    let adoption_requests = rig.fake.requests()[requests_before..].to_vec();
+    assert_eq!(
+        adoption_requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("GET", "/1.0/instances?all-projects=true&recursion=1"),
+            ("GET", "/1.0/instances/svc1?project=arca"),
+        ],
+        "adoption adds only one locked instance read"
+    );
+    let adopted_bytes = serde_json::to_vec(&rig.entries()).unwrap();
     let rows = listed["services"].as_array().expect("rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["name"], "svc1");
@@ -2481,9 +2495,19 @@ fn adoption_reads_the_exact_user_arca_keys_and_leaves_them_as_they_are() {
         live["config"]["environment.POSTGRES_PASSWORD"],
         "redacted-value"
     );
+    let requests_before = rig.fake.requests().len();
     assert_eq!(
         rig.call("service_status", json!({"name":"svc1"})).unwrap()["state"],
         "running"
+    );
+    assert_eq!(serde_json::to_vec(&rig.entries()).unwrap(), adopted_bytes);
+    assert_eq!(
+        rig.fake.requests()[requests_before..]
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/1.0/instances?all-projects=true&recursion=1"],
+        "no candidate means no extra read"
     );
     assert!(matches!(
         rig.call("service_create", json!({"name":"svc1","template":"nats"})),
@@ -3238,6 +3262,268 @@ fn an_instance_only_delete_rejection_is_a_partial_refusal_and_keeps_secrets() {
         ),
         Err(arca_approval::ApprovalRefusal::Replayed)
     ));
+}
+
+// The proxy snapshots the real fake's listing while removal is paused, then delivers it only
+// after removal finishes. Later reads go to the fake normally; no scheduling delay proves the race.
+#[test]
+fn a_service_call_with_a_listing_taken_during_removal_does_not_readopt_it() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let key = common::SkKey::from_seed(9);
+    let (entered, at_retirement) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let rig = Rig::with_key_and_pause(
+        empty_state(),
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+        Some(RemovalPause {
+            entered,
+            release: released,
+        }),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let proxy_path = rig.dir.join("listing.sock");
+    let listener = UnixListener::bind(&proxy_path).unwrap();
+    let real = UnixIncus::new(rig.fake.socket().into());
+    let (listed, snapshot_ready) = mpsc::channel();
+    let (deliver, removal_done) = mpsc::channel();
+    let proxy = std::thread::spawn(move || {
+        let mut first = true;
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let path = line.split_whitespace().nth(1).unwrap().to_string();
+            if path == "/quit" {
+                break;
+            }
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let result = real.get(&path);
+            if first {
+                assert_eq!(path, "/1.0/instances?all-projects=true&recursion=1");
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap()
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["name"] == "pg")
+                );
+                listed.send(()).unwrap();
+                removal_done.recv_timeout(Duration::from_secs(5)).unwrap();
+                first = false;
+            }
+            let (status, body) = match result {
+                Ok(rows) => (
+                    200,
+                    json!({"type":"sync","status":"Success","status_code":200,"metadata":rows}),
+                ),
+                Err(arca_incus::IncusError::Status { code: 404, .. }) => (
+                    404,
+                    json!({"type":"error","error_code":404,"error":"not found"}),
+                ),
+                Err(error) => panic!("proxy read: {error}"),
+            };
+            let body = body.to_string();
+            write!(stream, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let mut cfg = (*rig.cfg).clone();
+    cfg.incus.socket = proxy_path.clone();
+    let list_handler = service_handlers(Arc::clone(&rig.kernel), Arc::new(|| NOW), Arc::new(cfg))
+        .into_iter()
+        .find(|(name, _)| *name == "service_list")
+        .unwrap()
+        .1;
+    let handler = Arc::clone(&rig.handlers["service_remove"]);
+    let approval = owner_approval(&key, "pg");
+    let remove = std::thread::spawn(move || {
+        handler.call(
+            json!({"name":"pg","approval":approval}),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+                limits: Default::default(),
+            },
+        )
+    });
+    at_retirement.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(rig.kernel.try_lock().is_err());
+    let listing = std::thread::spawn(move || {
+        list_handler.call(
+            json!({}),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+                limits: Default::default(),
+            },
+        )
+    });
+    snapshot_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(remove.join().unwrap().unwrap(), json!({"removed":true}));
+    deliver.send(()).unwrap();
+    let result = listing.join().unwrap();
+    let mut quit = UnixStream::connect(proxy_path).unwrap();
+    write!(quit, "GET /quit HTTP/1.1\r\n\r\n").unwrap();
+    proxy.join().unwrap();
+    result.expect("overlapping service call");
+    assert!(
+        !rig.entries().iter().any(|entry| entry.id.0 == "service-pg"),
+        "a stale listing must not resurrect a removed record"
+    );
+}
+
+#[test]
+fn failed_adoption_reads_do_not_refuse_other_calls_and_are_retried_later() {
+    for status in [403, 503] {
+        let rig = Rig::with(
+            FakeState {
+                instances: vec![adopted_instance(
+                    "svc1",
+                    "arca",
+                    "postgres-autopg",
+                    "192.0.2.10",
+                    "5432",
+                    "uuid-svc1",
+                )],
+                ..empty_state()
+            },
+            vec![PROJECT.into(), "arca".into()],
+            Some("192.0.2.0/24"),
+        );
+        rig.template("nats", nats_template());
+        let path = "/1.0/instances/svc1?project=arca";
+        rig.fake.fail_reads(path, 2, status);
+        rig.call("service_list", json!({}))
+            .expect("a failed candidate read must not refuse the list");
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1")
+        );
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+            .expect("a failed candidate read must not refuse another service's create");
+        assert!(
+            rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-nats")
+        );
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1")
+        );
+        assert_eq!(
+            rig.fake
+                .requests()
+                .iter()
+                .filter(|request| request.path == path && request.status == status)
+                .count(),
+            2
+        );
+        rig.call("service_list", json!({}))
+            .expect("a later call retries adoption");
+        assert!(
+            rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1" && entry.config["adopted"] == true)
+        );
+    }
+}
+
+#[test]
+fn a_missing_adoption_is_preserved_despite_old_retirement_history() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        empty_state(),
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let mut phantom = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "service-pg")
+        .unwrap();
+    rig.call(
+        "service_remove",
+        json!({"name":"pg","approval":owner_approval(&key, "pg")}),
+    )
+    .unwrap();
+    // Exactly the old adoption record: no source, secrets or environment, and no host writes.
+    phantom.config["adopted"] = json!(true);
+    phantom.config["source"] = json!({});
+    phantom.config["secretRefs"] = json!({});
+    phantom.config["environment"] = json!({});
+    phantom.config["pool"] = json!("");
+    phantom.config["bridge"] = json!("");
+    phantom.config["autostart"] = json!(false);
+    phantom.config["start"] = json!(false);
+    rig.kernel
+        .lock()
+        .unwrap()
+        .propose(vec![arca::desired_store::EntryChange::Put(phantom)], NOW)
+        .unwrap();
+    let before = rig.entries();
+    let writes = rig.fake.writes();
+    rig.call("service_list", json!({})).unwrap();
+    assert_eq!(
+        rig.entries(),
+        before,
+        "an old retirement does not authorize forgetting an adopted record without approval"
+    );
+    assert_eq!(rig.fake.writes(), writes);
+}
+
+#[test]
+fn an_adopted_instance_missing_without_a_kernel_retirement_keeps_its_record() {
+    let rig = Rig::with(
+        FakeState {
+            instances: vec![adopted_instance(
+                "svc1",
+                "arca",
+                "postgres-autopg",
+                "192.0.2.10",
+                "5432",
+                "uuid-svc1",
+            )],
+            ..empty_state()
+        },
+        vec![PROJECT.into(), "arca".into()],
+        Some("192.0.2.0/24"),
+    );
+    rig.call("service_list", json!({})).unwrap();
+    let before = rig.entries();
+    rig.edit(
+        "PUT",
+        "/1.0/instances/svc1/state?project=arca",
+        json!({"action":"stop"}),
+    );
+    rig.edit("DELETE", "/1.0/instances/svc1?project=arca", json!({}));
+    let writes = rig.fake.writes();
+    rig.call("service_list", json!({})).unwrap();
+    assert_eq!(rig.entries(), before);
+    assert_eq!(rig.fake.writes(), writes);
 }
 
 #[test]
