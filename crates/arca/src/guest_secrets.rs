@@ -14,6 +14,7 @@
 //! project: the project is the one the effect journal holds for the instance, never the one a call names, and the
 //! writer reaches that tenant's project and no other tenant's. Commands (the exec seam) stay in the node's own project.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,14 @@ const AGENT_WAIT: Duration = Duration::from_secs(120);
 const AGENT_PAUSE: Duration = Duration::from_secs(3);
 /// The time one file request may take.
 const REQUEST_BUDGET: Duration = Duration::from_secs(15);
+/// Renew well inside GitHub's one-hour token lifetime.
+pub const REPOSITORY_REFRESH: Duration = Duration::from_secs(45 * 60);
+pub type RepositoryMint = Arc<
+    dyn Fn(&str) -> Result<crate::github_repository::RepositoryCredential, NotWritten>
+        + Send
+        + Sync,
+>;
+type RepositoryWrites = BTreeMap<(String, String, String), u64>;
 
 /// Why a virtual machine's secrets were not written into its guest. The words never hold a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +72,9 @@ pub struct GuestSecrets {
     kernel: Arc<Mutex<Kernel>>,
     wait: Duration,
     pause: Duration,
+    repository_mint: Option<RepositoryMint>,
+    repository_clock: crate::handlers::Clock,
+    repository_written: Mutex<RepositoryWrites>,
 }
 
 impl GuestSecrets {
@@ -72,6 +84,12 @@ impl GuestSecrets {
             kernel,
             wait: AGENT_WAIT,
             pause: AGENT_PAUSE,
+            repository_mint: None,
+            repository_clock: {
+                let began = Instant::now();
+                Arc::new(move || u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX))
+            },
+            repository_written: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -80,6 +98,52 @@ impl GuestSecrets {
         self.wait = wait;
         self.pause = pause;
         self
+    }
+
+    pub fn with_repository_mint(mut self, mint: RepositoryMint) -> Self {
+        self.repository_mint = Some(mint);
+        self
+    }
+
+    /// A monotonic millisecond test clock proves the production refresh interval without waiting forty-five minutes.
+    pub fn with_repository_clock(mut self, clock: crate::handlers::Clock) -> Self {
+        self.repository_clock = clock;
+        self
+    }
+
+    /// Refresh each running, owned workspace independently; a failure does not starve other workspaces.
+    pub fn refresh_repositories(&self) {
+        let candidates: Vec<_> = match self.kernel.lock() {
+            Ok(kernel) => kernel
+                .entries()
+                .iter()
+                .filter(|e| e.plugin.0 == "arca.service")
+                .filter_map(|e| serde_json::from_value::<ServiceConfig>(e.config.clone()).ok())
+                .filter(|s| s.template == "automagik-workspace" && s.vm.is_some() && !s.adopted)
+                .map(|s| (s.project, s.instance))
+                .collect(),
+            Err(_) => return,
+        };
+        for (project, instance) in candidates {
+            if let Err(why) = self.deliver_inner(&project, &instance, true) {
+                eprintln!(
+                    "arca: workspace repository credential refresh failed: {}",
+                    why.why
+                );
+            }
+        }
+    }
+
+    pub fn spawn_repository_refresh(self: Arc<Self>) -> std::io::Result<()> {
+        std::thread::Builder::new()
+            .name("workspace-repository-tokens".into())
+            .spawn(move || {
+                loop {
+                    self.refresh_repositories();
+                    std::thread::park_timeout(Duration::from_secs(60));
+                }
+            })
+            .map(|_| ())
     }
 
     /// Writes the stored secrets of the virtual-machine service whose instance is `instance` in `project` into its
@@ -95,6 +159,15 @@ impl GuestSecrets {
         &self,
         project: &str,
         instance: &str,
+    ) -> Result<Option<Vec<String>>, NotWritten> {
+        self.deliver_inner(project, instance, false)
+    }
+
+    fn deliver_inner(
+        &self,
+        project: &str,
+        instance: &str,
+        repository_only: bool,
     ) -> Result<Option<Vec<String>>, NotWritten> {
         if project != arca_netproject::PROJECT
             && arca_kernel::ownership::tenant_of_project(project).is_none()
@@ -123,7 +196,12 @@ impl GuestSecrets {
             else {
                 return Ok(None);
             };
-            if record.vm.is_none() || record.adopted || record.secret_refs.is_empty() {
+            let workspace = record.template == "automagik-workspace";
+            if record.vm.is_none()
+                || record.adopted
+                || (record.secret_refs.is_empty() && !workspace)
+                || (repository_only && !workspace)
+            {
                 return Ok(None);
             }
             let object = kernel.service_object(&entry, &record.instance);
@@ -142,7 +220,10 @@ impl GuestSecrets {
         // process's user, and the file that was checked is the file that is read.
         let secrets = self.cfg.state_dir.join("secrets");
         let mut files = Vec::new();
-        for (key, reference) in &record.secret_refs {
+        for (key, reference) in record.secret_refs.iter().filter(|(key, _)| {
+            !repository_only
+                && !(record.template == "automagik-workspace" && key.as_str() == "GITHUB_TOKEN")
+        }) {
             let name = SecretName::new(key).map_err(|_| {
                 NotWritten::fixed(format!("the secret name {key} cannot be a file name"))
             })?;
@@ -182,6 +263,79 @@ impl GuestSecrets {
         })?;
         if owned.tombstone().is_some() {
             return Err(NotWritten::fixed("its instance is being removed"));
+        }
+        let repository_key = (
+            project.to_string(),
+            instance.to_string(),
+            object.uuid.clone().unwrap_or_default(),
+        );
+        let workspace = target.service.template == "automagik-workspace";
+        if workspace {
+            // Ownership and UUID were checked above. Read power state before minting, including on a refresh:
+            // a stopped VM gets neither a token nor any guest-file request.
+            let family = arca_incus::ProjectFamily::new(
+                self.cfg.kernel.projects.iter().map(String::as_str),
+                self.cfg.kernel.droidd_projects.iter().map(String::as_str),
+            )
+            .map_err(|_| NotWritten::fixed("the node project family cannot be read"))?;
+            let family = if target.service.tenant.is_some() {
+                family
+                    .with_tenants([project])
+                    .map_err(|_| NotWritten::fixed("the workspace tenant is not in place"))?
+            } else {
+                family
+            };
+            let power = arca_incus::StateChanger::new(self.cfg.incus.socket.clone(), family)
+                .read(project, instance)
+                .map_err(|_| NotWritten::later("the workspace power state could not be read"))?;
+            if power.uuid != object.uuid {
+                return Err(NotWritten::fixed(
+                    "the workspace UUID changed; nothing was written",
+                ));
+            }
+            if !power.is_running() {
+                return Ok(None);
+            }
+            if repository_only
+                && self
+                    .repository_written
+                    .lock()
+                    .map_err(|_| NotWritten::fixed("the repository refresh state cannot be read"))?
+                    .get(&repository_key)
+                    .is_some_and(|at| {
+                        (self.repository_clock)().saturating_sub(*at)
+                            < REPOSITORY_REFRESH.as_secs() * 1000
+                    })
+            {
+                return Ok(None);
+            }
+            let settings = target
+                .service
+                .vm
+                .as_ref()
+                .and_then(|vm| vm.guest_settings())
+                .ok_or_else(|| {
+                    NotWritten::fixed("the workspace has no recorded repository settings")
+                })?;
+            let repo = settings["repoUrl"]
+                .as_str()
+                .ok_or_else(|| NotWritten::fixed("the workspace has no recorded repoUrl"))?;
+            let mint = self
+                .repository_mint
+                .as_ref()
+                .ok_or_else(|| NotWritten::fixed("the owner must connect the repository App"))?;
+            let credential = mint(repo)?;
+            for (key, value) in [
+                ("GITHUB_TOKEN", credential.token.expose().to_string()),
+                ("GITHUB_BOT_ID", credential.bot_id.to_string()),
+            ] {
+                files.push((
+                    key.to_string(),
+                    SecretName::new(key)
+                        .map_err(|_| NotWritten::fixed("invalid generated secret name"))?,
+                    value,
+                ));
+            }
         }
         // The directory first: a new file is made before its mode is set, and only root enters the directory. It is
         // read before it is made, so a directory an earlier start made is left as it is and nothing depends on how
@@ -225,6 +379,12 @@ impl GuestSecrets {
                     ))
                 })?;
             written.push(key);
+        }
+        if workspace {
+            self.repository_written
+                .lock()
+                .map_err(|_| NotWritten::fixed("the repository refresh state cannot be written"))?
+                .insert(repository_key, (self.repository_clock)());
         }
         Ok(Some(written))
     }

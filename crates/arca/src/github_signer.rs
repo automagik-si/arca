@@ -98,6 +98,9 @@ pub struct RegisteredRunner {
 pub struct Binding {
     pub id: String,
     pub mode: Mode,
+    /// A separate App for workspace repository credentials, never runner credentials.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repository_access: bool,
     /// The organisation's login.
     pub account: String,
     pub status: Status,
@@ -123,6 +126,10 @@ pub struct Binding {
     pub updated_at: u64,
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl Binding {
     /// The organisation's address on GitHub's web host, as a runner's `gitHubUrl` names it.
     pub fn org_url(&self, endpoints: &Endpoints) -> String {
@@ -141,6 +148,9 @@ pub struct AppRecord {
     pub html_url: String,
     /// The organisation's numeric id, which the install page is opened for.
     pub owner_id: u64,
+    /// The bot user ID verified through GitHub, never inferred from the App ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_id: Option<u64>,
 }
 
 /// An App's installation in the organisation.

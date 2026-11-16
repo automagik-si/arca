@@ -532,6 +532,43 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 cfg: Arc::new(cfg.clone()),
             }),
         );
+    // The GitHub signer: its store is `<stateDir>/github`, and a node that only looks has none of its verbs.
+    let github_signer = if kernel_mode {
+        Some(
+            crate::github_signer::Signer::open(
+                &cfg.state_dir,
+                crate::github_api::Endpoints::github(),
+                clock.clone(),
+            )
+            .map_err(|e| {
+                Failure::Runtime(format!(
+                    "the GitHub signer cannot be opened: {}",
+                    e.message()
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
+    let repository_secrets = if kernel_mode {
+        let signer = github_signer
+            .clone()
+            .ok_or_else(|| Failure::Runtime("the repository signer is unavailable".into()))?;
+        let handle = runtime.handle().clone();
+        Some(Arc::new(
+            crate::guest_secrets::GuestSecrets::new(Arc::new(cfg.clone()), Arc::clone(&kernel))
+                .with_repository_mint(Arc::new(move |repo| {
+                    handle
+                        .block_on(signer.repository_credential(repo))
+                        .map_err(|why| crate::guest_secrets::NotWritten {
+                            why: why.why,
+                            retry: why.retry,
+                        })
+                })),
+        ))
+    } else {
+        None
+    };
     // A watch-only node has no state writer either. A kernel-mode node starts, stops and restarts only the instances of
     // its own project family that its mark makes its own, and journals each action in the state directory.
     let lifecycle = if kernel_mode {
@@ -543,7 +580,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         let retained_kernel = Arc::clone(&kernel);
         // A start or a restart of a virtual-machine service writes its stored secrets into its guest.
         let guest_secrets =
-            crate::guest_secrets::GuestSecrets::new(Arc::new(cfg.clone()), Arc::clone(&kernel));
+            Arc::clone(repository_secrets.as_ref().ok_or_else(|| {
+                Failure::Runtime("the guest secret writer is unavailable".into())
+            })?);
         Some(Arc::new(
             crate::lifecycle::InstanceLifecycle::new(
                 cfg.incus.socket.clone(),
@@ -715,31 +754,15 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     };
     crate::self_update::spawn_schedule(config_path.clone(), cfg.clone(), waiting)
         .map_err(|e| Failure::Runtime(e.to_string()))?;
-    // The GitHub signer: its store is `<stateDir>/github`, and a node that only looks has none of its verbs.
-    let github_signer = if kernel_mode {
-        let signer = crate::github_signer::Signer::open(
-            &cfg.state_dir,
-            crate::github_api::Endpoints::github(),
-            clock.clone(),
-        )
-        .map_err(|e| {
-            Failure::Runtime(format!(
-                "the GitHub signer cannot be opened: {}",
-                e.message()
-            ))
-        })?;
-        for (verb, handler) in crate::github_handlers::handlers(&signer) {
+    if let Some(signer) = &github_signer {
+        for (verb, handler) in crate::github_handlers::handlers(signer) {
             server = server.handle(verb, handler);
         }
-        // The runner pools sign in with this signer's connections.
         if let Some(board) = runner_board {
             crate::runners::spawn(&cfg, &runner_owner, signer.clone(), board)
                 .map_err(Failure::Runtime)?;
         }
-        Some(signer)
-    } else {
-        None
-    };
+    }
     for (verb, handler) in crate::approval_requests::handlers(
         Arc::clone(&kernel),
         clock.clone(),
@@ -921,6 +944,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // lapses while it can be asked; with none connected, nothing moves.
     let hold_kernel = oauth.as_ref().map(|_| Arc::clone(&kernel));
     let outcome: io::Result<()> = runtime.block_on(async {
+        if let Some(writer) = repository_secrets {
+            writer.spawn_repository_refresh()?;
+        }
         if let Some(kernel) = hold_kernel {
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));

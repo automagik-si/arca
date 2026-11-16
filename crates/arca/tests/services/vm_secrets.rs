@@ -801,48 +801,129 @@ fn repository_16_refresh_rewrites_guest_before_expiry_and_skips_stopped_vms() {
     template["secrets"] = json!(["GITHUB_TOKEN"]);
     template["settings"] = json!({"repoUrl":"https://github.com/acme/api","repoRef":""});
     rig.template("automagik-workspace", template);
-    rig.call("service_create", json!({"name":"w1","template":"automagik-workspace"})).unwrap();
-    assert!(rig.call("service_secret_set", json!({"name":"w1","key":"GITHUB_TOKEN","value":"synthetic-manual-token"})).is_err());
+    rig.call(
+        "service_create",
+        json!({"name":"w1","template":"automagik-workspace"}),
+    )
+    .unwrap();
+    assert!(
+        rig.call(
+            "service_secret_set",
+            json!({"name":"w1","key":"GITHUB_TOKEN","value":"synthetic-manual-token"})
+        )
+        .is_err()
+    );
     let mints = Arc::new(AtomicU64::new(0));
     let counted = mints.clone();
     let time = Arc::new(AtomicU64::new(1000));
     let clock = time.clone();
-    let secrets = Arc::new(arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), rig.kernel.clone())
-        .with_wait(Duration::from_secs(1), Duration::from_millis(10))
-        .with_repository_clock(Arc::new(move || clock.load(Ordering::SeqCst)))
-        .with_repository_mint(Arc::new(move |repo| {
-            assert_eq!(repo, "https://github.com/acme/api");
-            let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(arca::github_repository::RepositoryCredential { token: arca::github_api::Secret::new(format!("synthetic-workspace-token-{n}")), bot_id:7007 })
-        })));
-    assert_eq!(arca::guest_secrets::REPOSITORY_REFRESH, Duration::from_secs(45 * 60));
+    let secrets = Arc::new(
+        arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), rig.kernel.clone())
+            .with_wait(Duration::from_secs(1), Duration::from_millis(10))
+            .with_repository_clock(Arc::new(move || clock.load(Ordering::SeqCst)))
+            .with_repository_mint(Arc::new(move |repo| {
+                assert_eq!(repo, "https://github.com/acme/api");
+                let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(arca::github_repository::RepositoryCredential {
+                    token: arca::github_api::Secret::new(format!("synthetic-workspace-token-{n}")),
+                    bot_id: 7007,
+                })
+            })),
+    );
+    assert_eq!(
+        arca::guest_secrets::REPOSITORY_REFRESH,
+        Duration::from_secs(45 * 60)
+    );
     secrets.refresh_repositories();
     assert_eq!(mints.load(Ordering::SeqCst), 0, "created stopped: no mint");
     let kernel = rig.kernel.clone();
     let writer = secrets.clone();
-    let lifecycle = InstanceLifecycle::new(rig.fake.socket().to_path_buf(),
+    let lifecycle = InstanceLifecycle::new(
+        rig.fake.socket().to_path_buf(),
         arca_incus::ProjectFamily::new([PROJECT], ["other"]).unwrap(),
-        move || kernel.lock().map_err(|_| "kernel".into())?.retained_entries().map_err(|e| e.to_string()), &rig.dir)
-        .with_after_start(Arc::new(move |project, instance| writer.deliver(project, instance)));
-    let handlers: HashMap<_, _> = arca::lifecycle::handlers(rig.kernel.clone(), Arc::new(|| NOW), Some(Arc::new(lifecycle))).into_iter().collect();
+        move || {
+            kernel
+                .lock()
+                .map_err(|_| "kernel".to_string())?
+                .retained_entries()
+                .map_err(|e| e.to_string())
+        },
+        &rig.dir,
+    )
+    .with_after_start(Arc::new(move |project, instance| {
+        writer.deliver(project, instance)
+    }));
+    let handlers: HashMap<_, _> = arca::lifecycle::handlers(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        Some(Arc::new(lifecycle)),
+    )
+    .into_iter()
+    .collect();
     start(&handlers, "w1").unwrap();
-    assert_eq!(guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(), Some("synthetic-workspace-token-1"));
-    assert_eq!(guest_file(&rig, "w1", "GITHUB_BOT_ID").as_deref(), Some("7007"));
-    secrets.refresh_repositories(); assert_eq!(mints.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(),
+        Some("synthetic-workspace-token-1")
+    );
+    assert_eq!(
+        guest_file(&rig, "w1", "GITHUB_BOT_ID").as_deref(),
+        Some("7007")
+    );
+    secrets.refresh_repositories();
+    assert_eq!(mints.load(Ordering::SeqCst), 1);
     time.store(1000 + 44 * 60 * 1000, Ordering::SeqCst);
-    secrets.refresh_repositories(); assert_eq!(mints.load(Ordering::SeqCst), 1);
+    secrets.refresh_repositories();
+    assert_eq!(mints.load(Ordering::SeqCst), 1);
     time.store(1000 + 45 * 60 * 1000, Ordering::SeqCst);
     secrets.refresh_repositories();
-    assert_eq!(guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(), Some("synthetic-workspace-token-2"));
-    let writes = rig.fake.service_requests().iter().filter(|r| r.method == "POST" && r.path.contains("/files?")).count();
+    assert_eq!(
+        guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(),
+        Some("synthetic-workspace-token-2")
+    );
+    let writes = rig
+        .fake
+        .service_requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.contains("/files?"))
+        .count();
     rig.fake.set_instance_status(PROJECT, "w1", "Stopped");
     time.store(1000 + 90 * 60 * 1000, Ordering::SeqCst);
-    secrets.refresh_repositories(); assert_eq!(mints.load(Ordering::SeqCst), 2);
-    assert_eq!(rig.fake.service_requests().iter().filter(|r| r.method == "POST" && r.path.contains("/files?")).count(), writes);
-    assert_eq!(guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(), Some("synthetic-workspace-token-2"));
+    secrets.refresh_repositories();
+    assert_eq!(mints.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        rig.fake
+            .service_requests()
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.contains("/files?"))
+            .count(),
+        writes
+    );
+    assert_eq!(
+        guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(),
+        Some("synthetic-workspace-token-2")
+    );
     assert!(!state_text(&rig).contains("synthetic-workspace-token"));
     for request in rig.fake.service_requests() {
-        assert!(!format!("{} {} {:?}", request.method, request.path, request.headers).contains("synthetic-workspace-token"));
-        if !request.path.contains("/files?") { assert!(!String::from_utf8_lossy(&request.body).contains("synthetic-workspace-token")); }
+        assert!(
+            !format!("{} {} {:?}", request.method, request.path, request.headers)
+                .contains("synthetic-workspace-token")
+        );
+        if !request.path.contains("/files?") {
+            assert!(!String::from_utf8_lossy(&request.body).contains("synthetic-workspace-token"));
+        }
+    }
+}
+
+#[test]
+fn minted_repository_tokens_are_redacted_without_stored_secret_values() {
+    for suffix in [
+        "syntheticOpaqueCredential",
+        "12345_synthetic.header.signature",
+    ] {
+        let token = ["ghs", suffix].join("_");
+        assert_eq!(
+            service::redact_log(&format!("credential {token}"), &[]),
+            "credential [secret]"
+        );
     }
 }

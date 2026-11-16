@@ -365,6 +365,11 @@ impl ServiceHandler {
             let key = args["key"]
                 .as_str()
                 .ok_or_else(|| CallError::Invalid("key: expected a secret name".into()))?;
+            if cfg.template == "automagik-workspace" && key == "GITHUB_TOKEN" {
+                return Err(service_refused(
+                    "GITHUB_TOKEN is minted by the repository App and cannot be set by hand",
+                ));
+            }
             if caller.scope == Scope::Doctor
                 && [
                     "OMNI_API_KEY",
