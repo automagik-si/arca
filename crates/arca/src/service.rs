@@ -63,13 +63,47 @@ pub struct Published {
     pub reach: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Limits {
     #[serde(default)]
     pub cpu: Option<String>,
     #[serde(default)]
     pub memory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_read: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<String>,
+}
+
+impl Limits {
+    pub fn has_io_limits(&self) -> bool {
+        self.disk_read.is_some()
+            || self.disk_write.is_some()
+            || self.ingress.is_some()
+            || self.egress.is_some()
+    }
+
+    fn invalid_io_limit(&self) -> Option<&'static str> {
+        for (key, value) in [
+            ("diskRead", &self.disk_read),
+            ("diskWrite", &self.disk_write),
+        ] {
+            if value.as_deref().is_some_and(|value| !disk_limit_ok(value)) {
+                return Some(key);
+            }
+        }
+        for (key, value) in [("ingress", &self.ingress), ("egress", &self.egress)] {
+            if value.as_deref().is_some_and(|value| !rate_ok(value, true)) {
+                return Some(key);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -394,6 +428,13 @@ pub struct ServiceConfig {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub droidd_port: Option<u16>,
+    /// The container's root size at create. Absent, a tenant keeps its 16GiB default and the node's own project
+    /// leaves the size to its pool, as before. Reconfigure and update keep this recorded size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_size: Option<String>,
+    /// The container NIC's port isolation at create, kept through reconfigure and image updates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub port_isolation: bool,
     #[serde(default)]
     pub limits: Option<Limits>,
     #[serde(default)]
@@ -787,11 +828,30 @@ fn vm_config(cfg: &ServiceConfig) -> Map<String, Value> {
 fn vm_devices(cfg: &ServiceConfig, vm: &Vm, mut nic: Map<String, Value>) -> Value {
     nic.insert("type".into(), json!("nic"));
     nic.insert("name".into(), json!(VM_NIC_NAME));
-    json!({
+    let mut devices = json!({
         "root": { "type": "disk", "path": "/", "pool": cfg.pool, "size": vm.root_size },
         "eth0": nic,
         "agent": { "type": "disk", "source": "agent:config" }
-    })
+    });
+    set_io_limits(cfg, &mut devices);
+    devices
+}
+
+/// Device limits are part of the create itself. Incus must accept them; there is no uncapped retry.
+fn set_io_limits(cfg: &ServiceConfig, devices: &mut Value) {
+    let Some(limits) = &cfg.limits else {
+        return;
+    };
+    for (device, key, value) in [
+        ("root", "limits.read", &limits.disk_read),
+        ("root", "limits.write", &limits.disk_write),
+        ("eth0", "limits.ingress", &limits.ingress),
+        ("eth0", "limits.egress", &limits.egress),
+    ] {
+        if let Some(value) = value {
+            devices[device][key] = json!(value);
+        }
+    }
 }
 
 /// The create body of a virtual machine on a host bridge. It names no profile, no Incus network, no address and no ACL
@@ -929,18 +989,21 @@ pub fn ingress(cfg: &ServiceConfig) -> Vec<Value> {
         rules.push(rule(json!({"action":"allow","source":format!("{}/32",grant.address),"protocol":"tcp",
             "destination_port":grant.port.to_string(),"description":format!("link from {} to port {}",grant.address,grant.port),"state":"enabled"})));
     }
-    // The node's front service reaches every port a tenant's service declares, and nothing else of it.
+    // The front reaches the declared application ports, excluding the host's control port.
     if let Some(front) = cfg.tenant.as_ref().and_then(|tenant| tenant.front.as_ref())
         && !cfg.ports.is_empty()
     {
         let ports = cfg
             .ports
             .iter()
+            .filter(|port| Some(**port) != cfg.droidd_port)
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        rules.push(rule(json!({"action":"allow","source":format!("{front}/32"),"protocol":"tcp",
-            "destination_port":ports,"description":"the node's front service to the declared ports","state":"enabled"})));
+        if !ports.is_empty() {
+            rules.push(rule(json!({"action":"allow","source":format!("{front}/32"),"protocol":"tcp",
+                "destination_port":ports,"description":"the node's front service to the declared ports","state":"enabled"})));
+        }
     }
     rules
 }
@@ -1092,7 +1155,9 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
         devices.insert(KERNEL_DEVICE.into(), kernel_device(link));
     }
     let mut root = json!({ "type": "disk", "path": "/", "pool": cfg.pool });
-    if cfg.tenant.is_some() {
+    if let Some(size) = &cfg.root_size {
+        root["size"] = json!(size);
+    } else if cfg.tenant.is_some() {
         // The tenant project's disk cap counts a root disk by its size, so a tenant's container states one.
         root["size"] = json!(arca_netproject::tenant::CONTAINER_ROOT_SIZE);
     }
@@ -1106,7 +1171,7 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             "name": "eth0",
             "network": cfg.bridge,
             "ipv4.address": cfg.ipv4,
-            "security.port_isolation": "false",
+            "security.port_isolation": if cfg.port_isolation { "true" } else { "false" },
             "security.mac_filtering": "true",
             "security.ipv4_filtering": "true",
             "security.acls": cfg.acl(),
@@ -1115,6 +1180,8 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             }),
         ),
     );
+    let mut devices = Value::Object(devices);
+    set_io_limits(cfg, &mut devices);
     json!({
         "name": cfg.instance,
         "type": "container",
@@ -1174,6 +1241,9 @@ impl Plugin for Service {
         // An adopted instance is owned through its adopt entry. The service record never writes it.
         if cfg.adopted {
             return Ok(());
+        }
+        if let Some(key) = cfg.limits.as_ref().and_then(Limits::invalid_io_limit) {
+            return Err(PluginError::Config(format!("invalid limits.{key}")));
         }
         // Kernel access is a container's, in the node's own project: a record that says otherwise is never applied,
         // whatever else it holds.
@@ -1571,9 +1641,12 @@ pub struct Template {
     /// address is the create's. Unlike `lan`, the proxy never listens on every interface.
     #[serde(default)]
     pub private_port: Option<PrivatePort>,
-    /// The root disk size of a virtual-machine template, such as `20GiB`. No other kind sets it.
+    /// A container's optional root disk size, or a virtual machine's required size, such as `20GiB`.
     #[serde(default)]
     pub root_size: Option<String>,
+    /// Whether a container's NIC isolates its bridge port. Off unless the template says true.
+    #[serde(default)]
+    pub port_isolation: bool,
     /// A virtual-machine template's first-boot script: `{ "file": "name.sh" }`, a file beside the template that
     /// cloud-init runs once, at the machine's first boot. No other kind sets it.
     #[serde(default)]
@@ -1997,6 +2070,11 @@ pub const IMAGE_RUNNING: &str = " running ";
 
 fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateError> {
     let name = &template.name;
+    if let Some(key) = template.limits.as_ref().and_then(Limits::invalid_io_limit) {
+        return Err(TemplateError::refused(format!(
+            "template {name}: invalid limits.{key}: use a positive integer in Incus byte/s or iops units for disk, bit/s units for network, within signed 64-bit range"
+        )));
+    }
     if template.is_vm() {
         return validate_vm_template(template);
     }
@@ -2005,9 +2083,13 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             "template {name}: kind is oci, system or virtual-machine"
         )));
     }
-    if template.root_size.is_some() {
+    if template
+        .root_size
+        .as_deref()
+        .is_some_and(|size| !size_ok(size))
+    {
         return Err(TemplateError::refused(format!(
-            "template {name}: only a virtual-machine template has a rootSize"
+            "template {name}: rootSize is a size such as 20GiB"
         )));
     }
     if template.first_boot.is_some()
@@ -2071,7 +2153,7 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
         }
     }
     if let Some(limits) = &template.limits
-        && ((limits.cpu.is_none() && limits.memory.is_none())
+        && ((limits.cpu.is_none() && limits.memory.is_none() && !limits.has_io_limits())
             || limits.cpu.as_deref().is_some_and(|cpu| !decimal(cpu))
             || limits
                 .memory
@@ -2227,6 +2309,9 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         return refused(
             "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan, privatePort or kernelAccess: they need a container's environment, image or devices",
         );
+    }
+    if template.port_isolation {
+        return refused("a virtual machine has no portIsolation: it is for a container's NIC");
     }
     if template.no_new_privileges || !template.raw_lxc.is_empty() {
         return refused(
@@ -2723,6 +2808,59 @@ fn decimal(value: &str) -> bool {
         && bytes.all(|b| b.is_ascii_digit())
 }
 
+/// Incus parses rates as signed 64-bit integers with case-sensitive decimal or binary units.
+/// Zero disables throttling in Incus: a requested cap must instead be positive; omit it for no cap.
+fn rate_ok(value: &str, bits: bool) -> bool {
+    let split = value.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, unit) = value.split_at(split);
+    let Ok(number) = number.parse::<i64>() else {
+        return false;
+    };
+    if number <= 0 {
+        return false;
+    }
+    let (base, power): (i64, u32) = match (bits, unit) {
+        (_, "") | (false, "B" | " bytes") | (true, "bit") => (1, 0),
+        (false, "kB") | (true, "kbit") => (1000, 1),
+        (false, "MB") | (true, "Mbit") => (1000, 2),
+        (false, "GB") | (true, "Gbit") => (1000, 3),
+        (false, "TB") | (true, "Tbit") => (1000, 4),
+        (false, "PB") | (true, "Pbit") => (1000, 5),
+        (false, "EB") | (true, "Ebit") => (1000, 6),
+        (false, "KiB") | (true, "Kibit") => (1024, 1),
+        (false, "MiB") | (true, "Mibit") => (1024, 2),
+        (false, "GiB") | (true, "Gibit") => (1024, 3),
+        (false, "TiB") | (true, "Tibit") => (1024, 4),
+        (false, "PiB") | (true, "Pibit") => (1024, 5),
+        (false, "EiB") | (true, "Eibit") => (1024, 6),
+        _ => return false,
+    };
+    number.checked_mul(base.pow(power)).is_some()
+}
+
+/// A disk rate may name bytes/s, IOPS, or one of each separated by a comma, as Incus accepts.
+fn disk_limit_ok(value: &str) -> bool {
+    let mut bytes = false;
+    let mut iops = false;
+    for field in value.split(',').map(str::trim) {
+        if let Some(number) = field.strip_suffix("iops") {
+            if iops
+                || !number.bytes().all(|byte| byte.is_ascii_digit())
+                || !number.parse::<i64>().is_ok_and(|number| number > 0)
+            {
+                return false;
+            }
+            iops = true;
+        } else {
+            if bytes || !rate_ok(field, false) {
+                return false;
+            }
+            bytes = true;
+        }
+    }
+    bytes || iops
+}
+
 pub fn size_ok(value: &str) -> bool {
     [
         "B", "kB", "MB", "GB", "TB", "PB", "EB", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB",
@@ -3211,6 +3349,21 @@ mod tests {
     }
 
     #[test]
+    fn container_options_port_isolation_is_refused_for_a_virtual_machine_template() {
+        let mut template: Template = serde_json::from_value(json!({
+            "name": "vm", "kind": "virtual-machine", "image": "images:debian/13",
+            "limits": { "cpu": "2", "memory": "4GiB" }, "rootSize": "20GiB"
+        }))
+        .unwrap();
+        let dir = Path::new("/nonexistent");
+        validate_template(&template, dir).expect("the unchanged VM template is valid");
+        template.port_isolation = true;
+        let error =
+            validate_template(&template, dir).expect_err("portIsolation needs a container NIC");
+        assert!(error.message.contains("portIsolation"), "{error:?}");
+    }
+
+    #[test]
     fn a_records_no_new_privileges_renders_as_raw_lxc_and_an_older_record_renders_without_it() {
         let record = |extra: Value| -> ServiceConfig {
             let mut value = json!({
@@ -3244,6 +3397,70 @@ mod tests {
             serde_json::to_value(&on).expect("serialized")["noNewPrivileges"],
             json!(true)
         );
+    }
+
+    #[test]
+    fn container_options_leave_default_bodies_and_records_unchanged() {
+        let value = json!({
+            "name": "app", "template": "app", "instance": "app", "ipv4": "192.0.2.10",
+            "ports": [8080], "created": 0, "source": { "type": "image", "alias": "app" },
+            "pool": "default", "project": PROJECT, "bridge": BRIDGE, "gateway": "192.0.2.1"
+        });
+        for tenant in [
+            None,
+            Some(json!({ "id": "aaaaaaaa", "block": "192.0.2.248/29" })),
+        ] {
+            let mut value = value.clone();
+            if let Some(tenant) = tenant {
+                value["tenant"] = tenant;
+            }
+            let old: ServiceConfig = serde_json::from_value(value.clone()).unwrap();
+            let before = create_body(&old);
+            assert_eq!(
+                before["devices"]["eth0"]["security.port_isolation"],
+                "false"
+            );
+            if old.tenant.is_some() {
+                assert_eq!(before["devices"]["root"]["size"], "16GiB");
+            } else {
+                assert!(before["devices"]["root"].get("size").is_none());
+            }
+            let saved = serde_json::to_value(&old).unwrap();
+            assert!(saved.get("rootSize").is_none());
+            assert!(saved.get("portIsolation").is_none());
+            value["portIsolation"] = json!(false);
+            let explicit: ServiceConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(create_body(&explicit), before);
+            assert_eq!(serde_json::to_value(explicit).unwrap(), saved);
+            value["rootSize"] = json!("30GiB");
+            value["portIsolation"] = json!(true);
+            let custom: ServiceConfig = serde_json::from_value(value).unwrap();
+            let mut expected = before;
+            expected["devices"]["root"]["size"] = json!("30GiB");
+            expected["devices"]["eth0"]["security.port_isolation"] = json!("true");
+            assert_eq!(create_body(&custom), expected);
+        }
+    }
+
+    #[test]
+    fn container_options_root_size_is_validated_for_both_container_kinds() {
+        let dir = Path::new(".");
+        for (kind, image) in [
+            ("oci", "registry.example/app"),
+            ("system", "images:alpine/3.20"),
+        ] {
+            let mut value = json!({ "name": "app", "kind": kind, "image": image,
+                "digest": format!("sha256:{}", "a".repeat(64)), "rootSize": "30GiB" });
+            let template = |value| serde_json::from_value::<Template>(value).unwrap();
+            assert!(validate_template(&template(value.clone()), dir).is_ok());
+            for size in ["0GiB", "bad", "-1GiB"] {
+                value["rootSize"] = json!(size);
+                assert!(
+                    validate_template(&template(value.clone()), dir).is_err(),
+                    "{kind}: {size}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3952,6 +4169,9 @@ fn credential_patterns() -> &'static [(regex::Regex, &'static str)] {
             (r#"(?i)\b((?:access_|refresh_|id_|auth_)?token|api[_-]?key|apikey|auth[_-]?key|client_secret|secret|passw(?:or)?d)=[^\s&"'<>]+"#, "$1=[secret]"),
             (r#"(?i)(authorization["']?\s*[:=]\s*["']?)(?:(?:bearer|basic|token)\s+)?[^\s"',]+"#, "$1[secret]"),
             (r#"(?i)\b(bearer)\s+[A-Za-z0-9._~+/-]{16,}=*"#, "$1 [secret]"),
+            // Repository installation tokens are minted in memory, never stored secret references.
+            // Covers both opaque and stateless GitHub installation-token formats.
+            (r"\bghs_[A-Za-z0-9_.-]+", "[secret]"),
             (r"\btskey-[A-Za-z0-9-]*", "[secret]"),
             (r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:@/?#]*):[^\s@/?#]+@", "$1:[secret]@"),
             (r"\bomni_sk_[A-Za-z0-9*]+", "[secret]"),

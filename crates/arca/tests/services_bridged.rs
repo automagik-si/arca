@@ -333,6 +333,111 @@ fn owner_approval(key: &common::SkKey, name: &str) -> String {
 }
 
 #[test]
+fn unsupported_vm_io_limits_undo_the_failed_start_on_both_network_kinds() {
+    for bridged in [false, true] {
+        let rig = if bridged {
+            Rig::bridged(&["br0"], None)
+        } else {
+            let mut config = managed_kernel();
+            config["vmLimits"] = roomy();
+            Rig::with(config, None, vec![])
+        };
+        let mut template = vm_template();
+        template["limits"]["diskWrite"] = json!("10MB");
+        template["limits"]["egress"] = json!("20Mbit");
+        rig.template("ws", template);
+        rig.fake.reject_device_limits_on_start();
+        let mut args = json!({"name":"ws1","template":"ws"});
+        if bridged {
+            args["bridge"] = json!("br0");
+        }
+        let message = refusal(rig.call("service_create", args));
+        assert!(
+            message.contains("device I/O limits are not supported by this driver"),
+            "{message}"
+        );
+        assert!(
+            rig.get(&format!("/1.0/instances/ws1?project={PROJECT}"))
+                .is_none()
+        );
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-ws1")
+        );
+        assert!(rig.kernel.lock().unwrap().pending_plans().is_empty());
+        assert_eq!(
+            rig.fake
+                .writes()
+                .into_iter()
+                .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn invalid_vm_io_limits_fail_before_any_incus_write() {
+    let rig = Rig::bridged(&["br0"], None);
+    for (key, value) in [
+        ("diskRead", "100Mbit"),
+        ("diskWrite", "0iops"),
+        ("ingress", "100MB"),
+        ("egress", "1.5Mbit"),
+    ] {
+        let mut template = vm_template();
+        template["limits"][key] = json!(value);
+        rig.template("ws", template);
+        let before = rig.fake.writes().len();
+        let message = refusal(rig.call(
+            "service_create",
+            json!({"name":"ws1", "template":"ws", "bridge":"br0"}),
+        ));
+        assert!(message.contains(key), "{message}");
+        assert_eq!(rig.fake.writes().len(), before);
+    }
+}
+
+#[test]
+fn template_io_limits_reach_both_vm_network_kinds_and_status_settings() {
+    for bridged in [false, true] {
+        let rig = if bridged {
+            Rig::bridged(&["br0"], None)
+        } else {
+            let mut config = managed_kernel();
+            config["vmLimits"] = roomy();
+            Rig::with(config, None, vec![])
+        };
+        let mut template = vm_template();
+        template["limits"]["diskRead"] = json!("100MB");
+        template["limits"]["diskWrite"] = json!("1000iops");
+        template["limits"]["ingress"] = json!("200Mbit");
+        template["limits"]["egress"] = json!("100Mbit");
+        template["settings"] = json!({"label":"kept"});
+        let limits = template["limits"].clone();
+        rig.template("ws", template);
+        let mut args = json!({"name":"ws1","template":"ws"});
+        if bridged {
+            args["bridge"] = json!("br0");
+        }
+        rig.call("service_create", args).expect("create");
+        let instance = rig
+            .get(&format!("/1.0/instances/ws1?project={PROJECT}"))
+            .expect("instance");
+        assert_eq!(instance["devices"]["root"]["limits.read"], "100MB");
+        assert_eq!(instance["devices"]["root"]["limits.write"], "1000iops");
+        assert_eq!(instance["devices"]["eth0"]["limits.ingress"], "200Mbit");
+        assert_eq!(instance["devices"]["eth0"]["limits.egress"], "100Mbit");
+        let status = rig
+            .call("service_status", json!({"name":"ws1"}))
+            .expect("status");
+        assert_eq!(status["settings"]["limits"], limits);
+        assert_eq!(status["settings"]["label"], "kept");
+    }
+}
+
+#[test]
 fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or_read() {
     let rig = Rig::bridged(&["br0", "br1"], None);
     let created = rig
@@ -860,16 +965,13 @@ fn a_vm_template_needs_both_limits_and_a_root_size_and_nothing_of_the_service_ne
             error.message
         );
     }
-    // Only a virtual machine has a root size.
+    // A container may name a valid root size too.
     let mut container = nats_template();
     container["name"] = json!("ws");
     container["rootSize"] = json!("20GiB");
-    let error = load(container).expect_err("refused");
-    assert!(
-        error
-            .message
-            .contains("only a virtual-machine template has a rootSize")
-    );
+    let template = load(container).expect("a container template may state a root size");
+    assert!(!template.is_vm());
+    assert_eq!(template.root_size.as_deref(), Some("20GiB"));
     let _ = fs::remove_dir_all(&dir);
 }
 

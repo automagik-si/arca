@@ -7069,7 +7069,7 @@
               "type": "boolean"
             },
             "settings": {
-              "description": "For a virtual machine with settings: the settings object it was created with, as its guest reads it (the template's, with the values its create replaced). Never a secret.",
+              "description": "The virtual machine guest settings, when present, with the recorded template limits under limits when an I/O cap is set. Limits describe the create configuration, not measured throughput. Never a secret.",
               "type": "object"
             },
             "startedAt": {
@@ -7159,7 +7159,7 @@
           "type": "object"
         }
       },
-      "summary": "One service, named by its name: its address, its ports, its links and its state, and for a virtual machine the settings it was created with. Never a secret. Use service_list first when the name is not known.",
+      "summary": "One service, named by its name: its address, its ports, its links and its state, its recorded I/O limits when set, and for a virtual machine the settings it was created with. Never a secret. Use service_list first when the name is not known.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
@@ -7998,7 +7998,7 @@
                   "type": "boolean"
                 },
                 "settings": {
-                  "description": "For a virtual machine with settings: the settings object it was created with, as its guest reads it (the template's, with the values its create replaced). Never a secret.",
+                  "description": "The virtual machine guest settings, when present, with the recorded template limits under limits when an I/O cap is set. Limits describe the create configuration, not measured throughput. Never a secret.",
                   "type": "object"
                 },
                 "state": {

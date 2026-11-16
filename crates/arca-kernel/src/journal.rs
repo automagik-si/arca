@@ -20,6 +20,9 @@ use crate::canon::{Digest, canonical_json};
 use crate::desired::{EntryId, PluginId};
 use crate::ownership::ObjectRef;
 
+mod binding;
+pub use binding::{BindingEvent, BindingKind, BindingState, JournalRecord};
+
 /// How an effect is undone when its entry leaves the desired state.
 ///
 /// `A` is revertible without loss and is reverted at once. `B` is revertible but destructive, so its removal needs an approved
@@ -176,6 +179,7 @@ pub enum EffectState {
 /// One journal record. A record names its effect by `id`; each state change writes a full copy of the record, so the newest
 /// record for an id is the effect's state. The intent fields (`target`, `pre_image`, `acl_patch`, `intent`) are copied unchanged to every
 /// later record of the effect. An `Intent` has no object and no inverse; every later state of an applied effect carries both.
+/// After a binding, later states repeat its authorized effective addresses; earlier stored lines stay untouched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectRecord {
@@ -211,8 +215,18 @@ pub struct EffectRecord {
 pub trait JournalStore {
     /// Appends one record. An error means the record may not be durable, and the caller must not run the effect it names.
     fn append(&mut self, record: &EffectRecord) -> Result<(), KernelError>;
-    /// Every record in append order, with a note when the last line was torn and dropped.
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError>;
+    /// Every effect state in append order, using effective binding addresses,
+    /// with a note when the last line was torn and dropped. Use `history` for raw lines.
+    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
+        let (records, note) = self.history()?;
+        Ok((effect_history(records)?, note))
+    }
+    /// Raw lines in append order, including binding events. Wrappers must
+    /// forward the raw history so reopen preserves the binding chain.
+    fn history(&self) -> Result<(Vec<JournalRecord>, Option<String>), KernelError>;
+    /// Appends and syncs one complete binding line. Like `append`, an error
+    /// means durability is uncertain and the journal must be reopened.
+    fn append_binding(&mut self, event: &BindingEvent) -> Result<(), KernelError>;
 }
 
 /// The write side the reconciler and [`crate::plugin::Ctx`] use. A plan's effect is intended, then applied, then recorded.
@@ -326,8 +340,8 @@ impl FileJournal {
     }
 }
 
-impl JournalStore for FileJournal {
-    fn append(&mut self, record: &EffectRecord) -> Result<(), KernelError> {
+impl FileJournal {
+    fn append_line(&mut self, record: &impl Serialize) -> Result<(), KernelError> {
         let shown = self.shown();
         if self.broken {
             return Err(io_reason(
@@ -348,8 +362,21 @@ impl JournalStore for FileJournal {
         }
         Ok(())
     }
+}
 
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
+impl JournalStore for FileJournal {
+    fn append(&mut self, record: &EffectRecord) -> Result<(), KernelError> {
+        self.append_line(record)
+    }
+
+    fn append_binding(&mut self, event: &BindingEvent) -> Result<(), KernelError> {
+        self.append_line(&JournalRecord::Binding {
+            kind: BindingKind::Binding,
+            binding: event.clone(),
+        })
+    }
+
+    fn history(&self) -> Result<(Vec<JournalRecord>, Option<String>), KernelError> {
         let bytes = read_all(&self.file).map_err(|e| io_error(&self.shown(), &e))?;
         let decoded = decode(&bytes)?;
         Ok((decoded.records, self.torn.clone().or(decoded.torn)))
@@ -357,7 +384,8 @@ impl JournalStore for FileJournal {
 }
 
 /// Reads the journal at `path` without taking its lock, for a read-only listing while a server holds the file. A missing
-/// file is an empty journal. Damaged records refuse the read; a torn last line is dropped by the same decoder.
+/// file is an empty journal. Addresses follow committed bindings; raw lines stay on disk.
+/// Damaged records refuse the read; a torn last line is dropped by the same decoder.
 pub fn read_journal(path: &Path) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -366,13 +394,14 @@ pub fn read_journal(path: &Path) -> Result<(Vec<EffectRecord>, Option<String>), 
         }
         Err(error) => return Err(io_error(&path.display().to_string(), &error)),
     };
-    decode(&bytes).map(|decoded| (decoded.records, decoded.torn))
+    let decoded = decode(&bytes)?;
+    Ok((effect_history(decoded.records)?, decoded.torn))
 }
 
 /// An in-memory journal, for tests and for callers that need no durability.
 #[derive(Debug, Default, Clone)]
 pub struct MemJournal {
-    records: Vec<EffectRecord>,
+    records: Vec<JournalRecord>,
 }
 
 impl MemJournal {
@@ -384,12 +413,20 @@ impl MemJournal {
 
 impl JournalStore for MemJournal {
     fn append(&mut self, record: &EffectRecord) -> Result<(), KernelError> {
-        self.records.push(record.clone());
+        self.records.push(JournalRecord::Effect(record.clone()));
         Ok(())
     }
 
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
+    fn history(&self) -> Result<(Vec<JournalRecord>, Option<String>), KernelError> {
         Ok((self.records.clone(), None))
+    }
+
+    fn append_binding(&mut self, event: &BindingEvent) -> Result<(), KernelError> {
+        self.records.push(JournalRecord::Binding {
+            kind: BindingKind::Binding,
+            binding: event.clone(),
+        });
+        Ok(())
     }
 }
 
@@ -403,6 +440,7 @@ impl JournalStore for MemJournal {
 pub struct Journal<S: JournalStore> {
     store: S,
     latest: BTreeMap<u64, EffectRecord>,
+    bindings: BTreeMap<u64, BindingEvent>,
     next_id: u64,
     torn: Option<String>,
     poison: Option<KernelError>,
@@ -412,21 +450,10 @@ impl<S: JournalStore> Journal<S> {
     /// Folds the store's records into the journal's state. A record that does not follow its effect's last record refuses
     /// the open, so the state is always a legal history. Unresolved intents do not refuse the open; the caller decides.
     pub fn open(store: S) -> Result<Self, KernelError> {
-        let (records, torn) = store.load()?;
-        let mut latest: BTreeMap<u64, EffectRecord> = BTreeMap::new();
-        for record in records {
-            check_outcome(&record)?;
-            match latest.get(&record.id) {
-                None if record.state == EffectState::Intent => {}
-                None => return Err(corrupt(record.id, "has no intent")),
-                Some(prev) => {
-                    if let Some(why) = refusal_to_follow(prev, &record) {
-                        return Err(corrupt(record.id, why));
-                    }
-                }
-            }
-            latest.insert(record.id, record);
-        }
+        let (records, torn) = store.history()?;
+        let Folded {
+            latest, bindings, ..
+        } = fold(records)?;
         // The journal never writes the top id, so a journal that holds it has no id left to continue from.
         let next_id = match latest.keys().next_back() {
             None => 1,
@@ -439,6 +466,7 @@ impl<S: JournalStore> Journal<S> {
         Ok(Journal {
             store,
             latest,
+            bindings,
             next_id,
             torn,
             poison: None,
@@ -948,9 +976,75 @@ fn corrupt(id: u64, why: &str) -> KernelError {
     KernelError::Journal(format!("effect {id} {why}"))
 }
 
+struct Folded {
+    latest: BTreeMap<u64, EffectRecord>,
+    bindings: BTreeMap<u64, BindingEvent>,
+    effects: Vec<EffectRecord>,
+}
+
+/// Validate in append order. A binding is the one explicit transition that
+/// changes existing effect addresses; later outcomes must follow that view.
+fn fold(records: Vec<JournalRecord>) -> Result<Folded, KernelError> {
+    let mut view = Folded {
+        latest: BTreeMap::new(),
+        bindings: BTreeMap::new(),
+        effects: Vec::new(),
+    };
+    for record in records {
+        match record {
+            JournalRecord::Effect(record) => {
+                check_outcome(&record)?;
+                match view.latest.get(&record.id) {
+                    None if record.state == EffectState::Intent => {}
+                    None => return Err(corrupt(record.id, "has no intent")),
+                    Some(prev) => {
+                        if let Some(why) = refusal_to_follow(prev, &record) {
+                            return Err(corrupt(record.id, why));
+                        }
+                    }
+                }
+                view.effects.push(record.clone());
+                view.latest.insert(record.id, record);
+            }
+            JournalRecord::Binding { binding: event, .. } => {
+                let (create, ids) = binding::validate(&view.latest, &view.bindings, &event)?;
+                for id in &ids {
+                    binding::translate(view.latest.get_mut(id).expect("validated effect"), &event);
+                }
+                // Listing readers keep every effect state, with the same
+                // effective addresses as live(). The bytes on disk never change.
+                for effect in &mut view.effects {
+                    if ids.contains(&effect.id) {
+                        binding::translate(effect, &event);
+                    }
+                }
+                view.bindings.insert(create, event);
+            }
+        }
+    }
+    Ok(view)
+}
+
+fn effect_history(records: Vec<JournalRecord>) -> Result<Vec<EffectRecord>, KernelError> {
+    // Preserve the old read-only decoder's behaviour for journals without bindings.
+    if records
+        .iter()
+        .any(|record| matches!(record, JournalRecord::Binding { .. }))
+    {
+        return Ok(fold(records)?.effects);
+    }
+    Ok(records
+        .into_iter()
+        .filter_map(|record| match record {
+            JournalRecord::Effect(effect) => Some(effect),
+            JournalRecord::Binding { .. } => None,
+        })
+        .collect())
+}
+
 /// A decoded journal file. `keep` is the length of the prefix that holds whole lines, so a torn tail is cut at `keep`.
 struct Decoded {
-    records: Vec<EffectRecord>,
+    records: Vec<JournalRecord>,
     keep: usize,
     torn: Option<String>,
 }
@@ -974,7 +1068,7 @@ fn decode(bytes: &[u8]) -> Result<Decoded, KernelError> {
                 )),
             });
         };
-        let record = serde_json::from_slice::<EffectRecord>(&rest[..end])
+        let record = serde_json::from_slice::<JournalRecord>(&rest[..end])
             .map_err(|_| KernelError::Journal(format!("record {number} does not decode")))?;
         records.push(record);
         start += end + 1;

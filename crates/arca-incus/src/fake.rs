@@ -208,7 +208,11 @@ struct Shared {
     requests: Mutex<Vec<RecordedRequest>>,
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
+    reject_device_limits: AtomicBool,
     reject_patch: Mutex<Vec<String>>,
+    dropped_patches: Mutex<Vec<(String, bool)>>,
+    late_patches: Mutex<Vec<String>>,
+    pending_patches: Mutex<Vec<Request>>,
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
     /// How the node's liblxc splits a container's command, which decides whether its entrypoint starts.
@@ -474,7 +478,11 @@ impl Shared {
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
+            reject_device_limits: AtomicBool::new(false),
             reject_patch: Mutex::new(Vec::new()),
+            dropped_patches: Mutex::new(Vec::new()),
+            late_patches: Mutex::new(Vec::new()),
+            pending_patches: Mutex::new(Vec::new()),
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
             lxc_split: Mutex::new(LxcSplit::default()),
@@ -726,6 +734,13 @@ impl FakeIncus {
         lock(&self.shared.reject_config).push(kind_path_prefix.to_string());
     }
 
+    /// Accept disk/NIC limits at create, then refuse applying them at start, as an unsupported driver would.
+    pub fn reject_device_limits_on_start(&self) {
+        self.shared
+            .reject_device_limits
+            .store(true, Ordering::SeqCst);
+    }
+
     /// Fail the start phase of create, leaving the new instance stopped.
     pub fn fail_instance_start_on_create(&self) {
         self.shared.fail_create_start.store(true, Ordering::SeqCst);
@@ -751,6 +766,16 @@ impl FakeIncus {
 
     pub fn set_reject_patch(&self, path_prefix: &str) {
         lock(&self.shared.reject_patch).push(path_prefix.to_string());
+    }
+
+    /// Drops the next matching PATCH's answer, after applying it when `apply` is true. No retry is made by the fake.
+    pub fn drop_patch_answer(&self, path_prefix: &str, apply: bool) {
+        lock(&self.shared.dropped_patches).push((path_prefix.to_string(), apply));
+    }
+
+    /// Drops a PATCH answer and applies it only after computing the next GET of that object. That GET shows the old state.
+    pub fn patch_after_next_get(&self, path_prefix: &str) {
+        lock(&self.shared.late_patches).push(path_prefix.to_string());
     }
 
     /// Starts an operation that names `target` and runs until the test releases or fails it. It changes no object. It shows in
@@ -1180,6 +1205,7 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>, stop: &AtomicBool)
 }
 
 /// One request as the fake reads it. A head that does not parse has an empty method and is answered 400.
+#[derive(Clone)]
 struct Request {
     method: String,
     target: String,
@@ -1247,7 +1273,48 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         hold_until_hung_up(&mut stream);
         return;
     }
+    if request.method == "PATCH" {
+        let late = {
+            let mut paths = lock(&shared.late_patches);
+            paths
+                .iter()
+                .position(|prefix| request.target.starts_with(prefix))
+                .map(|index| paths.remove(index))
+                .is_some()
+        };
+        if late {
+            lock(&shared.pending_patches).push(request.clone());
+            record(shared, &request, 0);
+            return;
+        }
+        let apply = {
+            let mut faults = lock(&shared.dropped_patches);
+            faults
+                .iter()
+                .position(|(prefix, _)| request.target.starts_with(prefix))
+                .map(|index| faults.remove(index).1)
+        };
+        if let Some(apply) = apply {
+            if apply {
+                handle(shared, &request, None);
+            }
+            record(shared, &request, 0);
+            return;
+        }
+    }
     let (status, extra, envelope) = handle(shared, &request, fault);
+    if request.method == "GET" {
+        let pending = {
+            let mut pending = lock(&shared.pending_patches);
+            pending
+                .iter()
+                .position(|patch| patch.target == request.target)
+                .map(|index| pending.remove(index))
+        };
+        if let Some(patch) = pending {
+            handle(shared, &patch, None);
+        }
+    }
     record(shared, &request, status);
     let _ = respond(
         &mut stream,
@@ -2325,6 +2392,22 @@ fn lxc_split_cmd(cmd: &str, split: LxcSplit) -> Vec<String> {
     }
 }
 
+/// Driver/cgroup/tc rejection happens at start, after Incus has accepted the instance devices.
+fn device_limit_refusal(shared: &Shared, instance: &Value) -> Option<String> {
+    (shared.reject_device_limits.load(Ordering::SeqCst)
+        && instance
+            .get("devices")
+            .and_then(Value::as_object)
+            .is_some_and(|devices| {
+                devices.values().any(|device| {
+                    device
+                        .as_object()
+                        .is_some_and(|device| device.keys().any(|key| key.starts_with("limits.")))
+                })
+            }))
+    .then(|| "device I/O limits are not supported by this driver".to_string())
+}
+
 /// Why a container cannot start on a node whose liblxc splits as `split` says. Incus 7.6 refuses a line break or a
 /// carriage return in any LXC config value at start, so in an `environment.*` value too, which its create lets a
 /// carriage return through. Its `oci.entrypoint` may not split or encode, or init would get other arguments than it
@@ -2614,7 +2697,9 @@ fn create(
                     Err((400, "Failed starting instance".into())),
                 );
             }
-            if let Some(reason) = start_refusal(&store.objects[at].body, *lock(&shared.lxc_split)) {
+            if let Some(reason) = start_refusal(&store.objects[at].body, *lock(&shared.lxc_split))
+                .or_else(|| device_limit_refusal(shared, &store.objects[at].body))
+            {
                 store.objects[at].body["status"] = json!("Stopped");
                 store.expand(at, false);
                 return answered(shared, store, kind, "POST", Err((400, reason)));
@@ -3987,6 +4072,7 @@ fn change_state(
         "start" => {
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
+                    .or_else(|| device_limit_refusal(shared, &store.objects[index].body))
             {
                 return answered(shared, store, "instance", "PUT", Err((400, reason)));
             }
@@ -4066,6 +4152,7 @@ fn change_state(
             // Its stop half is done when its start half cannot start the entrypoint: it ends stopped.
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
+                    .or_else(|| device_limit_refusal(shared, &store.objects[index].body))
             {
                 store.objects[index].body["status"] = json!("Stopped");
                 lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));

@@ -3,6 +3,9 @@ mod common;
 #[path = "tenants/status_fields.rs"]
 mod status_fields;
 
+#[path = "tenants/container_options.rs"]
+mod container_options;
+
 use arca::{
     config::NodeConfig,
     handlers::{

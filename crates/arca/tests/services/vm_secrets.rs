@@ -36,9 +36,16 @@ fn pool_rig() -> Rig {
 /// The instance verbs as `arca serve` builds them: a start or a restart writes a virtual machine's secrets into its
 /// guest. `wait` is how long the guest agent is waited for.
 fn life(rig: &Rig, wait: Duration) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
-    let kernel = Arc::clone(&rig.kernel);
     let secrets = arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), Arc::clone(&rig.kernel))
         .with_wait(wait, Duration::from_millis(10));
+    life_with_writer(rig, Arc::new(secrets))
+}
+
+fn life_with_writer(
+    rig: &Rig,
+    secrets: Arc<arca::guest_secrets::GuestSecrets>,
+) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
+    let kernel = Arc::clone(&rig.kernel);
     let lifecycle = InstanceLifecycle::new(
         rig.fake.socket().to_path_buf(),
         arca_incus::ProjectFamily::new([PROJECT], ["other"]).expect("the family"),
@@ -791,3 +798,230 @@ fn the_create_requests_of_an_oci_a_system_and_a_plain_vm_template_are_the_golden
 
 #[path = "in_words.rs"]
 mod in_words;
+
+#[test]
+fn repository_16_refresh_rewrites_guest_before_expiry_and_skips_stopped_vms() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let rig = pool_rig();
+    let mut template = pool_template();
+    template["name"] = json!("automagik-workspace");
+    template["secrets"] = json!(["GITHUB_TOKEN"]);
+    template["settings"] = json!({"repoUrl":"https://github.com/acme/api","repoRef":""});
+    rig.template("automagik-workspace", template);
+    rig.call(
+        "service_create",
+        json!({"name":"w1","template":"automagik-workspace"}),
+    )
+    .unwrap();
+    assert!(
+        rig.call(
+            "service_secret_set",
+            json!({"name":"w1","key":"GITHUB_TOKEN","value":"synthetic-manual-token"})
+        )
+        .is_err()
+    );
+    let mints = Arc::new(AtomicU64::new(0));
+    let counted = mints.clone();
+    let time = Arc::new(AtomicU64::new(1000));
+    let clock = time.clone();
+    let secrets = Arc::new(
+        arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), rig.kernel.clone())
+            .with_wait(Duration::from_secs(1), Duration::from_millis(10))
+            .with_repository_clock(Arc::new(move || clock.load(Ordering::SeqCst)))
+            .with_repository_mint(Arc::new(move |repo| {
+                assert_eq!(repo, "https://github.com/acme/api");
+                let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(arca::github_repository::RepositoryCredential {
+                    token: arca::github_api::Secret::new(format!("synthetic-workspace-token-{n}")),
+                    bot_id: 7007,
+                    bot_login: "project-custom-repositories[bot]".into(),
+                })
+            })),
+    );
+    assert_eq!(
+        arca::guest_secrets::REPOSITORY_REFRESH,
+        Duration::from_secs(45 * 60)
+    );
+    secrets.refresh_repositories();
+    assert_eq!(mints.load(Ordering::SeqCst), 0, "created stopped: no mint");
+    let kernel = rig.kernel.clone();
+    let writer = secrets.clone();
+    let lifecycle = InstanceLifecycle::new(
+        rig.fake.socket().to_path_buf(),
+        arca_incus::ProjectFamily::new([PROJECT], ["other"]).unwrap(),
+        move || {
+            kernel
+                .lock()
+                .map_err(|_| "kernel".to_string())?
+                .retained_entries()
+                .map_err(|e| e.to_string())
+        },
+        &rig.dir,
+    )
+    .with_after_start(Arc::new(move |project, instance| {
+        writer.deliver(project, instance)
+    }));
+    let handlers: HashMap<_, _> = arca::lifecycle::handlers(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        Some(Arc::new(lifecycle)),
+    )
+    .into_iter()
+    .collect();
+    start(&handlers, "w1").unwrap();
+    assert_eq!(
+        guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(),
+        Some("synthetic-workspace-token-1")
+    );
+    assert_eq!(
+        guest_file(&rig, "w1", "GITHUB_BOT_ID").as_deref(),
+        Some("7007")
+    );
+    let identity: Value =
+        serde_json::from_str(&guest_file(&rig, "w1", "GITHUB_BOT_IDENTITY").unwrap()).unwrap();
+    assert_eq!(
+        identity,
+        json!({"id":"7007", "login":"project-custom-repositories[bot]"})
+    );
+    secrets.refresh_repositories();
+    assert_eq!(mints.load(Ordering::SeqCst), 1);
+    time.store(1000 + 44 * 60 * 1000, Ordering::SeqCst);
+    secrets.refresh_repositories();
+    assert_eq!(mints.load(Ordering::SeqCst), 1);
+    time.store(1000 + 45 * 60 * 1000, Ordering::SeqCst);
+    secrets.refresh_repositories();
+    assert_eq!(
+        guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(),
+        Some("synthetic-workspace-token-2")
+    );
+    let writes = rig
+        .fake
+        .service_requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.contains("/files?"))
+        .count();
+    rig.fake.set_instance_status(PROJECT, "w1", "Stopped");
+    time.store(1000 + 90 * 60 * 1000, Ordering::SeqCst);
+    secrets.refresh_repositories();
+    assert_eq!(mints.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        rig.fake
+            .service_requests()
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.contains("/files?"))
+            .count(),
+        writes
+    );
+    assert_eq!(
+        guest_file(&rig, "w1", "GITHUB_TOKEN").as_deref(),
+        Some("synthetic-workspace-token-2")
+    );
+    assert!(!state_text(&rig).contains("synthetic-workspace-token"));
+    for request in rig.fake.service_requests() {
+        assert!(
+            !format!("{} {} {:?}", request.method, request.path, request.headers)
+                .contains("synthetic-workspace-token")
+        );
+        if !request.path.contains("/files?") {
+            assert!(!String::from_utf8_lossy(&request.body).contains("synthetic-workspace-token"));
+        }
+    }
+}
+
+#[test]
+fn minted_repository_tokens_are_redacted_without_stored_secret_values() {
+    for suffix in [
+        "syntheticOpaqueCredential",
+        "12345_synthetic.header.signature",
+    ] {
+        let token = ["ghs", suffix].join("_");
+        assert_eq!(
+            service::redact_log(&format!("credential {token}"), &[]),
+            "credential [secret]"
+        );
+    }
+}
+
+#[test]
+fn reach_secrets_are_delivered_and_rotated_without_repository_credentials() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    for case in [
+        "unconnected",
+        "unreachable",
+        "legacy-no-repo",
+        "legacy-empty-repo",
+    ] {
+        let rig = pool_rig();
+        let mut template = pool_template();
+        template["name"] = json!("automagik-workspace");
+        template["secrets"] = json!(["TUNNEL_TOKEN", "TAILSCALE_AUTHKEY", "GITHUB_TOKEN"]);
+        template["settings"] = if case == "legacy-no-repo" {
+            json!({"reach":"cloudflare"})
+        } else if case == "legacy-empty-repo" {
+            json!({"repoUrl":""})
+        } else {
+            json!({"repoUrl":"https://github.com/acme/api"})
+        };
+        rig.template("automagik-workspace", template);
+        rig.call(
+            "service_create",
+            json!({"name":"w1","template":"automagik-workspace"}),
+        )
+        .unwrap();
+        for key in ["TUNNEL_TOKEN", "TAILSCALE_AUTHKEY"] {
+            rig.call(
+                "service_secret_set",
+                json!({"name":"w1","key":key,"value":TOKEN}),
+            )
+            .unwrap();
+        }
+        let attempts = Arc::new(AtomicU64::new(0));
+        let mut writer =
+            arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), rig.kernel.clone())
+                .with_wait(Duration::from_secs(1), Duration::from_millis(10));
+        if case != "unconnected" {
+            let count = attempts.clone();
+            writer = writer.with_repository_mint(Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(arca::guest_secrets::NotWritten {
+                    why: "GitHub could not be reached".into(),
+                    retry: true,
+                })
+            }));
+        }
+        let writer = Arc::new(writer);
+        let handlers = life_with_writer(&rig, writer.clone());
+        assert!(
+            start(&handlers, "w1").is_ok(),
+            "{case}: reach delivery must not depend on minting"
+        );
+        assert_eq!(
+            guest_file(&rig, "w1", "TUNNEL_TOKEN").as_deref(),
+            Some(TOKEN)
+        );
+        assert_eq!(
+            guest_file(&rig, "w1", "TAILSCALE_AUTHKEY").as_deref(),
+            Some(TOKEN)
+        );
+        assert_eq!(guest_file(&rig, "w1", "GITHUB_TOKEN"), None);
+        rig.call(
+            "service_secret_set",
+            json!({"name":"w1","key":"TUNNEL_TOKEN","value":"synthetic-rotated-reach-token"}),
+        )
+        .unwrap();
+        assert!(start(&handlers, "w1").is_ok());
+        assert_eq!(
+            guest_file(&rig, "w1", "TUNNEL_TOKEN").as_deref(),
+            Some("synthetic-rotated-reach-token")
+        );
+        assert_eq!(
+            guest_file(&rig, "w1", "TAILSCALE_AUTHKEY").as_deref(),
+            Some(TOKEN)
+        );
+        writer.refresh_repositories();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            if case == "unreachable" { 3 } else { 0 }
+        );
+    }
+}

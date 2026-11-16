@@ -6891,6 +6891,8 @@ pub(crate) fn adopted_config(
         entrypoint: None,
         environment: BTreeMap::new(),
         droidd_port: None,
+        root_size: None,
+        port_isolation: false,
         limits: None,
         autostart: false,
         data: None,
@@ -7111,6 +7113,8 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         entrypoint,
         environment,
         droidd_port: parts.template.droidd_port,
+        root_size: parts.template.root_size.clone(),
+        port_isolation: parts.template.port_isolation,
         limits: parts.template.limits.clone(),
         autostart: parts.template.autostart,
         data: parts.template.data.clone(),
@@ -7219,6 +7223,8 @@ fn vm_service_config(
         no_new_privileges: false,
         raw_lxc: Vec::new(),
         run_tmpfs: false,
+        root_size: None,
+        port_isolation: false,
         edge: None,
         connector: None,
     })
@@ -7304,8 +7310,8 @@ impl ServiceHandler {
         }
     }
 
-    /// Proposes a create's changes and answers the new service's view. A create that left no instance is undone: its
-    /// record goes and the secret files it made (`made`) are removed.
+    /// Proposes a create's changes and answers the new service's view. A create that left no instance is undone.
+    /// A fresh capped create whose initial start failed also rolls back its instance and other new service objects.
     #[allow(clippy::too_many_arguments)]
     fn settle_create(
         &self,
@@ -7318,9 +7324,30 @@ impl ServiceHandler {
         now: u64,
     ) -> Result<Value, CallError> {
         let id = config.entry_id();
-        let outcomes = {
+        let (outcomes, attempt) = {
             let mut kernel = lock(&self.kernel)?;
-            kernel.propose(changes, now).map_err(|_| internal())?
+            let attempt = if config.start
+                && config.function.is_none()
+                && config
+                    .limits
+                    .as_ref()
+                    .is_some_and(crate::service::Limits::has_io_limits)
+            {
+                Some(kernel.prepare_capped_service_create(config).ok_or_else(|| {
+                    if let Some((secrets, seeded)) = made {
+                        cleanup_service_secrets(secrets, seeded);
+                    }
+                    service_refused(format!(
+                        "service {name} has previous objects from an earlier attempt: resolve their cleanup or retention before a fresh capped create"
+                    ))
+                })?)
+            } else {
+                None
+            };
+            (
+                kernel.propose(changes, now).map_err(|_| internal())?,
+                attempt,
+            )
         };
         let failed = service_wiring::failed_for(&outcomes, &[id.as_str()]);
         if failed {
@@ -7329,14 +7356,46 @@ impl ServiceHandler {
                 config.instance, config.project
             )) {
                 Ok(found) => {
-                    // The instance exists, so its record stays: the effect journal holds the create as applied, never
-                    // as an open intent, and the owner is told what is there and what to do next.
+                    // The create is journalled as applied. A fresh capped create is compensated if its start failed;
+                    // other failures keep the existing stopped-instance recovery path.
                     let why = service_wiring::failure_reason(&outcomes, &[id.as_str()])
                         .unwrap_or_else(|| "the kernel recorded no reason".to_string());
                     let why = crate::service::redact_log(
                         &why,
                         &service_secret_values(&self.cfg.state_dir.join("secrets")),
                     );
+                    if found["status"].as_str() == Some("Stopped")
+                        && let Some(attempt) = attempt
+                    {
+                        let removal =
+                            lock(&self.kernel)?.rollback_capped_service_create(attempt, now);
+                        let cleaned = removal.as_ref().is_ok_and(|removal| {
+                            let changed = removal
+                                .changed
+                                .iter()
+                                .map(|entry| entry.0.as_str())
+                                .collect::<Vec<_>>();
+                            !service_wiring::failed_for(&removal.outcomes, &changed)
+                                && removal
+                                    .run
+                                    .as_ref()
+                                    .is_ok_and(|run| run.as_ref().is_none_or(|run| !run.partial))
+                        });
+                        let cleaned = cleaned
+                            && made.is_none_or(|(secrets, seeded)| {
+                                cleanup_service_secrets(secrets, seeded);
+                                service_secret_names(secrets)
+                                    .is_ok_and(|names| names.is_subset(seeded))
+                            });
+                        let left = if cleaned {
+                            "nothing was left behind"
+                        } else {
+                            "the cleanup did not complete; check service_list and plan_list before retrying"
+                        };
+                        return Err(service_refused(format!(
+                            "create service {name} from template {template_name}: {why}; {left}"
+                        )));
+                    }
                     // Only a state that was read is stated.
                     let left = match found["status"].as_str() {
                         Some("Stopped") => {
@@ -7921,6 +7980,19 @@ impl ServiceHandler {
                     // a template's secrets are named apart and are never part of this object.
                     if let Some(settings) = config.vm.as_ref().and_then(|vm| vm.guest_settings()) {
                         view["settings"] = settings;
+                    }
+                    if let Some(limits) = config
+                        .limits
+                        .as_ref()
+                        .filter(|limits| limits.has_io_limits())
+                    {
+                        if !view["settings"].is_object() {
+                            view["settings"] = json!({});
+                        }
+                        view["settings"]["limits"] = json!(limits);
+                        if let Some(configured) = view["settings"]["limits"].as_object_mut() {
+                            configured.retain(|_, value| !value.is_null());
+                        }
                     }
                     if config.can_follow_automagik() {
                         view["follow"] = json!(config.follows_automagik());
