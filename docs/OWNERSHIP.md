@@ -1705,7 +1705,8 @@ Source: `RunnerVms` and `RUNNER_KEY` in `crates/arca-incus/src/runner_vm.rs`; te
 own store by full fingerprint. Its closed writer only copies that fingerprint, sets image properties and creates
 its alias in a tenant project; it never deletes an image or an alias. The card binds the source properties, tenant
 incarnation, destination's exact properties and alias state. A property replacement is permitted only as the card
-showed it; the destination is re-read before writing. The copy API's out-of-band race is described in OPERATING.md.
+showed it; the final read must match the expected map and its ETag guards the PUT through `If-Match`. A 412
+is re-read, never retried blindly. The copy API's out-of-band race is described in OPERATING.md.
 The import is not journalled as an effect: it adds content-addressed data, has no inverse and leaves completed
 steps in place on failure. A new approval can complete them from a new destination snapshot. Images belong to
 the tenant by containment and Arca removes them only with the tenant, through Rule 42.

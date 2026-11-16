@@ -1049,7 +1049,7 @@ static VERBS: [Verb; 95] = [
     },
     Verb {
         name: "tenant_image_import",
-        summary: "Import an image from the node's own store by full fingerprint, only through an approved proposal. The card binds the source, tenant incarnation and destination image properties and alias. It may explicitly approve replacing different destination properties. Success kinds: imported, completed, alreadyPresent; imageWrite and aliasWrite say which write requests were issued. Refusals: NotApproved, StaleCard, AliasTaken, SourceMissing, PartialImport, ImportFailed; their closed data schema is result.schema.x-arca-refusal-data. Completed steps stay in the tenant's store: no import record, rollback or deletion.",
+        summary: "Import an image from the node's own store by full fingerprint, only through an approved proposal. The card binds the source, tenant incarnation and destination image properties and alias. It may explicitly approve replacing different destination properties. Success kinds: imported, completed, alreadyPresent; imageWrite and aliasWrite say which writes were issued, excluding a property PUT rejected with 412. Refusals: NotApproved, StaleCard, AliasTaken, SourceMissing, PartialImport, ImportFailed; their closed data schema is result.schema.x-arca-refusal-data. Completed steps stay in the tenant's store: no import record, rollback or deletion.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,

@@ -11,6 +11,13 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 /// The one source store for this closed writer.
 pub const SOURCE_PROJECT: &str = "arcak-svc";
 
+/// A checked property replacement. A stale observation or rejected conditional write changes nothing.
+pub enum PropertyUpdate {
+    Stale,
+    Unchanged,
+    Sent(Result<Option<String>, IncusError>),
+}
+
 pub struct ImageWriter {
     socket: PathBuf,
     project: String,
@@ -68,9 +75,23 @@ impl ImageWriter {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Option<String>, IncusError> {
-        let framed =
-            self.transport()?
-                .send_checked(method, path, None, body, Duration::from_secs(30))?;
+        self.send_if_match(method, path, None, body)
+    }
+
+    fn send_if_match(
+        &self,
+        method: &str,
+        path: &str,
+        if_match: Option<&str>,
+        body: Option<&Value>,
+    ) -> Result<Option<String>, IncusError> {
+        let framed = self.transport()?.send_checked(
+            method,
+            path,
+            if_match,
+            body,
+            Duration::from_secs(30),
+        )?;
         let reply = checked_envelope(&framed.into_raw())?;
         match reply
             .get("operation")
@@ -125,20 +146,48 @@ impl ImageWriter {
         })))
     }
 
-    pub fn set_properties(&self, properties: &Value) -> Result<Option<String>, IncusError> {
-        let image = self
-            .image()?
-            .ok_or_else(|| IncusError::Refused("image missing".into()))?;
+    /// Replace only the map approved for replacement, under the final read's ETag.
+    pub fn set_properties(
+        &self,
+        expected: &Value,
+        properties: &Value,
+    ) -> Result<PropertyUpdate, IncusError> {
+        let path = format!("/1.0/images/{}?project={}", self.fingerprint, self.project);
+        let framed =
+            self.transport()?
+                .send_checked("GET", &path, None, None, Duration::from_secs(30))?;
+        let etag = framed.header("etag").map(str::to_owned);
+        let envelope = match checked_envelope(&framed.into_raw()) {
+            Ok(envelope) => envelope,
+            Err(IncusError::Status { code: 404, .. }) => return Ok(PropertyUpdate::Stale),
+            Err(error) => return Err(error),
+        };
+        let image = &envelope["metadata"];
+        if image["fingerprint"] != self.fingerprint || &image["properties"] != expected {
+            return Ok(PropertyUpdate::Stale);
+        }
+        let etag = etag.ok_or_else(|| IncusError::Decode("image carries no ETag".into()))?;
         // PUT replaces these fields too; approval changes only the property map.
         let body = json!({ "properties": properties,
             "public": image["public"].as_bool().unwrap_or(false),
             "auto_update": image["auto_update"].as_bool().unwrap_or(false),
             "profiles": image.get("profiles").cloned().unwrap_or(json!([])) });
-        self.send(
-            "PUT",
-            &format!("/1.0/images/{}?project={}", self.fingerprint, self.project),
-            Some(&body),
-        )
+        match self.send_if_match("PUT", &path, Some(&etag), Some(&body)) {
+            Ok(operation) => Ok(PropertyUpdate::Sent(Ok(operation))),
+            Err(IncusError::Status { code: 412, .. }) => {
+                // A rejected conditional PUT wrote nothing. Another writer may already have completed it.
+                Ok(match self.image() {
+                    Ok(Some(found))
+                        if found["fingerprint"] == self.fingerprint
+                            && &found["properties"] == properties =>
+                    {
+                        PropertyUpdate::Unchanged
+                    }
+                    _ => PropertyUpdate::Stale,
+                })
+            }
+            Err(error) => Ok(PropertyUpdate::Sent(Err(error))),
+        }
     }
 
     pub fn add_alias(&self) -> Result<Option<String>, IncusError> {

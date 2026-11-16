@@ -7390,13 +7390,19 @@ The card binds the source properties, tenant project and creation incarnation, a
 and alias target. For different properties, the card shows both maps and explicitly says approving replaces the
 old map. The run checks all of this again immediately before its first write; a changed destination, source or
 tenant answers `StaleCard` without a write. Each later write rechecks the expected state after this run's own steps.
+A failed recheck after a write landed answers `PartialImport` with the observed store state; a foreign alias keeps
+`AliasTaken` and any copied image stays.
 
 Absent means copy by the exact fingerprint, then read back. Incus reuses a database record from the earliest
 project holding that fingerprint (`default` first), then merges request properties. Extra properties can survive
 that merge, so this run sets the approved map and reads it back when needed. A pre-existing destination is never
 changed blindly: equal properties need no image write; different properties require the replacement shown on the
 card. Incus has no create-only copy: an out-of-band hand copy of the same fingerprint between the final read and
-POST may be reused and its metadata changed. Avoid concurrent out-of-band writes while an import runs.
+POST may be reused and its metadata changed. Property replacement compares the map from its final read with the
+map on the card (or the map this run's copy produced), then sends `If-Match` with that read's ETag. A changed map
+is left alone. A 412 is re-read: the approved map already present is success without a property write; otherwise
+it answers `StaleCard` before any write of this run, or `PartialImport` after a landed write. Avoid concurrent
+out-of-band writes while an import runs.
 
 An absent alias is created and read back. One already pointing at this fingerprint needs no write. One pointing
 elsewhere answers `AliasTaken` and is never replaced; an image copied before that conflict stays in the store.
@@ -7406,12 +7412,13 @@ is there, including different properties left by a failed corrective write, and 
 belong to the tenant by containment and are removed only with the tenant (OWNERSHIP.md, Rules 42 and 78).
 
 Success `kind` is `imported` (copied), `completed` (finished from an existing image), or `alreadyPresent` (no write).
-`imageWrite` and `aliasWrite` say which write requests this run issued. Import refusals have closed codes
+`imageWrite` and `aliasWrite` say which writes this run issued, excluding a property PUT rejected with 412.
+Import refusals have closed codes
 `StaleCard`, `AliasTaken`, `SourceMissing`, `PartialImport` and `ImportFailed` (plus the approval gate's
 `NotApproved`). Their error data schema is the result schema's `x-arca-refusal-data` in OpenRPC. `imageState`
 is `absent`, `present` or `unknown`; `aliasState` is `absent`, `matching`, `taken` or `unknown`. Known image
-properties, fingerprint and alias target are included. `PartialImport` means an image remains after a failed write;
-unknown observations are reported as unknown. `proposeAgain: true` means the approval was spent. A repeat whose
+properties, fingerprint and alias target are included. `PartialImport` means a write landed or an image remains
+after a failed step; unknown observations are reported as unknown. `proposeAgain: true` means the approval was spent. A repeat whose
 image properties and alias already match sends no Incus write.
 
 A node may hold tenants: each is one restricted Incus project of its own, on the node's managed service network, with its

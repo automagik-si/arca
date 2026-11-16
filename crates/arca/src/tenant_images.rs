@@ -1,6 +1,6 @@
 //! Approved, idempotent additions to one tenant's image store. No record and no delete.
 use super::*;
-use arca_incus::image::{ImageWriter, SOURCE_PROJECT, alias_ok, fingerprint_ok};
+use arca_incus::image::{ImageWriter, PropertyUpdate, SOURCE_PROJECT, alias_ok, fingerprint_ok};
 use arca_kernel::{
     desired::Entry,
     journal::{EffectClass, EffectState},
@@ -42,6 +42,7 @@ struct Plan {
 struct Writes {
     image: bool,
     alias: bool,
+    landed: bool,
 }
 
 fn image_properties(
@@ -129,23 +130,32 @@ fn fault(
             Err(_) => {}
         }
     }
+    if code == "StaleCard" && (writes.image || writes.alias) {
+        code = if data["aliasState"] == "taken" {
+            "AliasTaken"
+        } else {
+            "PartialImport"
+        };
+    }
     if code == "ImportFailed" {
-        if writes.alias && data["aliasState"] == "taken" {
+        if (writes.image || writes.alias) && data["aliasState"] == "taken" {
             code = "AliasTaken";
-        } else if (writes.image || writes.alias) && data["imageState"] == "present" {
+        } else if writes.landed
+            || ((writes.image || writes.alias) && data["imageState"] == "present")
+        {
             code = "PartialImport";
         }
     }
     let message = match code {
         "StaleCard" => {
-            "The source, tenant or destination no longer matches the card. Make a new proposal."
+            "The source, tenant or destination is unavailable or changed. Make a new proposal."
         }
         "SourceMissing" => "The node's own store does not have this fingerprint.",
         "AliasTaken" => {
             "The alias names another fingerprint and was not replaced. Any copied image stays in the tenant's store."
         }
         "PartialImport" => {
-            "The image is in the tenant's store, but a later step did not complete. Nothing was deleted; propose again to complete it."
+            "A write landed or the image remains, but a later step did not complete. The data describes the current store; nothing was deleted. Make a new proposal."
         }
         _ => {
             "The import did not complete. The data describes what could be read; nothing was deleted."
@@ -369,13 +379,8 @@ impl Handler {
         writes: Writes,
     ) -> Result<(), CallError> {
         let args = serde_json::to_value(expected).map_err(|_| internal())?;
-        let actual = current(&self.cfg, entries, &args).map_err(|error| {
-            let code = match error.refusal().map(|(code, _)| code) {
-                Some("SourceMissing" | "StaleCard") => "StaleCard",
-                _ => "ImportFailed",
-            };
-            fault(code, Some(writer), &expected.fingerprint, writes)
-        })?;
+        let actual = current(&self.cfg, entries, &args)
+            .map_err(|_| fault("StaleCard", Some(writer), &expected.fingerprint, writes))?;
         if &actual != expected {
             let code = if writes.image
                 && actual
@@ -406,6 +411,7 @@ impl Handler {
         if copied {
             writes.image = true;
             finish(writer, writer.copy(&json!(plan.properties))).map_err(|_| failed(writes))?;
+            writes.landed = true;
             plan.destination.properties =
                 image_properties(writer, &plan.fingerprint).map_err(|_| failed(writes))?;
             if plan.destination.properties.is_none() {
@@ -415,9 +421,20 @@ impl Handler {
         }
         if plan.destination.properties.as_ref() != Some(&plan.properties) {
             self.recheck(&plan, entries, writer, writes)?;
-            writes.image = true;
-            finish(writer, writer.set_properties(&json!(plan.properties)))
+            let update = writer
+                .set_properties(&json!(plan.destination.properties), &json!(plan.properties))
                 .map_err(|_| failed(writes))?;
+            match update {
+                PropertyUpdate::Stale => {
+                    return Err(fault("StaleCard", Some(writer), &plan.fingerprint, writes));
+                }
+                PropertyUpdate::Unchanged => {}
+                PropertyUpdate::Sent(operation) => {
+                    writes.image = true;
+                    finish(writer, operation).map_err(|_| failed(writes))?;
+                    writes.landed = true;
+                }
+            }
             if image_properties(writer, &plan.fingerprint)
                 .ok()
                 .flatten()
@@ -433,6 +450,7 @@ impl Handler {
             self.recheck(&plan, entries, writer, writes)?;
             writes.alias = true;
             finish(writer, writer.add_alias()).map_err(|_| failed(writes))?;
+            writes.landed = true;
         }
         let found =
             destination(writer, &plan.fingerprint, &plan.properties).map_err(|_| failed(writes))?;
