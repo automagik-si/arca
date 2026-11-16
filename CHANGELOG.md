@@ -7,12 +7,17 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.32.0 (2026-11-16)
+
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the
 gate. A `service_create` that gives a list is now refused (`expected a string`), since the template's default is text;
 a workspace made before with a list keeps working, as its own keeper reads it. It pins Automagik 3.146.5, and its
 keeper pulls the server's image only once the image's GitHub build provenance (repository `automagik-si/automagik`)
 verifies with cosign v3.1.4, pinned by version and sha256; an image that does not verify is not pulled and the server
 does not start. Its first boot downloads cosign from github.com and release-assets.githubusercontent.com.
+
+- Merge origin/dev v0.31.0 release into dev
+- Merge feat/automagik-template-text-emails: automagik-workspace takes accessEmails as text, pins Automagik 3.146.5 and verifies its build provenance before the pull
 
 ## 0.31.0 (2026-11-15)
 
