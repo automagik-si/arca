@@ -44,7 +44,7 @@ fn proposed(rig: &Rig, args: Value) -> Value {
         .unwrap()
 }
 
-fn grant(rig: &Rig, key: &common::SkKey, proposal: &Value) -> (Value, String) {
+fn approved_args(rig: &Rig, key: &common::SkKey, proposal: &Value) -> (Value, String) {
     static NONCE: AtomicU64 = AtomicU64::new(0x7400);
     let statement = arca::handlers::action_statement(
         "node1",
@@ -71,7 +71,7 @@ fn connect(rig: &Rig, key: &common::SkKey, name: Option<&str>) -> Result<Value, 
         args["name"] = json!(name);
     }
     let proposal = proposed(rig, args);
-    let (mut args, grant) = grant(rig, key, &proposal);
+    let (mut args, grant) = approved_args(rig, key, &proposal);
     args["approval"] = json!(grant);
     rig.call("reach_connect", args)
 }
@@ -312,7 +312,7 @@ fn both_verbs_run_through_the_mcp_door() {
     let (rig, key) = rig();
     let door = external::Door::over(&rig);
     let proposal = proposed(&rig, json!({"kind":"tailscale","name":"node-ts"}));
-    let (mut args, grant) = grant(&rig, &key, &proposal);
+    let (mut args, grant) = approved_args(&rig, &key, &proposal);
     args["approval"] = json!(grant);
     assert_eq!(door.call("reach_connect", args), "ok");
     assert_eq!(door.call("reach_list", json!({})), "ok");
@@ -478,14 +478,14 @@ fn an_approval_binds_the_template_and_cannot_be_replayed() {
             .iter()
             .any(|row| row["label"] == "Template content")
     );
-    let (mut args, grant) = grant(&rig, &key, &proposal);
+    let (mut args, grant) = approved_args(&rig, &key, &proposal);
     args["approval"] = json!(grant);
     rig.call("reach_connect", args.clone()).unwrap();
     assert!(
         matches!(rig.call("reach_connect", args), Err(CallError::Refused { code, .. }) if code == "NotApproved")
     );
     let proposal = proposed(&rig, json!({"kind":"tailscale","name":"changed-ts"}));
-    let (mut args, grant) = grant(&rig, &key, &proposal);
+    let (mut args, grant) = approved_args(&rig, &key, &proposal);
     args["approval"] = json!(grant);
     let template = rig.dir.join("templates/tailscale.json");
     let mut value: Value = serde_json::from_slice(&fs::read(&template).unwrap()).unwrap();
