@@ -64,6 +64,87 @@ fn arca() -> Command {
     command
 }
 
+#[test]
+fn token_mint_binds_a_tenant_and_normalizes_its_services() {
+    let scratch = Scratch::new("tenant-token");
+    let hashes = scratch.at("tokens");
+    fs::create_dir(&hashes).unwrap();
+    fs::set_permissions(&hashes, fs::Permissions::from_mode(0o700)).unwrap();
+    let secret = scratch.at("secret");
+    let out = arca()
+        .args([
+            "token",
+            "mint",
+            "--scope",
+            "doctor",
+            "--id",
+            "tenant",
+            "--tenant",
+            "abcdefgh",
+            "--services",
+            "web,abcdefgh/db",
+            "--hash-dir",
+        ])
+        .arg(&hashes)
+        .arg("--out")
+        .arg(&secret)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(said["tenant"], "abcdefgh");
+    assert_eq!(said["services"], "abcdefgh/db,abcdefgh/web");
+    let hash = fs::read_to_string(hashes.join("tenant.hash")).unwrap();
+    assert!(hash.contains("\ntenant=abcdefgh\n"));
+    assert!(
+        TokenStore::load(&hashes)
+            .unwrap()
+            .lookup(fs::read_to_string(secret).unwrap().trim())
+            .is_some()
+    );
+}
+
+#[test]
+fn token_mint_refuses_invalid_tenants_cross_tenant_services_and_bound_admins() {
+    for (scope, tenant, services) in [
+        ("doctor", "bad", "web"),
+        ("doctor", "abcdefgh", "ijklmnop/web"),
+        ("admin", "abcdefgh", "web"),
+    ] {
+        let scratch = Scratch::new("bad-tenant-token");
+        let hashes = scratch.at("tokens");
+        fs::create_dir(&hashes).unwrap();
+        fs::set_permissions(&hashes, fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = scratch.at("secret");
+        let out = arca()
+            .args([
+                "token",
+                "mint",
+                "--scope",
+                scope,
+                "--id",
+                "tenant",
+                "--tenant",
+                tenant,
+                "--services",
+                services,
+                "--hash-dir",
+            ])
+            .arg(&hashes)
+            .arg("--out")
+            .arg(&secret)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(!secret.exists());
+        assert_eq!(fs::read_dir(hashes).unwrap().count(), 0);
+    }
+}
+
 /// A home directory under `scratch` as the installer leaves it: `.config/arca`, with `node.json` when `config` is given.
 fn installed_home(scratch: &Scratch, config: Option<&Value>) -> PathBuf {
     let home = scratch.at("home");
