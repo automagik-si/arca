@@ -25,6 +25,12 @@ state is on its own data volume, so it logs in once and a single-use key is enou
 no port and reaches only what it is linked to. docs/OPERATING.md, "Reaching a service over your own tailnet
 (Tailscale)", has the steps.
 
+Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
+`TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:
+a connector may start with no key, and an unset optional secret is absent from the container's environment. Other
+templates keep requiring their secrets. Connector records now keep their template's kind (`tailscale` or `cloudflare`),
+with a template fallback for services made before this change.
+
 The edge allows the PROXY protocol header from each service linked to it (`service_connect` to the edge), by the
 service's own address, besides the port device's loopback, so a connector that sends one needs no hand edit inside the
 edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the

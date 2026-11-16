@@ -732,6 +732,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         env: std::collections::BTreeMap::new(),
         provides: None,
         secrets: vec![],
+        optional_secrets: vec![],
         publishable: false,
         dash_port: None,
         description: None,
@@ -753,6 +754,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         raw_lxc: Vec::new(),
         run_tmpfs: true,
         edge: false,
+        connector: None,
         update: None,
     }
 }

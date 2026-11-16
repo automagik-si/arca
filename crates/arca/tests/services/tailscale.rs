@@ -135,6 +135,8 @@ fn the_shipped_tailscale_template_loads_pinned_by_digest_with_no_port_a_state_vo
         template.secrets,
         vec!["TS_AUTHKEY".to_string(), "TS_TARGET".to_string()]
     );
+    assert_eq!(template.optional_secrets, template.secrets);
+    assert_eq!(template.connector.as_deref(), Some("tailscale"));
     assert!(template.generate.is_empty());
     assert_eq!(
         template.env,
@@ -195,7 +197,7 @@ fn a_connector_is_an_unprivileged_container_with_its_state_volume_and_no_port_an
 }
 
 #[test]
-fn the_key_and_the_target_are_set_like_a_tunnel_token_and_the_connector_starts_once_both_are() {
+fn the_key_and_the_target_are_optional_overrides_and_keep_their_secret_handling() {
     let rig = ts_rig();
     // A secret its template does not declare is refused: nothing else reaches containerboot's environment.
     for key in [
@@ -732,7 +734,7 @@ fn optional_secrets_omit_the_whole_variable_but_an_unset_required_secret_still_s
     let template: service::Template = serde_json::from_value(json!({
         "name":"mixed", "kind":"oci", "image":"docker.io/library/example", "digest":DIGEST,
         "secrets":["OPTIONAL", "REQUIRED"], "optionalSecrets":["OPTIONAL"],
-        "env":{"OPTIONAL_VALUE":"prefix-{{secret:OPTIONAL}}", "REQUIRED_VALUE":"{{secret:REQUIRED}}"}
+        "env":{"OPTIONAL_VALUE":"prefix-{{secret:OPTIONAL}}", "REQUIRED_VALUE":"{{secret:REQUIRED}}", "COMBINED":"{{secret:OPTIONAL}}-{{secret:REQUIRED}}"}
     })).expect("optionalSecrets is a template field");
     let secrets = rig.dir.join("secrets");
     let (env, ready) = service::environment(
@@ -766,9 +768,58 @@ fn optional_secrets_omit_the_whole_variable_but_an_unset_required_secret_still_s
     .unwrap();
     assert!(ready);
     assert!(!env.contains_key("OPTIONAL_VALUE"));
+    assert!(!env.contains_key("COMBINED"));
     assert!(env.contains_key("REQUIRED_VALUE"));
     assert_eq!(
         service::template_stopped_reason(&template, "service-mixed", &secrets),
         None
     );
+}
+
+#[test]
+fn other_services_take_the_edges_provided_target_and_disconnect_without_losing_their_environment() {
+    let rig = ts_rig();
+    let target = linked_edge(&rig);
+    let before = instance(&rig, "web")["config"].clone();
+    let record = rig.service_config("web").environment;
+    let linked = rig
+        .call("service_connect", json!({"from":"web","to":"edge"}))
+        .expect("link an ordinary service");
+    assert_eq!(linked["env"], json!(["ARCA_EDGE_TARGET"]));
+    let mut expected = before.clone();
+    expected["environment.ARCA_EDGE_TARGET"] = json!(target);
+    // The link marker and environment-key index also change; every unrelated Incus config key keeps its bytes.
+    let config = instance(&rig, "web")["config"].clone();
+    for (key, value) in expected.as_object().unwrap() {
+        if ![service::LINKS_KEY, service::ENVKEYS_KEY].contains(&key.as_str()) {
+            assert_eq!(&config[key], value, "{key}");
+        }
+    }
+    rig.call("service_disconnect", json!({"from":"web","to":"edge"}))
+        .expect("disconnect the ordinary service");
+    assert!(
+        instance(&rig, "web")["config"]
+            .get("environment.ARCA_EDGE_TARGET")
+            .is_none()
+    );
+    assert_eq!(rig.service_config("web").environment, record);
+    assert_eq!(rig.service_config("edge").incoming.len(), 1);
+    assert_eq!(rig.service_config("edge").incoming[0].consumer, "edge-ts");
+}
+
+#[test]
+fn the_script_uses_the_link_target_when_the_override_is_empty_under_each_shell() {
+    for shell in super::nats::shells() {
+        let mut env = good();
+        env.retain(|(key, _)| *key != "TS_AUTHKEY" && *key != "TS_TARGET");
+        env.push(("TS_TARGET", ""));
+        env.push(("ARCA_EDGE_TARGET", "192.0.2.99:443"));
+        let ran = run_in(&shell, &env);
+        assert_eq!(ran.code, Some(0), "{shell:?}: {}", ran.err);
+        let serve: Value = serde_json::from_str(ran.serve.as_deref().unwrap()).unwrap();
+        assert_eq!(serve["TCP"]["443"]["TCPForward"], "192.0.2.99:443");
+        let boot = ran.boot_env.unwrap();
+        assert!(boot.lines().any(|line| line == "TS_HOSTNAME=edge-ts"));
+        assert!(!boot.lines().any(|line| line.starts_with("TS_AUTHKEY=")));
+    }
 }
