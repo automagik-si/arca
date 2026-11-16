@@ -1891,12 +1891,22 @@ fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and
     propose(&socket1, &viewer1, 14, "natsj");
     // natsf's Approve has the keyboard focus, and the owner moves it to the passkey name field during the hold: it stays
     // there after the hold.
-    chrome.eval(&format!(
-        "(() => {{ {}.querySelector('button.approve').focus(); const plans = document.getElementById('plans'); \
+    wait_for(
+        &mut chrome,
+        "!document.getElementById('plans').inert",
+        "taps are let through after the request's approval",
+    );
+    let focused = chrome.eval(&format!(
+        "(() => {{ const b = {}.querySelector('button.approve'); b.focus(); const plans = document.getElementById('plans'); \
            const moved = new MutationObserver(() => {{ if (plans.inert) {{ document.getElementById('passkey-label').focus(); moved.disconnect(); }} }}); \
-           moved.observe(plans, {{ attributes: true, attributeFilter: ['inert'] }}); return true; }})()",
+           moved.observe(plans, {{ attributes: true, attributeFilter: ['inert'] }}); return document.activeElement === b; }})()",
         card("natsf")
     ));
+    assert_eq!(
+        focused,
+        json!(true),
+        "natsf's Approve has the keyboard focus"
+    );
     chrome.eval(
         "document.documentElement.style.overflowAnchor = 'none'; document.body.style.overflowAnchor = 'none'; refreshPlans(); true",
     );
