@@ -296,7 +296,7 @@ mod tests {
         )
         .unwrap();
         fake.add_profile("default", json!({"name":"default","config":{},"devices":{"root":{"type":"disk","pool":"pool1","path":"/"}}}));
-        let cfg: Arc<NodeConfig> = Arc::new(serde_json::from_value(json!({"stateDir":dir,"incus":{"socket":fake.socket()},"listen":{"unix":dir.join("arca.sock")},"tokens":{"hashDir":dir.join("tokens")},"kernel":{"projects":[arca_netproject::PROJECT],"serviceCidr":"192.0.2.0/24"}})).unwrap());
+        let cfg: Arc<NodeConfig> = Arc::new(serde_json::from_value(json!({"stateDir":dir,"incus":{"socket":fake.socket()},"listen":{"unix":dir.join("arca.sock")},"tokens":{"hashDir":dir.join("tokens")},"kernel":{"projects":[arca_netproject::PROJECT],"droiddProjects":[],"serviceCidr":"192.0.2.0/24"}})).unwrap());
         let mut plugins = PluginSet::new();
         plugins.add::<arca_netproject::NetProject>().unwrap();
         plugins.add::<service::Service>().unwrap();
