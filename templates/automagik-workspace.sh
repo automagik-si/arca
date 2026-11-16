@@ -796,13 +796,15 @@ checkout_authorship() {
   name=$(checkout_git -C "$CHECKOUT_TARGET" config --get user.name 2>/dev/null) || name=''
   email=$(checkout_git -C "$CHECKOUT_TARGET" config --get user.email 2>/dev/null) || email=''
   if [ -z "$name$email" ]; then
-    # GitHub's bot id is delivered with the minted credential; never infer it from an App or installation id.
-    [ -s "$WS_SECRETS/GITHUB_BOT_ID" ] || return 0
-    local bot_id
-    bot_id=$(cat "$WS_SECRETS/GITHUB_BOT_ID")
-    [[ $bot_id =~ ^[1-9][0-9]*$ ]] || return 1
-    checkout_git config --file "$WS_DATA/.gitconfig" user.name 'arca-repositories[bot]' &&
-      checkout_git config --file "$WS_DATA/.gitconfig" user.email "$bot_id+arca-repositories[bot]@users.noreply.github.com" || return 1
+    # GitHub's verified bot identity is delivered with the credential; never infer its user ID from an App ID.
+    [ -s "$WS_SECRETS/GITHUB_BOT_IDENTITY" ] || return 0
+    local identity bot_id bot_login
+    # Read the verified ID and login as one bundle; separate file updates must not mix two identities.
+    identity=$(cat "$WS_SECRETS/GITHUB_BOT_IDENTITY") || return 1
+    bot_id=$(jq -er '.id | select(type == "string" and test("^[1-9][0-9]*$"))' <<<"$identity" 2>/dev/null) || return 1
+    bot_login=$(jq -er '.login | select(type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\[bot\\]$"))' <<<"$identity" 2>/dev/null) || return 1
+    checkout_git config --file "$WS_DATA/.gitconfig" user.name "$bot_login" &&
+      checkout_git config --file "$WS_DATA/.gitconfig" user.email "$bot_id+$bot_login@users.noreply.github.com" || return 1
   fi
 }
 
