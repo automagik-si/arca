@@ -576,6 +576,70 @@ fn an_io_limited_create_does_not_claim_data_left_by_an_earlier_attempt() {
 }
 
 #[test]
+fn an_io_limited_create_reports_incomplete_cleanup_when_rollback_delete_is_refused() {
+    let rig = Rig::new();
+    let mut template = nats_template();
+    template["limits"] = json!({"egress":"20Mbit"});
+    template["runTmpfs"] = json!(false);
+    template["secrets"] = json!(["TOKEN"]);
+    template["generate"] = json!({"TOKEN":"test_"});
+    template["env"] = json!({"TOKEN":"{{secret:TOKEN}}"});
+    rig.template("nats", template);
+    let secrets = rig.dir.join("secrets/service-nats");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("owner-seeded"), "keep this").unwrap();
+    rig.fake.reject_device_limits_on_start();
+    rig.fake.set_reject_delete("nats");
+
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+    else {
+        panic!("the failed start and refused rollback must fail create");
+    };
+    assert!(
+        message.contains("device I/O limits are not supported by this driver"),
+        "{message}"
+    );
+    assert!(message.contains("cleanup did not complete"), "{message}");
+    assert!(
+        message.contains("service_list") && message.contains("plan_list"),
+        "{message}"
+    );
+    assert!(!message.contains("nothing was left behind"), "{message}");
+    let instance = rig
+        .get(&format!("/1.0/instances/nats?project={PROJECT}"))
+        .expect("the refused DELETE leaves the instance");
+    assert_eq!(instance["status"], "Stopped");
+    assert!(
+        secrets.join("token").exists(),
+        "incomplete rollback preserves generated secrets"
+    );
+    assert_eq!(
+        fs::read_to_string(secrets.join("owner-seeded")).unwrap(),
+        "keep this"
+    );
+    let plans = rig.kernel.lock().unwrap().pending_plans();
+    assert!(plans.iter().any(|plan| {
+        plan.entry.0 == "service-nats"
+            && plan
+                .objects
+                .iter()
+                .any(|object| object.kind == IncusKind::Instance && object.name == "nats")
+    }));
+    let writes = rig.fake.writes();
+    assert!(writes.iter().any(|write| write.method == "DELETE"
+        && write.path.starts_with("/1.0/instances/nats?")
+        && write.status == 400));
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn unsupported_io_limits_fail_create_without_retrying_uncapped() {
     for (key, cap, run_tmpfs) in [("diskRead", "100MB", false), ("egress", "100Mbit", true)] {
         let rig = Rig::with(
