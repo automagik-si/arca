@@ -61,7 +61,7 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
-    // 0.32.0: before the edge provided its target and the Cloudflare template named its connector kind.
+    // 0.32.0 to 0.33.0: before the edge provided its target and the Cloudflare template named its connector kind.
     (
         "arca-edge.json",
         "56e40fd9a6d77b8c6c35fac7a61575488ef5db044a45177660c682af31ca8a71",
@@ -70,7 +70,7 @@ pub const EARLIER: &[(&str, &str)] = &[
         "cloudflare-tunnel.json",
         "ab2bbb77cd12d1b4c6fb0bd5a75ee2901552cdfbc01dedbc76b5c5b1ceb611e1",
     ),
-    // Installed from the unreleased Tailscale template: before linked targets and optional secrets.
+    // 0.33.0: before linked targets and optional secrets.
     (
         "tailscale.json",
         "6afdbdaf54a0f91590aa1f1e86cde5c1677a3f8447693e4c69296a28fd868145",

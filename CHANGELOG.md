@@ -46,7 +46,8 @@ whole-disk snapshot storage: kernel device origins are checked, and unreadable o
 free. A mounted mapped image now has the `system` role with no folder offer, where it could previously be `in use`
 and offered as a folder target. `storage_add` refuses these devices before an exclusive open or any write, including
 when the device becomes a mapped image after approval; SATA, NVMe (including native multipath), USB and a VM's own
-virtio disks keep their offers.
+virtio disks keep their offers. Disks attached over iSCSI, Fibre Channel or SRP, and NVMe over fabrics with native
+multipath, count as machine disks and are protected only by the usual in-use checks.
 The `automagik-workspace` template prepares workspace homes, the CLI store, workspace, secrets and run directories
 under its existing persistent `/data` mount; `HOME` and `AUTOMAGIK_HOME` are `/data`. The server runs as the configured
 image user and requires `automagikPnpm`, explicitly pinned to the image's `/usr/local/bin/pnpm`, with no fallback.
