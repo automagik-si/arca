@@ -315,7 +315,7 @@ impl Kernel {
             journal::{BindingState, EffectClass, Inverse},
             ownership::IncusKind,
         };
-        if self.store.binding_unsaved() {
+        if self.store.binding_unsaved(&entry.id) {
             return Err(KernelError::Journal("the previous binding is journalled but its service record is not saved; restore state-directory writes and restart Arca, or complete a successful state save, before another re-bind".into()));
         }
         let journal = self.reconciler.journal();

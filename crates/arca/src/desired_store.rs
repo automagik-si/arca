@@ -79,8 +79,8 @@ pub struct DesiredStore {
     applied: Option<Applied>,
     converged: Vec<Entry>,
     retained: Retained,
-    // A durable binding must reach the state file before another binding can replace it.
-    binding_unsaved: bool,
+    // Each entry must save its durable binding before another binding can replace it.
+    unsaved_bindings: BTreeSet<EntryId>,
 }
 
 impl DesiredStore {
@@ -121,7 +121,7 @@ impl DesiredStore {
             applied,
             converged: state.converged,
             retained,
-            binding_unsaved: false,
+            unsaved_bindings: BTreeSet::new(),
         })
     }
 
@@ -140,8 +140,8 @@ impl DesiredStore {
         self.applied.as_ref()
     }
 
-    pub(crate) fn binding_unsaved(&self) -> bool {
-        self.binding_unsaved
+    pub(crate) fn binding_unsaved(&self, entry: &EntryId) -> bool {
+        self.unsaved_bindings.contains(entry)
     }
 
     /// The entries that applied with their current config, as the reconciler last reported them.
@@ -243,6 +243,7 @@ impl DesiredStore {
         };
         let old = signed.document.clone();
         let mut converged = self.converged.clone();
+        let mut projected = BTreeSet::new();
         for event in events {
             for entry in signed
                 .document
@@ -250,7 +251,11 @@ impl DesiredStore {
                 .iter_mut()
                 .chain(converged.iter_mut())
             {
+                let before = entry.digest.clone();
                 crate::service_rebind::project(entry, event)?;
+                if entry.digest != before {
+                    projected.insert(entry.id.clone());
+                }
             }
         }
         if signed.document.entries == old.entries && converged == self.converged {
@@ -280,7 +285,7 @@ impl DesiredStore {
         });
         self.current = next.current.clone();
         self.converged = next.converged.clone();
-        self.binding_unsaved = true;
+        self.unsaved_bindings.extend(projected);
         self.persist(&next)
     }
 
@@ -330,7 +335,7 @@ impl DesiredStore {
         File::open(&self.dir)
             .and_then(|dir| dir.sync_all())
             .map_err(|error| io_error(&self.dir, &error))?;
-        self.binding_unsaved = false;
+        self.unsaved_bindings.clear();
         Ok(())
     }
 }
