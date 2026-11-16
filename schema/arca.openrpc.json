@@ -7103,6 +7103,38 @@
         "schema": {
           "additionalProperties": false,
           "properties": {
+            "edges": {
+              "description": "Present when the removed service was linked to an edge: what writing each such edge's config again did, now that the service's address is out of its PROXY allow list.",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "applied": {
+                    "description": "Whether the edge took its new config file.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The edge service.",
+                    "type": "string"
+                  },
+                  "note": {
+                    "description": "What the edge did, in words, when it is not simply done.",
+                    "type": "string"
+                  },
+                  "reloaded": {
+                    "description": "Whether Caddy was reloaded with it; false when the edge is not running.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "name",
+                  "applied",
+                  "reloaded"
+                ],
+                "type": "object"
+              },
+              "maxItems": 64,
+              "type": "array"
+            },
             "removed": {
               "const": true,
               "type": "boolean"
@@ -7971,6 +8003,34 @@
         "schema": {
           "additionalProperties": false,
           "properties": {
+            "edge": {
+              "additionalProperties": false,
+              "description": "Present when the provider is an edge: what writing its config again did, with the consumer's address in or out of its PROXY allow list.",
+              "properties": {
+                "applied": {
+                  "description": "Whether the edge took its new config file.",
+                  "type": "boolean"
+                },
+                "name": {
+                  "description": "The edge service.",
+                  "type": "string"
+                },
+                "note": {
+                  "description": "What the edge did, in words, when it is not simply done.",
+                  "type": "string"
+                },
+                "reloaded": {
+                  "description": "Whether Caddy was reloaded with it; false when the edge is not running.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "name",
+                "applied",
+                "reloaded"
+              ],
+              "type": "object"
+            },
             "env": {
               "description": "The environment variable names, never their values.",
               "items": {
@@ -8030,6 +8090,34 @@
         "schema": {
           "additionalProperties": false,
           "properties": {
+            "edge": {
+              "additionalProperties": false,
+              "description": "Present when the provider is an edge: what writing its config again did, with the consumer's address in or out of its PROXY allow list.",
+              "properties": {
+                "applied": {
+                  "description": "Whether the edge took its new config file.",
+                  "type": "boolean"
+                },
+                "name": {
+                  "description": "The edge service.",
+                  "type": "string"
+                },
+                "note": {
+                  "description": "What the edge did, in words, when it is not simply done.",
+                  "type": "string"
+                },
+                "reloaded": {
+                  "description": "Whether Caddy was reloaded with it; false when the edge is not running.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "name",
+                "applied",
+                "reloaded"
+              ],
+              "type": "object"
+            },
             "env": {
               "description": "The environment variable names, never their values.",
               "items": {
@@ -11291,6 +11379,38 @@
         "schema": {
           "additionalProperties": false,
           "properties": {
+            "edges": {
+              "description": "Present when the removed service was linked to an edge: what writing each such edge's config again did, now that the service's address is out of its PROXY allow list.",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "applied": {
+                    "description": "Whether the edge took its new config file.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The edge service.",
+                    "type": "string"
+                  },
+                  "note": {
+                    "description": "What the edge did, in words, when it is not simply done.",
+                    "type": "string"
+                  },
+                  "reloaded": {
+                    "description": "Whether Caddy was reloaded with it; false when the edge is not running.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "name",
+                  "applied",
+                  "reloaded"
+                ],
+                "type": "object"
+              },
+              "maxItems": 64,
+              "type": "array"
+            },
             "removed": {
               "const": true,
               "type": "boolean"

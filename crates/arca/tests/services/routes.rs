@@ -574,3 +574,44 @@ fn an_edge_with_no_route_takes_a_linked_services_address_and_drops_it_when_the_s
     assert_eq!(written(&rig), route::caddyfile(&EdgeRecord::default(), &[]));
     assert_eq!(edge_execs(&rig), reloads + 1);
 }
+
+/// Through the MCP door, which checks every answer against its verb's result schema: a link to the edge, its undoing
+/// and the removal of a service linked to it answer what the edge did, never "the tool failed" after the link or the
+/// removal already ran.
+#[test]
+fn a_link_to_the_edge_and_the_removal_of_a_linked_service_answer_in_their_schemas() {
+    let key = common::SkKey::from_seed(9);
+    let rig = edge_rig_with(Some(&key));
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("a service");
+    let address = rig.service_config("nats").ipv4;
+    let door = super::external::Door::over(&rig);
+    reload(&rig, 0);
+    assert_eq!(
+        door.call("service_connect", json!({"from":"nats","to":"edge"})),
+        "ok"
+    );
+    assert!(written(&rig).contains(&allows(&[&address])));
+    reload(&rig, 0);
+    assert_eq!(
+        door.call("service_disconnect", json!({"from":"nats","to":"edge"})),
+        "ok"
+    );
+    assert!(written(&rig).contains(&allows(&[])));
+    reload(&rig, 0);
+    assert_eq!(
+        door.call("service_connect", json!({"from":"nats","to":"edge"})),
+        "ok"
+    );
+    reload(&rig, 0);
+    assert_eq!(
+        door.call(
+            "service_remove",
+            json!({"name":"nats","approval":owner_approval(&key, "nats")}),
+        ),
+        "ok"
+    );
+    assert!(rig.service_config("edge").incoming.is_empty());
+    assert!(written(&rig).contains(&allows(&[])));
+}

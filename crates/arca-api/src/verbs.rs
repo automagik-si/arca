@@ -5722,10 +5722,51 @@ fn service_update_result() -> Value {
 fn service_remove_result() -> Value {
     json!({
         "additionalProperties": false,
-        "properties": { "removed": { "const": true, "type": "boolean" } },
+        "properties": {
+            "removed": { "const": true, "type": "boolean" },
+            "edges": {
+                "description": "Present when the removed service was linked to an edge: what writing each such edge's config again did, now that the service's address is out of its PROXY allow list.",
+                "items": edge_relinked_schema(),
+                "maxItems": 64,
+                "type": "array"
+            }
+        },
         "required": ["removed"],
         "type": "object"
     })
+}
+
+/// What writing an edge's config again did after the services linked to it changed: Caddy took it (`reloaded`), or the
+/// edge does not run and reads it at its start, or the edge did not take it (`applied` false), which `note` says in
+/// words. The link or the removal itself is done either way.
+fn edge_relinked_schema() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "name": { "description": "The edge service.", "type": "string" },
+            "applied": { "description": "Whether the edge took its new config file.", "type": "boolean" },
+            "reloaded": { "description": "Whether Caddy was reloaded with it; false when the edge is not running.", "type": "boolean" },
+            "note": { "description": "What the edge did, in words, when it is not simply done.", "type": "string" }
+        },
+        "required": ["name", "applied", "reloaded"],
+        "type": "object"
+    })
+}
+
+/// A connect or disconnect result: the variable names, and `edge` when the provider is an edge, whose PROXY allow list
+/// follows the services linked to it.
+fn with_edge_relinked(mut schema: Value) -> Value {
+    schema["properties"]
+        .as_object_mut()
+        .expect("an object")
+        .insert("edge".into(), {
+            let mut edge = edge_relinked_schema();
+            edge["description"] = json!(
+                "Present when the provider is an edge: what writing its config again did, with the consumer's address in or out of its PROXY allow list."
+            );
+            edge
+        });
+    schema
 }
 
 fn service_connect_params() -> Value {
@@ -5736,7 +5777,7 @@ fn service_connect_params_base() -> Value {
     serde_json::from_str(r##"{"additionalProperties":false,"properties":{"from":{"description":"The consumer: the service whose environment gets the provider's variables.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"to":{"description":"The provider: the service whose first port the link opens.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"}},"required":["from","to"],"type":"object"}"##).expect("fixed service schema")
 }
 fn service_connect_result() -> Value {
-    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"env":{"description":"The environment variable names, never their values.","items":{"maxLength":64,"type":"string"},"maxItems":64,"type":"array"}},"required":["env"],"type":"object"}"##).expect("fixed service schema")
+    with_edge_relinked(serde_json::from_str(r##"{"additionalProperties":false,"properties":{"env":{"description":"The environment variable names, never their values.","items":{"maxLength":64,"type":"string"},"maxItems":64,"type":"array"}},"required":["env"],"type":"object"}"##).expect("fixed service schema"))
 }
 fn summary_service_connect(_: &Value) -> String {
     "service_connect: complete".into()
@@ -5749,7 +5790,7 @@ fn service_disconnect_params_base() -> Value {
     serde_json::from_str(r##"{"additionalProperties":false,"properties":{"from":{"description":"The consumer: the service whose environment gets the provider's variables.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"to":{"description":"The provider: the service whose first port the link opens.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"}},"required":["from","to"],"type":"object"}"##).expect("fixed service schema")
 }
 fn service_disconnect_result() -> Value {
-    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"env":{"description":"The environment variable names, never their values.","items":{"maxLength":64,"type":"string"},"maxItems":64,"type":"array"}},"required":["env"],"type":"object"}"##).expect("fixed service schema")
+    with_edge_relinked(serde_json::from_str(r##"{"additionalProperties":false,"properties":{"env":{"description":"The environment variable names, never their values.","items":{"maxLength":64,"type":"string"},"maxItems":64,"type":"array"}},"required":["env"],"type":"object"}"##).expect("fixed service schema"))
 }
 fn summary_service_disconnect(_: &Value) -> String {
     "service_disconnect: complete".into()

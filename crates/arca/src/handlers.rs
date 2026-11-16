@@ -7799,6 +7799,7 @@ impl ServiceHandler {
             // going has been stopped; a run and the two reads take none.
             return self.call_function(
                 &args,
+                caller,
                 &read,
                 &all_entries,
                 &all_rows,
