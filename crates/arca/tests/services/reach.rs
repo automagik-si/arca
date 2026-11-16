@@ -380,6 +380,9 @@ fn privacy_cases(cases: &[(&str, String)], id: &str, placeholder: bool) {
     let mut failures = Vec::new();
     for (label, raw) in cases {
         let lines = privacy_log_lines(&rig, "node-ts", raw);
+        if cases.len() < 5 {
+            println!("{label}: {lines:?}");
+        }
         if lines.concat().contains(id)
             || (placeholder && !lines.concat().contains("[sign-in link]"))
         {
@@ -487,10 +490,16 @@ fn logs_privacy_every_link_offset() {
 fn logs_privacy_two_inserts() {
     let id = "syntheticDouble1234";
     privacy_cases(
-        &[(
-            "host and identifier",
-            "visit https://\u{1b}login.tailscale.com/a/synthetic\0Double1234\n".into(),
-        )],
+        &[
+            (
+                "host and identifier",
+                "visit https://\u{1b}login.tailscale.com/a/synthetic\0Double1234\n".into(),
+            ),
+            (
+                "mixed host sequences",
+                "visit https://lo\u{1b}[1mgin.tails\u{1b}[cale.com/a/syntheticDouble1234\n".into(),
+            ),
+        ],
         id,
         false,
     );

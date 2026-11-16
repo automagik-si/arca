@@ -8219,25 +8219,14 @@ impl ServiceHandler {
                 }
                 // A PEM block is hidden whole before the log is cut into lines: cut first, its lines are no longer
                 // one block. Each line is then cleaned and hidden again, a secret of several lines line by line.
-                let text = crate::service::redact_blocks(&text);
-                let text = if crate::reach::kind(&self.cfg, &config).is_some() {
-                    // Mask the bytes as they will be answered: cleaning can rejoin a URL split by ANSI or NUL.
-                    // Keep carriage returns until masking sees the whole identifier, then split other log lines as usual.
-                    text.split('\n')
-                        .map(|line| {
-                            let clean = line
-                                .split('\r')
-                                .map(crate::service::clean_log)
-                                .collect::<Vec<_>>()
-                                .join("\r");
-                            crate::reach::redact_login_links(&clean)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                let (text, hidden) = if crate::reach::kind(&self.cfg, &config).is_some() {
+                    crate::reach::connector_log(&text, &secrets)
                 } else {
-                    text
+                    (
+                        crate::service::redact_blocks(&text),
+                        crate::service::values_to_hide(&secrets),
+                    )
                 };
-                let hidden = crate::service::values_to_hide(&secrets);
                 let mut lines_out = Vec::new();
                 for line in text.split(['\n', '\r']) {
                     if line.trim().is_empty() {

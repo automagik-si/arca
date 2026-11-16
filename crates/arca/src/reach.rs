@@ -231,26 +231,77 @@ fn login_link(url: &str) -> bool {
         })
 }
 
-/// Hide node-login URLs, including HTTP and case variants; preserve punctuation, admin URLs and other text.
-pub(crate) fn redact_login_links(text: &str) -> String {
+fn login_links() -> &'static regex::Regex {
     static LINKS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        // Carriage returns inside a URL must not leave an identifier fragment on another answered line.
-        // Outside a matching URL they remain ordinary log-line separators.
-        let across_returns = |literal: &str| {
-            literal
-                .chars()
-                .map(|ch| regex::escape(&ch.to_string()))
-                .collect::<Vec<_>>()
-                .join(r"\r*")
-        };
+        let host = "login.tailscale.com/a/"
+            .chars()
+            .map(|ch| regex::escape(&ch.to_string()))
+            .collect::<Vec<_>>()
+            .join(r"\r*");
+        // Other breaks inside an identifier cannot be distinguished from the next log word; leave that tail.
         regex::Regex::new(&format!(
-            r"(?i){}(?:\r*s)?\r*{}\r*[A-Za-z0-9_-]+(?:\r+[A-Za-z0-9_-]+)*",
-            across_returns("http"),
-            across_returns("://login.tailscale.com/a/")
-        ))
-        .expect("fixed login-link pattern")
+            r"(?i)(?:[a-z\r]*:?\r*/\r*/)?{host}[ \t\r\n]*(?P<id>[A-Za-z0-9_-]+(?:\r+[A-Za-z0-9_-]+)*)"
+        )).expect("fixed login-link pattern")
     });
-    LINKS.replace_all(text, "[sign-in link]").into_owned()
+    &LINKS
+}
+
+/// Hide the vendor's login host and path, with or without a scheme; preserve admin URLs and other text.
+pub(crate) fn redact_login_links(text: &str) -> String {
+    login_links()
+        .replace_all(text, "[sign-in link]")
+        .into_owned()
+}
+
+fn clean_console(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            line.split('\r')
+                .map(service::clean_log)
+                .collect::<Vec<_>>()
+                .join("\r")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The raw pass masks one-piece links regardless of surrounding text. The sweep closes a single tested insertion
+/// anywhere in a link whose identifier meets the value-hiding floor. Damage to both host and login path is best effort.
+/// Detection views are never answered.
+pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service::Hidden) {
+    let shown = clean_console(&service::redact_blocks(text));
+    let without_controls: String = text.chars().filter(|ch| !ch.is_control()).collect();
+    static INTRODUCERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\x1b(?:[\[\]][0-?]*)?").expect("fixed terminal-introducer pattern")
+    });
+    // A detection-only projection: discard introducers and parameters without consuming a following letter.
+    let without_introducers = INTRODUCERS.replace_all(text, "");
+    let mut values = secrets.to_vec();
+    for view in [
+        text,
+        &shown,
+        &without_controls,
+        without_introducers.as_ref(),
+    ] {
+        for found in login_links().captures_iter(view) {
+            values.push(found["id"].replace('\r', ""));
+        }
+    }
+    let raw = redact_login_links(&service::redact_blocks(text));
+    // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
+    let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
+    let answer = redact_login_links(&clean_console(&raw));
+    static URL_IDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"//[^\s/]*\.[^\s/]*/a/([A-Za-z0-9_-]{8,})")
+            .expect("fixed URL-identifier pattern")
+    });
+    values.extend(
+        URL_IDS
+            .captures_iter(&answer)
+            .map(|found| found[1].to_string()),
+    );
+    // values_to_hide keeps its existing 8-byte floor: short identifiers are hidden by shape, not as ordinary words.
+    (answer, service::values_to_hide(&values))
 }
 
 #[cfg(test)]
