@@ -167,7 +167,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 94] = [
+static VERBS: [Verb; 95] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -984,6 +984,20 @@ static VERBS: [Verb; 94] = [
         cut: no_cut,
         params: tenant_remove_params,
         result: service_remove_result,
+    },
+    Verb {
+        name: "tenant_image_import",
+        summary: "Copy an image already in the node's own store by its full fingerprint into one tenant, including its source properties, and set a new alias. Runs only from an approved proposal; existing content is not replaced.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_tenant_image_import,
+        cut: no_cut,
+        params: tenant_image_import_params,
+        result: tenant_image_import_result,
     },
     Verb {
         name: "deploy_confirm",
@@ -4243,8 +4257,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty-nine verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 31] = [
+/// The verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 32] = [
     "service_create",
     "service_remove",
     "service_update",
@@ -4266,6 +4280,7 @@ const ACTION_NAMES: [&str; 31] = [
     "instance_restart",
     "tenant_create",
     "tenant_remove",
+    "tenant_image_import",
     "deploy_remove",
     "function_create",
     "function_remove",
@@ -4299,7 +4314,8 @@ fn action_propose_params() -> Value {
 /// removed or overwritten before the action's own check runs (the GPU verbs from the instance, storage_add from the
 /// disk survey, the snapshot verbs from the source or the snapshot). A branch takes any value for them, as the door did
 /// before it held `args` to a branch, and says so.
-pub const KERNEL_FILLED: [(&str, &[&str]); 7] = [
+pub const KERNEL_FILLED: [(&str, &[&str]); 8] = [
+    ("tenant_image_import", &["project", "tenantIncarnation", "properties"]),
     ("service_reconfigure", &["changes"]),
     ("service_update", &["changes"]),
     ("gpu_attach", &["project", "kind", "uuid"]),
@@ -4350,7 +4366,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 31] = [
+const ACTION_EXAMPLES: [(&str, &str); 32] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
@@ -4387,6 +4403,7 @@ const ACTION_EXAMPLES: [(&str, &str); 31] = [
     ),
     ("tenant_create", r#"{}"#),
     ("tenant_remove", r#"{"id":"abcdefgh"}"#),
+    ("tenant_image_import", r#"{"tenant":"abcdefgh","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","alias":"app"}"#),
     ("deploy_remove", r#"{"tenant":"abcdefgh","deploy":"d1"}"#),
     (
         "function_create",
@@ -6790,4 +6807,27 @@ pub fn summary_owner_approval_list(v: &Value) -> String {
         "{} owner approval request(s) in the last 24 h, {pending} pending. Untrusted: requesters wrote the arguments.",
         requests.len()
     )
+}
+
+fn tenant_image_import_params() -> Value {
+    params(vec![
+        ("tenant", true, tenant_id_schema()),
+        ("fingerprint", true, json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" })),
+        ("alias", true, json!({ "type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$" })),
+        ("approval", false, json!({ "type": "string", "minLength": 1, "maxLength": 16384,
+            "description": "The one-shot grant of an approved proposal. Without it the verb returns NotApproved." })),
+        ("project", false, string()),
+        ("tenantIncarnation", false, json!({ "type": "string", "pattern": "^[1-9][0-9]*$" })),
+        ("properties", false, json!({ "type": "object", "additionalProperties": { "type": "string" } })),
+    ])
+}
+
+fn tenant_image_import_result() -> Value {
+    result(vec![("tenant", true, tenant_id_schema()), ("project", true, string()),
+        ("fingerprint", true, string()), ("alias", true, string()), ("imported", true, boolean())])
+}
+
+pub fn summary_tenant_image_import(result: &Value) -> String {
+    if result["imported"] == true { "Image imported into the tenant's store".into() }
+    else { "Image and alias already present in the tenant's store".into() }
 }

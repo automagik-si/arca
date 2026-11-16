@@ -7077,6 +7077,32 @@ arca-gitlab-pool: totals jobs_now=3 of 6 jobs_done=161 jobs_failed=12 runners=2 
 
 ## Tenants
 
+**Importing a pinned image.** `tenant_image_import {tenant, fingerprint, alias}` copies an image already held in
+the node's own `arcak-svc` image store into an existing tenant's own store, then adds the alias. `fingerprint` is
+the full 64 lowercase hex digits Incus uses, without `sha256:`. The alias is 1-128 letters, digits, dots,
+underscores or dashes, starting with a letter or digit. Arca fetches nothing and accepts no file or source project.
+
+This verb runs only from an approved proposal (`action_propose` and the owner's card). A direct call without its
+one-shot grant answers `NotApproved`. The card binds the fingerprint, alias, tenant project and the creation
+record that identifies this incarnation of the tenant. It also shows and binds the source image's properties:
+properties set after publication live in Incus's database and are not covered by the image fingerprint. Arca
+checks all of these again before writing anything. A tenant recreated since the proposal, changed source
+properties or an alias now taken by another fingerprint requires a new proposal.
+
+The copy request carries the source properties explicitly. Arca reads them back and, for a newly copied image,
+sets them to the approved map if Incus reused extra database properties from another copy. A pre-existing tenant
+copy with different properties is refused rather than changed. If the same image, properties and alias are
+already there, the import succeeds with `imported: false` and sends no Incus write. A new alias can name an existing
+matching image. A container template can then use `local:<alias>` with its `sha256:<fingerprint>` pin as usual.
+
+`tenant-image-imports.jsonl` in the state directory is a private, fsynced import record. Each Incus copy, property
+write, alias create or inverse has an intent before its request, its operation ID when asynchronous, and a
+read-back outcome. Failure undoes only additions attributable to that action: the source store and pre-existing
+tenant content are kept. A copied image is conservatively retained when the tenant has a service or live instance,
+another alias, or a service-update history pin that may need it for rollback; the refusal reports incomplete
+cleanup. An unreadable operation is settled before an inverse is attempted. After a restart, another approved
+import settles unfinished records in the same tenant incarnation, and a completed copy and alias need no write.
+
 A node may hold tenants: each is one restricted Incus project of its own, on the node's managed service network, with its
 own caps and its own block of addresses. The node's own project, `arcak-svc`, stays the node owner's. The rules are 61 to
 67 of `docs/OWNERSHIP.md`.

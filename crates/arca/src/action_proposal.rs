@@ -75,6 +75,7 @@ pub enum ActionKind {
     InstanceRestart,
     TenantCreate,
     TenantRemove,
+    TenantImageImport,
     DeployRemove,
     FunctionCreate,
     FunctionRemove,
@@ -144,7 +145,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 31] = [
+    pub const ALL: [ActionKind; 32] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
@@ -166,6 +167,7 @@ impl ActionKind {
         Self::InstanceRestart,
         Self::TenantCreate,
         Self::TenantRemove,
+        Self::TenantImageImport,
         Self::DeployRemove,
         Self::FunctionCreate,
         Self::FunctionRemove,
@@ -216,6 +218,7 @@ impl ActionKind {
             Self::InstanceStop => "Ask your assistant to start it again.",
             Self::InstanceRestart => "There is nothing to undo: it runs again once it is back.",
             Self::TenantCreate => "Ask your assistant to remove the tenant.",
+            Self::TenantImageImport => "Removing the tenant removes its copy. On failure only new, unreferenced additions are undone; existing or potentially used content is kept.",
             Self::TenantRemove => {
                 "It cannot be undone: the tenant is deleted with every service in it and their data."
             }
@@ -310,6 +313,7 @@ impl ActionKind {
             Self::InstanceRestart => "instance_restart",
             Self::TenantCreate => "tenant_create",
             Self::TenantRemove => "tenant_remove",
+            Self::TenantImageImport => "tenant_image_import",
             Self::DeployRemove => "deploy_remove",
             Self::FunctionCreate => "function_create",
             Self::FunctionRemove => "function_remove",
@@ -668,6 +672,12 @@ impl ActionKind {
                 rows
             }
             Self::ServiceReconfigure => reconfigure_rows(args),
+            Self::TenantImageImport => vec![
+                row("Fingerprint", text("fingerprint")), row("Project", text("project")),
+                row("Tenant incarnation", text("tenantIncarnation")), row("Alias", text("alias")),
+                row("Source properties", &args["properties"].to_string()),
+                row("Effect", "Copy this exact image from the node's own image store into the tenant's store and set its alias and these source properties. Existing images and aliases are not replaced."),
+            ],
             Self::ServiceImport => vec![
                 row("Name", text("name")),
                 row(
@@ -1102,6 +1112,7 @@ impl ActionKind {
                 "Create a tenant with caps above this node's defaults".to_string()
             }
             Self::TenantCreate => "Create a tenant".to_string(),
+            Self::TenantImageImport => format!("Import image {} as {}", text("fingerprint"), text("alias")),
             Self::TenantRemove => format!("Remove the tenant {} and everything in it", text("id")),
             Self::DeployRemove => {
                 format!("Remove everything the deploy {} created", text("deploy"))

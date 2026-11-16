@@ -321,6 +321,9 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "instances": 4, "containers": 4, "virtualMachines": 1, "cpu": 8,
                 "memory": "16GiB", "disk": "100GiB" } }),
             ActionKind::TenantRemove => json!({ "id": "abcdefgh" }),
+            ActionKind::TenantImageImport => json!({ "tenant": "abcdefgh", "project": "arcak-t-abcdefgh",
+                "fingerprint": "c".repeat(64), "alias": "app", "tenantIncarnation": "3",
+                "properties": { "type": "app", "architecture": "x86_64" } }),
             ActionKind::DeployRemove => json!({ "tenant": "abcdefgh", "deploy": "d1" }),
             ActionKind::ServicePublish => json!({ "name": "nats", "reach": "tailnet" }),
             ActionKind::ServiceConnect | ActionKind::ServiceDisconnect => {
@@ -666,6 +669,19 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             assert_eq!(labels, ["Function", "Effect"]);
             assert_eq!(details[0].value, "relay");
             assert!(details[1].value.contains("run log are kept"));
+            continue;
+        }
+        if action == ActionKind::TenantImageImport {
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(labels, ["Fingerprint", "Project", "Tenant incarnation", "Alias", "Source properties", "Effect", "Tenant"]);
+            assert_eq!(details[0].value, "c".repeat(64));
+            assert_eq!(details[1].value, "arcak-t-abcdefgh");
+            assert_eq!(details[2].value, "3");
+            assert_eq!(details[3].value, "app");
+            assert_eq!(serde_json::from_str::<Value>(&details[4].value).unwrap(), prepared["properties"]);
+            assert_eq!(details[6].value, "abcdefgh");
+            assert!(action.params_schema()["properties"].as_object().unwrap().keys().all(|field|
+                ["tenant", "project", "fingerprint", "alias", "tenantIncarnation", "properties"].contains(&field.as_str())));
             continue;
         }
         if action == ActionKind::TenantCreate {
@@ -2273,7 +2289,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(all.len(), 31);
+    assert_eq!(all.len(), 32);
     assert_eq!(
         failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
         format!(

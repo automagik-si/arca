@@ -91,6 +91,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "tenant_status",
             "tenant_usage",
             "tenant_remove",
+            "tenant_image_import",
             "deploy_confirm",
             "deploy_rollback",
             "deploy_remove",
@@ -184,6 +185,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("tenant_status", VerbClass::L, Scope::Viewer, false, false),
         ("tenant_usage", VerbClass::L, Scope::Viewer, false, false),
         ("tenant_remove", VerbClass::L, Scope::Doctor, true, true),
+        ("tenant_image_import", VerbClass::L, Scope::Doctor, true, false),
         ("deploy_confirm", VerbClass::L, Scope::Doctor, true, false),
         ("deploy_rollback", VerbClass::L, Scope::Doctor, true, true),
         ("deploy_remove", VerbClass::L, Scope::Doctor, true, true),
@@ -433,6 +435,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "instance_restart",
         "tenant_create",
         "tenant_remove",
+        "tenant_image_import",
         "deploy_remove",
         "function_create",
         "function_remove",
@@ -1945,7 +1948,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 31);
+    assert_eq!(actions.len(), 32);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));
@@ -2067,6 +2070,7 @@ fn a_field_the_kernel_fills_in_is_taken_at_the_door_with_any_value() {
         for field in fields {
             let rule = &own["properties"][*field];
             assert!(rule.is_object(), "{action} takes {field}");
+            let off_rule = if conforms(rule, &off_rule).is_ok() { json!(7) } else { off_rule.clone() };
             assert!(
                 conforms(rule, &off_rule).is_err(),
                 "{action}/{field}: off its rule"

@@ -202,12 +202,16 @@ pub struct FakeIncus {
 }
 
 /// What every connection shares: the objects, the logs and the switches.
+#[path = "fake_images.rs"]
+mod images;
+
 struct Shared {
     service: Mutex<ServiceFake>,
     store: Mutex<Store>,
     requests: Mutex<Vec<RecordedRequest>>,
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
+    image_failure: Mutex<Option<String>>,
     reject_patch: Mutex<Vec<String>>,
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
@@ -347,6 +351,7 @@ enum Route {
     Resources,
     ListProjects,
     ListImages(String),
+    ImageAliases(String, Option<String>),
     ListInstances,
     ListInstancesWithState,
     ProjectInstancesWithState(String),
@@ -382,6 +387,9 @@ impl Route {
             Route::Object(address) if address.kind == "instance" => {
                 &["GET", "POST", "PUT", "PATCH", "DELETE"]
             }
+            Route::Object(address) if address.kind == "image" => &["GET", "PUT", "PATCH", "DELETE"],
+            Route::ImageAliases(_, None) => &["POST"],
+            Route::ImageAliases(_, Some(_)) => &["GET", "DELETE"],
             Route::Object(address) if address.kind == "volume" => {
                 &["GET", "POST", "PATCH", "DELETE"]
             }
@@ -461,6 +469,7 @@ impl Shared {
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
+            image_failure: Mutex::new(None),
             reject_patch: Mutex::new(Vec::new()),
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
@@ -681,6 +690,11 @@ impl FakeIncus {
     /// does. An address without one is answered with no `netmask`.
     pub fn set_host_netmask(&self, address: IpAddr, length: u8) {
         lock(&self.shared.host_netmasks).insert(address, length);
+    }
+
+    /// Injects one image-copy (copy/copy_after) or alias POST failure, without changing other routes.
+    pub fn fail_image_import_at(&self, step: &str) {
+        *lock(&self.shared.image_failure) = Some(step.to_string());
     }
 
     /// Puts an image with the alias `alias` in the store `project` reads, as a copy by hand would, and returns its fingerprint.
@@ -1541,7 +1555,10 @@ fn parse(target: &str) -> Option<Route> {
         ["images"] if query_param(query, "recursion") == Some("1") => {
             Route::ListImages(project.to_string())
         }
+        ["images", "aliases"] => Route::ImageAliases(project.into(), None),
+        ["images", "aliases", name] => Route::ImageAliases(project.into(), Some((*name).into())),
         ["images", fingerprint] => Route::Object(address("image", "", fingerprint)),
+        ["images"] => Route::Collection(address("image", "", "")),
         ["storage-pools"] if query == "recursion=1" => Route::ListPools,
         ["storage-pools", pool] if query.is_empty() => Route::PoolObject((*pool).to_string()),
         ["storage-pools", pool, "resources"] if query.is_empty() => {
@@ -1579,6 +1596,8 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         other => other,
     };
     match (request.method.as_str(), route) {
+        (_, Route::ImageAliases(project, name)) => images::aliases(shared, store, request, &project, name.as_deref()),
+        ("POST", Route::Collection(address)) if address.kind == "image" => images::copy(shared, store, request, &address),
         ("GET", Route::Server) => sync(store.server.clone()),
         ("GET", Route::Resources) => match lock(&shared.resources).clone() {
             Some(document) => sync(document),
@@ -2606,6 +2625,18 @@ fn put(
     };
     if store.objects[index].kind == "project" {
         return write_project(shared, store, index, &body, true);
+    }
+    if store.objects[index].kind == "image" {
+        let properties = body.get("properties").cloned().unwrap_or(json!({}));
+        if !properties.as_object().is_some_and(|p| p.values().all(Value::is_string)) {
+            return (400, String::new(), error_envelope(400, "image properties must be strings"));
+        }
+        store.objects[index].body["properties"] = properties;
+        for key in ["public", "auto_update"] {
+            store.objects[index].body[key] = body.get(key).cloned().unwrap_or(json!(false));
+        }
+        store.objects[index].body["profiles"] = body.get("profiles").cloned().unwrap_or(json!([]));
+        return sync(Value::Null);
     }
     let bad = |message: &str| (400, String::new(), error_envelope(400, message));
     // A restore names a snapshot the instance holds and puts back its root's `/run`; it replaces nothing else the fake
