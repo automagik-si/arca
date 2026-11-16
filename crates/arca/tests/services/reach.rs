@@ -23,6 +23,11 @@ fn rig() -> (Rig, common::SkKey) {
     rig.template("edge", json!({"name":"edge","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[443],"env":{},"lan":{"port":443},"edge":true,"provides":{"env":{"ARCA_EDGE_TARGET":"{{host}}:{{port}}"}}}));
     rig.call("service_create", json!({"name":"edge","template":"edge"}))
         .unwrap();
+    rig.fake.script_exec(ExecScript::new(
+        arca_incus::exec::ExecCommand::EdgeReload.argv(),
+        0,
+        "",
+    ));
     (rig, key)
 }
 
@@ -115,11 +120,6 @@ fn assert_private(rig: &Rig, needle: &str) {
 #[test]
 fn approved_connect_links_starts_and_lists_without_the_sign_in_link() {
     let (rig, key) = rig();
-    rig.fake.script_exec(ExecScript::new(
-        arca_incus::exec::ExecCommand::EdgeReload.argv(),
-        0,
-        "",
-    ));
     status(&rig, "NeedsLogin");
     let made = connect(&rig, &key, None).unwrap();
     assert_eq!(made["name"], "node1-ts");
