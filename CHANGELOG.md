@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Service adoption rechecks an instance under the kernel lock before recording it, so an overlapping removal cannot
+bring its record back; existing adopted records of instances the kernel journal proves it created and retired heal
+on the next managed service call, and an approved release can forget a missing adopted instance without an import
+allowlist entry.
+
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
 its old values may precede a late synchronous PATCH: Arca keeps the original values as its inverse and retries the
 entry on the next document, rather than claiming the change did not land. Gateway errors (502/503/504) also leave the

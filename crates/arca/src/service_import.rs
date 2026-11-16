@@ -472,17 +472,30 @@ pub fn import(
 
 /// Releases the imported service `name`, whose record names `project`: clears the import's mark when the instance still
 /// carries it, under the ETag of the read that showed it, and records the outcome. The caller removes the record after.
-/// It refuses, and writes nothing, when the instance is no longer listed, is not the one that was imported, carries another
+/// It refuses, and writes nothing, when a present instance is no longer listed, is not the one that was imported, carries another
 /// Arca key, or carries a mark that is not this import's. An instance that is gone, or whose mark is already cleared, takes
 /// no write.
 pub fn release(cfg: &NodeConfig, name: &str, project: &str) -> Result<Released, CallError> {
     let what = format!("release service {name}");
-    let Some(listed) = cfg.kernel.import_service(name, project) else {
-        return Err(refused(format!(
-            "{what}: kernel.importServices no longer lists it, so Arca may not write to its instance; list it again with the same name, project and cidr, then release it. Nothing was written"
-        )));
+    let listed = cfg.kernel.import_service(name, project);
+    let target = ImportTarget {
+        project: project.to_string(),
+        instance: name.to_string(),
     };
-    let target = target(listed);
+    // The caller holds the kernel lock. Without a listed import there is no writer allowance:
+    // only a confirmed absence can release the record, and a present instance keeps the old refusal.
+    if listed.is_none() {
+        let path = format!("/1.0/instances/{name}?project={project}");
+        match UnixIncus::new(cfg.incus.socket.clone()).get(&path) {
+            Err(IncusError::Status { code: 404, .. }) => {}
+            Ok(_) => {
+                return Err(refused(format!(
+                    "{what}: kernel.importServices no longer lists it, so Arca may not write to its instance; list it again with the same name, project and cidr, then release it. Nothing was written"
+                )));
+            }
+            Err(error) => return Err(read_failure(&what, error)),
+        }
+    }
     let entry = target
         .entry()
         .ok_or_else(|| refused(format!("{what}: the name has no import entry")))?;
@@ -497,10 +510,14 @@ pub fn release(cfg: &NodeConfig, name: &str, project: &str) -> Result<Released, 
         phase,
         why: why.map(str::to_string),
     };
-    let Some(read) = writer
-        .read(&target)
-        .map_err(|error| read_failure(&what, error))?
-    else {
+    let read = if listed.is_some() {
+        writer
+            .read(&target)
+            .map_err(|error| read_failure(&what, error))?
+    } else {
+        None
+    };
+    let Some(read) = read else {
         let (uuid, digest) = imported
             .as_ref()
             .map(|imported| (imported.uuid.as_str(), imported.pre_image.as_str()))

@@ -914,6 +914,75 @@ fn a_release_refuses_in_plain_words_when_the_inverse_is_not_safe() {
 }
 
 #[test]
+fn release_forgets_a_missing_adopted_instance_without_an_allowlist_entry() {
+    let mut rig = standard();
+    rig.approved("service_import", "db1").unwrap();
+    rig.edit(
+        "PUT",
+        "/1.0/instances/db1/state?project=app1",
+        json!({"action":"stop"}),
+    );
+    rig.edit("DELETE", DB1, json!({}));
+    rig.close();
+    rig.open(json!([]));
+    let writes = rig.fake.writes();
+    let released = rig
+        .approved("service_release", "db1")
+        .expect("forget the missing instance");
+    assert_eq!(
+        released,
+        json!({"released":true,"restored":false,"preImage":null,"alreadyGone":true})
+    );
+    assert!(rig.entry("service-db1").is_none());
+    assert_eq!(
+        rig.fake.writes(),
+        writes,
+        "forgetting writes nothing to Incus"
+    );
+}
+
+#[test]
+fn release_forgets_a_missing_adopted_service_in_the_managed_project() {
+    let rig = Rig::new(
+        "release-managed-gone",
+        vec![foreign_service("db1", PROJECT, "192.0.2.10", UUID)],
+        json!([]),
+    );
+    rig.call("service_list", json!({})).unwrap();
+    assert_eq!(rig.entry("service-db1").unwrap()["adopted"], true);
+    let path = format!("/1.0/instances/db1?project={PROJECT}");
+    rig.edit(
+        "PUT",
+        &format!("/1.0/instances/db1/state?project={PROJECT}"),
+        json!({"action":"stop"}),
+    );
+    rig.edit("DELETE", &path, json!({}));
+    let writes = rig.fake.writes();
+    let result = rig
+        .approved("service_release", "db1")
+        .expect("forget without an import allowance");
+    assert_eq!(result["alreadyGone"], true);
+    assert!(rig.entry("service-db1").is_none());
+    assert_eq!(rig.fake.writes(), writes);
+}
+
+#[test]
+fn release_of_a_present_unlisted_instance_keeps_the_exact_refusal() {
+    let mut rig = standard();
+    rig.approved("service_import", "db1").unwrap();
+    rig.close();
+    rig.open(json!([]));
+    let writes = rig.fake.writes();
+    let (_, words) = refusal(rig.approved("service_release", "db1"));
+    assert_eq!(
+        words,
+        "release service db1: kernel.importServices no longer lists it, so Arca may not write to its instance; list it again with the same name, project and cidr, then release it. Nothing was written"
+    );
+    assert!(rig.entry("service-db1").is_some());
+    assert_eq!(rig.fake.writes(), writes);
+}
+
+#[test]
 fn a_restart_reads_the_imported_record_back_and_writes_nothing() {
     let mut rig = standard();
     rig.approved("service_import", "db1").expect("the import");
