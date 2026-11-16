@@ -232,6 +232,19 @@ fn maximum_service_names_round_trip_with_tools_and_keep_the_unbound_file_limit()
         Err(TokenStoreError::Malformed { .. })
     ));
 
+    let scratch = Scratch::new("bound-file-limit");
+    let (_, header) = mint(Scope::Operator);
+    let oversized = format!(
+        "{header}tenant={TENANT}\ntools={}\n",
+        "arca_status,".repeat(700)
+    );
+    assert!(oversized.len() > 8192);
+    write_hash_file(scratch.path(), "too-large", &oversized, 0o400);
+    assert!(matches!(
+        TokenStore::load(scratch.path()),
+        Err(TokenStoreError::Malformed { .. })
+    ));
+
     // A tenant line after the former read boundary still excludes a limited admin from the admin enumeration.
     let scratch = Scratch::new("large-bound-admin");
     let (secret, header) = mint(Scope::Admin);

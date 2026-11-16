@@ -18,7 +18,9 @@
 //!
 //! A `tenant=` line binds the token to one tenant. Bare service names in its `services=` line are resolved inside that
 //! tenant; another tenant is malformed. A release with unknown-line skipping leaves a tenant-bound token out; an older
-//! release without that behavior refuses the whole directory on `tenant=`, so revoke these tokens before downgrading.
+//! release without that behavior refuses the whole directory on `tenant=`. Tenant-bound files may use up to 8 KiB;
+//! an older 4 KiB reader refuses the whole directory for a larger file even if it skips unknown lines. Revoke bound
+//! tokens before downgrading to either kind of reader.
 //! A secret is never stored, logged or echoed, and an error names a file, never its content. The token directory is a real
 //! directory, not a symlink, owned by this process and writable by its owner only.
 //!
@@ -43,8 +45,23 @@ use crate::fresh::process_uid;
 const PREFIX: &str = "arca_";
 const BODY_LEN: usize = 43;
 const SECRET_BYTES: usize = 32;
-/// The largest hash file the server reads. A well-formed one is about 100 bytes.
+/// The largest unbound hash file the server reads. Kept unchanged for existing tokens.
 pub const MAX_FILE_BYTES: u64 = 4096;
+const MAX_TENANT_FILE_BYTES: u64 = 8192;
+
+/// The byte budget for a hash file, shared by the reader and the mint's check of its exact serialized bytes.
+/// Tenant-bound files allow 8 KiB for up to 64 fully qualified service names beside tools and other limits;
+/// files without a valid `tenant=` line keep the existing 4 KiB budget. Parsing still checks every line.
+pub fn hash_file_budget(text: &str) -> u64 {
+    if text.lines().skip(2).any(|line| {
+        line.strip_prefix("tenant=")
+            .is_some_and(arca_api::limits::tenant_id_ok)
+    }) {
+        MAX_TENANT_FILE_BYTES
+    } else {
+        MAX_FILE_BYTES
+    }
+}
 /// The longest id a hash file may name.
 const MAX_ID_LEN: usize = 64;
 
@@ -414,11 +431,10 @@ pub fn admin_token_ids(dir: &Path) -> Vec<String> {
             let mut bytes = Vec::new();
             File::open(item.path())
                 .ok()?
-                .take(MAX_FILE_BYTES)
+                .take(MAX_TENANT_FILE_BYTES + 1)
                 .read_to_end(&mut bytes)
                 .ok()?;
-            let text = std::str::from_utf8(&bytes).ok()?;
-            let Ok(Body { scope, limits, .. }) = parse_body(text) else {
+            let Ok(Body { scope, limits, .. }) = parse_file(&bytes) else {
                 return None;
             };
             (scope == Scope::Admin && limits.services.is_none() && limits.tenant.is_none())
@@ -517,7 +533,7 @@ enum Loaded {
 }
 
 /// One hash file, checked before it is read: a regular file (not a symlink, not one swapped for a symlink between the
-/// checks), mode exactly 0400, owned by `owner_uid`, at most `MAX_FILE_BYTES`, and well formed.
+/// checks), mode exactly 0400, owned by `owner_uid`, within its [`hash_file_budget`], and well formed.
 fn load_one(
     path: &Path,
     name: &str,
@@ -557,17 +573,13 @@ fn load_one(
     }
     let mut bytes = Vec::new();
     (&mut file)
-        .take(MAX_FILE_BYTES + 1)
+        .take(MAX_TENANT_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| io_err())?;
     let malformed = || TokenStoreError::Malformed {
         file: name.to_string(),
     };
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err(malformed());
-    }
-    let text = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
-    let body = match parse_body(text) {
+    let body = match parse_file(&bytes) {
         Ok(body) => body,
         Err(BodyError::Unknown) => return Ok(Loaded::Skipped(SKIP_UNKNOWN_LINE)),
         Err(BodyError::Malformed) => return Err(malformed()),
@@ -664,6 +676,15 @@ enum BodyError {
     Malformed,
     /// It parses, and has a `<key>=<value>` line whose key this release does not know: the token is left out.
     Unknown,
+}
+
+/// Size and UTF-8 checks are the same for loading and admin enumeration; neither parses a truncated prefix.
+fn parse_file(bytes: &[u8]) -> Result<Body, BodyError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| BodyError::Malformed)?;
+    if bytes.len() as u64 > hash_file_budget(text) {
+        return Err(BodyError::Malformed);
+    }
+    parse_body(text)
 }
 
 /// The lines of a hash file: `scope=` and `sha256=` first, then each optional line at most once, in any order. LF endings

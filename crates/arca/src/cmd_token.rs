@@ -526,13 +526,13 @@ fn parse_services(text: &str) -> Result<ServiceLimit, Failure> {
     })
 }
 
-/// A hash file the store reads: no longer than [`arca_mcp::auth::MAX_FILE_BYTES`]. A longer one would refuse the whole token
-/// directory at the next start or reload, so the mint refuses it before it writes.
+/// Check the exact bytes before either file is created, using the loader's budget for this kind of token.
 fn fits(hash_text: &str) -> Result<(), Failure> {
-    if hash_text.len() as u64 > arca_mcp::auth::MAX_FILE_BYTES {
+    let budget = arca_mcp::auth::hash_file_budget(hash_text);
+    if hash_text.len() as u64 > budget {
         return Err(Failure::Usage(format!(
             "the token's hash file would pass {} bytes, the most a node reads: name fewer tools or services",
-            arca_mcp::auth::MAX_FILE_BYTES
+            budget
         )));
     }
     Ok(())
@@ -724,6 +724,7 @@ mod tests {
             .map(|n| format!("abcdefgh/{}{n:02}", "s".repeat(38)))
             .collect();
         let limits = Limits {
+            tenant: None,
             services: ServiceLimit::parse(&services.join(",")),
             expires: None,
             by: None,

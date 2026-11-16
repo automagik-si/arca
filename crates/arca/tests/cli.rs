@@ -114,6 +114,11 @@ fn token_mint_at_documented_maxima_either_loads_or_writes_nothing() {
         .map(|n| format!("a{n:02}{}", "x".repeat(37)))
         .collect::<Vec<_>>()
         .join(",");
+    let qualified = names
+        .split(',')
+        .map(|name| format!("abcdefgh/{name}"))
+        .collect::<Vec<_>>()
+        .join(",");
     for scope in [
         arca_api::Scope::Viewer,
         arca_api::Scope::Doctor,
@@ -126,7 +131,7 @@ fn token_mint_at_documented_maxima_either_loads_or_writes_nothing() {
             .collect::<Vec<_>>()
             .join(",");
         for bound in [false, true] {
-            for with_services in [false, true] {
+            for services in [None, Some(names.as_str()), Some(qualified.as_str())] {
                 for with_tools in [false, true] {
                     for with_expiry in [false, true] {
                         let scratch = Scratch::new("maximum-token");
@@ -150,8 +155,8 @@ fn token_mint_at_documented_maxima_either_loads_or_writes_nothing() {
                         if bound {
                             cmd.args(["--tenant", "abcdefgh"]);
                         }
-                        if with_services {
-                            cmd.args(["--services", &names]);
+                        if let Some(services) = services {
+                            cmd.args(["--services", services]);
                         }
                         if with_tools {
                             cmd.args(["--tools", &tools]);
@@ -164,11 +169,15 @@ fn token_mint_at_documented_maxima_either_loads_or_writes_nothing() {
                         let size = format!("scope={}\nsha256={}\n", scope.as_str(), "0".repeat(64))
                             .len()
                             + if bound { "tenant=abcdefgh\n".len() } else { 0 }
-                            + if with_services {
-                                "services=\n".len() + names.len() + if bound { 9 * 64 } else { 0 }
-                            } else {
-                                0
-                            }
+                            + services.map_or(0, |services| {
+                                "services=\n".len()
+                                    + services.len()
+                                    + if bound && !services.contains('/') {
+                                        9 * 64
+                                    } else {
+                                        0
+                                    }
+                            })
                             + if with_tools {
                                 "tools=\n".len() + tools.len()
                             } else {

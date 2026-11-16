@@ -722,8 +722,10 @@ GET route is refused too. The tool list applies these same limits. No binding gi
 A token handed down by a bound parent must bind to the same tenant and remain within the parent's other limits.
 An unbound parent may hand down a bound child when that child's resolved services are within its own list.
 A release that skips unknown token lines leaves a token with an unknown `tenant=` line out. A release from before
-unknown-line skipping refuses the whole token directory on that line: revoke tenant-bound tokens before such a
-downgrade.
+unknown-line skipping refuses the whole token directory on that line. Tenant-bound hash files may use up to 8 KiB;
+unbound files keep the 4 KiB limit. The mint checks the exact serialized size before writing either file and refuses
+combinations of tools and services that exceed the file's budget. An older reader with a 4 KiB limit refuses the whole
+directory for a larger file even if it skips unknown lines. Revoke bound tokens before downgrading to either reader.
 
 ### Modes and the umask
 
