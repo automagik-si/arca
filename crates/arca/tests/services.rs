@@ -429,8 +429,7 @@ fn nats_template() -> Value {
     })
 }
 
-#[test]
-fn service_rebind_is_available_after_a_copy_changes_uuid_and_data_pool() {
+fn copied_service_binding_fixture() -> Rig {
     let mut state = empty_state();
     state.pools = vec![("pool1".into(), json!({})), ("pool2".into(), json!({}))];
     let rig = Rig::with(state, vec![PROJECT.into()], Some("192.0.2.0/24"));
@@ -465,6 +464,7 @@ fn service_rebind_is_available_after_a_copy_changes_uuid_and_data_pool() {
     )
     .expect("the original UUID is accepted");
 
+    let original = rig.get(&instance_path).unwrap();
     // Model a name swap using the existing fake's fixture methods: the old
     // instance survives under a backup name with its UUID and old data disk.
     rig.fake.set_instance_status(PROJECT, "sample", "Stopped");
@@ -559,11 +559,15 @@ fn service_rebind_is_available_after_a_copy_changes_uuid_and_data_pool() {
         "the refusal changes no Incus object"
     );
 
-    // Phase one stays red until the explicit, approved recovery verb exists.
-    // Ordinary service verbs must continue to refuse a UUID mismatch.
+    rig
+}
+
+#[test]
+fn service_rebind_is_available_after_a_copy_changes_uuid_and_data_pool() {
     assert!(
-        rig.handlers.contains_key("service_rebind"),
-        "no explicit rebind is available; service_secret_set returned {blocked:?}"
+        copied_service_binding_fixture()
+            .handlers
+            .contains_key("service_rebind")
     );
 }
 
@@ -5418,3 +5422,6 @@ fn plan_renew_with_an_unresolved_intent_renews_nothing_and_says_why() {
         "the lapsed plan is still left out"
     );
 }
+
+#[path = "services/rebind.rs"]
+mod rebind;
