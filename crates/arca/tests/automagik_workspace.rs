@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 const SERVER_IMAGE: &str = "registry.example/server@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const PNPM: &str = "/usr/local/bin/pnpm";
 const TOKEN: &str = "eyJzeW50aGV0aWMiOiJ0dW5uZWwtdG9rZW4tZm9yLXRlc3RzLW9ubHkifQ";
 const OTHER_TOKEN: &str = "eyJzeW50aGV0aWMiOiJhLXNlY29uZC10dW5uZWwtdG9rZW4ifQ";
 const URL: &str = "https://team.example.org";
@@ -135,7 +136,7 @@ fn cosign_call(image: &str) -> String {
 
 /// A workspace reached on a tailnet, under the machine's own tailnet name.
 fn tailnet_settings() -> Value {
-    json!({ "reach": "tailnet", "publicUrl": TAILNET_URL, "serverImage": SERVER_IMAGE })
+    json!({ "reach": "tailnet", "publicUrl": TAILNET_URL, "serverImage": SERVER_IMAGE, "automagikPnpm": PNPM })
 }
 
 /// What `tailscale status --json` says, as far as the keeper reads it.
@@ -151,7 +152,15 @@ fn tailnet_status(workspace: &Workspace, backend: &str, name: &str) {
 
 /// A workspace's settings with a public address and no Cloudflare Access application.
 fn settings(public_url: &str) -> Value {
-    json!({ "publicUrl": public_url, "serverImage": SERVER_IMAGE })
+    json!({ "publicUrl": public_url, "serverImage": SERVER_IMAGE, "automagikPnpm": PNPM })
+}
+
+/// The server's explicit image-user environment, with all homes on its one /data mount.
+fn server_environment() -> String {
+    format!(
+        "--user {} -e HOME=/data -e AUTOMAGIK_HOME=/data -e AUTOMAGIK_BOTS_HOME=/data/bots -e DSH_HOME=/data/dsh -e HERDR_APP_HOME=/data/herdr-app -e AUTOMAGIK_WORKSPACE=/data/workspace -e HC_TERMINAL_SOCKET=/data/run/herdr-core/default.sock -e AUTOMAGIK_PNPM={PNPM}",
+        me()
+    )
 }
 
 /// The same, with the owner's Cloudflare Access application for that address.
@@ -461,6 +470,124 @@ fn says(workspace: &Workspace, words: &str) {
 }
 
 #[test]
+fn project_homes_and_native_home_match_the_image_contract_and_persist_in_the_existing_data_mount() {
+    let mut value = settings(URL);
+    value["automagikPnpm"] = json!(PNPM);
+    let mut workspace = Workspace::new(&value);
+    workspace.start();
+    says(&workspace, "the server is started from");
+    let run = &workspace.runs("automagik-server")[0];
+    for (name, path) in [
+        ("HOME", ""),
+        ("AUTOMAGIK_HOME", ""),
+        ("AUTOMAGIK_BOTS_HOME", "bots"),
+        ("DSH_HOME", "dsh"),
+        ("HERDR_APP_HOME", "herdr-app"),
+        ("AUTOMAGIK_WORKSPACE", "workspace"),
+    ] {
+        let container_path = if path.is_empty() {
+            "/data".to_string()
+        } else {
+            format!("/data/{path}")
+        };
+        assert!(
+            run.contains(&format!(" -e {name}={container_path} ")),
+            "{run}"
+        );
+        let directory = workspace.dir.join("data").join(path);
+        let metadata = fs::metadata(&directory).expect("a persistent home");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        use std::os::unix::fs::MetadataExt;
+        let data = fs::metadata(workspace.dir.join("data")).expect("data");
+        assert_eq!((metadata.uid(), metadata.gid()), (data.uid(), data.gid()));
+    }
+    assert!(run.contains(&format!(" --user {} ", me())), "{run}");
+    assert!(
+        run.contains(&format!(" -e AUTOMAGIK_PNPM={PNPM} ")),
+        "{run}"
+    );
+    assert_eq!(run.matches(" -v ").count(), 1, "one existing data mount");
+    assert!(
+        run.contains(" -e HC_TERMINAL_SOCKET=/data/run/herdr-core/default.sock "),
+        "{run}"
+    );
+    assert!(
+        !run.contains("--entrypoint"),
+        "the image keeps its own launcher"
+    );
+    for path in ["secrets", "run", "run/herdr-core", "acp", "acp/clis"] {
+        let directory = workspace.dir.join("data").join(path);
+        let metadata = fs::metadata(&directory).expect("an image-user directory");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        use std::os::unix::fs::MetadataExt;
+        let data = fs::metadata(workspace.dir.join("data")).unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (data.uid(), data.gid()));
+        assert_eq!(metadata.permissions().mode() & 0o200, 0o200);
+    }
+    assert!(!workspace.dir.join("data/.herdr/bots.json").exists());
+    assert!(
+        !workspace
+            .dir
+            .join("data/workspace/.herdr/bots.json")
+            .exists()
+    );
+    let clis = workspace.dir.join("data/acp/clis");
+    assert!(clis.is_dir());
+    fs::write(clis.join("installed"), "persistent CLI state").expect("CLI state");
+    assert_eq!(workspace.stop(), Some(0));
+    workspace.end("automagik-server", 0);
+    workspace.start();
+    wait_for(&workspace, "a fresh server", || {
+        workspace.started("automagik-server", 2)
+    });
+    assert_eq!(
+        fs::read_to_string(clis.join("installed")).unwrap(),
+        "persistent CLI state"
+    );
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn the_cli_store_does_not_start_without_an_explicit_absolute_baked_pnpm_path() {
+    for pnpm in [
+        None,
+        Some(json!("")),
+        Some(json!(null)),
+        Some(json!(10)),
+        Some(json!("pnpm")),
+        Some(json!("/opt/../pnpm")),
+        Some(json!("/opt/pnpm\nextra")),
+    ] {
+        let mut value = settings(URL);
+        if let Some(pnpm) = pnpm {
+            value["automagikPnpm"] = pnpm;
+        } else {
+            value.as_object_mut().unwrap().remove("automagikPnpm");
+        }
+        let mut workspace = Workspace::new(&value);
+        workspace.start();
+        wait_for(&workspace, "a refusal or a server start", || {
+            workspace.output().contains("settings.automagikPnpm")
+                || !workspace.runs("automagik-server").is_empty()
+        });
+        assert!(
+            workspace
+                .output()
+                .lines()
+                .any(|line| line.contains("settings.automagikPnpm")
+                    && line.contains("pnpm 10")
+                    && line.contains("AUTOMAGIK_PNPM")),
+            "{}",
+            workspace.output()
+        );
+        assert!(workspace.read("docker/calls.log").is_empty());
+        assert_eq!(workspace.stop(), Some(0));
+    }
+}
+
+#[test]
 fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pins() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let template =
@@ -515,6 +642,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             "accessAudience",
             "accessEmails",
             "accessTeamDomain",
+            "automagikPnpm",
             "memberRunner",
             "publicUrl",
             "reach",
@@ -567,7 +695,8 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             "accessTeamDomain",
             "accessAudience",
             "accessEmails",
-            "memberRunner"
+            "memberRunner",
+            "automagikPnpm"
         ]
     );
     // The member runner ships off; a create turns it on with true, and nothing else.
@@ -621,8 +750,22 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
         arca::service::create_settings(&template, Some(&json!({ "serverImage": SERVER_IMAGE })))
             .is_err()
     );
-    // The address and the Access settings ship empty. The same settings start the keeper, which starts the server
-    // alone, with nothing of them in its environment, and says that no gate is started.
+    // The supplied image contract pins pnpm explicitly. An empty override refuses any Docker call.
+    assert_eq!(settings["automagikPnpm"], PNPM);
+    let mut missing = settings.clone();
+    missing["automagikPnpm"] = json!("");
+    let mut unset = Workspace::new(&missing);
+    unset.start();
+    says(&unset, "AUTOMAGIK_PNPM is required to start the CLI store");
+    assert!(unset.read("docker/calls.log").is_empty());
+    assert_eq!(unset.stop(), Some(0));
+    let configured =
+        arca::service::create_settings(&template, Some(&json!({ "automagikPnpm": PNPM })))
+            .expect("the image owner's explicit pnpm path")
+            .merged
+            .expect("settings");
+    // With pnpm supplied, the empty public address starts only the server, with its private environment.
+    // Neither the address nor the Access settings goes into its environment.
     assert_eq!(settings["publicUrl"], "");
     assert_eq!(
         (
@@ -632,7 +775,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
         ),
         (&json!(""), &json!(""), &json!(""))
     );
-    let mut workspace = Workspace::new(settings);
+    let mut workspace = Workspace::new(&configured);
     workspace.start();
     says(
         &workspace,
@@ -641,8 +784,9 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     assert_eq!(
         workspace.runs("automagik-server"),
         [format!(
-            "run -d --name automagik-server --pull never --restart no -v {}:/data {}",
+            "run -d --name automagik-server --pull never --restart no -v {}:/data {} {}",
             workspace.dir.join("data").display(),
+            server_environment(),
             settings["serverImage"].as_str().expect("an image")
         )]
     );
@@ -663,15 +807,16 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
         "status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel waits for TUNNEL_TOKEN (service_secret_set, then instance_start); reach cloudflare: public address",
     );
     // The server: a network namespace of its own, no published port and no host network, its data on the machine's
-    // disk, and nothing in its environment. It is never told its public name, so it does not trust a request
-    // that comes under one: a route that names its port instead of the gate's gives nobody the workspace.
+    // disk, with private homes and pinned pnpm in its environment. It is never told its public name, so it does not
+    // trust a request that comes under one: a route that names its port instead of the gate's gives nobody the workspace.
     let data = workspace.dir.join("data");
     let gate_data = workspace.dir.join("gate");
     assert_eq!(
         workspace.runs("automagik-server"),
         [format!(
-            "run -d --name automagik-server --pull never --restart no -v {}:/data {SERVER_IMAGE}",
-            data.display()
+            "run -d --name automagik-server --pull never --restart no -v {}:/data {} {SERVER_IMAGE}",
+            data.display(),
+            server_environment()
         )]
     );
     // The gate: the same image by the same digest with the gate's entrypoint, in the server's namespace, with a
@@ -1678,15 +1823,16 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
         &workspace,
         "the tailnet node waits for TAILSCALE_AUTHKEY (service_secret_set, then instance_start)",
     );
-    // The server gets no environment. The gate gets its origin, its port and the remote claim, and none of the
-    // three Access settings.
+    // The server gets its private homes and pinned pnpm. The gate gets its origin, port and remote claim,
+    // and none of the three Access settings.
     let data = workspace.dir.join("data");
     let gate_data = workspace.dir.join("gate");
     assert_eq!(
         workspace.runs("automagik-server"),
         [format!(
-            "run -d --name automagik-server --pull never --restart no -v {}:/data {SERVER_IMAGE}",
-            data.display()
+            "run -d --name automagik-server --pull never --restart no -v {}:/data {} {SERVER_IMAGE}",
+            data.display(),
+            server_environment()
         )]
     );
     assert_eq!(
@@ -2075,7 +2221,8 @@ fn with_the_member_runner_the_server_gets_the_workspace_and_the_socket_folder_at
     assert_eq!(
         runs.last().expect("a run"),
         &format!(
-            "run -d --name automagik-server --pull never --restart no -v {data}:/data --mount type=bind,source={folder},target={folder} --mount type=bind,source={sockets},target={sockets} {SERVER_IMAGE}",
+            "run -d --name automagik-server --pull never --restart no -v {data}:/data --mount type=bind,source={folder},target={folder} --mount type=bind,source={sockets},target={sockets} {} {SERVER_IMAGE}",
+            server_environment(),
             data = data.display(),
             folder = folder.display(),
             sockets = sockets.display(),

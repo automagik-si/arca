@@ -63,13 +63,47 @@ pub struct Published {
     pub reach: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Limits {
     #[serde(default)]
     pub cpu: Option<String>,
     #[serde(default)]
     pub memory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_read: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<String>,
+}
+
+impl Limits {
+    pub fn has_io_limits(&self) -> bool {
+        self.disk_read.is_some()
+            || self.disk_write.is_some()
+            || self.ingress.is_some()
+            || self.egress.is_some()
+    }
+
+    fn invalid_io_limit(&self) -> Option<&'static str> {
+        for (key, value) in [
+            ("diskRead", &self.disk_read),
+            ("diskWrite", &self.disk_write),
+        ] {
+            if value.as_deref().is_some_and(|value| !disk_limit_ok(value)) {
+                return Some(key);
+            }
+        }
+        for (key, value) in [("ingress", &self.ingress), ("egress", &self.egress)] {
+            if value.as_deref().is_some_and(|value| !rate_ok(value, true)) {
+                return Some(key);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -459,6 +493,9 @@ pub struct ServiceConfig {
     /// renders into the edge's Caddyfile. Absent on every other service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge: Option<crate::route::EdgeRecord>,
+    /// The connector kind named by its template. Older records fall back to their template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
 }
 
 /// An image digest and the version Automagik published it as.
@@ -719,11 +756,30 @@ fn vm_config(cfg: &ServiceConfig) -> Map<String, Value> {
 fn vm_devices(cfg: &ServiceConfig, vm: &Vm, mut nic: Map<String, Value>) -> Value {
     nic.insert("type".into(), json!("nic"));
     nic.insert("name".into(), json!(VM_NIC_NAME));
-    json!({
+    let mut devices = json!({
         "root": { "type": "disk", "path": "/", "pool": cfg.pool, "size": vm.root_size },
         "eth0": nic,
         "agent": { "type": "disk", "source": "agent:config" }
-    })
+    });
+    set_io_limits(cfg, &mut devices);
+    devices
+}
+
+/// Device limits are part of the create itself. Incus must accept them; there is no uncapped retry.
+fn set_io_limits(cfg: &ServiceConfig, devices: &mut Value) {
+    let Some(limits) = &cfg.limits else {
+        return;
+    };
+    for (device, key, value) in [
+        ("root", "limits.read", &limits.disk_read),
+        ("root", "limits.write", &limits.disk_write),
+        ("eth0", "limits.ingress", &limits.ingress),
+        ("eth0", "limits.egress", &limits.egress),
+    ] {
+        if let Some(value) = value {
+            devices[device][key] = json!(value);
+        }
+    }
 }
 
 /// The create body of a virtual machine on a host bridge. It names no profile, no Incus network, no address and no ACL
@@ -1047,6 +1103,8 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             }),
         ),
     );
+    let mut devices = Value::Object(devices);
+    set_io_limits(cfg, &mut devices);
     json!({
         "name": cfg.instance,
         "type": "container",
@@ -1106,6 +1164,9 @@ impl Plugin for Service {
         // An adopted instance is owned through its adopt entry. The service record never writes it.
         if cfg.adopted {
             return Ok(());
+        }
+        if let Some(key) = cfg.limits.as_ref().and_then(Limits::invalid_io_limit) {
+            return Err(PluginError::Config(format!("invalid limits.{key}")));
         }
         // Kernel access is a container's, in the node's own project: a record that says otherwise is never applied,
         // whatever else it holds.
@@ -1475,6 +1536,9 @@ pub struct Template {
     pub provides: Option<Value>,
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Declared secrets that may be unset at a start; a variable needing one is then absent.
+    #[serde(default)]
+    pub optional_secrets: Vec<String>,
     #[serde(default)]
     pub publishable: bool,
     #[serde(default)]
@@ -1550,6 +1614,27 @@ pub struct Template {
     /// each client's own address. Off unless the template says `true`.
     #[serde(default)]
     pub edge: bool,
+    /// The connector kind, such as tailscale or cloudflare. Absent for other services.
+    #[serde(default)]
+    pub connector: Option<String>,
+}
+
+/// A service's connector kind, including a service made before its record carried the kind.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the next reach change uses connector kinds to show sign-in links"
+    )
+)]
+pub(crate) fn connector_kind<'a>(
+    record: &'a ServiceConfig,
+    template: Option<&'a Template>,
+) -> Option<&'a str> {
+    record
+        .connector
+        .as_deref()
+        .or_else(|| template?.connector.as_deref())
 }
 
 /// One rule of a template's `settingRules`: `{ "need": <amount>, "atLeast": <amount>, "why": "<words>" }`. An amount
@@ -1905,6 +1990,11 @@ pub const IMAGE_RUNNING: &str = " running ";
 
 fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateError> {
     let name = &template.name;
+    if let Some(key) = template.limits.as_ref().and_then(Limits::invalid_io_limit) {
+        return Err(TemplateError::refused(format!(
+            "template {name}: invalid limits.{key}: use a positive integer in Incus byte/s or iops units for disk, bit/s units for network, within signed 64-bit range"
+        )));
+    }
     if template.is_vm() {
         return validate_vm_template(template);
     }
@@ -1979,7 +2069,7 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
         }
     }
     if let Some(limits) = &template.limits
-        && ((limits.cpu.is_none() && limits.memory.is_none())
+        && ((limits.cpu.is_none() && limits.memory.is_none() && !limits.has_io_limits())
             || limits.cpu.as_deref().is_some_and(|cpu| !decimal(cpu))
             || limits
                 .memory
@@ -2631,6 +2721,59 @@ fn decimal(value: &str) -> bool {
         && bytes.all(|b| b.is_ascii_digit())
 }
 
+/// Incus parses rates as signed 64-bit integers with case-sensitive decimal or binary units.
+/// Zero disables throttling in Incus: a requested cap must instead be positive; omit it for no cap.
+fn rate_ok(value: &str, bits: bool) -> bool {
+    let split = value.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, unit) = value.split_at(split);
+    let Ok(number) = number.parse::<i64>() else {
+        return false;
+    };
+    if number <= 0 {
+        return false;
+    }
+    let (base, power): (i64, u32) = match (bits, unit) {
+        (_, "") | (false, "B" | " bytes") | (true, "bit") => (1, 0),
+        (false, "kB") | (true, "kbit") => (1000, 1),
+        (false, "MB") | (true, "Mbit") => (1000, 2),
+        (false, "GB") | (true, "Gbit") => (1000, 3),
+        (false, "TB") | (true, "Tbit") => (1000, 4),
+        (false, "PB") | (true, "Pbit") => (1000, 5),
+        (false, "EB") | (true, "Ebit") => (1000, 6),
+        (false, "KiB") | (true, "Kibit") => (1024, 1),
+        (false, "MiB") | (true, "Mibit") => (1024, 2),
+        (false, "GiB") | (true, "Gibit") => (1024, 3),
+        (false, "TiB") | (true, "Tibit") => (1024, 4),
+        (false, "PiB") | (true, "Pibit") => (1024, 5),
+        (false, "EiB") | (true, "Eibit") => (1024, 6),
+        _ => return false,
+    };
+    number.checked_mul(base.pow(power)).is_some()
+}
+
+/// A disk rate may name bytes/s, IOPS, or one of each separated by a comma, as Incus accepts.
+fn disk_limit_ok(value: &str) -> bool {
+    let mut bytes = false;
+    let mut iops = false;
+    for field in value.split(',').map(str::trim) {
+        if let Some(number) = field.strip_suffix("iops") {
+            if iops
+                || !number.bytes().all(|byte| byte.is_ascii_digit())
+                || !number.parse::<i64>().is_ok_and(|number| number > 0)
+            {
+                return false;
+            }
+            iops = true;
+        } else {
+            if bytes || !rate_ok(field, false) {
+                return false;
+            }
+            bytes = true;
+        }
+    }
+    bytes || iops
+}
+
 pub fn size_ok(value: &str) -> bool {
     [
         "B", "kB", "MB", "GB", "TB", "PB", "EB", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB",
@@ -2878,20 +3021,31 @@ pub fn environment(
             references.insert(key.clone(), secret_reference(owner, key));
         }
     }
-    let mut env = BTreeMap::new();
-    for (key, value) in &template.env {
-        match render(
+    // Only the readiness check treats missing optional secrets as present. The actual render still omits the
+    // whole variable, including any literal text around the missing placeholder.
+    let mut for_start = references.clone();
+    for key in &template.optional_secrets {
+        if template.secrets.contains(key) {
+            for_start.entry(key.clone()).or_default();
+        }
+    }
+    let render_value = |value: &str, secrets: &BTreeMap<String, String>| {
+        render(
             value,
             name,
             ipv4,
             gateway,
             template.ports.first().copied(),
-            &references,
-        ) {
+            secrets,
+        )
+    };
+    let mut env = BTreeMap::new();
+    for (key, value) in &template.env {
+        match render_value(value, &references) {
             Some(value) => {
                 env.insert(key.clone(), value);
             }
-            None => start = false,
+            None => start &= render_value(value, &for_start).is_some(),
         }
     }
     Ok((env, start))
@@ -2900,8 +3054,8 @@ pub fn environment(
 /// Why a new service of this template is created stopped whatever the call's `start` says, in words that finish
 /// "it is created stopped because ...". `None` when a create starts it. A virtual machine whose template declares
 /// secrets is one: they are written into its guest by `instance_start`. A container is one while its environment names
-/// a secret that is neither stored for the entry `owner` nor made by the template. Nothing is read but whether each
-/// secret's file exists, and nothing is written: a secret is named, never shown.
+/// a required secret that is neither stored for the entry `owner` nor made by the template. Nothing is read but whether
+/// each secret's file exists, and nothing is written: a secret is named, never shown.
 pub fn template_stopped_reason(
     template: &Template,
     owner: &str,
@@ -2929,7 +3083,11 @@ pub fn template_stopped_reason(
             let Some(end) = after.find("}}") else { break };
             let key = &after[..end];
             let held = template.secrets.iter().any(|declared| declared == key)
-                && (template.generate.contains_key(key)
+                && (template
+                    .optional_secrets
+                    .iter()
+                    .any(|optional| optional == key)
+                    || template.generate.contains_key(key)
                     || secret_file(secrets_dir, owner, key).is_some_and(|file| file.is_file()));
             if !held {
                 missing.insert(key);
@@ -3005,6 +3163,30 @@ fn generated_secret_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_kind_uses_the_record_then_the_template_for_an_older_service() {
+        let mut record: ServiceConfig = serde_json::from_value(json!({
+            "name":"edge-ts", "template":"tailscale", "instance":"edge-ts", "ipv4":"192.0.2.10",
+            "ports":[], "created":0, "source":{}, "pool":"pool1", "project":PROJECT,
+            "bridge":BRIDGE, "gateway":"192.0.2.1"
+        }))
+        .unwrap();
+        let mut template: Template = serde_json::from_value(json!({
+            "name":"tailscale", "kind":"oci", "image":"docker.io/tailscale/tailscale"
+        }))
+        .unwrap();
+        assert!(record.connector.is_none());
+        assert!(template.connector.is_none());
+        assert!(template.optional_secrets.is_empty());
+        assert_eq!(connector_kind(&record, None), None);
+        assert_eq!(connector_kind(&record, Some(&template)), None);
+        template.connector = Some("tailscale".into());
+        assert_eq!(connector_kind(&record, Some(&template)), Some("tailscale"));
+        record.connector = Some("cloudflare".into());
+        assert_eq!(connector_kind(&record, Some(&template)), Some("cloudflare"));
+        assert_eq!(connector_kind(&record, None), Some("cloudflare"));
+    }
 
     #[test]
     fn a_templates_fingerprint_is_of_its_bytes_as_they_stand_and_no_byte_passes_between_parts() {

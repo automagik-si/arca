@@ -81,6 +81,7 @@ fn a_loaded_store_authenticates_each_secret_as_its_own_token() {
             token_id: "ops-viewer".into(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         })
     );
     assert_eq!(
@@ -89,6 +90,7 @@ fn a_loaded_store_authenticates_each_secret_as_its_own_token() {
             token_id: "ops-admin".into(),
             scope: Scope::Operator,
             tools: None,
+            limits: Default::default(),
         })
     );
 }
@@ -426,7 +428,12 @@ fn a_hash_file_with_a_bad_body_is_refused_as_malformed() {
         ("scope with a space", format!("scope= viewer\n{digest}\n")),
         ("short digest", "scope=viewer\nsha256=abcd\n".to_string()),
         ("uppercase digest", format!("scope=viewer\n{upper}\n")),
-        ("extra line", format!("scope=viewer\n{digest}\nextra=1\n")),
+        // A `<key>=<value>` line of a key this release does not know leaves only its token out (token_limits.rs); a line
+        // of any other shape refuses the directory.
+        (
+            "extra line",
+            format!("scope=viewer\n{digest}\nextra line\n"),
+        ),
         ("no trailing newline", format!("scope=viewer\n{digest}")),
         (
             "crlf endings",
@@ -601,6 +608,7 @@ fn a_held_token_authenticates_with_its_scope_and_list_and_is_listed_apart_from_t
             token_id: "node:console".into(),
             scope: Scope::Viewer,
             tools: Some(tools.clone()),
+            limits: Default::default(),
         })
     );
     assert_eq!(

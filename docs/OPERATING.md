@@ -113,7 +113,7 @@ node takes a new token after `arca token reload` or a restart.
 | `arca link remove [--] <name> [--config <file>]` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call <verb> [--config <file>] [--token-file <file>]`, with `--args <json>` or `--args-file <file>`; `arca call` alone lists the verbs | one tool call against the local node | the verb's result, as JSON |
 | `arca call --peer <name> <verb> [--config <file>] --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and `--token-file` is always named: this node's own token is never sent by default | the verb's result, as JSON |
-| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id, scope and tool list |
+| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>] [--services <comma list>] [--expires <span or time>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id and scope, and the services and expiry when given |
 | `arca token revoke <id>` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | the token's hash file | the id and `revoked: true` |
 | `arca token reload [--config <file>]` | the pid file and the reload record in the state directory, and `/proc` | one line: `reloaded: the node on this config (pid <n>) read its tokens again and holds <k> token(s)`. It exits non-zero, with the reason on stderr, when no node runs on the config, when the node could not read its token directory, or when it cannot tell |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
@@ -190,7 +190,7 @@ refused without the value being echoed back.
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
 | `approval.trustOwnerKeysFrom` | no | Absolute paths of other kernels' owner passkeys files on this machine, which this kernel also trusts, read-only, for action approvals only (never to change its own passkeys). See "Approving on another kernel of this machine". |
 | `approval.origins` | with `trustOwnerKeysFrom` | The page origins (`approvalOrigin` form) a passkey from those files may answer from. A line for any other origin is not trusted. |
-| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>", "incusSocket": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. The optional `incusSocket` is that host's Incus socket on this machine (local, or forwarded to a path here); `instance_move_preflight` reads the host through it, with GETs only, and an approved `instance_move` writes through it (the copy it receives, its start, and its removal on a rollback). |
+| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>", "incusSocket": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. The optional `incusSocket` is that host's Incus socket on this machine (local, or forwarded to a path here); `instance_move_preflight` reads the host through it, with GETs only, and an approved `instance_move` writes through it (the copy it receives, its start, and its removal on a rollback). The optional `ceph` (`{ "cluster": "<name>", "client": "<name>", "readClient": "<name>" }`) names that host's Ceph cluster as this machine reaches it; a stopped virtual machine on Ceph then moves there by `rbd` from this machine (see [Stopped virtual machines](#moving-containers-and-stopped-virtual-machines-to-a-linked-host-instance_move)). |
 
 The config is refused, with exit 2, when:
 
@@ -649,6 +649,57 @@ owner-approval.hash is ignored: ..."). Its secret is refused as any unknown toke
 token revoke owner-approval`. An action approved in the terminal runs as `terminal-approval:<admin token id>`, which no
 token can be, since an id holds no colon.
 
+### Tokens limited to services and to a time
+
+A token may also be limited to named services, to a time, or both. Three more lines, each optional, each at most once,
+may follow the digest in any order, beside `tools=`:
+
+```
+scope=doctor
+sha256=<64 lowercase hex digits>
+services=dev,gtm,abcdefgh/web
+expires=2026-12-01T00:00:00Z
+by=<parent token id>
+```
+
+- `services=` is a comma list of 1 to 64 services, none twice: `<service>` is a service of the node's own service
+  project, and `<tenant id>/<service>` one inside that tenant.
+- `expires=` is a moment in UTC to the second, exactly in that shape. From that moment on the token authenticates nobody:
+  a call is `401`, as for an unknown token. Nothing is removed; revoke the file as any other.
+- `by=` names the token that handed this one down. It loads only while that token loads, and only when it is no wider:
+  no higher scope, and no tool, service or later expiry its parent lacks. Revoke the parent and the whole chain stops at
+  the next reload. Nothing mints with `by=` yet; a later release adds the verb that does.
+
+`arca token mint --services <comma list>` writes `services=`, and `--expires <span or time>` writes `expires=`: a span
+from now (`30m`, `12h`, `7d`, or `s`), or a moment such as `2026-12-01T00:00:00Z`, after now and within ten years. An
+admin token is never limited to services: the mint refuses it, and a hand-made one is left out at load.
+
+**What a limited token reaches.** Every verb says what it touches. A call outside the list is refused before anything
+runs, with the refusal `OutsideTokenServices`, whose words never name a service:
+
+- a verb on one service (`service_status`, `service_logs`, `service_update`, `service_secret_set` and the other
+  `service_*` verbs, the `omni_*` verbs) needs that service, with the call's `tenant` when it names one, on the list;
+- `service_connect` and `service_disconnect` need both services on the list;
+- `instance_start`, `instance_stop` and `instance_restart` need the instance of a listed service: `project` `arcak-svc`
+  and the service's name, or inside a tenant its `service` (or its instance `<service>-<tenant id>`);
+- `action_propose` is checked when it is made, against the proposed action's own arguments: once the owner approves it,
+  it runs as the owner's action, outside any token's limit. A proposal of an action no service names is refused;
+- `service_list`, `snapshot_list` and `watch_report` run, and the door cuts their answer to the list: rows of other
+  services go, and so does every link to one; a snapshot of a volume or a folder, and a project with no listed
+  instance, go too;
+- every other verb reaches the whole node (`arca_status`, `journal_list`, `plan_list`, the tenant, database, function,
+  route, storage and GitHub verbs, and the rest) and is refused. `tools/list` does not offer them to a limited token;
+- a call with `node` is refused: the limit is this node's, and a linked node does not hold it;
+- every GET route (`/metrics`, `/alerts`) is refused with `403`: its answer has no cut.
+
+**Older releases and new lines.** From this release on, a line `<key>=<value>` whose key the release does not know leaves
+only that token out: the node loads every other token, writes one line on stderr each time it reads its tokens ("token
+file <id>.hash is left out, so its token is refused: ..."), and refuses that token's secret. The key may be a limit a later
+release added, so the token is never taken without it. Any other line that does not parse still refuses the whole
+directory. **A release before this one refuses the whole token directory when it meets `services=`, `expires=` or
+`by=`**: on such a downgrade the node starts with no token at all. Before downgrading past this release, revoke every
+token minted with `--services` or `--expires` (`grep -l -E '^(services|expires|by)=' <hashDir>/*.hash` lists them).
+
 ### Modes and the umask
 
 **The token directory must be mode 0700 or 0500.** The server refuses any directory with a group or other write bit, and it
@@ -837,6 +888,56 @@ dashes and underscores, not starting with a dot, so no path. A template whose sc
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.
+
+#### Service disk and network limits
+
+A template may add these optional caps beside its existing CPU and memory limits:
+
+```json
+"limits": {
+  "cpu": "2",
+  "memory": "2GiB",
+  "diskRead": "100MB",
+  "diskWrite": "1000iops",
+  "ingress": "200Mbit",
+  "egress": "100Mbit"
+}
+```
+
+`diskRead` and `diskWrite` become Incus `limits.read` and `limits.write` on the **root disk**. Disk throughput is
+bytes per second: `B`, `kB`, `MB`, `GB`, `TB`, `PB`, `EB`, or the binary units `KiB` through `EiB`. An integer without
+a suffix is bytes/s; `<integer>iops` caps operations per second. Incus also accepts one of each, such as
+`"10MB,1000iops"`. A separate attached data volume is outside the root disk's cap.
+
+`ingress` and `egress` become `limits.ingress` and `limits.egress` on the service NIC, for traffic into and out of the
+instance respectively. Rates are bits per second: `bit`, `kbit`, `Mbit`, `Gbit`, `Tbit`, `Pbit`, `Ebit`, or binary
+`Kibit` through `Eibit`; an integer without a suffix is bits/s. Units are case-sensitive: `MB` is a disk rate and
+`Mbit` is a network rate. These follow [Incus's unit parser](https://github.com/lxc/incus/blob/v7.5.0/shared/units/units.go).
+
+Values must be positive whole numbers whose converted rate fits a signed 64-bit integer. Empty values, zero,
+negative values, fractions, wrong units and overflow fail `service_create` before any Incus write. Omit a field for
+no cap. A container may specify just I/O limits; virtual machines still need both CPU and memory limits and a root
+disk size.
+
+The caps travel in the instance create for containers and virtual machines, on either a managed service network or
+a VM's host bridge. Incus applies them at **start**. If a create requests a start and that start fails, Arca rolls back
+the fresh capped instance, its service record, ACL, new data volume and newly generated secrets, and returns the
+error. Files supplied before the create are kept. Arca never retries without the cap. Resolve cleanup or retention of objects left by an earlier
+attempt before a fresh capped create; rollback cannot claim that earlier data. If cleanup itself fails, the error says so. An explicitly stopped create applies its caps at its later
+`instance_start`, so creating it stopped does not prove the host can enforce them.
+Container disk throttling requires Incus's I/O cgroup controller and a backing block device the storage driver can
+identify. VM disk throttling uses QEMU. Network caps require the bridged NICs Arca creates. Validate the caps on the
+storage driver and network in use before relying on them for isolation; support on one driver proves nothing about
+another.
+
+Caps are fixed at create. Editing a template changes future services. `service_status` of a service created with an
+I/O cap includes its recorded limits under `settings.limits`, alongside any VM guest settings. This reports the
+create's requested configuration, not a live bandwidth measurement. Services created without I/O caps keep their
+existing status shape.
+
+Adopted services and functions are not covered: adoption does not apply these template fields, and `function_create`
+accepts only CPU and memory limits. In a capped service's status, `settings.limits` reports the configured caps;
+unset CPU and memory fields are omitted from this view.
 
 #### A script entrypoint and the Incus version
 
@@ -3102,9 +3203,9 @@ proposals file.
 The imported VM carries no `user.arcakernel.entry`: Arca's instance verbs (`instance_start`, `instance_stop`) do not
 act on it yet.
 
-## Moving containers to a linked host: `instance_move`
+## Moving containers and stopped virtual machines to a linked host: `instance_move`
 
-A move takes containers from this node to a linked host with one owner card. The owner approves once; Incus does the
+A move takes containers, and stopped virtual machines, from this node to a linked host with one owner card. The owner approves once; Incus does the
 copy; the kernel orchestrates the rounds, journals them, measures the downtime, and rolls back what fails. The source is
 never deleted by the move: the owner finishes a verified move with a second card, whenever they choose.
 
@@ -3121,7 +3222,8 @@ plan names; it is not built yet, so a target that does not listen blocks the pla
 file, `/etc/hostname` when it does not), the `target`, and `rounds` (1 to 5 copy rounds while the container runs, 2 when
 absent). It runs the whole `instance_move_preflight` again. Any no-go blocks the whole plan, with the preflight's own
 reasons per instance in `blocked`: remove or fix those and plan again. Beyond the preflight, the plan blocks a virtual
-machine (`virtual machines are not movable yet`: this build moves containers only), an ephemeral container (Incus deletes
+machine that is not stopped (`the virtual machine is Running: this build moves a virtual machine only while it is
+stopped`: stop it first; see **Stopped virtual machines** below), an ephemeral container (Incus deletes
 it when it stops, so the cutover would delete the source: make it non-ephemeral first), a host folder (Incus does not copy
 it: move its data into a custom volume first), a spot-check file that cannot be read in the container now (a check that
 could never compare would always pass), and a name the target already holds, instance or custom volume (a move never
@@ -3204,6 +3306,68 @@ goes on in the background, one instance after the other:
   `moved`, but its reason says so (set `boot.autostart` by hand, or finish the move), and the proposal's late result is
   `MoveNeedsOwner`.
 
+**Stopped virtual machines.** A virtual machine moves only while it is stopped, and stays stopped: nothing here starts
+or stops it, and its copy on the target is started only once every disk is copied and the source still reads
+`Stopped`. Its plan has no round while it runs (`rounds.preCopy` 0, one round in all), and the plan says how it is copied
+(`copy`):
+
+- `incus`: Incus on this host pushes it once, consistent, with its snapshots and custom volumes, as a container's last
+  round. The target must listen on the network, as for a container. This is the way when the linked host names no Ceph
+  cluster, when a pool the machine uses (its root's or a custom volume's) is not a Ceph pool on both hosts, or when it
+  has an ISO volume (Incus cannot make an empty one).
+- `ceph`: the linked host's entry names its Ceph cluster (`approval.linkedHosts[].ceph`), and every pool the machine
+  uses is a Ceph pool here and there: two Ceph clusters, in either direction. Incus on the target makes the
+  machine and each custom volume empty, at the source image's exact size (the root disk gets that size on the copy's own
+  root device), and this machine copies each image with `rbd export-diff <source> - | rbd import-diff - <target>`, two
+  processes and a pipe. The target does not need to listen. The plan's `ceph` names, per Incus pool, the cluster, client
+  and OSD pool of each side, and the card's `Ceph` row shows them. Before anything is made, each source image is read:
+  one that anyone holds open (a machine that runs somewhere) fails the move with nothing made; its size is read too. The
+  image Incus made is read back at that size before the copy writes it. Besides its disk, the machine's config image
+  (`virtual-machine_<project>_<name>`, with `qemu.nvram`, its UEFI variables, and each `tpm` device's state) is copied
+  the same way, so a guest that boots from its own NVRAM entry, or keeps a secret sealed to its TPM, finds them on the
+  copy. The source's `last_used_at` is read before the first image and again after the last: a source started and
+  stopped again during the copy makes the copy torn, and it is rolled back. When `rbd info` reads the disk at another
+  size than the plan measured from Incus, a `sized` line in the journal says so, and the copy takes rbd's. The source's
+  cluster is only read (`rbd status`, `rbd info`, `rbd export-diff`). Snapshots are not copied: they stay with the
+  source, and finishing the move deletes them with it, which the finish card says. Two sides that name one OSD pool of
+  one Ceph cluster are refused (Incus would make the copy's images beside the source's).
+
+  A move by `incus` on Ceph pools is not read-only on the source cluster: Incus makes and deletes a temporary RBD
+  snapshot (`migration-send-<uuid>`) on the source image for its own migration, as it does for a container.
+
+The preflight sizes a virtual machine's block disk (Ceph, zfs or lvm) from Incus, not by walking: its volume's `size`,
+else its root disk device's `size`, else the pool's `volume.size`, else its volume state's total (Incus answers that one
+from the root device's size or its own 10 GiB default, never from the pool, so it comes last); a disk with none of
+these is not measured, and the plan says so. The size is the whole disk, the most its copy can take. On an `incus`
+move, which sends the snapshots, each snapshot is counted at that size too. A copy by `ceph` takes no snapshot, so its
+plan counts the disk, the custom volumes and the config image (the root device's `size.state`, else Incus's 500 MiB
+default) with 10% headroom, and the snapshots do not block it; the card says they are not counted. A stopped
+machine's custom volume on a block driver is sized from its own `size`, else the pool's `volume.size`, else Incus's 10
+GiB default, which is the size Incus made it.
+
+The checks are the copy's: it runs, and still runs after them; its guest answers, by its Incus agent (its state counts
+processes) or by one of its addresses answering a TCP connection to port 22 from this node (accepted, or refused by the
+guest's own stack), waited for five times the checks' wait (five minutes by default),
+since a machine boots slower than a container starts; and each custom volume is attached. A stopped machine's files
+cannot be read, so the spot-check stands on the guest's answer, and there is no network card or proxy to compare. An
+address Incus lists is not an answer by itself: without the agent Incus still lists the address it derives from the
+card's MAC on an IPv6 bridge, the MAC's DHCP leases and OVN's address, for a guest that never booted. A machine without
+the Incus agent whose addresses this node cannot reach (a NAT bridge on the target, a firewall that drops) does not
+answer, and its copy is rolled back. A copy whose guest does not answer is deleted, and the source is left as it was:
+never started, stopped or written. A verified
+source is kept, stopped, with `boot.autostart` off, and `instance_move_finish` deletes it as a container's.
+
+What a copy by Ceph needs on this machine: the `rbd` command; the target cluster's config at
+`/etc/ceph/<cluster>.conf` and the writing client's keyring beside it (`/etc/ceph/<cluster>.client.<client>.keyring`);
+the source cluster's (the source pool's `ceph.cluster_name`, `ceph` unless set) with the reading client's keyring, both
+readable by the kernel's user; and the network to the target cluster's monitors and OSDs. `client` defaults to the
+target pool's `ceph.user.name`, `readClient` to the source pool's; a reading client limited to read-only access on the
+source pool is enough. The copy streams: the node holds no more of a disk than the pipe and the two processes' buffers,
+and a thin source copies only what it holds, but its time is that of the whole data at the slower cluster's speed. A
+kernel stopped during a copy may leave an `rbd import-diff` running: the next start's rollback may then fail to delete
+the copy while it holds the image, and the instance is then `failed` for the owner, the source still stopped and
+untouched.
+
 **Failure and rollback.** Any failure before the checks pass rolls that instance back, under the rule above. A failed
 push first waits (up to a minute) for the target's receiving operation to end, and a delete Incus answers as busy is
 tried again for 30 s. Then the source is read back: only when it is here with the plan's `volatile.uuid` is the copy on
@@ -3256,6 +3420,10 @@ SHA-256. It is read line by line with no size cap; a torn last line is skipped, 
 a line over 8 MiB is skipped and said on the log.
 
 **What the tests prove, and a real run.** The tests run two fake Incus daemons linked so that a push lands on the target.
+For a stopped virtual machine they prove one consistent push and no `rbd` on one cluster, and, with `rbd` recorded, a
+copy by Ceph in both directions (the source cluster only read, each side naming its own cluster, client and OSD pool),
+a failed copy that leaves the source unwritten, a disk held open that stops the move before anything is made, and a
+copy whose guest does not answer being removed. The copy by Ceph has not been run against two real Ceph clusters yet.
 `crates/arca/tests/instance_move_live.rs` (ignored by default) runs the same verbs, card and grant against two live Incus
 daemons. Run between two Incus 7.6 hosts on btrfs, it moved a running container with a 300 MB data file: three rounds,
 the progress read live from `fs_progress`, all six checks passed (the proxy port probed at the target's address), about
@@ -3285,6 +3453,11 @@ and total space. Loop, optical and zram devices are not listed. Each disk gets o
 | `snapshots` | the disk holds a snapshot pool of this machine (a folder pool is matched by the file system UUID it recorded, so its disk is known even while it is not mounted), or a file system labelled `arca-snapshots-<name>` (a whole disk another machine made snapshot storage) | never: it is not erased |
 | `in use` | something on it is mounted elsewhere | `folder`: a pool in a folder on it |
 | `free` | nothing on it is mounted or a member of anything | `whole disk`: Incus erases and formats it |
+
+Mapped images (RBD, NBD, loop, device-mapper, ZFS volumes and DRBD) reported as disks are `system` with no whole-disk
+or folder offer, even when mounted; the kernel must identify a machine disk through its device subsystem (including
+virtio for a VM's own disk) or the native NVMe multipath path `/sys/devices/virtual/nvme-subsystem/`, and unreadable or
+unrecognised origins are never free.
 
 `lsblk` lists a multi-device btrfs or bcachefs mount on one member only, so every device with the same file system type and
 UUID, and every device the kernel lists under `/sys/fs/btrfs/<uuid>/devices/` or `/sys/fs/bcachefs/<uuid>/dev-*/block`, is
@@ -3650,7 +3823,7 @@ service, database, GPU, storage, snapshot, instance, function or tenant verbs: `
 `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and
 `deploy_remove` (see [Tenants](#tenants)), and `route_add` and `route_remove` (see
 [Routes](#routes-names-for-your-instances-served-by-the-nodes-edge)), and `instance_move` and `instance_move_finish`
-(see [Moving containers to a linked host](#moving-containers-to-a-linked-host-instance_move)), are proposed the same
+(see [Moving containers and stopped virtual machines to a linked host](#moving-containers-and-stopped-virtual-machines-to-a-linked-host-instance_move)), are proposed the same
 way. The canvas Doctor proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`,
 `route_add`, `route_remove`, `instance_move` or `instance_move_finish`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
 came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a
@@ -5985,30 +6158,34 @@ more service. It joins your tailnet under the service's name and hands every con
 address to one service you link it to, as raw TCP: it does not decrypt anything, so the target serves its own TLS. The
 node calls out to Tailscale; nothing calls in from the internet.
 
-You need a Tailscale account (a tailnet), and a service in Arca that serves TLS itself (here it is called `app`, with
-its TLS port first among its ports). As for the Cloudflare connector, the Arca steps are Arca's own verbs, and
-`service_secret_set` needs an assistant that holds a `doctor`-scope token.
+You need a Tailscale account (a tailnet), and this node's edge with the routes you want to reach. The link gives the
+connector the edge's address and port 443 and puts the connector on the edge's PROXY allow list. As for the Cloudflare
+connector, the Arca steps are Arca's own verbs, and `service_secret_set` needs an assistant that holds a `doctor`-scope
+token.
 
 1. **Tailscale admin console, "Settings" > "Keys".** Generate an auth key: for one use, not ephemeral, pre-approved if
    your tailnet asks for device approval, and with a tag, so that the node's own key does not expire. Copy it; treat it
    like a password. The tag must already be in your tailnet policy's `tagOwners` ("Access controls"), and the policy's
    rules must let your devices reach that tag on TCP 443; without such a rule the node joins but nothing reaches it.
-2. **Arca: `service_status`** with `{"name": "app"}`. Note its `ipv4` and its first `ports` entry, for example
-   `192.0.2.11` and `8443`.
-3. **Arca: `service_create`** with `{"name": "app-ts", "template": "tailscale"}`. The service's name is also the node's
-   name on your tailnet, unless step 4 gives it another. The service is created with its state volume and stays
-   `stopped`, because it has no key yet.
-4. **Arca: `service_secret_set`** with `{"name": "app-ts", "key": "TS_AUTHKEY", "value": "<the key>"}`, and again with
-   `{"name": "app-ts", "key": "TS_TARGET", "value": "192.0.2.11:8443"}`: the address and port from step 2. To give the
-   node a tailnet name other than the service's, put it in front with an `@`: `"value": "app@192.0.2.11:8443"` (lower
-   case letters, digits and dashes, at most 63, not starting or ending with a dash).
-5. **Arca: `service_connect`** with `{"from": "app-ts", "to": "app"}`. This is what lets the node reach `app`, on `app`'s
-   first port and nothing else.
-6. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "app-ts"}`. The node logs in with the key and
-   appears in the admin console's "Machines" list under its tailnet name (`app-ts`, or the name from step 4).
-7. **Check.** The node is listed as connected in the admin console. From a device on your tailnet, a connection to port
-   443 of the node (its name `app-ts` or its tailnet address) reaches `app`, which answers with its own certificate:
-   use a name that certificate is for, pointed at the node.
+2. **Arca: `service_create`** with `{"name": "app-ts", "template": "tailscale", "start": false}`. The service's name is
+   also the node's name on your tailnet. Leaving it stopped lets you set its key and link before its first start.
+3. **Arca: `service_secret_set`** with `{"name": "app-ts", "key": "TS_AUTHKEY", "value": "<the key>"}`. The key is
+   optional: a connector may start with no `TS_AUTHKEY`, including one whose state already holds its login.
+4. **Arca: `service_connect`** with `{"from": "app-ts", "to": "edge"}` (use your edge service's name). This lets the
+   connector reach the edge on port 443, gives it `ARCA_EDGE_TARGET`, and allows its PROXY header at the edge. No target
+   address needs to be typed.
+5. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "app-ts"}`. With a key, the node logs in and
+   appears in the admin console's "Machines" list under its tailnet name (`app-ts`).
+6. **Check.** The node is listed as connected in the admin console. From a device on your tailnet, a connection to port
+   443 of the node reaches the edge. Point a name served by one of the edge's routes at the node; the edge answers with
+   that route's certificate and forwards the request to its target.
+
+`TS_TARGET` is an optional override. To reach another service that accepts PROXY protocol, link the connector to it
+and set `TS_TARGET` with `service_secret_set` to its `ADDRESS:PORT`, such as `192.0.2.11:8443`. It takes precedence over
+`ARCA_EDGE_TARGET`, so an existing connector with a typed target keeps forwarding there after an update. To give the
+node a tailnet name other than the service's, prefix the override with `NAME@`, such as `app@192.0.2.11:8443` (lower
+case letters, digits and dashes, at most 63, not starting or ending with a dash). With neither target, the script exits
+and says to link the service to the edge or set `TS_TARGET`.
 
 What to know:
 
@@ -6019,7 +6196,7 @@ What to know:
   tailnet client's own address. The target must accept that header from the node's address (`service_status` of
   `app-ts`, its `ipv4`), and only from it. A target that does not speak PROXY protocol refuses these connections.
   When the target is this node's edge, linking the node to it (`service_connect` from `app-ts` to the edge) is enough:
-  Arca adds the node's address to the edge's PROXY allow list and reloads Caddy.
+  Arca adds the node's address to the edge's PROXY allow list, reloads Caddy, and supplies the forward target.
 - **Only port 443, only one target.** Nothing else is served. A connection to any other port of the node's tailnet
   address goes to that port on the node's own loopback, and the node is alone in its container, so nothing listens
   there. To change the target or the tailnet name, set `TS_TARGET` again and restart the node (`instance_restart`).
@@ -6030,11 +6207,119 @@ What to know:
 - **Where the key and the target live.** In private files in Arca's `secrets/` directory, and in the container's
   environment in Incus, as for every template secret. `service_logs` replaces both with `[secret]`. Inside the
   container the key is handed to Tailscale as a file of its own (mode 600, under `/run`, which is in memory), so it is
-  never on a command line. The tailnet name
-  rides on `TS_TARGET` because every secret a template names must be set before it starts, so an optional value cannot
-  be a secret of its own.
+  never on a command line. Unset optional secrets are absent from the environment. The target supplied by the link
+  follows the same private-file and environment path as other provided connection values.
 - **The image.** The template pins `docker.io/tailscale/tailscale` release 1.104.7 by digest, so it never updates by
   itself. A later Arca release moves the pin.
+
+## One Automagik workspace per project
+
+This prepares one `automagik-workspace` service and virtual machine per project; deployment waits for owner review
+and the final image release. Its existing root disk holds the persistent
+`WS_DATA` directory, `/var/lib/automagik-workspace/data`, bound into the server at `/data`. There is no new data
+volume. Removing the machine removes this data too.
+
+The image contract runs the distroless image as numeric uid:gid `1000:1000` (the `automagik` user, with no
+`/home` entry). `WS_DATA_OWNER` and the paths are named together at the top of
+`templates/automagik-workspace.sh`. The image's entrypoint runs as shipped:
+`/nodejs/bin/node /opt/automagik/entrypoint.mjs`, with working directory `/opt/automagik`. There is no systemd
+inside the container; the entrypoint supervises its programs. The existing keeper remains a service in the VM.
+
+| Server environment | Persistent path in the server |
+|--------------------|-------------------------------|
+| `HOME` | `/data` — native home private to this workspace |
+| `AUTOMAGIK_HOME` | `/data` — registry home |
+| `AUTOMAGIK_BOTS_HOME` | `/data/bots` — team state, deliberately distinct from the registry home |
+| `DSH_HOME` | `/data/dsh` |
+| `AUTOMAGIK_WORKSPACE` | `/data/workspace` — the project's real repository checkout |
+| `HERDR_APP_HOME` | `/data/herdr-app` — **PROPOSED**, being added by the image owner |
+| `HC_TERMINAL_SOCKET` | `/data/run/herdr-core/default.sock` — **PROPOSED**, for the supervised herdr-core |
+
+The template prepares `/data`, these directories, `/data/secrets` (mode `0700`), `/data/run`,
+`/data/run/herdr-core` and `/data/acp/clis` as writable by uid:gid `1000:1000`, with mode `0700`.
+It does not recursively change existing files. They live under the one existing mount, which hides the image's
+seeded directories. The template **does not pre-populate `.herdr/bots.json`, a roster or any v2 registry file**.
+A real project checkout must be delivered to `/data/workspace` before first boot; preparing the directory does
+not clone a repository or supply its credentials. Repository delivery remains an owner prerequisite. The
+reviewed entrypoint then installs the vendor CLIs, creates the base triad, runs its seed and starts DSH.
+
+**Before admission.** The supplied image contract pins baked **pnpm 10.34.6** at `/usr/local/bin/pnpm`. The template
+explicitly sets `settings.automagikPnpm` to that path and passes it unchanged as `AUTOMAGIK_PNPM`. The image owner
+must reconfirm the executable and path at the release gate. There is no fallback to `PATH` or
+`AUTOMAGIK_APP_BROWSER=1`. An empty, missing, non-string or malformed path refuses startup before any container
+starts and the keeper says, on one line, that the CLI store requires the baked pnpm 10 path. The template checks
+the path's spelling; the image owner must verify the executable and its version. Vendor CLIs install at first
+boot rather than being redistributed in the image and persist at `/data/acp/clis`. The VM needs outbound HTTPS
+to `registry.npmjs.org` and the vendors' hosts. Fake-Docker tests cannot prove the real programs' installation
+or where they write.
+
+**Sign-in: passkey or phone only for a project workspace.** Leave `accessTeamDomain`, `accessAudience` and
+`accessEmails` empty. Those settings remain available to other workspaces that use Cloudflare Access e-mail
+sign-in. The current template supports a passkey claim on the **tailnet** reach, as described below; it does not
+implement a phone route. Arca must show the owner the one-time claim code once, behind the owner's passkey,
+before the owner claims the gate and registers a passkey on-screen. That claim-code screen is not built yet:
+it is missing Arca work, and the owner has no terminal step. Until it exists, reading the container health log
+at a terminal is an interim step for the node operator only, following the image's claim procedure. The keeper
+never reads or prints the code, and no Arca verb hands it out. Do not send the code through an assistant.
+The Cloudflare connector deliberately stays stopped when Access is unset, so merely clearing `accessEmails`
+does not create an internet passkey route.
+Automagik still needs to release the image implementing the supplied entrypoint and proposed herdr paths, confirm
+its claim-log access and recovery procedure, and supply any phone or internet passkey route that the project needs.
+Do not admit a workspace that needs that missing route, and do not substitute e-mail sign-in.
+
+**Admission, once the owner has accepted the prerequisites.** Propose `service_create` through `action_propose`,
+using a service name for that project, template `automagik-workspace`, and these settings:
+
+| Setting | Project choice |
+|---------|----------------|
+| `reach` | `tailnet` for the existing passkey route; any other route waits for the reviewed sign-in contract |
+| `publicUrl` | The exact HTTPS origin, the machine's own tailnet name for `tailnet` |
+| `automagikPnpm` | `/usr/local/bin/pnpm`, reconfirmed for the reviewed image |
+| `accessTeamDomain`, `accessAudience`, `accessEmails` | Empty; no e-mail sign-in |
+| `memberRunner` | `false` until its separately reviewed release is available |
+
+The proposal has shape `{"action":"service_create","args":{"name":"project-workspace","template":"automagik-workspace","settings":{...}}}`.
+The owner approves the card on Arca's approval page. It shows `Name`, `Template`, `Start` (created stopped until the
+reach secret is set), and a `Setting <name>` row for each setting supplied. Give all settings above explicitly so
+the owner sees their values. The homes, default image pin and VM size are template details, not extra card rows:
+review them before approval. `serverImage` is not selectable at create. Keep the current pin until Automagik
+supplies a final reviewed digest; the template description marks `settings.serverImage` as its replacement point.
+No image is published by this template change.
+
+**First boot and checks.** After a separately approved rollout, follow the reach's existing secret and
+`instance_start` steps below. `service_status` shows the service and its settings; `service_logs` shows the keeper.
+For the node operator, `systemctl status arca-automagik-workspace` and `/var/log/cloud-init-output.log` inside the
+VM explain a first boot that did not finish. The node operator checks these before handing the workspace over:
+
+- The keeper says the server and gate are healthy (HTTP 401 on their loopback ports), and the tailnet node serves
+  the exact origin. A running VM alone does not establish this.
+- Owner onboarding needs Arca's missing claim-code screen: Arca must show the code once behind the owner's
+  passkey, then the owner completes the gate's first claim on-screen. The keeper then says `claimed`. It infers
+  that from the claim file's absence, so also check a real owner sign-in. Until that screen exists, the terminal
+  read is for the node operator only. Do not copy the code into assistant conversations or Arca's logs.
+- On the server container, inspect only the home, workspace, socket and pnpm variables above. Confirm the
+  directories, `secrets`, `run` and `<AUTOMAGIK_HOME>/acp/clis` exist, are owned by uid:gid `1000:1000` with mode
+  `0700`, and resolve through the one `WS_DATA:/data` bind. Confirm pnpm reports `10.34.6`, the real checkout is in
+  `/data/workspace`, and `.herdr/bots.json` was absent before the entrypoint seeded it.
+- Check real CLI installation, account isolation and state persistence after a server restart. These need the
+  reviewed image and owner sign-in; the template tests exercise directory preparation and Docker arguments only.
+
+**Rollback.** Propose `{"action":"service_remove","args":{"name":"project-workspace"}}` through `action_propose`.
+The owner approves its removal card, whose `Name` row identifies the service. Removal deletes the VM's root disk:
+all workspace homes, installed CLIs, project files, workspace and gate account state, the tailnet identity and the
+service's stored secrets are lost. There is **no restore verb today**; removal is not a reversible rollback to a
+prior image. The backup paper, currently being revised, covers backups. Agree backup and recovery with the owner
+before admission. Remove any obsolete external tailnet node or tunnel route through its owning operator too.
+
+**Owner actions still required.** Confirm placement and capacity; deliver the real project checkout before first boot;
+obtain and review the final image digest, entrypoint, proposed herdr paths and baked pnpm path; confirm the image's
+bot registry seed, per-project base triad and versioned herdr-core artifact; exercise on-screen claim, passkey
+sign-in and recovery (and obtain a phone route if required); settle backups;
+approve the create and start; and verify the real first boot. This change performs none of those host or deployment
+actions.
+
+**Remaining Arca work.** Build the claim-code screen that shows the owner the code once, behind the owner's
+passkey. That owner flow is not available yet; an interim terminal read by the node operator does not replace it.
 
 ## An Automagik workspace in its own virtual machine
 
@@ -6077,7 +6362,7 @@ token passes through that assistant's conversation.
    Audience (AUD) Tag" on its overview. From now on Cloudflare asks every visitor of that address to prove one of the
    listed e-mail addresses before anything reaches the workspace.
 3. **Arca: `service_create`**, with the workspace's own settings in the call:
-   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"publicUrl": "https://workspace.example.com", "accessTeamDomain": "<your team>.cloudflareaccess.com", "accessAudience": "<the audience tag>", "accessEmails": "owner@example.com"}}`.
+   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"automagikPnpm": "/usr/local/bin/pnpm", "publicUrl": "https://workspace.example.com", "accessTeamDomain": "<your team>.cloudflareaccess.com", "accessAudience": "<the audience tag>", "accessEmails": "owner@example.com"}}`.
    `publicUrl` is the address the workspace will have, with no closing slash; the three Access settings are the two
    values noted in step 2 and the same addresses as the policy. No copy of the template is made: these settings are
    given at create, and `service_status` shows them afterwards. The machine is created and stays `stopped`, because
@@ -6102,14 +6387,15 @@ token passes through that assistant's conversation.
    The Cloudflare "Tunnels" page lists the tunnel as `Healthy`. `https://workspace.example.com` shows Cloudflare's
    own sign-in for your e-mail address first, and then the workspace.
 
-The settings. A `service_create` may give `reach`, `publicUrl` and the three Access settings (the template lists
-them in `createSettings`); `serverImage` is the template's own, since the image a workspace runs is not for a
+The settings. A `service_create` may give `reach`, `publicUrl`, `automagikPnpm`, `memberRunner` and the three Access
+settings (the template lists them in `createSettings`); `serverImage` is the template's own, since the image a workspace runs is not for a
 create to choose.
 
 | Setting | Meaning |
 |---------|---------|
 | `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. It ships empty, which means "not set": the server then starts alone, no gate is started, and every status line says so. |
 | `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the e-mail addresses that may sign in: text, one address or several separated by commas (`"owner@example.com, second@example.com"`, 1 to 16). A create that gives a list is refused (`settings.accessEmails: expected a string, the type of the template's default`); a workspace made before with a list keeps it, and its own keeper reads it. None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS`: the text unchanged (the gate trims each address and compares without regard to case). An address the script does not take stops the workspace with `settings.accessEmails is 1 to 16 e-mail addresses ...`. |
+| `automagikPnpm` | Required absolute path of pnpm 10 baked into the server image, supplied by its owner. Passed as `AUTOMAGIK_PNPM`, with no fallback. Explicitly pins `/usr/local/bin/pnpm` from the image contract; an empty or missing setting refuses startup. Reconfirm the path for the final reviewed image. |
 | `serverImage` | The Automagik server's public image, pinned by digest (Automagik 3.146.5). The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below), and one with GitHub build provenance from `automagik-si/automagik` (see "The image's provenance" below). |
 
 | `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
@@ -6145,7 +6431,7 @@ choose a machine name you do not mind the world reading.
    treat it like a password. Decide the machine's name (for example `workspace1`) and note your tailnet's name:
    together they are the address, `https://workspace1.<tailnet>.ts.net`.
 2. **Arca: `service_create`** with
-   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"reach": "tailnet", "publicUrl": "https://workspace1.<tailnet>.ts.net"}}`:
+   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"reach": "tailnet", "publicUrl": "https://workspace1.<tailnet>.ts.net", "automagikPnpm": "/usr/local/bin/pnpm"}}`:
    the reach, and that address with no port and no closing slash. Give none of the three Access settings; with
    `tailnet` they are refused. It stays `stopped`.
 3. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TAILSCALE_AUTHKEY", "value": "<the key>"}`.
@@ -6267,8 +6553,9 @@ What to know:
   snapshot carries the token's file too.
 - **No Docker Compose.** The keeper starts the three containers with `docker run`, with the same image, entrypoint,
   environment, volumes, shared network namespace and restrictions (read-only file system, no capability, no new
-  privileges) that Automagik's compose file gives the gate, and gives the server no environment, as that file
-  does. The connector gets the same three restrictions. The first boot installs `docker.io` and `docker-cli`
+  privileges) that Automagik's compose file gives the gate. The server gets its explicit user, persistent homes,
+  workspace, proposed herdr socket and `AUTOMAGIK_PNPM`; it still gets no public origin. The connector gets the same
+  three restrictions. The first boot installs `docker.io` and `docker-cli`
   (on Debian 13 the `docker` command is a package of its own) and no compose package.
 - **No model key.** The template declares no model secret. Sign-ins to model providers happen inside the workspace.
 - **After a restart of the node** the machine starts by itself (the template sets `autostart`), and the keeper starts
@@ -7643,7 +7930,9 @@ no answer, a start that Docker refuses, the settings that are refused (by the ke
 first boot), `accessEmails` as text and as a list, the first boot's packages, verifier download, unit and console
 lines, its failures (a verifier whose sha256 is not the fixed one among them), the provenance check before the one
 pull of the server's image (and no start when it fails), `--pull never` on every container from that image, and that
-the token is in no output, no file outside the machine's memory and no command line. It does not run cosign itself.
+the token is in no output, no file outside the machine's memory and no command line. It also covers the explicit
+persistent homes, private to their workspace, their owner and modes, CLI state surviving server replacement,
+the explicit image user, and missing or malformed pnpm paths refusing any container start. It does not run cosign itself.
 
 For the tailnet reach it covers the node's exact command line (a namespace of its own, never the server's,
 userspace networking, the key as a file's path, the state directory), the private network and the relay's command

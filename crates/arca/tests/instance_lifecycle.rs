@@ -157,6 +157,7 @@ impl Rig {
                 token_id: "doctor-1".to_string(),
                 scope,
                 tools: None,
+                limits: Default::default(),
             },
         );
         if let Ok(value) = &result {
@@ -1059,6 +1060,7 @@ fn the_admin_tokens_terminal_approval_runs_a_stop_once_and_the_journal_names_it(
         token_id: id.to_string(),
         scope,
         tools: None,
+        limits: Default::default(),
     };
     // A token below admin approves nothing here.
     assert!(matches!(
@@ -1145,6 +1147,7 @@ fn a_terminal_yes_runs_nothing_when_the_card_decided_the_shown_proposal_first() 
             token_id: "admin-1".to_string(),
             scope: Scope::Admin,
             tools: None,
+            limits: Default::default(),
         };
         // The owner decides the card while the terminal's question is open.
         if decided == "approved" {
@@ -1195,5 +1198,6 @@ fn terminal_admin() -> Caller {
         token_id: "admin-1".to_string(),
         scope: Scope::Admin,
         tools: None,
+        limits: Default::default(),
     }
 }

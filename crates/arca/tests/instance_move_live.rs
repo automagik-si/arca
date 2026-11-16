@@ -156,6 +156,7 @@ fn a_move_between_two_live_incus_daemons() {
                 token_id: "live".to_string(),
                 scope: Scope::Viewer,
                 tools: None,
+                limits: Default::default(),
             },
         )
     };

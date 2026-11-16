@@ -71,6 +71,7 @@ fn caller() -> Caller {
         token_id: "v".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     }
 }
 

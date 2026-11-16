@@ -2063,6 +2063,7 @@ impl IssuedTokens for OAuth {
             token_id: format!("{ISSUED_PREFIX}{}/{}", grant.client_id, grant.id),
             scope,
             tools: grant.tools.clone(),
+            limits: Default::default(),
         })
     }
 }
