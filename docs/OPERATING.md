@@ -5987,7 +5987,7 @@ template's image and content digest. A node without an edge explains what to cre
 `reach_list` (doctor scope) shows each connector's name, kind, edge and state. A Tailscale connector is
 `waiting-sign-in` until it joins, then `running` with its tailnet name and address when available. A stopped connector
 whose console records containerboot's authentication deadline is `gave-up`; restart it to retry. Other stops are
-`stopped`. Without a key or a nonempty persisted state file, startup allows 10 minutes for sign-in, preserving an
+`stopped`. Every keyless startup allows 10 minutes for sign-in, preserving an
 explicit `TS_BOOT_TIMEOUT`. This is a process deadline, not a known lifetime for the sign-in link. The link never
 appears in a verb's answer, journal or kernel log; connector logs replace it with `[sign-in link]`. The owner page's
 sign-in button is a separate change. Until it is available, use an auth key through the hand path below.

@@ -825,7 +825,7 @@ fn the_script_uses_the_link_target_when_the_override_is_empty_under_each_shell()
 }
 
 #[test]
-fn keyless_first_boot_waits_ten_minutes_and_keeps_explicit_timeouts_and_state() {
+fn keyless_boot_with_or_without_state_waits_ten_minutes_and_keeps_explicit_timeouts() {
     let mut env = good();
     env.retain(|(key, _)| *key != "TS_AUTHKEY");
     let boot = run_in(&["/bin/sh"], &env).boot_env.unwrap();
@@ -849,11 +849,11 @@ fn keyless_first_boot_waits_ten_minutes_and_keeps_explicit_timeouts_and_state() 
     env.retain(|(key, _)| *key != "TS_STATE_DIR");
     env.push(("TS_STATE_DIR", kept.to_str().unwrap()));
     assert!(
-        !run_in(&["/bin/sh"], &env)
+        run_in(&["/bin/sh"], &env)
             .boot_env
             .unwrap()
             .lines()
-            .any(|line| line.starts_with("TS_BOOT_TIMEOUT="))
+            .any(|line| line == "TS_BOOT_TIMEOUT=10m")
     );
     fs::remove_dir_all(kept).unwrap();
     assert!(
