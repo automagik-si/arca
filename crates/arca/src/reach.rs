@@ -81,12 +81,8 @@ struct Peer {
 
 fn tailnet_name(text: &str) -> Option<&str> {
     let text = text.trim_end_matches('.');
-    (!text.is_empty()
-        && text.len() <= 253
-        && text
-            .split('.')
-            .all(|label| arca_incus::exec::node_ok(label)))
-    .then_some(text)
+    (!text.is_empty() && text.len() <= 253 && text.split('.').all(arca_incus::exec::node_ok))
+        .then_some(text)
 }
 
 /// One safe row per connector, including records written before connector kinds were stored on services.
