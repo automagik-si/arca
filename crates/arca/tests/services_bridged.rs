@@ -350,13 +350,28 @@ fn unsupported_vm_io_limits_undo_the_failed_start_on_both_network_kinds() {
             args["bridge"] = json!("br0");
         }
         let message = refusal(rig.call("service_create", args));
-        assert!(message.contains("device I/O limits are not supported by this driver"), "{message}");
-        assert!(rig.get(&format!("/1.0/instances/ws1?project={PROJECT}")).is_none());
-        assert!(!rig.entries().iter().any(|entry| entry.id.0 == "service-ws1"));
+        assert!(
+            message.contains("device I/O limits are not supported by this driver"),
+            "{message}"
+        );
+        assert!(
+            rig.get(&format!("/1.0/instances/ws1?project={PROJECT}"))
+                .is_none()
+        );
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-ws1")
+        );
         assert!(rig.kernel.lock().unwrap().pending_plans().is_empty());
-        assert_eq!(rig.fake.writes().into_iter()
-            .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
-            .count(), 1);
+        assert_eq!(
+            rig.fake
+                .writes()
+                .into_iter()
+                .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
+                .count(),
+            1
+        );
     }
 }
 

@@ -9,7 +9,9 @@ Write under this comment only what a reader needs beyond those lines; the releas
 
 Service templates may set `limits.diskRead` and `diskWrite` in bytes/s or IOPS, and `limits.ingress` and `egress` in
 bits/s. Containers and virtual machines receive these caps on their root disk and NIC at create; a bad value or an
-Incus refusal fails the create, with no retry without the cap. Unset caps leave the old behaviour unchanged.
+Incus refusal fails the create, with no retry without the cap. Incus applies caps at start: if a fresh capped create's
+initial start fails, its instance, record and other new service resources are rolled back, while files supplied before
+the create are kept. Unset caps leave the old behaviour unchanged.
 `service_status` shows the recorded limits under `settings.limits`. See "Service disk and network limits" in
 docs/OPERATING.md for units and storage-driver requirements.
 

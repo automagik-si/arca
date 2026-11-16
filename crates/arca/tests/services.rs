@@ -538,21 +538,35 @@ fn template_io_limit_units_are_checked_before_create() {
 #[test]
 fn an_io_limited_create_does_not_claim_data_left_by_an_earlier_attempt() {
     let rig = Rig::with(
-        FakeState { server: json!({}), projects: vec![], instances: vec![], networks: vec![], pools: vec![("pool1".into(), json!({}))] },
-        vec![PROJECT.into()], Some("192.0.2.0/24"),
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
     );
     let mut template = nats_template();
     template["data"] = json!({"path":"/data"});
     rig.template("nats", template.clone());
     rig.fake.set_reject_config_on_post("/1.0/instances");
-    assert!(rig.call("service_create", json!({"name":"nats","template":"nats"})).is_err());
+    assert!(
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+            .is_err()
+    );
     let path = format!("/1.0/storage-pools/pool1/volumes/custom/nats-data?project={PROJECT}");
-    let previous = rig.get(&path).expect("the earlier create left data for approval");
+    let previous = rig
+        .get(&path)
+        .expect("the earlier create left data for approval");
     let plans = rig.kernel.lock().unwrap().pending_plans();
     template["limits"] = json!({"diskWrite":"10MB"});
     rig.template("nats", template);
     let before = rig.fake.writes().len();
-    let Err(CallError::Refused { message, .. }) = rig.call("service_create", json!({"name":"nats","template":"nats"})) else {
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+    else {
         panic!("the prior data must be dealt with before a fresh capped create");
     };
     assert!(message.contains("previous objects"), "{message}");
@@ -565,8 +579,15 @@ fn an_io_limited_create_does_not_claim_data_left_by_an_earlier_attempt() {
 fn unsupported_io_limits_fail_create_without_retrying_uncapped() {
     for (key, cap, run_tmpfs) in [("diskRead", "100MB", false), ("egress", "100Mbit", true)] {
         let rig = Rig::with(
-            FakeState { server: json!({}), projects: vec![], instances: vec![], networks: vec![], pools: vec![("pool1".into(), json!({}))] },
-            vec![PROJECT.into()], Some("192.0.2.0/24"),
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                networks: vec![],
+                pools: vec![("pool1".into(), json!({}))],
+            },
+            vec![PROJECT.into()],
+            Some("192.0.2.0/24"),
         );
         let mut template = nats_template();
         template["limits"] = json!({key: cap});
@@ -592,11 +613,28 @@ fn unsupported_io_limits_fail_create_without_retrying_uncapped() {
             rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
                 .is_none()
         );
-        assert!(!rig.entries().iter().any(|entry| entry.id.0 == "service-nats"));
-        assert!(rig.get(&format!("/1.0/network-acls/{PROJECT}-svc-nats?project=default")).is_none());
-        assert!(rig.get(&format!("/1.0/storage-pools/pool1/volumes/custom/nats-data?project={PROJECT}")).is_none());
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-nats")
+        );
+        assert!(
+            rig.get(&format!(
+                "/1.0/network-acls/{PROJECT}-svc-nats?project=default"
+            ))
+            .is_none()
+        );
+        assert!(
+            rig.get(&format!(
+                "/1.0/storage-pools/pool1/volumes/custom/nats-data?project={PROJECT}"
+            ))
+            .is_none()
+        );
         assert!(!secrets.join("token").exists());
-        assert_eq!(fs::read_to_string(secrets.join("owner-seeded")).unwrap(), "keep this");
+        assert_eq!(
+            fs::read_to_string(secrets.join("owner-seeded")).unwrap(),
+            "keep this"
+        );
         assert!(rig.kernel.lock().unwrap().pending_plans().is_empty());
         let attempts: Vec<_> = rig
             .fake

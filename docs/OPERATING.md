@@ -869,7 +869,11 @@ no cap. A container may specify just I/O limits; virtual machines still need bot
 disk size.
 
 The caps travel in the instance create for containers and virtual machines, on either a managed service network or
-a VM's host bridge. If Incus cannot apply one, the create returns its error; Arca never retries without the cap.
+a VM's host bridge. Incus applies them at **start**. If a create requests a start and that start fails, Arca rolls back
+the fresh capped instance, its service record, ACL, new data volume and newly generated secrets, and returns the
+error. Files supplied before the create are kept. Arca never retries without the cap. Resolve cleanup or retention of objects left by an earlier
+attempt before a fresh capped create; rollback cannot claim that earlier data. If cleanup itself fails, the error says so. An explicitly stopped create applies its caps at its later
+`instance_start`, so creating it stopped does not prove the host can enforce them.
 Container disk throttling requires Incus's I/O cgroup controller and a backing block device the storage driver can
 identify. VM disk throttling uses QEMU. Network caps require the bridged NICs Arca creates. Validate the caps on the
 storage driver and network in use before relying on them for isolation; support on one driver proves nothing about
@@ -879,6 +883,10 @@ Caps are fixed at create. Editing a template changes future services. `service_s
 I/O cap includes its recorded limits under `settings.limits`, alongside any VM guest settings. This reports the
 create's requested configuration, not a live bandwidth measurement. Services created without I/O caps keep their
 existing status shape.
+
+Adopted services and functions are not covered: adoption does not apply these template fields, and `function_create`
+accepts only CPU and memory limits. In a capped service's status, `settings.limits` reports the configured caps;
+unset CPU and memory fields are omitted from this view.
 
 #### A script entrypoint and the Incus version
 

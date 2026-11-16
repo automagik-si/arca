@@ -2258,13 +2258,16 @@ fn lxc_split_cmd(cmd: &str, split: LxcSplit) -> Vec<String> {
 /// Driver/cgroup/tc rejection happens at start, after Incus has accepted the instance devices.
 fn device_limit_refusal(shared: &Shared, instance: &Value) -> Option<String> {
     (shared.reject_device_limits.load(Ordering::SeqCst)
-        && instance.get("devices").and_then(Value::as_object).is_some_and(|devices| {
-            devices.values().any(|device| {
-                device.as_object().is_some_and(|device| {
-                    device.keys().any(|key| key.starts_with("limits."))
+        && instance
+            .get("devices")
+            .and_then(Value::as_object)
+            .is_some_and(|devices| {
+                devices.values().any(|device| {
+                    device
+                        .as_object()
+                        .is_some_and(|device| device.keys().any(|key| key.starts_with("limits.")))
                 })
-            })
-        }))
+            }))
     .then(|| "device I/O limits are not supported by this driver".to_string())
 }
 
