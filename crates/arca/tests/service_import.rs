@@ -914,6 +914,59 @@ fn a_release_refuses_in_plain_words_when_the_inverse_is_not_safe() {
 }
 
 #[test]
+fn an_import_with_an_unreadable_candidate_reports_that_it_landed_and_retries_later() {
+    for wrong_type in [false, true] {
+        let rig = standard();
+        let proposal = rig.propose("service_import", "db1").unwrap();
+        let approval = rig.approval(&proposal);
+        // The import's plan and mark read-back succeed; only the adoption read is uncertain.
+        rig.fake.pass_reads(DB1, 2);
+        if wrong_type {
+            rig.fake.answer_reads(DB1, 1, json!([]));
+        } else {
+            rig.fake.fail_reads(DB1, 1, 503);
+        }
+        let (_, words) = refusal(rig.approve_with(&proposal, &approval));
+        assert!(words.ends_with("The instance carries Arca's mark already, and its record is made by the next service call that Incus answers: service_list shows it. Do not propose the import again."), "{words}");
+        assert!(
+            !words.contains("service_release"),
+            "a successful import must not be undone: {words}"
+        );
+        assert_eq!(rig.get(DB1).unwrap()["config"][KERNEL_ENTRY_KEY], MARK);
+        assert_eq!(rig.db1_writes(), one_patch());
+        assert!(rig.entry("service-db1").is_none());
+        rig.call("service_list", json!({}))
+            .expect("the next managed call makes the record");
+        assert_eq!(rig.entry("service-db1").unwrap()["adopted"], true);
+        assert_eq!(
+            rig.db1_writes(),
+            one_patch(),
+            "the import is not proposed or written again"
+        );
+    }
+}
+
+#[test]
+fn an_import_with_unreadable_service_keys_keeps_its_exact_release_advice() {
+    let rig = standard();
+    let mut invalid = rig.instance(DB1);
+    invalid["config"][KERNEL_ENTRY_KEY] = json!(MARK);
+    invalid["config"]["user.arca.ports"] = json!("invalid-port");
+    let proposal = rig.propose("service_import", "db1").unwrap();
+    let approval = rig.approval(&proposal);
+    rig.fake.pass_reads(DB1, 2);
+    rig.fake.answer_reads(DB1, 1, invalid);
+    let (_, words) = refusal(rig.approve_with(&proposal, &approval));
+    assert_eq!(
+        words,
+        "The approval was accepted, but service_import did not complete: import service db1: the instance is marked, but its keys no longer read as a service record; service_list shows it as failed, and service_release takes the mark off"
+    );
+    assert_eq!(rig.get(DB1).unwrap()["config"][KERNEL_ENTRY_KEY], MARK);
+    assert_eq!(rig.db1_writes(), one_patch());
+    assert!(rig.entry("service-db1").is_none());
+}
+
+#[test]
 fn release_forgets_a_missing_adopted_instance_without_an_allowlist_entry() {
     let mut rig = standard();
     rig.approved("service_import", "db1").unwrap();

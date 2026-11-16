@@ -3449,6 +3449,70 @@ fn failed_adoption_reads_do_not_refuse_other_calls_and_are_retried_later() {
 }
 
 #[test]
+fn non_object_adoption_reads_do_not_poison_the_kernel_or_refuse_other_calls() {
+    for metadata in [
+        json!([]),
+        json!("not an instance"),
+        json!(42),
+        json!(true),
+        Value::Null,
+    ] {
+        let rig = Rig::with(
+            FakeState {
+                instances: vec![adopted_instance(
+                    "svc1",
+                    "arca",
+                    "postgres-autopg",
+                    "192.0.2.10",
+                    "5432",
+                    "uuid-svc1",
+                )],
+                ..empty_state()
+            },
+            vec![PROJECT.into(), "arca".into()],
+            Some("192.0.2.0/24"),
+        );
+        rig.template("nats", nats_template());
+        let path = "/1.0/instances/svc1?project=arca";
+        rig.fake.answer_reads(path, 2, metadata);
+        rig.call("service_list", json!({}))
+            .expect("a wrong-typed candidate must not poison the kernel");
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1")
+        );
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+            .expect("another service still creates under the same kernel");
+        assert!(
+            rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-nats")
+        );
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1")
+        );
+        assert_eq!(
+            rig.fake
+                .requests()
+                .iter()
+                .filter(|request| request.path == path)
+                .count(),
+            2
+        );
+        rig.call("service_list", json!({}))
+            .expect("a healthy later read adopts the candidate");
+        assert!(
+            rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1" && entry.config["adopted"] == true)
+        );
+    }
+}
+
+#[test]
 fn a_missing_adoption_is_preserved_despite_old_retirement_history() {
     let key = common::SkKey::from_seed(9);
     let rig = Rig::with_key(
