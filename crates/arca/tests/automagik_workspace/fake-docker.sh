@@ -15,6 +15,10 @@
 #   inspect` answers. `docker pull` puts it there (it fails while $FAKE_DOCKER_DIR/fail-pull is there, with that
 #   file's words), and so does a `docker run` without `--pull never`, as Docker pulls a missing image itself. A run
 #   with `--pull never` of an image that is not here fails, as with Docker.
+# - Each start of a container gives it a process number and a network namespace, shown as the kernel shows them, in
+#   $FAKE_DOCKER_DIR/proc/<pid>/ns/net (the keeper's WS_PROC). A container that joins another's namespace gets that
+#   one's namespace at its start; `docker restart <name>` gives a container a new process and a new namespace, and
+#   leaves those that joined it in the old one, as with Docker.
 # - While $FAKE_DOCKER_DIR/fail-rm-<name> is there, `docker rm` leaves that container and fails.
 # - While $FAKE_DOCKER_DIR/fail-inspect is there, `docker inspect` fails as it does when the daemon cannot be
 #   reached; while warn-inspect is there it prints a warning beside its answer.
@@ -22,12 +26,25 @@
 #   still starting when there is no such file). Any other `docker exec` plays the image's health check: it prints
 #   the code in $FAKE_DOCKER_DIR/health-<name> (401 when there is no such file) and succeeds on 401.
 set -u
+# The keeper's PATH holds only the programs it lists; this stand-in may use the machine's own (ln, for /proc).
+PATH=$PATH:/usr/bin:/bin
 root=$FAKE_DOCKER_DIR
 mkdir -p "$root/containers" "$root/networks" "$root/images"
 # The file that stands for one image here.
 image_file() {
   local ref=$1
   printf '%s/images/%s' "$root" "${ref//[\/:@]/_}"
+}
+# Starts container $1's process: a new number, and the namespace $2 (a new one when $2 is empty).
+start_process() {
+  local pid netns=$2
+  pid=$(($(cat "$root/next-pid" 2>/dev/null || echo 100) + 1))
+  printf '%s\n' "$pid" >"$root/next-pid"
+  [ -n "$netns" ] || netns="net:[$((4026531000 + pid))]"
+  mkdir -p "$root/proc/$pid/ns"
+  ln -sfn "$netns" "$root/proc/$pid/ns/net"
+  printf '%s\n' "$pid" >"$root/containers/$1/pid"
+  printf '%s\n' "$netns" >"$root/containers/$1/netns"
 }
 printf '%s\n' "$*" >>"$root/calls.log"
 command=${1-}
@@ -91,6 +108,7 @@ case $command in
     printf '%s\n' "$netmode" >"$root/containers/$name/netmode"
     : >"$root/containers/$name/log"
     [ -z "$token_dir" ] || sha256sum <"$token_dir/$token_file" | cut -d' ' -f1 >"$root/containers/$name/token.sha256"
+    start_process "$name" "$([ -z "$joins" ] || cat "$root/containers/$joins/netns")"
     : >"$root/containers/$name/running"
     echo "0123456789ab"
     ;;
@@ -116,12 +134,24 @@ case $command in
         fi
         ;;
       '{{.HostConfig.NetworkMode}}') cat "$root/containers/$name/netmode" ;;
+      '{{.State.Pid}}')
+        if [ -e "$root/containers/$name/running" ]; then cat "$root/containers/$name/pid"; else echo 0; fi
+        ;;
       '{{with index .NetworkSettings.Networks "'*'"}}{{.IPAddress}}{{end}}')
         network=${format#*Networks \"}
         cat "$root/containers/$name/address-${network%%\"*}" 2>/dev/null || echo
         ;;
       *) exit 2 ;;
     esac
+    ;;
+  restart)
+    [ -d "$root/containers/${1-}" ] || {
+      echo "Error response from daemon: No such container: ${1-}" >&2
+      exit 1
+    }
+    start_process "$1" ''
+    : >"$root/containers/$1/running"
+    echo "$1"
     ;;
   image)
     [ "${1-}" = inspect ] || exit 2
