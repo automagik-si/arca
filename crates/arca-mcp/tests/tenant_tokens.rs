@@ -377,7 +377,6 @@ fn node_verbs_and_linked_nodes_are_refused_before_any_handler() {
         "storage_list",
         "route_list",
         "tenant_create",
-        "deploy_rollback",
     ] {
         let reply = door.call(&door.bound, name, json!({}));
         // Some write schemas require arguments; either way no handler may run.

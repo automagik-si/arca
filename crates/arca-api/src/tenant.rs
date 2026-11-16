@@ -8,7 +8,7 @@ use crate::Verb;
 pub const OUTSIDE_TENANT: &str = "OutsideTokenTenant";
 
 /// The reviewed verbs that accept a tenant. A new verb is refused until it is reviewed here too.
-const TENANT_VERBS: [&str; 18] = [
+const TENANT_VERBS: [&str; 19] = [
     "service_create",
     "service_list",
     "service_status",
@@ -26,6 +26,7 @@ const TENANT_VERBS: [&str; 18] = [
     "instance_stop",
     "instance_restart",
     "deploy_confirm",
+    "deploy_rollback",
     "deploy_remove",
 ];
 
@@ -39,7 +40,8 @@ pub fn offered(verb: &Verb) -> bool {
 }
 
 /// Resolve the tenant without broadening a call. Returns a proposal's inner verb so the door can check its scope and
-/// tools too. Arguments have already met the public schema. Errors contain no name supplied by a caller.
+/// tools too. Defaults are injected before the public schema is checked; no schema is changed. Errors contain no name
+/// supplied by a caller.
 pub fn resolve(
     verb: &Verb,
     tenant: &str,

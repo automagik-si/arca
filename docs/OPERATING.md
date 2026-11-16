@@ -712,7 +712,7 @@ default: omitted `tenant` means the node's own project. With `--tenant`, bare na
 `<id>/<service>` is also accepted for that same tenant. Names from another tenant and duplicate names after resolution
 are refused. The file and mint answer spell these service limits as `<id>/<service>`.
 
-The token reaches the tenant-aware service, instance and snapshot verbs, plus `deploy_confirm` and `deploy_remove`,
+The token reaches the tenant-aware service, instance and snapshot verbs, plus `deploy_confirm`, `deploy_rollback` and `deploy_remove`,
 within its scope, tool list and service list. Of the verbs without `tenant`, only `arca_status`, `tenant_list`, `tenant_status`, `tenant_usage` and
 `action_propose` are available. The tenant list contains only its own row; status and usage require its own `id`.
 A proposal resolves its inner arguments and checks the action's tenant, scope, tools and services before saving it.

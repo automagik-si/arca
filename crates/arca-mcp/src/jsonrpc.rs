@@ -275,9 +275,6 @@ async fn call_tool(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if let Err(why) = conforms(&(verb.params)(), &arguments) {
-        return Ok(Some(result_reply(id, invalid_arguments(&why))));
-    }
     if let Some(tenant) = &caller.limits.tenant {
         let resolved = arca_api::tenant::resolve(verb, tenant, &mut arguments).and_then(|inner| {
             if inner.is_some_and(|inner| !caller.admits(inner)) {
@@ -294,6 +291,9 @@ async fn call_tool(
                 Some(json!({ "refusal": arca_api::tenant::OUTSIDE_TENANT })),
             )));
         }
+    }
+    if let Err(why) = conforms(&(verb.params)(), &arguments) {
+        return Ok(Some(result_reply(id, invalid_arguments(&why))));
     }
     // A token limited to named services is held to them here, before anything runs: on what the call touches, and on what
     // a proposal would do once the owner approved it. Its limit is this node's, so it is never relayed to a linked one.
