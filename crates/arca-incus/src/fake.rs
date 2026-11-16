@@ -208,6 +208,7 @@ struct Shared {
     requests: Mutex<Vec<RecordedRequest>>,
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
+    reject_device_limits: AtomicBool,
     reject_patch: Mutex<Vec<String>>,
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
@@ -461,6 +462,7 @@ impl Shared {
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
+            reject_device_limits: AtomicBool::new(false),
             reject_patch: Mutex::new(Vec::new()),
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
@@ -704,6 +706,11 @@ impl FakeIncus {
     /// object is not created. A switch for the live probe's rejection case.
     pub fn set_reject_config_on_post(&self, kind_path_prefix: &str) {
         lock(&self.shared.reject_config).push(kind_path_prefix.to_string());
+    }
+
+    /// Refuse an instance create carrying disk or NIC limits, as an unsupported driver would.
+    pub fn reject_device_limits_on_create(&self) {
+        self.shared.reject_device_limits.store(true, Ordering::SeqCst);
     }
 
     /// Fail the start phase of create, leaving the new instance stopped.
@@ -2319,6 +2326,22 @@ fn create(
         );
     };
     let path = request.path();
+    if path == "/1.0/instances"
+        && shared.reject_device_limits.load(Ordering::SeqCst)
+        && body.get("devices").and_then(Value::as_object).is_some_and(|devices| {
+            devices.values().any(|device| {
+                device.as_object().is_some_and(|device| {
+                    device.keys().any(|key| key.starts_with("limits."))
+                })
+            })
+        })
+    {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "device I/O limits are not supported by this driver"),
+        );
+    }
     let rejected = body.contains_key("config")
         && lock(&shared.reject_config)
             .iter()

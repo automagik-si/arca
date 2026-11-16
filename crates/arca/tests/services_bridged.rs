@@ -331,6 +331,44 @@ fn owner_approval(key: &common::SkKey, name: &str) -> String {
 }
 
 #[test]
+fn template_io_limits_reach_both_vm_network_kinds_and_status_settings() {
+    for bridged in [false, true] {
+        let rig = if bridged {
+            Rig::bridged(&["br0"], None)
+        } else {
+            let mut config = managed_kernel();
+            config["vmLimits"] = roomy();
+            Rig::with(config, None, vec![])
+        };
+        let mut template = vm_template();
+        template["limits"]["diskRead"] = json!("100MB");
+        template["limits"]["diskWrite"] = json!("1000iops");
+        template["limits"]["ingress"] = json!("200Mbit");
+        template["limits"]["egress"] = json!("100Mbit");
+        template["settings"] = json!({"label":"kept"});
+        let limits = template["limits"].clone();
+        rig.template("ws", template);
+        let mut args = json!({"name":"ws1","template":"ws"});
+        if bridged {
+            args["bridge"] = json!("br0");
+        }
+        rig.call("service_create", args).expect("create");
+        let instance = rig
+            .get(&format!("/1.0/instances/ws1?project={PROJECT}"))
+            .expect("instance");
+        assert_eq!(instance["devices"]["root"]["limits.read"], "100MB");
+        assert_eq!(instance["devices"]["root"]["limits.write"], "1000iops");
+        assert_eq!(instance["devices"]["eth0"]["limits.ingress"], "200Mbit");
+        assert_eq!(instance["devices"]["eth0"]["limits.egress"], "100Mbit");
+        let status = rig
+            .call("service_status", json!({"name":"ws1"}))
+            .expect("status");
+        assert_eq!(status["settings"]["limits"], limits);
+        assert_eq!(status["settings"]["label"], "kept");
+    }
+}
+
+#[test]
 fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or_read() {
     let rig = Rig::bridged(&["br0", "br1"], None);
     let created = rig
