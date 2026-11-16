@@ -61,6 +61,11 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
+    // 0.34.0: before keyless Tailscale starts waited ten minutes for sign-in.
+    (
+        "tailscale.sh",
+        "21711cabba260ff9994d80164d3ee3d6cc626b3de101c0ee2b9f1c3730be76aa",
+    ),
     // 0.32.0: before the edge provided its target and the Cloudflare template named its connector kind.
     (
         "arca-edge.json",
