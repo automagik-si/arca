@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`arca token mint --tenant <id>` binds a token to one tenant. Omitted tenant arguments resolve to that tenant;
+other tenants and node-wide operations outside a small read/proposal allowlist are refused. Scope, tools and
+service limits still apply, and proposals are checked before saving. Bare service names become tenant-local.
+Tokens without the new line keep their current behavior. Older releases skip an unknown tenant-bound token,
+or refuse the directory if they predate unknown-line skipping; revoke these tokens before that downgrade.
+
 A token can be limited to named services and to a time: `arca token mint --services dev,gtm --expires 12h`. A limited
 token reaches only the verbs that name a listed service (or a listed service's instance), is refused every verb that
 reaches the whole node, every GET route and every call relayed to a linked node, and reads `service_list`,

@@ -113,7 +113,7 @@ node takes a new token after `arca token reload` or a restart.
 | `arca link remove [--] <name> [--config <file>]` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call <verb> [--config <file>] [--token-file <file>]`, with `--args <json>` or `--args-file <file>`; `arca call` alone lists the verbs | one tool call against the local node | the verb's result, as JSON |
 | `arca call --peer <name> <verb> [--config <file>] --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and `--token-file` is always named: this node's own token is never sent by default | the verb's result, as JSON |
-| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>] [--services <comma list>] [--expires <span or time>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id and scope, and the services and expiry when given |
+| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>] [--tenant <id>] [--services <comma list>] [--expires <span or time>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id and scope, and the tenant, services and expiry when given |
 | `arca token revoke <id>` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | the token's hash file | the id and `revoked: true` |
 | `arca token reload [--config <file>]` | the pid file and the reload record in the state directory, and `/proc` | one line: `reloaded: the node on this config (pid <n>) read its tokens again and holds <k> token(s)`. It exits non-zero, with the reason on stderr, when no node runs on the config, when the node could not read its token directory, or when it cannot tell |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
@@ -699,6 +699,31 @@ release added, so the token is never taken without it. Any other line that does 
 directory. **A release before this one refuses the whole token directory when it meets `services=`, `expires=` or
 `by=`**: on such a downgrade the node starts with no token at all. Before downgrading past this release, revoke every
 token minted with `--services` or `--expires` (`grep -l -E '^(services|expires|by)=' <hashDir>/*.hash` lists them).
+
+### Tenant-bound tokens
+
+`arca token mint --tenant <id>` adds `tenant=<id>` to the hash file. The id is eight lowercase base32 characters
+(`a-z`, `2-7`). An admin token cannot be bound to a tenant. Minting needs no connection to Incus; the tenant must exist
+when a call uses it.
+
+For this token, omitting a verb's `tenant` selects the bound tenant. Stating the same tenant is accepted; another is
+refused with `OutsideTokenTenant` before a handler, relay or approval runs. A token without `tenant=` keeps its current
+default: omitted `tenant` means the node's own project. With `--tenant`, bare names in `--services` are tenant-local;
+`<id>/<service>` is also accepted for that same tenant. Names from another tenant and duplicate names after resolution
+are refused. The file and mint answer spell these service limits as `<id>/<service>`.
+
+The token reaches the tenant-aware service, instance and snapshot verbs, plus `deploy_confirm` and `deploy_remove`,
+within its scope, tool list and service list. Of the verbs without `tenant`, only `arca_status`, `tenant_list`, `tenant_status`, `tenant_usage` and
+`action_propose` are available. The tenant list contains only its own row; status and usage require its own `id`.
+A proposal resolves its inner arguments and checks the action's tenant, scope, tools and services before saving it.
+Every other node verb, including `node_metrics` and `watch_report`, is refused. Every linked-node argument and every
+GET route is refused too. The tool list applies these same limits. No binding gives an approval or a standing grant.
+
+A token handed down by a bound parent must bind to the same tenant and remain within the parent's other limits.
+An unbound parent may hand down a bound child when that child's resolved services are within its own list.
+A release that skips unknown token lines leaves a token with an unknown `tenant=` line out. A release from before
+unknown-line skipping refuses the whole token directory on that line: revoke tenant-bound tokens before such a
+downgrade.
 
 ### Modes and the umask
 
@@ -6896,6 +6921,9 @@ arca-gitlab-pool: totals jobs_now=3 of 6 jobs_done=161 jobs_failed=12 runners=2 
 A node may hold tenants: each is one restricted Incus project of its own, on the node's managed service network, with its
 own caps and its own block of addresses. The node's own project, `arcak-svc`, stays the node owner's. The rules are 61 to
 67 of `docs/OWNERSHIP.md`.
+
+A tenant-bound token can work only in its bound tenant; omitting `tenant` selects that tenant. Tokens without a
+binding keep the node project as their default. See "Tenant-bound tokens" for the verbs they may reach.
 
 `kernel.tenants` turns it on. Without the key the node behaves exactly as before, and every tenant verb, and every verb
 given a `tenant`, answers "this node has no tenants". The key needs `kernel.serviceCidr` and is refused beside

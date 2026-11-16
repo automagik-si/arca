@@ -2,7 +2,7 @@
 //!
 //! A token is the secret `arca_` followed by 43 base64url characters (32 random bytes). The server holds only the SHA-256
 //! digest of the whole secret, in `<id>.hash`, whose text is `scope=<scope>` and `sha256=<64 lowercase hex>`, then, each at
-//! most once and in any order, the optional `tools=<comma list>`, `services=<comma list>` ([`ServiceLimit`]),
+//! most once and in any order, the optional `tools=<comma list>`, `tenant=<id>`, `services=<comma list>` ([`ServiceLimit`]),
 //! `expires=<RFC 3339 UTC time>` and `by=<parent token id>`, each on its own line. A secret carries 256 random bits, so a
 //! plain digest is enough: a copied hash file yields no usable secret.
 //!
@@ -14,7 +14,11 @@
 //!
 //! A token with `by=` was handed down by that token. It loads only while its parent does, and only when it is no wider:
 //! no higher scope, no tool, service or later expiry its parent lacks. Revoking a parent so leaves out its whole chain at
-//! the next load. An expired token is refused at each lookup.
+//! the next load. A bound parent only admits children bound to the same tenant. An expired token is refused at each lookup.
+//!
+//! A `tenant=` line binds the token to one tenant. Bare service names in its `services=` line are resolved inside that
+//! tenant; another tenant is malformed. A release with unknown-line skipping leaves a tenant-bound token out; an older
+//! release without that behavior refuses the whole directory on `tenant=`, so revoke these tokens before downgrading.
 //! A secret is never stored, logged or echoed, and an error names a file, never its content. The token directory is a real
 //! directory, not a symlink, owned by this process and writable by its owner only.
 //!
@@ -58,6 +62,8 @@ pub struct Caller {
 /// What a stored token is limited to besides its scope and its tool list.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Limits {
+    /// The tenant this token may reach. `None` keeps the existing node-wide behavior.
+    pub tenant: Option<String>,
     /// The services it may reach. `None` reaches every service its scope and tools do.
     pub services: Option<ServiceLimit>,
     /// When it stops being accepted, in seconds since the Unix epoch. `None` never.
@@ -409,7 +415,8 @@ pub fn admin_token_ids(dir: &Path) -> Vec<String> {
             let Ok(Body { scope, limits, .. }) = parse_body(text) else {
                 return None;
             };
-            (scope == Scope::Admin && limits.services.is_none()).then_some(id)
+            (scope == Scope::Admin && limits.services.is_none() && limits.tenant.is_none())
+                .then_some(id)
         })
         .collect();
     ids.sort();
@@ -427,7 +434,7 @@ pub fn mint_with_tools(scope: Scope, tools: Option<&[String]>) -> (String, Strin
 }
 
 /// A new secret of `scope` and its hash-file text, with an optional tool allowlist and the `limits` it is minted with:
-/// the `services=`, `expires=` and `by=` lines, each when it is set.
+/// the `tenant=`, `services=`, `expires=` and `by=` lines, each when it is set.
 pub fn mint_limited(scope: Scope, tools: Option<&[String]>, limits: &Limits) -> (String, String) {
     let mut raw = [0u8; SECRET_BYTES];
     getrandom::fill(&mut raw).expect("the operating system's random source is available");
@@ -439,6 +446,9 @@ pub fn mint_limited(scope: Scope, tools: Option<&[String]>, limits: &Limits) -> 
     );
     if let Some(tools) = tools {
         text.push_str(&format!("tools={}\n", tools.join(",")));
+    }
+    if let Some(tenant) = &limits.tenant {
+        text.push_str(&format!("tenant={tenant}\n"));
     }
     if let Some(services) = &limits.services {
         text.push_str(&format!("services={}\n", services.as_line()));
@@ -559,6 +569,9 @@ fn load_one(
     if body.limits.by.as_deref() == Some(id.as_str()) {
         return Err(malformed());
     }
+    if body.scope == Scope::Admin && body.limits.tenant.is_some() {
+        return Ok(Loaded::Skipped("an admin token is never bound to a tenant"));
+    }
     if body.scope == Scope::Admin && body.limits.services.is_some() {
         return Ok(Loaded::Skipped(SKIP_ADMIN_LIMITED));
     }
@@ -622,7 +635,12 @@ fn no_wider(child: &Entry, parent: &Entry) -> bool {
         (None, Some(_)) => false,
         (Some(mine), Some(theirs)) => mine <= theirs,
     };
-    child.scope <= parent.scope && tools && services && expires
+    let tenant = parent
+        .limits
+        .tenant
+        .as_ref()
+        .is_none_or(|tenant| child.limits.tenant.as_ref() == Some(tenant));
+    child.scope <= parent.scope && tools && services && expires && tenant
 }
 
 /// The lines of one hash file.
@@ -677,6 +695,12 @@ fn parse_body(text: &str) -> Result<Body, BodyError> {
                 )
             }
             "services" => limits.services = Some(ServiceLimit::parse(value).ok_or(Malformed)?),
+            "tenant" => {
+                if !arca_api::limits::tenant_id_ok(value) {
+                    return Err(Malformed);
+                }
+                limits.tenant = Some(value.to_string());
+            }
             "expires" => limits.expires = Some(parse_rfc3339(value).ok_or(Malformed)?),
             "by" => {
                 limits.by = Some(
@@ -692,6 +716,13 @@ fn parse_body(text: &str) -> Result<Body, BodyError> {
     }
     if unknown {
         return Err(BodyError::Unknown);
+    }
+    if let Some(tenant) = &limits.tenant {
+        limits.services = limits
+            .services
+            .as_ref()
+            .map(|services| services.in_tenant(tenant).ok_or(Malformed))
+            .transpose()?;
     }
     Ok(Body {
         scope,

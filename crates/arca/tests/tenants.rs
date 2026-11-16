@@ -564,3 +564,6 @@ fn a_tenant_create_reads_the_instances_with_their_live_state_and_a_tenant_list_d
         "the list read live state"
     );
 }
+
+#[path = "tenants/token_binding.rs"]
+mod token_binding;

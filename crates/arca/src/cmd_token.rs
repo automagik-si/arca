@@ -62,7 +62,19 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
         Some(text) => Some(parse_tools(text, scope)?),
         None => None,
     };
-    let limits = Limits {
+    let mut limits = Limits {
+        tenant: flags
+            .value("tenant")
+            .map(|tenant| {
+                arca_api::limits::tenant_id_ok(tenant)
+                    .then(|| tenant.to_string())
+                    .ok_or_else(|| {
+                        Failure::Usage(
+                            "--tenant is eight lowercase base32 characters (a-z, 2-7)".into(),
+                        )
+                    })
+            })
+            .transpose()?,
         services: flags.value("services").map(parse_services).transpose()?,
         expires: flags
             .value("expires")
@@ -70,6 +82,22 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
             .transpose()?,
         by: None,
     };
+    if let Some(tenant) = &limits.tenant {
+        limits.services = limits
+            .services
+            .as_ref()
+            .map(|services| {
+                services.in_tenant(tenant).ok_or_else(|| {
+                    Failure::Usage("--services must name distinct services of --tenant only".into())
+                })
+            })
+            .transpose()?;
+        if scope == Scope::Admin {
+            return Err(Failure::Usage(
+                "an admin token is never bound to a tenant: choose a lower scope".into(),
+            ));
+        }
+    }
     if scope == Scope::Admin && limits.services.is_some() {
         return Err(Failure::Usage(
             "--services limits a token to named services, and the admin token is never limited: choose a lower scope"
@@ -113,6 +141,9 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
         })?;
     }
     let mut said = json!({ "id": id, "scope": scope.as_str() });
+    if let Some(tenant) = &limits.tenant {
+        said["tenant"] = json!(tenant);
+    }
     if let Some(services) = &limits.services {
         said["services"] = json!(services.as_line());
     }

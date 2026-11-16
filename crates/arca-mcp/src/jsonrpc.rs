@@ -228,6 +228,7 @@ fn tools_for(server: &Server, caller: &Caller) -> Vec<Value> {
         .verbs
         .iter()
         .filter(|v| may_call(caller.scope, v) && caller.allows_tool(v.name))
+        .filter(|v| caller.limits.tenant.is_none() || arca_api::tenant::offered(v))
         .filter(|v| !limited || arca_api::limits::offered(v))
         .map(|v| {
             json!({
@@ -276,6 +277,25 @@ async fn call_tool(
         .unwrap_or_else(|| json!({}));
     if let Err(why) = conforms(&(verb.params)(), &arguments) {
         return Ok(Some(result_reply(id, invalid_arguments(&why))));
+    }
+    if let Some(tenant) = &caller.limits.tenant {
+        let resolved = arca_api::tenant::resolve(verb, tenant, &mut arguments).and_then(|inner| {
+            if inner.is_some_and(|inner| {
+                !may_call(caller.scope, inner) || !caller.allows_tool(inner.name)
+            }) {
+                Err("the proposed action is outside this token's scope or tools")
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(why) = resolved {
+            return Ok(Some(error_reply(
+                id,
+                REFUSED,
+                why,
+                Some(json!({ "refusal": arca_api::tenant::OUTSIDE_TENANT })),
+            )));
+        }
     }
     // A token limited to named services is held to them here, before anything runs: on what the call touches, and on what
     // a proposal would do once the owner approved it. Its limit is this node's, so it is never relayed to a linked one.
@@ -457,7 +477,10 @@ async fn call_tool(
         }
     };
     match result {
-        Ok(value) => {
+        Ok(mut value) => {
+            if let Some(tenant) = &caller.limits.tenant {
+                arca_api::tenant::cut(verb, tenant, &mut value);
+            }
             let value = match &limited {
                 None => value,
                 Some((services, args)) => {

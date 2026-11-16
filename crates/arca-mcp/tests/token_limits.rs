@@ -37,6 +37,7 @@ fn services(text: &str) -> Option<ServiceLimit> {
 
 fn limits(list: Option<&str>, expires: Option<u64>, by: Option<&str>) -> Limits {
     Limits {
+        tenant: None,
         services: list.and_then(services),
         expires,
         by: by.map(str::to_string),

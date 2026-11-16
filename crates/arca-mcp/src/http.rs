@@ -415,7 +415,8 @@ async fn serve_get(
     // The route is its verb's reading over GET: a token the verb does not admit, by scope or by tool list, is refused
     // here as a `tools/call` of the verb is. A route's answer has no cut to a token's services, so a token limited to
     // named services is refused every route.
-    let admitted = caller.limits.services.is_none()
+    let admitted = caller.limits.tenant.is_none()
+        && caller.limits.services.is_none()
         && server
             .verbs
             .iter()

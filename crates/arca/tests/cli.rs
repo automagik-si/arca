@@ -114,26 +114,22 @@ fn token_mint_refuses_invalid_tenants_cross_tenant_services_and_bound_admins() {
         ("doctor", "bad", "web"),
         ("doctor", "abcdefgh", "ijklmnop/web"),
         ("admin", "abcdefgh", "web"),
+        ("admin", "abcdefgh", ""),
     ] {
         let scratch = Scratch::new("bad-tenant-token");
         let hashes = scratch.at("tokens");
         fs::create_dir(&hashes).unwrap();
         fs::set_permissions(&hashes, fs::Permissions::from_mode(0o700)).unwrap();
         let secret = scratch.at("secret");
-        let out = arca()
-            .args([
-                "token",
-                "mint",
-                "--scope",
-                scope,
-                "--id",
-                "tenant",
-                "--tenant",
-                tenant,
-                "--services",
-                services,
-                "--hash-dir",
-            ])
+        let mut command = arca();
+        command.args([
+            "token", "mint", "--scope", scope, "--id", "tenant", "--tenant", tenant,
+        ]);
+        if !services.is_empty() {
+            command.args(["--services", services]);
+        }
+        let out = command
+            .arg("--hash-dir")
             .arg(&hashes)
             .arg("--out")
             .arg(&secret)
@@ -1847,7 +1843,7 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
         "  picks it: when ARCA_CONFIG names another file than the default, they refuse and say the --config to run them with.",
         "  init --watch-only [--config <file>] (back to a node that only looks)",
         "  call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]",
-        "  token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--services <comma list>] [--expires <30m|12h|7d|RFC 3339 UTC time>] [--replace] [--config <file> | --hash-dir <dir>]",
+        "  token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--tenant <id>] [--services <comma list>] [--expires <30m|12h|7d|RFC 3339 UTC time>] [--replace] [--config <file> | --hash-dir <dir>]",
         "  token reload [--config <file>] (the running node reads its tokens again)",
         "  serve [--config <file>]",
     ] {

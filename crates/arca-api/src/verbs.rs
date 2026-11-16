@@ -3054,7 +3054,7 @@ fn deploy_rollback_result() -> Value {
 /// The optional `tenant` of a verb that may act inside one tenant.
 fn tenant_schema() -> Value {
     json!({
-        "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+        "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the token's bound tenant, or in the node's own project when the token has no tenant binding. A node without kernel.tenants has no tenants.",
         "pattern": "^[a-z2-7]{8}$",
         "type": "string"
     })

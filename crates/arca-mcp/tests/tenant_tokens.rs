@@ -6,9 +6,12 @@ use std::sync::{Arc, Mutex};
 
 use arca_api::{Scope, verbs};
 use arca_mcp::{
-    CallError, Caller, Server, TokenStore, TokenStoreError, ToolHandler, mint, serve_unix,
+    CallError, Caller, GetHandler, GetReply, Server, TokenStore, TokenStoreError, ToolHandler,
+    mint, serve_unix,
 };
-use common::{Scratch, bearer, connect_unix, post, rpc, wait_for_socket, write_hash_file};
+use common::{
+    Scratch, bearer, connect_unix, exchange, post, rpc, wait_for_socket, write_hash_file,
+};
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
@@ -22,6 +25,17 @@ fn token(scratch: &Scratch, id: &str, scope: Scope, lines: &str) -> String {
 }
 
 struct Recording(&'static str, Calls);
+
+struct Inventory;
+
+impl GetHandler for Inventory {
+    fn get(&self, _: Option<&str>, _: &Caller) -> Result<GetReply, CallError> {
+        Ok(GetReply {
+            content_type: "text/plain",
+            body: b"inventory".to_vec(),
+        })
+    }
+}
 
 impl ToolHandler for Recording {
     fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
@@ -49,6 +63,8 @@ struct Door {
     bound: String,
     limited: String,
     open: String,
+    viewer: String,
+    proposer_only: String,
     calls: Calls,
 }
 
@@ -63,12 +79,20 @@ impl Door {
             "tenant=abcdefgh\nservices=web\n",
         );
         let open = token(&scratch, "open", Scope::Operator, "");
+        let viewer = token(&scratch, "viewer", Scope::Viewer, "tenant=abcdefgh\n");
+        let proposer_only = token(
+            &scratch,
+            "proposer",
+            Scope::Doctor,
+            "tenant=abcdefgh\ntools=action_propose\n",
+        );
         let calls: Calls = Arc::default();
         let mut server = Server::new(verbs(), TokenStore::load(scratch.path()).unwrap())
             .log_to(Arc::new(|_| {}));
         for v in verbs() {
             server = server.handle(v.name, Arc::new(Recording(v.name, calls.clone())));
         }
+        server = server.get_route("/inventory", "arca_status", Arc::new(Inventory));
         let runtime = Runtime::new().unwrap();
         let socket = scratch.at("mcp.sock");
         let (router, served) = (server.router(), socket.clone());
@@ -81,6 +105,8 @@ impl Door {
             bound,
             limited,
             open,
+            viewer,
+            proposer_only,
             calls,
         }
     }
@@ -101,6 +127,32 @@ impl Door {
             "tools/call",
             json!({"name": name, "arguments": args}),
         )
+    }
+}
+
+#[test]
+fn a_proposals_inner_scope_and_tool_list_still_apply() {
+    let door = Door::start();
+    for token in [&door.viewer, &door.proposer_only] {
+        let reply = door.call(
+            token,
+            "action_propose",
+            json!({"action": "service_remove", "args": {"name": "web"}}),
+        );
+        assert_eq!(refusal(&reply), "OutsideTokenTenant", "{reply}");
+    }
+    assert!(door.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_bound_token_never_reads_a_get_route_even_when_its_verb_is_allowed() {
+    let door = Door::start();
+    for (token, expected) in [(&door.bound, 403), (&door.open, 200)] {
+        let request = format!(
+            "GET /inventory HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        let reply = exchange(&mut connect_unix(&door.socket), request.as_bytes());
+        assert_eq!(reply.status, expected);
     }
 }
 
@@ -349,4 +401,33 @@ fn the_tool_list_contains_only_the_closed_tenant_allowlist() {
     ] {
         assert!(!names.contains(&name), "{name}");
     }
+}
+
+#[test]
+fn mint_round_trips_the_binding_and_unbound_parent_can_narrow_to_it() {
+    let scratch = Scratch::new("tenant-mint");
+    token(&scratch, "parent", Scope::Doctor, "services=abcdefgh/web\n");
+    let limits = arca_mcp::Limits {
+        tenant: Some(TENANT.into()),
+        services: Some(arca_api::limits::ServiceLimit::parse("web").unwrap()),
+        by: Some("parent".into()),
+        ..Default::default()
+    };
+    let (secret, text) = arca_mcp::mint_limited(Scope::Viewer, None, &limits);
+    assert!(text.contains("\ntenant=abcdefgh\n"));
+    write_hash_file(scratch.path(), "child", &text, 0o400);
+    let store = TokenStore::load(scratch.path()).unwrap();
+    let caller = store.lookup(&secret).unwrap();
+    assert_eq!(caller.limits.tenant.as_deref(), Some(TENANT));
+    assert_eq!(caller.limits.services.unwrap().as_line(), "abcdefgh/web");
+}
+
+#[test]
+fn a_stored_tenant_bound_admin_never_authenticates_or_counts_as_the_nodes_admin() {
+    let scratch = Scratch::new("tenant-admin");
+    let secret = token(&scratch, "admin", Scope::Admin, "tenant=abcdefgh\n");
+    let store = TokenStore::load(scratch.path()).unwrap();
+    assert!(store.lookup(&secret).is_none());
+    assert_eq!(store.skipped().len(), 1);
+    assert!(arca_mcp::admin_token_ids(scratch.path()).is_empty());
 }
