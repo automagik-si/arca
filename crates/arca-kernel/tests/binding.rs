@@ -132,7 +132,7 @@ fn a_committed_binding_reopens_with_new_instance_volume_and_patch_inverse() {
 #[test]
 fn before_the_append_and_after_a_torn_append_the_old_binding_stays_current() {
     let line = format!("{}\n", event());
-    for cut in [0, 1, line.len() / 2, line.len() - 1] {
+    for cut in 0..line.len() {
         let scratch = Scratch::new();
         seed(&scratch.0);
         let before = fs::read(&scratch.0).unwrap();
@@ -398,4 +398,103 @@ fn a_pending_effect_or_invalid_destination_refuses_a_binding_before_any_append()
     journal
         .bind(serde_json::from_value(event()["binding"].clone()).unwrap())
         .unwrap();
+}
+
+fn seed_other(path: &std::path::Path, slot: &str, source_volume: bool) {
+    let mut journal = Journal::open(FileJournal::open(path).unwrap()).unwrap();
+    let mut object = if source_volume {
+        volume("pool1")
+    } else {
+        instance("new")
+    };
+    if !source_volume {
+        object.name = "other-name".into();
+    }
+    let mut target = object.clone();
+    if slot != "target" {
+        target.uuid = None;
+    }
+    let mut outcome = object.clone();
+    if slot == "inverse" {
+        outcome.uuid = None;
+    }
+    let inverse = if slot == "create" {
+        Inverse::IncusDelete { object }
+    } else if slot == "inverse" {
+        Inverse::IncusRestoreConfig {
+            object,
+            config: BTreeMap::new(),
+        }
+    } else {
+        Inverse::Emission
+    };
+    let id = journal
+        .intend(
+            &EntryId("other-entry".into()),
+            EffectClass::B,
+            Digest::of(b"other"),
+            target,
+            None,
+            12,
+        )
+        .unwrap();
+    journal.applied(id, outcome, inverse).unwrap();
+}
+
+#[test]
+fn bind_refuses_a_destination_uuid_owned_by_another_entry_at_any_address() {
+    for slot in ["create", "target", "object", "inverse"] {
+        let scratch = Scratch::new();
+        seed(&scratch.0);
+        seed_other(&scratch.0, slot, false);
+        let before = fs::read(&scratch.0).unwrap();
+        let mut journal = Journal::open(FileJournal::open(&scratch.0).unwrap()).unwrap();
+        let binding = serde_json::from_value(event()["binding"].clone()).unwrap();
+        assert!(journal.bind(binding).is_err(), "collision in {slot}");
+        assert_eq!(fs::read(&scratch.0).unwrap(), before);
+        assert_eq!(
+            removal(&journal, &EntryId("service-sample".into()), 30)
+                .plan
+                .unwrap()
+                .objects,
+            [volume("pool1"), instance("old")]
+        );
+    }
+}
+
+#[test]
+fn replay_refuses_a_destination_uuid_owned_by_another_entry_at_any_address() {
+    for slot in ["create", "target", "object", "inverse"] {
+        let scratch = Scratch::new();
+        seed(&scratch.0);
+        seed_other(&scratch.0, slot, false);
+        append(&scratch.0, &event());
+        let bytes = fs::read(&scratch.0).unwrap();
+        assert!(
+            Journal::open(FileJournal::open(&scratch.0).unwrap()).is_err(),
+            "collision in {slot}"
+        );
+        assert_eq!(fs::read(&scratch.0).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn another_entry_on_the_source_volume_refuses_bind_and_replay() {
+    for slot in ["target", "object", "inverse"] {
+        let scratch = Scratch::new();
+        seed(&scratch.0);
+        seed_other(&scratch.0, slot, true);
+        let before = fs::read(&scratch.0).unwrap();
+        {
+            let mut journal = Journal::open(FileJournal::open(&scratch.0).unwrap()).unwrap();
+            let binding = serde_json::from_value(event()["binding"].clone()).unwrap();
+            assert!(journal.bind(binding).is_err(), "source volume in {slot}");
+            assert_eq!(fs::read(&scratch.0).unwrap(), before);
+        }
+        append(&scratch.0, &event());
+        assert!(
+            Journal::open(FileJournal::open(&scratch.0).unwrap()).is_err(),
+            "source volume in {slot}"
+        );
+    }
 }
