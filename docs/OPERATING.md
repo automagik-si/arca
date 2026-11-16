@@ -6162,6 +6162,115 @@ What to know:
 - **The image.** The template pins `docker.io/tailscale/tailscale` release 1.104.7 by digest, so it never updates by
   itself. A later Arca release moves the pin.
 
+## One Automagik workspace per project
+
+This prepares one `automagik-workspace` service and virtual machine per project; deployment waits for owner review
+and the final image release. Its existing root disk holds the persistent
+`WS_DATA` directory, `/var/lib/automagik-workspace/data`, bound into the server at `/data`. There is no new data
+volume. Removing the machine removes this data too.
+
+The image contract runs the distroless image as numeric uid:gid `1000:1000` (the `automagik` user, with no
+`/home` entry). `WS_DATA_OWNER` and the paths are named together at the top of
+`templates/automagik-workspace.sh`. The image's entrypoint runs as shipped:
+`/nodejs/bin/node /opt/automagik/entrypoint.mjs`, with working directory `/opt/automagik`. There is no systemd
+inside the container; the entrypoint supervises its programs. The existing keeper remains a service in the VM.
+
+| Server environment | Persistent path in the server |
+|--------------------|-------------------------------|
+| `HOME` | `/data` — native home private to this workspace |
+| `AUTOMAGIK_HOME` | `/data` — registry home |
+| `AUTOMAGIK_BOTS_HOME` | `/data/bots` — team state, deliberately distinct from the registry home |
+| `DSH_HOME` | `/data/dsh` |
+| `AUTOMAGIK_WORKSPACE` | `/data/workspace` — the project's real repository checkout |
+| `HERDR_APP_HOME` | `/data/herdr-app` — **PROPOSED**, being added by the image owner |
+| `HC_TERMINAL_SOCKET` | `/data/run/herdr-core/default.sock` — **PROPOSED**, for the supervised herdr-core |
+
+The template prepares `/data`, these directories, `/data/secrets` (mode `0700`), `/data/run`,
+`/data/run/herdr-core` and `/data/acp/clis` as writable by uid:gid `1000:1000`, with mode `0700`.
+It does not recursively change existing files. They live under the one existing mount, which hides the image's
+seeded directories. The template **does not pre-populate `.herdr/bots.json`, a roster or any v2 registry file**.
+A real project checkout must be delivered to `/data/workspace` before first boot; preparing the directory does
+not clone a repository or supply its credentials. Repository delivery remains an owner prerequisite. The
+reviewed entrypoint then installs the vendor CLIs, creates the base triad, runs its seed and starts DSH.
+
+**Before admission.** The supplied image contract pins baked **pnpm 10.34.6** at `/usr/local/bin/pnpm`. The template
+explicitly sets `settings.automagikPnpm` to that path and passes it unchanged as `AUTOMAGIK_PNPM`. The image owner
+must reconfirm the executable and path at the release gate. There is no fallback to `PATH` or
+`AUTOMAGIK_APP_BROWSER=1`. An empty, missing, non-string or malformed path refuses startup before any container
+starts and the keeper says, on one line, that the CLI store requires the baked pnpm 10 path. The template checks
+the path's spelling; the image owner must verify the executable and its version. Vendor CLIs install at first
+boot rather than being redistributed in the image and persist at `/data/acp/clis`. The VM needs outbound HTTPS
+to `registry.npmjs.org` and the vendors' hosts. Fake-Docker tests cannot prove the real programs' installation
+or where they write.
+
+**Sign-in: passkey or phone only for a project workspace.** Leave `accessTeamDomain`, `accessAudience` and
+`accessEmails` empty. Those settings remain available to other workspaces that use Cloudflare Access e-mail
+sign-in. The current template supports a passkey claim on the **tailnet** reach, as described below; it does not
+implement a phone route. Arca must show the owner the one-time claim code once, behind the owner's passkey,
+before the owner claims the gate and registers a passkey on-screen. That claim-code screen is not built yet:
+it is missing Arca work, and the owner has no terminal step. Until it exists, reading the container health log
+at a terminal is an interim step for the node operator only, following the image's claim procedure. The keeper
+never reads or prints the code, and no Arca verb hands it out. Do not send the code through an assistant.
+The Cloudflare connector deliberately stays stopped when Access is unset, so merely clearing `accessEmails`
+does not create an internet passkey route.
+Automagik still needs to release the image implementing the supplied entrypoint and proposed herdr paths, confirm
+its claim-log access and recovery procedure, and supply any phone or internet passkey route that the project needs.
+Do not admit a workspace that needs that missing route, and do not substitute e-mail sign-in.
+
+**Admission, once the owner has accepted the prerequisites.** Propose `service_create` through `action_propose`,
+using a service name for that project, template `automagik-workspace`, and these settings:
+
+| Setting | Project choice |
+|---------|----------------|
+| `reach` | `tailnet` for the existing passkey route; any other route waits for the reviewed sign-in contract |
+| `publicUrl` | The exact HTTPS origin, the machine's own tailnet name for `tailnet` |
+| `automagikPnpm` | `/usr/local/bin/pnpm`, reconfirmed for the reviewed image |
+| `accessTeamDomain`, `accessAudience`, `accessEmails` | Empty; no e-mail sign-in |
+| `memberRunner` | `false` until its separately reviewed release is available |
+
+The proposal has shape `{"action":"service_create","args":{"name":"project-workspace","template":"automagik-workspace","settings":{...}}}`.
+The owner approves the card on Arca's approval page. It shows `Name`, `Template`, `Start` (created stopped until the
+reach secret is set), and a `Setting <name>` row for each setting supplied. Give all settings above explicitly so
+the owner sees their values. The homes, default image pin and VM size are template details, not extra card rows:
+review them before approval. `serverImage` is not selectable at create. Keep the current pin until Automagik
+supplies a final reviewed digest; the template description marks `settings.serverImage` as its replacement point.
+No image is published by this template change.
+
+**First boot and checks.** After a separately approved rollout, follow the reach's existing secret and
+`instance_start` steps below. `service_status` shows the service and its settings; `service_logs` shows the keeper.
+For the node operator, `systemctl status arca-automagik-workspace` and `/var/log/cloud-init-output.log` inside the
+VM explain a first boot that did not finish. The node operator checks these before handing the workspace over:
+
+- The keeper says the server and gate are healthy (HTTP 401 on their loopback ports), and the tailnet node serves
+  the exact origin. A running VM alone does not establish this.
+- Owner onboarding needs Arca's missing claim-code screen: Arca must show the code once behind the owner's
+  passkey, then the owner completes the gate's first claim on-screen. The keeper then says `claimed`. It infers
+  that from the claim file's absence, so also check a real owner sign-in. Until that screen exists, the terminal
+  read is for the node operator only. Do not copy the code into assistant conversations or Arca's logs.
+- On the server container, inspect only the home, workspace, socket and pnpm variables above. Confirm the
+  directories, `secrets`, `run` and `<AUTOMAGIK_HOME>/acp/clis` exist, are owned by uid:gid `1000:1000` with mode
+  `0700`, and resolve through the one `WS_DATA:/data` bind. Confirm pnpm reports `10.34.6`, the real checkout is in
+  `/data/workspace`, and `.herdr/bots.json` was absent before the entrypoint seeded it.
+- Check real CLI installation, account isolation and state persistence after a server restart. These need the
+  reviewed image and owner sign-in; the template tests exercise directory preparation and Docker arguments only.
+
+**Rollback.** Propose `{"action":"service_remove","args":{"name":"project-workspace"}}` through `action_propose`.
+The owner approves its removal card, whose `Name` row identifies the service. Removal deletes the VM's root disk:
+all workspace homes, installed CLIs, project files, workspace and gate account state, the tailnet identity and the
+service's stored secrets are lost. There is **no restore verb today**; removal is not a reversible rollback to a
+prior image. The backup paper, currently being revised, covers backups. Agree backup and recovery with the owner
+before admission. Remove any obsolete external tailnet node or tunnel route through its owning operator too.
+
+**Owner actions still required.** Confirm placement and capacity; deliver the real project checkout before first boot;
+obtain and review the final image digest, entrypoint, proposed herdr paths and baked pnpm path; confirm the image's
+bot registry seed, per-project base triad and versioned herdr-core artifact; exercise on-screen claim, passkey
+sign-in and recovery (and obtain a phone route if required); settle backups;
+approve the create and start; and verify the real first boot. This change performs none of those host or deployment
+actions.
+
+**Remaining Arca work.** Build the claim-code screen that shows the owner the code once, behind the owner's
+passkey. That owner flow is not available yet; an interim terminal read by the node operator does not replace it.
+
 ## An Automagik workspace in its own virtual machine
 
 The shipped `automagik-workspace` template is one virtual machine that holds one Automagik workspace and publishes it
@@ -6203,7 +6312,7 @@ token passes through that assistant's conversation.
    Audience (AUD) Tag" on its overview. From now on Cloudflare asks every visitor of that address to prove one of the
    listed e-mail addresses before anything reaches the workspace.
 3. **Arca: `service_create`**, with the workspace's own settings in the call:
-   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"publicUrl": "https://workspace.example.com", "accessTeamDomain": "<your team>.cloudflareaccess.com", "accessAudience": "<the audience tag>", "accessEmails": "owner@example.com"}}`.
+   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"automagikPnpm": "/usr/local/bin/pnpm", "publicUrl": "https://workspace.example.com", "accessTeamDomain": "<your team>.cloudflareaccess.com", "accessAudience": "<the audience tag>", "accessEmails": "owner@example.com"}}`.
    `publicUrl` is the address the workspace will have, with no closing slash; the three Access settings are the two
    values noted in step 2 and the same addresses as the policy. No copy of the template is made: these settings are
    given at create, and `service_status` shows them afterwards. The machine is created and stays `stopped`, because
@@ -6228,14 +6337,15 @@ token passes through that assistant's conversation.
    The Cloudflare "Tunnels" page lists the tunnel as `Healthy`. `https://workspace.example.com` shows Cloudflare's
    own sign-in for your e-mail address first, and then the workspace.
 
-The settings. A `service_create` may give `reach`, `publicUrl` and the three Access settings (the template lists
-them in `createSettings`); `serverImage` is the template's own, since the image a workspace runs is not for a
+The settings. A `service_create` may give `reach`, `publicUrl`, `automagikPnpm`, `memberRunner` and the three Access
+settings (the template lists them in `createSettings`); `serverImage` is the template's own, since the image a workspace runs is not for a
 create to choose.
 
 | Setting | Meaning |
 |---------|---------|
 | `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. It ships empty, which means "not set": the server then starts alone, no gate is started, and every status line says so. |
 | `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the e-mail addresses that may sign in: text, one address or several separated by commas (`"owner@example.com, second@example.com"`, 1 to 16). A create that gives a list is refused (`settings.accessEmails: expected a string, the type of the template's default`); a workspace made before with a list keeps it, and its own keeper reads it. None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS`: the text unchanged (the gate trims each address and compares without regard to case). An address the script does not take stops the workspace with `settings.accessEmails is 1 to 16 e-mail addresses ...`. |
+| `automagikPnpm` | Required absolute path of pnpm 10 baked into the server image, supplied by its owner. Passed as `AUTOMAGIK_PNPM`, with no fallback. Explicitly pins `/usr/local/bin/pnpm` from the image contract; an empty or missing setting refuses startup. Reconfirm the path for the final reviewed image. |
 | `serverImage` | The Automagik server's public image, pinned by digest (Automagik 3.146.5). The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below), and one with GitHub build provenance from `automagik-si/automagik` (see "The image's provenance" below). |
 
 | `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
@@ -6271,7 +6381,7 @@ choose a machine name you do not mind the world reading.
    treat it like a password. Decide the machine's name (for example `workspace1`) and note your tailnet's name:
    together they are the address, `https://workspace1.<tailnet>.ts.net`.
 2. **Arca: `service_create`** with
-   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"reach": "tailnet", "publicUrl": "https://workspace1.<tailnet>.ts.net"}}`:
+   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"reach": "tailnet", "publicUrl": "https://workspace1.<tailnet>.ts.net", "automagikPnpm": "/usr/local/bin/pnpm"}}`:
    the reach, and that address with no port and no closing slash. Give none of the three Access settings; with
    `tailnet` they are refused. It stays `stopped`.
 3. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TAILSCALE_AUTHKEY", "value": "<the key>"}`.
@@ -6393,8 +6503,9 @@ What to know:
   snapshot carries the token's file too.
 - **No Docker Compose.** The keeper starts the three containers with `docker run`, with the same image, entrypoint,
   environment, volumes, shared network namespace and restrictions (read-only file system, no capability, no new
-  privileges) that Automagik's compose file gives the gate, and gives the server no environment, as that file
-  does. The connector gets the same three restrictions. The first boot installs `docker.io` and `docker-cli`
+  privileges) that Automagik's compose file gives the gate. The server gets its explicit user, persistent homes,
+  workspace, proposed herdr socket and `AUTOMAGIK_PNPM`; it still gets no public origin. The connector gets the same
+  three restrictions. The first boot installs `docker.io` and `docker-cli`
   (on Debian 13 the `docker` command is a package of its own) and no compose package.
 - **No model key.** The template declares no model secret. Sign-ins to model providers happen inside the workspace.
 - **After a restart of the node** the machine starts by itself (the template sets `autostart`), and the keeper starts
@@ -7769,7 +7880,9 @@ no answer, a start that Docker refuses, the settings that are refused (by the ke
 first boot), `accessEmails` as text and as a list, the first boot's packages, verifier download, unit and console
 lines, its failures (a verifier whose sha256 is not the fixed one among them), the provenance check before the one
 pull of the server's image (and no start when it fails), `--pull never` on every container from that image, and that
-the token is in no output, no file outside the machine's memory and no command line. It does not run cosign itself.
+the token is in no output, no file outside the machine's memory and no command line. It also covers the explicit
+persistent homes, private to their workspace, their owner and modes, CLI state surviving server replacement,
+the explicit image user, and missing or malformed pnpm paths refusing any container start. It does not run cosign itself.
 
 For the tailnet reach it covers the node's exact command line (a namespace of its own, never the server's,
 userspace networking, the key as a file's path, the state directory), the private network and the relay's command
