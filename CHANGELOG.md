@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.33.0 (2026-11-16)
+
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
 refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
 the node holds that cluster's config (`/etc/ceph/<name>.conf`) and the read-only client's keyring beside it, and reads
@@ -63,6 +65,16 @@ The edge allows the PROXY protocol header from each service linked to it (`servi
 service's own address, besides the port device's loopback, so a connector that sends one needs no hand edit inside the
 edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the
 routes are untouched. An edge with no service linked to it keeps exactly the config it had.
+
+- Merge feat/edge-allow-linked: the edge's PROXY allow list names the services linked to it
+- Merge fix/disconnect-data-volume: a disconnect restores only the link's own names, so a plain template value no longer blocks later changes
+- Merge fix/approve-page-every-card: the approve page lists every waiting card and a tap approves only the card tapped
+- Merge feat/support-report: support reports with named-only support verbs and a refresh that never widens scope
+- Merge fix/automagik-keeper-netns: the keeper heals a gate, tunnel or relay left in an old network namespace after the server restarts
+- Merge feat/automagik-member-runner: an opt-in member runner for Automagik workspaces, uid 1000 locked down when on, placeholder pin until Automagik publishes the runner
+- Merge feat/tailscale-connector: a one-click Tailscale connector template that joins a tailnet and forwards a port inside Arca with PROXY v2
+- Merge fix/import-reword-no-lock-wait: plan handlers never wait on the kernel lock; serve rewords waiting import cards before it shares the kernel
+- Merge feat/vm-import-cross-cluster: import a VM's disk from another Ceph cluster, the card names the cluster read
 
 ## 0.32.0 (2026-11-16)
 
