@@ -80,7 +80,7 @@ impl Provider for PausedProvider {
         op: &EffectOp,
         planned: &Planned,
     ) -> Result<(ObjectRef, Inverse), EffectRefusal> {
-        // An instance create whose answer never came: the provider cannot tell whether it landed.
+        // An instance create whose answer and read-back are unavailable: its outcome stays unknown.
         if *self.unknown_create.lock().expect("unknown switch")
             && matches!(
                 op,
@@ -100,6 +100,11 @@ impl Provider for PausedProvider {
         target: &ObjectRef,
         pre_image: Option<&std::collections::BTreeMap<String, Option<String>>>,
     ) -> Result<ReadBack, EffectRefusal> {
+        if target.kind == IncusKind::Instance
+            && *self.unknown_create.lock().expect("unknown switch")
+        {
+            return Err(EffectRefusal::Unresolved);
+        }
         self.inner.read_back(entry, target, pre_image)
     }
     fn read_back_acl(

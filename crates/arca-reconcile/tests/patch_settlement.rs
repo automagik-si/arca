@@ -83,9 +83,37 @@ fn lost_answer(apply: bool, read_fails: bool) {
         )
     };
     fake.drop_patch_answer(PATH, apply);
-    fake.set_operations_unreadable(read_fails);
+    let operation = fake.hold_operation(&ObjectRef {
+        kind: IncusKind::Instance,
+        project: PROJECT.into(),
+        parent: None,
+        name: "box".into(),
+        uuid: None,
+    });
     let first = doc(1, None, "first");
-    let outcomes = reconciler.reconcile(&first, NOW);
+    let outcomes = std::thread::scope(|scope| {
+        let release = scope.spawn(|| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !fake
+                .requests()
+                .iter()
+                .any(|request| request.path.contains("/wait"))
+            {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "settlement must wait for the operation"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if read_fails {
+                fake.fail_reads(PATH, 1, 500);
+            }
+            fake.release_operation(&operation);
+        });
+        let outcomes = reconciler.reconcile(&first, NOW);
+        release.join().unwrap();
+        outcomes
+    });
     if read_fails {
         assert!(
             outcomes
@@ -94,6 +122,7 @@ fn lost_answer(apply: bool, read_fails: bool) {
         );
         assert_eq!(reconciler.journal().unresolved().len(), 1);
         let blocked = doc(2, Some(first.document.digest()), "second");
+        fake.fail_reads(PATH, 1, 500);
         let outcomes = reconciler.reconcile(&blocked, NOW + 1);
         assert!(
             outcomes.iter().any(
@@ -101,7 +130,6 @@ fn lost_answer(apply: bool, read_fails: bool) {
             )
         );
         assert_eq!(patches(&fake), 1, "an open intent is never replayed");
-        fake.set_operations_unreadable(false);
         let next = doc(3, Some(blocked.document.digest()), "third");
         assert!(
             reconciler
@@ -139,6 +167,8 @@ fn lost_answer(apply: bool, read_fails: bool) {
         2,
         "one PATCH per intent; no replay during settlement"
     );
+    let live = reconciler.journal().live(&EntryId("patch".into())).len();
+    drop(reconciler);
     let (records, _) = FileJournal::open(&journal_path).unwrap().load().unwrap();
     let first_outcome = records
         .iter()
@@ -152,10 +182,7 @@ fn lost_answer(apply: bool, read_fails: bool) {
             EffectState::Failed
         }
     );
-    assert_eq!(
-        reconciler.journal().live(&EntryId("patch".into())).len(),
-        if apply { 2 } else { 1 }
-    );
+    assert_eq!(live, if apply { 2 } else { 1 });
 }
 
 fn patches(fake: &FakeIncus) -> usize {

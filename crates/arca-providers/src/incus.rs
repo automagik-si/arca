@@ -5,9 +5,9 @@
 //! applies anything. `docs/OWNERSHIP.md` states the rules.
 //!
 //! A write that Incus answered with an error, or that did not finish, may still have landed. The provider reads the object back
-//! before it decides the outcome, unless the answer could not be read at all: then it makes no read, since a read after a write
-//! still running proves nothing. It reports a failure only when the object shows the write did not happen, and reports
-//! [`EffectRefusal::Unresolved`] for anything it cannot prove either way.
+//! before it decides the outcome. A config patch whose answer is uncertain first waits for operations on its object; other
+//! writes whose answers could not be read stay unresolved. It reports a failure only when the object shows the write did not
+//! happen, and reports [`EffectRefusal::Unresolved`] for anything it cannot prove either way.
 //!
 //! The read-back that settles an intent after a restart, or finds a removed entry's object gone, reads the object only once no
 //! operation Incus still runs that may write it names it: it waits on each such operation up to the operation deadline, and an
@@ -1036,11 +1036,10 @@ impl IncusProvider {
         }
     }
 
-    /// The settled outcome of a patch whose request failed. A refusal before the write is final. A 412 is a stale plan, and changes
-    /// nothing. An answer that could not be read, an unconfirmed write and a timeout are unresolved with no read-back: an operation
-    /// still running can apply after a read that shows the pre-image. Any other error is settled by a read-back. A patch the
-    /// read-back shows is landed; a patch the read-back shows without its change did not land; anything else is unresolved. The
-    /// read-back's uuid is used only for the writer's own checks, so the answer names the object as the op did.
+    /// Settles a failed patch from a read-back. A refusal before the write is final; a 412 is a stale plan. When the
+    /// answer is uncertain, first wait for operations on the object so a pre-image cannot precede a still-running patch.
+    /// Changes present mean applied; the pre-image means not applied; an unreadable or different state stays unresolved.
+    /// The answer names the object as the op did, as for a patch whose request succeeded.
     fn settle_patch(
         &self,
         entry: &EntryId,
@@ -1051,30 +1050,29 @@ impl IncusProvider {
         error: IncusError,
     ) -> Result<(), EffectRefusal> {
         match error {
-            IncusError::Refused(reason) => Err(EffectRefusal::Provider(reason)),
-            IncusError::Status { code: 412, .. } => Err(EffectRefusal::Stale),
+            IncusError::Refused(reason) => return Err(EffectRefusal::Provider(reason)),
+            IncusError::Status { code: 412, .. } => return Err(EffectRefusal::Stale),
             IncusError::AppliedUnconfirmed(_)
             | IncusError::Timeout
             | IncusError::Io(_)
-            | IncusError::Decode(_) => Err(EffectRefusal::Unresolved),
-            _ => {
-                let Ok(reading) = writer.read_class(object) else {
-                    return Err(EffectRefusal::Unresolved);
-                };
-                if !kernel_may_write(&reading.class, entry) {
-                    return Err(EffectRefusal::Unresolved);
-                }
-                if shows(&reading.config, changes) {
-                    return Ok(());
-                }
-                if self.shows_pre_image(entry, &reading.config, pre_image) {
-                    return Err(EffectRefusal::Provider(
-                        "the patch did not land".to_string(),
-                    ));
-                }
-                Err(EffectRefusal::Unresolved)
-            }
+            | IncusError::Decode(_) => self.settle_operations(object)?,
+            _ => {}
         }
+        let Ok(reading) = writer.read_class(object) else {
+            return Err(EffectRefusal::Unresolved);
+        };
+        if !kernel_may_write(&reading.class, entry) {
+            return Err(EffectRefusal::Unresolved);
+        }
+        if shows(&reading.config, changes) {
+            return Ok(());
+        }
+        if self.shows_pre_image(entry, &reading.config, pre_image) {
+            return Err(EffectRefusal::Provider(
+                "the patch did not land".to_string(),
+            ));
+        }
+        Err(EffectRefusal::Unresolved)
     }
 
     /// Waits until no operation Incus still runs that may write `place` names it, for at most the operation deadline from the

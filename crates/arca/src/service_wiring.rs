@@ -206,8 +206,14 @@ impl ServiceHandler {
             .map(ServiceConfig::entry_id)
             .collect::<Vec<_>>();
         let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
-        if failed_for(&outcomes, &ids) {
-            return Err(service_refused("service config or ACL update failed"));
+        if let Some(why) = failure_reason(&outcomes, &ids) {
+            let message = format!("service config or ACL update failed: {why}");
+            eprintln!(
+                "arca: {}: {}",
+                self.verb,
+                message.replace(['\n', '\r'], " ")
+            );
+            return Err(service_refused(message));
         }
         Ok(())
     }

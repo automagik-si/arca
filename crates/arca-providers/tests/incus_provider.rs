@@ -2171,7 +2171,9 @@ fn serve_patch_then_drop(mut stream: UnixStream, seen: &Mutex<Vec<(String, Strin
     if method == "PATCH" {
         return;
     }
-    let reply = if method == "GET" && target == "/1.0/instances/io1?project=svc" {
+    let reply = if method == "GET" && target == OPERATIONS_PATH {
+        http(200, None, &sync_env(json!({})))
+    } else if method == "GET" && target == "/1.0/instances/io1?project=svc" {
         object_reply(&instance_meta(json!({MARK: "toy"})), "\"e1\"")
     } else {
         not_found()
@@ -2180,9 +2182,8 @@ fn serve_patch_then_drop(mut stream: UnixStream, seen: &Mutex<Vec<(String, Strin
 }
 
 #[test]
-fn a_patch_whose_answer_is_an_io_error_is_unresolved_and_is_not_read_back() {
-    // The object still shows its pre-image, which a read-back would report as "did not land". An I/O error says nothing about the
-    // write, since an operation still running can apply after such a read, so the outcome is unresolved and no read follows.
+fn a_patch_whose_answer_is_an_io_error_is_failed_when_read_back_shows_the_pre_image() {
+    // Once no operation can still apply the patch, its pre-image proves that it did not land.
     let dir = Scratch::new("patch-io");
     let socket = dir.0.join("patch-io.sock");
     let listener = UnixListener::bind(&socket).expect("bind");
@@ -2213,12 +2214,18 @@ fn a_patch_whose_answer_is_an_io_error_is_unresolved_and_is_not_read_back() {
     let result = provider.effect(&entry("toy"), &op, &planned);
     stop.store(true, Ordering::SeqCst);
     server.join().expect("the server thread");
-    assert_eq!(result, Err(EffectRefusal::Unresolved));
-    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert_eq!(
-        seen.last().map(|(method, _)| method.as_str()),
-        Some("PATCH"),
-        "no read-back followed the I/O error: {seen:?}"
+        result,
+        Err(EffectRefusal::Provider("the patch did not land".into()))
+    );
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert!(
+        seen.iter()
+            .any(|(method, target)| method == "GET" && target == OPERATIONS_PATH)
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&("GET".into(), "/1.0/instances/io1?project=svc".into()))
     );
 }
 

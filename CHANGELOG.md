@@ -7,6 +7,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+A config PATCH whose answer times out or is lost waits for Incus operations and reads the object back to settle its
+intent. Open intents are retried before later writes, so a temporary read failure no longer requires a restart once Incus
+answers again. PATCH requests get 30 seconds, and service config errors include the kernel's reason in the answer and log.
+
 ## 0.32.0 (2026-11-16)
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the

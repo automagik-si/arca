@@ -1,6 +1,6 @@
-//! Settling the journal after a restart. A killed process leaves intents with no outcome. Before any effect runs, each one is read
-//! back with a GET and settled from what the host shows, so the journal is a legal history again and the removal that follows sees
-//! what landed.
+//! Settling the journal after an uncertain write or a restart. Both can leave intents with no outcome. Before any effect runs,
+//! each one is read back with a GET and settled from what the host shows, so the journal is a legal history again and the removal
+//! that follows sees what landed.
 //!
 //! The rules, by the kind of intent:
 //!
@@ -58,11 +58,11 @@ enum Step {
 }
 
 impl<S: JournalStore> Reconciler<S> {
-    /// Settles every intent a restart left open, before any effect runs. Each one is read back and settled by the rules in the
-    /// module's documentation. The resolution is kept for [`Reconciler::resolution`].
+    /// Settles every open intent before opening the reconciler or trying another reconciliation or approved write. Each one is
+    /// read back and settled by the rules in the module's documentation. The resolution is kept for [`Reconciler::resolution`].
     ///
     /// Returns [`KernelError::Unresolved`] with the ids of the intents it could not settle, because a read could not be answered.
-    /// Those intents stay open, so the reconciler does not open. Calling it again settles nothing that is already settled.
+    /// Those intents stay open and keep writes blocked. Calling it again settles nothing that is already settled.
     pub fn resolve(&mut self, now_ms: u64) -> Result<Resolution, KernelError> {
         let mut resolution = Resolution {
             at_ms: now_ms,
