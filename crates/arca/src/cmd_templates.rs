@@ -86,6 +86,16 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik-workspace.json",
         "d30cf55d0c3de85be17a4e726aefd5018213d2bb4e5798b97837cbda826f22a9",
     ),
+    // 0.32.0: before memberRunner.
+    (
+        "automagik-workspace.json",
+        "3c2fea0f86a274aba33ef9bddc9285523d6d515705f944ce5104527cdef492a4",
+    ),
+    // 0.32.0: before the member runner.
+    (
+        "automagik-workspace.sh",
+        "8cdcf3d1403c4c130edaf95efd7024a67dc8ca9ba9503d54b3c298ec4efc5b50",
+    ),
     // 0.17.0 to 0.30.0: Automagik's release 3.136.4, and accessEmails a list only.
     (
         "automagik-workspace.json",

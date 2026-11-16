@@ -50,6 +50,27 @@
 #   code and never prints it; it looks only at whether the file is there. read_claim_code below is the one place
 #   that reads it, and nothing in this script calls it.
 #
+# The member runner (settings.memberRunner, off unless a create turns it on). A member of the workspace is someone the
+# owner lets in, and Automagik runs that member's commands under a host uid of the member's own, so a member cannot
+# read the owner's files. DSH's container cannot make a user namespace, so the runner does it, OUTSIDE the container:
+# Automagik's member-runner.mjs, run by Node 22 as a user of its own (automagik-runner) as a systemd service. It holds
+# one /etc/subuid and one /etc/subgid range and maps each member, for good, to one uid of that range through
+# newuidmap and newgidmap. It is rootless, needs no daemon, and is not in the docker group. DSH reaches it over one
+# unix socket in a folder only DSH's own uid and group may enter; DSH itself holds no privilege. With the runner on:
+#   - DSH's uid on the machine (the server image's own user, WS_DATA_OWNER) is a service uid and nothing else: a
+#     cloud image gives that uid to its login user (Debian's "debian", in sudo with NOPASSWD). The first boot takes
+#     its sudo rules, its supplementary groups, its password and its shell away. Nothing of Arca's logs in as that
+#     user: Arca reaches the machine as root, through the Incus agent.
+#   - The workspace DSH works in, /data/workspace in DSH's container, is a folder of the machine at that same path,
+#     mounted over the server's /data, so a path names one place for DSH and for the runner. It is never all of
+#     /data: that holds DSH's own state and its launch token.
+#   - Every run of every member is in the runner's service, whose memory and task count are bounded (MemoryMax,
+#     TasksMax). Delegate=yes lets the runner give each run a bound of its own.
+#   - The runner's file is Automagik's release, fetched by URL and kept only when its sha256 is the one fixed here.
+#     THE PAIR BELOW IS A PLACEHOLDER: Automagik has not released the runner yet. Its URL is empty and its sha256 is
+#     that of the M1 spike's member-runner.mjs, for tests only. A create that turns the runner on before the release is
+#     refused at the first boot, in words, unless the file is on the machine already.
+#
 # What it reads:
 # - /etc/arca/settings.json: the service's settings, written by cloud-init at the first boot and fixed from then on.
 #   Those a service_create gave (the template lists which it may) stand in place of the template's own.
@@ -105,6 +126,15 @@ set -u
 : "${WS_APT_PAUSE:=20}"       # seconds between two tries of the first boot's package install
 : "${WS_COSIGN:=/usr/local/lib/arca-automagik-workspace/cosign}"  # the provenance verifier, as the first boot installs it
 : "${WS_COSIGN_SHA256:=}"     # the verifier's checksum; empty is the one fixed below for this machine's architecture
+: "${WS_WORKSPACE:=/data/workspace}"                         # DSH's workspace, at the same path in its container
+: "${WS_RUNNER_HOME:=/var/lib/automagik-member-runner}"      # the runner user's home: its state, members.json
+: "${WS_RUNNER_PROGRAM:=/usr/local/lib/automagik-member-runner}"  # Node 22 and member-runner.mjs, root's
+: "${WS_RUNNER_SOCKETS:=/run/automagik-member-runner}"       # the socket's folder, mounted into DSH's container
+: "${WS_RUNNER_UNIT:=/etc/systemd/system/automagik-member-runner.service}"
+: "${WS_RUNNER_TMPFILES:=/etc/tmpfiles.d/automagik-member-runner.conf}"
+: "${WS_SUDOERS:=/etc/sudoers.d}"
+: "${WS_RUNNER_SHA256:=}"     # the runner file's checksum; empty is the one fixed below
+: "${WS_NODE_SHA256:=}"       # Node's checksum; empty is the one fixed below for this machine's architecture
 
 SERVER=automagik-server
 GATE=automagik-gate
@@ -153,6 +183,24 @@ COSIGN_ARM64=ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2
 PROVENANCE_REPO=automagik-si/automagik
 PROVENANCE_ISSUER=https://token.actions.githubusercontent.com
 
+# The member runner (see the head of this file). Its user, its uid and gid range (one /etc/subuid and one /etc/subgid
+# line; far above the ranges useradd hands out from 100000), and the Node it runs on: Node 22.23.5, the Node.js
+# project's own release, one tarball for each architecture, by its sha256 (the release's SHASUMS256.txt).
+RUNNER_USER=automagik-runner
+RUNNER_RANGE_START=1000000
+RUNNER_RANGE_COUNT=65536
+NODE_RELEASE=https://nodejs.org/dist/v22.23.5
+NODE_VERSION=v22.23.5
+NODE_AMD64=c54118104acc524633b5abe106bbf44a53126ec8b4e5fa105cb92b5d7de8a1a1
+NODE_ARM64=8bd3dc69eee8f3f226315a80d7d1d4faccf217a4c8fae500168ac2e38f3bdba3
+# PLACEHOLDER, one pair: Automagik's release of member-runner.mjs. There is no release yet, so the URL is empty, and the
+# sha256 is the M1 spike's file (automagik-member-runner-spike, 2026-11-15), for tests only. Never ship this pair
+# turned on: replace both with the release's URL and sha256 when Automagik publishes it.
+RUNNER_URL=''
+RUNNER_SHA256=0b6f3e4ac3800eb55f8365a5282c96c6a3e64adc4754f332c6517d5bc913d55c
+# The packages only the member runner needs: newuidmap and newgidmap (setuid, so they are installed only with it).
+RUNNER_PACKAGES='uidmap'
+
 # The relay's whole program, for the server image's node: it listens on the one address and port it is given and
 # copies bytes to and from the same port on loopback. Bytes only: the visitor's Host header reaches the gate as the
 # node sent it.
@@ -199,18 +247,26 @@ missing_programs() {
   printf '%s' "${missing# }"
 }
 
-install_workspace() {
-  export DEBIAN_FRONTEND=noninteractive
-  local try missing
-  boot_say "first boot: installing $WS_PACKAGES"
+# Installs these packages from the distribution, without the ones they only recommend, in up to six tries. Whether
+# they are there is for the caller to look at, by the commands it needs.
+apt_install() {
+  local try
+  boot_say "first boot: installing $1"
   for try in 1 2 3 4 5 6; do
     # shellcheck disable=SC2086
-    if apt-get update -q && apt-get install -y -q --no-install-recommends $WS_PACKAGES; then
-      break
+    if apt-get update -q && apt-get install -y -q --no-install-recommends $1; then
+      return 0
     fi
     boot_say "first boot: the packages could not be installed (try $try of 6); trying again in $WS_APT_PAUSE seconds"
     sleep "$WS_APT_PAUSE"
   done
+  return 1
+}
+
+install_workspace() {
+  export DEBIAN_FRONTEND=noninteractive
+  local missing
+  apt_install "$WS_PACKAGES"
   missing=$(missing_programs)
   if [ -n "$missing" ]; then
     boot_say "first boot failed: these commands are missing after the install: $missing. The packages asked for were: $WS_PACKAGES. The package manager's own words are in /var/log/cloud-init-output.log inside the machine. The machine has no workspace; service_remove it and create it again once it can reach its package mirror"
@@ -231,6 +287,10 @@ install_workspace() {
   load_settings || boot_say "first boot: the settings cannot be used: $REFUSAL. The workspace will not start; service_remove it and create it again with settings that are right"
   if ! data_directories; then
     boot_say "first boot failed: the data directories $WS_DATA and $WS_GATE_DATA could not be made for the server's user ($WS_DATA_OWNER). The machine has no workspace"
+    exit 1
+  fi
+  if [ "${MEMBER_RUNNER:-false}" = true ] && ! install_member_runner; then
+    boot_say "first boot failed: the member runner could not be set up: $REFUSAL. The machine has no workspace; service_remove it and create it again, or create it with settings.memberRunner false"
     exit 1
   fi
   install -m 0755 "$0" "$WS_INSTALLED"
@@ -304,6 +364,165 @@ install_verifier() {
   fi
 }
 
+# Downloads $1 to the file $3 and keeps it only when its sha256 is $2, in up to six tries of at most 600 seconds.
+fetch_pinned() {
+  local try got part="$3.part"
+  for try in 1 2 3 4 5 6; do
+    if curl -fsSL --proto '=https' --connect-timeout 30 --max-time 600 -o "$part" "$1"; then
+      got=$(sha256sum "$part" 2>/dev/null | cut -d' ' -f1)
+      if [ "$got" != "$2" ]; then
+        rm -f "$part"
+        refuse "$1 is not the file this script fixes (sha256 $got, where $2 was expected)"
+        return 1
+      fi
+      mv -f "$part" "$3" && return 0
+      rm -f "$part"
+      refuse "$1 was downloaded and checked, but could not be put at $3"
+      return 1
+    fi
+    boot_say "first boot: $1 could not be downloaded within 600 seconds (try $try of 6); trying again in $WS_APT_PAUSE seconds"
+    sleep "$WS_APT_PAUSE"
+  done
+  rm -f "$part"
+  refuse "$1 could not be downloaded in 6 tries of at most 600 seconds each"
+}
+
+# The member runner, as the head of this file says: its packages, Node, Automagik's file, DSH's uid made a service
+# uid, the runner's user and range, the workspace folder, the socket's folder and the runner's service. Each step that
+# fails says why in REFUSAL.
+install_member_runner() {
+  local dsh_uid=${WS_DATA_OWNER%%:*} dsh_gid=${WS_DATA_OWNER##*:} arch sum dsh_name dsh_home file line who start count
+  local runner=$WS_RUNNER_PROGRAM/member-runner.mjs node=$WS_RUNNER_PROGRAM/node/bin/node
+  local want=${WS_RUNNER_SHA256:-$RUNNER_SHA256} got
+  boot_say "first boot: setting up the member runner"
+  apt_install "$RUNNER_PACKAGES" || true
+  for file in newuidmap newgidmap unshare setpriv getent useradd usermod systemd-tmpfiles tar sed; do
+    command -v "$file" >/dev/null 2>&1 || {
+      refuse "the command $file is missing after installing $RUNNER_PACKAGES"
+      return 1
+    }
+  done
+  mkdir -p "$WS_RUNNER_PROGRAM" || {
+    refuse "the folder $WS_RUNNER_PROGRAM could not be made"
+    return 1
+  }
+
+  # Automagik's file before Node and the users: a release that is not there yet is said before any user is changed.
+  # uidmap and the runner's folder are in place by then; a first boot that ends here leaves no keeper and no runner.
+  got=$(sha256sum "$runner" 2>/dev/null | cut -d' ' -f1)
+  if [ "$got" != "$want" ]; then
+    if [ -z "$RUNNER_URL" ]; then
+      refuse "Automagik has not released the member runner yet: this template's runner URL is a placeholder"
+      return 1
+    fi
+    fetch_pinned "$RUNNER_URL" "$want" "$runner" || return 1
+  fi
+  chmod 0644 "$runner"
+
+  case $(uname -m) in
+    x86_64) arch=x64 sum=$NODE_AMD64 ;;
+    aarch64) arch=arm64 sum=$NODE_ARM64 ;;
+    *)
+      refuse "Node has no build fixed here for this machine's architecture, $(uname -m)"
+      return 1
+      ;;
+  esac
+  sum=${WS_NODE_SHA256:-$sum}
+  if [ "$("$node" --version 2>/dev/null)" != "$NODE_VERSION" ]; then
+    fetch_pinned "$NODE_RELEASE/node-$NODE_VERSION-linux-$arch.tar.gz" "$sum" "$WS_RUNNER_PROGRAM/node.tar.gz" || return 1
+    rm -rf "$WS_RUNNER_PROGRAM/node" && mkdir -p "$WS_RUNNER_PROGRAM/node" &&
+      tar -xzf "$WS_RUNNER_PROGRAM/node.tar.gz" -C "$WS_RUNNER_PROGRAM/node" --strip-components=1 --no-same-owner
+    rm -f "$WS_RUNNER_PROGRAM/node.tar.gz"
+    if [ "$("$node" --version 2>/dev/null)" != "$NODE_VERSION" ]; then
+      refuse "Node $NODE_VERSION did not unpack to $WS_RUNNER_PROGRAM/node"
+      return 1
+    fi
+  fi
+
+  # DSH's uid is a service uid only: whoever the image gave it to loses sudo, its groups, its password and its shell.
+  dsh_name=$(getent passwd "$dsh_uid" | cut -d: -f1)
+  if [ -n "$dsh_name" ]; then
+    if ! [[ $dsh_name =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+      refuse "the user with DSH's uid $dsh_uid has a name this script does not take apart safely: $dsh_name"
+      return 1
+    fi
+    dsh_home=$(getent passwd "$dsh_uid" | cut -d: -f6)
+    for file in "$WS_SUDOERS"/*; do
+      [ -f "$file" ] && grep -q "^[[:space:]]*${dsh_name}[[:space:]]" "$file" && sed -i "/^[[:space:]]*${dsh_name}[[:space:]]/d" "$file"
+    done
+    if ! usermod --lock --shell /usr/sbin/nologin -G '' "$dsh_name"; then
+      refuse "the user $dsh_name, who has DSH's uid $dsh_uid, could not be made a service user"
+      return 1
+    fi
+    [ -z "$dsh_home" ] || rm -f "$dsh_home/.ssh/authorized_keys"
+    boot_say "first boot: uid $dsh_uid ($dsh_name) is DSH's service uid now: no sudo, no groups, no password, no shell"
+  fi
+
+  if ! getent passwd "$RUNNER_USER" >/dev/null; then
+    useradd --system --user-group --home-dir "$WS_RUNNER_HOME" --create-home --shell /usr/sbin/nologin "$RUNNER_USER" || {
+      refuse "the runner's user $RUNNER_USER could not be made"
+      return 1
+    }
+  fi
+  chmod 0700 "$WS_RUNNER_HOME"
+  # One line in each of /etc/subuid and /etc/subgid, and no other line that overlaps it.
+  for file in /etc/subuid /etc/subgid; do
+    while IFS=: read -r who start count; do
+      [[ $start =~ ^[0-9]+$ && $count =~ ^[0-9]+$ ]] || continue
+      [ "$who" = "$RUNNER_USER" ] && [ "$start" = "$RUNNER_RANGE_START" ] && [ "$count" = "$RUNNER_RANGE_COUNT" ] && continue
+      if [ "$start" -lt $((RUNNER_RANGE_START + RUNNER_RANGE_COUNT)) ] && [ $((start + count)) -gt "$RUNNER_RANGE_START" ]; then
+        refuse "$file gives $who ids $start to $((start + count - 1)), inside the runner's range $RUNNER_RANGE_START to $((RUNNER_RANGE_START + RUNNER_RANGE_COUNT - 1))"
+        return 1
+      fi
+    done <"$file"
+  done 2>/dev/null
+  line="$RUNNER_USER:$RUNNER_RANGE_START:$RUNNER_RANGE_COUNT"
+  if ! grep -qx "$line" /etc/subuid 2>/dev/null || ! grep -qx "$line" /etc/subgid 2>/dev/null; then
+    usermod --add-subuids "$RUNNER_RANGE_START-$((RUNNER_RANGE_START + RUNNER_RANGE_COUNT - 1))" \
+      --add-subgids "$RUNNER_RANGE_START-$((RUNNER_RANGE_START + RUNNER_RANGE_COUNT - 1))" "$RUNNER_USER" || {
+      refuse "the runner's range could not be written to /etc/subuid and /etc/subgid"
+      return 1
+    }
+  fi
+
+  # The workspace: DSH's, and others may pass through it to a member's own folder but not list it. The socket's
+  # folder: the runner's, in DSH's group, setgid so the socket is DSH's group's too; nobody else enters it.
+  if ! { install -d -m 0711 -o "$dsh_uid" -g "$dsh_gid" "$WS_WORKSPACE" &&
+    printf 'd %s 2750 %s %s -\n' "$WS_RUNNER_SOCKETS" "$RUNNER_USER" "$dsh_gid" >"$WS_RUNNER_TMPFILES" &&
+    systemd-tmpfiles --create "$WS_RUNNER_TMPFILES"; }; then
+    refuse "the folders $WS_WORKSPACE and $WS_RUNNER_SOCKETS could not be made"
+    return 1
+  fi
+
+  cat >"$WS_RUNNER_UNIT" <<UNIT
+[Unit]
+Description=Automagik member runner: members' commands under uids of their own
+After=local-fs.target systemd-tmpfiles-setup.service
+
+[Service]
+User=$RUNNER_USER
+Group=$RUNNER_USER
+ExecStart=$node $runner --socket $WS_RUNNER_SOCKETS/runner.sock --socket-mode 660 --state $WS_RUNNER_HOME/members.json --workspace-root $WS_WORKSPACE --refuse-uid $dsh_uid
+Restart=always
+RestartSec=5
+# Every run of every member is in this service: these bound them all together. Delegate lets the runner bound each.
+MemoryMax=50%
+TasksMax=1024
+Delegate=yes
+# NoNewPrivileges must stay off: newuidmap and newgidmap are setuid, and the runner needs them for every run.
+StandardOutput=journal
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  if ! { systemctl daemon-reload && systemctl enable --now automagik-member-runner.service; }; then
+    refuse "its service did not start; inside the machine, 'systemctl status automagik-member-runner' says why"
+    return 1
+  fi
+  boot_say "first boot: the member runner is started as $RUNNER_USER, ids $RUNNER_RANGE_START to $((RUNNER_RANGE_START + RUNNER_RANGE_COUNT - 1)), socket $WS_RUNNER_SOCKETS/runner.sock"
+}
+
 # The server's /data and the gate's /data: two directories on the machine's own disk, the server user's. Only the
 # directories themselves are touched; what the server and the gate keep in them is never read or changed.
 data_directories() {
@@ -337,6 +556,7 @@ load_settings() {
   url=$(jq -r '.publicUrl | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   REACH=$(jq -r '.reach | if . == null then "cloudflare" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   SERVER_IMAGE=$(jq -r '.serverImage | if type == "string" then . else "" end' "$WS_SETTINGS")
+  MEMBER_RUNNER=$(jq -r '.memberRunner | if . == null then "false" elif type == "boolean" then tostring else "!" end' "$WS_SETTINGS")
   # A missing key is an empty one, and so is an empty list or text of spaces alone. A value of the wrong kind
   # becomes "!", which no rule below takes. accessEmails is text the gate gets unchanged: one address or several,
   # separated by commas, spaces around each allowed (the gate trims each one and compares them without regard to
@@ -349,6 +569,11 @@ load_settings() {
   if [ "$REACH" != cloudflare ] && [ "$REACH" != tailnet ]; then
     REACH=cloudflare
     refuse "settings.reach is how the workspace is reached: \"cloudflare\" (a Cloudflare Tunnel; also when it is left out) or \"tailnet\" (a node on your tailnet)"
+    return
+  fi
+  if [ "$MEMBER_RUNNER" != true ] && [ "$MEMBER_RUNNER" != false ]; then
+    MEMBER_RUNNER=false
+    refuse "settings.memberRunner is true (members' commands run under uids of their own, through the member runner) or false (no member runner; also when it is left out)"
     return
   fi
   if ! pinned "$SERVER_IMAGE"; then
@@ -492,7 +717,14 @@ keep_server() {
   due server || return 0
   server_image_here || return 0
   say "starting the server"
-  if out=$(docker run -d --name "$SERVER" --pull never --restart no -v "$WS_DATA:/data" "$SERVER_IMAGE" 2>&1 >/dev/null); then
+  local mounts=(-v "$WS_DATA:/data")
+  # With the member runner: the workspace, at the same path as on the machine, over /data's own workspace folder, and
+  # the runner's socket folder. --mount, not -v: a folder that is missing stops the start instead of being made, as
+  # root's, by Docker.
+  [ "${MEMBER_RUNNER:-false}" != true ] ||
+    mounts+=(--mount "type=bind,source=$WS_WORKSPACE,target=$WS_WORKSPACE"
+      --mount "type=bind,source=$WS_RUNNER_SOCKETS,target=$WS_RUNNER_SOCKETS")
+  if out=$(docker run -d --name "$SERVER" --pull never --restart no "${mounts[@]}" "$SERVER_IMAGE" 2>&1 >/dev/null); then
     say "the server is started from $SERVER_IMAGE"
   else
     docker rm -f "$SERVER" >/dev/null 2>&1

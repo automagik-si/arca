@@ -52,6 +52,16 @@ case $command in
           shift 2
           ;;
         --pull) pull=$2; shift 2 ;;
+        --mount)
+          # As Docker: a bind whose source is not there fails the run; nothing is made in its place.
+          source=${2#*source=}
+          source=${source%%,*}
+          if [ ! -e "$source" ]; then
+            echo "docker: Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: $source" >&2
+            exit 125
+          fi
+          shift 2
+          ;;
         -e | --restart | --user | --cap-drop | --security-opt | --entrypoint) shift 2 ;;
         -*) shift ;;
         *) break ;;

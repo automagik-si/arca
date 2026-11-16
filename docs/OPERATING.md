@@ -6144,6 +6144,26 @@ What to know:
 - **No model key.** The template declares no model secret. Sign-ins to model providers happen inside the workspace.
 - **After a restart of the node** the machine starts by itself (the template sets `autostart`), and the keeper starts
   the containers again from the token on its disk.
+- **The member runner (`memberRunner`, off by default).** With `"memberRunner": true` at create, a member's commands
+  run on the machine under a uid of the member's own instead of inside DSH's container, so a member cannot read the
+  owner's files. **It waits for Automagik's release of the runner:** the template's runner URL is empty and its sha256
+  is that of a test build, a placeholder, so a create that turns it on today fails at the first boot with
+  "Automagik has not released the member runner yet". Once the template pins the release, the first boot:
+  - installs `uidmap` and Node 22.23.5 (by sha256), and Automagik's `member-runner.mjs` (by sha256) under
+    `/usr/local/lib/automagik-member-runner`;
+  - makes uid 1000, DSH's uid, a service uid only. A cloud image gives that uid to its login user (Debian's
+    `debian`, with sudo and no password): the first boot takes its sudo rules, groups, password, shell and SSH keys
+    away. Arca never logs in as that user; it reaches the machine as root through the Incus agent;
+  - adds a user `automagik-runner`, not in the `docker` group, with one `/etc/subuid` and one `/etc/subgid` line
+    (ids 1000000 to 1065535), and runs the runner as that user's service, `automagik-member-runner`. Its memory
+    (half the machine's) and task count (1024) bound every member's runs together. It never runs as root;
+  - makes `/data/workspace` a folder of the machine at that same path, mounted into DSH's container over the server's
+    own `/data/workspace`, never the whole of `/data`, which holds DSH's state. Its socket is in
+    `/run/automagik-member-runner`, which only uid 1000's group and the runner may enter, mounted into DSH's
+    container too.
+
+  `systemctl status automagik-member-runner` and `journalctl -u automagik-member-runner` inside the machine say how it
+  runs. Its refusals and failures also reach the console (`service_logs`).
 - **The settings are fixed.** They are read when the machine is created. To change the reach, the public address
   or the Access settings, create the workspace again with other settings. To move the server's image pin, edit
   `serverImage` in the template: workspaces created afterwards run the new build.
