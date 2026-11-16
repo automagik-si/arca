@@ -304,7 +304,7 @@ impl Signer {
             "default_events": [],
         });
         if repository_access {
-            manifest["name"] = json!("Arca repositories");
+            manifest["name"] = json!(format!("Arca repositories {}", &state[..6]));
             manifest["description"] = json!(
                 "Workspace Git access to the selected repositories. Contents and pull requests write; metadata read."
             );

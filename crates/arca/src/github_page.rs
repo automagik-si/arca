@@ -381,7 +381,7 @@ pub fn app_start(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
     );
     let body = if repositories {
         format!(
-            "<h1>Create the repository App</h1><p>GitHub will create Arca repositories in {} with Contents and Pull requests: Read and write, and Metadata: Read. No webhook. Choose Only select repositories, select the workspace repositories and install. Existing branch policies stay in place.</p><form method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"manifest\" value=\"{}\"><button type=\"submit\">Create the App on GitHub</button></form>",
+            "<h1>Create the repository App</h1><p>GitHub will suggest a unique repository App name in {}. You may edit the name on GitHub. It asks for Contents and Pull requests: Read and write, and Metadata: Read. No webhook. Choose Only select repositories, select the workspace repositories and install. Existing branch policies stay in place.</p><form method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"manifest\" value=\"{}\"><button type=\"submit\">Create the App on GitHub</button></form>",
             escape(field(form, "org")),
             escape(&start.action_url),
             escape(&start.manifest)
