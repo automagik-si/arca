@@ -917,7 +917,12 @@ fn watch_report_schemas_equal_its_table_row() {
             },
             "privileged": { "type": "boolean" },
             "identity": { "type": "boolean" },
-            "configHash": hex64()
+            "configHash": hex64(),
+            "serviceMark": {
+                "type":"object", "additionalProperties":false,
+                "properties": {"entry":{"type":"string"},"why":{"type":"string","enum":["serviceNameMismatch"]}},
+                "required":["entry","why"]
+            }
         },
         "required": ["name", "kind", "status", "owner", "privileged", "identity", "configHash"]
     });

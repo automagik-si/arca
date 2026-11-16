@@ -183,6 +183,44 @@ fn row_project(row: &Value) -> Result<&str, PluginError> {
         .ok_or_else(shape_error)
 }
 
+/// Explain only a name mismatch that the existing classifier would accept
+/// under the service's name. Other contested marks gain no new interpretation.
+fn service_mark(
+    object: &ObjectRef,
+    own: &BTreeMap<String, String>,
+    retained: &BTreeMap<EntryId, (PluginId, Digest)>,
+    owner: &OwnerClass,
+) -> Option<report::ServiceMark> {
+    if *owner != OwnerClass::Contested {
+        return None;
+    }
+    let entry = EntryId::parse(own.get(KERNEL_ENTRY_KEY)?)?;
+    let name = if let Some(name) = entry.0.strip_prefix("service-") {
+        name.to_string()
+    } else {
+        let (tenant, name) = entry.0.strip_prefix("t-")?.split_once("-service-")?;
+        format!("{name}-{tenant}")
+    };
+    if object.name == name {
+        return None;
+    }
+    let expected = ObjectRef {
+        name,
+        ..object.clone()
+    };
+    match classify_object(&expected, own, retained) {
+        OwnerClass::Kernel { entry: marked } | OwnerClass::Retained { entry: marked, .. }
+            if marked == entry =>
+        {
+            Some(report::ServiceMark {
+                entry,
+                why: report::ServiceMarkReason::ServiceNameMismatch,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Builds the report from the listing. Rows outside the covered projects are dropped before they are read, a listed instance
 /// twice is refused, and the drift is the marks against the live entries. A live entry with no object is drift only for a
 /// complete watch.
@@ -256,6 +294,7 @@ fn assemble(listing: &Value, cfg: &WatchConfig) -> Result<WatchReport, PluginErr
                 name: fact.name.clone(),
                 kind: fact.kind.clone(),
                 status: fact.status.clone(),
+                service_mark: service_mark(&object, &fact.own, &cfg.retained, &owner),
                 owner,
                 privileged: fact.privileged,
                 identity: cfg.identity_phones.contains(&fact.name),

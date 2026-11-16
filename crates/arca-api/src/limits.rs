@@ -278,6 +278,15 @@ pub fn cut(verb: &Verb, limit: &ServiceLimit, args: &Value, mut value: Value) ->
                         .unwrap_or_default()
                         .to_string();
                     retain(project, "instances", |row| instance_ok(&name, row));
+                    // Even an allowed instance can carry another service's mark.
+                    // Limited callers keep the existing rows without this annotation.
+                    if let Some(rows) = project.get_mut("instances").and_then(Value::as_array_mut) {
+                        for row in rows {
+                            if let Some(row) = row.as_object_mut() {
+                                row.remove("serviceMark");
+                            }
+                        }
+                    }
                 }
                 // A project left with no listed instance goes too: its name is not the token's to know.
                 projects.retain(|project| {
@@ -603,6 +612,37 @@ mod tests {
             tenant["snapshots"],
             json!([row("container", "arcak-t-abcdefgh", "web-abcdefgh")])
         );
+    }
+
+    #[test]
+    fn limited_watch_never_exposes_a_service_mark_on_an_allowed_instance() {
+        let answer = json!({"at":1,"projects":[
+            {"project":"arcak-svc","instances":[{"name":"dev","owner":{"class":"contested"},
+                "serviceMark":{"entry":"service-other","why":"serviceNameMismatch"}}]},
+            {"project":"arcak-t-abcdefgh","instances":[{"name":"web-abcdefgh","owner":{"class":"contested"},
+                "serviceMark":{"entry":"t-abcdefgh-service-other","why":"serviceNameMismatch"}}]}
+        ],"drift":[]});
+        for services in ["dev,abcdefgh/web", "dev,other,abcdefgh/web,abcdefgh/other"] {
+            let list = limit(services);
+            let cut = cut(v("watch_report"), &list, &json!({}), answer.clone()).unwrap();
+            assert_eq!(
+                cut,
+                json!({"at":1,"projects":[
+            {"project":"arcak-svc","instances":[{"name":"dev","owner":{"class":"contested"}}]},
+            {"project":"arcak-t-abcdefgh","instances":[{"name":"web-abcdefgh","owner":{"class":"contested"}}]}
+        ],"drift":[]})
+            );
+            assert!(!cut.to_string().contains("serviceMark"));
+            assert!(!cut.to_string().contains("other"));
+        }
+    }
+
+    #[test]
+    fn journal_list_stays_node_wide_for_service_limited_tokens() {
+        let list = limit("dev");
+        let journal = v("journal_list");
+        assert!(check(journal, &list, &json!({})).is_err());
+        assert_eq!(journal.target, Target::Node);
     }
 
     #[test]
