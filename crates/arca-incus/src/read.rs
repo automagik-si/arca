@@ -109,6 +109,7 @@ pub trait IncusRead: Send + Sync {
 pub struct UnixIncus {
     socket: PathBuf,
     timeout: Duration,
+    budget: Option<Instant>,
 }
 
 impl UnixIncus {
@@ -117,6 +118,7 @@ impl UnixIncus {
         Self {
             socket,
             timeout: TIMEOUT,
+            budget: None,
         }
     }
 
@@ -125,6 +127,23 @@ impl UnixIncus {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Caps all reads by one overall budget, including clones of this client.
+    pub fn with_total_budget(mut self, budget: Duration) -> Self {
+        self.budget = Instant::now().checked_add(budget);
+        self
+    }
+
+    /// The time left in the overall budget, when one was set.
+    pub fn remaining_budget(&self) -> Option<Duration> {
+        self.budget
+            .map(|until| until.saturating_duration_since(Instant::now()))
+    }
+
+    fn request_timeout(&self, timeout: Duration) -> Duration {
+        self.remaining_budget()
+            .map_or(timeout, |left| left.min(timeout))
     }
 
     /// The deadline each of this client's reads is given.
@@ -145,7 +164,11 @@ impl UnixIncus {
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: incus\r\nAccept: text/plain\r\nConnection: close\r\n\r\n"
         );
-        let framed = exchange(&self.socket, self.timeout, request.as_bytes())?;
+        let framed = exchange(
+            &self.socket,
+            self.request_timeout(self.timeout),
+            request.as_bytes(),
+        )?;
         if !(200..300).contains(&framed.status) {
             return Err(IncusError::Status {
                 code: framed.status,
@@ -164,7 +187,11 @@ impl IncusRead for UnixIncus {
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: incus\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
         );
-        let framed = exchange(&self.socket, self.timeout, request.as_bytes())?;
+        let framed = exchange(
+            &self.socket,
+            self.request_timeout(self.timeout),
+            request.as_bytes(),
+        )?;
         decode(framed.into_raw())
     }
 
@@ -173,7 +200,11 @@ impl IncusRead for UnixIncus {
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: incus\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
         );
-        let framed = exchange(&self.socket, timeout, request.as_bytes())?;
+        let framed = exchange(
+            &self.socket,
+            self.request_timeout(timeout),
+            request.as_bytes(),
+        )?;
         decode(framed.into_raw())
     }
 }

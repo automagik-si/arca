@@ -355,6 +355,7 @@ impl<S: JournalStore> Reconciler<S> {
             Ok(Target::Hold { stale, .. }) => return vec![Outcome::Held { stale }],
             Err(refusal) => return vec![Outcome::Refused(refusal)],
         }
+        self.settle_open_intents(now_ms);
         let carried: BTreeSet<EntryId> = doc
             .document
             .entries
@@ -424,7 +425,11 @@ impl<S: JournalStore> Reconciler<S> {
         self.execute_plan(plan, delete_plan, now_ms)
     }
 
-    fn delete_plan_for(&self, plan: &Digest, now_ms: u64) -> Result<DeletePlan, ApprovalRefusal> {
+    fn delete_plan_for(
+        &mut self,
+        plan: &Digest,
+        now_ms: u64,
+    ) -> Result<DeletePlan, ApprovalRefusal> {
         let delete_plan = self
             .pending
             .iter()
@@ -434,6 +439,7 @@ impl<S: JournalStore> Reconciler<S> {
         if now_ms.saturating_sub(delete_plan.created_ms) > PLAN_TTL_MS {
             return Err(ApprovalRefusal::Expired);
         }
+        self.settle_open_intents(now_ms);
         if self.blocked() {
             return Err(ApprovalRefusal::Unresolved);
         }
@@ -659,6 +665,14 @@ impl<S: JournalStore> Reconciler<S> {
             .iter()
             .map(|pending| pending.plan.clone())
             .collect()
+    }
+
+    /// Retry read-only provider resolution before a new reconcile or approved write. A failed read leaves the intent open;
+    /// a journal failure leaves the journal poisoned, so the existing blocked checks still stop every effect.
+    fn settle_open_intents(&mut self, now_ms: u64) {
+        if self.journal.poisoned().is_none() && !self.journal.unresolved().is_empty() {
+            let _ = self.resolve_runtime(now_ms);
+        }
     }
 
     /// Whether an intent has no outcome, or the journal has stopped. Every new effect is refused while this holds.

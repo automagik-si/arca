@@ -103,6 +103,14 @@ case $command in
       echo "docker: Error response from daemon: cannot join network namespace of a non running container: $joins" >&2
       exit 125
     fi
+    if [ "$name" = automagik-server ] && [ -n "${FAKE_CHECKOUT_MARKER:-}" ]; then
+      cat "$FAKE_CHECKOUT_MARKER" >"$root/seed-marker.json" 2>/dev/null || true
+      # Model a fast entrypoint: it writes the roster BEFORE docker run returns.
+      if [ -e "$root/seed-roster" ]; then
+        mkdir -p "$FAKE_CHECKOUT_TARGET/.herdr"
+        cat "$root/seed-roster" >"$FAKE_CHECKOUT_TARGET/.herdr/bots.json"
+      fi
+    fi
     mkdir -p "$root/containers/$name"
     printf '%s\n' "${1-}" >"$root/containers/$name/image"
     printf '%s\n' "$netmode" >"$root/containers/$name/netmode"

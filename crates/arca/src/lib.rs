@@ -41,6 +41,7 @@ pub mod github_app;
 pub mod github_handlers;
 pub mod github_oauth;
 pub mod github_page;
+pub mod github_repository;
 pub mod github_signer;
 pub mod gpu;
 pub mod guest_secrets;

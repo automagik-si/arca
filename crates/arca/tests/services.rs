@@ -80,7 +80,7 @@ impl Provider for PausedProvider {
         op: &EffectOp,
         planned: &Planned,
     ) -> Result<(ObjectRef, Inverse), EffectRefusal> {
-        // An instance create whose answer never came: the provider cannot tell whether it landed.
+        // An instance create whose answer and read-back are unavailable: its outcome stays unknown.
         if *self.unknown_create.lock().expect("unknown switch")
             && matches!(
                 op,
@@ -100,6 +100,11 @@ impl Provider for PausedProvider {
         target: &ObjectRef,
         pre_image: Option<&std::collections::BTreeMap<String, Option<String>>>,
     ) -> Result<ReadBack, EffectRefusal> {
+        if target.kind == IncusKind::Instance
+            && *self.unknown_create.lock().expect("unknown switch")
+        {
+            return Err(EffectRefusal::Unresolved);
+        }
         self.inner.read_back(entry, target, pre_image)
     }
     fn read_back_acl(
@@ -109,6 +114,29 @@ impl Provider for PausedProvider {
         patch: &AclPatch,
     ) -> Result<ReadBack, EffectRefusal> {
         self.inner.read_back_acl(entry, target, patch)
+    }
+    fn read_back_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre: Option<&std::collections::BTreeMap<String, Option<String>>>,
+        budget: std::time::Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        if target.kind == IncusKind::Instance
+            && *self.unknown_create.lock().expect("unknown switch")
+        {
+            return Err(EffectRefusal::Unresolved);
+        }
+        self.inner.read_back_now(entry, target, pre, budget)
+    }
+    fn read_back_acl_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+        budget: std::time::Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back_acl_now(entry, target, patch, budget)
     }
     fn retire(
         &mut self,
@@ -1214,6 +1242,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         lan: None,
         private_port: None,
         root_size: None,
+        port_isolation: false,
         first_boot: None,
         settings: None,
         create_settings: Vec::new(),
