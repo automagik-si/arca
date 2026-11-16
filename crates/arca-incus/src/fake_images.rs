@@ -159,6 +159,9 @@ pub(super) fn aliases(
                 .unwrap()
                 .push(json!({ "name": name,
                 "description": parsed["description"].as_str().unwrap_or("") }));
+            if failure(shared, "alias_after") {
+                return bad(500, "alias response failed after creation");
+            }
             (201, String::new(), sync_envelope(Value::Null))
         }
         "DELETE" => match held {

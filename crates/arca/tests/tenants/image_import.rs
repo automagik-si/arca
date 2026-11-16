@@ -217,7 +217,7 @@ fn image_import_rechecks_source_properties_before_any_write() {
 
 #[test]
 fn image_import_copy_and_alias_failures_compensate_only_new_content() {
-    for step in ["copy", "copy_after", "alias"] {
+    for step in ["copy", "copy_after", "alias", "alias_after"] {
         let (rig, fingerprint) = setup();
         let source = rig.get(&format!("/1.0/images/{fingerprint}?project={PROJECT}"));
         rig.fake().fail_image_import_at(step);
