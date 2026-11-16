@@ -370,11 +370,14 @@ fetch_pinned() {
   for try in 1 2 3 4 5 6; do
     if curl -fsSL --proto '=https' --connect-timeout 30 --max-time 600 -o "$part" "$1"; then
       got=$(sha256sum "$part" 2>/dev/null | cut -d' ' -f1)
-      if [ "$got" = "$2" ]; then
-        mv -f "$part" "$3" && return 0
+      if [ "$got" != "$2" ]; then
+        rm -f "$part"
+        refuse "$1 is not the file this script fixes (sha256 $got, where $2 was expected)"
+        return 1
       fi
+      mv -f "$part" "$3" && return 0
       rm -f "$part"
-      refuse "$1 is not the file this script fixes (sha256 $got, where $2 was expected)"
+      refuse "$1 was downloaded and checked, but could not be put at $3"
       return 1
     fi
     boot_say "first boot: $1 could not be downloaded within 600 seconds (try $try of 6); trying again in $WS_APT_PAUSE seconds"
@@ -404,7 +407,8 @@ install_member_runner() {
     return 1
   }
 
-  # Automagik's file first: a release that is not there yet is said before anything else is changed.
+  # Automagik's file before Node and the users: a release that is not there yet is said before any user is changed.
+  # uidmap and the runner's folder are in place by then; a first boot that ends here leaves no keeper and no runner.
   got=$(sha256sum "$runner" 2>/dev/null | cut -d' ' -f1)
   if [ "$got" != "$want" ]; then
     if [ -z "$RUNNER_URL" ]; then
