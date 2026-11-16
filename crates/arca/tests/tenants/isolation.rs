@@ -1491,6 +1491,7 @@ fn a_tenants_image_is_fetched_without_the_nodes_registry_credential() {
             token_id: "doctor".into(),
             scope: Scope::Doctor,
             tools: None,
+            limits: Default::default(),
         },
     )
     .expect("set");

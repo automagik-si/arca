@@ -21,8 +21,8 @@ pub mod tools;
 pub mod version;
 
 pub use auth::{
-    Caller, HELD_PREFIX, ISSUED_PREFIX, IssuedTokens, TokenStore, TokenStoreError, admin_token_ids,
-    mint, mint_with_tools,
+    Caller, HELD_PREFIX, ISSUED_PREFIX, IssuedTokens, Limits, TokenStore, TokenStoreError,
+    admin_token_ids, mint, mint_limited, mint_with_tools,
 };
 pub use elicit::{Asking, PendingPlan, TerminalApprover};
 pub use http::{

@@ -1310,3 +1310,166 @@ fn a_proxy_listener_without_an_approval_origin_serves_no_page_route() {
     assert_eq!(status, 200);
     assert_eq!(serve.terminate().code(), Some(0));
 }
+
+/// A token limited to one service, minted by the binary with `--services` and `--expires`, over the MCP door of a node
+/// served end to end: it is offered no node-wide verb, is refused one and a service outside its list, and reads a watch
+/// report cut to its own service's instance, with no other instance or project named.
+#[test]
+fn a_token_limited_to_one_service_sees_and_reaches_that_service_only() {
+    let scratch = Scratch::new("limited");
+    // The fixture, with the node's own service project holding two services' instances.
+    let mut state: Value =
+        serde_json::from_str(&fs::read_to_string(FIXTURE).expect("read the fixture"))
+            .expect("the fixture is JSON");
+    state["projects"]
+        .as_array_mut()
+        .expect("projects")
+        .push(json!({"name": "arcak-svc", "description": "", "config": {}}));
+    for name in ["dev", "gtm"] {
+        state["instances"]
+            .as_array_mut()
+            .expect("instances")
+            .push(json!({"name": name, "project": "arcak-svc", "type": "container", "status": "Running", "config": {}, "expanded_config": {}}));
+    }
+    let fixture = scratch.at("state.json");
+    fs::write(&fixture, state.to_string()).expect("write the fixture");
+    let fake =
+        FakeIncus::start(&scratch.0, FakeState::load(&fixture).expect("load")).expect("fake");
+    let shim = RecordingShim::start(
+        fake.socket(),
+        &scratch.at("shim.sock"),
+        &scratch.at("shim.log"),
+    )
+    .expect("shim");
+
+    let hash_dir = scratch.at("tokens");
+    fs::create_dir(&hash_dir).expect("create the token directory");
+    fs::set_permissions(&hash_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let out_file = scratch.at("limited.secret");
+    let minted = arca()
+        .args([
+            "token",
+            "mint",
+            "--scope",
+            "viewer",
+            "--id",
+            "limited",
+            "--services",
+            "dev",
+            "--expires",
+            "1h",
+            "--hash-dir",
+        ])
+        .arg(&hash_dir)
+        .arg("--out")
+        .arg(&out_file)
+        .output()
+        .expect("run token mint");
+    assert!(
+        minted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&minted.stderr)
+    );
+    let said: Value = serde_json::from_slice(&minted.stdout).expect("the mint prints JSON");
+    assert_eq!(said["services"], json!("dev"));
+    assert!(
+        said["expires"].as_str().is_some_and(|at| at.ends_with('Z')),
+        "{said}"
+    );
+    let hash = fs::read_to_string(hash_dir.join("limited.hash")).expect("the hash file");
+    assert!(
+        hash.contains("\nservices=dev\n") && hash.contains("\nexpires="),
+        "{hash}"
+    );
+    let limited = fs::read_to_string(&out_file)
+        .expect("the secret")
+        .trim_end()
+        .to_string();
+
+    let config = write_config(&scratch, shim.socket(), &hash_dir);
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+
+    let (status, text) = post(
+        &socket,
+        &[bearer(&limited)],
+        &rpc(1, "tools/list", json!({})),
+    );
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_str(&text).expect("JSON");
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("a name"))
+        .collect();
+    assert!(
+        names.contains(&"watch_report") && names.contains(&"service_status"),
+        "{names:?}"
+    );
+    assert!(
+        !names.contains(&"arca_status") && !names.contains(&"node_metrics"),
+        "{names:?}"
+    );
+
+    let refused = |text: &str| -> Value {
+        let reply: Value = serde_json::from_str(text).expect("JSON");
+        assert_eq!(
+            reply["error"]["data"]["refusal"],
+            json!("OutsideTokenServices"),
+            "{reply}"
+        );
+        reply
+    };
+    let (_, text) = post(
+        &socket,
+        &[bearer(&limited)],
+        &call(2, "arca_status", json!({})),
+    );
+    refused(&text);
+    let (_, text) = post(
+        &socket,
+        &[bearer(&limited)],
+        &call(3, "service_status", json!({"name": "gtm"})),
+    );
+    let reply = refused(&text);
+    assert!(
+        !reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("gtm")
+    );
+
+    let (status, text) = post(
+        &socket,
+        &[bearer(&limited)],
+        &call(4, "watch_report", json!({})),
+    );
+    assert_eq!(status, 200);
+    let report = tool_result(&text);
+    conforming("watch_report", &report);
+    let projects = report["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 1, "{report}");
+    assert_eq!(projects[0]["project"], json!("arcak-svc"));
+    let rows: Vec<&str> = projects[0]["instances"]
+        .as_array()
+        .expect("instances")
+        .iter()
+        .map(|row| row["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(rows, ["dev"]);
+    let shown = report.to_string();
+    for other in [
+        "gtm",
+        "phone1",
+        "desk1",
+        "guest1",
+        "db1",
+        "\"droid\"",
+        "\"svc\"",
+    ] {
+        assert!(!shown.contains(other), "the report names {other}: {shown}");
+    }
+    assert_eq!(serve.terminate().code(), Some(0));
+}

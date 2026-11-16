@@ -68,6 +68,7 @@ fn propose(rig: &Rig, args: Value) -> Result<Value, CallError> {
             token_id: "doctor".into(),
             scope: Scope::Doctor,
             tools: None,
+            limits: Default::default(),
         },
     )
 }

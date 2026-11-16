@@ -221,12 +221,14 @@ fn modern_result(mut result: Value) -> Value {
 }
 
 /// The tools the caller may call, in table order. A write verb is absent for a viewer, and `token_list` for anything
-/// below an operator.
+/// below an operator. A token limited to named services is offered no verb that reaches the whole node.
 fn tools_for(server: &Server, caller: &Caller) -> Vec<Value> {
+    let limited = caller.limits.services.is_some();
     server
         .verbs
         .iter()
         .filter(|v| may_call(caller.scope, v) && caller.allows_tool(v.name))
+        .filter(|v| !limited || arca_api::limits::offered(v))
         .map(|v| {
             json!({
                 "name": v.name,
@@ -274,6 +276,26 @@ async fn call_tool(
         .unwrap_or_else(|| json!({}));
     if let Err(why) = conforms(&(verb.params)(), &arguments) {
         return Ok(Some(result_reply(id, invalid_arguments(&why))));
+    }
+    // A token limited to named services is held to them here, before anything runs: on what the call touches, and on what
+    // a proposal would do once the owner approved it. Its limit is this node's, so it is never relayed to a linked one.
+    if let Some(services) = &caller.limits.services {
+        let outside = if verb.takes_node() && arguments.get(NODE).is_some() {
+            Err(arca_api::limits::Outside(format!(
+                "{} is refused: this token is limited to named services of this node, and a linked node does not hold its limit",
+                verb.name
+            )))
+        } else {
+            arca_api::limits::check(verb, services, &arguments)
+        };
+        if let Err(arca_api::limits::Outside(why)) = outside {
+            return Ok(Some(error_reply(
+                id,
+                REFUSED,
+                &why,
+                Some(json!({ "refusal": arca_api::limits::OUTSIDE_SERVICES })),
+            )));
+        }
     }
     // A destructive verb's `confirm` is the door's: it is taken out here, so the handler, and every approval it checks or
     // binds, sees the call without it. `false` refuses before the handler runs, so nothing changes and nothing is spent.
@@ -411,6 +433,12 @@ async fn call_tool(
             }
         }
     }
+    // What a limited token's answer is cut by: the call's own arguments, which the handler takes.
+    let limited = caller
+        .limits
+        .services
+        .clone()
+        .map(|services| (services, arguments.clone()));
     let owned_caller = caller.clone();
     let outcome = tokio::task::spawn_blocking(move || handler.call(arguments, &owned_caller)).await;
     let result = match outcome {
@@ -430,6 +458,24 @@ async fn call_tool(
     };
     match result {
         Ok(value) => {
+            let value = match &limited {
+                None => value,
+                Some((services, args)) => {
+                    match arca_api::limits::cut(verb, services, args, value) {
+                        Some(value) => value,
+                        None => {
+                            (server.log)(&internal_line(
+                                name,
+                                "its answer has no cut for a token limited to named services",
+                            ));
+                            return Ok(Some(result_reply(
+                                id,
+                                tool_failure("internal", "the tool failed"),
+                            )));
+                        }
+                    }
+                }
+            };
             let (cut, value) = match (verb.cut)(&value) {
                 Some(capped) => (
                     Some(
@@ -1277,6 +1323,7 @@ mod tests {
             cut: |_| Some(json!({ "cut": true })),
             params: || json!({ "type": "object", "properties": {} }),
             result: || json!({ "type": "array", "items": { "type": "string" } }),
+            target: arca_api::limits::Target::Node,
         }
     }
 

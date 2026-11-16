@@ -439,6 +439,7 @@ fn a_route_needs_an_edge_a_real_instance_and_a_dns_name() {
             token_id: "viewer".into(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         },
     );
     assert!(matches!(viewer, Err(CallError::Forbidden { .. })));

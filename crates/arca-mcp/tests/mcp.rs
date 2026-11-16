@@ -34,6 +34,7 @@ fn table() -> &'static [Verb] {
             cut: arca_api::verbs::no_cut,
             params: write_probe_params,
             result: write_probe_result,
+            target: arca_api::limits::Target::Node,
         });
         Box::leak(all.into_boxed_slice())
     })
@@ -1024,6 +1025,7 @@ fn a_write_verb_open_to_viewers_is_a_wiring_error_at_start() {
         cut: arca_api::verbs::no_cut,
         params: write_probe_params,
         result: write_probe_result,
+        target: arca_api::limits::Target::Node,
     });
     let table: &'static [Verb] = Box::leak(all.into_boxed_slice());
     let _ = Server::new(table, tokens);

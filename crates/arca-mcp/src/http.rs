@@ -413,12 +413,14 @@ async fn serve_get(
         return server.unauthorized(&headers);
     };
     // The route is its verb's reading over GET: a token the verb does not admit, by scope or by tool list, is refused
-    // here as a `tools/call` of the verb is.
-    let admitted = server
-        .verbs
-        .iter()
-        .find(|verb| verb.name == tool)
-        .is_some_and(|verb| may_call(caller.scope, verb) && caller.allows_tool(verb.name));
+    // here as a `tools/call` of the verb is. A route's answer has no cut to a token's services, so a token limited to
+    // named services is refused every route.
+    let admitted = caller.limits.services.is_none()
+        && server
+            .verbs
+            .iter()
+            .find(|verb| verb.name == tool)
+            .is_some_and(|verb| may_call(caller.scope, verb) && caller.allows_tool(verb.name));
     if !admitted {
         return server.forbidden(&caller, tool, false);
     }

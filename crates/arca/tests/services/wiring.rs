@@ -37,6 +37,7 @@ fn op(rig: &Rig, verb: &str, args: Value) -> Result<Value, CallError> {
             token_id: "operator".into(),
             scope: Scope::Operator,
             tools: None,
+            limits: Default::default(),
         },
     )
 }
@@ -252,6 +253,7 @@ fn the_shipped_postgres_template_approved_from_a_card_starts_and_gives_a_linked_
         token_id: "viewer".into(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let executor = arca::handlers::ActionExecutor::new(
         rig.handlers
@@ -393,6 +395,7 @@ fn a_card_that_waited_across_the_replacement_of_its_template_is_refused_and_prop
         token_id: "viewer".into(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let executor = arca::handlers::ActionExecutor::new(
         rig.handlers
@@ -622,6 +625,7 @@ fn g5_secrets_reach_no_answer_audit_journal_or_public_metadata() {
             token_id: "viewer".into(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         },
     )
     .unwrap();
@@ -1701,6 +1705,7 @@ fn g5_bad_removal_approval_runs_no_exec_and_other_verbs_answer_during_logout() {
                 token_id: "operator".into(),
                 scope: Scope::Operator,
                 tools: None,
+                limits: Default::default(),
             },
         )
     });
@@ -1825,6 +1830,7 @@ fn g5_publication_preserves_secret_updates_made_during_its_exec() {
                 token_id: "operator".into(),
                 scope: Scope::Operator,
                 tools: None,
+                limits: Default::default(),
             },
         )
     });

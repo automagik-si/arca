@@ -3,6 +3,7 @@
 
 pub mod check;
 pub mod compat;
+pub mod limits;
 pub mod openrpc;
 pub mod refusals;
 pub mod verbs;

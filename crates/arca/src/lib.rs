@@ -99,7 +99,7 @@ const USAGE: &str = "usage: arca <command>
   call <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
   call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]
   call (alone: lists the verbs)
-  token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--replace] [--config <file> | --hash-dir <dir>]
+  token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--services <comma list>] [--expires <30m|12h|7d|RFC 3339 UTC time>] [--replace] [--config <file> | --hash-dir <dir>]
   token revoke <id> [--config <file> | --hash-dir <dir>]
   token reload [--config <file>] (the running node reads its tokens again)
   oauth list [--config <file>] (the MCP apps connected through the approval page)
@@ -684,7 +684,9 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
         "token" => match rest.split_first() {
             Some((action, rest)) if action == "mint" => cmd_token::mint_token(&parse_flags(
                 rest,
-                &["scope", "id", "hash-dir", "out", "config", "tools"],
+                &[
+                    "scope", "id", "hash-dir", "out", "config", "tools", "services", "expires",
+                ],
                 &["replace"],
             )?),
             Some((action, rest)) if action == "revoke" => {

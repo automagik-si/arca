@@ -7,6 +7,8 @@
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::limits::Target;
+
 /// The class of a verb. Every initial verb is `L`: it runs on one node and needs no second node or vote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum VerbClass {
@@ -71,6 +73,8 @@ pub struct Verb {
     pub summary_text: fn(&Value) -> String,
     /// What the MCP door cuts for its cap, and then marks `truncated`.
     pub cut: fn(&Value) -> Option<Value>,
+    /// What a call touches, for a token limited to named services ([`crate::limits`]).
+    pub target: Target,
 }
 
 impl Verb {
@@ -178,6 +182,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(arca_status_params),
         result: arca_status_result,
+        target: Target::Node,
     },
     Verb {
         name: "node_metrics",
@@ -192,6 +197,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(node_metrics_params),
         result: node_metrics_result,
+        target: Target::Node,
     },
     Verb {
         name: "watch_report",
@@ -206,6 +212,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(watch_report_params),
         result: watch_report_result,
+        target: Target::Filtered,
     },
     Verb {
         name: "token_list",
@@ -220,6 +227,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(token_list_params),
         result: token_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "journal_list",
@@ -234,6 +242,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(journal_list_params),
         result: journal_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "plan_list",
@@ -248,6 +257,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(plan_list_params),
         result: plan_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "action_propose",
@@ -262,6 +272,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(action_propose_params),
         result: action_propose_result,
+        target: Target::Proposal,
     },
     Verb {
         name: "plan_decline",
@@ -276,6 +287,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: plan_decline_params,
         result: plan_decline_result,
+        target: Target::Node,
     },
     Verb {
         name: "plan_renew",
@@ -290,6 +302,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: plan_renew_params,
         result: plan_renew_result,
+        target: Target::Node,
     },
     Verb {
         name: "approval_submit",
@@ -304,6 +317,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: approval_submit_params,
         result: approval_submit_result,
+        target: Target::Node,
     },
     Verb {
         name: "action_approve",
@@ -318,6 +332,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: action_approve_params,
         result: action_approve_result,
+        target: Target::Node,
     },
     Verb {
         name: "peer_keys_sync",
@@ -332,6 +347,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: peer_keys_sync_params,
         result: peer_keys_sync_result,
+        target: Target::Node,
     },
     Verb {
         name: "alerts_list",
@@ -346,6 +362,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(alerts_list_params),
         result: alerts_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "postgres_create",
@@ -360,6 +377,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: postgres_create_params,
         result: postgres_create_result,
+        target: Target::Node,
     },
     Verb {
         name: "postgres_list",
@@ -374,6 +392,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(postgres_list_params),
         result: postgres_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "postgres_link",
@@ -388,6 +407,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: postgres_link_params,
         result: postgres_link_result,
+        target: Target::Node,
     },
     Verb {
         name: "postgres_unlink",
@@ -402,6 +422,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: postgres_unlink_params,
         result: postgres_unlink_result,
+        target: Target::Node,
     },
     Verb {
         name: "postgres_delete",
@@ -416,6 +437,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: postgres_delete_params,
         result: postgres_delete_result,
+        target: Target::Node,
     },
     Verb {
         name: "ontology_query",
@@ -430,6 +452,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(ontology_query_params),
         result: ontology_query_result,
+        target: Target::Node,
     },
     Verb {
         name: "service_create",
@@ -444,6 +467,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_create_params,
         result: service_create_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_list",
@@ -458,6 +482,7 @@ static VERBS: [Verb; 90] = [
         cut: cut_service_list,
         params: on_node!(service_list_params),
         result: service_list_result,
+        target: Target::Filtered,
     },
     Verb {
         name: "service_status",
@@ -472,6 +497,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(service_status_params),
         result: service_status_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_logs",
@@ -486,6 +512,7 @@ static VERBS: [Verb; 90] = [
         cut: cut_service_logs,
         params: on_node!(service_logs_params),
         result: service_logs_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_remove",
@@ -500,6 +527,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_remove_params,
         result: service_remove_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_update",
@@ -514,6 +542,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_update_params,
         result: service_update_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_reconfigure",
@@ -528,6 +557,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_reconfigure_params,
         result: service_reconfigure_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_import",
@@ -542,6 +572,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_import_params,
         result: service_import_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_release",
@@ -556,6 +587,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_release_params,
         result: service_release_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_connect",
@@ -570,6 +602,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_connect_params,
         result: service_connect_result,
+        target: Target::Services("from", "to"),
     },
     Verb {
         name: "service_disconnect",
@@ -584,6 +617,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_disconnect_params,
         result: service_disconnect_result,
+        target: Target::Services("from", "to"),
     },
     Verb {
         name: "service_secret_set",
@@ -598,6 +632,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_secret_set_params,
         result: service_secret_set_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_publish",
@@ -612,6 +647,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_publish_params,
         result: service_publish_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_unpublish",
@@ -626,6 +662,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: service_unpublish_params,
         result: service_unpublish_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "external_add",
@@ -644,6 +681,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: external_add_params,
         result: external_add_result,
+        target: Target::Node,
     },
     Verb {
         name: "external_remove",
@@ -659,6 +697,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: external_remove_params,
         result: external_remove_result,
+        target: Target::Node,
     },
     Verb {
         name: "omni_instance_create",
@@ -673,6 +712,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: omni_instance_create_params,
         result: omni_instance_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "omni_pair",
@@ -687,6 +727,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: omni_pair_params,
         result: omni_pair_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "omni_status",
@@ -701,6 +742,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(omni_status_params),
         result: omni_status_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "owner_approval_request",
@@ -715,6 +757,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: owner_approval_request_params,
         result: owner_approval_request_result,
+        target: Target::Node,
     },
     Verb {
         name: "owner_approval_status",
@@ -729,6 +772,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: owner_approval_status_params,
         result: owner_approval_status_result,
+        target: Target::Node,
     },
     Verb {
         name: "owner_approval_list",
@@ -743,6 +787,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: owner_approval_list_params,
         result: owner_approval_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "owner_approval_pending",
@@ -757,6 +802,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: owner_approval_pending_params,
         result: owner_approval_pending_result,
+        target: Target::Node,
     },
     Verb {
         name: "enroll_confirm",
@@ -771,6 +817,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: enroll_confirm_params,
         result: enroll_confirm_result,
+        target: Target::Node,
     },
     Verb {
         name: "gpu_attach",
@@ -785,6 +832,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: gpu_attach_params,
         result: gpu_change_result,
+        target: Target::Node,
     },
     Verb {
         name: "gpu_detach",
@@ -799,6 +847,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: gpu_detach_params,
         result: gpu_change_result,
+        target: Target::Node,
     },
     Verb {
         name: "storage_list",
@@ -813,6 +862,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(empty_params),
         result: storage_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "storage_add",
@@ -827,6 +877,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: storage_add_params,
         result: storage_add_result,
+        target: Target::Node,
     },
     Verb {
         name: "snapshot_create",
@@ -841,6 +892,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: snapshot_create_params,
         result: snapshot_change_result,
+        target: Target::Node,
     },
     Verb {
         name: "snapshot_list",
@@ -855,6 +907,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(snapshot_list_params),
         result: snapshot_list_result,
+        target: Target::Filtered,
     },
     Verb {
         name: "snapshot_delete",
@@ -869,6 +922,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: snapshot_delete_params,
         result: snapshot_change_result,
+        target: Target::Node,
     },
     Verb {
         name: "instance_start",
@@ -883,6 +937,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: instance_start_params,
         result: instance_change_result,
+        target: Target::Instance,
     },
     Verb {
         name: "instance_stop",
@@ -897,6 +952,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: instance_gated_params,
         result: instance_change_result,
+        target: Target::Instance,
     },
     Verb {
         name: "instance_restart",
@@ -911,6 +967,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: instance_gated_params,
         result: instance_change_result,
+        target: Target::Instance,
     },
     Verb {
         name: "tenant_create",
@@ -925,6 +982,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: tenant_create_params,
         result: tenant_status_result,
+        target: Target::Node,
     },
     Verb {
         name: "tenant_list",
@@ -939,6 +997,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(empty_params),
         result: tenant_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "tenant_status",
@@ -953,6 +1012,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(tenant_id_params),
         result: tenant_status_result,
+        target: Target::Node,
     },
     Verb {
         name: "tenant_usage",
@@ -967,6 +1027,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(tenant_id_params),
         result: tenant_usage_result,
+        target: Target::Node,
     },
     Verb {
         name: "tenant_remove",
@@ -981,6 +1042,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: tenant_remove_params,
         result: service_remove_result,
+        target: Target::Node,
     },
     Verb {
         name: "deploy_confirm",
@@ -995,6 +1057,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: deploy_params,
         result: deploy_confirm_result,
+        target: Target::Node,
     },
     Verb {
         name: "deploy_rollback",
@@ -1009,6 +1072,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: deploy_rollback_params,
         result: deploy_rollback_result,
+        target: Target::Node,
     },
     Verb {
         name: "deploy_remove",
@@ -1023,6 +1087,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: deploy_remove_params,
         result: deploy_remove_result,
+        target: Target::Node,
     },
     Verb {
         name: "function_create",
@@ -1037,6 +1102,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: function_create_params,
         result: function_result,
+        target: Target::Node,
     },
     Verb {
         name: "function_remove",
@@ -1051,6 +1117,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: function_remove_params,
         result: function_remove_result,
+        target: Target::Node,
     },
     Verb {
         name: "function_secret_set",
@@ -1065,6 +1132,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: function_secret_set_params,
         result: service_secret_set_result,
+        target: Target::Node,
     },
     Verb {
         name: "function_list",
@@ -1079,6 +1147,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(empty_params),
         result: function_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "function_run",
@@ -1093,6 +1162,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: function_name_params,
         result: function_run_result,
+        target: Target::Node,
     },
     Verb {
         name: "function_runs",
@@ -1107,6 +1177,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(function_runs_params),
         result: function_runs_result,
+        target: Target::Node,
     },
     Verb {
         name: "registry_secret_set",
@@ -1121,6 +1192,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: registry_secret_set_params,
         result: registry_result,
+        target: Target::Node,
     },
     Verb {
         name: "registry_list",
@@ -1135,6 +1207,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(empty_params),
         result: registry_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "registry_secret_remove",
@@ -1149,6 +1222,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: registry_server_params,
         result: registry_result,
+        target: Target::Node,
     },
     Verb {
         name: "host_network_restore",
@@ -1163,6 +1237,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: host_network_restore_params,
         result: host_network_restore_result,
+        target: Target::Node,
     },
     Verb {
         name: "instance_move_preflight",
@@ -1177,6 +1252,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(instance_move_preflight_params),
         result: instance_move_preflight_result,
+        target: Target::Node,
     },
     Verb {
         name: "instance_move_plan",
@@ -1191,6 +1267,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(instance_move_plan_params),
         result: instance_move_plan_result,
+        target: Target::Node,
     },
     Verb {
         name: "instance_move",
@@ -1205,6 +1282,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: instance_move_params,
         result: instance_move_result,
+        target: Target::Node,
     },
     Verb {
         name: "instance_move_status",
@@ -1219,6 +1297,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(instance_move_status_params),
         result: instance_move_status_result,
+        target: Target::Node,
     },
     Verb {
         name: "instance_move_finish",
@@ -1233,6 +1312,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: instance_move_finish_params,
         result: instance_move_finish_result,
+        target: Target::Node,
     },
     Verb {
         name: "github_oauth_app_set",
@@ -1247,6 +1327,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: github_oauth_app_set_params,
         result: github_oauth_app_set_result,
+        target: Target::Node,
     },
     Verb {
         name: "github_connect",
@@ -1261,6 +1342,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: github_connect_params,
         result: github_flow_result,
+        target: Target::Node,
     },
     Verb {
         name: "github_connect_status",
@@ -1275,6 +1357,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(github_connect_status_params),
         result: github_flow_result,
+        target: Target::Node,
     },
     Verb {
         name: "github_bindings",
@@ -1289,6 +1372,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(github_bindings_params),
         result: github_bindings_result,
+        target: Target::Node,
     },
     Verb {
         name: "github_audit",
@@ -1303,6 +1387,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(github_audit_params),
         result: github_audit_result,
+        target: Target::Node,
     },
     Verb {
         name: "github_runner_mint",
@@ -1317,6 +1402,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: github_runner_mint_params,
         result: github_runner_mint_result,
+        target: Target::Node,
     },
     Verb {
         name: "github_mint_job",
@@ -1331,6 +1417,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: github_mint_job_params,
         result: github_mint_job_result,
+        target: Target::Node,
     },
     Verb {
         name: "github_disconnect",
@@ -1345,6 +1432,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: github_disconnect_params,
         result: github_binding_record,
+        target: Target::Node,
     },
     Verb {
         name: "os_update",
@@ -1359,6 +1447,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(os_update_params),
         result: os_update_result,
+        target: Target::Node,
     },
     Verb {
         name: "route_add",
@@ -1373,6 +1462,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: route_add_params,
         result: route_result,
+        target: Target::Node,
     },
     Verb {
         name: "route_remove",
@@ -1387,6 +1477,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: route_remove_params,
         result: route_remove_result,
+        target: Target::Node,
     },
     Verb {
         name: "route_list",
@@ -1401,6 +1492,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: on_node!(empty_params),
         result: route_list_result,
+        target: Target::Node,
     },
     Verb {
         name: "instance_import",
@@ -1415,6 +1507,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: instance_import_params,
         result: instance_import_result,
+        target: Target::Node,
     },
     Verb {
         name: "instance_import_undo",
@@ -1429,6 +1522,7 @@ static VERBS: [Verb; 90] = [
         cut: no_cut,
         params: instance_import_undo_params,
         result: instance_import_undo_result,
+        target: Target::Node,
     },
 ];
 
@@ -4035,7 +4129,7 @@ fn plan_list_result() -> Value {
 }
 
 /// The twenty-nine verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 31] = [
+pub(crate) const ACTION_NAMES: [&str; 31] = [
     "service_create",
     "service_remove",
     "service_update",
