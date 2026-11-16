@@ -88,45 +88,61 @@ fn write(writer: &UnixIncusWriter, object: &ObjectRef, delta: &Delta) -> Result<
     unreachable!("bounded retries return on their last attempt")
 }
 
+/// Repair only the label key after restoring a snapshot. Never replay an uncertain PATCH.
+fn put_back(writer: &UnixIncusWriter, owned: &arca_incus::Owned) -> Result<(), IncusError> {
+    let labels = owned.config().get(KEY).cloned();
+    for attempt in 0..ATTEMPTS {
+        let fresh = writer.read_owned(owned.target())?;
+        if fresh.config().get(KEY) == labels.as_ref() {
+            return Ok(());
+        }
+        match writer.patch(&fresh, &BTreeMap::from([(KEY.into(), labels.clone())])) {
+            Ok(_) => return Ok(()),
+            Err(IncusError::Status { code: 412, .. }) if attempt + 1 < ATTEMPTS => continue,
+            Err(error) => {
+                let _ = writer.read_owned(owned.target());
+                return Err(error);
+            }
+        }
+    }
+    unreachable!("bounded retries return on their last attempt")
+}
+
 impl ServiceHandler {
-    /// Snapshot rollback restores config as well as the root. Keep caller labels as they stand now, while the
-    /// existing write gate excludes another node call between that read, the restore and the one-key repair.
+    /// Keep labels best effort under the existing write gate. Label failures never prevent the restore or
+    /// change its result. A failed pre-read drops the gate before restoring, as without label preservation.
     pub(super) fn with_labels_preserved(
         &self,
         entry: &Entry,
         config: &crate::service::ServiceConfig,
         restore: impl FnOnce() -> Result<(), IncusError>,
     ) -> Result<(), IncusError> {
-        let refused = || {
-            IncusError::Refused(
-                "service labels ownership or UUID could not be checked for snapshot rollback"
-                    .into(),
-            )
+        let keeping = self.writes.lock().ok().and_then(|gate| {
+            let owned = self.live_owned(entry, config).ok()?;
+            let target = self.exec_target(entry, config).ok()?;
+            Some((gate, owned, target))
+        });
+        let Some((_write, owned, target)) = keeping else {
+            eprintln!(
+                "arca: service {}: labels could not be read before rollback; restoring snapshot without keeping labels",
+                config.name
+            );
+            return restore();
         };
-        let _write = self.writes.lock().map_err(|_| refused())?;
-        let owned = self.live_owned(entry, config).map_err(|_| refused())?;
-        let labels = owned.config().get(KEY).cloned();
-        let target = self.exec_target(entry, config).map_err(|_| refused())?;
-        restore()?;
-        // A restore may consume the changer's whole operation budget; give its read-back and repair their own.
-        let writer = crate::service_exec::writer_for(&self.cfg, &target, Duration::from_secs(90))
-            .map_err(|_| refused())?;
-        for attempt in 0..ATTEMPTS {
-            let fresh = writer.read_owned(owned.target())?;
-            if fresh.config().get(KEY) == labels.as_ref() {
-                return Ok(());
-            }
-            match writer.patch(&fresh, &BTreeMap::from([(KEY.into(), labels.clone())])) {
-                Ok(_) => return Ok(()),
-                Err(IncusError::Status { code: 412, .. }) if attempt + 1 < ATTEMPTS => continue,
-                Err(error) => {
-                    // An uncertain config PATCH must not be replayed. Read back before reporting its failure.
-                    let _ = writer.read_owned(owned.target());
-                    return Err(error);
-                }
+        let result = restore();
+        if result.is_ok() {
+            // The restore has its own operation budget. Keep the label repair bounded separately.
+            let kept = crate::service_exec::writer_for(&self.cfg, &target, Duration::from_secs(90))
+                .ok()
+                .is_some_and(|writer| put_back(&writer, &owned).is_ok());
+            if !kept {
+                eprintln!(
+                    "arca: service {}: rollback succeeded but labels could not be kept; its labels read as of the snapshot",
+                    config.name
+                );
             }
         }
-        unreachable!("bounded retries return on their last attempt")
+        result
     }
 
     pub(super) fn call_labels(&self, args: &Value, entries: &[Entry]) -> Result<Value, CallError> {
