@@ -63,13 +63,47 @@ pub struct Published {
     pub reach: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Limits {
     #[serde(default)]
     pub cpu: Option<String>,
     #[serde(default)]
     pub memory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_read: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<String>,
+}
+
+impl Limits {
+    pub fn has_io_limits(&self) -> bool {
+        self.disk_read.is_some()
+            || self.disk_write.is_some()
+            || self.ingress.is_some()
+            || self.egress.is_some()
+    }
+
+    fn invalid_io_limit(&self) -> Option<&'static str> {
+        for (key, value) in [
+            ("diskRead", &self.disk_read),
+            ("diskWrite", &self.disk_write),
+        ] {
+            if value.as_deref().is_some_and(|value| !disk_limit_ok(value)) {
+                return Some(key);
+            }
+        }
+        for (key, value) in [("ingress", &self.ingress), ("egress", &self.egress)] {
+            if value.as_deref().is_some_and(|value| !rate_ok(value, true)) {
+                return Some(key);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -722,11 +756,30 @@ fn vm_config(cfg: &ServiceConfig) -> Map<String, Value> {
 fn vm_devices(cfg: &ServiceConfig, vm: &Vm, mut nic: Map<String, Value>) -> Value {
     nic.insert("type".into(), json!("nic"));
     nic.insert("name".into(), json!(VM_NIC_NAME));
-    json!({
+    let mut devices = json!({
         "root": { "type": "disk", "path": "/", "pool": cfg.pool, "size": vm.root_size },
         "eth0": nic,
         "agent": { "type": "disk", "source": "agent:config" }
-    })
+    });
+    set_io_limits(cfg, &mut devices);
+    devices
+}
+
+/// Device limits are part of the create itself. Incus must accept them; there is no uncapped retry.
+fn set_io_limits(cfg: &ServiceConfig, devices: &mut Value) {
+    let Some(limits) = &cfg.limits else {
+        return;
+    };
+    for (device, key, value) in [
+        ("root", "limits.read", &limits.disk_read),
+        ("root", "limits.write", &limits.disk_write),
+        ("eth0", "limits.ingress", &limits.ingress),
+        ("eth0", "limits.egress", &limits.egress),
+    ] {
+        if let Some(value) = value {
+            devices[device][key] = json!(value);
+        }
+    }
 }
 
 /// The create body of a virtual machine on a host bridge. It names no profile, no Incus network, no address and no ACL
@@ -1050,6 +1103,8 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             }),
         ),
     );
+    let mut devices = Value::Object(devices);
+    set_io_limits(cfg, &mut devices);
     json!({
         "name": cfg.instance,
         "type": "container",
@@ -1109,6 +1164,9 @@ impl Plugin for Service {
         // An adopted instance is owned through its adopt entry. The service record never writes it.
         if cfg.adopted {
             return Ok(());
+        }
+        if let Some(key) = cfg.limits.as_ref().and_then(Limits::invalid_io_limit) {
+            return Err(PluginError::Config(format!("invalid limits.{key}")));
         }
         // Kernel access is a container's, in the node's own project: a record that says otherwise is never applied,
         // whatever else it holds.
@@ -1932,6 +1990,11 @@ pub const IMAGE_RUNNING: &str = " running ";
 
 fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateError> {
     let name = &template.name;
+    if let Some(key) = template.limits.as_ref().and_then(Limits::invalid_io_limit) {
+        return Err(TemplateError::refused(format!(
+            "template {name}: invalid limits.{key}: use a positive integer in Incus byte/s or iops units for disk, bit/s units for network, within signed 64-bit range"
+        )));
+    }
     if template.is_vm() {
         return validate_vm_template(template);
     }
@@ -2006,7 +2069,7 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
         }
     }
     if let Some(limits) = &template.limits
-        && ((limits.cpu.is_none() && limits.memory.is_none())
+        && ((limits.cpu.is_none() && limits.memory.is_none() && !limits.has_io_limits())
             || limits.cpu.as_deref().is_some_and(|cpu| !decimal(cpu))
             || limits
                 .memory
@@ -2656,6 +2719,59 @@ fn decimal(value: &str) -> bool {
         .next()
         .is_some_and(|first| matches!(first, b'1'..=b'9'))
         && bytes.all(|b| b.is_ascii_digit())
+}
+
+/// Incus parses rates as signed 64-bit integers with case-sensitive decimal or binary units.
+/// Zero disables throttling in Incus: a requested cap must instead be positive; omit it for no cap.
+fn rate_ok(value: &str, bits: bool) -> bool {
+    let split = value.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, unit) = value.split_at(split);
+    let Ok(number) = number.parse::<i64>() else {
+        return false;
+    };
+    if number <= 0 {
+        return false;
+    }
+    let (base, power): (i64, u32) = match (bits, unit) {
+        (_, "") | (false, "B" | " bytes") | (true, "bit") => (1, 0),
+        (false, "kB") | (true, "kbit") => (1000, 1),
+        (false, "MB") | (true, "Mbit") => (1000, 2),
+        (false, "GB") | (true, "Gbit") => (1000, 3),
+        (false, "TB") | (true, "Tbit") => (1000, 4),
+        (false, "PB") | (true, "Pbit") => (1000, 5),
+        (false, "EB") | (true, "Ebit") => (1000, 6),
+        (false, "KiB") | (true, "Kibit") => (1024, 1),
+        (false, "MiB") | (true, "Mibit") => (1024, 2),
+        (false, "GiB") | (true, "Gibit") => (1024, 3),
+        (false, "TiB") | (true, "Tibit") => (1024, 4),
+        (false, "PiB") | (true, "Pibit") => (1024, 5),
+        (false, "EiB") | (true, "Eibit") => (1024, 6),
+        _ => return false,
+    };
+    number.checked_mul(base.pow(power)).is_some()
+}
+
+/// A disk rate may name bytes/s, IOPS, or one of each separated by a comma, as Incus accepts.
+fn disk_limit_ok(value: &str) -> bool {
+    let mut bytes = false;
+    let mut iops = false;
+    for field in value.split(',').map(str::trim) {
+        if let Some(number) = field.strip_suffix("iops") {
+            if iops
+                || !number.bytes().all(|byte| byte.is_ascii_digit())
+                || !number.parse::<i64>().is_ok_and(|number| number > 0)
+            {
+                return false;
+            }
+            iops = true;
+        } else {
+            if bytes || !rate_ok(field, false) {
+                return false;
+            }
+            bytes = true;
+        }
+    }
+    bytes || iops
 }
 
 pub fn size_ok(value: &str) -> bool {

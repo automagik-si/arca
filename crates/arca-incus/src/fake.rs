@@ -208,6 +208,7 @@ struct Shared {
     requests: Mutex<Vec<RecordedRequest>>,
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
+    reject_device_limits: AtomicBool,
     reject_patch: Mutex<Vec<String>>,
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
@@ -474,6 +475,7 @@ impl Shared {
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
+            reject_device_limits: AtomicBool::new(false),
             reject_patch: Mutex::new(Vec::new()),
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
@@ -724,6 +726,13 @@ impl FakeIncus {
     /// object is not created. A switch for the live probe's rejection case.
     pub fn set_reject_config_on_post(&self, kind_path_prefix: &str) {
         lock(&self.shared.reject_config).push(kind_path_prefix.to_string());
+    }
+
+    /// Accept disk/NIC limits at create, then refuse applying them at start, as an unsupported driver would.
+    pub fn reject_device_limits_on_start(&self) {
+        self.shared
+            .reject_device_limits
+            .store(true, Ordering::SeqCst);
     }
 
     /// Fail the start phase of create, leaving the new instance stopped.
@@ -2325,6 +2334,22 @@ fn lxc_split_cmd(cmd: &str, split: LxcSplit) -> Vec<String> {
     }
 }
 
+/// Driver/cgroup/tc rejection happens at start, after Incus has accepted the instance devices.
+fn device_limit_refusal(shared: &Shared, instance: &Value) -> Option<String> {
+    (shared.reject_device_limits.load(Ordering::SeqCst)
+        && instance
+            .get("devices")
+            .and_then(Value::as_object)
+            .is_some_and(|devices| {
+                devices.values().any(|device| {
+                    device
+                        .as_object()
+                        .is_some_and(|device| device.keys().any(|key| key.starts_with("limits.")))
+                })
+            }))
+    .then(|| "device I/O limits are not supported by this driver".to_string())
+}
+
 /// Why a container cannot start on a node whose liblxc splits as `split` says. Incus 7.6 refuses a line break or a
 /// carriage return in any LXC config value at start, so in an `environment.*` value too, which its create lets a
 /// carriage return through. Its `oci.entrypoint` may not split or encode, or init would get other arguments than it
@@ -2614,7 +2639,9 @@ fn create(
                     Err((400, "Failed starting instance".into())),
                 );
             }
-            if let Some(reason) = start_refusal(&store.objects[at].body, *lock(&shared.lxc_split)) {
+            if let Some(reason) = start_refusal(&store.objects[at].body, *lock(&shared.lxc_split))
+                .or_else(|| device_limit_refusal(shared, &store.objects[at].body))
+            {
                 store.objects[at].body["status"] = json!("Stopped");
                 store.expand(at, false);
                 return answered(shared, store, kind, "POST", Err((400, reason)));
@@ -3987,6 +4014,7 @@ fn change_state(
         "start" => {
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
+                    .or_else(|| device_limit_refusal(shared, &store.objects[index].body))
             {
                 return answered(shared, store, "instance", "PUT", Err((400, reason)));
             }
@@ -4066,6 +4094,7 @@ fn change_state(
             // Its stop half is done when its start half cannot start the entrypoint: it ends stopped.
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
+                    .or_else(|| device_limit_refusal(shared, &store.objects[index].body))
             {
                 store.objects[index].body["status"] = json!("Stopped");
                 lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));

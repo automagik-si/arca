@@ -489,7 +489,7 @@ static VERBS: [Verb; 94] = [
     },
     Verb {
         name: "service_status",
-        summary: "One service, named by its name: its address, its ports, its links and its state, and for a virtual machine the settings it was created with. Never a secret. Use service_list first when the name is not known.",
+        summary: "One service, named by its name: its address, its ports, its links and its state, its recorded I/O limits when set, and for a virtual machine the settings it was created with. Never a secret. Use service_list first when the name is not known.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -5617,7 +5617,7 @@ fn service_status_params_base() -> Value {
 fn service_status_result() -> Value {
     let mut view = service_view_schema();
     view["properties"]["settings"] = json!({
-        "description": "For a virtual machine with settings: the settings object it was created with, as its guest reads it (the template's, with the values its create replaced). Never a secret.",
+        "description": "The virtual machine guest settings, when present, with the recorded template limits under limits when an I/O cap is set. Limits describe the create configuration, not measured throughput. Never a secret.",
         "type": "object"
     });
     view["properties"]["baseImage"] = json!({
