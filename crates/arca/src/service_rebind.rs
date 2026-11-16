@@ -100,7 +100,10 @@ pub(crate) fn observe(
     }
     let from = kernel
         .binding_source(entry, &cfg)
-        .map_err(|_| refused("the journal or converged service binding is not current"))?;
+        .map_err(|error| match error {
+            KernelError::Journal(why) => refused(&why),
+            _ => refused("the journal or converged service binding is not current"),
+        })?;
     let retained = kernel
         .retained_entries()
         .map_err(|_| refused("retained ownership is unreadable"))?;
@@ -295,7 +298,10 @@ pub(crate) fn execute(
         to: expected.to.clone(),
         at_ms: now,
     };
-    kernel.commit_binding(event,now).map_err(|_| CallError::Refused {code:"service_rebind".into(),message:"Re-bind was not confirmed. Restart Arca so its durable journal recovers the binding and storage before retrying.".into()})?;
+    kernel.commit_binding(event, now).map_err(|failure| match failure {
+        crate::kernel::BindingCommitFailure::NotAppended => refused("the journal refused the binding before appending it"),
+        crate::kernel::BindingCommitFailure::Unconfirmed => CallError::Refused {code:"service_rebind".into(),message:"Re-bind was not confirmed. Restore state-directory writes and restart Arca so its durable journal recovers the binding and storage before retrying.".into()},
+    })?;
     Ok(json!({"rebound":true,"name":name,"from":expected.from,"to":expected.to}))
 }
 
@@ -314,6 +320,10 @@ pub(crate) fn project(entry: &mut Entry, event: &BindingEvent) -> Result<(), Ker
             .iter()
             .any(|state| state.root_pool == cfg.pool && state.data_volume == volume)
     {
+        eprintln!(
+            "arca: binding recovery of {} skipped: its record does not match either side of the latest binding",
+            entry.id.0
+        );
         return Ok(());
     }
     entry.config["pool"] = json!(event.to.root_pool);

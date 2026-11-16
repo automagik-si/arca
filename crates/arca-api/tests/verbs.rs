@@ -1971,6 +1971,9 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         }
         let fields = own["properties"].as_object_mut().expect("properties");
         fields.remove("approval");
+        if *action == "service_rebind" {
+            fields.remove("binding");
+        }
         for field in kernel_filled(action) {
             let said = fields[*field]["description"]
                 .as_str()
@@ -2311,4 +2314,17 @@ fn journal_binding_fixture_has_a_closed_bounded_schema_and_keeps_legacy_results(
     no_volume["bindings"][0]["to"]["data_volume"] = Value::Null;
     no_volume["bindings"][0]["afterEffect"] = Value::Null;
     conforms(&schema, &no_volume).unwrap();
+}
+
+#[test]
+fn a_rebind_proposal_accepts_only_the_callers_name() {
+    let schema = (verb("action_propose").unwrap().params)();
+    let branch = schema["properties"]["args"]["anyOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["title"] == "service_rebind")
+        .unwrap();
+    assert!(branch["properties"].get("binding").is_none());
+    assert!(conforms(branch, &json!({"name":"sample","binding":{}})).is_err());
 }
