@@ -7,6 +7,24 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
+refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
+the node holds that cluster's config (`/etc/ceph/<name>.conf`) and the read-only client's keyring beside it, and reads
+the source with them while it writes the Incus pool with Incus's own user on Incus's cluster. Arca only reads the
+source cluster. The card's new `Ceph` row and the answer's `ceph` field name both clusters. Each disk streams through the
+node through a pipe, with up to about 100 MiB per `rbd` process whatever the disk's size, at about 10 seconds per GiB
+held on 1 Gbit/s. A failed copy names its side, cluster and client. A card still waiting when `serve` restarts with
+another import config shows the source cluster of the new config, the one the run reads. See docs/OPERATING.md.
+
+A new shipped template, `tailscale`, is the Cloudflare connector's twin for a tailnet: one service that runs Tailscale's
+own node (release 1.104.7, by digest) in userspace networking, with no tun device and no capability, under the service's
+name (or another one given with the target), and forwards TCP 443 on its tailnet address to one linked service as raw
+TCP with a PROXY protocol v2 header, TLS left to the target. The auth key (`TS_AUTHKEY`) and the target (`TS_TARGET`,
+`[NAME@]ADDRESS:PORT`) are set with `service_secret_set`; it is created stopped and `instance_start` starts it. Its
+state is on its own data volume, so it logs in once and a single-use key is enough. Like the Cloudflare connector it has
+no port and reaches only what it is linked to. docs/OPERATING.md, "Reaching a service over your own tailnet
+(Tailscale)", has the steps.
+
 The edge allows the PROXY protocol header from each service linked to it (`service_connect` to the edge), by the
 service's own address, besides the port device's loopback, so a connector that sends one needs no hand edit inside the
 edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the
@@ -68,15 +86,6 @@ the operator) into Incus behind one owner card: the same CPUs, memory, firmware,
 security groups as an Incus network ACL, a cloud-init seed from its context, a full sparse disk copy from the source
 Ceph pool (read-only) into the Incus Ceph pool, and a read-back after the start. `instance_import_undo` stops and
 removes an imported VM; the source is never written. A node needs `kernel.instanceImport` for either.
-
-`instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
-refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
-the node holds that cluster's config (`/etc/ceph/<name>.conf`) and the read-only client's keyring beside it, and reads
-the source with them while it writes the Incus pool with Incus's own user on Incus's cluster. Arca only reads the
-source cluster. The card's new `Ceph` row and the answer's `ceph` field name both clusters. Each disk streams through the
-node through a pipe, with up to about 100 MiB per `rbd` process whatever the disk's size, at about 10 seconds per GiB
-held on 1 Gbit/s. A failed copy names its side, cluster and client. A card still waiting when `serve` restarts with
-another import config shows the source cluster of the new config, the one the run reads. See docs/OPERATING.md.
 
 `action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
 `service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`

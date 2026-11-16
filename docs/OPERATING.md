@@ -5860,6 +5860,65 @@ What to know:
 - **The image.** The template pins `docker.io/cloudflare/cloudflared` release 2026.10.7 by digest, so it never updates
   by itself. A later Arca release moves the pin.
 
+## Reaching a service over your own tailnet (Tailscale)
+
+The shipped `tailscale` template is the Cloudflare connector's twin for a tailnet: it puts one of your services on your
+own Tailscale network, and nowhere else, without opening a port on your router. Arca runs Tailscale's own node as one
+more service. It joins your tailnet under the service's name and hands every connection to port 443 of its tailnet
+address to one service you link it to, as raw TCP: it does not decrypt anything, so the target serves its own TLS. The
+node calls out to Tailscale; nothing calls in from the internet.
+
+You need a Tailscale account (a tailnet), and a service in Arca that serves TLS itself (here it is called `app`, with
+its TLS port first among its ports). As for the Cloudflare connector, the Arca steps are Arca's own verbs, and
+`service_secret_set` needs an assistant that holds a `doctor`-scope token.
+
+1. **Tailscale admin console, "Settings" > "Keys".** Generate an auth key: for one use, not ephemeral, pre-approved if
+   your tailnet asks for device approval, and with a tag, so that the node's own key does not expire. Copy it; treat it
+   like a password. The tag must already be in your tailnet policy's `tagOwners` ("Access controls"), and the policy's
+   rules must let your devices reach that tag on TCP 443; without such a rule the node joins but nothing reaches it.
+2. **Arca: `service_status`** with `{"name": "app"}`. Note its `ipv4` and its first `ports` entry, for example
+   `192.0.2.11` and `8443`.
+3. **Arca: `service_create`** with `{"name": "app-ts", "template": "tailscale"}`. The service's name is also the node's
+   name on your tailnet, unless step 4 gives it another. The service is created with its state volume and stays
+   `stopped`, because it has no key yet.
+4. **Arca: `service_secret_set`** with `{"name": "app-ts", "key": "TS_AUTHKEY", "value": "<the key>"}`, and again with
+   `{"name": "app-ts", "key": "TS_TARGET", "value": "192.0.2.11:8443"}`: the address and port from step 2. To give the
+   node a tailnet name other than the service's, put it in front with an `@`: `"value": "app@192.0.2.11:8443"` (lower
+   case letters, digits and dashes, at most 63, not starting or ending with a dash).
+5. **Arca: `service_connect`** with `{"from": "app-ts", "to": "app"}`. This is what lets the node reach `app`, on `app`'s
+   first port and nothing else.
+6. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "app-ts"}`. The node logs in with the key and
+   appears in the admin console's "Machines" list under its tailnet name (`app-ts`, or the name from step 4).
+7. **Check.** The node is listed as connected in the admin console. From a device on your tailnet, a connection to port
+   443 of the node (its name `app-ts` or its tailnet address) reaches `app`, which answers with its own certificate:
+   use a name that certificate is for, pointed at the node.
+
+What to know:
+
+- **One login.** The node keeps its state on its own data volume, so it uses the key once. Every later start, restart or
+  reconfigure logs in from that state, and a single-use key that is spent does no harm. Removing the service removes the
+  state; a new one needs a new key.
+- **The PROXY header.** Each connection reaches the target with a PROXY protocol version 2 header first, carrying the
+  tailnet client's own address. The target must accept that header from the node's address (`service_status` of
+  `app-ts`, its `ipv4`), and only from it. A target that does not speak PROXY protocol refuses these connections.
+  When the target is this node's edge, linking the node to it (`service_connect` from `app-ts` to the edge) is enough:
+  Arca adds the node's address to the edge's PROXY allow list and reloads Caddy.
+- **Only port 443, only one target.** Nothing else is served. A connection to any other port of the node's tailnet
+  address goes to that port on the node's own loopback, and the node is alone in its container, so nothing listens
+  there. To change the target or the tailnet name, set `TS_TARGET` again and restart the node (`instance_restart`).
+  If the name is already taken on your tailnet, Tailscale gives the node another one (with a number added).
+- **What the node needs from your network.** Outgoing connections to Tailscale's control plane and relays (TCP 443),
+  STUN (UDP 3478) and direct WireGuard paths (UDP 41641), which Arca's service network allows like any other internet
+  traffic. Peers on private ranges are reached through Tailscale's relays. No incoming port is opened.
+- **Where the key and the target live.** In private files in Arca's `secrets/` directory, and in the container's
+  environment in Incus, as for every template secret. `service_logs` replaces both with `[secret]`. Inside the
+  container the key is handed to Tailscale as a file of its own (mode 600, under `/run`, which is in memory), so it is
+  never on a command line. The tailnet name
+  rides on `TS_TARGET` because every secret a template names must be set before it starts, so an optional value cannot
+  be a secret of its own.
+- **The image.** The template pins `docker.io/tailscale/tailscale` release 1.104.7 by digest, so it never updates by
+  itself. A later Arca release moves the pin.
+
 ## An Automagik workspace in its own virtual machine
 
 The shipped `automagik-workspace` template is one virtual machine that holds one Automagik workspace and publishes it
@@ -6077,7 +6136,10 @@ What to know:
   the server's and the gate's containers: HTTP 401 on the loopback port, the answer to a visitor who has not signed
   in. A part that stops is started again after a pause that doubles up to five minutes. A tunnel that keeps
   stopping usually has a token Cloudflare does not accept. When the server's container is replaced, the gate and
-  the connector are started again beside it, since they live in its network namespace. When Docker itself does not
+  the connector are started again beside it, since they live in its network namespace. So are they when Docker
+  starts the server again in place (`docker restart automagik-server`): the server then has a new namespace, and a
+  gate left in the old one would stay healthy on its own loopback while it reaches nothing (HTTP 502, "DSH
+  unavailable"). The keeper compares the namespaces themselves, from `/proc`, at every look. When Docker itself does not
   answer, the keeper says so and touches nothing: a container is only removed or started once Docker has said that
   it stopped or is not there. A keeper that cannot start at all (a missing command, settings that cannot be used)
   stays up and repeats the reason every five minutes.
@@ -6094,6 +6156,26 @@ What to know:
 - **No model key.** The template declares no model secret. Sign-ins to model providers happen inside the workspace.
 - **After a restart of the node** the machine starts by itself (the template sets `autostart`), and the keeper starts
   the containers again from the token on its disk.
+- **The member runner (`memberRunner`, off by default).** With `"memberRunner": true` at create, a member's commands
+  run on the machine under a uid of the member's own instead of inside DSH's container, so a member cannot read the
+  owner's files. **It waits for Automagik's release of the runner:** the template's runner URL is empty and its sha256
+  is that of a test build, a placeholder, so a create that turns it on today fails at the first boot with
+  "Automagik has not released the member runner yet". Once the template pins the release, the first boot:
+  - installs `uidmap` and Node 22.23.5 (by sha256), and Automagik's `member-runner.mjs` (by sha256) under
+    `/usr/local/lib/automagik-member-runner`;
+  - makes uid 1000, DSH's uid, a service uid only. A cloud image gives that uid to its login user (Debian's
+    `debian`, with sudo and no password): the first boot takes its sudo rules, groups, password, shell and SSH keys
+    away. Arca never logs in as that user; it reaches the machine as root through the Incus agent;
+  - adds a user `automagik-runner`, not in the `docker` group, with one `/etc/subuid` and one `/etc/subgid` line
+    (ids 1000000 to 1065535), and runs the runner as that user's service, `automagik-member-runner`. Its memory
+    (half the machine's) and task count (1024) bound every member's runs together. It never runs as root;
+  - makes `/data/workspace` a folder of the machine at that same path, mounted into DSH's container over the server's
+    own `/data/workspace`, never the whole of `/data`, which holds DSH's state. Its socket is in
+    `/run/automagik-member-runner`, which only uid 1000's group and the runner may enter, mounted into DSH's
+    container too.
+
+  `systemctl status automagik-member-runner` and `journalctl -u automagik-member-runner` inside the machine say how it
+  runs. Its refusals and failures also reach the console (`service_logs`).
 - **The settings are fixed.** They are read when the machine is created. To change the reach, the public address
   or the Access settings, create the workspace again with other settings. To move the server's image pin, edit
   `serverImage` in the template: workspaces created afterwards run the new build.

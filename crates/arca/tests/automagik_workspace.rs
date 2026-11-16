@@ -281,6 +281,14 @@ impl Workspace {
             .env("WS_APT_PAUSE", "0")
             .env("WS_COSIGN", self.dir.join("verifier/cosign"))
             .env("WS_COSIGN_SHA256", sha256_hex(fake_cosign().as_bytes()))
+            .env("WS_WORKSPACE", self.dir.join("workspace"))
+            .env("WS_RUNNER_HOME", self.dir.join("runner-home"))
+            .env("WS_RUNNER_PROGRAM", self.dir.join("runner-program"))
+            .env("WS_RUNNER_SOCKETS", self.dir.join("runner-sockets"))
+            .env("WS_RUNNER_UNIT", self.dir.join("runner.service"))
+            .env("WS_RUNNER_TMPFILES", self.dir.join("runner-tmpfiles.conf"))
+            .env("WS_SUDOERS", self.dir.join("sudoers.d"))
+            .env("WS_PROC", self.dir.join("docker/proc"))
             .env("FAKE_DOCKER_DIR", self.dir.join("docker"));
         command
     }
@@ -507,6 +515,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             "accessAudience",
             "accessEmails",
             "accessTeamDomain",
+            "memberRunner",
             "publicUrl",
             "reach",
             "serverImage"
@@ -557,8 +566,19 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             "publicUrl",
             "accessTeamDomain",
             "accessAudience",
-            "accessEmails"
+            "accessEmails",
+            "memberRunner"
         ]
+    );
+    // The member runner ships off; a create turns it on with true, and nothing else.
+    assert_eq!(settings["memberRunner"], json!(false));
+    let on = arca::service::create_settings(&template, Some(&json!({ "memberRunner": true })))
+        .expect("a create may turn the runner on")
+        .merged
+        .expect("the merged settings");
+    assert_eq!(on["memberRunner"], json!(true));
+    assert!(
+        arca::service::create_settings(&template, Some(&json!({ "memberRunner": "yes" }))).is_err()
     );
     let created = arca::service::create_settings(
         &template,
@@ -1421,7 +1441,7 @@ fn a_part_that_is_not_healthy_and_a_start_that_fails_are_said_in_words() {
 #[test]
 fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
     let access = |team: &str, audience: &str, emails: Value| json!({ "accessTeamDomain": team, "accessAudience": audience, "accessEmails": emails });
-    let cases: [(Value, &str); 30] = [
+    let cases: [(Value, &str); 31] = [
         (
             json!({ "serverImage": "registry.example/server:latest" }),
             "settings.serverImage is an image by digest",
@@ -1567,6 +1587,11 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
         (
             json!({ "publicUrl": "https://192.0.2.10" }),
             "settings.publicUrl is a name, not an IP address",
+        ),
+        // The member runner is on or off, and nothing else.
+        (
+            json!({ "memberRunner": "yes" }),
+            "settings.memberRunner is true (members' commands run under uids of their own, through the member runner) or false",
         ),
         // The reach is one of two words.
         (
@@ -2021,6 +2046,122 @@ fn a_tailnet_node_outside_a_namespace_of_its_own_is_removed_and_never_called_ser
     wait_for(&workspace, "the second relay", || {
         workspace.runs("automagik-relay").len() == 2
     });
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+/// With the member runner on, the server gets DSH's workspace and the runner's socket folder, each at its own path on
+/// the machine and in the container, by --mount: a folder that is missing stops the start, in words, and is never made
+/// by Docker. With it off, the server gets neither.
+#[test]
+fn with_the_member_runner_the_server_gets_the_workspace_and_the_socket_folder_at_their_own_paths() {
+    let mut value = settings(URL);
+    value["memberRunner"] = json!(true);
+    let mut workspace = Workspace::new(&value);
+    let (data, folder, sockets) = (
+        workspace.dir.join("data"),
+        workspace.dir.join("workspace"),
+        workspace.dir.join("runner-sockets"),
+    );
+    fs::create_dir_all(&folder).expect("the workspace");
+    workspace.start();
+    says(
+        &workspace,
+        "the server did not start: docker: Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: ",
+    );
+    assert!(!sockets.exists(), "Docker made no folder in its place");
+    fs::create_dir_all(&sockets).expect("the socket folder");
+    says(&workspace, "the server is started from");
+    let runs = workspace.runs("automagik-server");
+    assert_eq!(
+        runs.last().expect("a run"),
+        &format!(
+            "run -d --name automagik-server --pull never --restart no -v {data}:/data --mount type=bind,source={folder},target={folder} --mount type=bind,source={sockets},target={sockets} {SERVER_IMAGE}",
+            data = data.display(),
+            folder = folder.display(),
+            sockets = sockets.display(),
+        )
+    );
+    assert_eq!(workspace.stop(), Some(0));
+
+    let mut off = Workspace::new(&settings(URL));
+    off.start();
+    says(&off, "the server is started from");
+    assert!(!off.runs("automagik-server")[0].contains("--mount"));
+    assert_eq!(off.stop(), Some(0));
+}
+
+/// The runner's file is pinned by URL and sha256, and the pair the template ships is a placeholder until Automagik
+/// releases the runner: a first boot with the runner on says so and changes nothing of the machine's users.
+#[test]
+fn before_automagiks_release_the_first_boot_refuses_the_member_runner_and_changes_no_user() {
+    let mut value = settings(URL);
+    value["memberRunner"] = json!(true);
+    let workspace = Workspace::new(&value);
+    for tool in [
+        "newuidmap",
+        "newgidmap",
+        "unshare",
+        "setpriv",
+        "getent",
+        "useradd",
+        "usermod",
+        "systemd-tmpfiles",
+        "tar",
+        "sed",
+    ] {
+        workspace.stand_in(tool, 0);
+    }
+    let output = workspace.command(None).output().expect("the first boot");
+    assert_eq!(output.status.code(), Some(1));
+    let console = workspace.read("console.log");
+    assert!(
+        console.contains("first boot failed: the member runner could not be set up: Automagik has not released the member runner yet: this template's runner URL is a placeholder"),
+        "{console}"
+    );
+    assert!(
+        workspace
+            .read("apt-get.log")
+            .contains("install -y -q --no-install-recommends uidmap")
+    );
+    for tool in ["getent", "useradd", "usermod", "systemd-tmpfiles", "sed"] {
+        assert_eq!(workspace.read(&format!("{tool}.log")), "", "{tool} ran");
+    }
+    assert!(!workspace.dir.join("installed").exists());
+    assert!(!workspace.dir.join("runner.service").exists());
+}
+
+/// A server that Docker starts again in place (`docker restart`) has a new network namespace, and the gate stays in the
+/// old one: healthy on its own loopback and reaching nothing. The keeper finds it by the namespaces themselves, not
+/// by each part's own health, and starts the gate again beside the server, which it leaves as it is.
+#[test]
+fn a_gate_left_in_the_namespace_of_a_server_restarted_in_place_is_started_again_beside_it() {
+    let mut workspace = Workspace::new(&settings(URL));
+    workspace.start();
+    wait_for(&workspace, "the gate", || {
+        workspace.started("automagik-gate", 1)
+    });
+    says(&workspace, "status: the server is healthy");
+    let restarted = Command::new(workspace.dir.join("bin/docker"))
+        .args(["restart", "automagik-server"])
+        .env("FAKE_DOCKER_DIR", workspace.dir.join("docker"))
+        .output()
+        .expect("docker restart");
+    assert!(restarted.status.success());
+    says(
+        &workspace,
+        "automagik-gate is not in the server's network namespace: the server was started again beside it, so it reaches nothing",
+    );
+    wait_for(&workspace, "the gate again", || {
+        workspace.started("automagik-gate", 2)
+    });
+    assert_eq!(
+        workspace.runs("automagik-server").len(),
+        1,
+        "the server is left as it is"
+    );
+    let netns = |name: &str| workspace.read(&format!("docker/containers/{name}/netns"));
+    assert_eq!(netns("automagik-gate"), netns("automagik-server"));
+    assert!(!netns("automagik-server").is_empty());
     assert_eq!(workspace.stop(), Some(0));
 }
 

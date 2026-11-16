@@ -257,7 +257,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // Both checks come before the kernel opens, because opening it reconciles the desired state: a node whose mode was
     // switched must not create or repair anything of the other mode first.
     check_bridged_start(&cfg, std::path::Path::new("/sys/class/net"))?;
-    let kernel = Kernel::open_with_tenants(
+    let mut kernel = Kernel::open_with_tenants(
         &cfg.state_dir,
         key,
         plugins,
@@ -269,6 +269,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         now_ms(),
     )
     .map_err(kernel_failure)?;
+    // A waiting import's card names the source cluster the run reads, the one of this config: a card proposed under
+    // another is written again here, while this start still owns the kernel and nothing is served.
+    crate::vm_import::reword_waiting_imports(&mut kernel, &cfg);
     let applied_seq = kernel.applied_seq_reader();
     let kernel = Arc::new(Mutex::new(kernel));
 

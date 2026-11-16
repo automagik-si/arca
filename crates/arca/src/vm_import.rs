@@ -363,6 +363,15 @@ fn kept_row(row: &str, from: &str, pool: &str) -> bool {
             )
 }
 
+/// Writes each waiting import's `Ceph` row again from `node`'s import config, the config the run reads with and the
+/// import backend is made from ([`row_after_restart`]). `serve` calls it on the kernel it owns, once it opens and before
+/// it is shared, so a card proposed under another config is written again before anything is served and no handler waits
+/// on the kernel lock for it.
+pub fn reword_waiting_imports(kernel: &mut Kernel, node: &NodeConfig) {
+    let import = node.kernel.instance_import.as_ref();
+    kernel.reword_import_cards(|args, stored| row_after_restart(import, args, stored));
+}
+
 /// The `Ceph` row a waiting import shows once `serve` has started again, for its arguments `args`, the row the journal
 /// kept (`stored`) and the node's import config now (`import`), which is what the run reads with. The stored row stays
 /// when it names the source pool, cluster and client the config names now and the Incus pool of the arguments. Else the
