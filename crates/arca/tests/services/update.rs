@@ -277,6 +277,7 @@ fn a_call_that_cannot_run_changes_nothing() {
             token_id: "viewer".into(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         },
     );
     assert!(matches!(viewer, Err(CallError::Forbidden { .. })));

@@ -23,6 +23,7 @@ fn op(rig: &Rig, verb: &str, args: Value) -> Result<Value, CallError> {
             token_id: "operator".into(),
             scope: Scope::Operator,
             tools: None,
+            limits: Default::default(),
         },
     )
 }

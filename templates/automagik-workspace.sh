@@ -78,7 +78,8 @@
 #   means "not set". accessTeamDomain, accessAudience and accessEmails are the owner's Cloudflare Access application for
 #   that address (none of them a secret): all three are set, or none. accessEmails is text, one address or several
 #   separated by commas, which the gate gets unchanged; a list with one address in each entry, as workspaces made
-#   before took it, is taken too. serverImage is the server's image by digest.
+#   before took it, is taken too. serverImage is the server's image by digest. automagikPnpm is the absolute path
+#   of pnpm 10 baked into that image, supplied by its owner; an empty or missing setting refuses the server start.
 #   reach is "cloudflare" (also when it is left out) or "tailnet"; with "tailnet" publicUrl is the node's own
 #   https://<machine>.<tailnet>.ts.net and the Access settings are refused.
 # - /etc/arca-secrets/TUNNEL_TOKEN (reach "cloudflare") or /etc/arca-secrets/TAILSCALE_AUTHKEY (reach "tailnet"):
@@ -116,6 +117,15 @@ set -u
 : "${WS_UNIT:=/etc/systemd/system/arca-automagik-workspace.service}"
 : "${WS_DOCKER_ETC:=/etc/docker}"
 : "${WS_DATA_OWNER:=1000:1000}"      # the server image's own user, which the gate runs as too
+# Automagik image contract: numeric uid 1000 (no /home entry); the image's entrypoint runs unchanged.
+# All paths are inside the EXISTING WS_DATA bind at /data. Keep this layout together for image review.
+NATIVE_HOME=/data
+AUTOMAGIK_HOME=/data
+AUTOMAGIK_BOTS_HOME=/data/bots
+DSH_HOME=/data/dsh
+AUTOMAGIK_WORKSPACE=/data/workspace
+HERDR_APP_HOME=/data/herdr-app                         # PROPOSED: the image owner is adding this
+HC_TERMINAL_SOCKET=/data/run/herdr-core/default.sock   # PROPOSED: supervised by the image entrypoint
 : "${WS_TUNNEL_OWNER:=65532:65532}"  # the user the tunnel is run as; it alone reads the token's copy
 : "${WS_TAILNET_OWNER:=0:0}"         # the tailnet image's own user; it alone reads the auth key's copy
 : "${WS_CLAIM_MINUTES:=15}"          # how long the gate's claim code is good for, as the gate fixes it
@@ -525,9 +535,17 @@ UNIT
 }
 
 # The server's /data and the gate's /data: two directories on the machine's own disk, the server user's. Only the
-# directories themselves are touched; what the server and the gate keep in them is never read or changed.
+# directories and the server's explicit homes are prepared; existing file contents are never read or changed.
 data_directories() {
-  install -d -m 0750 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$WS_DATA" "$WS_GATE_DATA" || return 1
+  install -d -m 0750 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$WS_GATE_DATA" || return 1
+  # The image seeds directories, but this bind hides them. Prepare them for uid 1000 before the entrypoint runs.
+  # No extra volume, no recursive ownership changes and NO .herdr/bots.json or roster: the image seeds those.
+  local workspace_path
+  for workspace_path in "$NATIVE_HOME" "$AUTOMAGIK_HOME" "$AUTOMAGIK_BOTS_HOME" "$DSH_HOME" "$HERDR_APP_HOME" \
+    "$AUTOMAGIK_WORKSPACE" "$AUTOMAGIK_HOME/acp" "$AUTOMAGIK_HOME/acp/clis" /data/secrets /data/run \
+    "${HC_TERMINAL_SOCKET%/*}"; do
+    install -d -m 0700 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$WS_DATA${workspace_path#/data}" || return 1
+  done
   # The tailnet node's state: its identity on the tailnet. Made only for the reach that has a node.
   [ "${REACH:-cloudflare}" != tailnet ] ||
     install -d -m 0700 -o "${WS_TAILNET_OWNER%%:*}" -g "${WS_TAILNET_OWNER##*:}" "$WS_TAILNET_STATE"
@@ -557,6 +575,7 @@ load_settings() {
   url=$(jq -r '.publicUrl | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   REACH=$(jq -r '.reach | if . == null then "cloudflare" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   SERVER_IMAGE=$(jq -r '.serverImage | if type == "string" then . else "" end' "$WS_SETTINGS")
+  AUTOMAGIK_PNPM=$(jq -r '.automagikPnpm | if type == "string" then . else "" end' "$WS_SETTINGS")
   MEMBER_RUNNER=$(jq -r '.memberRunner | if . == null then "false" elif type == "boolean" then tostring else "!" end' "$WS_SETTINGS")
   # A missing key is an empty one, and so is an empty list or text of spaces alone. A value of the wrong kind
   # becomes "!", which no rule below takes. accessEmails is text the gate gets unchanged: one address or several,
@@ -579,6 +598,12 @@ load_settings() {
   fi
   if ! pinned "$SERVER_IMAGE"; then
     refuse "settings.serverImage is an image by digest: <registry>/<name>@sha256:<64 hex digits>"
+    return
+  fi
+  # There is deliberately no fallback to PATH or AUTOMAGIK_APP_BROWSER: the store needs the image's pinned pnpm 10.
+  if ! [[ $AUTOMAGIK_PNPM =~ ^/([A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+$ ]] ||
+    [[ $AUTOMAGIK_PNPM =~ /\.\.?(/|$) ]]; then
+    refuse "settings.automagikPnpm must name the absolute path of pnpm 10 baked into the image; AUTOMAGIK_PNPM is required to start the CLI store"
     return
   fi
   # The gate takes its origin exactly as a browser writes it, and stops when it is written another way: no path, no
@@ -764,7 +789,12 @@ keep_server() {
   [ "${MEMBER_RUNNER:-false}" != true ] ||
     mounts+=(--mount "type=bind,source=$WS_WORKSPACE,target=$WS_WORKSPACE"
       --mount "type=bind,source=$WS_RUNNER_SOCKETS,target=$WS_RUNNER_SOCKETS")
-  if out=$(docker run -d --name "$SERVER" --pull never --restart no "${mounts[@]}" "$SERVER_IMAGE" 2>&1 >/dev/null); then
+  if out=$(docker run -d --name "$SERVER" --pull never --restart no "${mounts[@]}" \
+    --user "$WS_DATA_OWNER" -e "HOME=$NATIVE_HOME" \
+    -e "AUTOMAGIK_HOME=$AUTOMAGIK_HOME" -e "AUTOMAGIK_BOTS_HOME=$AUTOMAGIK_BOTS_HOME" \
+    -e "DSH_HOME=$DSH_HOME" -e "HERDR_APP_HOME=$HERDR_APP_HOME" \
+    -e "AUTOMAGIK_WORKSPACE=$AUTOMAGIK_WORKSPACE" -e "HC_TERMINAL_SOCKET=$HC_TERMINAL_SOCKET" \
+    -e "AUTOMAGIK_PNPM=$AUTOMAGIK_PNPM" "$SERVER_IMAGE" 2>&1 >/dev/null); then
     say "the server is started from $SERVER_IMAGE"
   else
     docker rm -f "$SERVER" >/dev/null 2>&1

@@ -79,6 +79,15 @@ pub const EARLIER: &[(&str, &str)] = &[
         "tailscale.sh",
         "5cc08fec28a57c18c16a641239a7cfd98524beaa371da60bfdbc4cc7c87ba38f",
     ),
+    // 0.33.0: before explicit persistent homes and the required baked pnpm path.
+    (
+        "automagik-workspace.json",
+        "c1a098c97ea945418f3113f4e6a87ff4a5b4c106226dc3d7d53adcb8a91e4bea",
+    ),
+    (
+        "automagik-workspace.sh",
+        "1cc3119c26c9a7b16c97cdf8be1f271494433229e582c0ffb87d00125e3c1cf5",
+    ),
     // 0.1.0-alpha.7 to 0.14.0: before its image's name carried the inputs it is built from.
     (
         "automagik.json",

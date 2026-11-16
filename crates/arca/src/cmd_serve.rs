@@ -1023,12 +1023,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }
         };
         tokio::select! {
-            // The pid file is published the moment the socket is this process's own, and before any request is served: a
-            // start that is refused never reaches it, so the file never names a process that holds no listener.
-            // The console's token file is written there too, so a refused start never touches a live node's file, and a
-            // file that cannot be written stops the start.
+            // Publish the pid only after this process owns the socket and its console token is written and synced,
+            // before any request is served. A refused start never touches a live node's token file; a token write
+            // failure stops the start without publishing a pid.
             result = serve_unix_bound(router.clone(), &unix_path, || {
-                publish_pid(&pid_path);
                 match &console {
                     Some(console) => console.write().map(|()| {
                         eprintln!(
@@ -1041,7 +1039,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                         format!("the console's token file was not written: {error}"),
                     )),
                     None => Ok(()),
-                }
+                }?;
+                publish_pid(&pid_path);
+                Ok(())
             }) => result,
             result = loopback => result,
             result = loopback_twin => result,
@@ -1497,12 +1497,17 @@ fn approval_failure(error: ApprovalRefusal) -> Failure {
 }
 
 /// One line for each token file the store left out when it was last read: a file under the name approved actions
-/// run under. The node runs without it, and the line says how the file is removed.
+/// run under, and a file the store skipped ([`TokenStore::skipped`]). The node runs without them, and each line says why.
 fn say_ignored_tokens(tokens: &TokenStore) {
     for file in tokens.ignored() {
         eprintln!(
             "arca: token file {file} is ignored: it uses the name an action runs under once the owner approved it, so no token of that name is accepted. Remove it with: arca token revoke {}",
             arca_mcp::auth::APPROVED_ACTION_ID
+        );
+    }
+    for (file, why) in tokens.skipped() {
+        eprintln!(
+            "arca: token file {file} is left out, so its token is refused: {why}. The other tokens are loaded"
         );
     }
 }

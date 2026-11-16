@@ -2260,3 +2260,25 @@ fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
         }
     }
 }
+
+#[test]
+fn reach_verbs_and_their_proposals_stay_outside_service_limited_tokens() {
+    use arca_api::limits::{ServiceLimit, check};
+    let limited = ServiceLimit::parse("node-ts,edge").expect("two named services");
+    for (name, args) in [
+        (
+            "reach_connect",
+            json!({"kind":"tailscale","name":"node-ts"}),
+        ),
+        ("reach_list", json!({})),
+        (
+            "action_propose",
+            json!({"action":"reach_connect","args":{"kind":"tailscale","name":"node-ts"}}),
+        ),
+    ] {
+        assert!(
+            check(verb(name).expect("registered verb"), &limited, &args).is_err(),
+            "{name} reaches the node beyond a token's named services"
+        );
+    }
+}

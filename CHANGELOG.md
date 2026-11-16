@@ -9,8 +9,70 @@ template's image and content digest. `reach_list` shows connector state and tail
 Keyless startup allows 10 minutes for sign-in; connector logs hide the login link, and a timed-out connector is
 shown as `gave-up`. Keys remain separate, through `service_secret_set` and a restart.
 
+Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
+`TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:
+a connector may start with no key, and an unset optional secret is absent from the container's environment. Other
+templates keep requiring their secrets. Connector records now keep their template's kind (`tailscale` or `cloudflare`),
+with a template fallback for services made before this change.
+
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
+
+`instance_move` now moves a stopped virtual machine, where every virtual machine was refused before. It stays stopped:
+nothing starts or stops it here, its copy is made once and started on the target, and the move counts only once the
+copy's guest answers: its Incus agent, or one of its addresses answering a TCP connection from this node (an address
+Incus lists for a guest that never booted does not count). Otherwise the copy is deleted and the source is left as it
+was. A virtual machine that runs is still refused, with the words to stop it first. When the linked host's entry names
+its Ceph cluster (`approval.linkedHosts[].ceph`: `cluster`, and optionally `client` and `readClient`) and every pool the
+machine uses is Ceph on both hosts, its disks and its config image (UEFI variables, TPM state) go by `rbd export-diff |
+rbd import-diff` from this node into an empty machine Incus makes there at the source's exact size, between two Ceph
+clusters in either direction, reading the source's cluster only; a source started and stopped again during the copy
+makes the copy roll back. Otherwise Incus pushes it, as before for a container. The moved copy keeps its cloud-init
+instance id, so cloud-init does not run its first-boot steps again (containers too). The preflight now sizes a virtual
+machine's Ceph, zfs or lvm disk from what Incus says (its volume's size, its root device's, the pool's `volume.size`,
+else its volume state's), counted whole, where it said the disk could not be measured; a copy by Ceph, which takes no
+snapshot, counts the disk, its custom volumes and its config image, not its snapshots. The card names both nodes, the
+disk's size, what the room it needs counts, that the machine stays stopped, its own rollback promise, and for a copy by
+Ceph each side's cluster, pool and client; the finish card says the source's snapshots go with it. OPERATING.md
+("Stopped virtual machines") says what a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
+
+A token can be limited to named services and to a time: `arca token mint --services dev,gtm --expires 12h`. A limited
+token reaches only the verbs that name a listed service (or a listed service's instance), is refused every verb that
+reaches the whole node, every GET route and every call relayed to a linked node, and reads `service_list`,
+`snapshot_list` and `watch_report` cut to its own services, with no other service's name in them. An action it proposes
+is checked against its list when it is proposed. A token past its `expires` is refused. A token file may also say
+`by=` the token that handed it down; it loads only while that token does and is no wider than it (the verb that hands
+tokens down comes later). From this release on, a token file line of a key the release does not know leaves only that
+token out instead of refusing the whole token directory. A release before this one refuses the whole directory on the
+new lines, so revoke limited tokens before downgrading past it.
+
+`storage_list` never offers mapped RBD, NBD, loop, device-mapper, ZFS volume, DRBD or zram devices as
+whole-disk snapshot storage: kernel device origins are checked, and unreadable or unrecognised origins are not
+free. A mounted mapped image now has the `system` role with no folder offer, where it could previously be `in use`
+and offered as a folder target. `storage_add` refuses these devices before an exclusive open or any write, including
+when the device becomes a mapped image after approval; SATA, NVMe (including native multipath), USB and a VM's own
+virtio disks keep their offers.
+The `automagik-workspace` template prepares workspace homes, the CLI store, workspace, secrets and run directories
+under its existing persistent `/data` mount; `HOME` and `AUTOMAGIK_HOME` are `/data`. The server runs as the configured
+image user and requires `automagikPnpm`, explicitly pinned to the image's `/usr/local/bin/pnpm`, with no fallback.
+The proposed herdr app home and terminal socket are passed to the image's unchanged entrypoint; no roster is
+pre-populated. The current image pin stays. The operating guide adds admission, first-boot checks, removal and
+remaining owner actions for one workspace per project, with passkey/phone sign-in prerequisites. This prepares
+the template; it deploys nothing.
+
+Arca writes and syncs the console's token before publishing its PID at startup. A console reading the token as soon as
+that PID appears no longer finds a missing or previous token; a second start refused by a live node still leaves its
+token file alone.
+
+Service templates may set `limits.diskRead` and `diskWrite` in bytes/s or IOPS, and `limits.ingress` and `egress` in
+bits/s. Containers and virtual machines receive these caps on their root disk and NIC at create; a bad value or an
+Incus refusal fails the create, with no retry without the cap. Incus applies caps at start: if a fresh capped create's
+initial start fails, its instance, record and other new service resources are rolled back, while files supplied before
+the create are kept. Unset caps leave the old behaviour unchanged.
+`service_status` shows the recorded limits under `settings.limits`. See "Service disk and network limits" in
+docs/OPERATING.md for units and storage-driver requirements.
+
+## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
 refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
@@ -29,12 +91,6 @@ TCP with a PROXY protocol v2 header, TLS left to the target. The auth key (`TS_A
 state is on its own data volume, so it logs in once and a single-use key is enough. Like the Cloudflare connector it has
 no port and reaches only what it is linked to. docs/OPERATING.md, "Reaching a service over your own tailnet
 (Tailscale)", has the steps.
-
-Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
-`TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:
-a connector may start with no key, and an unset optional secret is absent from the container's environment. Other
-templates keep requiring their secrets. Connector records now keep their template's kind (`tailscale` or `cloudflare`),
-with a template fallback for services made before this change.
 
 Support reports: `support_report` (any viewer) files a report, with a title of at most 200 characters, a body of at most
 16 KiB, and optionally a severity, a service and a tenant, as one line of `<stateDir>/support-reports.jsonl`; a token
@@ -74,6 +130,16 @@ The edge allows the PROXY protocol header from each service linked to it (`servi
 service's own address, besides the port device's loopback, so a connector that sends one needs no hand edit inside the
 edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the
 routes are untouched. An edge with no service linked to it keeps exactly the config it had.
+
+- Merge feat/edge-allow-linked: the edge's PROXY allow list names the services linked to it
+- Merge fix/disconnect-data-volume: a disconnect restores only the link's own names, so a plain template value no longer blocks later changes
+- Merge fix/approve-page-every-card: the approve page lists every waiting card and a tap approves only the card tapped
+- Merge feat/support-report: support reports with named-only support verbs and a refresh that never widens scope
+- Merge fix/automagik-keeper-netns: the keeper heals a gate, tunnel or relay left in an old network namespace after the server restarts
+- Merge feat/automagik-member-runner: an opt-in member runner for Automagik workspaces, uid 1000 locked down when on, placeholder pin until Automagik publishes the runner
+- Merge feat/tailscale-connector: a one-click Tailscale connector template that joins a tailnet and forwards a port inside Arca with PROXY v2
+- Merge fix/import-reword-no-lock-wait: plan handlers never wait on the kernel lock; serve rewords waiting import cards before it shares the kernel
+- Merge feat/vm-import-cross-cluster: import a VM's disk from another Ceph cluster, the card names the cluster read
 
 ## 0.32.0 (2026-11-16)
 

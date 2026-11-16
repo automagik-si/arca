@@ -342,6 +342,7 @@ mod tests {
             token_id: "doctor".into(),
             scope: arca_api::Scope::Doctor,
             tools: None,
+            limits: Default::default(),
         };
         let handlers =
             crate::handlers::service_handlers(kernel.clone(), Arc::new(|| 1000), cfg.clone());

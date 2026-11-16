@@ -390,7 +390,8 @@ impl<S: JournalStore> Reconciler<S> {
         self.execute_plan(plan, delete_plan, now_ms)
     }
 
-    /// Runs a plan whose owner approval was already checked by the caller. The same TTL, blocked and live-object checks run.
+    /// Runs a plan authorized by the caller: an approved removal or guarded compensation of a fresh failed create.
+    /// The same TTL, blocked and live-object checks run.
     pub fn run_plan_authorized(
         &mut self,
         plan: &Digest,

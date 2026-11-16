@@ -308,6 +308,7 @@ impl Rig {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
     }
@@ -429,6 +430,321 @@ fn nats_template() -> Value {
 }
 
 #[test]
+fn template_io_limit_units_are_checked_before_create() {
+    let rig = Rig::new();
+    for (key, values) in [
+        (
+            "diskRead",
+            vec![
+                "100MB",
+                "1MiB",
+                "1000iops",
+                "100000",
+                "10MB, 1000iops",
+                "001kB",
+                "9223372036854775807B",
+            ],
+        ),
+        (
+            "diskWrite",
+            vec![
+                "1B", "1kB", "1GB", "1TB", "1PB", "1EB", "1KiB", "1GiB", "1TiB", "1PiB", "1EiB",
+            ],
+        ),
+        (
+            "ingress",
+            vec![
+                "200Mbit", "1kbit", "1bit", "100000", "1Kibit", "1Mibit", "1Gibit", "1Tibit",
+                "1Pibit", "1Eibit",
+            ],
+        ),
+        (
+            "egress",
+            vec!["100Mbit", "1Gbit", "1Tbit", "1Pbit", "1Ebit"],
+        ),
+    ] {
+        for value in values {
+            let mut template = nats_template();
+            template["limits"] = json!({key: value});
+            rig.template("nats", template);
+            service::load_template(&rig.dir.join("templates"), "nats")
+                .unwrap_or_else(|error| panic!("{key}={value}: {error:?}"));
+        }
+    }
+    for (key, values) in [
+        (
+            "diskRead",
+            vec![
+                "200Mbit",
+                "1MB/s",
+                "1mb",
+                "1KB",
+                "1.5MB",
+                "-1MB",
+                "0MB",
+                "9223372036854775808",
+                "10EiB",
+                "1MB,2MB",
+                "1iops,2iops",
+            ],
+        ),
+        (
+            "diskWrite",
+            vec![
+                "",
+                "iops",
+                "1IOPS",
+                "-1iops",
+                "0iops",
+                "9223372036854775808iops",
+            ],
+        ),
+        (
+            "ingress",
+            vec![
+                "100MB", "100mbit", "1Mbit/s", "1.5Mbit", "0Mbit", "-1Mbit", "10Eibit",
+            ],
+        ),
+        (
+            "egress",
+            vec![
+                "",
+                "Mbit",
+                "1000iops",
+                " 100Mbit",
+                "100Mbit\n",
+                "9223372036854775808bit",
+            ],
+        ),
+    ] {
+        for value in values {
+            let mut template = nats_template();
+            template["limits"] = json!({key: value});
+            rig.template("nats", template);
+            let before = rig.fake.writes().len();
+            let result = rig.call("service_create", json!({"name":"nats","template":"nats"}));
+            let Err(CallError::Refused { message, .. }) = result else {
+                panic!("{key}={value:?} must fail create");
+            };
+            assert!(message.contains(key), "{message}");
+            assert_eq!(
+                rig.fake.writes().len(),
+                before,
+                "invalid limit writes nothing"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_io_limited_create_does_not_claim_data_left_by_an_earlier_attempt() {
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+    );
+    let mut template = nats_template();
+    template["data"] = json!({"path":"/data"});
+    rig.template("nats", template.clone());
+    rig.fake.set_reject_config_on_post("/1.0/instances");
+    assert!(
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+            .is_err()
+    );
+    let path = format!("/1.0/storage-pools/pool1/volumes/custom/nats-data?project={PROJECT}");
+    let previous = rig
+        .get(&path)
+        .expect("the earlier create left data for approval");
+    let plans = rig.kernel.lock().unwrap().pending_plans();
+    template["limits"] = json!({"diskWrite":"10MB"});
+    rig.template("nats", template);
+    let before = rig.fake.writes().len();
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+    else {
+        panic!("the prior data must be dealt with before a fresh capped create");
+    };
+    assert!(message.contains("previous objects"), "{message}");
+    assert_eq!(rig.fake.writes().len(), before);
+    assert_eq!(rig.get(&path), Some(previous));
+    assert_eq!(rig.kernel.lock().unwrap().pending_plans(), plans);
+}
+
+#[test]
+fn an_io_limited_create_reports_incomplete_cleanup_when_rollback_delete_is_refused() {
+    let rig = Rig::new();
+    let mut template = nats_template();
+    template["limits"] = json!({"egress":"20Mbit"});
+    template["runTmpfs"] = json!(false);
+    template["secrets"] = json!(["TOKEN"]);
+    template["generate"] = json!({"TOKEN":"test_"});
+    template["env"] = json!({"TOKEN":"{{secret:TOKEN}}"});
+    rig.template("nats", template);
+    let secrets = rig.dir.join("secrets/service-nats");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("owner-seeded"), "keep this").unwrap();
+    rig.fake.reject_device_limits_on_start();
+    rig.fake.set_reject_delete("nats");
+
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+    else {
+        panic!("the failed start and refused rollback must fail create");
+    };
+    assert!(
+        message.contains("device I/O limits are not supported by this driver"),
+        "{message}"
+    );
+    assert!(message.contains("cleanup did not complete"), "{message}");
+    assert!(
+        message.contains("service_list") && message.contains("plan_list"),
+        "{message}"
+    );
+    assert!(!message.contains("nothing was left behind"), "{message}");
+    let instance = rig
+        .get(&format!("/1.0/instances/nats?project={PROJECT}"))
+        .expect("the refused DELETE leaves the instance");
+    assert_eq!(instance["status"], "Stopped");
+    assert!(
+        secrets.join("token").exists(),
+        "incomplete rollback preserves generated secrets"
+    );
+    assert_eq!(
+        fs::read_to_string(secrets.join("owner-seeded")).unwrap(),
+        "keep this"
+    );
+    let plans = rig.kernel.lock().unwrap().pending_plans();
+    assert!(plans.iter().any(|plan| {
+        plan.entry.0 == "service-nats"
+            && plan
+                .objects
+                .iter()
+                .any(|object| object.kind == IncusKind::Instance && object.name == "nats")
+    }));
+    let writes = rig.fake.writes();
+    assert!(writes.iter().any(|write| write.method == "DELETE"
+        && write.path.starts_with("/1.0/instances/nats?")
+        && write.status == 400));
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unsupported_io_limits_fail_create_without_retrying_uncapped() {
+    for (key, cap, run_tmpfs) in [("diskRead", "100MB", false), ("egress", "100Mbit", true)] {
+        let rig = Rig::with(
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                networks: vec![],
+                pools: vec![("pool1".into(), json!({}))],
+            },
+            vec![PROJECT.into()],
+            Some("192.0.2.0/24"),
+        );
+        let mut template = nats_template();
+        template["limits"] = json!({key: cap});
+        template["runTmpfs"] = json!(run_tmpfs);
+        template["data"] = json!({"path":"/data"});
+        template["secrets"] = json!(["TOKEN"]);
+        template["generate"] = json!({"TOKEN":"test_"});
+        template["env"] = json!({"TOKEN":"{{secret:TOKEN}}"});
+        let secrets = rig.dir.join("secrets/service-nats");
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(secrets.join("owner-seeded"), "keep this").unwrap();
+        rig.template("nats", template);
+        rig.fake.reject_device_limits_on_start();
+        let failed = rig.call("service_create", json!({"name":"nats","template":"nats"}));
+        let Err(CallError::Refused { message, .. }) = failed else {
+            panic!("unsupported {key} must fail create");
+        };
+        assert!(
+            message.contains("device I/O limits are not supported by this driver"),
+            "{message}"
+        );
+        assert!(
+            rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
+                .is_none()
+        );
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-nats")
+        );
+        assert!(
+            rig.get(&format!(
+                "/1.0/network-acls/{PROJECT}-svc-nats?project=default"
+            ))
+            .is_none()
+        );
+        assert!(
+            rig.get(&format!(
+                "/1.0/storage-pools/pool1/volumes/custom/nats-data?project={PROJECT}"
+            ))
+            .is_none()
+        );
+        assert!(!secrets.join("token").exists());
+        assert_eq!(
+            fs::read_to_string(secrets.join("owner-seeded")).unwrap(),
+            "keep this"
+        );
+        assert!(rig.kernel.lock().unwrap().pending_plans().is_empty());
+        let attempts: Vec<_> = rig
+            .fake
+            .writes()
+            .into_iter()
+            .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
+            .collect();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "no fallback create without the requested cap"
+        );
+        assert_eq!(attempts[0].status, 202);
+    }
+}
+
+#[test]
+fn template_io_limits_reach_the_container_devices_and_status_settings() {
+    let rig = Rig::new();
+    let limits = json!({
+        "diskRead": "100MB", "diskWrite": "1000iops",
+        "ingress": "200Mbit", "egress": "100Mbit"
+    });
+    let mut template = nats_template();
+    template["limits"] = limits.clone();
+    rig.template("nats", template);
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("create with I/O limits alone");
+    let instance = rig
+        .get(&format!("/1.0/instances/nats?project={PROJECT}"))
+        .expect("instance");
+    assert_eq!(instance["devices"]["root"]["limits.read"], "100MB");
+    assert_eq!(instance["devices"]["root"]["limits.write"], "1000iops");
+    assert_eq!(instance["devices"]["eth0"]["limits.ingress"], "200Mbit");
+    assert_eq!(instance["devices"]["eth0"]["limits.egress"], "100Mbit");
+    rig.template("nats", nats_template());
+    let status = rig
+        .call("service_status", json!({"name":"nats"}))
+        .expect("status");
+    assert_eq!(status["settings"]["limits"], limits);
+    let verb = arca_api::verb("service_status").expect("verb");
+    arca_api::conforms(&(verb.result)(), &status).expect("status matches its schema");
+}
+
+#[test]
 fn service_create_list_status_round_trip() {
     let rig = Rig::new();
     rig.template("nats", nats_template());
@@ -464,6 +780,15 @@ fn service_create_list_status_round_trip() {
         .expect("instance");
     assert_eq!(instance["config"]["user.arca.template"], "nats");
     assert_eq!(instance["config"]["user.arca.address"], "192.0.2.10");
+    for (device, key) in [
+        ("root", "limits.read"),
+        ("root", "limits.write"),
+        ("eth0", "limits.ingress"),
+        ("eth0", "limits.egress"),
+    ] {
+        assert!(instance["devices"][device].get(key).is_none());
+    }
+    assert!(status.get("settings").is_none());
     let acl = rig
         .get(&format!(
             "/1.0/network-acls/{PROJECT}-svc-nats?project=default"
@@ -674,6 +999,7 @@ fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     let (send, receive) = std::sync::mpsc::channel();
     let reader = Arc::clone(&status);
@@ -704,6 +1030,7 @@ fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
         .expect("status survives a poisoned kernel lock");
@@ -1096,6 +1423,7 @@ fn the_tools_operator_scope_read_only_reads_a_viewer_reads_and_changes_nothing()
         token_id: "viewer".into(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     assert!(matches!(
         rig.handlers["service_create"].call(json!({"name":"nats","template":"nats"}), &viewer),
@@ -1283,6 +1611,7 @@ fn doctor() -> Caller {
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     }
 }
 
@@ -2917,6 +3246,7 @@ fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
     });
@@ -2945,6 +3275,7 @@ fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         );
         finished.send(result).unwrap();
@@ -4781,6 +5112,7 @@ fn operator_call(
             token_id: "operator".into(),
             scope: Scope::Operator,
             tools: None,
+            limits: Default::default(),
         },
     )
 }

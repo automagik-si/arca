@@ -114,9 +114,16 @@ pub struct ServiceRemoval {
     pub run: Result<Option<PlanRun>, ApprovalRefusal>,
 }
 
-/// A consumed approval, held across logout and consumed once by the proposal/run operation.
+/// A removal authorized by an approval or by rollback of a guarded fresh create.
 pub struct SpentServiceRemoval {
     entry: EntryId,
+}
+
+/// One fresh capped create, captured before effects and consumed only if its initial start fails.
+/// No record or live effects may precede it, so rollback cannot delete an earlier attempt's data.
+pub(crate) struct CappedServiceCreate {
+    entry: EntryId,
+    config: Value,
 }
 
 /// Whether removal stopped before approval was spent or during the proposal afterward.
@@ -956,6 +963,56 @@ impl Kernel {
         self.verifier.nonce_spent(nonce)
     }
 
+    /// Capture the rollback scope before a capped create writes anything to Incus. The caller holds the write gate
+    /// through the create and its settlement; this token is never stored, cloned or exposed through a tool.
+    pub(crate) fn prepare_capped_service_create(
+        &self,
+        config: &crate::service::ServiceConfig,
+    ) -> Option<CappedServiceCreate> {
+        let entry = EntryId(config.entry_id());
+        if config.adopted
+            || config.function.is_some()
+            || !config.start
+            || !config
+                .limits
+                .as_ref()
+                .is_some_and(crate::service::Limits::has_io_limits)
+            || self.entries().iter().any(|found| found.id == entry)
+            || !self.reconciler.journal().live(&entry).is_empty()
+        {
+            return None;
+        }
+        Some(CappedServiceCreate {
+            entry,
+            config: json!(config),
+        })
+    }
+
+    /// Undo only the fresh service whose initial start just failed. Its create authorizes this compensation, not an
+    /// ordinary deletion: the token proves the entry had no prior objects, and its exact record must still match.
+    /// Retirement still uses the journal's plan, UUID, drift and unresolved-effect checks.
+    pub(crate) fn rollback_capped_service_create(
+        &mut self,
+        attempt: CappedServiceCreate,
+        now_ms: u64,
+    ) -> Result<ServiceRemoval, ServiceRemovalError> {
+        if !self.entries().iter().any(|entry| {
+            entry.id == attempt.entry
+                && entry.plugin.0 == "arca.service"
+                && entry.config == attempt.config
+        }) {
+            return Err(ServiceRemovalError::Proposal(KernelError::Journal(
+                "the fresh service record changed before rollback".into(),
+            )));
+        }
+        self.remove_service_spent(
+            SpentServiceRemoval {
+                entry: attempt.entry,
+            },
+            now_ms,
+        )
+    }
+
     /// Spends one service-action approval, removes its entry and runs its pending plan under the caller's one kernel lock.
     /// A concurrent plan approval cannot observe the plan between the proposal and its execution.
     pub fn remove_service(
@@ -1119,7 +1176,7 @@ impl Kernel {
         })
     }
 
-    /// Runs a delete plan whose owner approval was checked and spent by the caller.
+    /// Runs a delete plan authorized by a spent owner approval or a guarded fresh-create rollback.
     pub fn run_plan_authorized(
         &mut self,
         plan: &Digest,
