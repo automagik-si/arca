@@ -134,12 +134,15 @@ claims that the change was not applied.
 The whole string map lives in the one exact instance config key `user.arca.labels`. Only an already matched service
 instance gets this exact allowance in `classify_object`; no prefix is exempted, and adoption's `classify` is unchanged.
 Reconcile, reconfigure and image rebuild preserve the key because it is outside desired state. Failed-update snapshot
-rollback keeps labels best effort: it captures the current map under the existing write gate, restores the snapshot,
-then repairs only this key under If-Match and reads it back. A failed label pre-read drops the gate and still runs the
-restore; a failed label repair after a successful restore leaves the rollback successful. Each failure logs one line
-naming the service without label values; labels may then read as of the snapshot. Label keeping never prevents a
-rollback or changes the restore's result. When keeping succeeds, labels written during the update survive; every
-other key still restores from the snapshot. Status and list read it
+rollback keeps labels best effort without taking the node write gate: it reads the snapshot's label value, captures
+the current map immediately before restore, then repairs only this key under If-Match and reads it back. Put-back
+writes only while the stored value is exactly the snapshot's, absence included; a different value is left alone as
+a post-restore write, including after re-reading a 412. An identical rewrite cannot be distinguished by this rule.
+A label write that lands while the restore itself is running can be lost; this rare metadata window is accepted.
+A failed label pre-read still runs the restore; a failed label repair after a successful restore leaves the rollback
+successful. Each failure logs one line naming the service without label values; labels may then read as of the
+snapshot. Label keeping never prevents a rollback or changes the restore's result. When keeping succeeds, labels
+written before restore survive; every other key still restores from the snapshot. Status and list read it
 from the instance, or show an empty map when none is present. Imported and adopted services may show existing labels,
 but label writes remain refused under the existing read-only rule. Recorded host programs show an empty map and take no
 label writes. Labels are plain data, never secrets and never rendered into configuration. A `hold` key has no special
@@ -158,7 +161,8 @@ Source: `crates/arca/src/service_labels.rs`; tests `service_labels_merge_remove_
 `adopted_services_show_labels_but_still_refuse_label_writes`,
 `labels_survive_reconfigure_and_hold_changes_no_boot_policy`,
 `labels_set_before_and_during_a_failed_update_survive_snapshot_rollback`,
-`rollback_still_succeeds_when_label_pre_read_fails`, `rollback_still_succeeds_when_label_put_back_fails`, and
+`rollback_still_succeeds_when_label_pre_read_fails`, `rollback_still_succeeds_when_label_put_back_fails`,
+`rollback_preserves_a_post_restore_label_writer_after_412`, and
 `an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest`.
 
 ## Writes

@@ -88,12 +88,18 @@ fn write(writer: &UnixIncusWriter, object: &ObjectRef, delta: &Delta) -> Result<
     unreachable!("bounded retries return on their last attempt")
 }
 
-/// Repair only the label key after restoring a snapshot. Never replay an uncertain PATCH.
-fn put_back(writer: &UnixIncusWriter, owned: &arca_incus::Owned) -> Result<(), IncusError> {
+/// Repair only an unchanged snapshot label value; leave any post-restore writer's different value alone.
+/// Recheck that rule after a 412, and never replay an uncertain PATCH.
+fn put_back(
+    writer: &UnixIncusWriter,
+    owned: &arca_incus::Owned,
+    snapshot_labels: Option<&str>,
+) -> Result<(), IncusError> {
     let labels = owned.config().get(KEY).cloned();
     for attempt in 0..ATTEMPTS {
         let fresh = writer.read_owned(owned.target())?;
-        if fresh.config().get(KEY) == labels.as_ref() {
+        let current = fresh.config().get(KEY).map(String::as_str);
+        if current == labels.as_deref() || current != snapshot_labels {
             return Ok(());
         }
         match writer.patch(&fresh, &BTreeMap::from([(KEY.into(), labels.clone())])) {
@@ -109,20 +115,34 @@ fn put_back(writer: &UnixIncusWriter, owned: &arca_incus::Owned) -> Result<(), I
 }
 
 impl ServiceHandler {
-    /// Keep labels best effort under the existing write gate. Label failures never prevent the restore or
-    /// change its result. A failed pre-read drops the gate before restoring, as without label preservation.
+    /// Keep labels best effort without taking the node write gate. A label write during the restore itself
+    /// can be lost. Preserve a different post-restore value, and never change the restore's result.
     pub(super) fn with_labels_preserved(
         &self,
         entry: &Entry,
         config: &crate::service::ServiceConfig,
+        snapshot: &str,
         restore: impl FnOnce() -> Result<(), IncusError>,
     ) -> Result<(), IncusError> {
-        let keeping = self.writes.lock().ok().and_then(|gate| {
-            let owned = self.live_owned(entry, config).ok()?;
+        let keeping = (|| {
             let target = self.exec_target(entry, config).ok()?;
-            Some((gate, owned, target))
-        });
-        let Some((_write, owned, target)) = keeping else {
+            let path = format!(
+                "/1.0/instances/{}/snapshots/{snapshot}?project={}",
+                config.instance, config.project
+            );
+            let saved = UnixIncus::new(self.cfg.incus.socket.clone())
+                .get(&path)
+                .ok()?;
+            let saved_config = saved["config"].as_object()?;
+            let snapshot_labels = match saved_config.get(KEY) {
+                Some(value) => Some(value.as_str()?.to_string()),
+                None => None,
+            };
+            // Read the live labels last, immediately before the restore, without excluding node writes.
+            let owned = self.live_owned(entry, config).ok()?;
+            Some((owned, target, snapshot_labels))
+        })();
+        let Some((owned, target, snapshot_labels)) = keeping else {
             eprintln!(
                 "arca: service {}: labels could not be read before rollback; restoring snapshot without keeping labels",
                 config.name
@@ -134,7 +154,9 @@ impl ServiceHandler {
             // The restore has its own operation budget. Keep the label repair bounded separately.
             let kept = crate::service_exec::writer_for(&self.cfg, &target, Duration::from_secs(90))
                 .ok()
-                .is_some_and(|writer| put_back(&writer, &owned).is_ok());
+                .is_some_and(|writer| {
+                    put_back(&writer, &owned, snapshot_labels.as_deref()).is_ok()
+                });
             if !kept {
                 eprintln!(
                     "arca: service {}: rollback succeeded but labels could not be kept; its labels read as of the snapshot",

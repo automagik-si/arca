@@ -882,6 +882,9 @@ means the PATCH answer was uncertain: the returned map is what was read, and the
 status again before deciding what to do. If read-back is unavailable, `labels_unconfirmed` reports that uncertainty.
 Adopted and imported services show existing labels but take no label write. Snapshot rollback keeps labels best effort;
 a label read or repair failure is logged without values and never prevents an otherwise successful rollback.
+Rollback takes no node write gate: a label write that lands while the restore itself is running can be lost.
+Put-back only replaces a stored value still exactly equal to the snapshot's; a different value is left alone,
+including after an If-Match conflict is re-read.
 
 **Templates an earlier release installed.** A release may change a shipped template: up to 0.12.0, for one, the
 shipped `postgres-autopg` template declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped

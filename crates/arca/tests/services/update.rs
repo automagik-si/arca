@@ -1878,3 +1878,77 @@ fn rollback_still_succeeds_when_label_pre_read_fails() {
 fn rollback_still_succeeds_when_label_put_back_fails() {
     rollback_with_unavailable_label_preservation(false);
 }
+
+#[test]
+fn rollback_preserves_a_post_restore_label_writer_after_412() {
+    let up = Arc::new(AtomicBool::new(false));
+    let mut rig = rig(&up);
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"before":"snapshot"}}),
+    )
+    .unwrap();
+    let setter = rig.handlers["service_labels_set"].clone();
+    let fake = Arc::clone(&rig.fake);
+    let armed = Arc::new(AtomicBool::new(false));
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe: Arc::new(move |_, _, _| {
+                if !armed.swap(true, Ordering::SeqCst) {
+                    let set = setter
+                        .call(
+                            json!({"name":"app", "labels":{"during":"before-restore"}}),
+                            &Caller {
+                                token_id: "doctor".into(),
+                                scope: Scope::Doctor,
+                                tools: None,
+                                limits: Default::default(),
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(set["code"], "confirmed");
+                    // No PATCH occurs between the health failure and label put-back. Change the label value
+                    // just before that PATCH checks If-Match: its 412 must not overwrite this writer on retry.
+                    fake.race_patch_config(
+                        "/1.0/instances/app",
+                        "user.arca.labels",
+                        r#"{"after":"restore"}"#,
+                    );
+                }
+                false
+            }),
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
+    let failure = update(
+        &rig,
+        json!({"name":"app", "digest":NEW, "timeoutSeconds":1}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(failure, CallError::Refused {ref code, ..} if code == "rolled_back"),
+        "{failure:?}"
+    );
+    assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"after":"restore"})
+    );
+    let requests = rig.fake.requests();
+    let conflict = requests
+        .iter()
+        .position(|request| request.method == "PATCH" && request.status == 412)
+        .expect("put-back lost an If-Match race");
+    assert!(
+        !requests[conflict + 1..]
+            .iter()
+            .any(|request| request.method == "PATCH"),
+        "a different label value is not overwritten on retry"
+    );
+}

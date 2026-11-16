@@ -1709,7 +1709,7 @@ impl Run<'_> {
         match back {
             Back::Snapshot(snapshot) => {
                 self.handler
-                    .with_labels_preserved(self.entry, self.config, || {
+                    .with_labels_preserved(self.entry, self.config, snapshot, || {
                         self.changer.restore_snapshot(instance, snapshot)
                     })
                     .map_err(|error| Failure::of("restore", &error))?;
