@@ -750,8 +750,9 @@ node was started with, or restart the node on the new path.
 
 `arca token revoke <id>` removes the token's hash file. With `--config`, it sends `SIGHUP` to a live `arca serve` for that
 config: it checks `<stateDir>/serve.pid` only when its pid is a live `arca serve`, and otherwise finds the same process in
-`/proc`. The server writes that pid file as soon as its own unix socket is bound, before it serves a request, and removes
-it only when it still holds its own pid; a write that fails is said once on stderr and does not stop the node. A second start that fails to bind leaves the running server's pid file unchanged. The answer carries
+`/proc`. Once its unix socket is this process's own, the server writes and syncs the console token file (when configured),
+then publishes the pid, before it serves a request. A token write failure stops the start without publishing a pid. It removes
+the pid file only when it still holds its own pid; a pid file write that fails is said once on stderr and does not stop the node. A second start that fails to bind leaves the running server's pid file unchanged. The answer carries
 `reloadSignalled`; `token_list` drops the token and a call with it is 401 without a restart. With `--hash-dir` alone no state
 directory or serve is known, so no signal is sent (`reloadSignalled: false`) and a running server keeps the token until it is
 restarted or signalled. The hash files stay mode 0400. The signal goes through a pid descriptor (Linux 5.3 or later), never the host's `kill` command: the process is held, checked again and signalled through the descriptor, so no other process can receive it.
@@ -773,8 +774,8 @@ client. Nobody is at that machine to mint one, so the node makes it, when the co
   a tool list, and the reply's one-line body names the verb (`forbidden: journal_list is not on this token's list of
   tools`). Its id is `node:console`; no hash file can carry that id, since an id there holds no colon.
 - **When it is made.** At each start, `serve` checks the file's place before anything listens, holds the new token in
-  memory, and writes it to the file once it holds its unix socket and before it serves there: created new, mode 0400,
-  never through a link, the token and one newline. It is never in `tokens.hashDir`.
+  memory, and writes and syncs it to the file once its unix socket is this process's own, before publishing its pid
+  or serving there: created new, mode 0400, never through a link, the token and one newline. It is never in `tokens.hashDir`.
 - **The start is refused, with exit 2 and words that name `console.tokenFile`,** when the file's directory is missing,
   is a link, is not owned by the user that runs `serve`, or is open to its group or others (it must be mode 0700); when a
   link is at the file's path; and when something other than this node's earlier file is there. The node leaves such a
@@ -3454,10 +3455,12 @@ and total space. Loop, optical and zram devices are not listed. Each disk gets o
 | `in use` | something on it is mounted elsewhere | `folder`: a pool in a folder on it |
 | `free` | nothing on it is mounted or a member of anything | `whole disk`: Incus erases and formats it |
 
-Mapped images (RBD, NBD, loop, device-mapper, ZFS volumes and DRBD) reported as disks are `system` with no whole-disk
-or folder offer, even when mounted; the kernel must identify a machine disk through its device subsystem (including
-virtio for a VM's own disk) or the native NVMe multipath path `/sys/devices/virtual/nvme-subsystem/`, and unreadable or
-unrecognised origins are never free.
+Mapped images (RBD, NBD, loop, device-mapper, ZFS volumes (zvol), DRBD and zram) are never offered as whole-disk
+or folder targets; when listed as disks they are `system`, even when mounted. The kernel device subsystem (including
+virtio for a VM's own disk) or the native NVMe multipath path `/sys/devices/virtual/nvme-subsystem/` decides the origin;
+unreadable or unrecognised origins are never free. This does not check the disk transport: disks attached over iSCSI,
+Fibre Channel or SRP, and NVMe over fabrics with native multipath, count as machine disks and are protected only by
+the usual in-use checks.
 
 `lsblk` lists a multi-device btrfs or bcachefs mount on one member only, so every device with the same file system type and
 UUID, and every device the kernel lists under `/sys/fs/btrfs/<uuid>/devices/` or `/sys/fs/bcachefs/<uuid>/dev-*/block`, is
