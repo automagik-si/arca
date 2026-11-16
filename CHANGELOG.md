@@ -67,6 +67,15 @@ the create are kept. Unset caps leave the old behaviour unchanged.
 `service_status` shows the recorded limits under `settings.limits`. See "Service disk and network limits" in
 docs/OPERATING.md for units and storage-driver requirements.
 
+A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
+its old values may precede a late synchronous PATCH: Arca keeps the original values as its inverse and retries the
+entry on the next document, rather than claiming the change did not land. Gateway errors (502/503/504) also leave the
+answer uncertain for config and ACL array PATCHes and synchronous creates; ACL array PATCHes keep their original rules
+as the inverse when an uncertain answer still reads as the old rules. Runtime recovery polls open intents without
+waiting on Incus operations, with one 5 s Incus I/O budget; an absent synchronous create stays open until it can be read
+back present or restart recovery settles it. PATCH requests get 30 seconds, and service config errors include the
+kernel's reason in the answer and log.
+
 ## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
