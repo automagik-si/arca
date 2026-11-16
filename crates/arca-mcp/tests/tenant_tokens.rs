@@ -291,6 +291,77 @@ fn services_are_checked_after_resolving_the_tenant() {
 }
 
 #[test]
+fn required_deployment_tenants_default_before_validation_only_for_bound_tokens() {
+    let door = Door::start();
+    for (name, args) in [
+        ("deploy_confirm", json!({"deploy": "draft"})),
+        ("deploy_rollback", json!({"deploy": "draft"})),
+        (
+            "deploy_remove",
+            json!({"deploy": "draft", "approval": "grant"}),
+        ),
+    ] {
+        assert_eq!(
+            refusal(&door.call(&door.bound, name, args.clone())),
+            "Reached"
+        );
+        assert_eq!(
+            door.calls.lock().unwrap().last().unwrap().1["tenant"],
+            TENANT
+        );
+        let before = door.calls.lock().unwrap().len();
+        let reply = door.call(&door.open, name, args);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(door.calls.lock().unwrap().len(), before);
+    }
+    // Input schemas remain the same for both kinds of token.
+    for token in [&door.bound, &door.open] {
+        let reply = door.rpc(token, "tools/list", json!({}));
+        let tool = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "deploy_rollback")
+            .unwrap();
+        assert!(
+            tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("tenant"))
+        );
+    }
+}
+
+#[test]
+fn proposals_default_required_tenants_and_foreign_tenants_are_refused_before_validation() {
+    let door = Door::start();
+    let reply = door.call(
+        &door.bound,
+        "action_propose",
+        json!({"action": "deploy_remove", "args": {"deploy": "draft"}}),
+    );
+    assert_eq!(refusal(&reply), "Reached", "{reply}");
+    assert_eq!(
+        door.calls.lock().unwrap().last().unwrap().1["args"]["tenant"],
+        TENANT
+    );
+    let before = door.calls.lock().unwrap().len();
+    for (name, args) in [
+        ("service_create", json!({"tenant": "ijklmnop", "name": 42})),
+        (
+            "action_propose",
+            json!({"action": "deploy_remove", "args": {"tenant": "ijklmnop", "deploy": 42}}),
+        ),
+    ] {
+        assert_eq!(
+            refusal(&door.call(&door.bound, name, args)),
+            "OutsideTokenTenant"
+        );
+    }
+    assert_eq!(door.calls.lock().unwrap().len(), before);
+}
+
+#[test]
 fn node_verbs_and_linked_nodes_are_refused_before_any_handler() {
     let door = Door::start();
     for name in [
