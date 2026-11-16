@@ -11,7 +11,7 @@ pub mod verbs;
 
 pub use check::{closest, conforms, unknown_field};
 pub use openrpc::openrpc;
-pub use verbs::{Scope, Verb, VerbClass, may_call, verb, verbs};
+pub use verbs::{Scope, Verb, VerbClass, may_call, may_call_listed, verb, verbs};
 
 /// The API version. It is the `info.version` of the OpenRPC document and the version of the frozen released schema.
 pub const API_VERSION: &str = "0.1.0";

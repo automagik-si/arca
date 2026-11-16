@@ -4883,8 +4883,8 @@ fn g7_a_kind_arca_request_is_approved_by_one_tap_on_the_page_and_kind_upgrade_is
     assert_eq!(status, 200);
     let page = String::from_utf8_lossy(&page);
     assert!(
-        page.contains("id=\"requests-section\""),
-        "the requests section"
+        page.contains("if (item[REQUEST]) return requestCard(item, current);"),
+        "the requests are drawn among the cards"
     );
     for unsafe_sink in ["innerHTML", "outerHTML", "insertAdjacentHTML"] {
         assert!(!page.contains(unsafe_sink), "text only: {unsafe_sink}");

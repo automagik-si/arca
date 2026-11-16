@@ -967,6 +967,75 @@ fn a_limited_token_is_refused_every_get_route() {
     assert_eq!(get(&door.open).status, 200);
 }
 
+/// A POST route that records each path it is asked for, so a request that reaches it shows.
+struct Ack(Arc<Mutex<Vec<String>>>);
+
+impl arca_mcp::PostHandler for Ack {
+    fn post(&self, path: &str, _caller: &Caller) -> Result<GetReply, CallError> {
+        self.0.lock().expect("the paths").push(path.to_string());
+        Ok(GetReply {
+            content_type: "application/json",
+            body: b"{}".to_vec(),
+        })
+    }
+}
+
+/// A POST route's verb reaches the node's own feed, never one service, so a token limited to named services is refused
+/// it however its scope or list admits the verb: an operator, and a viewer whose list names it. An unlimited operator still
+/// reaches it.
+#[test]
+fn a_limited_token_is_refused_every_post_route() {
+    let scratch = Scratch::new("door-post");
+    let dev_only = limits(Some("dev"), None, None);
+    let operator = mint_limited_into(&scratch, "limited-op", Scope::Operator, None, &dev_only);
+    let named = mint_limited_into(
+        &scratch,
+        "limited-named",
+        Scope::Viewer,
+        Some(&["support_report_ack"]),
+        &dev_only,
+    );
+    let open = mint_limited_into(
+        &scratch,
+        "open-op",
+        Scope::Operator,
+        None,
+        &Limits::default(),
+    );
+    let tokens = TokenStore::load(scratch.path()).expect("loads");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = Server::new(verbs(), tokens)
+        .log_to(Arc::new(|_| {}))
+        .post_route(
+            "/reports/{id}/ack",
+            "support_report_ack",
+            Arc::new(Ack(Arc::clone(&seen))),
+        );
+    let rt = Runtime::new().expect("runtime");
+    let socket = scratch.at("arca.sock");
+    let (router, served) = (server.router(), socket.clone());
+    rt.spawn(async move { serve_unix(router, &served).await });
+    wait_for_socket(&socket);
+    let ack = |token: &str| {
+        let request = format!(
+            "POST /reports/1/ack HTTP/1.1\r\nHost: arca\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        exchange(&mut connect_unix(&socket), request.as_bytes())
+    };
+    for (id, token) in [("limited-op", &operator), ("limited-named", &named)] {
+        let reply = ack(token);
+        assert_eq!(reply.status, 403, "{id}");
+        assert!(reply.body.is_empty(), "{id}: the refusal says nothing");
+    }
+    assert!(
+        seen.lock().expect("the paths").is_empty(),
+        "no refused request reached the handler"
+    );
+    assert_eq!(ack(&open).status, 200);
+    assert_eq!(seen.lock().expect("the paths").len(), 1);
+    drop(rt);
+}
+
 #[test]
 fn an_expired_token_is_refused_at_the_door() {
     let door = Door::start("door-expired");

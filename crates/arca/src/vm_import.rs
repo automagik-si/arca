@@ -3,21 +3,23 @@
 //!
 //! Both verbs run only with the one-shot grant of an action proposal the owner approved. The plan is a pure function of
 //! the approved arguments ([`arca_vmimport::plan_of`]), so the run does what the card said. The node's
-//! `kernel.instanceImport` names the one source pool an import reads and the Ceph client that reads it; a node without
-//! it refuses a proposal before the owner is asked.
+//! `kernel.instanceImport` names the one source pool an import reads, the Ceph client that reads it and the Ceph cluster
+//! it is on, which may be another cluster than the Incus pool's; a node without it refuses a proposal before the owner is
+//! asked. The card names both clusters.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arca_incus::VmImportWriter;
 use arca_mcp::{CallError, Caller, ToolHandler};
+use arca_vmimport::source::ceph_name_ok;
 use arca_vmimport::{DiskCopy, Held, ImportIncus, Place, PoolInfo, Probe, ProcessRunner, RbdCopy};
 use serde_json::Value;
 
 use crate::action_proposal::ActionKind;
-use crate::config::NodeConfig;
+use crate::config::{InstanceImportConfig, NodeConfig};
 use crate::kernel::Kernel;
 
 /// What an import runs through: the Incus writer, the disk copy and the read-back's probe, with the node's source pool.
@@ -226,16 +228,212 @@ fn disabled() -> CallError {
     }
 }
 
+/// How long the proposal waits for Incus to say which Ceph cluster the target pool is on.
+const POOL_READ: Duration = Duration::from_secs(5);
+
+/// Where the node keeps each Ceph cluster's config file, `<name>.conf`.
+const CEPH_DIR: &str = "/etc/ceph";
+
+/// How every `Ceph` row of an import's card starts. A journal's row that does not is not one this kernel wrote.
+pub const CEPH_ROW_START: &str = "Arca reads the source pool ";
+
+/// The target pool as the proposal reads it from Incus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetPool {
+    /// A Ceph pool on the cluster of this name. `one_fsid` is whether the two config files name one cluster under two
+    /// names (the same `fsid`).
+    Ceph { cluster: String, one_fsid: bool },
+    /// A pool of another driver: the run stops before it makes anything.
+    NotCeph(String),
+    /// Incus did not answer, or has no such pool.
+    Unread,
+}
+
+/// The `fsid` a Ceph config file names: the value of its `fsid` line, in any section. `None` when the file cannot be
+/// read or names none.
+fn conf_fsid(dir: &Path, cluster: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(format!("{cluster}.conf"))).ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "fsid")
+            .then(|| {
+                value
+                    .split(['#', ';'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            })
+            .filter(|fsid| !fsid.is_empty())
+    })
+}
+
+/// The target pool from its Incus document, against the source's cluster `source`, with the config files in `dir`.
+fn target_pool(read: Option<&Value>, source: &str, dir: &Path) -> TargetPool {
+    let Some(read) = read else {
+        return TargetPool::Unread;
+    };
+    let driver = read
+        .get("driver")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if driver != "ceph" {
+        return TargetPool::NotCeph(driver.to_string());
+    }
+    let cluster = read
+        .pointer("/config/ceph.cluster_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("ceph")
+        .to_string();
+    // Both names become file names: a name the copy would refuse (one with a `/`, say) reads no file and has no fsid.
+    let one_fsid = cluster != source
+        && ceph_name_ok(source)
+        && ceph_name_ok(&cluster)
+        && conf_fsid(dir, source).is_some_and(|fsid| conf_fsid(dir, &cluster) == Some(fsid));
+    TargetPool::Ceph { cluster, one_fsid }
+}
+
 /// Checks a proposed `instance_import` against the node: the node must name a source pool, and every disk of the
-/// source must be in it. The plan itself is made and checked by [`ActionKind::prepare`].
-pub fn check_proposal(node: &NodeConfig, args: &Value) -> Result<(), CallError> {
+/// source must be in it. The plan itself is made and checked by [`ActionKind::prepare`]. Answers the card's fact: the
+/// `Ceph` row, which names the source's cluster and the target pool's, as the node's config and Incus say now. An Incus
+/// that does not answer, or a pool that is not Ceph, refuses nothing: the row says so.
+pub fn check_proposal(node: &NodeConfig, args: &Value) -> Result<String, CallError> {
     let import = node.kernel.instance_import.as_ref().ok_or_else(disabled)?;
     let plan = arca_vmimport::plan_of(args).map_err(CallError::Invalid)?;
     plan.check_source_pool(&import.source_pool)
         .map_err(|message| CallError::Refused {
             code: "InstanceImportRefused".to_string(),
             message,
-        })
+        })?;
+    let pool = &plan.request.pool;
+    let read = VmImportWriter::new(node.incus.socket.clone())
+        .with_deadline(POOL_READ)
+        .pool(pool)
+        .ok()
+        .flatten();
+    let target = target_pool(read.as_ref(), &import.ceph_cluster, Path::new(CEPH_DIR));
+    let row = ceph_words(
+        &import.ceph_cluster,
+        &import.ceph_client,
+        &import.source_pool,
+        pool,
+        &target,
+    );
+    Ok(ceph_fact(&row))
+}
+
+/// The card fact that carries the `Ceph` row `row`.
+pub fn ceph_fact(row: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "rows": [["Ceph", row]] })).unwrap_or_default()
+}
+
+/// The first half of the `Ceph` row: the source pool, its cluster and the client that reads it, as the node's config
+/// names them. The run reads with exactly these.
+pub fn source_words(cluster: &str, client: &str, source_pool: &str) -> String {
+    format!(
+        "{CEPH_ROW_START}{source_pool} on the Ceph cluster {cluster} as client.{client}, set up to only read, and never writes it"
+    )
+}
+
+/// Whether `row` is a `Ceph` row [`ceph_words`] writes with the first half `from`, for the Incus pool `pool`.
+fn kept_row(row: &str, from: &str, pool: &str) -> bool {
+    let Some(rest) = row.strip_prefix(from) else {
+        return false;
+    };
+    let made = format!("the images Incus made in the Incus pool {pool}");
+    let one_word = |name: &str| !name.is_empty() && !name.contains(' ');
+    rest == format!(". It writes only {made}, on the same cluster")
+        || rest
+            .strip_prefix(&format!(". It writes only {made}, on the Ceph cluster "))
+            .is_some_and(|tail| tail.ends_with(", so this is one cluster under two names"))
+        || rest
+            .strip_prefix(". It copies to the Ceph cluster ")
+            .and_then(|tail| tail.strip_suffix(&format!(", writing only {made}")))
+            .is_some_and(one_word)
+        || rest
+            .strip_prefix(&format!(
+                ". The Incus pool {pool} is not a Ceph pool (its driver is "
+            ))
+            .and_then(|tail| tail.strip_suffix("), so the import stops before it makes anything"))
+            .is_some_and(one_word)
+        || rest
+            == format!(
+                ". It writes only the images Incus makes in the Incus pool {pool}, on the cluster Incus names for it when the import runs"
+            )
+}
+
+/// Writes each waiting import's `Ceph` row again from `node`'s import config, the config the run reads with and the
+/// import backend is made from ([`row_after_restart`]). `serve` calls it on the kernel it owns, once it opens and before
+/// it is shared, so a card proposed under another config is written again before anything is served and no handler waits
+/// on the kernel lock for it.
+pub fn reword_waiting_imports(kernel: &mut Kernel, node: &NodeConfig) {
+    let import = node.kernel.instance_import.as_ref();
+    kernel.reword_import_cards(|args, stored| row_after_restart(import, args, stored));
+}
+
+/// The `Ceph` row a waiting import shows once `serve` has started again, for its arguments `args`, the row the journal
+/// kept (`stored`) and the node's import config now (`import`), which is what the run reads with. The stored row stays
+/// when it names the source pool, cluster and client the config names now and the Incus pool of the arguments. Else the
+/// row is written again from the config, with the target's cluster left to Incus, as when Incus does not answer. A node
+/// without `kernel.instanceImport`, or whose source pool does not hold the disks, shows no row: its run refuses.
+pub fn row_after_restart(
+    import: Option<&InstanceImportConfig>,
+    args: &Value,
+    stored: Option<&str>,
+) -> Option<String> {
+    let import = import?;
+    let plan = arca_vmimport::plan_of(args).ok()?;
+    plan.check_source_pool(&import.source_pool).ok()?;
+    let pool = &plan.request.pool;
+    let from = source_words(
+        &import.ceph_cluster,
+        &import.ceph_client,
+        &import.source_pool,
+    );
+    match stored {
+        Some(row) if kept_row(row, &from, pool) => Some(row.to_string()),
+        _ => Some(ceph_words(
+            &import.ceph_cluster,
+            &import.ceph_client,
+            &import.source_pool,
+            pool,
+            &TargetPool::Unread,
+        )),
+    }
+}
+
+/// The card's `Ceph` row: where the disks are read and where they are written. It says what Arca's own commands do:
+/// they read the source pool and write only the images Incus made. The source client's Ceph grant is the operator's
+/// to set; the row calls it set up to only read.
+fn ceph_words(
+    cluster: &str,
+    client: &str,
+    source_pool: &str,
+    pool: &str,
+    target: &TargetPool,
+) -> String {
+    let from = source_words(cluster, client, source_pool);
+    match target {
+        TargetPool::Ceph { cluster: to, .. } if to == cluster => format!(
+            "{from}. It writes only the images Incus made in the Incus pool {pool}, on the same cluster"
+        ),
+        TargetPool::Ceph {
+            cluster: to,
+            one_fsid: true,
+        } => format!(
+            "{from}. It writes only the images Incus made in the Incus pool {pool}, on the Ceph cluster {to}: the config files of {cluster} and {to} name one fsid, so this is one cluster under two names"
+        ),
+        TargetPool::Ceph { cluster: to, .. } => format!(
+            "{from}. It copies to the Ceph cluster {to}, writing only the images Incus made in the Incus pool {pool}"
+        ),
+        TargetPool::NotCeph(driver) => format!(
+            "{from}. The Incus pool {pool} is not a Ceph pool (its driver is {driver}), so the import stops before it makes anything"
+        ),
+        TargetPool::Unread => format!(
+            "{from}. It writes only the images Incus makes in the Incus pool {pool}, on the cluster Incus names for it when the import runs"
+        ),
+    }
 }
 
 /// A proposal's arguments as anyone who lists it sees them: `plan_list`, the approval page (and the linked page hosts that
@@ -336,6 +534,143 @@ pub fn handlers(
 
 #[cfg(test)]
 mod tests {
+    use super::{TargetPool, ceph_words, conf_fsid, kept_row, source_words, target_pool};
+    use serde_json::json;
+
+    fn words(target: &TargetPool) -> String {
+        ceph_words("source-b", "arca-import", "src-pool", "remote", target)
+    }
+
+    #[test]
+    fn the_ceph_row_names_both_clusters() {
+        let other = TargetPool::Ceph {
+            cluster: "ceph".into(),
+            one_fsid: false,
+        };
+        assert_eq!(
+            words(&other),
+            "Arca reads the source pool src-pool on the Ceph cluster source-b as client.arca-import, set up to only read, and never writes it. It copies to the Ceph cluster ceph, writing only the images Incus made in the Incus pool remote"
+        );
+        let same = TargetPool::Ceph {
+            cluster: "source-b".into(),
+            one_fsid: false,
+        };
+        assert!(words(&same).ends_with("in the Incus pool remote, on the same cluster"));
+        let renamed = TargetPool::Ceph {
+            cluster: "ceph".into(),
+            one_fsid: true,
+        };
+        assert!(words(&renamed).ends_with("so this is one cluster under two names"));
+        assert!(
+            words(&TargetPool::NotCeph("dir".into())).ends_with(
+                "The Incus pool remote is not a Ceph pool (its driver is dir), so the import stops before it makes anything"
+            )
+        );
+        assert!(
+            words(&TargetPool::Unread)
+                .ends_with("on the cluster Incus names for it when the import runs")
+        );
+        for target in [other, same, renamed, TargetPool::Unread] {
+            assert!(words(&target).starts_with(super::CEPH_ROW_START));
+        }
+    }
+
+    #[test]
+    fn a_row_is_kept_only_for_the_source_it_names_and_the_pool_of_the_args() {
+        let from = source_words("source-b", "arca-import", "src-pool");
+        let targets = [
+            TargetPool::Ceph {
+                cluster: "ceph".into(),
+                one_fsid: false,
+            },
+            TargetPool::Ceph {
+                cluster: "source-b".into(),
+                one_fsid: false,
+            },
+            TargetPool::Ceph {
+                cluster: "ceph".into(),
+                one_fsid: true,
+            },
+            TargetPool::NotCeph("dir".into()),
+            TargetPool::Unread,
+        ];
+        for target in &targets {
+            let row = words(target);
+            assert!(kept_row(&row, &from, "remote"), "{row}");
+            // Another source cluster, client or pool, or another Incus pool, is not this row.
+            for other in [
+                source_words("source-c", "arca-import", "src-pool"),
+                source_words("source-b", "admin", "src-pool"),
+                source_words("source-b", "arca-import", "one"),
+            ] {
+                assert!(!kept_row(&row, &other, "remote"), "{row}");
+            }
+            assert!(!kept_row(&row, &from, "remote-2"), "{row}");
+            assert!(!kept_row(&row, &from, "rem"), "{row}");
+            assert!(!kept_row(&format!("{row} and more"), &from, "remote"));
+        }
+        assert!(!kept_row(&from, &from, "remote"));
+    }
+
+    #[test]
+    fn the_target_pool_is_read_from_its_driver_its_cluster_name_and_the_fsids() {
+        let dir = std::env::temp_dir().join(format!("arca-vmimport-fsid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory");
+        std::fs::write(
+            dir.join("ceph.conf"),
+            "[global]\n\tfsid = 0b1e2c3d-0000-4000-8000-00000000000a\n\tmon_host = 192.0.2.1\n",
+        )
+        .expect("a conf");
+        std::fs::write(
+            dir.join("same.conf"),
+            "[global]\nfsid=0b1e2c3d-0000-4000-8000-00000000000a # the one cluster\n",
+        )
+        .expect("a conf");
+        std::fs::write(
+            dir.join("other.conf"),
+            "[global]\nfsid = 0b1e2c3d-0000-4000-8000-00000000000b\n",
+        )
+        .expect("a conf");
+        assert_eq!(
+            conf_fsid(&dir, "same").as_deref(),
+            Some("0b1e2c3d-0000-4000-8000-00000000000a")
+        );
+        assert_eq!(conf_fsid(&dir, "missing"), None);
+        let ceph = json!({ "driver": "ceph", "config": {} });
+        assert_eq!(
+            target_pool(Some(&ceph), "same", &dir),
+            TargetPool::Ceph {
+                cluster: "ceph".into(),
+                one_fsid: true
+            }
+        );
+        assert_eq!(
+            target_pool(Some(&ceph), "other", &dir),
+            TargetPool::Ceph {
+                cluster: "ceph".into(),
+                one_fsid: false
+            }
+        );
+        let named = json!({ "driver": "ceph", "config": { "ceph.cluster_name": "cluster-b" } });
+        assert_eq!(
+            target_pool(Some(&named), "other", &dir),
+            TargetPool::Ceph {
+                cluster: "cluster-b".into(),
+                one_fsid: false
+            }
+        );
+        assert_eq!(
+            target_pool(
+                Some(&json!({ "driver": "zfs", "config": {} })),
+                "other",
+                &dir
+            ),
+            TargetPool::NotCeph("zfs".into())
+        );
+        assert_eq!(target_pool(None, "other", &dir), TargetPool::Unread);
+        std::fs::remove_dir_all(&dir).expect("removed");
+    }
+
     #[test]
     fn the_writer_and_the_plan_name_one_mark_and_one_acl_prefix() {
         assert_eq!(arca_incus::IMPORT_KEY, arca_vmimport::IMPORT_KEY);

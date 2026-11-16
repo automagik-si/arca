@@ -1766,7 +1766,21 @@ impl OAuth {
                     ));
                 }
                 let tools = match (&granted_tools, tools) {
-                    (None, tools) => tools,
+                    // With no list approved, an asked list may only narrow: a tool the approved scope does not reach
+                    // without naming it (arca_api::verbs::NAMED_ONLY) would widen the grant past what the owner approved.
+                    (None, Some(asked)) => {
+                        if let Some(extra) = asked.iter().find(|tool| {
+                            !arca_api::verb(tool)
+                                .is_some_and(|verb| arca_api::may_call_listed(granted, None, verb))
+                        }) {
+                            return Err(OAuthError::new(
+                                "invalid_scope",
+                                format!("the owner did not approve the tool {extra}"),
+                            ));
+                        }
+                        Some(asked)
+                    }
+                    (None, None) => None,
                     (Some(held), None) => Some(held.clone()),
                     (Some(held), Some(asked)) => {
                         if let Some(extra) = asked.iter().find(|tool| !held.contains(tool)) {
@@ -2900,8 +2914,23 @@ stay open for it instead of lapsing after 15 minutes.</p></div>"
         .tools
         .as_ref()
         .map(|tools| {
+            // A tool the list names that no scope below operator reaches without naming it: the list grants it rather
+            // than narrowing to it, whatever level is picked, so the owner is told.
+            let named: Vec<&str> = tools
+                .iter()
+                .map(String::as_str)
+                .filter(|tool| arca_api::verbs::NAMED_ONLY.contains(tool))
+                .collect();
+            let grants = if named.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ". <span class=\"named\">Naming <code>{}</code> gives the app that at any level: it reads or marks the support reports of everyone on this node.</span>",
+                    escape_html(&named.join(", "))
+                )
+            };
             format!(
-                "<p class=\"tools\">Only these tools: <code>{}</code></p>",
+                "<p class=\"tools\">Only these tools: <code>{}</code>{grants}</p>",
                 escape_html(&tools.join(", "))
             )
         })

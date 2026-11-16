@@ -123,6 +123,10 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "route_list",
             "instance_import",
             "instance_import_undo",
+            "support_report",
+            "support_report_status",
+            "support_reports",
+            "support_report_ack",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -294,6 +298,22 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
             Scope::Doctor,
             true,
             true,
+        ),
+        ("support_report", VerbClass::L, Scope::Viewer, false, false),
+        (
+            "support_report_status",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
+        ),
+        ("support_reports", VerbClass::L, Scope::Viewer, false, false),
+        (
+            "support_report_ack",
+            VerbClass::L,
+            Scope::Viewer,
+            false,
+            false,
         ),
     ];
     for (name, class, scope, writes, destructive) in rows {
@@ -2076,7 +2096,8 @@ fn a_field_the_kernel_fills_in_is_taken_at_the_door_with_any_value() {
 }
 
 /// `node` names a linked node: every read the door serves takes it, and `action_propose`, always optional. The only reads
-/// without it are the `owner_approval_*` ones, whose rows are the calling token's own; no write verb takes it.
+/// without it are the `owner_approval_*` ones, whose rows are the calling token's own, and the `support_*` ones, whose
+/// reports are filed, read and picked up on the node they are filed with; no write verb takes it.
 #[test]
 fn node_is_an_optional_argument_of_every_read_and_of_action_propose_only() {
     use arca_api::verbs::NODE;
@@ -2095,7 +2116,9 @@ fn node_is_an_optional_argument_of_every_read_and_of_action_propose_only() {
             assert_eq!(params["properties"][NODE]["type"], json!("string"));
         } else {
             assert!(
-                v.writes || v.name.starts_with("owner_approval_"),
+                v.writes
+                    || v.name.starts_with("owner_approval_")
+                    || v.name.starts_with("support_report"),
                 "the read {} takes no node",
                 v.name
             );
@@ -2113,4 +2136,123 @@ fn node_is_an_optional_argument_of_every_read_and_of_action_propose_only() {
     assert!(verb("action_propose").expect("present").takes_node());
     assert!(verb("watch_report").expect("present").takes_node());
     assert!(verb("route_list").expect("present").takes_node());
+}
+
+/// The support verbs: a viewer files a report and reads its state and the feed; only an operator, or a token whose list
+/// names it, marks one picked up. The params are closed and capped as the handler caps them; the feed's text is untrusted.
+#[test]
+fn support_verbs_have_their_schemas_scopes_and_marks() {
+    let report = verb("support_report").expect("present");
+    let params = (report.params)();
+    assert_eq!(params["required"], json!(["title", "body"]));
+    assert_eq!(params["additionalProperties"], json!(false));
+    assert_eq!(params["properties"]["title"]["maxLength"], json!(200));
+    assert_eq!(params["properties"]["title"]["minLength"], json!(1));
+    assert_eq!(params["properties"]["body"]["maxLength"], json!(16_384));
+    assert_eq!(
+        params["properties"]["severity"]["enum"],
+        json!(["low", "medium", "high", "urgent"])
+    );
+    assert!(conforms(&params, &json!({ "title": "t", "body": "b", "extra": 1 })).is_err());
+    assert!(conforms(&params, &json!({ "title": "x".repeat(201), "body": "b" })).is_err());
+    assert_eq!(
+        conforms(&params, &json!({ "title": "t", "body": "b" })),
+        Ok(())
+    );
+    // A report records something durable, so it is not advertised read-only; neither is an ack. The two reads are.
+    assert!(!report.read_only_hint());
+    assert!(
+        !verb("support_report_ack")
+            .expect("present")
+            .read_only_hint()
+    );
+    assert!(
+        verb("support_report_status")
+            .expect("present")
+            .read_only_hint()
+    );
+    assert!(verb("support_reports").expect("present").read_only_hint());
+    // Only the feed carries a caller's words.
+    for (name, untrusted) in [
+        ("support_report", false),
+        ("support_report_status", false),
+        ("support_reports", true),
+        ("support_report_ack", false),
+    ] {
+        assert_eq!(verb(name).expect("present").untrusted, untrusted, "{name}");
+    }
+    let record =
+        &(verb("support_reports").expect("present").result)()["properties"]["reports"]["items"];
+    assert_eq!(
+        record["required"],
+        json!([
+            "schema",
+            "id",
+            "at",
+            "node",
+            "tokenId",
+            "scope",
+            "state",
+            "pickedUpAt",
+            "untrusted",
+            "report"
+        ])
+    );
+}
+
+/// `support_reports` and `support_report_ack` are the verbs a token reaches only as an operator or by naming them: a viewer
+/// or a doctor with no list, or with a list that leaves the verb out, is refused; a viewer whose list names it is admitted.
+#[test]
+fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
+    use arca_api::may_call_listed;
+    use arca_api::verbs::NAMED_ONLY;
+    assert_eq!(NAMED_ONLY, ["support_reports", "support_report_ack"]);
+    let list = |tools: &[&str]| {
+        tools
+            .iter()
+            .map(|tool| tool.to_string())
+            .collect::<Vec<_>>()
+    };
+    for name in NAMED_ONLY {
+        let v = verb(name).expect("present");
+        let other = NAMED_ONLY.iter().find(|n| **n != name).expect("the other");
+        assert!(!may_call_listed(Scope::Viewer, None, v), "{name}");
+        assert!(!may_call_listed(Scope::Doctor, None, v), "{name}");
+        assert!(may_call_listed(Scope::Operator, None, v), "{name}");
+        assert!(may_call_listed(Scope::Admin, None, v), "{name}");
+        assert!(
+            may_call_listed(Scope::Viewer, Some(&list(&[name])), v),
+            "{name}"
+        );
+        assert!(
+            may_call_listed(Scope::Doctor, Some(&list(&["service_list", name])), v),
+            "{name}"
+        );
+        assert!(
+            !may_call_listed(Scope::Viewer, Some(&list(&[other])), v),
+            "{name}"
+        );
+        assert!(
+            !may_call_listed(Scope::Operator, Some(&list(&[other])), v),
+            "{name}"
+        );
+    }
+    // Every other verb is as before: the scope order and the list.
+    let narrow = list(&["service_list"]);
+    for v in verbs().iter().filter(|v| !NAMED_ONLY.contains(&v.name)) {
+        for scope in [Scope::Viewer, Scope::Doctor, Scope::Operator, Scope::Admin] {
+            assert_eq!(
+                may_call_listed(scope, None, v),
+                may_call(scope, v),
+                "{}",
+                v.name
+            );
+            assert_eq!(
+                may_call_listed(scope, Some(&narrow), v),
+                may_call(scope, v) && v.name == "service_list",
+                "{}",
+                v.name
+            );
+        }
+    }
 }

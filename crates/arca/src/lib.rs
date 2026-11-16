@@ -64,6 +64,7 @@ pub mod service;
 pub mod service_exec;
 pub mod service_import;
 pub mod storage;
+pub mod support_reports;
 pub mod vm_import;
 
 use std::collections::{BTreeMap, BTreeSet};

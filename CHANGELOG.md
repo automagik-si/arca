@@ -4,6 +4,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
+`TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:
+a connector may start with no key, and an unset optional secret is absent from the container's environment. Other
+templates keep requiring their secrets. Connector records now keep their template's kind (`tailscale` or `cloudflare`),
+with a template fallback for services made before this change.
+
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
@@ -12,6 +18,24 @@ other tenants and node-wide operations outside a small read/proposal allowlist a
 service limits still apply, and proposals are checked before saving. Bare service names become tenant-local.
 Tokens without the new line keep their current behavior. Older releases skip an unknown tenant-bound token,
 or refuse the directory if they predate unknown-line skipping; revoke these tokens before that downgrade.
+
+`instance_move` now moves a stopped virtual machine, where every virtual machine was refused before. It stays stopped:
+nothing starts or stops it here, its copy is made once and started on the target, and the move counts only once the
+copy's guest answers: its Incus agent, or one of its addresses answering a TCP connection from this node (an address
+Incus lists for a guest that never booted does not count). Otherwise the copy is deleted and the source is left as it
+was. A virtual machine that runs is still refused, with the words to stop it first. When the linked host's entry names
+its Ceph cluster (`approval.linkedHosts[].ceph`: `cluster`, and optionally `client` and `readClient`) and every pool the
+machine uses is Ceph on both hosts, its disks and its config image (UEFI variables, TPM state) go by `rbd export-diff |
+rbd import-diff` from this node into an empty machine Incus makes there at the source's exact size, between two Ceph
+clusters in either direction, reading the source's cluster only; a source started and stopped again during the copy
+makes the copy roll back. Otherwise Incus pushes it, as before for a container. The moved copy keeps its cloud-init
+instance id, so cloud-init does not run its first-boot steps again (containers too). The preflight now sizes a virtual
+machine's Ceph, zfs or lvm disk from what Incus says (its volume's size, its root device's, the pool's `volume.size`,
+else its volume state's), counted whole, where it said the disk could not be measured; a copy by Ceph, which takes no
+snapshot, counts the disk, its custom volumes and its config image, not its snapshots. The card names both nodes, the
+disk's size, what the room it needs counts, that the machine stays stopped, its own rollback promise, and for a copy by
+Ceph each side's cluster, pool and client; the finish card says the source's snapshots go with it. OPERATING.md
+("Stopped virtual machines") says what a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
 
 A token can be limited to named services and to a time: `arca token mint --services dev,gtm --expires 12h`. A limited
 token reaches only the verbs that name a listed service (or a listed service's instance), is refused every verb that
@@ -22,6 +46,89 @@ is checked against its list when it is proposed. A token past its `expires` is r
 tokens down comes later). From this release on, a token file line of a key the release does not know leaves only that
 token out instead of refusing the whole token directory. A release before this one refuses the whole directory on the
 new lines, so revoke limited tokens before downgrading past it.
+
+`storage_list` never offers mapped RBD, NBD, loop, device-mapper, ZFS volume, DRBD or zram devices as
+whole-disk snapshot storage: kernel device origins are checked, and unreadable or unrecognised origins are not
+free. A mounted mapped image now has the `system` role with no folder offer, where it could previously be `in use`
+and offered as a folder target. `storage_add` refuses these devices before an exclusive open or any write, including
+when the device becomes a mapped image after approval; SATA, NVMe (including native multipath), USB and a VM's own
+virtio disks keep their offers.
+The `automagik-workspace` template prepares workspace homes, the CLI store, workspace, secrets and run directories
+under its existing persistent `/data` mount; `HOME` and `AUTOMAGIK_HOME` are `/data`. The server runs as the configured
+image user and requires `automagikPnpm`, explicitly pinned to the image's `/usr/local/bin/pnpm`, with no fallback.
+The proposed herdr app home and terminal socket are passed to the image's unchanged entrypoint; no roster is
+pre-populated. The current image pin stays. The operating guide adds admission, first-boot checks, removal and
+remaining owner actions for one workspace per project, with passkey/phone sign-in prerequisites. This prepares
+the template; it deploys nothing.
+
+## 0.33.0 (2026-11-16)
+
+`instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
+refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
+the node holds that cluster's config (`/etc/ceph/<name>.conf`) and the read-only client's keyring beside it, and reads
+the source with them while it writes the Incus pool with Incus's own user on Incus's cluster. Arca only reads the
+source cluster. The card's new `Ceph` row and the answer's `ceph` field name both clusters. Each disk streams through the
+node through a pipe, with up to about 100 MiB per `rbd` process whatever the disk's size, at about 10 seconds per GiB
+held on 1 Gbit/s. A failed copy names its side, cluster and client. A card still waiting when `serve` restarts with
+another import config shows the source cluster of the new config, the one the run reads. See docs/OPERATING.md.
+
+A new shipped template, `tailscale`, is the Cloudflare connector's twin for a tailnet: one service that runs Tailscale's
+own node (release 1.104.7, by digest) in userspace networking, with no tun device and no capability, under the service's
+name (or another one given with the target), and forwards TCP 443 on its tailnet address to one linked service as raw
+TCP with a PROXY protocol v2 header, TLS left to the target. The auth key (`TS_AUTHKEY`) and the target (`TS_TARGET`,
+`[NAME@]ADDRESS:PORT`) are set with `service_secret_set`; it is created stopped and `instance_start` starts it. Its
+state is on its own data volume, so it logs in once and a single-use key is enough. Like the Cloudflare connector it has
+no port and reaches only what it is linked to. docs/OPERATING.md, "Reaching a service over your own tailnet
+(Tailscale)", has the steps.
+
+Support reports: `support_report` (any viewer) files a report, with a title of at most 200 characters, a body of at most
+16 KiB, and optionally a severity, a service and a tenant, as one line of `<stateDir>/support-reports.jsonl`; a token
+files at most 10 an hour, and no field holds a control character (except a newline in the body) or a bidi override. It
+changes nothing and needs no approval. The support side pulls the reports from `GET /reports?after=<id>` (NDJSON, the
+same shape and paging as `/alerts`) or `support_reports`, with the caller's words under `report` and marked untrusted,
+and marks one picked up with `POST /reports/<id>/ack` or `support_report_ack`. Only an operator token, or a token whose
+tool list names the verb, reads the feed or acks: a plain viewer never reads other people's reports. An OAuth refresh may
+not name either verb unless the owner approved operator, and the consent page says what naming one gives. `support_report_status` tells the filer whether its report was picked up. The kernel sends
+nothing outward and holds no credential of the support side.
+
+The approval page approves every card in one sitting. It reads what is waiting again every minute while it is in view
+and when it comes back into view (never under a card being approved), so a card's ten-minute statement no longer goes
+stale on an open page, and a card proposed after the page loaded shows up by itself. Its own readings, and the reading after a refused tap, never move a card:
+plans and the assistant's requests stand in one list, a new card of any kind goes after every card drawn, a card that
+stopped waiting leaves a placeholder of its height, and open Details stay open. The owner's own approval or decline (or
+a passkey registered or removed) closes up the cards below. For a second after the cards changed, a tap on them, the connected apps or the passkey
+list does nothing, and the keyboard focus comes back after. A card refused `Expired` anyway is
+renewed and asks for one more tap. Each card's passkey challenge is computed when the list loads, so a tap goes straight
+to the passkey prompt; in Safari a later tap could bring no prompt at all before. What went wrong with a card is said on
+that card. Decline on a linked machine's card now declines it there, not on the page's own machine. A linked machine's
+delete plans are listed and approved through the relay (`approval_submit`); its relay token needs `approval_submit` on
+its list of tools, and the card says so when it is missing. A relayed approval waits as long as its action can run (a
+`service_update` with `timeoutSeconds` 300 waits 1110 seconds, not 180: one slow Incus step, its own health check and
+the old version's after a rollback), and an `Unreachable` answer reads the list again. Each approval or decline from
+the page writes one log line with its outcome code: `approved`, `approved, then failed <code>` (the approval was spent
+and the action failed), `refused <code>`, `unreachable` or `declined`.
+
+`service_disconnect` works again for a consumer whose template environment has a plain value, such as `"true"`. A
+disconnect used to store every value of the consumer's own environment as one of its secret files. The provider hides a
+stored value wherever it reads it back, so a value like `true` hid the mark on the consumer's own network ACL: the
+disconnect was refused after the provider's side had closed, and every later change to that service was refused the
+same way. A disconnect now rebuilds only the names the link gave. A node that already holds such a file keeps
+refusing until the file goes: it is `secrets/service-<name>/v-<sha256 of the value>`, and no record refers to it.
+
+The edge allows the PROXY protocol header from each service linked to it (`service_connect` to the edge), by the
+service's own address, besides the port device's loopback, so a connector that sends one needs no hand edit inside the
+edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the
+routes are untouched. An edge with no service linked to it keeps exactly the config it had.
+
+- Merge feat/edge-allow-linked: the edge's PROXY allow list names the services linked to it
+- Merge fix/disconnect-data-volume: a disconnect restores only the link's own names, so a plain template value no longer blocks later changes
+- Merge fix/approve-page-every-card: the approve page lists every waiting card and a tap approves only the card tapped
+- Merge feat/support-report: support reports with named-only support verbs and a refresh that never widens scope
+- Merge fix/automagik-keeper-netns: the keeper heals a gate, tunnel or relay left in an old network namespace after the server restarts
+- Merge feat/automagik-member-runner: an opt-in member runner for Automagik workspaces, uid 1000 locked down when on, placeholder pin until Automagik publishes the runner
+- Merge feat/tailscale-connector: a one-click Tailscale connector template that joins a tailnet and forwards a port inside Arca with PROXY v2
+- Merge fix/import-reword-no-lock-wait: plan handlers never wait on the kernel lock; serve rewords waiting import cards before it shares the kernel
+- Merge feat/vm-import-cross-cluster: import a VM's disk from another Ceph cluster, the card names the cluster read
 
 ## 0.32.0 (2026-11-16)
 

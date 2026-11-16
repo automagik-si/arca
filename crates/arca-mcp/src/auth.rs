@@ -44,7 +44,7 @@ const PREFIX: &str = "arca_";
 const BODY_LEN: usize = 43;
 const SECRET_BYTES: usize = 32;
 /// The largest hash file the server reads. A well-formed one is about 100 bytes.
-const MAX_FILE_BYTES: u64 = 4096;
+pub const MAX_FILE_BYTES: u64 = 4096;
 /// The longest id a hash file may name.
 const MAX_ID_LEN: usize = 64;
 
@@ -78,6 +78,12 @@ impl Caller {
         self.tools
             .as_ref()
             .is_none_or(|tools| tools.iter().any(|name| name == tool))
+    }
+
+    /// Whether this caller may call `verb`: its scope, its tool list, and for a verb a token reaches only by naming it
+    /// ([`arca_api::verbs::NAMED_ONLY`]) an operator scope or a list that names it.
+    pub fn admits(&self, verb: &arca_api::Verb) -> bool {
+        arca_api::may_call_listed(self.scope, self.tools.as_deref(), verb)
     }
 }
 

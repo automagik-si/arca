@@ -88,6 +88,8 @@ pub struct Server {
     pub(crate) handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     /// Each GET route: its path, the verb whose scope and tool list admit a caller to it, and its handler.
     gets: Vec<(&'static str, &'static str, Arc<dyn GetHandler>)>,
+    /// Each POST route other than `/mcp`: its path pattern, the verb that admits a caller to it, and its handler.
+    posts: Vec<(&'static str, &'static str, Arc<dyn PostHandler>)>,
     /// Whether the node only looks: it reads and answers, and changes nothing. Every answer of such a node says so.
     pub(crate) only_looks: bool,
     /// Where the line for an answer of "internal" goes: the process's standard error, unless a test collects it.
@@ -109,7 +111,15 @@ pub trait GetHandler: Send + Sync {
     fn get(&self, query: Option<&str>, caller: &Caller) -> Result<GetReply, CallError>;
 }
 
-/// A GET route's reply: its content type and its body.
+/// Answers one POST route other than `/mcp`. The server runs it on a blocking thread, after the bearer check; the request's
+/// body is never read, so everything the route acts on is in its path.
+pub trait PostHandler: Send + Sync {
+    /// The reply to a POST of `path` (the request's whole path, matched by the route's pattern) by `caller`.
+    /// `CallError::Invalid` is answered 400 and `CallError::NotFound` 404.
+    fn post(&self, path: &str, caller: &Caller) -> Result<GetReply, CallError>;
+}
+
+/// A GET or POST route's reply: its content type and its body.
 pub struct GetReply {
     pub content_type: &'static str,
     pub body: Vec<u8>,
@@ -135,6 +145,7 @@ impl Server {
             tokens,
             handlers: HashMap::new(),
             gets: Vec::new(),
+            posts: Vec::new(),
             only_looks: false,
             log: Arc::new(|line| eprintln!("{line}")),
             approver: None,
@@ -216,6 +227,11 @@ impl Server {
                     verb.name,
                     verb.min_scope.as_str()
                 )
+            } else if !caller.admits(verb) {
+                format!(
+                    "forbidden: {} needs an operator token, or a token whose list of tools names it\n",
+                    verb.name
+                )
             } else {
                 format!("forbidden: {} refused this token\n", verb.name)
             };
@@ -232,6 +248,12 @@ impl Server {
                 scope.push_str(" tool:");
                 scope.push_str(tool);
             }
+        } else if arca_api::verbs::NAMED_ONLY.contains(&verb.name) && caller.scope < Scope::Operator
+        {
+            // A verb reached only by naming it: the scope the token holds is not enough, and asking the owner for it again
+            // changes nothing, so the challenge names the tool.
+            scope.push_str(" tool:");
+            scope.push_str(verb.name);
         }
         challenge(
             StatusCode::FORBIDDEN,
@@ -313,6 +335,35 @@ impl Server {
         self
     }
 
+    /// Answers `POST <path>` with `h`, behind the same bearer check and `Origin` refusal as `/mcp`, for a caller who may
+    /// call the verb `tool`: the route does what that verb does, so a token is admitted to it exactly as to the verb. A
+    /// request without a valid bearer is 401, one with an `Origin` is 403, and one from a token the verb does not admit is
+    /// 403. `path` is an axum pattern, so a segment such as `{id}` matches any one segment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is `/mcp`, does not start with `/`, or already has a POST route, and when the table has no verb
+    /// named `tool`: a wiring error, found at start.
+    pub fn post_route(
+        mut self,
+        path: &'static str,
+        tool: &'static str,
+        h: Arc<dyn PostHandler>,
+    ) -> Self {
+        assert!(
+            path.starts_with('/')
+                && path != "/mcp"
+                && self.posts.iter().all(|(p, _, _)| *p != path),
+            "the POST route {path} is not a new path"
+        );
+        assert!(
+            self.verbs.iter().any(|v| v.name == tool),
+            "the verb table has no verb named {tool}"
+        );
+        self.posts.push((path, tool, h));
+        self
+    }
+
     /// The router: `POST /mcp`, with the body limit, and the GET routes. Any request with an `Origin` is refused before the
     /// body is read.
     pub fn router(mut self) -> Router {
@@ -327,6 +378,16 @@ impl Server {
                 get(
                     move |state: State<Arc<Server>>, uri: Uri, headers: HeaderMap| {
                         serve_get(state, handler, tool, uri, headers)
+                    },
+                ),
+            );
+        }
+        for (path, tool, handler) in std::mem::take(&mut self.posts) {
+            router = router.route(
+                path,
+                post(
+                    move |state: State<Arc<Server>>, uri: Uri, headers: HeaderMap| {
+                        serve_post(state, handler, tool, uri, headers)
                     },
                 ),
             );
@@ -421,17 +482,53 @@ async fn serve_get(
             .verbs
             .iter()
             .find(|verb| verb.name == tool)
-            .is_some_and(|verb| may_call(caller.scope, verb) && caller.allows_tool(verb.name));
+            .is_some_and(|verb| caller.admits(verb));
     if !admitted {
         return server.forbidden(&caller, tool, false);
     }
     let query = uri.query().map(str::to_string);
     let outcome = tokio::task::spawn_blocking(move || handler.get(query.as_deref(), &caller)).await;
+    route_reply(&server, &headers, outcome)
+}
+
+async fn serve_post(
+    State(server): State<Arc<Server>>,
+    handler: Arc<dyn PostHandler>,
+    tool: &'static str,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let Some(caller) = server.authenticate(&headers) else {
+        return server.unauthorized(&headers);
+    };
+    // The route is its verb's action over POST: a token the verb does not admit is refused here as a `tools/call` of the
+    // verb is, before the handler reads the path. A route names no service, so a token limited to named services is
+    // refused every route.
+    let admitted = caller.limits.services.is_none()
+        && server
+            .verbs
+            .iter()
+            .find(|verb| verb.name == tool)
+            .is_some_and(|verb| caller.admits(verb));
+    if !admitted {
+        return server.forbidden(&caller, tool, false);
+    }
+    let path = uri.path().to_string();
+    let outcome = tokio::task::spawn_blocking(move || handler.post(&path, &caller)).await;
+    route_reply(&server, &headers, outcome)
+}
+
+/// The HTTP answer of a GET or POST route's handler.
+fn route_reply(
+    server: &Server,
+    headers: &HeaderMap,
+    outcome: Result<Result<GetReply, CallError>, tokio::task::JoinError>,
+) -> Response {
     match outcome {
         Ok(Ok(reply)) => ([(header::CONTENT_TYPE, reply.content_type)], reply.body).into_response(),
         Ok(Err(CallError::Invalid(_))) => StatusCode::BAD_REQUEST.into_response(),
         Ok(Err(CallError::Forbidden { .. })) => StatusCode::FORBIDDEN.into_response(),
-        Ok(Err(CallError::Unauthenticated)) => server.unauthorized(&headers),
+        Ok(Err(CallError::Unauthenticated)) => server.unauthorized(headers),
         Ok(Err(CallError::NotFound)) => StatusCode::NOT_FOUND.into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

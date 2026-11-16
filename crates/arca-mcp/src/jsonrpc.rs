@@ -12,7 +12,7 @@
 use arca_api::verbs::{LINKED_NODE, NODE, NOT_CONFIRMED, take_confirm};
 use std::sync::Arc;
 
-use arca_api::{Verb, conforms, may_call};
+use arca_api::{Verb, conforms};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
@@ -227,7 +227,7 @@ fn tools_for(server: &Server, caller: &Caller) -> Vec<Value> {
     server
         .verbs
         .iter()
-        .filter(|v| may_call(caller.scope, v) && caller.allows_tool(v.name))
+        .filter(|v| caller.admits(v))
         .filter(|v| caller.limits.tenant.is_none() || arca_api::tenant::offered(v))
         .filter(|v| !limited || arca_api::limits::offered(v))
         .map(|v| {
@@ -266,7 +266,7 @@ async fn call_tool(
     let Some(verb) = server.verbs.iter().find(|v| v.name == name) else {
         return Ok(Some(error_reply(id, unknown_tool, "not_found", None)));
     };
-    if !may_call(caller.scope, verb) || !caller.allows_tool(verb.name) {
+    if !caller.admits(verb) {
         return Err(CallError::Forbidden {
             verb: name.to_string(),
         });
@@ -280,9 +280,7 @@ async fn call_tool(
     }
     if let Some(tenant) = &caller.limits.tenant {
         let resolved = arca_api::tenant::resolve(verb, tenant, &mut arguments).and_then(|inner| {
-            if inner.is_some_and(|inner| {
-                !may_call(caller.scope, inner) || !caller.allows_tool(inner.name)
-            }) {
+            if inner.is_some_and(|inner| !caller.admits(inner)) {
                 Err("the proposed action is outside this token's scope or tools")
             } else {
                 Ok(())

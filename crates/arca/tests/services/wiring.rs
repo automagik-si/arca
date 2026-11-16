@@ -1931,3 +1931,79 @@ fn a_netproject_read_failure_does_not_refuse_a_service_connect() {
         json!({"env":["DATABASE_URL"]})
     );
 }
+
+/// A disconnect stores no plain value of the consumer's own environment as a secret. Its consumer's environment is
+/// rebuilt for the link's names alone. Before, every template value was stored as one of the consumer's secret files,
+/// and a value that is plain text the provider then redacts (here `true`, the value of the ACL's `user.arca.managed`)
+/// made every later reconcile of the consumer read its own ACL as unmanaged. A data volume plays no part, so the three
+/// consumers tell the two apart. Every name and address is synthetic.
+#[test]
+fn a_disconnect_stores_no_plain_value_of_the_consumers_environment_and_the_consumer_reconciles_after_it()
+ {
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+    );
+    rig.template(
+        "web",
+        json!({"name":"web","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[8443],"env":{}}),
+    );
+    rig.call("service_create", json!({"name":"web","template":"web"}))
+        .expect("the provider");
+    let data = json!({"path":"/data","uid":0,"gid":0,"size":"1GiB"});
+    for (name, consumer) in [
+        ("both", json!({"data":data,"env":{"MODE":"true"}})),
+        ("volume", json!({"data":data,"env":{}})),
+        ("plain", json!({"env":{"MODE":"true"}})),
+    ] {
+        let mut template = json!({"name":name,"kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[]});
+        template
+            .as_object_mut()
+            .unwrap()
+            .extend(consumer.as_object().unwrap().clone());
+        rig.template(name, template);
+        rig.call("service_create", json!({"name":name,"template":name}))
+            .expect("the consumer");
+        op(&rig, "service_connect", json!({"from":name,"to":"web"})).expect("connect");
+        op(&rig, "service_disconnect", json!({"from":name,"to":"web"}))
+            .unwrap_or_else(|error| panic!("{name}: disconnect: {error:?}"));
+        // No secret file of the consumer holds a plain value of its environment.
+        if let Ok(files) = fs::read_dir(rig.dir.join(format!("secrets/service-{name}"))) {
+            for file in files.flatten() {
+                assert_ne!(
+                    fs::read_to_string(file.path()).unwrap_or_default(),
+                    "true",
+                    "{name}: {:?}",
+                    file.file_name()
+                );
+            }
+        }
+        // The consumer still reconciles: a second link and its disconnect both apply.
+        op(&rig, "service_connect", json!({"from":name,"to":"web"}))
+            .unwrap_or_else(|error| panic!("{name}: connect again: {error:?}"));
+        op(&rig, "service_disconnect", json!({"from":name,"to":"web"}))
+            .unwrap_or_else(|error| panic!("{name}: disconnect again: {error:?}"));
+        assert_eq!(
+            rig.get(&format!(
+                "/1.0/network-acls/{PROJECT}-svc-web?project=default"
+            ))
+            .expect("acl")["ingress"],
+            json!([]),
+            "{name}"
+        );
+        if name != "volume" {
+            assert_eq!(
+                instance(&rig, name)["config"]["environment.MODE"],
+                "true",
+                "{name}"
+            );
+        }
+    }
+}

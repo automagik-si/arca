@@ -1027,7 +1027,7 @@ impl GetHandler for AlertsExport {
 }
 
 /// The `after` of a query string: the value of its first `after=` pair, or 0 when there is none.
-fn after_of(query: Option<&str>) -> Result<u64, CallError> {
+pub(crate) fn after_of(query: Option<&str>) -> Result<u64, CallError> {
     let value = query
         .unwrap_or("")
         .split('&')
@@ -1424,6 +1424,8 @@ pub fn plan_handlers_versioned(
             .and_then(crate::vm_import::ImportBackend::from_node)
             .map(Arc::new),
     );
+    // Making the handlers never takes the kernel lock: `serve` writes a waiting import's card again from this config
+    // once the kernel opens, before it is shared ([`crate::vm_import::reword_waiting_imports`]).
     let host_network_socket = node.as_ref().map_or_else(
         || std::path::PathBuf::from(arca_hostnet::SOCKET_FILE),
         |node| node.host_network.socket.clone(),
@@ -1889,7 +1891,7 @@ impl ToolHandler for ActionPropose {
         } else if let (ActionKind::InstanceImport, Some(node)) = (action, &self.node) {
             // A node that names no source pool, or a source whose disks are elsewhere, is refused now, so the owner is
             // never asked to approve an import this node cannot run.
-            crate::vm_import::check_proposal(node, &payload)?;
+            card_fact = Some(crate::vm_import::check_proposal(node, &payload)?);
             payload
         } else if let (ActionKind::FunctionRemove, Some(_)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
@@ -1953,6 +1955,8 @@ impl ToolHandler for ActionPropose {
             // only when it does, and otherwise why the database is created stopped. Both were read when the
             // proposal was given its template's fingerprint, from that one read of the template.
             ActionKind::ServiceCreate | ActionKind::PostgresCreate => card_fact.take(),
+            // The card of an import names the Ceph cluster its disks are read from and the one they are written to.
+            ActionKind::InstanceImport => card_fact.take(),
             // The card of a host restore says what the host has drifted from, read live from the root part now.
             ActionKind::HostNetworkRestore => Some(crate::host_network::proposal_fact(
                 &self.host_network_socket(),
@@ -6012,7 +6016,10 @@ mod service_reconfigure;
 mod service_update;
 #[path = "service_wiring.rs"]
 mod service_wiring;
-pub use service_update::{Probe as UpdateProbe, UpdateOptions, digest_ok as service_digest_ok};
+pub use service_update::{
+    DEFAULT_HEALTH_SECONDS, MAX_HEALTH_SECONDS, OLD_ANSWERS_SECONDS, Probe as UpdateProbe,
+    STEP_DEADLINE, UpdateOptions, digest_ok as service_digest_ok,
+};
 #[path = "tenants.rs"]
 mod tenants;
 pub use tenants::{SnapshotListInTenant, spawn_front_sync, sync_front, tenant_handlers};
@@ -6907,6 +6914,7 @@ pub(crate) fn adopted_config(
         raw_lxc: Vec::new(),
         run_tmpfs: false,
         edge: None,
+        connector: None,
     })
 }
 
@@ -7120,6 +7128,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         raw_lxc: parts.template.raw_lxc.clone(),
         run_tmpfs: parts.template.memory_run(),
         edge: parts.template.edge.then(crate::route::EdgeRecord::default),
+        connector: parts.template.connector.clone(),
     })
 }
 
@@ -7208,6 +7217,7 @@ fn vm_service_config(
         raw_lxc: Vec::new(),
         run_tmpfs: false,
         edge: None,
+        connector: None,
     })
 }
 
@@ -7799,6 +7809,7 @@ impl ServiceHandler {
             // going has been stopped; a run and the two reads take none.
             return self.call_function(
                 &args,
+                caller,
                 &read,
                 &all_entries,
                 &all_rows,
@@ -8117,6 +8128,16 @@ impl ServiceHandler {
                         })?
                 };
                 self.logout_before_remove(&entry, &config, caller);
+                // The edges this service is linked to, with the addresses they allow the PROXY header from now: the
+                // removal takes its grant off each, and its Caddyfile is written again once the removal ran.
+                let edges = service_entries(&entries)
+                    .into_iter()
+                    .filter(|(_, other)| {
+                        other.edge.is_some()
+                            && other.incoming.iter().any(|grant| grant.consumer == name)
+                    })
+                    .map(|(edge, cfg)| (edge.id, crate::route::linked(&cfg.incoming)))
+                    .collect::<Vec<_>>();
                 let _write = self.writes.lock().map_err(|_| internal())?;
                 let removal = lock(&self.kernel)?
                     .remove_service_spent(spent, now)
@@ -8155,7 +8176,15 @@ impl ServiceHandler {
                 if tenant.is_none() {
                     self.drop_fetched_images(&read, &config);
                 }
-                Ok(json!({ "removed": true }))
+                let edges = edges
+                    .iter()
+                    .filter_map(|(edge, before)| self.edge_relinked(edge, before, caller))
+                    .collect::<Vec<_>>();
+                if edges.is_empty() {
+                    Ok(json!({ "removed": true }))
+                } else {
+                    Ok(json!({ "removed": true, "edges": edges }))
+                }
             }
             "service_import" => {
                 let name = service_name(&args)?;
