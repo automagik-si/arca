@@ -1889,6 +1889,14 @@ fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and
     let natsh = propose(&socket1, &viewer1, 12, "natsh");
     propose(&socket1, &viewer1, 13, "natsi");
     propose(&socket1, &viewer1, 14, "natsj");
+    // natsf's Approve has the keyboard focus, and the owner moves it to the passkey name field during the hold: it stays
+    // there after the hold.
+    chrome.eval(&format!(
+        "(() => {{ {}.querySelector('button.approve').focus(); const plans = document.getElementById('plans'); \
+           const moved = new MutationObserver(() => {{ if (plans.inert) {{ document.getElementById('passkey-label').focus(); moved.disconnect(); }} }}); \
+           moved.observe(plans, {{ attributes: true, attributeFilter: ['inert'] }}); return true; }})()",
+        card("natsf")
+    ));
     chrome.eval(
         "document.documentElement.style.overflowAnchor = 'none'; document.body.style.overflowAnchor = 'none'; refreshPlans(); true",
     );
@@ -1900,6 +1908,13 @@ fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and
         ),
         "the three cards show up, and taps are let through",
     );
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        chrome.eval("document.activeElement === document.getElementById('passkey-label')"),
+        json!(true),
+        "the focus the owner moved during the hold stays where they put it"
+    );
+    chrome.eval("document.activeElement.blur(); true");
     chrome.eval(
         "(() => { const listed = window.fetch; window.__ageName = 'natsi'; \
          window.fetch = async (url, options) => { \
