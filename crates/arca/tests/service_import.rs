@@ -976,7 +976,7 @@ fn release_of_a_present_unlisted_instance_keeps_the_exact_refusal() {
     let (_, words) = refusal(rig.approved("service_release", "db1"));
     assert_eq!(
         words,
-        "release service db1: kernel.importServices no longer lists it, so Arca may not write to its instance; list it again with the same name, project and cidr, then release it. Nothing was written"
+        "The approval was accepted, but service_release did not complete: release service db1: kernel.importServices no longer lists it, so Arca may not write to its instance; list it again with the same name, project and cidr, then release it. Nothing was written"
     );
     assert!(rig.entry("service-db1").is_some());
     assert_eq!(rig.fake.writes(), writes);
