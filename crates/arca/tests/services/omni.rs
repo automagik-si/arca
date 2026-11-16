@@ -310,6 +310,7 @@ fn operator() -> Caller {
         token_id: "operator".into(),
         scope: Scope::Operator,
         tools: None,
+        limits: Default::default(),
     }
 }
 
@@ -417,6 +418,7 @@ impl OmniRig {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
     }
@@ -745,6 +747,7 @@ fn g6_no_other_route_is_reachable_three_tools_no_path_input() {
         token_id: "viewer".into(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     assert!(matches!(
         r.call_as("omni_status", json!({"name":"omni"}), &viewer),

@@ -326,6 +326,7 @@ impl Rig {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: tools.map(|tools| tools.iter().map(|tool| tool.to_string()).collect()),
+                limits: Default::default(),
             },
         )
     }
@@ -344,6 +345,7 @@ impl Rig {
                 token_id: token.into(),
                 scope: Scope::Doctor,
                 tools: Some(tools.iter().map(|tool| tool.to_string()).collect()),
+                limits: Default::default(),
             },
         )
     }

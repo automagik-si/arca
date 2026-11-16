@@ -9,6 +9,7 @@
   "data": { "path": "/data", "uid": 0, "gid": 0, "size": "1GiB" },
   "env": { "CLOUDFLARE_API_TOKEN": "{{secret:CLOUDFLARE_API_TOKEN}}" },
   "secrets": ["CLOUDFLARE_API_TOKEN"],
+  "provides": { "env": { "ARCA_EDGE_TARGET": "{{host}}:{{port}}" } },
   "limits": { "cpu": "2", "memory": "512MiB" },
   "autostart": true,
   "privatePort": { "port": 443 },

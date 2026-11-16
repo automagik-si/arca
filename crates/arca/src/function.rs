@@ -348,6 +348,7 @@ pub fn definition(args: &Value) -> Result<Definition, String> {
         limits: Limits {
             cpu: Some(cpu.to_string()),
             memory: Some(memory.to_string()),
+            ..Limits::default()
         },
         links,
     })

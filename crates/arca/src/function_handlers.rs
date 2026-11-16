@@ -676,6 +676,7 @@ impl ServiceHandler {
             raw_lxc: Vec::new(),
             run_tmpfs: false,
             edge: None,
+            connector: None,
         };
         let template = function::template(&config).ok_or_else(internal)?;
         config.source = crate::service::source(&template).map_err(service_template_error)?;

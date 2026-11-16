@@ -626,6 +626,7 @@ fn a_secret_set_while_the_update_runs_leaves_the_template_unwritten_and_the_roll
                             token_id: "operator".into(),
                             scope: Scope::Operator,
                             tools: None,
+                            limits: Default::default(),
                         },
                     )
                     .expect("the secret is set meanwhile");

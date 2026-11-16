@@ -71,7 +71,7 @@ pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
 /// is not there. A node installed before the installer named its token `assistant-1.secret` keeps its viewer token in
 /// that directory under another name (`viewer.secret`), so the first command after an upgrade finds that one instead of
 /// telling the owner to mint a token. It is the first `.secret` file there, by name, that is a private token file and
-/// that the node's own token directory holds as a viewer that may call `arca_status`; a token of a wider scope is never
+/// that the node's own token directory holds as a viewer that may call `arca_status` and is limited to no services; a token of a wider scope is never
 /// taken in its place. A file that is not such a token is passed over without a word, and none found keeps the refusal.
 /// The token is returned with the file it was read from.
 fn viewer_token_beside(
@@ -101,8 +101,11 @@ fn viewer_token_beside(
         };
         let token = read_token(&file, node).ok()?;
         let caller = store.lookup(&token)?;
-        (caller.scope == arca_api::Scope::Viewer && caller.allows_tool(VERB))
-            .then_some((token, file.path))
+        // A token limited to named services is refused arca_status, a node-wide verb, so it is passed over too.
+        (caller.scope == arca_api::Scope::Viewer
+            && caller.allows_tool(VERB)
+            && caller.limits.services.is_none())
+        .then_some((token, file.path))
     })
 }
 

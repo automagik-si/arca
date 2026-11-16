@@ -662,6 +662,7 @@ mod tests {
             token_id: id.to_string(),
             scope,
             tools: tools.map(|tools| tools.iter().map(|tool| tool.to_string()).collect()),
+            limits: Default::default(),
         }
     }
 
