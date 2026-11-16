@@ -432,10 +432,35 @@ fn nats_template() -> Value {
 fn template_io_limit_units_are_checked_before_create() {
     let rig = Rig::new();
     for (key, values) in [
-        ("diskRead", vec!["100MB", "1MiB", "1000iops", "100000", "10MB, 1000iops", "001kB", "9223372036854775807B"]),
-        ("diskWrite", vec!["1B", "1kB", "1GB", "1TB", "1PB", "1EB", "1KiB", "1GiB", "1TiB", "1PiB", "1EiB"]),
-        ("ingress", vec!["200Mbit", "1kbit", "1bit", "100000", "1Kibit", "1Mibit", "1Gibit", "1Tibit", "1Pibit", "1Eibit"]),
-        ("egress", vec!["100Mbit", "1Gbit", "1Tbit", "1Pbit", "1Ebit"]),
+        (
+            "diskRead",
+            vec![
+                "100MB",
+                "1MiB",
+                "1000iops",
+                "100000",
+                "10MB, 1000iops",
+                "001kB",
+                "9223372036854775807B",
+            ],
+        ),
+        (
+            "diskWrite",
+            vec![
+                "1B", "1kB", "1GB", "1TB", "1PB", "1EB", "1KiB", "1GiB", "1TiB", "1PiB", "1EiB",
+            ],
+        ),
+        (
+            "ingress",
+            vec![
+                "200Mbit", "1kbit", "1bit", "100000", "1Kibit", "1Mibit", "1Gibit", "1Tibit",
+                "1Pibit", "1Eibit",
+            ],
+        ),
+        (
+            "egress",
+            vec!["100Mbit", "1Gbit", "1Tbit", "1Pbit", "1Ebit"],
+        ),
     ] {
         for value in values {
             let mut template = nats_template();
@@ -446,10 +471,50 @@ fn template_io_limit_units_are_checked_before_create() {
         }
     }
     for (key, values) in [
-        ("diskRead", vec!["200Mbit", "1MB/s", "1mb", "1KB", "1.5MB", "-1MB", "0MB", "9223372036854775808", "10EiB", "1MB,2MB", "1iops,2iops"]),
-        ("diskWrite", vec!["", "iops", "1IOPS", "-1iops", "0iops", "9223372036854775808iops"]),
-        ("ingress", vec!["100MB", "100mbit", "1Mbit/s", "1.5Mbit", "0Mbit", "-1Mbit", "10Eibit"]),
-        ("egress", vec!["", "Mbit", "1000iops", " 100Mbit", "100Mbit\n", "9223372036854775808bit"]),
+        (
+            "diskRead",
+            vec![
+                "200Mbit",
+                "1MB/s",
+                "1mb",
+                "1KB",
+                "1.5MB",
+                "-1MB",
+                "0MB",
+                "9223372036854775808",
+                "10EiB",
+                "1MB,2MB",
+                "1iops,2iops",
+            ],
+        ),
+        (
+            "diskWrite",
+            vec![
+                "",
+                "iops",
+                "1IOPS",
+                "-1iops",
+                "0iops",
+                "9223372036854775808iops",
+            ],
+        ),
+        (
+            "ingress",
+            vec![
+                "100MB", "100mbit", "1Mbit/s", "1.5Mbit", "0Mbit", "-1Mbit", "10Eibit",
+            ],
+        ),
+        (
+            "egress",
+            vec![
+                "",
+                "Mbit",
+                "1000iops",
+                " 100Mbit",
+                "100Mbit\n",
+                "9223372036854775808bit",
+            ],
+        ),
     ] {
         for value in values {
             let mut template = nats_template();
@@ -461,7 +526,11 @@ fn template_io_limit_units_are_checked_before_create() {
                 panic!("{key}={value:?} must fail create");
             };
             assert!(message.contains(key), "{message}");
-            assert_eq!(rig.fake.writes().len(), before, "invalid limit writes nothing");
+            assert_eq!(
+                rig.fake.writes().len(),
+                before,
+                "invalid limit writes nothing"
+            );
         }
     }
 }
@@ -478,12 +547,25 @@ fn unsupported_io_limits_fail_create_without_retrying_uncapped() {
         let Err(CallError::Refused { message, .. }) = failed else {
             panic!("unsupported {key} must fail create");
         };
-        assert!(message.contains("device I/O limits are not supported by this driver"), "{message}");
-        assert!(rig.get(&format!("/1.0/instances/nats?project={PROJECT}")).is_none());
-        let attempts: Vec<_> = rig.fake.writes().into_iter()
+        assert!(
+            message.contains("device I/O limits are not supported by this driver"),
+            "{message}"
+        );
+        assert!(
+            rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
+                .is_none()
+        );
+        let attempts: Vec<_> = rig
+            .fake
+            .writes()
+            .into_iter()
             .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
             .collect();
-        assert_eq!(attempts.len(), 1, "no fallback create without the requested cap");
+        assert_eq!(
+            attempts.len(),
+            1,
+            "no fallback create without the requested cap"
+        );
         assert_eq!(attempts[0].status, 400);
     }
 }

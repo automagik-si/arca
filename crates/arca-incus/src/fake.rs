@@ -710,7 +710,9 @@ impl FakeIncus {
 
     /// Refuse an instance create carrying disk or NIC limits, as an unsupported driver would.
     pub fn reject_device_limits_on_create(&self) {
-        self.shared.reject_device_limits.store(true, Ordering::SeqCst);
+        self.shared
+            .reject_device_limits
+            .store(true, Ordering::SeqCst);
     }
 
     /// Fail the start phase of create, leaving the new instance stopped.
@@ -2328,13 +2330,16 @@ fn create(
     let path = request.path();
     if path == "/1.0/instances"
         && shared.reject_device_limits.load(Ordering::SeqCst)
-        && body.get("devices").and_then(Value::as_object).is_some_and(|devices| {
-            devices.values().any(|device| {
-                device.as_object().is_some_and(|device| {
-                    device.keys().any(|key| key.starts_with("limits."))
+        && body
+            .get("devices")
+            .and_then(Value::as_object)
+            .is_some_and(|devices| {
+                devices.values().any(|device| {
+                    device
+                        .as_object()
+                        .is_some_and(|device| device.keys().any(|key| key.starts_with("limits.")))
                 })
             })
-        })
     {
         return (
             400,

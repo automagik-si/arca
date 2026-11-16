@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Service templates may set `limits.diskRead` and `diskWrite` in bytes/s or IOPS, and `limits.ingress` and `egress` in
+bits/s. Containers and virtual machines receive these caps on their root disk and NIC at create; a bad value or an
+Incus refusal fails the create, with no retry without the cap. Unset caps leave the old behaviour unchanged.
+`service_status` shows the recorded limits under `settings.limits`. See "Service disk and network limits" in
+docs/OPERATING.md for units and storage-driver requirements.
+
 ## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it

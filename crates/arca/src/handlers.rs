@@ -7913,6 +7913,16 @@ impl ServiceHandler {
                     if let Some(settings) = config.vm.as_ref().and_then(|vm| vm.guest_settings()) {
                         view["settings"] = settings;
                     }
+                    if let Some(limits) = config
+                        .limits
+                        .as_ref()
+                        .filter(|limits| limits.has_io_limits())
+                    {
+                        if !view["settings"].is_object() {
+                            view["settings"] = json!({});
+                        }
+                        view["settings"]["limits"] = json!(limits);
+                    }
                     if config.can_follow_automagik() {
                         view["follow"] = json!(config.follows_automagik());
                     }

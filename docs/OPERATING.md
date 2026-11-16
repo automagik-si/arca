@@ -838,6 +838,48 @@ dashes and underscores, not starting with a dot, so no path. A template whose sc
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.
 
+#### Service disk and network limits
+
+A template may add these optional caps beside its existing CPU and memory limits:
+
+```json
+"limits": {
+  "cpu": "2",
+  "memory": "2GiB",
+  "diskRead": "100MB",
+  "diskWrite": "1000iops",
+  "ingress": "200Mbit",
+  "egress": "100Mbit"
+}
+```
+
+`diskRead` and `diskWrite` become Incus `limits.read` and `limits.write` on the **root disk**. Disk throughput is
+bytes per second: `B`, `kB`, `MB`, `GB`, `TB`, `PB`, `EB`, or the binary units `KiB` through `EiB`. An integer without
+a suffix is bytes/s; `<integer>iops` caps operations per second. Incus also accepts one of each, such as
+`"10MB,1000iops"`. A separate attached data volume is outside the root disk's cap.
+
+`ingress` and `egress` become `limits.ingress` and `limits.egress` on the service NIC, for traffic into and out of the
+instance respectively. Rates are bits per second: `bit`, `kbit`, `Mbit`, `Gbit`, `Tbit`, `Pbit`, `Ebit`, or binary
+`Kibit` through `Eibit`; an integer without a suffix is bits/s. Units are case-sensitive: `MB` is a disk rate and
+`Mbit` is a network rate. These follow [Incus's unit parser](https://github.com/lxc/incus/blob/v7.5.0/shared/units/units.go).
+
+Values must be positive whole numbers whose converted rate fits a signed 64-bit integer. Empty values, zero,
+negative values, fractions, wrong units and overflow fail `service_create` before any Incus write. Omit a field for
+no cap. A container may specify just I/O limits; virtual machines still need both CPU and memory limits and a root
+disk size.
+
+The caps travel in the instance create for containers and virtual machines, on either a managed service network or
+a VM's host bridge. If Incus cannot apply one, the create returns its error; Arca never retries without the cap.
+Container disk throttling requires Incus's I/O cgroup controller and a backing block device the storage driver can
+identify. VM disk throttling uses QEMU. Network caps require the bridged NICs Arca creates. Validate the caps on the
+storage driver and network in use before relying on them for isolation; support on one driver proves nothing about
+another.
+
+Caps are fixed at create. Editing a template changes future services. `service_status` of a service created with an
+I/O cap includes its recorded limits under `settings.limits`, alongside any VM guest settings. This reports the
+create's requested configuration, not a live bandwidth measurement. Services created without I/O caps keep their
+existing status shape.
+
 #### A script entrypoint and the Incus version
 
 Incus 7.6 refuses a line break anywhere in

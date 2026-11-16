@@ -331,6 +331,28 @@ fn owner_approval(key: &common::SkKey, name: &str) -> String {
 }
 
 #[test]
+fn invalid_vm_io_limits_fail_before_any_incus_write() {
+    let rig = Rig::bridged(&["br0"], None);
+    for (key, value) in [
+        ("diskRead", "100Mbit"),
+        ("diskWrite", "0iops"),
+        ("ingress", "100MB"),
+        ("egress", "1.5Mbit"),
+    ] {
+        let mut template = vm_template();
+        template["limits"][key] = json!(value);
+        rig.template("ws", template);
+        let before = rig.fake.writes().len();
+        let message = refusal(rig.call(
+            "service_create",
+            json!({"name":"ws1", "template":"ws", "bridge":"br0"}),
+        ));
+        assert!(message.contains(key), "{message}");
+        assert_eq!(rig.fake.writes().len(), before);
+    }
+}
+
+#[test]
 fn template_io_limits_reach_both_vm_network_kinds_and_status_settings() {
     for bridged in [false, true] {
         let rig = if bridged {
