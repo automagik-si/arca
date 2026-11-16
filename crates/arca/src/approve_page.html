@@ -385,11 +385,6 @@
     <div id="plans" class="plans"><div class="card loading">Loading…</div></div>
   </section>
 
-  <section id="requests-section" aria-labelledby="requests-title" hidden>
-    <h2 id="requests-title">Asked by your assistant</h2>
-    <div id="requests" class="plans"></div>
-  </section>
-
   <section id="apps-section" aria-labelledby="apps-title" hidden>
     <h2 id="apps-title">Connected apps</h2>
     <div id="apps" class="plans"></div>
@@ -490,12 +485,19 @@ let busy = 0;
 let listing = 0;
 // What went wrong on a card, by card, kept across a redraw of the list until that card is tapped again or is gone.
 const cardNotes = new Map();
-// The cards drawn now, in the order they stand on the page (see placeCards).
+// The cards drawn now, in the order they stand on the page (see placeCards): the plans, the passkey lists and the
+// requests an assistant made, in one list, so a new card of any kind goes after every card already drawn.
 const drawnPlans = [];
-const drawnRequests = [];
-// How long a tap is held off after the cards moved, and the timer that lets taps through again.
+// Whether the list has been drawn once (cards or "Nothing to approve"): from then on a change holds taps.
+let listShown = false;
+// How long a tap is held off after the cards moved, the timer that lets taps through again, the lists it holds, and
+// the button or field that had the keyboard focus when the hold began (it gets it back when the hold ends).
 const HOLD_MS = 1000;
 let holding = 0;
+const HELD_LISTS = ["plans", "apps", "passkeys"];
+let heldFocus = null;
+// Marks a request an assistant made (owner_approval_request) among the cards; a symbol, so it is not in the card's shape.
+const REQUEST = Symbol("request");
 
 const REFUSALS = {
   Expired: "This approval ran out of time. Reload the page and try again.",
@@ -866,7 +868,7 @@ const REQUEST_WORDS = { delete: "Delete", publish: "Publish", spend: "Spend on" 
 // A request an agent made with owner_approval_request. Everything in it is the agent's words, so every part is set as text.
 function requestCard(request, current = () => request) {
   const fields = request.fields || {};
-  const card = el("article", "card plan action");
+  const card = el("article", "card plan action request");
   const meta = el("div", "plan-meta");
   const expiresAt = Date.parse(request.expiresAt);
   const expiry = el("time", "expiry");
@@ -963,16 +965,6 @@ async function denyRequest(request, button) {
   }
 }
 
-// Draws the pending requests in place (see placeCards) and says whether a drawn one moved.
-function showRequests(requests, quiet) {
-  const section = document.getElementById("requests-section");
-  const target = document.getElementById("requests");
-  const pending = (Array.isArray(requests) ? requests : []).filter((request) => request.state === "pending");
-  const moved = placeCards(target, drawnRequests, pending, (request) => String(request.id), requestCard, quiet);
-  section.hidden = drawnRequests.length === 0;
-  return moved;
-}
-
 function showTrusted(count) {
   document.getElementById("trusted").textContent = String(count);
   document.body.dataset.trusted = count > 0 ? "yes" : "no";
@@ -997,7 +989,7 @@ function cardShape(item) {
 // `quiet`) takes the placeholders away. Says whether anything on the list was drawn, drawn again or taken away.
 function placeCards(target, drawn, items, keyOf, draw, quiet) {
   const listed = new Map(items.map((item) => [keyOf(item), item]));
-  if (!drawn.length) target.replaceChildren();
+  if (!drawn.length && items.length) target.replaceChildren();
   let moved = false;
   const kept = [];
   for (const entry of drawn) {
@@ -1050,12 +1042,20 @@ function placeCards(target, drawn, items, keyOf, draw, quiet) {
   return moved;
 }
 
-// For a moment after the cards moved, a tap does nothing: it was aimed at what stood there before.
+// For a moment after the cards moved, a tap does nothing: it was aimed at what stood there before. Every list below
+// the cards is held too, since it moved with them. What had the keyboard focus in a held list gets it back after.
 function holdTaps() {
-  const lists = ["plans", "requests", "apps"].map((id) => document.getElementById(id));
+  const lists = HELD_LISTS.map((id) => document.getElementById(id)).filter(Boolean);
+  const active = document.activeElement;
+  if (active && lists.some((list) => list.contains(active))) heldFocus = active;
   for (const list of lists) list.inert = true;
   clearTimeout(holding);
-  holding = setTimeout(() => { for (const list of lists) list.inert = false; }, HOLD_MS);
+  holding = setTimeout(() => {
+    for (const list of lists) list.inert = false;
+    const back = heldFocus;
+    heldFocus = null;
+    if (back && back.isConnected && !back.disabled) back.focus({ preventScroll: true });
+  }, HOLD_MS);
 }
 
 // Reads what is waiting and draws it. Every card gets its challenge now, so a tap goes straight to the passkey. A quiet
@@ -1075,21 +1075,28 @@ async function loadPlans(quiet) {
     }));
     // A refresh that a tap overtook draws nothing: the card being approved keeps its place and its disabled button.
     if (mine !== listing || (quiet && busy)) return;
-    // Taps are held only when cards were already drawn: the first drawing moves nothing a finger was aimed at.
-    const before = drawnPlans.length + drawnRequests.length;
+    // Taps are held only once the list was drawn: the first drawing moves nothing a finger was aimed at.
+    const before = listShown;
     showTrusted(body.passkeysTrusted || 0);
-    let moved = showRequests(body.approvalRequests, quiet);
+    const requests = (Array.isArray(body.approvalRequests) ? body.approvalRequests : [])
+      .filter((request) => request.state === "pending");
+    for (const request of requests) request[REQUEST] = true;
     const listed = new Set(body.plans.map(cardKey));
     for (const key of [...cardNotes.keys()]) if (!listed.has(key)) cardNotes.delete(key);
-    const keyOf = (item) => item.kind === "peerKeys" ? "keys\n" + item.linkedHost : "plan\n" + cardKey(item);
+    const keyOf = (item) => {
+      if (item[REQUEST]) return "request\n" + String(item.id);
+      return item.kind === "peerKeys" ? "keys\n" + item.linkedHost : "plan\n" + cardKey(item);
+    };
     const draw = (item, current) => {
+      if (item[REQUEST]) return requestCard(item, current);
       if (item.kind === "peerKeys") return peerKeysCard(item, current);
       return item.kind === "action" ? actionCard(item, current) : planCard(item, current);
     };
-    if (placeCards(target, drawnPlans, [...peerKeys, ...body.plans], keyOf, draw, quiet)) moved = true;
+    const moved = placeCards(target, drawnPlans, [...peerKeys, ...body.plans, ...requests], keyOf, draw, quiet);
     if (!drawnPlans.length && !target.querySelector(".notice:not(.problem)")) {
       target.replaceChildren(notice("empty", "Nothing to approve", "When Arca wants to change or delete something, it will wait here for your OK."));
     }
+    listShown = true;
     if (moved && before) holdTaps();
   } catch (error) {
     if (quiet || mine !== listing) return;

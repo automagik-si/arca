@@ -795,7 +795,7 @@ fn g8_a_real_browser_registers_two_passkeys_and_approves_a_request_and_a_delete_
     );
     let deadline = Instant::now() + WAIT;
     while chrome.eval(
-        "document.readyState === 'complete' && document.getElementById('trusted').textContent === '0' && !document.getElementById('requests-section').hidden",
+        "document.readyState === 'complete' && document.getElementById('trusted').textContent === '0' && !!document.querySelector('#plans article.request')",
     ) != json!(true)
     {
         assert!(Instant::now() < deadline, "the page loads with no passkey and one request");
@@ -905,7 +905,7 @@ fn g8_a_real_browser_registers_two_passkeys_and_approves_a_request_and_a_delete_
     // 4. The owner approval request, approved by the second device with one tap.
     chrome.presence(&first, false);
     chrome.presence(&second, true);
-    chrome.click("#requests button.approve");
+    chrome.click("#plans article.request button.approve");
     chrome.status_ok(APPROVED_REQUEST, &serve);
     let audit =
         fs::read_to_string(state.join(arca::approval_requests::AUDIT_FILE)).expect("the audit");
@@ -1282,6 +1282,9 @@ fn two_approvals_in_one_page_load_both_reach_the_server_and_a_later_card_shows_u
 /// - A card refused `Expired` says so on the card, is renewed in place, and the next tap approves it.
 /// - Decline on a linked card declines it on its own machine.
 /// - A card that stops waiting while the page is open leaves a placeholder of its height, and nothing below it moves.
+/// - Review 2: a request an assistant made stands in the same list. A plan proposed after it goes after it, so a real tap
+///   at the request's old place after the hold approves the request, never the plan. The keyboard focus comes back after
+///   the hold, and the passkeys list below is held with the cards.
 #[test]
 #[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
 fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and_a_linked_decline_reaches_its_host()
@@ -1357,6 +1360,28 @@ fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and
         (state, hash_dir, viewer, fake)
     };
     let (state1, tokens1, viewer1, fake1) = machine("node1");
+    // The assistant's doctor token on node1, for an owner approval request.
+    let doctor_file = scratch.at("node1-doctor.secret");
+    run(
+        arca()
+            .args([
+                "token",
+                "mint",
+                "--scope",
+                "doctor",
+                "--id",
+                "doctor-1",
+                "--hash-dir",
+            ])
+            .arg(&tokens1)
+            .arg("--out")
+            .arg(&doctor_file),
+        "token mint",
+    );
+    let doctor1 = fs::read_to_string(&doctor_file)
+        .expect("the doctor secret")
+        .trim_end()
+        .to_string();
     let (state2, tokens2, viewer2, fake2) = machine("node2");
     let relay_file = scratch.at("node2-relay.secret");
     run(
@@ -1743,6 +1768,98 @@ fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and
             && close(&gone[1], &measured[1])
             && close(&gone[2], &measured[2]),
         "the placeholder stands where the card stood, at its height, and what comes after it stays: {measured} then {gone}"
+    );
+
+    // 6. A request an assistant made goes in the same list as the plans. A plan proposed after it, which the server lists
+    //    above every request, goes after it: the request does not move, and a real tap at its old place after the hold
+    //    approves the request, never the new plan. Its Approve had the keyboard focus, and gets it back after the hold;
+    //    the passkeys list below is held with the cards.
+    let asked = result(
+        &mcp(
+            &socket1,
+            &doctor1,
+            10,
+            "owner_approval_request",
+            json!({ "kind": "arca", "action": "delete", "target": "natsb", "args": { "name": "natsb" } }),
+        ),
+        "owner_approval_request",
+    );
+    let request = asked["id"].as_str().expect("a request id").to_string();
+    chrome.eval("refreshPlans(); true");
+    let request_button = "document.querySelector('#plans article.request button.approve')";
+    wait_for(
+        &mut chrome,
+        &format!("!!{request_button}"),
+        "the request shows up among the cards",
+    );
+    wait_for(
+        &mut chrome,
+        "!document.getElementById('plans').inert",
+        "taps are let through again",
+    );
+    let spot_of = format!(
+        "(() => {{ const r = {request_button}.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()"
+    );
+    chrome.eval(&format!(
+        "{request_button}.scrollIntoView({{ block: 'center' }}); {request_button}.focus(); true"
+    ));
+    let spot = chrome.eval(&spot_of);
+    propose(&socket1, &viewer1, 11, "natsf");
+    assert_eq!(
+        chrome.eval(
+            "fetch('/approve/plans').then((r) => r.json()).then((b) => b.plans.some((p) => String(p.summary).includes('service natsf from')) && b.approvalRequests.length > 0)"
+        ),
+        json!(true),
+        "the server lists the new plan with the plans, above every request"
+    );
+    chrome.eval(
+        "(() => { window.__heldLists = []; for (const id of ['plans', 'passkeys']) { const list = document.getElementById(id); \
+         new MutationObserver(() => { if (list.inert && !window.__heldLists.includes(id)) window.__heldLists.push(id); }) \
+           .observe(list, { attributes: true, attributeFilter: ['inert'] }); } \
+         refreshPlans(); return true; })()",
+    );
+    wait_for(
+        &mut chrome,
+        &format!("!!{}", card("natsf")),
+        "the new plan shows up",
+    );
+    assert_eq!(
+        chrome.eval(&format!(
+            "[[...window.__heldLists].sort(), [...document.querySelectorAll('#plans article')].at(-1) === {}]",
+            card("natsf")
+        )),
+        json!([["passkeys", "plans"], true]),
+        "the cards and the passkeys list were held, and the new plan went after the request"
+    );
+    let moved_to = chrome.eval(&spot_of);
+    assert!(
+        close(&moved_to[0], &spot[0]) && close(&moved_to[1], &spot[1]),
+        "the request did not move: {spot} then {moved_to}"
+    );
+    wait_for(
+        &mut chrome,
+        &format!(
+            "!document.getElementById('plans').inert && document.activeElement === {request_button}"
+        ),
+        "after the hold, the request's Approve has the keyboard focus again",
+    );
+    chrome.eval("status(''); true");
+    chrome.tap_at(spot[0].as_f64().expect("x"), spot[1].as_f64().expect("y"));
+    chrome.status_ok(APPROVED_REQUEST, &serve);
+    let audit =
+        fs::read_to_string(state1.join(arca::approval_requests::AUDIT_FILE)).expect("the audit");
+    assert!(
+        audit.contains(&format!("approved:{request}:")),
+        "the request was approved: {audit}"
+    );
+    assert!(
+        !instance_exists(&fake1, "natsf"),
+        "the new plan was not approved"
+    );
+    wait_for(
+        &mut chrome,
+        &format!("!!{}", card("natsf")),
+        "the new plan still waits",
     );
 
     assert_eq!(

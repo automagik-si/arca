@@ -3908,12 +3908,15 @@ passkey challenge when it reads the list, so a tap goes straight to the passkey 
 when nothing is awaited before the prompt). What went wrong with one card is said on that card, as well as in the status
 line at the top.
 
-A new reading of the list never moves a card the owner may be reading or about to tap. A card still waiting keeps its
-place, its open Details and the keyboard focus, and its next tap signs the statement just read for it. A new card goes
-after the others, wherever the list puts it. A card that stopped waiting while the page was open (it lapsed, or was
-approved or declined somewhere else) leaves a placeholder of its height, which the owner's next approval or decline takes
-away. For a second after a reading that changed what is drawn, the page takes no tap on its cards, so a tap aimed at what
-stood there before does nothing.
+The page's own readings (every minute, and on coming back into view) never move a card the owner may be reading or about
+to tap. Every card waits in one list: the delete plans, the actions, a linked machine's passkey list and the requests an
+assistant made (each with its own badge). A card still waiting keeps its place and its open Details, and its next tap
+signs the statement just read for it. A new card of any kind goes after every card already drawn, wherever the server
+lists it. A card that stopped waiting while the page was open (it lapsed, or was approved or declined somewhere else)
+leaves a placeholder of its height. The owner's own approval or decline does move cards: it takes the placeholders and
+that card away, and the cards below close up. For a second after any reading that changed what is drawn (from "Nothing to
+approve" too), the cards, the connected apps and the passkey list take no tap, so a tap aimed at what stood there before
+does nothing. A button that had the keyboard focus gets it back when that second ends.
 
 Every route of the page, the canvas routes below among them, answers the same with one trailing slash as without it
 (`/approve/` is `/approve`, `/approve/plans/` is `/approve/plans`): the same handler under the same rules, not a
@@ -7566,7 +7569,7 @@ A token keeps at most 5 pending requests and Arca at most 20 (past either, the r
 request. The request names the passkey page in `dashboard`. Requests and statuses are a doctor's or an operator's, and
 `owner_approval_list` is a viewer's too. The list's arguments and fields are untrusted, because the assistant wrote them.
 
-The request waits on the passkey page under "Asked by your assistant", drawn as text. One tap on Approve asks Arca for the
+The request waits on the passkey page among the other cards, with its own `Request` badge, drawn as text. One tap on Approve asks Arca for the
 statement (this host, the request's action, target and argument digest, a fresh nonce, valid 15 minutes), the passkey signs
 it, and Arca checks the proof as the call will, spending nothing. The owner has 120 seconds from the tap. Only passkeys made
 for the page's address are offered; a passkey made for an earlier address is refused with `passkey_rp_changed`, and the
