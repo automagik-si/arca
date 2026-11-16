@@ -3590,6 +3590,28 @@ mod tests {
         assert_eq!(arca_netproject::tenant::CONTAINER_ROOT_SIZE, "16GiB");
     }
 
+    #[test]
+    fn container_options_card_names_the_root_size_on_the_node_and_in_a_tenant() {
+        for kind in ["oci", "system"] {
+            for root in ["30GiB", "500GiB"] {
+                let template: crate::service::Template = serde_json::from_value(json!({
+                    "name": "app", "kind": kind, "image": "local:app", "rootSize": root,
+                    "data": { "path": "/data", "size": "10GiB" }
+                }))
+                .unwrap();
+                for in_tenant in [false, true] {
+                    assert_eq!(
+                        uses_words(&template, in_tenant),
+                        format!(
+                            "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), a {root} disk, and a 10GiB disk for its data."
+                        ),
+                        "{kind}, tenant={in_tenant}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Only a create says what it uses: a proposal of another action is given no `uses`, and a journal line that
     /// carries one for such an action loads without it.
     #[test]

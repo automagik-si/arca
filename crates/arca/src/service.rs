@@ -3099,6 +3099,21 @@ mod tests {
     }
 
     #[test]
+    fn container_options_port_isolation_is_refused_for_a_virtual_machine_template() {
+        let mut template: Template = serde_json::from_value(json!({
+            "name": "vm", "kind": "virtual-machine", "image": "images:debian/13",
+            "limits": { "cpu": "2", "memory": "4GiB" }, "rootSize": "20GiB"
+        }))
+        .unwrap();
+        let dir = Path::new("/nonexistent");
+        validate_template(&template, dir).expect("the unchanged VM template is valid");
+        template.port_isolation = true;
+        let error =
+            validate_template(&template, dir).expect_err("portIsolation needs a container NIC");
+        assert!(error.message.contains("portIsolation"), "{error:?}");
+    }
+
+    #[test]
     fn a_records_no_new_privileges_renders_as_raw_lxc_and_an_older_record_renders_without_it() {
         let record = |extra: Value| -> ServiceConfig {
             let mut value = json!({
