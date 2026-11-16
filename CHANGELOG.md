@@ -19,10 +19,11 @@ clusters in either direction, reading the source's cluster only; a source starte
 makes the copy roll back. Otherwise Incus pushes it, as before for a container. The moved copy keeps its cloud-init
 instance id, so cloud-init does not run its first-boot steps again (containers too). The preflight now sizes a virtual
 machine's Ceph, zfs or lvm disk from what Incus says (its volume's size, its root device's, the pool's `volume.size`,
-else its volume state's), counted whole, where it said the disk could not be measured. The card names both nodes, the
-disk's size, that the machine stays stopped, its own rollback promise, and for a copy by Ceph each side's cluster, pool
-and client; the finish card says the source's snapshots go with it. OPERATING.md ("Stopped virtual machines") says what
-a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
+else its volume state's), counted whole, where it said the disk could not be measured; a copy by Ceph, which takes no
+snapshot, counts the disk, its custom volumes and its config image, not its snapshots. The card names both nodes, the
+disk's size, what the room it needs counts, that the machine stays stopped, its own rollback promise, and for a copy by
+Ceph each side's cluster, pool and client; the finish card says the source's snapshots go with it. OPERATING.md
+("Stopped virtual machines") says what a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
 
 ## 0.32.0 (2026-11-16)
 

@@ -24,6 +24,9 @@ use crate::config::{NodeConfig, host_name_ok};
 
 /// The size Incus gives a block volume that neither the volume nor its pool sizes (`DefaultBlockSize`).
 const INCUS_DEFAULT_BLOCK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// The size Incus gives a virtual machine's config volume when its root device sets no `size.state`
+/// (`DefaultVMBlockFilesystemSize`).
+const INCUS_DEFAULT_VM_CONFIG_BYTES: u64 = 500 * 1024 * 1024;
 
 /// The most instances one call checks.
 pub const MAX_INSTANCES: usize = 50;
@@ -483,6 +486,16 @@ fn measure_path(path: &Path) -> Result<u64, String> {
         }
     }
     Ok(bytes)
+}
+
+/// The size of a virtual machine's config volume (its UEFI variables and TPM state): its root device's `size.state`, else
+/// the size Incus gives it (`DefaultVMBlockFilesystemSize`, 500 MiB).
+pub fn vm_config_bytes(instance: &Value) -> u64 {
+    devices(instance)
+        .into_iter()
+        .find(|(_, device)| is_root_disk(device))
+        .and_then(|(_, device)| text(&device, "size.state").and_then(size_of))
+        .unwrap_or(INCUS_DEFAULT_VM_CONFIG_BYTES)
 }
 
 /// The bytes a size Incus writes names: a plain count of bytes, or a count with a unit (`10GiB`, `512MB`).

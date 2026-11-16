@@ -42,7 +42,8 @@
 //!   pool the machine uses is not Ceph on both sides, or it has an ISO volume (Incus cannot make an empty one).
 //! - `ceph`: the linked host names its Ceph cluster as this node reaches it (`approval.linkedHosts[].ceph`), and every
 //!   pool the machine uses is a Ceph pool here and there: two clusters, either way (see the `rbd` module below). The plan
-//!   freezes, per Incus pool, the cluster, client and OSD pool each side is read or written with. The run reads the
+//!   freezes, per Incus pool, the cluster, client and OSD pool each side is read or written with, and sizes the copy
+//!   without the snapshots it does not take: the disk, the custom volumes and the config image. The run reads the
 //!   source's `last_used_at`, then every source image (who holds it open: anyone does, and nothing is made; and its
 //!   size), then, per custom volume and then for the machine, asks Incus on the target to make it empty at the source's
 //!   exact size, journals its uuid, reads the image Incus made back at that size, and copies with `rbd export-diff | rbd
@@ -83,7 +84,9 @@ use crate::action_proposal::ActionKind;
 use crate::config::{LinkedCeph, NodeConfig, host_name_ok};
 use crate::handlers::Clock;
 use crate::kernel::Kernel;
-use crate::move_preflight::{MovePreflightHandler, human, instance_ok, project_ok, seg};
+use crate::move_preflight::{
+    MovePreflightHandler, human, instance_ok, project_ok, seg, vm_config_bytes,
+};
 use arca_vmimport::{ProcessRunner, Runner};
 use rbd::RbdImage;
 
@@ -714,10 +717,16 @@ fn verify_of(vm: bool, spot_check: &str) -> Value {
 /// and how it is copied.
 fn vm_row(instance: &Value, source: &str, target: &str) -> (String, String) {
     let volumes = instance["volumes"].as_array().map_or(0, Vec::len);
-    let how = if instance["copy"] == "ceph" {
-        "by Ceph (rbd), disk by disk, with its config image (its UEFI variables and TPM state) and without its snapshots, which stay with the source"
+    let (how, counted) = if instance["copy"] == "ceph" {
+        (
+            "by Ceph (rbd), disk by disk, with its config image (its UEFI variables and TPM state) and without its snapshots, which stay with the source",
+            " (its disk, custom volumes and config image with 10% headroom; its snapshots are not counted, as none is copied)",
+        )
     } else {
-        "by an Incus push from this node, with its snapshots"
+        (
+            "by an Incus push from this node, with its snapshots",
+            " (its snapshots counted in full, with 10% headroom)",
+        )
     };
     (
         format!(
@@ -726,7 +735,7 @@ fn vm_row(instance: &Value, source: &str, target: &str) -> (String, String) {
             instance["name"].as_str().unwrap_or("?")
         ),
         format!(
-            "from {source} to {target}; its disk is {}{}; it needs {} on {target}'s pool {}; it stays stopped for the move and is copied {how}; about {} s at 50 MiB/s (the move measures the real time)",
+            "from {source} to {target}; its disk is {}{}; it needs {}{counted} on {target}'s pool {}; it stays stopped for the move and is copied {how}; about {} s at 50 MiB/s (the move measures the real time)",
             human(instance["bytes"]["instance"].as_u64().unwrap_or(0)),
             if volumes == 0 {
                 String::new()
@@ -1177,7 +1186,12 @@ pub struct Moves {
     verify_wait: Duration,
     /// What runs `rbd` for a virtual machine copied by Ceph.
     ceph: Arc<dyn Runner>,
+    /// Whether a moved virtual machine's guest answers at an address: a TCP connection from this node by default.
+    guest_probe: GuestProbe,
 }
+
+/// Whether the guest behind an address answers (see [`guest_answers`]).
+pub type GuestProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// How a running copy stands.
 #[derive(Debug, Clone, Default)]
@@ -1228,7 +1242,15 @@ impl Moves {
             poll: Duration::from_secs(2),
             verify_wait: Duration::from_secs(60),
             ceph: Arc::new(ProcessRunner),
+            guest_probe: Arc::new(guest_answers),
         }
+    }
+
+    /// The same, asking `probe` whether a moved virtual machine's guest answers at an address, in place of a TCP
+    /// connection from this node.
+    pub fn with_guest_probe(mut self, probe: GuestProbe) -> Self {
+        self.guest_probe = probe;
+        self
     }
 
     /// The same, running `rbd` through `runner` for the virtual machines it copies by Ceph.
@@ -1326,7 +1348,7 @@ impl Moves {
         let records = fold(&self.journal.lines());
         for (index, one) in wanted.iter().enumerate() {
             let row = &preflight["rows"][index];
-            let size = row["checks"]
+            let mut size = row["checks"]
                 .as_array()
                 .and_then(|checks| checks.iter().find(|check| check["check"] == "size"))
                 .map(|check| check["measure"].clone())
@@ -1435,6 +1457,26 @@ impl Moves {
                         Err(why) => reasons.extend(why),
                     }
                 }
+                // A copy by Ceph takes no snapshot: it needs the disk, the custom volumes and the config image, not
+                // the snapshots the preflight counts in full. Sized so, a machine that fits is not refused for them.
+                if !ceph.is_null()
+                    && let Some(measured) = size["measuredBytes"].as_u64()
+                {
+                    let config = vm_config_bytes(doc);
+                    let copied = measured
+                        .saturating_sub(size["snapshotBytes"].as_u64().unwrap_or(0))
+                        .saturating_add(config);
+                    let needed = copied.saturating_add(copied / 10);
+                    size["measuredBytes"] = json!(copied);
+                    size["neededBytes"] = json!(needed);
+                    size["configBytes"] = json!(config);
+                    if size["availableBytes"]
+                        .as_u64()
+                        .is_some_and(|available| needed <= available)
+                    {
+                        reasons.retain(|reason| !reason.starts_with("size: "));
+                    }
+                }
             }
             if !reasons.is_empty() {
                 blocked
@@ -1493,6 +1535,7 @@ impl Moves {
                     "hostFolders": size["hostFolderBytes"],
                     "measured": measured,
                     "needed": size["neededBytes"],
+                    "config": size["configBytes"],
                 },
                 "volumes": volumes,
                 "copy": if ceph.is_null() { "incus" } else { "ceph" },
@@ -2970,7 +3013,7 @@ impl Moves {
                         answered = Some("its Incus agent answers".to_string());
                     } else if let Some((card, address)) = global_addresses(&state)
                         .into_iter()
-                        .find(|(_, address)| guest_answers(address))
+                        .find(|(_, address)| (self.guest_probe)(address))
                     {
                         answered = Some(format!(
                             "{card}'s address {address} answers a connection from this node (port {GUEST_PROBE_PORT})"

@@ -3233,9 +3233,12 @@ or stops it, and its copy on the target is started only once every disk is copie
 The preflight sizes a virtual machine's block disk (Ceph, zfs or lvm) from Incus, not by walking: its volume's `size`,
 else its root disk device's `size`, else the pool's `volume.size`, else its volume state's total (Incus answers that one
 from the root device's size or its own 10 GiB default, never from the pool, so it comes last); a disk with none of
-these is not measured, and the plan says so. The size is the whole disk, the most its copy can take; each snapshot is
-counted at that size too. A stopped machine's custom volume on a block driver is sized from its own `size`, else the
-pool's `volume.size`, else Incus's 10 GiB default, which is the size Incus made it.
+these is not measured, and the plan says so. The size is the whole disk, the most its copy can take. On an `incus`
+move, which sends the snapshots, each snapshot is counted at that size too. A copy by `ceph` takes no snapshot, so its
+plan counts the disk, the custom volumes and the config image (the root device's `size.state`, else Incus's 500 MiB
+default) with 10% headroom, and the snapshots do not block it; the card says they are not counted. A stopped
+machine's custom volume on a block driver is sized from its own `size`, else the pool's `volume.size`, else Incus's 10
+GiB default, which is the size Incus made it.
 
 The checks are the copy's: it runs, and still runs after them; its guest answers, by its Incus agent (its state counts
 processes) or by one of its addresses answering a TCP connection to port 22 from this node (accepted, or refused by the

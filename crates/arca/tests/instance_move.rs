@@ -116,6 +116,10 @@ struct Rig {
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     executor: ActionExecutor,
     nonce: AtomicU64,
+    /// The guest probe's record: each address the move asked about, and the addresses that answer (none until a test
+    /// names one). No test connects to a real address.
+    probed: Arc<Mutex<Vec<String>>>,
+    answering: Arc<Mutex<Vec<String>>>,
 }
 
 impl Rig {
@@ -267,6 +271,13 @@ impl Rig {
         if let Some((_, runner)) = ceph {
             moves = moves.with_ceph_runner(runner);
         }
+        let probed = Arc::new(Mutex::new(Vec::new()));
+        let answering: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (asked, answers) = (Arc::clone(&probed), Arc::clone(&answering));
+        moves = moves.with_guest_probe(Arc::new(move |address: &str| {
+            asked.lock().unwrap().push(address.to_string());
+            answers.lock().unwrap().iter().any(|one| one == address)
+        }));
         let moves = Arc::new(moves);
         let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = plan_handlers_served(
             Arc::clone(&kernel),
@@ -297,6 +308,8 @@ impl Rig {
             key,
             now,
             moves,
+            probed,
+            answering,
             handlers,
             executor,
             nonce: AtomicU64::new(0),
@@ -1113,6 +1126,73 @@ fn ceph_rig(machine: Value) -> (Rig, Arc<CephFake>) {
     (rig, ceph)
 }
 
+/// Makes `count` snapshots of `db` in `shop` on `fake`, as `incus snapshot create` does, by Incus's own API.
+fn snapshot_db(fake: &FakeIncus, count: usize) {
+    use std::io::Read;
+    for index in 0..count {
+        let body = json!({ "name": format!("snap{index}") }).to_string();
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(fake.socket()).expect("the fake listens");
+        write!(
+            stream,
+            "POST /1.0/instances/db/snapshots?project=shop HTTP/1.1\r\nHost: incus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("sent");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("answered");
+        assert!(answer.starts_with("HTTP/1.1 20"), "{answer}");
+    }
+    assert_eq!(
+        writer(fake)
+            .get("/1.0/instances/db/snapshots?project=shop")
+            .expect("listed")
+            .as_array()
+            .map(Vec::len),
+        Some(count)
+    );
+}
+
+/// N1 (review 2): a copy by Ceph takes no snapshot, so it is sized without them. A 1 GiB machine with three snapshots fits
+/// node-b's 4 GiB pool: it needs its disk and its config image (Incus's 500 MiB default) with 10% headroom, not the 4.4
+/// GiB its snapshots counted in full would make, and it moves.
+#[test]
+fn a_ceph_copy_is_sized_without_the_snapshots_it_does_not_take() {
+    let (rig, _ceph) = ceph_rig(vm());
+    snapshot_db(&rig.source, 3);
+    let (status, plan) = move_db(&rig);
+    let instance = &plan["plan"]["instances"][0];
+    assert_eq!(instance["copy"], "ceph", "{plan}");
+    let copied = GIB + 500 * MIB;
+    assert_eq!(instance["bytes"]["measured"], copied, "{instance}");
+    assert_eq!(
+        instance["bytes"]["needed"],
+        copied + copied / 10,
+        "{instance}"
+    );
+    assert_eq!(instance["bytes"]["snapshots"], 3 * GIB, "{instance}");
+    let rows = card(&plan);
+    assert!(
+        rows.iter()
+            .any(|(_, words)| words.contains("its snapshots are not counted, as none is copied")),
+        "{rows:?}"
+    );
+    assert_eq!(status["instances"][0]["result"], "moved", "{status}");
+}
+
+/// The same machine on the Incus push, which sends its snapshots, still counts them in full: 4.4 GiB do not fit 4 GiB.
+#[test]
+fn an_incus_push_still_counts_the_snapshots_it_sends() {
+    let ceph = Arc::new(CephFake::default());
+    let rig = Rig::with_ceph(vec![vm()], Value::Null, Arc::clone(&ceph));
+    ceph_pools(&rig, "one", "two");
+    snapshot_db(&rig.source, 3);
+    let plan = rig.plan(&["db"]);
+    assert_eq!(plan["go"], false, "{plan}");
+    let reasons = plan.to_string();
+    assert!(reasons.contains("counted in full"), "{reasons}");
+}
+
 /// H1: without its agent, Incus lists for a guest that never booted the address it derives from the card's MAC (and its
 /// leases): those are not an answer. Only an address that answers a connection from this node is.
 #[test]
@@ -1143,6 +1223,17 @@ fn a_guest_that_never_booted_is_not_counted_by_the_addresses_incus_lists_for_it(
         reason.contains("none of its addresses answered a connection from this node"),
         "{reason}"
     );
+    let probed = rig.probed.lock().unwrap().clone();
+    assert!(
+        probed.iter().any(|address| address == "192.0.2.59"),
+        "{probed:?}"
+    );
+    assert!(
+        probed
+            .iter()
+            .any(|address| address == "fd42:4242:4242:4242:216:3eff:fe00:9"),
+        "{probed:?}"
+    );
     assert!(!rig.target.holds("instance", "shop", "db"));
     assert_eq!(
         rig.source.instance_status("shop", "db").as_deref(),
@@ -1151,13 +1242,14 @@ fn a_guest_that_never_booted_is_not_counted_by_the_addresses_incus_lists_for_it(
 }
 
 /// A guest without the agent answers when one of its addresses takes a connection from this node, accepted or refused:
-/// here its lease is this node's loopback, which always answers.
+/// here the probe answers at its lease's address.
 #[test]
 fn a_guest_without_the_agent_answers_by_an_address_that_takes_a_connection() {
     let (rig, _ceph) = ceph_rig(vm_on_lease());
     rig.target.agentless("shop", "db");
     rig.target
-        .set_lease("arcabr0", "00:16:3e:00:00:09", "127.0.0.1");
+        .set_lease("arcabr0", "00:16:3e:00:00:09", "192.0.2.77");
+    rig.answering.lock().unwrap().push("192.0.2.77".to_string());
     let (status, _) = move_db(&rig);
     let one = &status["instances"][0];
     assert_eq!(one["result"], "moved", "{one}");
@@ -1169,7 +1261,7 @@ fn a_guest_without_the_agent_answers_by_an_address_that_takes_a_connection() {
         .unwrap();
     assert_eq!(
         agent["detail"],
-        "the guest answers: eth0's address 127.0.0.1 answers a connection from this node (port 22)"
+        "the guest answers: eth0's address 192.0.2.77 answers a connection from this node (port 22)"
     );
 }
 
