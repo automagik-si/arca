@@ -36,9 +36,13 @@ fn pool_rig() -> Rig {
 /// The instance verbs as `arca serve` builds them: a start or a restart writes a virtual machine's secrets into its
 /// guest. `wait` is how long the guest agent is waited for.
 fn life(rig: &Rig, wait: Duration) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
-    let kernel = Arc::clone(&rig.kernel);
     let secrets = arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), Arc::clone(&rig.kernel))
         .with_wait(wait, Duration::from_millis(10));
+    life_with_writer(rig, Arc::new(secrets))
+}
+
+fn life_with_writer(rig: &Rig, secrets: Arc<arca::guest_secrets::GuestSecrets>) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
+    let kernel = Arc::clone(&rig.kernel);
     let lifecycle = InstanceLifecycle::new(
         rig.fake.socket().to_path_buf(),
         arca_incus::ProjectFamily::new([PROJECT], ["other"]).expect("the family"),
@@ -932,5 +936,47 @@ fn minted_repository_tokens_are_redacted_without_stored_secret_values() {
             service::redact_log(&format!("credential {token}"), &[]),
             "credential [secret]"
         );
+    }
+}
+
+
+#[test]
+fn reach_secrets_are_delivered_and_rotated_without_repository_credentials() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    for case in ["unconnected", "unreachable", "legacy-no-repo", "legacy-empty-repo"] {
+        let rig = pool_rig();
+        let mut template = pool_template();
+        template["name"] = json!("automagik-workspace");
+        template["secrets"] = json!(["TUNNEL_TOKEN", "TAILSCALE_AUTHKEY", "GITHUB_TOKEN"]);
+        template["settings"] = if case == "legacy-no-repo" { json!({"reach":"cloudflare"}) }
+            else if case == "legacy-empty-repo" { json!({"repoUrl":""}) }
+            else { json!({"repoUrl":"https://github.com/acme/api"}) };
+        rig.template("automagik-workspace", template);
+        rig.call("service_create", json!({"name":"w1","template":"automagik-workspace"})).unwrap();
+        for key in ["TUNNEL_TOKEN", "TAILSCALE_AUTHKEY"] {
+            rig.call("service_secret_set", json!({"name":"w1","key":key,"value":TOKEN})).unwrap();
+        }
+        let attempts = Arc::new(AtomicU64::new(0));
+        let mut writer = arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), rig.kernel.clone())
+            .with_wait(Duration::from_secs(1), Duration::from_millis(10));
+        if case != "unconnected" {
+            let count = attempts.clone();
+            writer = writer.with_repository_mint(Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(arca::guest_secrets::NotWritten { why:"GitHub could not be reached".into(), retry:true })
+            }));
+        }
+        let writer = Arc::new(writer);
+        let handlers = life_with_writer(&rig, writer.clone());
+        assert!(start(&handlers, "w1").is_ok(), "{case}: reach delivery must not depend on minting");
+        assert_eq!(guest_file(&rig, "w1", "TUNNEL_TOKEN").as_deref(), Some(TOKEN));
+        assert_eq!(guest_file(&rig, "w1", "TAILSCALE_AUTHKEY").as_deref(), Some(TOKEN));
+        assert_eq!(guest_file(&rig, "w1", "GITHUB_TOKEN"), None);
+        rig.call("service_secret_set", json!({"name":"w1","key":"TUNNEL_TOKEN","value":"synthetic-rotated-reach-token"})).unwrap();
+        assert!(start(&handlers, "w1").is_ok());
+        assert_eq!(guest_file(&rig, "w1", "TUNNEL_TOKEN").as_deref(), Some("synthetic-rotated-reach-token"));
+        assert_eq!(guest_file(&rig, "w1", "TAILSCALE_AUTHKEY").as_deref(), Some(TOKEN));
+        writer.refresh_repositories();
+        assert_eq!(attempts.load(Ordering::SeqCst), if case == "unreachable" { 3 } else { 0 });
     }
 }
