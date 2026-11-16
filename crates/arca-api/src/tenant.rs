@@ -74,8 +74,16 @@ pub fn resolve(
         }
         "arca_status" | "tenant_list" => Ok(None),
         "tenant_status" | "tenant_usage" => {
-            if args.get("id").and_then(Value::as_str) != Some(tenant) {
-                return Err("the call names another tenant");
+            match args.get("id") {
+                Some(value) if value.as_str() != Some(tenant) => {
+                    return Err("the call names another tenant");
+                }
+                Some(_) => {}
+                None => {
+                    args.as_object_mut()
+                        .ok_or("the call has no arguments")?
+                        .insert("id".into(), tenant.into());
+                }
             }
             Ok(None)
         }
