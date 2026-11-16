@@ -1354,9 +1354,11 @@ async fn a_runner_pool_signs_in_and_mints_through_the_signer_inside_its_group() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repository_15_second_app_mints_one_repo_and_exact_permissions_without_changing_runners() {
+    for app_slug in ["project-custom-repositories", "arca-repositories"] {
+    let bot_login = format!("{app_slug}[bot]");
     let scratch = Scratch::new();
     let fake = Fake::start("acme").await;
-    fake.with(|s| s.repository_app = true);
+    fake.with(|s| { s.repository_app = true; s.repository_app_slug = app_slug.into(); });
     let signer = signer(&scratch, &fake);
     let runner = signer
         .app_begin(
@@ -1412,6 +1414,8 @@ async fn repository_15_second_app_mints_one_repo_and_exact_permissions_without_c
             .await
             .unwrap();
         assert_eq!(credential.bot_id, 7007, "bot user id, never App id");
+        let record = signer.bindings().into_iter().find(|b| b.id == binding).unwrap();
+        assert_eq!(serde_json::to_value(record.app.unwrap()).unwrap()["botLogin"], bot_login);
         assert_eq!(credential.token.expose(), fake::INSTALL_TOKEN);
     }
     assert!(
@@ -1481,7 +1485,7 @@ async fn repository_15_second_app_mints_one_repo_and_exact_permissions_without_c
         json!({"repositories":["api"],"permissions":permissions})
     );
     assert_eq!(
-        fake.seen("GET", "/api/users/arca-repositories%5Bbot%5D")
+        fake.seen("GET", &format!("/api/users/{app_slug}%5Bbot%5D"))
             .len(),
         1,
         "verified bot metadata survives restart without unauthenticated lookup on every mint"
@@ -1489,4 +1493,6 @@ async fn repository_15_second_app_mints_one_repo_and_exact_permissions_without_c
     for (path, text) in shown_files(&scratch.0) {
         assert_no_secret(&path.display().to_string(), &text);
     }
+}
+
 }

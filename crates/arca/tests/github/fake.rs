@@ -55,6 +55,7 @@ pub struct Seen {
 pub struct FakeState {
     pub org: String,
     pub repository_app: bool,
+    pub repository_app_slug: String,
     /// The person has typed the code and authorised.
     pub authorized: bool,
     /// The person declined.
@@ -125,6 +126,7 @@ impl Fake {
         let state = Arc::new(Mutex::new(FakeState {
             org: org.to_string(),
             repository_app: false,
+            repository_app_slug: "arca-repositories".into(),
             authorized: false,
             declined: false,
             restricted: false,
@@ -344,13 +346,13 @@ fn answer(
             }
             (200, json!({"id":INSTALLATION}))
         }
-        ("GET", "/api/users/arca-repositories%5Bbot%5D") => {
+        ("GET", p) if p == format!("/api/users/{}%5Bbot%5D", s.repository_app_slug) => {
             if auth != "none" {
                 return (401, message("bot lookup must not carry a credential"));
             }
             (
                 200,
-                json!({"id":7007,"login":"arca-repositories[bot]","type":"Bot"}),
+                json!({"id":7007,"login":format!("{}[bot]", s.repository_app_slug),"type":"Bot"}),
             )
         }
         ("POST", p) if p == format!("/api/app-manifests/{MANIFEST_CODE}/conversions") => {
@@ -362,7 +364,7 @@ fn answer(
                 201,
                 json!({
                     "id": APP_ID,
-                    "slug": if s.repository_app { "arca-repositories" } else { APP_SLUG },
+                    "slug": if s.repository_app { s.repository_app_slug.as_str() } else { APP_SLUG },
                     "client_id": APP_CLIENT_ID,
                     "client_secret": "fake-app-client-secret",
                     "webhook_secret": null,
