@@ -28,6 +28,21 @@ struct Recording(&'static str, Calls);
 
 struct Inventory;
 
+struct PostRecording(Calls);
+
+impl arca_mcp::PostHandler for PostRecording {
+    fn post(&self, path: &str, caller: &Caller) -> Result<GetReply, CallError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((caller.token_id.clone(), json!({"path": path})));
+        Ok(GetReply {
+            content_type: "application/json",
+            body: b"{}".to_vec(),
+        })
+    }
+}
+
 impl GetHandler for Inventory {
     fn get(&self, _: Option<&str>, _: &Caller) -> Result<GetReply, CallError> {
         Ok(GetReply {
@@ -65,6 +80,7 @@ struct Door {
     open: String,
     viewer: String,
     proposer_only: String,
+    ack_viewer: String,
     calls: Calls,
 }
 
@@ -86,6 +102,12 @@ impl Door {
             Scope::Doctor,
             "tenant=abcdefgh\ntools=action_propose\n",
         );
+        let ack_viewer = token(
+            &scratch,
+            "ack-viewer",
+            Scope::Viewer,
+            "tenant=abcdefgh\ntools=support_report_ack,arca_status\n",
+        );
         let calls: Calls = Arc::default();
         let mut server = Server::new(verbs(), TokenStore::load(scratch.path()).unwrap())
             .log_to(Arc::new(|_| {}));
@@ -93,6 +115,12 @@ impl Door {
             server = server.handle(v.name, Arc::new(Recording(v.name, calls.clone())));
         }
         server = server.get_route("/inventory", "arca_status", Arc::new(Inventory));
+        for (path, verb) in [
+            ("/reports/{id}/ack", "support_report_ack"),
+            ("/future", "arca_status"),
+        ] {
+            server = server.post_route(path, verb, Arc::new(PostRecording(calls.clone())));
+        }
         let runtime = Runtime::new().unwrap();
         let socket = scratch.at("mcp.sock");
         let (router, served) = (server.router(), socket.clone());
@@ -107,6 +135,7 @@ impl Door {
             open,
             viewer,
             proposer_only,
+            ack_viewer,
             calls,
         }
     }
@@ -154,6 +183,60 @@ fn a_bound_token_never_reads_a_get_route_even_when_its_verb_is_allowed() {
         let reply = exchange(&mut connect_unix(&door.socket), request.as_bytes());
         assert_eq!(reply.status, expected);
     }
+}
+
+#[test]
+fn bound_operators_and_named_viewers_never_reach_post_routes() {
+    let door = Door::start();
+    for path in ["/reports/1/ack", "/future"] {
+        door.calls.lock().unwrap().clear();
+        let statuses: Vec<_> = [&door.bound, &door.ack_viewer, &door.open]
+            .into_iter()
+            .map(|token| {
+                let request = format!(
+                    "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                exchange(&mut connect_unix(&door.socket), request.as_bytes()).status
+            })
+            .collect();
+        assert_eq!(statuses, [403, 403, 200], "{path}");
+        assert_eq!(
+            *door.calls.lock().unwrap(),
+            [("open".into(), json!({"path": path}))],
+            "only the unbound request reaches a handler"
+        );
+    }
+}
+
+#[test]
+fn tenant_status_and_usage_default_only_a_bound_tokens_missing_id() {
+    let door = Door::start();
+    for name in ["tenant_status", "tenant_usage"] {
+        assert_eq!(refusal(&door.call(&door.bound, name, json!({}))), "Reached");
+        assert_eq!(door.calls.lock().unwrap().last().unwrap().1["id"], TENANT);
+        let before = door.calls.lock().unwrap().len();
+        let reply = door.call(&door.open, name, json!({}));
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(door.calls.lock().unwrap().len(), before);
+    }
+}
+
+#[test]
+fn unbound_admin_enumeration_keeps_its_legacy_prefix_even_when_loading_refuses_the_file() {
+    let scratch = Scratch::new("unbound-admin-prefix");
+    let (_, header) = mint(Scope::Admin);
+    let padding = "x".repeat(4096 - header.len() - "tools=\n".len());
+    let mut bytes = format!("{header}tools={padding}\n").into_bytes();
+    bytes.extend_from_slice(&[0xff; 5000]);
+    let path = scratch.path().join("legacy.hash");
+    std::fs::write(&path, bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    assert_eq!(arca_mcp::admin_token_ids(scratch.path()), ["legacy"]);
+    assert!(matches!(
+        TokenStore::load(scratch.path()),
+        Err(TokenStoreError::Malformed { .. })
+    ));
 }
 
 fn refusal(reply: &Value) -> &Value {

@@ -4,7 +4,7 @@ use arca_mcp::version::Mirrors;
 use arca_mcp::{Server, TokenStore, mint};
 
 #[test]
-fn bound_tokens_use_only_their_tenants_services_and_save_only_resolved_proposals() {
+fn bound_tokens_use_only_their_tenants_services_and_run_approved_proposals_in_that_tenant() {
     let rig = two_tenants(policy());
     for tenant in [None, Some(A), Some(B)] {
         let mut args = json!({"name": "web", "template": "app"});
@@ -92,7 +92,7 @@ fn bound_tokens_use_only_their_tenants_services_and_save_only_resolved_proposals
     );
     assert_eq!(refused["error"]["data"]["refusal"], "OutsideTokenTenant");
     assert_eq!(rig.kernel.lock().unwrap().action_proposals().len(), before);
-    answer(call(
+    let proposed = answer(call(
         &bound,
         "action_propose",
         json!({"action": "service_remove", "args": {"name": "web"}}),
@@ -119,4 +119,47 @@ fn bound_tokens_use_only_their_tenants_services_and_save_only_resolved_proposals
             .unwrap()["status"],
         "Running"
     );
+    let id = proposed["id"].as_str().unwrap();
+    let digest = proposed["argsDigest"].as_str().unwrap();
+    let nonce = format!("{:064x}", rig.nonce.fetch_add(1, Ordering::SeqCst) + 1);
+    let statement =
+        arca::handlers::action_statement("node1", id, "service_remove", digest, rig.now(), &nonce)
+            .unwrap();
+    let approval = common::approve_statement(&rig.key, &statement);
+    let executor = ActionExecutor::new(
+        rig.handlers
+            .iter()
+            .map(|(verb, handler)| (*verb, Arc::clone(handler))),
+    );
+    arca::handlers::run_approved_action(
+        &rig.kernel,
+        &executor,
+        &json!({"plan": id, "approval": approval}),
+        rig.now(),
+    )
+    .expect("the owner's approved bound proposal runs");
+    assert!(
+        !rig.entries()
+            .iter()
+            .any(|entry| entry.id.0 == format!("t-{A}-service-web"))
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/web-{A}?project={}", project(A)))
+            .is_none()
+    );
+    for (project, instance, entry) in [
+        (project(B), format!("web-{B}"), format!("t-{B}-service-web")),
+        (
+            PROJECT.to_string(),
+            "web".to_string(),
+            "service-web".to_string(),
+        ),
+    ] {
+        assert!(rig.entries().iter().any(|row| row.id.0 == entry));
+        assert_eq!(
+            rig.get(&format!("/1.0/instances/{instance}?project={project}"))
+                .unwrap()["status"],
+            "Running"
+        );
+    }
 }
