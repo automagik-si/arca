@@ -58,6 +58,7 @@ const PUSHED_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug)]
 pub struct AppFlow {
     pub account: String,
+    pub repository_access: bool,
     pub label_sets: Vec<Vec<String>>,
     pub caller: String,
     pub created_at: u64,
@@ -268,8 +269,19 @@ impl Signer {
         origin: &str,
         caller: &str,
     ) -> Result<AppStart, SignerError> {
+        self.app_begin_for(account, label_sets, origin, caller, false)
+    }
+
+    pub(crate) fn app_begin_for(
+        &self,
+        account: &str,
+        label_sets: &[Vec<String>],
+        origin: &str,
+        caller: &str,
+        repository_access: bool,
+    ) -> Result<AppStart, SignerError> {
         check_account(account)?;
-        if label_sets.is_empty() || label_sets.len() > 10 {
+        if !repository_access && (label_sets.is_empty() || label_sets.len() > 10) {
             return Err(SignerError::Invalid(
                 "labels: one to ten label sets".to_string(),
             ));
@@ -279,7 +291,7 @@ impl Signer {
             .map(|set| check_labels("labels", set))
             .collect::<Result<Vec<_>, _>>()?;
         let state = fresh_state()?;
-        let manifest = json!({
+        let mut manifest = json!({
             "name": format!("Arca runners {}", &state[..6]),
             "url": origin,
             "description": "Runs this organisation's GitHub Actions jobs on Arca. It registers and removes self-hosted runners, and nothing else.",
@@ -291,6 +303,13 @@ impl Signer {
             "default_permissions": { APP_PERMISSION: "write" },
             "default_events": [],
         });
+        if repository_access {
+            manifest["name"] = json!(format!("Arca repositories {}", &state[..6]));
+            manifest["description"] = json!(
+                "Workspace Git access to the selected repositories. Contents and pull requests write; metadata read."
+            );
+            manifest["default_permissions"] = crate::github_repository::permissions();
+        }
         let now = self.now();
         {
             let mut state_lock = self.lock();
@@ -301,6 +320,7 @@ impl Signer {
                 state.clone(),
                 AppFlow {
                     account: account.to_string(),
+                    repository_access,
                     label_sets: label_sets.clone(),
                     caller: caller.to_string(),
                     created_at: now,
@@ -395,6 +415,7 @@ impl Signer {
         let binding = Binding {
             id: binding_id.clone(),
             mode: Mode::App,
+            repository_access: flow.repository_access,
             account: owner_login.clone(),
             status: Status::AwaitingInstall,
             why: Some("The App is made; install it in the organisation to finish.".to_string()),
@@ -407,6 +428,8 @@ impl Signer {
                 client_id,
                 html_url: field("html_url").unwrap_or_default(),
                 owner_id,
+                bot_id: None,
+                bot_login: None,
             }),
             installation: None,
             created_by: flow.caller.clone(),
@@ -543,6 +566,9 @@ impl Signer {
             .get(id)
             .cloned()
             .ok_or("no such connection")?;
+        if binding.repository_access {
+            return Ok(());
+        }
         let token = self
             .installation_token(id)
             .await
@@ -724,7 +750,7 @@ impl Signer {
         self.inner.dir.join("keys").join(format!("{binding}.pem"))
     }
 
-    fn app_jwt(&self, binding: &str) -> Result<Secret, MintRefused> {
+    pub(crate) fn app_jwt(&self, binding: &str) -> Result<Secret, MintRefused> {
         let issuer = self
             .lock()
             .bindings
@@ -775,6 +801,9 @@ impl Signer {
                 .bindings
                 .get(binding)
                 .ok_or(MintRefused::UnknownBinding)?;
+            if record.repository_access {
+                return Err(MintRefused::NotMintable);
+            }
             let installation = record
                 .installation
                 .as_ref()
@@ -998,6 +1027,9 @@ impl Signer {
             .get(&request.binding)
             .cloned()
             .ok_or(MintRefused::UnknownBinding)?;
+        if binding.repository_access {
+            return Err(MintRefused::NotMintable);
+        }
         let labels = binding
             .label_sets
             .iter()
@@ -1204,6 +1236,7 @@ impl Signer {
         let binding = Binding {
             id: id.clone(),
             mode: Mode::Push,
+            repository_access: false,
             account: account.to_string(),
             status: Status::Active,
             why: None,

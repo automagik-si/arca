@@ -595,6 +595,7 @@ impl Signer {
         let mut binding = Binding {
             id: binding_id.clone(),
             mode: Mode::Oauth,
+            repository_access: false,
             account: org.clone(),
             status: Status::Active,
             why: None,

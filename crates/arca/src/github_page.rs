@@ -205,9 +205,17 @@ pub fn view(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
     if let Some(id) = query.get("connected")
         && let Ok(info) = signer.binding(id)
     {
+        let words = if signer
+            .bindings()
+            .iter()
+            .any(|b| b.id == *id && b.repository_access)
+        {
+            "Its repository App supplies each workspace with access to its own selected repository."
+        } else {
+            "Runners register in its runner group with the labels you chose."
+        };
         body.push_str(&format!(
-            "<section><h2 class=\"ok\">Connected</h2><p>{} is connected. Runners register in its runner group with \
-             the labels you chose.</p></section>",
+            "<section><h2 class=\"ok\">Connected</h2><p>{} is connected. {words}</p></section>",
             escape(&info.org_url)
         ));
     }
@@ -222,7 +230,7 @@ pub fn view(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
         body.push_str(&format!(
             "<div class=\"row\"><strong>{}</strong><span class=\"{tone}\">{words}</span></div><p>{}",
             escape(&binding.account),
-            mode_words(binding.mode)
+            if binding.repository_access { "workspace repository App" } else { mode_words(binding.mode) }
         ));
         if let Some(group) = &binding.runner_group {
             body.push_str(&format!("; runner group \"{}\"", escape(&group.name)));
@@ -276,6 +284,9 @@ pub fn view(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
         body.push_str("</ul></section>");
     }
 
+    body.push_str(&format!(
+        "<section><h2>Workspace repositories</h2><p>Create a separate repository App for workspace Git access. It can fetch, push and open draft pull requests in the repositories you select. It does not change branch policies.</p><form method=\"post\" action=\"{APP_PATH}\"><input type=\"hidden\" name=\"purpose\" value=\"repositories\"><label for=\"repo-org\">Organisation</label><input id=\"repo-org\" name=\"org\" required maxlength=\"39\"><button type=\"submit\">Connect workspace repositories</button></form></section>"
+    ));
     if signer.oauth_client_id().is_some() {
         body.push_str(&format!(
             "<section><h2>Sign in with GitHub</h2><p>Arca shows a code; you type it on GitHub and allow Arca to \
@@ -343,10 +354,15 @@ pub async fn device(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
 /// host.
 pub fn app_start(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
     let sets = label_sets(field(form, "labels"));
-    let start = match ctx
-        .signer
-        .app_begin(field(form, "org"), &sets, ctx.origin, ctx.caller)
-    {
+    let repositories = field(form, "purpose") == "repositories";
+    let started = if repositories {
+        ctx.signer
+            .repository_app_begin(field(form, "org"), ctx.origin, ctx.caller)
+    } else {
+        ctx.signer
+            .app_begin(field(form, "org"), &sets, ctx.origin, ctx.caller)
+    };
+    let start = match started {
         Ok(start) => start,
         Err(error) => {
             return message_page(StatusCode::BAD_REQUEST, "Not started", &error.message());
@@ -363,6 +379,16 @@ pub fn app_start(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
         action = escape(&start.action_url),
         manifest = escape(&start.manifest),
     );
+    let body = if repositories {
+        format!(
+            "<h1>Create the repository App</h1><p>GitHub will suggest a unique repository App name in {}. You may edit the name on GitHub. It asks for Contents and Pull requests: Read and write, and Metadata: Read. No webhook. Choose Only select repositories, select the workspace repositories and install. Existing branch policies stay in place.</p><form method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"manifest\" value=\"{}\"><button type=\"submit\">Create the App on GitHub</button></form>",
+            escape(field(form, "org")),
+            escape(&start.action_url),
+            escape(&start.manifest)
+        )
+    } else {
+        body
+    };
     let mut response = html(&body, false);
     let web = web_origin(&ctx.signer.endpoints().web);
     let csp =

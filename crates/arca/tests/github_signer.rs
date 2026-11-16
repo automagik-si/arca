@@ -1352,3 +1352,182 @@ async fn a_runner_pool_signs_in_and_mints_through_the_signer_inside_its_group() 
         Some(arca_runners::SignInReason::NoCredential)
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_15_second_app_mints_one_repo_and_exact_permissions_without_changing_runners() {
+    for app_slug in ["project-custom-repositories", "arca-repositories"] {
+        let bot_login = format!("{}[bot]", app_slug.to_ascii_uppercase());
+        let scratch = Scratch::new();
+        let fake = Fake::start("acme").await;
+        fake.with(|s| {
+            s.repository_app = true;
+            s.repository_app_slug = app_slug.into();
+            s.repository_bot_login = Some(bot_login.clone());
+        });
+        let signer = signer(&scratch, &fake);
+        let runner = signer
+            .app_begin(
+                "acme",
+                &[vec!["linux".into()]],
+                "https://arca.example",
+                "page",
+            )
+            .unwrap();
+        let manifest: Value = serde_json::from_str(&runner.manifest).unwrap();
+        assert_eq!(
+            manifest["default_permissions"],
+            json!({"organization_self_hosted_runners":"write"})
+        );
+        let start = signer
+            .repository_app_begin("acme", "https://arca.example", "page")
+            .unwrap();
+        let manifest: Value = serde_json::from_str(&start.manifest).unwrap();
+        let permissions = json!({"contents":"write","pull_requests":"write","metadata":"read"});
+        assert_eq!(
+            manifest["name"],
+            format!("Arca repositories {}", &start.state[..6])
+        );
+        let another = signer
+            .repository_app_begin("acme", "https://arca.example", "page")
+            .unwrap();
+        let another_manifest: Value = serde_json::from_str(&another.manifest).unwrap();
+        assert_ne!(manifest["name"], another_manifest["name"]);
+        assert_eq!(manifest["default_permissions"], permissions);
+        assert_eq!(manifest["public"], false);
+        assert_eq!(manifest["hook_attributes"]["active"], false);
+        assert_eq!(manifest["default_events"], json!([]));
+        signer
+            .app_created(MANIFEST_CODE, &start.state)
+            .await
+            .unwrap();
+        fake.with(|s| s.installed = true);
+        let binding = signer
+            .app_installed(INSTALLATION, Some(&start.state))
+            .await
+            .unwrap();
+        assert!(
+            fake.seen(
+                "POST",
+                &format!("/api/app/installations/{INSTALLATION}/access_tokens")
+            )
+            .is_empty(),
+            "install must not mint an unrestricted token"
+        );
+        assert!(
+            signer
+                .bindings()
+                .iter()
+                .find(|b| b.id == binding)
+                .unwrap()
+                .repository_access
+        );
+        fake.with(|s| s.repository_bot_login = Some("unrelated-app[bot]".into()));
+        assert!(
+            signer
+                .repository_credential("https://github.com/acme/api")
+                .await
+                .is_err()
+        );
+        assert!(
+            fake.seen(
+                "POST",
+                &format!("/api/app/installations/{INSTALLATION}/access_tokens")
+            )
+            .is_empty()
+        );
+        fake.with(|s| s.repository_bot_login = Some(bot_login.clone()));
+        for repo in ["api", "web"] {
+            let credential = signer
+                .repository_credential(&format!("https://github.com/acme/{repo}"))
+                .await
+                .unwrap();
+            assert_eq!(credential.bot_id, 7007, "bot user id, never App id");
+            assert_eq!(credential.bot_login, bot_login);
+            let record = signer
+                .bindings()
+                .into_iter()
+                .find(|b| b.id == binding)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(record.app.unwrap()).unwrap()["botLogin"],
+                bot_login
+            );
+            assert_eq!(credential.token.expose(), fake::INSTALL_TOKEN);
+        }
+        assert!(
+            signer
+                .repository_credential("https://github.com/acme/unselected")
+                .await
+                .is_err()
+        );
+        assert!(
+            signer
+                .repository_credential("https://other.example/acme/api")
+                .await
+                .is_err()
+        );
+        for bad in [
+            "http://github.com/acme/api",
+            "https://user@github.com/acme/api",
+            "https://github.com/acme/api/extra",
+            "https://github.com/acme/api?token=bad",
+            "https://github.com/acme/..",
+        ] {
+            assert!(signer.repository_credential(bad).await.is_err());
+        }
+        let requests = fake.seen(
+            "POST",
+            &format!("/api/app/installations/{INSTALLATION}/access_tokens"),
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].body,
+            json!({"repositories":["api"],"permissions":permissions})
+        );
+        assert_eq!(
+            requests[1].body,
+            json!({"repositories":["web"],"permissions":permissions})
+        );
+        assert!(
+            fake.seen("POST", "/api/orgs/acme/actions/runner-groups")
+                .is_empty()
+        );
+        assert!(matches!(
+            signer
+                .mint(MintRequest {
+                    binding: binding.clone(),
+                    runner_name: "test".into(),
+                    labels: vec![],
+                    work_folder: None,
+                    scale_set_id: None,
+                    job: None,
+                    caller: "test".into()
+                })
+                .await,
+            Err(MintRefused::NotMintable)
+        ));
+        // The purpose survives an Arca restart; no installation-token cache broadens it.
+        let reopened = Signer::open(&scratch.0, fake.endpoints(), clock()).unwrap();
+        reopened
+            .repository_credential("https://github.com/acme/api.git")
+            .await
+            .unwrap();
+        let requests = fake.seen(
+            "POST",
+            &format!("/api/app/installations/{INSTALLATION}/access_tokens"),
+        );
+        assert_eq!(
+            requests[2].body,
+            json!({"repositories":["api"],"permissions":permissions})
+        );
+        assert_eq!(
+            fake.seen("GET", &format!("/api/users/{app_slug}%5Bbot%5D"))
+                .len(),
+            2,
+            "verified bot metadata survives restart without unauthenticated lookup on every mint"
+        );
+        for (path, text) in shown_files(&scratch.0) {
+            assert_no_secret(&path.display().to_string(), &text);
+        }
+    }
+}

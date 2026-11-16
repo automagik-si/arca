@@ -4,10 +4,10 @@
 //! before anything is journalled, and `effect` checks the family, the features, the ownership and the plan again before it
 //! applies anything. `docs/OWNERSHIP.md` states the rules.
 //!
-//! A write that Incus answered with an error, or that did not finish, may still have landed. The provider reads the object back
-//! before it decides the outcome, unless the answer could not be read at all: then it makes no read, since a read after a write
-//! still running proves nothing. It reports a failure only when the object shows the write did not happen, and reports
-//! [`EffectRefusal::Unresolved`] for anything it cannot prove either way.
+//! A failed response can leave a write uncertain. A config PATCH waits for any listed operations and reads the object
+//! back, but is itself synchronous: a pre-image read after an uncertain response may precede a late write. Its original
+//! inverse is kept as may-have-landed, and the caller is told to reconcile again. A definite refusal can prove that a
+//! patch did not land; an unreadable or different state stays unresolved.
 //!
 //! The read-back that settles an intent after a restart, or finds a removed entry's object gone, reads the object only once no
 //! operation Incus still runs that may write it names it: it waits on each such operation up to the operation deadline, and an
@@ -310,7 +310,7 @@ impl Family {
 }
 
 /// The Incus write provider. It writes only inside its family, only the objects an entry owns, and only through the writer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IncusProvider {
     socket: PathBuf,
     reader: UnixIncus,
@@ -400,8 +400,12 @@ impl IncusProvider {
             self.retained.snapshot()?,
             family,
         );
-        Ok(match self.deadline {
+        let writer = match self.deadline {
             Some(deadline) => writer.with_operation_deadline(deadline),
+            None => writer,
+        };
+        Ok(match self.reader.remaining_budget() {
+            Some(left) => writer.with_total_budget(left),
             None => writer,
         })
     }
@@ -954,7 +958,7 @@ impl IncusProvider {
     }
 
     /// The settled refusal for a create whose request failed. A refusal before the write is final. A failed create is
-    /// recorded as failed only when Incus answered with a status error and a GET of the name then answers 404. One case
+    /// recorded as failed only when Incus answered with a definite refusal and a GET of the name then answers 404. One case
     /// more is settled, as [`EffectRefusal::Landed`]: an instance whose create asked for a start, that Incus answered a
     /// status error for, and that now reads as stopped and as the entry's own, with no operation still at work on it.
     /// Incus creates and then starts, and a failed start leaves the instance stopped, so the create landed and the start
@@ -969,6 +973,10 @@ impl IncusProvider {
         sent: &Value,
         error: IncusError,
     ) -> EffectRefusal {
+        if uncertain_write_answer(&error) {
+            // A gateway can give up while a synchronous create is still running, even if a GET would show 404.
+            return EffectRefusal::Unresolved;
+        }
         match error {
             IncusError::Refused(reason) => EffectRefusal::Provider(reason),
             IncusError::Status { message, .. } => match writer.get_etag(target) {
@@ -1036,11 +1044,13 @@ impl IncusProvider {
         }
     }
 
-    /// The settled outcome of a patch whose request failed. A refusal before the write is final. A 412 is a stale plan, and changes
-    /// nothing. An answer that could not be read, an unconfirmed write and a timeout are unresolved with no read-back: an operation
-    /// still running can apply after a read that shows the pre-image. Any other error is settled by a read-back. A patch the
-    /// read-back shows is landed; a patch the read-back shows without its change did not land; anything else is unresolved. The
-    /// read-back's uuid is used only for the writer's own checks, so the answer names the object as the op did.
+    /// Settles a failed patch from a read-back. A refusal before the write is final; a 412 is a stale plan. When the
+    /// answer is uncertain, wait for listed operations before reading, but a synchronous PATCH can still be running
+    /// without any listed operation.
+    /// Changes present mean applied. After an uncertain answer, a pre-image may precede a late synchronous PATCH: keep
+    /// it as the inverse of a may-have-landed effect and let the next document reconcile again. Only a definite refusal
+    /// proves the patch did not land. An unreadable or different state stays unresolved.
+    /// The answer names the object as the op did, as for a patch whose request succeeded.
     fn settle_patch(
         &self,
         entry: &EntryId,
@@ -1050,31 +1060,38 @@ impl IncusProvider {
         pre_image: &BTreeMap<String, Option<String>>,
         error: IncusError,
     ) -> Result<(), EffectRefusal> {
+        let uncertain = uncertain_write_answer(&error);
         match error {
-            IncusError::Refused(reason) => Err(EffectRefusal::Provider(reason)),
-            IncusError::Status { code: 412, .. } => Err(EffectRefusal::Stale),
-            IncusError::AppliedUnconfirmed(_)
-            | IncusError::Timeout
-            | IncusError::Io(_)
-            | IncusError::Decode(_) => Err(EffectRefusal::Unresolved),
-            _ => {
-                let Ok(reading) = writer.read_class(object) else {
-                    return Err(EffectRefusal::Unresolved);
-                };
-                if !kernel_may_write(&reading.class, entry) {
-                    return Err(EffectRefusal::Unresolved);
-                }
-                if shows(&reading.config, changes) {
-                    return Ok(());
-                }
-                if self.shows_pre_image(entry, &reading.config, pre_image) {
-                    return Err(EffectRefusal::Provider(
-                        "the patch did not land".to_string(),
-                    ));
-                }
-                Err(EffectRefusal::Unresolved)
-            }
+            IncusError::Refused(reason) => return Err(EffectRefusal::Provider(reason)),
+            IncusError::Status { code: 412, .. } => return Err(EffectRefusal::Stale),
+            _ if uncertain => self.settle_operations(object)?,
+            _ => {}
         }
+        let Ok(reading) = writer.read_class(object) else {
+            return Err(EffectRefusal::Unresolved);
+        };
+        if !kernel_may_write(&reading.class, entry) {
+            return Err(EffectRefusal::Unresolved);
+        }
+        if shows(&reading.config, changes) {
+            return Ok(());
+        }
+        if self.shows_pre_image(entry, &reading.config, pre_image) {
+            if uncertain {
+                return Err(EffectRefusal::Landed(Box::new(Landed {
+                    object: object.clone(),
+                    inverse: Inverse::IncusRestoreConfig {
+                        object: object.clone(),
+                        config: pre_image.clone(),
+                    },
+                    why: "the patch may have landed; its original pre-image is kept".into(),
+                })));
+            }
+            return Err(EffectRefusal::Provider(
+                "the patch did not land".to_string(),
+            ));
+        }
+        Err(EffectRefusal::Unresolved)
     }
 
     /// Waits until no operation Incus still runs that may write `place` names it, for at most the operation deadline from the
@@ -1177,6 +1194,109 @@ impl IncusProvider {
             // Anything else may follow a delete that landed, so the outcome is not known.
             Err(_) => Err(EffectRefusal::Unresolved),
         }
+    }
+}
+
+impl IncusProvider {
+    fn runtime_probe(&self, budget: Duration) -> Result<Self, EffectRefusal> {
+        if budget.is_zero() {
+            return Err(EffectRefusal::Unresolved);
+        }
+        let reader = self
+            .reader
+            .clone()
+            .with_timeout(budget)
+            .with_total_budget(budget);
+        let mut probe = self.clone();
+        probe.reader = reader;
+        Ok(probe)
+    }
+
+    fn check_readback_operations(
+        &self,
+        target: &ObjectRef,
+        wait: bool,
+    ) -> Result<(), EffectRefusal> {
+        if wait {
+            return self.settle_operations(target);
+        }
+        let running = writing_on(
+            &self.reader,
+            target.kind,
+            &target.project,
+            target.parent.as_deref(),
+            &target.name,
+        )
+        .map_err(|_| EffectRefusal::Unresolved)?;
+        if running.is_empty() {
+            Ok(())
+        } else {
+            Err(EffectRefusal::Unresolved)
+        }
+    }
+
+    fn read_back_checked(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre_image: Option<&BTreeMap<String, Option<String>>>,
+        wait: bool,
+    ) -> Result<ReadBack, EffectRefusal> {
+        let place = self.served_at(entry, target)?;
+        self.check_family(place.kind, &place.project)?;
+        self.check_features(entry, place.kind, &place.project)?;
+        self.check_readback_operations(&place, wait)?;
+        let reading = match self.writer(entry)?.read_class(&place) {
+            Ok(reading) => reading,
+            Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),
+            Err(error) => return Err(incus_refusal(error)),
+        };
+        let holds_pre_image =
+            pre_image.is_some_and(|pre| self.shows_pre_image(entry, &reading.config, pre));
+        Ok(ReadBack::Present {
+            object: ObjectRef {
+                uuid: reading.uuid.clone(),
+                ..target.clone()
+            },
+            owned: kernel_may_write(&reading.class, entry),
+            holds_pre_image,
+        })
+    }
+
+    fn read_back_acl_checked(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+        wait: bool,
+    ) -> Result<ReadBack, EffectRefusal> {
+        check_acl_patch(target, &patch.rules)?;
+        self.check_family(target.kind, &target.project)?;
+        self.check_readback_operations(target, wait)?;
+        let writer = self.writer(entry)?;
+        let owned = match self.owned_for_write(entry, &writer, target) {
+            Ok(owned) => owned,
+            Err(EffectRefusal::Provider(_)) => match writer.read_class(target) {
+                Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),
+                _ => return Err(EffectRefusal::Unresolved),
+            },
+            Err(error) => return Err(error),
+        };
+        let current = owned
+            .acl_rules(patch.field)
+            .ok_or(EffectRefusal::Unresolved)?;
+        let is_previous = arca_incus::acl_rules_match(current, &patch.previous);
+        let is_wanted = arca_incus::acl_rules_match(current, &patch.rules);
+        if !is_previous && !is_wanted {
+            return Err(EffectRefusal::Unresolved);
+        }
+        Ok(ReadBack::Present {
+            object: target.clone(),
+            owned: true,
+            // A no-op satisfies the wanted state even though it also holds the
+            // pre-image. Live effects and restart settlement must agree on this.
+            holds_pre_image: is_previous && !is_wanted,
+        })
     }
 }
 
@@ -1461,9 +1581,9 @@ impl Provider for IncusProvider {
                     Err(IncusError::Refused(reason)) => {
                         return Err(EffectRefusal::Provider(reason));
                     }
-                    Err(_) => {
-                        // Even an empty answer or an unconfirmed write can be
-                        // settled once no operation can still change this ACL.
+                    Err(error) => {
+                        // ACL PATCH is synchronous too: an uncertain answer and the old rules can precede a late write.
+                        let uncertain = uncertain_write_answer(&error);
                         match self
                             .read_back_acl(entry, object, patch)
                             .map_err(|_| EffectRefusal::Unresolved)?
@@ -1478,6 +1598,17 @@ impl Provider for IncusProvider {
                                 holds_pre_image: true,
                                 ..
                             } => {
+                                if uncertain {
+                                    return Err(EffectRefusal::Landed(Box::new(Landed {
+                                        object: object.clone(),
+                                        inverse: Inverse::IncusRestoreAclField {
+                                            object: object.clone(),
+                                            field: *field,
+                                            rules: patch.previous.clone(),
+                                        },
+                                        why: "the ACL array patch may have landed; its original pre-image is kept".into(),
+                                    })));
+                                }
                                 return Err(EffectRefusal::Provider(
                                     "the ACL array patch did not land".into(),
                                 ));
@@ -1500,71 +1631,41 @@ impl Provider for IncusProvider {
         }
     }
 
-    /// Reads the object an unresolved intent names, with one GET. A target outside the family is refused before any request, and so
-    /// is a target whose project does not enable its kind's feature, as a write to it is: Incus would answer for the default project
-    /// instead. The object is read only once no operation Incus still runs names it (see [`IncusProvider::settle_operations`]), so a
-    /// create still running is not read as absent, nor one about to fail as present. An object that answers 404 is absent. Any other
-    /// answer that is not a read of the object is an error, so the intent stays open.
     fn read_back(
         &self,
         entry: &EntryId,
         target: &ObjectRef,
         pre_image: Option<&BTreeMap<String, Option<String>>>,
     ) -> Result<ReadBack, EffectRefusal> {
-        let place = self.served_at(entry, target)?;
-        self.check_family(place.kind, &place.project)?;
-        self.check_features(entry, place.kind, &place.project)?;
-        self.settle_operations(&place)?;
-        let reading = match self.writer(entry)?.read_class(&place) {
-            Ok(reading) => reading,
-            Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),
-            Err(error) => return Err(incus_refusal(error)),
-        };
-        let holds_pre_image =
-            pre_image.is_some_and(|pre| self.shows_pre_image(entry, &reading.config, pre));
-        Ok(ReadBack::Present {
-            object: ObjectRef {
-                uuid: reading.uuid.clone(),
-                ..target.clone()
-            },
-            owned: kernel_may_write(&reading.class, entry),
-            holds_pre_image,
-        })
+        self.read_back_checked(entry, target, pre_image, true)
     }
-
     fn read_back_acl(
         &self,
         entry: &EntryId,
         target: &ObjectRef,
         patch: &AclPatch,
     ) -> Result<ReadBack, EffectRefusal> {
-        check_acl_patch(target, &patch.rules)?;
-        self.check_family(target.kind, &target.project)?;
-        self.settle_operations(target)?;
-        let writer = self.writer(entry)?;
-        let owned = match self.owned_for_write(entry, &writer, target) {
-            Ok(owned) => owned,
-            Err(EffectRefusal::Provider(_)) => match writer.read_class(target) {
-                Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),
-                _ => return Err(EffectRefusal::Unresolved),
-            },
-            Err(error) => return Err(error),
-        };
-        let current = owned
-            .acl_rules(patch.field)
-            .ok_or(EffectRefusal::Unresolved)?;
-        let is_previous = arca_incus::acl_rules_match(current, &patch.previous);
-        let is_wanted = arca_incus::acl_rules_match(current, &patch.rules);
-        if !is_previous && !is_wanted {
-            return Err(EffectRefusal::Unresolved);
-        }
-        Ok(ReadBack::Present {
-            object: target.clone(),
-            owned: true,
-            // A no-op satisfies the wanted state even though it also holds the
-            // pre-image. Live effects and restart settlement must agree on this.
-            holds_pre_image: is_previous && !is_wanted,
-        })
+        self.read_back_acl_checked(entry, target, patch, true)
+    }
+    fn read_back_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre_image: Option<&BTreeMap<String, Option<String>>>,
+        budget: Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.runtime_probe(budget)?
+            .read_back_checked(entry, target, pre_image, false)
+    }
+    fn read_back_acl_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+        budget: Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.runtime_probe(budget)?
+            .read_back_acl_checked(entry, target, patch, false)
     }
 
     /// The reconciler's delete, through [`IncusProvider::retire`]: the tombstone, the read-back and the delete, in that order.
@@ -2167,6 +2268,19 @@ fn text_config(config: Option<&Value>) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A gateway can give up while Incus still runs a write. Keep 4xx refusals and Incus's own 500 definite;
+/// other server statuses, including 502/503/504, cannot prove that a write did not land.
+fn uncertain_write_answer(error: &IncusError) -> bool {
+    !matches!(
+        error,
+        IncusError::Refused(_)
+            | IncusError::Status {
+                code: 400..=500,
+                ..
+            }
+    )
 }
 
 /// A read failure as a fixed reason. Incus's own message is left out, since it can echo a response body.
