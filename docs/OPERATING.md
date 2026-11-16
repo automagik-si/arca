@@ -113,7 +113,7 @@ node takes a new token after `arca token reload` or a restart.
 | `arca link remove [--] <name> [--config <file>]` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call <verb> [--config <file>] [--token-file <file>]`, with `--args <json>` or `--args-file <file>`; `arca call` alone lists the verbs | one tool call against the local node | the verb's result, as JSON |
 | `arca call --peer <name> <verb> [--config <file>] --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and `--token-file` is always named: this node's own token is never sent by default | the verb's result, as JSON |
-| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id, scope and tool list |
+| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>] [--services <comma list>] [--expires <span or time>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id and scope, and the services and expiry when given |
 | `arca token revoke <id>` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | the token's hash file | the id and `revoked: true` |
 | `arca token reload [--config <file>]` | the pid file and the reload record in the state directory, and `/proc` | one line: `reloaded: the node on this config (pid <n>) read its tokens again and holds <k> token(s)`. It exits non-zero, with the reason on stderr, when no node runs on the config, when the node could not read its token directory, or when it cannot tell |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
@@ -648,6 +648,57 @@ every other token, leaves that file out, and writes one line each time it reads 
 owner-approval.hash is ignored: ..."). Its secret is refused as any unknown token is. Remove the file with `arca
 token revoke owner-approval`. An action approved in the terminal runs as `terminal-approval:<admin token id>`, which no
 token can be, since an id holds no colon.
+
+### Tokens limited to services and to a time
+
+A token may also be limited to named services, to a time, or both. Three more lines, each optional, each at most once,
+may follow the digest in any order, beside `tools=`:
+
+```
+scope=doctor
+sha256=<64 lowercase hex digits>
+services=dev,gtm,abcdefgh/web
+expires=2026-12-01T00:00:00Z
+by=<parent token id>
+```
+
+- `services=` is a comma list of 1 to 64 services, none twice: `<service>` is a service of the node's own service
+  project, and `<tenant id>/<service>` one inside that tenant.
+- `expires=` is a moment in UTC to the second, exactly in that shape. From that moment on the token authenticates nobody:
+  a call is `401`, as for an unknown token. Nothing is removed; revoke the file as any other.
+- `by=` names the token that handed this one down. It loads only while that token loads, and only when it is no wider:
+  no higher scope, and no tool, service or later expiry its parent lacks. Revoke the parent and the whole chain stops at
+  the next reload. Nothing mints with `by=` yet; a later release adds the verb that does.
+
+`arca token mint --services <comma list>` writes `services=`, and `--expires <span or time>` writes `expires=`: a span
+from now (`30m`, `12h`, `7d`, or `s`), or a moment such as `2026-12-01T00:00:00Z`, after now and within ten years. An
+admin token is never limited to services: the mint refuses it, and a hand-made one is left out at load.
+
+**What a limited token reaches.** Every verb says what it touches. A call outside the list is refused before anything
+runs, with the refusal `OutsideTokenServices`, whose words never name a service:
+
+- a verb on one service (`service_status`, `service_logs`, `service_update`, `service_secret_set` and the other
+  `service_*` verbs, the `omni_*` verbs) needs that service, with the call's `tenant` when it names one, on the list;
+- `service_connect` and `service_disconnect` need both services on the list;
+- `instance_start`, `instance_stop` and `instance_restart` need the instance of a listed service: `project` `arcak-svc`
+  and the service's name, or inside a tenant its `service` (or its instance `<service>-<tenant id>`);
+- `action_propose` is checked when it is made, against the proposed action's own arguments: once the owner approves it,
+  it runs as the owner's action, outside any token's limit. A proposal of an action no service names is refused;
+- `service_list`, `snapshot_list` and `watch_report` run, and the door cuts their answer to the list: rows of other
+  services go, and so does every link to one; a snapshot of a volume or a folder, and a project with no listed
+  instance, go too;
+- every other verb reaches the whole node (`arca_status`, `journal_list`, `plan_list`, the tenant, database, function,
+  route, storage and GitHub verbs, and the rest) and is refused. `tools/list` does not offer them to a limited token;
+- a call with `node` is refused: the limit is this node's, and a linked node does not hold it;
+- every GET route (`/metrics`, `/alerts`) is refused with `403`: its answer has no cut.
+
+**Older releases and new lines.** From this release on, a line `<key>=<value>` whose key the release does not know leaves
+only that token out: the node loads every other token, writes one line on stderr each time it reads its tokens ("token
+file <id>.hash is left out, so its token is refused: ..."), and refuses that token's secret. The key may be a limit a later
+release added, so the token is never taken without it. Any other line that does not parse still refuses the whole
+directory. **A release before this one refuses the whole token directory when it meets `services=`, `expires=` or
+`by=`**: on such a downgrade the node starts with no token at all. Before downgrading past this release, revoke every
+token minted with `--services` or `--expires` (`grep -l -E '^(services|expires|by)=' <hashDir>/*.hash` lists them).
 
 ### Modes and the umask
 

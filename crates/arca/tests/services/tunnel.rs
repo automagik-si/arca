@@ -17,6 +17,7 @@ fn op(rig: &Rig, verb: &str, args: Value) -> Result<Value, CallError> {
             token_id: "operator".into(),
             scope: Scope::Operator,
             tools: None,
+            limits: Default::default(),
         },
     )
 }
@@ -165,6 +166,7 @@ fn the_tunnel_token_is_a_reference_everywhere_arca_records_or_answers_and_only_t
             token_id: "viewer".into(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         },
     )
     .expect("journal");

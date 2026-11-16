@@ -39,6 +39,7 @@ impl IssuedTokens for Issued {
             token_id: SESSION_ID.to_string(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         })
     }
 }

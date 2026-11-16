@@ -1021,6 +1021,7 @@ impl Moves {
                 token_id: "instance-move-plan".to_string(),
                 scope: Scope::Viewer,
                 tools: None,
+                limits: Default::default(),
             },
         )?;
         let source = self.source();

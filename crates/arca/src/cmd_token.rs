@@ -1,5 +1,6 @@
 //! `token mint --scope <s> --id <id> --out <f>` with `--config <c>`, `--hash-dir <d>` or neither (the config every command
-//! finds): one scoped bearer token. The hash file goes
+//! finds): one scoped bearer token, optionally limited to named services (`--services`) and to a time (`--expires`). The
+//! hash file goes
 //! into the token directory and the secret into a file the caller names, both at mode 0400. Only the id and the scope are
 //! printed. Nothing is overwritten: an id or an output path that exists is refused.
 //!
@@ -16,8 +17,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arca_api::limits::ServiceLimit;
 use arca_api::{Scope, may_call, verb};
-use arca_mcp::mint_with_tools;
+use arca_mcp::{Limits, mint_limited};
 use serde_json::{Value, json};
 
 use crate::cmd_serve::{ReloadRecord, SERVE_PID_FILE, SERVE_RELOAD_FILE};
@@ -60,6 +62,20 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
         Some(text) => Some(parse_tools(text, scope)?),
         None => None,
     };
+    let limits = Limits {
+        services: flags.value("services").map(parse_services).transpose()?,
+        expires: flags
+            .value("expires")
+            .map(|text| parse_expires(text, arca_mcp::auth::unix_now()))
+            .transpose()?,
+        by: None,
+    };
+    if scope == Scope::Admin && limits.services.is_some() {
+        return Err(Failure::Usage(
+            "--services limits a token to named services, and the admin token is never limited: choose a lower scope"
+                .to_string(),
+        ));
+    }
 
     // One admin token per node. A second id is refused naming the first, unless `--replace` retires it.
     let mut retire = Vec::new();
@@ -80,7 +96,7 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
         ));
     }
 
-    let (secret, hash_text) = mint_with_tools(scope, tools.as_deref());
+    let (secret, hash_text) = mint_limited(scope, tools.as_deref(), &limits);
     write_new(&hash_path, hash_text.as_bytes())
         .map_err(|e| Failure::Runtime(format!("cannot write the hash file: {e}")))?;
     if let Err(e) = write_new(&out, format!("{secret}\n").as_bytes()) {
@@ -96,8 +112,15 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
             Failure::Runtime(format!("cannot retire the old admin token {old}: {e}"))
         })?;
     }
+    let mut said = json!({ "id": id, "scope": scope.as_str() });
+    if let Some(services) = &limits.services {
+        said["services"] = json!(services.as_line());
+    }
+    if let Some(expires) = limits.expires {
+        said["expires"] = json!(arca_mcp::auth::format_rfc3339(expires));
+    }
     if retire.is_empty() {
-        Ok(Some(json!({ "id": id, "scope": scope.as_str() })))
+        Ok(Some(said))
     } else {
         // The old admin token must stop at once, so the running node reads its tokens now, as a revoke does.
         let reload_signalled = signal_node(&node);
@@ -461,6 +484,52 @@ fn serve_args_match_config(args: &[Vec<u8>], cwd: Option<&Path>, config: &Path) 
     false
 }
 
+/// `--services`: a comma list of services, each `<service>` (the node's own) or `<tenant id>/<service>`.
+fn parse_services(text: &str) -> Result<ServiceLimit, Failure> {
+    ServiceLimit::parse(text).ok_or_else(|| {
+        Failure::Usage(format!(
+            "--services is a comma list of 1 to {} services, none twice, each a service name (a-z, 0-9 and inner -, starting with a letter, at most 40) or a tenant id, a slash and a service name",
+            arca_api::limits::MAX_SERVICES
+        ))
+    })
+}
+
+/// The longest a token may be minted for: ten years.
+const MAX_EXPIRES_SECS: u64 = 10 * 365 * 86_400;
+
+/// `--expires`: a span from `now` (`30m`, `12h`, `7d`; also `s`), or a moment in RFC 3339 UTC to the second
+/// (`2026-12-01T00:00:00Z`). It must be after `now`, and within ten years of it. In seconds since the Unix epoch.
+fn parse_expires(text: &str, now: u64) -> Result<u64, Failure> {
+    let usage = || {
+        Failure::Usage(
+            "--expires is a span such as 30m, 12h or 7d, or a moment in UTC such as 2026-12-01T00:00:00Z, after now and within ten years"
+                .to_string(),
+        )
+    };
+    let at = match arca_mcp::auth::parse_rfc3339(text) {
+        Some(at) => at,
+        None => {
+            let unit = text.chars().last().ok_or_else(usage)?;
+            let count: u64 = text[..text.len() - unit.len_utf8()]
+                .parse()
+                .map_err(|_| usage())?;
+            let per = match unit {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86_400,
+                _ => return Err(usage()),
+            };
+            now.checked_add(count.checked_mul(per).ok_or_else(usage)?)
+                .ok_or_else(usage)?
+        }
+    };
+    if at <= now || at - now > MAX_EXPIRES_SECS {
+        return Err(usage());
+    }
+    Ok(at)
+}
+
 fn parse_tools(text: &str, scope: Scope) -> Result<Vec<String>, Failure> {
     let mut tools = Vec::new();
     for name in text.split(',') {
@@ -615,6 +684,63 @@ mod tests {
         assert!(parse_tools("token_list", Scope::Viewer).is_err());
         assert!(parse_tools("node_metrics,node_metrics", Scope::Viewer).is_err());
         assert!(parse_tools("", Scope::Viewer).is_err());
+    }
+
+    #[test]
+    fn the_projects_a_limit_reads_are_the_kernels_own() {
+        assert_eq!(arca_api::limits::SERVICE_PROJECT, arca_netproject::PROJECT);
+        assert_eq!(
+            arca_api::limits::TENANT_PROJECT_PREFIXES,
+            [
+                arca_kernel::ownership::TENANT_PROJECT_PREFIX,
+                arca_kernel::ownership::SCRATCH_TENANT_PROJECT_PREFIX
+            ]
+        );
+    }
+
+    #[test]
+    fn services_are_a_list_of_service_names_or_tenant_services() {
+        assert_eq!(
+            parse_services("gtm,dev,abcdefgh/web")
+                .expect("a list")
+                .as_line(),
+            "dev,gtm,abcdefgh/web"
+        );
+        for bad in ["", "dev,dev", "Dev", "dev,", "x/web", "dev web"] {
+            assert!(parse_services(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn expires_is_a_span_or_a_utc_moment_after_now_and_within_ten_years() {
+        let now = 1_763_200_000;
+        assert_eq!(parse_expires("30s", now).ok(), Some(now + 30));
+        assert_eq!(parse_expires("30m", now).ok(), Some(now + 1800));
+        assert_eq!(parse_expires("12h", now).ok(), Some(now + 43_200));
+        assert_eq!(parse_expires("7d", now).ok(), Some(now + 604_800));
+        assert_eq!(
+            parse_expires("3650d", now).ok(),
+            Some(now + MAX_EXPIRES_SECS)
+        );
+        let moment = arca_mcp::auth::format_rfc3339(now + 86_400);
+        assert_eq!(parse_expires(&moment, now).ok(), Some(now + 86_400));
+        for bad in [
+            "",
+            "0m",
+            "3651d",
+            "7w",
+            "d",
+            "-5m",
+            "1.5h",
+            "12 h",
+            "2020-01-01T00:00:00Z",
+            "2026-12-01T00:00:00+00:00",
+            "18446744073709551615d",
+        ] {
+            assert!(parse_expires(bad, now).is_err(), "{bad:?}");
+        }
+        let past = arca_mcp::auth::format_rfc3339(now);
+        assert!(parse_expires(&past, now).is_err(), "now is not after now");
     }
 }
 

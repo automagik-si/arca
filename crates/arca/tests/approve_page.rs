@@ -3855,6 +3855,7 @@ fn canvas_cookie_cannot_approve_or_reach_mcp() {
         token_id: "test".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let typed = submit
         .call(json!({ "plan": plan }), &caller)
@@ -4072,6 +4073,7 @@ fn the_page_is_served_an_enroll_request_with_its_code_and_service_and_approves_i
         token_id: "doctor".to_string(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     let created = verbs["owner_approval_request"]
         .call(
@@ -4746,6 +4748,7 @@ fn g7_a_kind_arca_request_is_approved_by_one_tap_on_the_page_and_kind_upgrade_is
         token_id: "doctor".to_string(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     match verbs["owner_approval_request"].call(
         json!({ "kind": "upgrade", "droid": "phone1", "step": "eyes" }),
@@ -4903,6 +4906,7 @@ fn g7_the_approve_route_takes_what_a_delivery_would_and_refuses_another_target_a
         token_id: token.to_string(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     let created = verbs["owner_approval_request"]
         .call(

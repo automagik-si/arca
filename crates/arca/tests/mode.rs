@@ -156,6 +156,7 @@ fn the_status_exposes_the_chosen_mode_and_reason() {
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let row = status.call(json!({}), &caller).expect("status answers");
     assert_eq!(row["metricsSource"], json!("remote"));

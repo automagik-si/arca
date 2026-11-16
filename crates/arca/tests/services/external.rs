@@ -234,6 +234,7 @@ fn an_add_is_held_to_the_service_name_rule_the_kind_the_address_and_a_doctor_tok
         token_id: "viewer".into(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     for (verb, args) in [
         (
@@ -441,6 +442,7 @@ fn a_node_started_again_reads_the_record_back_through_its_own_handlers() {
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     let listed = again["service_list"]
         .call(json!({}), &caller)

@@ -500,6 +500,7 @@ async fn the_verbs_start_a_connection_and_show_its_steps_and_the_log() {
         token_id: "token-ops".to_string(),
         scope: arca_api::verbs::Scope::Operator,
         tools: None,
+        limits: Default::default(),
     };
     let call = |verb: &'static str, args: Value| {
         let handler = Arc::clone(&handlers[verb]);
