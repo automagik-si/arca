@@ -4,6 +4,9 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+An owner-approved `instance_start` card now starts an instance inside a tenant even when the proposing token's tool
+allowlist omits `instance_start`. Direct tenant starts still require the verb in the token's tool allowlist.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
