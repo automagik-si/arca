@@ -5323,3 +5323,39 @@ fn plan_renew_with_an_unresolved_intent_renews_nothing_and_says_why() {
         "the lapsed plan is still left out"
     );
 }
+
+#[test]
+fn service_labels_merge_remove_read_back_and_never_enter_the_journal() {
+    let rig = Rig::new();
+    rig.call("service_create", json!({"name":"nats","template":"nats"})).unwrap();
+    let before = rig.call("service_status", json!({"name":"nats"})).unwrap();
+    assert_eq!(before["labels"], json!({}));
+    let journal = journal_len(&rig);
+    let set = rig.call("service_labels_set", json!({"name":"nats","labels":{"hold":"true","empty":"","remove":"old"}})).unwrap();
+    assert_eq!(set["code"], "confirmed");
+    assert_eq!(set["labels"], json!({"hold":"true","empty":"","remove":"old"}));
+    let set = rig.call("service_labels_set", json!({"name":"nats","labels":{"remove":null}})).unwrap();
+    assert_eq!(set["labels"], json!({"hold":"true","empty":""}));
+    assert_eq!(journal_len(&rig), journal);
+    let mut after = rig.call("service_status", json!({"name":"nats"})).unwrap();
+    assert_eq!(after["labels"], set["labels"]);
+    after["labels"] = json!({});
+    assert_eq!(before, after, "all previous fields stay unchanged");
+    assert_eq!(rig.call("service_list", json!({})).unwrap()["services"][0]["labels"], set["labels"]);
+    rig.kernel.lock().unwrap().tick(NOW).unwrap();
+    assert_eq!(rig.call("service_status", json!({"name":"nats"})).unwrap()["labels"], set["labels"]);
+}
+
+#[test]
+fn service_labels_uncertain_patch_reads_back_without_claiming_not_applied() {
+    for late in [false, true] {
+        let rig = Rig::new();
+        rig.call("service_create", json!({"name":"nats","template":"nats"})).unwrap();
+        if late { rig.fake.patch_after_next_get("/1.0/instances/nats"); }
+        else { rig.fake.drop_patch_answer("/1.0/instances/nats", true); }
+        let set = rig.call("service_labels_set", json!({"name":"nats","labels":{"a":"b"}})).unwrap();
+        assert_eq!(set["code"], "unconfirmed");
+        assert_eq!(set["labels"], if late { json!({}) } else { json!({"a":"b"}) });
+        assert_eq!(rig.call("service_status", json!({"name":"nats"})).unwrap()["labels"], json!({"a":"b"}));
+    }
+}

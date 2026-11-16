@@ -2309,3 +2309,23 @@ fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
         }
     }
 }
+
+#[test]
+fn service_labels_are_a_doctor_write_with_closed_contracts() {
+    let v = verb("service_labels_set").expect("labels verb");
+    assert_eq!(v.min_scope, Scope::Doctor);
+    assert!(v.writes);
+    assert!(!v.destructive);
+    let params = (v.params)();
+    assert_eq!(params["additionalProperties"], false);
+    assert!(conforms(&params, &json!({"name":"box", "labels":{"empty":"", "gone":null}})).is_ok());
+    assert!(conforms(&params, &json!({"name":"box", "labels":{"bad":true}})).is_err());
+    let result = (v.result)();
+    assert_eq!(result["additionalProperties"], false);
+    for name in ["service_status", "service_list"] {
+        let schema = (verb(name).unwrap().result)();
+        let row = if name == "service_list" { &schema["properties"]["services"]["items"] } else { &schema };
+        assert!(row["required"].as_array().unwrap().contains(&json!("labels")));
+        assert!(conforms(&row["properties"]["labels"], &json!({"hold":"true"})).is_ok());
+    }
+}
