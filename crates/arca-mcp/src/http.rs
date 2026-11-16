@@ -501,12 +501,14 @@ async fn serve_post(
         return server.unauthorized(&headers);
     };
     // The route is its verb's action over POST: a token the verb does not admit is refused here as a `tools/call` of the
-    // verb is, before the handler reads the path.
-    let admitted = server
-        .verbs
-        .iter()
-        .find(|verb| verb.name == tool)
-        .is_some_and(|verb| caller.admits(verb));
+    // verb is, before the handler reads the path. A route names no service, so a token limited to named services is
+    // refused every route.
+    let admitted = caller.limits.services.is_none()
+        && server
+            .verbs
+            .iter()
+            .find(|verb| verb.name == tool)
+            .is_some_and(|verb| caller.admits(verb));
     if !admitted {
         return server.forbidden(&caller, tool, false);
     }

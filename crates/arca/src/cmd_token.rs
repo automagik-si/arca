@@ -97,6 +97,7 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
 
     let (secret, hash_text) = mint_limited(scope, tools.as_deref(), &limits);
+    fits(&hash_text)?;
     write_new(&hash_path, hash_text.as_bytes())
         .map_err(|e| Failure::Runtime(format!("cannot write the hash file: {e}")))?;
     if let Err(e) = write_new(&out, format!("{secret}\n").as_bytes()) {
@@ -494,6 +495,18 @@ fn parse_services(text: &str) -> Result<ServiceLimit, Failure> {
     })
 }
 
+/// A hash file the store reads: no longer than [`arca_mcp::auth::MAX_FILE_BYTES`]. A longer one would refuse the whole token
+/// directory at the next start or reload, so the mint refuses it before it writes.
+fn fits(hash_text: &str) -> Result<(), Failure> {
+    if hash_text.len() as u64 > arca_mcp::auth::MAX_FILE_BYTES {
+        return Err(Failure::Usage(format!(
+            "the token's hash file would pass {} bytes, the most a node reads: name fewer tools or services",
+            arca_mcp::auth::MAX_FILE_BYTES
+        )));
+    }
+    Ok(())
+}
+
 /// The longest a token may be minted for: ten years.
 const MAX_EXPIRES_SECS: u64 = 10 * 365 * 86_400;
 
@@ -673,6 +686,29 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hash_file_the_store_would_refuse_is_never_minted() {
+        let services: Vec<String> = (0..64)
+            .map(|n| format!("abcdefgh/{}{n:02}", "s".repeat(38)))
+            .collect();
+        let limits = Limits {
+            services: ServiceLimit::parse(&services.join(",")),
+            expires: None,
+            by: None,
+        };
+        assert!(limits.services.is_some());
+        let tools: Vec<String> = arca_api::verbs()
+            .iter()
+            .filter(|v| may_call(Scope::Operator, v))
+            .map(|v| v.name.to_string())
+            .collect();
+        let (_, long) = mint_limited(Scope::Operator, Some(&tools), &limits);
+        assert!(long.len() as u64 > arca_mcp::auth::MAX_FILE_BYTES);
+        assert!(matches!(fits(&long), Err(Failure::Usage(_))));
+        let (_, short) = mint_limited(Scope::Operator, Some(&tools[..3]), &Limits::default());
+        assert!(fits(&short).is_ok());
+    }
 
     #[test]
     fn tools_must_name_known_verbs_the_scope_may_call() {

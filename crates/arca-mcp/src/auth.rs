@@ -40,7 +40,7 @@ const PREFIX: &str = "arca_";
 const BODY_LEN: usize = 43;
 const SECRET_BYTES: usize = 32;
 /// The largest hash file the server reads. A well-formed one is about 100 bytes.
-const MAX_FILE_BYTES: u64 = 4096;
+pub const MAX_FILE_BYTES: u64 = 4096;
 /// The longest id a hash file may name.
 const MAX_ID_LEN: usize = 64;
 
