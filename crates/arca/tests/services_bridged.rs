@@ -554,6 +554,7 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
     let mut status = rig
         .call("service_status", json!({"name":"ws1"}))
         .expect("status");
+    // Compare additive observations with each other, then every legacy field with the create answer.
     assert_eq!(listed["services"][0]["labels"], json!({}));
     for key in [
         "id",
