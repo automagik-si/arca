@@ -300,9 +300,6 @@ fn a_failed_binding_append_poisons_the_writer_and_reopen_decides_what_landed() {
         fn append(&mut self, record: &EffectRecord) -> Result<(), arca_kernel::KernelError> {
             self.inner.append(record)
         }
-        fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), arca_kernel::KernelError> {
-            self.inner.load()
-        }
         fn history(
             &self,
         ) -> Result<(Vec<JournalRecord>, Option<String>), arca_kernel::KernelError> {
@@ -418,12 +415,13 @@ fn seed_other(path: &std::path::Path, slot: &str, source_volume: bool) {
     if slot == "inverse" {
         outcome.uuid = None;
     }
+    let config = BTreeMap::from([("user.note".into(), Some("before".into()))]);
     let inverse = if slot == "create" {
         Inverse::IncusDelete { object }
     } else if slot == "inverse" {
         Inverse::IncusRestoreConfig {
             object,
-            config: BTreeMap::new(),
+            config: config.clone(),
         }
     } else {
         Inverse::Emission
@@ -431,10 +429,14 @@ fn seed_other(path: &std::path::Path, slot: &str, source_volume: bool) {
     let id = journal
         .intend(
             &EntryId("other-entry".into()),
-            EffectClass::B,
+            if source_volume {
+                EffectClass::A
+            } else {
+                EffectClass::B
+            },
             Digest::of(b"other"),
             target,
-            None,
+            source_volume.then_some(config),
             12,
         )
         .unwrap();

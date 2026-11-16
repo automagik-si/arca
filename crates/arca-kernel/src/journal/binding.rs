@@ -189,18 +189,26 @@ pub(super) fn validate(
             }
         }
     }
-    // A destination already carried by another entry cannot acquire a second lineage.
+    // Another entry must neither own the destination nor keep undo on the source volume.
     if latest
         .values()
         .filter(|r| r.entry != event.entry && live(r))
         .any(|r| {
-            inverse_object(&r.inverse).is_some_and(|object| {
-                same_place(object, &to.instance)
-                    || to
-                        .data_volume
-                        .as_ref()
-                        .is_some_and(|volume| same_place(object, volume))
-            })
+            std::iter::once(&r.target)
+                .chain(r.object.iter())
+                .chain(inverse_object(&r.inverse))
+                .any(|object| {
+                    same_place(object, &to.instance)
+                        || (object.kind == IncusKind::Instance && object.uuid == to.instance.uuid)
+                        || to
+                            .data_volume
+                            .as_ref()
+                            .is_some_and(|volume| same_place(object, volume))
+                        || from
+                            .data_volume
+                            .as_ref()
+                            .is_some_and(|volume| same_place(object, volume))
+                })
         })
     {
         return Err(refused());

@@ -217,23 +217,16 @@ pub trait JournalStore {
     fn append(&mut self, record: &EffectRecord) -> Result<(), KernelError>;
     /// Every effect state in append order, using effective binding addresses,
     /// with a note when the last line was torn and dropped. Use `history` for raw lines.
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError>;
-    /// Raw lines in append order, including binding events. Legacy stores have
-    /// effects only. A binding store must implement both history and its append.
-    fn history(&self) -> Result<(Vec<JournalRecord>, Option<String>), KernelError> {
-        self.load().map(|(records, note)| {
-            (
-                records.into_iter().map(JournalRecord::Effect).collect(),
-                note,
-            )
-        })
+    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
+        let (records, note) = self.history()?;
+        Ok((effect_history(records)?, note))
     }
-    /// Appends and syncs one complete binding line.
-    fn append_binding(&mut self, _event: &BindingEvent) -> Result<(), KernelError> {
-        Err(KernelError::Journal(
-            "this store cannot record a binding".into(),
-        ))
-    }
+    /// Raw lines in append order, including binding events. Wrappers must
+    /// forward the raw history so reopen preserves the binding chain.
+    fn history(&self) -> Result<(Vec<JournalRecord>, Option<String>), KernelError>;
+    /// Appends and syncs one complete binding line. Like `append`, an error
+    /// means durability is uncertain and the journal must be reopened.
+    fn append_binding(&mut self, event: &BindingEvent) -> Result<(), KernelError>;
 }
 
 /// The write side the reconciler and [`crate::plugin::Ctx`] use. A plan's effect is intended, then applied, then recorded.
@@ -383,11 +376,6 @@ impl JournalStore for FileJournal {
         })
     }
 
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
-        let (records, note) = self.history()?;
-        Ok((effect_history(records)?, note))
-    }
-
     fn history(&self) -> Result<(Vec<JournalRecord>, Option<String>), KernelError> {
         let bytes = read_all(&self.file).map_err(|e| io_error(&self.shown(), &e))?;
         let decoded = decode(&bytes)?;
@@ -427,10 +415,6 @@ impl JournalStore for MemJournal {
     fn append(&mut self, record: &EffectRecord) -> Result<(), KernelError> {
         self.records.push(JournalRecord::Effect(record.clone()));
         Ok(())
-    }
-
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
-        Ok((effect_history(self.records.clone())?, None))
     }
 
     fn history(&self) -> Result<(Vec<JournalRecord>, Option<String>), KernelError> {

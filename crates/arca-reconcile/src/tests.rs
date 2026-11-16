@@ -515,8 +515,18 @@ impl JournalStore for Counting {
         self.inner.append(record)
     }
 
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
-        self.inner.load()
+    fn history(
+        &self,
+    ) -> Result<(Vec<arca_kernel::journal::JournalRecord>, Option<String>), KernelError> {
+        self.inner.history()
+    }
+
+    fn append_binding(
+        &mut self,
+        event: &arca_kernel::journal::BindingEvent,
+    ) -> Result<(), KernelError> {
+        *self.appended.lock().expect("the count is writable") += 1;
+        self.inner.append_binding(event)
     }
 }
 

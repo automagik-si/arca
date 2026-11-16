@@ -187,6 +187,7 @@ fn a_binding_replays_before_resolution_and_removal_undoes_and_deletes_only_the_n
     backup["name"] = json!("p-box-backup");
     backup["project"] = json!(PROJECT);
     backup["devices"] = json!({"root":{"type":"disk", "pool":"pool1", "path":"/"},"data":{"type":"disk", "pool":"pool1", "source":"p-data-q", "path":"/data"}});
+    backup["devices"]["root"] = json!({"type":"disk", "path":"/", "pool":"pool1"});
     fake.add_instance(backup.clone());
     fake.set_instance_config(PROJECT, "p-box-backup", "volatile.uuid", &old);
     let backup_before = get(&fake, &instance_path("p-box-backup")).unwrap();
