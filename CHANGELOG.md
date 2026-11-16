@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`storage_list` never offers mapped RBD, NBD, loop, device-mapper, ZFS volume, DRBD or zram devices as
+whole-disk snapshot storage: kernel device origins are checked, and unreadable or unrecognised origins are not
+free. A mounted mapped image now has the `system` role with no folder offer, where it could previously be `in use`
+and offered as a folder target. `storage_add` refuses these devices before an exclusive open or any write, including
+when the device becomes a mapped image after approval; SATA, NVMe, USB and a VM's own virtio disks keep their offers.
+
 ## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it

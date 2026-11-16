@@ -13,8 +13,9 @@ use arca::action_proposal::ActionKind;
 use arca::handlers::{ActionExecutor, ActionSlot, plan_handlers_full};
 use arca::kernel::Kernel;
 use arca::storage::{
-    DeviceLinks, ERASE_SENTENCE, ExclusiveOpen, FixedBlockDevices, SYSTEM_LISTS_SENTENCE,
-    SnapshotListHandler, Storage, StorageListHandler, SystemLists, snapshot_name,
+    DeviceLinks, DiskOrigin, ERASE_SENTENCE, ExclusiveOpen, FixedBlockDevices,
+    SYSTEM_LISTS_SENTENCE, SnapshotListHandler, Storage, StorageListHandler, SystemLists,
+    snapshot_name,
 };
 use arca_incus::fake_storage::FakeStorageIncus;
 use arca_incus::snapshot::{
@@ -368,6 +369,142 @@ fn a_mapped_rbd_is_system_and_refused_before_open_or_write() {
         "the device was never opened"
     );
     assert!(rig.incus.writes().is_empty(), "nothing was written");
+}
+
+#[test]
+fn a_mapped_nbd_is_never_offered_or_opened() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-mapped-nbd", &key);
+    rig.devices.set(Ok(json!({ "blockdevices": [
+        disk("nbd0", "Fake network image", "", false, GB, json!({}))
+    ]})));
+    let list = rig.storage_list();
+    let mapped = disk_view(&list, "nbd0");
+    assert_eq!(mapped["role"], json!("system"));
+    assert_eq!(mapped["offer"], Value::Null);
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "backup", "device": "nbd0" }))),
+        "SystemDisk"
+    );
+    assert!(rig.devices.opened().is_empty());
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn mapped_device_families_and_mapper_paths_are_never_offered() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-mapped-families", &key);
+    for name in ["loop0", "dm-0", "zd0", "drbd0", "zram0", "fake-volume"] {
+        let path = if name == "fake-volume" {
+            "/dev/mapper/fake-volume".to_string()
+        } else {
+            format!("/dev/{name}")
+        };
+        rig.devices.set(Ok(json!({ "blockdevices": [
+            disk(name, "Fake mapped image", "", false, GB, json!({ "path": path }))
+        ]})));
+        let list = rig.storage_list();
+        if name == "zram0" {
+            assert!(
+                list["disks"].as_array().expect("disks").is_empty(),
+                "zram stays omitted"
+            );
+            continue;
+        }
+        let mapped = disk_view(&list, name);
+        assert_eq!(mapped["role"], json!("system"), "{name}");
+        assert_eq!(mapped["offer"], Value::Null, "{name}");
+        assert_eq!(
+            refused_code(rig.propose("storage_add", json!({ "name": "backup", "device": path }))),
+            "SystemDisk",
+            "{name}"
+        );
+    }
+    assert!(rig.devices.opened().is_empty());
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn a_mounted_rbd_is_system_and_has_no_folder_offer() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-mounted-rbd", &key);
+    rig.devices.set(Ok(json!({ "blockdevices": [
+        disk("rbd0", "Fake mapped image", "", false, GB, json!({
+            "fstype": "ext4", "uuid": "fake-image-uuid", "mountpoints": ["/mnt/fake-image"]
+        }))
+    ]})));
+    let list = rig.storage_list();
+    let mapped = disk_view(&list, "rbd0");
+    assert_eq!(mapped["role"], json!("system"));
+    assert_eq!(mapped["offer"], Value::Null);
+    assert_eq!(mapped["folders"], json!([]));
+    assert_eq!(
+        refused_code(rig.propose(
+            "storage_add",
+            json!({ "name": "backup", "path": "/mnt/fake-image" })
+        )),
+        "SystemDisk"
+    );
+    assert!(rig.devices.opened().is_empty());
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn free_sata_nvme_usb_and_virtio_disks_keep_their_whole_disk_offer() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-machine-disks", &key);
+    rig.devices.set(Ok(json!({ "blockdevices": [
+        disk("sdb", "Fake SATA", "sata", false, GB, json!({})),
+        disk("nvme1n1", "Fake NVMe", "nvme", false, GB, json!({})),
+        disk("sdc", "Fake USB", "usb", true, GB, json!({})),
+        disk("vda", "Fake virtio", "", false, GB, json!({})),
+    ]})));
+    let list = rig.storage_list();
+    for name in ["sdb", "nvme1n1", "sdc", "vda"] {
+        let real = disk_view(&list, name);
+        assert_eq!(real["role"], json!("free"), "{name}");
+        assert_eq!(real["offer"], json!("whole disk"), "{name}");
+        rig.propose("storage_add", json!({ "name": "backup", "device": name }))
+            .expect("still offered");
+    }
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn kernel_origin_overrules_a_disk_name_and_missing_facts_fail_closed() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-kernel-origin", &key);
+    for origin in [DiskOrigin::Mapped, DiskOrigin::Unknown] {
+        // No identifying name prefix: kernel evidence must still decide the role.
+        rig.devices.set_disk_origin("sdb", origin);
+        let list = rig.storage_list();
+        assert_eq!(disk_view(&list, "sdb")["role"], json!("system"));
+        assert_eq!(disk_view(&list, "sdb")["offer"], Value::Null);
+        assert_eq!(
+            refused_code(rig.propose("storage_add", json!({ "name": "backup", "device": "sdb" }))),
+            "SystemDisk"
+        );
+    }
+    assert!(rig.devices.opened().is_empty());
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn a_machine_disk_that_becomes_a_mapped_image_after_proposal_is_refused_before_open() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-origin-changed", &key);
+    let proposed = rig
+        .propose("storage_add", json!({ "name": "backup", "device": "sdb" }))
+        .expect("a free disk");
+    let opened = rig.devices.opened();
+    // Keep every lsblk identity fact unchanged; only the fresh kernel evidence changes.
+    rig.devices.set_disk_origin("sdb", DiskOrigin::Mapped);
+    assert_eq!(
+        refused_code(rig.approve_and_run(&key, &proposed)),
+        "SystemDisk"
+    );
+    assert_eq!(rig.devices.opened(), opened, "no open at run");
+    assert!(rig.incus.writes().is_empty(), "nothing was wiped");
 }
 
 #[test]

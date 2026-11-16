@@ -5,11 +5,11 @@
 //!
 //! - **system**: it holds `/`, `/boot` or swap, it is a RAID, LVM, LUKS or ZFS member (mounted or not), something holds it
 //!   (`/sys/class/block/*/holders`), it is a member of a multi-device file system that holds `/` or is mounted, it is given
-//!   to an app, or it holds an Incus pool. It is never offered.
+//!   to an app, it holds an Incus pool, or it is a mapped image rather than a disk of this machine. It is never offered.
 //! - **snapshots**: it holds Arca snapshots. It is never offered, so it is never erased.
 //! - **in use**: it is mounted somewhere else. It is offered only as a folder target: a `dir` pool in a folder on it.
-//! - **free**: nothing on it is mounted or a member of anything. It is offered as a whole-disk target, which Incus erases and
-//!   formats as btrfs.
+//! - **free**: the kernel identifies it as a disk of this machine, and nothing on it is mounted or a member of anything.
+//!   It is offered as a whole-disk target, which Incus erases and formats as btrfs.
 //!
 //! `snapshot_create` copies an app, a data volume, or a host folder such as `/home` (a folder snapshot, see
 //! [`arca_incus::folder`]: Incus copies it through a short-lived read-only helper container; this process never reads or
@@ -87,6 +87,12 @@ pub trait BlockDevices: Send + Sync {
         DeviceLinks::try_from_sysfs(Path::new("/sys"))
     }
 
+    /// Whether the kernel identifies this as a disk of this machine, rather than a mapped image.
+    /// Missing or unrecognised kernel facts fail closed.
+    fn disk_origin(&self, name: &str) -> DiskOrigin {
+        DiskOrigin::from_sysfs(Path::new("/sys"), name)
+    }
+
     /// Opens the block device at `path` read-only and exclusively, and closes it again.
     fn open_exclusive(&self, path: &str) -> ExclusiveOpen {
         open_exclusive(path)
@@ -95,6 +101,38 @@ pub trait BlockDevices: Send + Sync {
     /// The system's own lists of what uses a device, read when the exclusive open is not allowed.
     fn system_lists(&self) -> Result<SystemLists, String> {
         SystemLists::read(Path::new("/proc"), Path::new("/sys"))
+    }
+}
+
+/// Kernel evidence that distinguishes a machine's disk (including a VM's own virtio disk) from a mapped image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskOrigin {
+    Machine,
+    Mapped,
+    Unknown,
+}
+
+impl DiskOrigin {
+    fn from_sysfs(sys: &Path, name: &str) -> Self {
+        let Ok(sys) = std::fs::canonicalize(sys) else {
+            return Self::Unknown;
+        };
+        let Ok(block) = std::fs::canonicalize(sys.join("class/block").join(name)) else {
+            return Self::Unknown;
+        };
+        // Software block devices live here even when lsblk calls them TYPE=disk.
+        if block.starts_with(sys.join("devices/virtual")) {
+            return Self::Mapped;
+        }
+        let Ok(subsystem) = std::fs::canonicalize(block.join("device/subsystem")) else {
+            return Self::Unknown;
+        };
+        match subsystem.file_name().and_then(|name| name.to_str()) {
+            // SATA/SAS/USB disks use SCSI; virtio, Xen and CCW include a VM's own disks.
+            Some("scsi" | "nvme" | "virtio" | "mmc" | "xen" | "ccw") => Self::Machine,
+            Some("rbd") => Self::Mapped,
+            _ => Self::Unknown,
+        }
     }
 }
 
@@ -392,7 +430,7 @@ impl BlockDevices for Lsblk {
 }
 
 /// A fixed `lsblk` answer, device links and exclusive-open answers, for tests. Every device opens as free unless a test
-/// says otherwise.
+/// says otherwise. Disk origins default to machine disks, with per-device overrides for kernel facts.
 pub struct FixedBlockDevices {
     lsblk: Mutex<Result<Value, String>>,
     links: Mutex<DeviceLinks>,
@@ -400,6 +438,7 @@ pub struct FixedBlockDevices {
     opened: Mutex<Vec<String>>,
     lists: Mutex<Result<SystemLists, String>>,
     links_error: Mutex<Option<String>>,
+    origins: Mutex<std::collections::BTreeMap<String, DiskOrigin>>,
 }
 
 fn held<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -416,7 +455,13 @@ impl FixedBlockDevices {
             opened: Mutex::new(Vec::new()),
             lists: Mutex::new(Ok(SystemLists::default())),
             links_error: Mutex::new(None),
+            origins: Mutex::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// The kernel's device origin from now on, independent of the lsblk identity.
+    pub fn set_disk_origin(&self, name: &str, origin: DiskOrigin) {
+        held(&self.origins).insert(name.to_string(), origin);
     }
 
     /// Makes the checked read of the device links fail from now on.
@@ -455,6 +500,13 @@ impl BlockDevices for FixedBlockDevices {
 
     fn links(&self) -> DeviceLinks {
         held(&self.links).clone()
+    }
+
+    fn disk_origin(&self, name: &str) -> DiskOrigin {
+        held(&self.origins)
+            .get(name)
+            .copied()
+            .unwrap_or(DiskOrigin::Machine)
     }
 
     fn open_exclusive(&self, path: &str) -> ExclusiveOpen {
@@ -567,7 +619,7 @@ fn parse_device(row: &Value) -> Option<BlockDevice> {
 }
 
 /// The whole disks of an `lsblk --json --tree` answer. Loop, optical, RAM and zram devices are not disks Arca offers and are
-/// left out.
+/// left out. Mapped devices reported as disks remain visible with the system role.
 pub fn parse_lsblk(value: &Value) -> Result<Vec<BlockDevice>, String> {
     let rows = value
         .get("blockdevices")
@@ -739,6 +791,8 @@ fn resolved_device(source: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct HostFacts {
     pub links: DeviceLinks,
+    /// The kernel origin of each surveyed disk. A live survey reads every origin again; lsblk-only classifiers omit it.
+    pub disk_origins: std::collections::BTreeMap<String, DiskOrigin>,
     /// Each host device passed through to an instance (a `unix-block` device, or a `disk` device whose source is under
     /// `/dev/`), with the app it is given to as `<project>/<instance>`.
     pub passthrough: Vec<(String, String)>,
@@ -924,7 +978,11 @@ pub fn classify_with(
         .iter()
         .zip(pool_disks)
         .map(|(disk, pool)| {
-            let (role, reason) = role_of(disk, pool, &shared, &facts.links.holders, &passthrough);
+            let (role, reason) =
+                match disk_origin_refusal(disk, facts.disk_origins.get(&disk.name).copied()) {
+                    Some(reason) => (DiskRole::System, reason.to_string()),
+                    None => role_of(disk, pool, &shared, &facts.links.holders, &passthrough),
+                };
             DiskView {
                 disk: disk.clone(),
                 role,
@@ -932,6 +990,23 @@ pub fn classify_with(
             }
         })
         .collect()
+}
+
+/// Prefixes and mapper paths are a floor even if other facts claim this is a machine disk.
+fn disk_origin_refusal(disk: &BlockDevice, origin: Option<DiskOrigin>) -> Option<&'static str> {
+    if ["rbd", "nbd", "loop", "dm-", "zd", "drbd", "zram"]
+        .iter()
+        .any(|prefix| disk.name.starts_with(prefix))
+        || disk.path.starts_with("/dev/mapper/")
+        || disk.name.starts_with("mapper/")
+        || origin == Some(DiskOrigin::Mapped)
+    {
+        Some("is a mapped image, not a disk of this machine; it is never offered")
+    } else if origin == Some(DiskOrigin::Unknown) {
+        Some("cannot be identified by the kernel as a disk of this machine; it is never offered")
+    } else {
+        None
+    }
 }
 
 fn role_of(
@@ -1360,6 +1435,10 @@ impl Storage {
             parse_lsblk(&lsblk).map_err(|why| StorageRefusal::new("StorageUnavailable", why))?;
         let facts = HostFacts {
             links: self.devices.links(),
+            disk_origins: disks
+                .iter()
+                .map(|disk| (disk.name.clone(), self.devices.disk_origin(&disk.name)))
+                .collect(),
             passthrough: self.passthrough()?,
         };
         Ok(Survey {
@@ -3220,7 +3299,11 @@ fn listed_unused(storage: &Storage, view: &DiskView) -> Result<(), StorageRefusa
 
 fn find_whole_disk<'a>(survey: &'a Survey, device: &str) -> Result<&'a DiskView, StorageRefusal> {
     let name = device.strip_prefix("/dev/").unwrap_or(device);
-    if let Some(view) = survey.disks.iter().find(|view| view.disk.name == name) {
+    if let Some(view) = survey
+        .disks
+        .iter()
+        .find(|view| view.disk.name == name || view.disk.path == device)
+    {
         return match view.role {
             DiskRole::Free => Ok(view),
             DiskRole::Snapshots => Err(StorageRefusal::new(
@@ -3850,6 +3933,65 @@ impl ToolHandler for SnapshotListHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_origin_requires_readable_kernel_machine_disk_facts() {
+        let root = std::env::temp_dir().join(format!("arca-disk-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("class/block")).expect("block class");
+        let make_disk = |name: &str, bus: &str, virtual_block: bool| {
+            let controller = root.join(format!("devices/fake-{name}"));
+            let block = if virtual_block {
+                root.join(format!("devices/virtual/block/{name}"))
+            } else {
+                controller.join(format!("block/{name}"))
+            };
+            let subsystem = root.join(format!("bus/{bus}"));
+            std::fs::create_dir_all(&controller).expect("device");
+            std::fs::create_dir_all(&block).expect("block device");
+            std::fs::create_dir_all(&subsystem).expect("subsystem");
+            std::os::unix::fs::symlink(&subsystem, controller.join("subsystem"))
+                .expect("subsystem link");
+            std::os::unix::fs::symlink(&controller, block.join("device")).expect("device link");
+            std::os::unix::fs::symlink(&block, root.join("class/block").join(name))
+                .expect("class link");
+        };
+        // SATA and USB present SCSI devices; a guest's own disk may present virtio with no TRAN value.
+        for (name, bus) in [
+            ("sda", "scsi"),
+            ("nvme0n1", "nvme"),
+            ("vda", "virtio"),
+            ("mmcblk0", "mmc"),
+            ("xvda", "xen"),
+            ("dasda", "ccw"),
+        ] {
+            make_disk(name, bus, false);
+            assert_eq!(
+                DiskOrigin::from_sysfs(&root, name),
+                DiskOrigin::Machine,
+                "{name}"
+            );
+        }
+        // The name alone does not decide: both a software block path and the RBD bus exclude an image.
+        make_disk("fake0", "scsi", true);
+        make_disk("fake1", "rbd", false);
+        assert_eq!(DiskOrigin::from_sysfs(&root, "fake0"), DiskOrigin::Mapped);
+        assert_eq!(DiskOrigin::from_sysfs(&root, "fake1"), DiskOrigin::Mapped);
+        make_disk("fake2", "unrecognised", false);
+        assert_eq!(DiskOrigin::from_sysfs(&root, "fake2"), DiskOrigin::Unknown);
+        std::fs::remove_file(root.join("devices/fake-sda/subsystem"))
+            .expect("remove subsystem fact");
+        assert_eq!(DiskOrigin::from_sysfs(&root, "sda"), DiskOrigin::Unknown);
+        std::fs::remove_file(root.join("devices/fake-vda/block/vda/device"))
+            .expect("remove device fact");
+        assert_eq!(DiskOrigin::from_sysfs(&root, "vda"), DiskOrigin::Unknown);
+        assert_eq!(
+            DiskOrigin::from_sysfs(&root, "missing"),
+            DiskOrigin::Unknown
+        );
+        std::fs::remove_dir_all(&root).expect("remove fixture");
+        assert_eq!(DiskOrigin::from_sysfs(&root, "sda"), DiskOrigin::Unknown);
+    }
 
     #[test]
     fn the_kernels_device_links_are_read_from_sysfs() {
