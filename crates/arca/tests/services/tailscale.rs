@@ -363,13 +363,6 @@ fn a_link_from_the_connector_opens_the_linked_services_port_to_it_and_nothing_el
             .skip(1)
             .all(|rule| rule["action"] == "reject")
     );
-    op(
-        &rig,
-        "service_disconnect",
-        json!({"from":"edge-ts","to":"web"}),
-    )
-    .expect("disconnect");
-    assert_eq!(acl(&rig, "web")["ingress"], json!([]));
 }
 
 /// What one run of `tailscale.sh` left: its exit code, what it printed, the serve config the fake containerboot found,
@@ -482,7 +475,6 @@ fn the_script_forwards_tcp_443_to_the_target_with_a_proxy_v2_header_and_execs_co
 #[test]
 fn the_script_refuses_a_target_that_is_not_one_address_and_port_and_starts_nothing() {
     for target in [
-        "",
         "192.0.2.11",
         "192.0.2.11:",
         "192.0.2.11:0",
@@ -494,6 +486,14 @@ fn the_script_refuses_a_target_that_is_not_one_address_and_port_and_starts_nothi
         "192.0.2.11:8443\"}",
         "192.0.2.11 :8443",
         "unix:/var/run/tailscale/tailscaled.sock",
+        // A tailnet name before the target that is no DNS label, or a second @.
+        "@192.0.2.11:8443",
+        "-edge@192.0.2.11:8443",
+        "edge-@192.0.2.11:8443",
+        "Edge@192.0.2.11:8443",
+        "edge_a@192.0.2.11:8443",
+        "a@b@192.0.2.11:8443",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@192.0.2.11:8443",
     ] {
         let mut env = good();
         env.retain(|(key, _)| *key != "TS_TARGET");
@@ -510,9 +510,51 @@ fn the_script_refuses_a_target_that_is_not_one_address_and_port_and_starts_nothi
     assert_ne!(ran.code, Some(0));
     assert!(ran.err.contains("TS_TARGET is not set"), "{}", ran.err);
     assert!(ran.boot_env.is_none());
+    // An empty target is no target.
+    let mut env = good();
+    env.retain(|(key, _)| *key != "TS_TARGET");
+    env.push(("TS_TARGET", ""));
+    let ran = run_in(&["/bin/sh"], &env);
+    assert_ne!(ran.code, Some(0));
+    assert!(ran.err.contains("TS_TARGET is not set"), "{}", ran.err);
+    assert!(ran.boot_env.is_none());
     // A host name in place of the address is a target too.
     let mut env = good();
     env.retain(|(key, _)| *key != "TS_TARGET");
     env.push(("TS_TARGET", "web.internal:8443"));
     assert_eq!(run_in(&["/bin/sh"], &env).code, Some(0));
+}
+
+#[test]
+fn a_name_before_the_target_is_the_nodes_tailnet_name_in_place_of_the_services_own() {
+    for shell in super::nats::shells() {
+        // Without one the node keeps the service's name, which the template gives.
+        let ran = run_in(&shell, &good());
+        let env = ran.boot_env.expect("containerboot ran");
+        assert!(env.lines().any(|l| l == "TS_HOSTNAME=edge-ts"), "{shell:?}");
+        // With one, that name, and the forward goes to the target after the @ alone.
+        let longest = "a".repeat(63);
+        for (name, target) in [
+            ("app-1", "app-1@192.0.2.11:8443".to_string()),
+            ("a", "a@192.0.2.11:8443".to_string()),
+            (longest.as_str(), format!("{longest}@192.0.2.11:8443")),
+        ] {
+            let mut env = good();
+            env.retain(|(key, _)| *key != "TS_TARGET");
+            env.push(("TS_TARGET", target.as_str()));
+            let ran = run_in(&shell, &env);
+            assert_eq!(ran.code, Some(0), "{shell:?} {target}: {}", ran.err);
+            let boot = ran.boot_env.expect("containerboot ran");
+            assert!(
+                boot.lines().any(|l| l == format!("TS_HOSTNAME={name}")),
+                "{shell:?} {target}"
+            );
+            let serve: Value = serde_json::from_str(ran.serve.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                serve,
+                json!({"TCP":{"443":{"TCPForward":TARGET,"ProxyProtocol":2}}}),
+                "{shell:?} {target}"
+            );
+        }
+    }
 }

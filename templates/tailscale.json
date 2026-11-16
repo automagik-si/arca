@@ -1,0 +1,21 @@
+{
+  "name": "tailscale",
+  "description": "Tailscale connector: Tailscale 1.104.7 (tailscale/tailscale by digest), a tailnet node in userspace networking (no tun, no capability). It forwards tailnet TCP 443 to one linked service as raw TCP with a PROXY v2 header. Set TS_AUTHKEY and TS_TARGET ([NAME@]ADDRESS:PORT; NAME is its tailnet name, the service's own by default) with service_secret_set, then instance_start. Its state is on its data volume, so it logs in once. No port of its own; it reaches only what it is linked to.",
+  "kind": "oci",
+  "image": "docker.io/tailscale/tailscale",
+  "digest": "sha256:72c1e19e0aedca96b8533bbb0b4368564410ff20b17e53b804eb6c1f04a31be4",
+  "entrypoint": ["/bin/sh", "-ec", { "file": "tailscale.sh" }, "tailscale"],
+  "ports": [],
+  "data": { "path": "/data", "uid": 0, "gid": 0, "size": "1GiB" },
+  "env": {
+    "TS_AUTHKEY": "{{secret:TS_AUTHKEY}}",
+    "TS_TARGET": "{{secret:TS_TARGET}}",
+    "TS_HOSTNAME": "{{name}}",
+    "TS_STATE_DIR": "/data",
+    "TS_USERSPACE": "true",
+    "TS_AUTH_ONCE": "true"
+  },
+  "secrets": ["TS_AUTHKEY", "TS_TARGET"],
+  "autostart": true,
+  "publishable": false
+}
