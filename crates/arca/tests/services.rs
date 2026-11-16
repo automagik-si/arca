@@ -429,6 +429,144 @@ fn nats_template() -> Value {
 }
 
 #[test]
+fn service_rebind_is_available_after_a_copy_changes_uuid_and_data_pool() {
+    let mut state = empty_state();
+    state.pools = vec![("pool1".into(), json!({})), ("pool2".into(), json!({}))];
+    let rig = Rig::with(state, vec![PROJECT.into()], Some("192.0.2.0/24"));
+    let mut template = nats_template();
+    template["data"] = json!({"path":"/data"});
+    template["secrets"] = json!(["TOKEN"]);
+    template["generate"] = json!({"TOKEN":"test_"});
+    template["env"] = json!({"TOKEN":"{{secret:TOKEN}}"});
+    rig.template("nats", template);
+    rig.call("service_create", json!({"name":"sample","template":"nats"}))
+        .expect("create the service with its data volume");
+    let instance_path = format!("/1.0/instances/sample?project={PROJECT}");
+    let volume_path = |pool: &str| {
+        format!("/1.0/storage-pools/{pool}/volumes/custom/sample-data?project={PROJECT}")
+    };
+    let original = rig.get(&instance_path).expect("the original instance");
+    let old_uuid = original["config"]["volatile.uuid"].as_str().unwrap();
+    let old_volume = rig.get(&volume_path("pool1")).expect("the original volume");
+    let entry = EntryId("service-sample".into());
+    assert_eq!(
+        rig.kernel
+            .lock()
+            .unwrap()
+            .service_uuid(&entry, "sample")
+            .as_deref(),
+        Some(old_uuid)
+    );
+    // The verb works before the operator replaces the instance.
+    rig.call(
+        "service_secret_set",
+        json!({"name":"sample","key":"TOKEN","value":"before-copy"}),
+    )
+    .expect("the original UUID is accepted");
+
+    // Model a name swap using the existing fake's fixture methods: the old
+    // instance survives under a backup name with its UUID and old data disk.
+    rig.fake.set_instance_status(PROJECT, "sample", "Stopped");
+    rig.edit("DELETE", &instance_path, json!({}));
+    let mut backup = original.clone();
+    backup["name"] = json!("sample-backup");
+    backup["project"] = json!(PROJECT);
+    backup["status"] = json!("Stopped");
+    rig.fake.add_instance(backup);
+    rig.fake
+        .set_instance_config(PROJECT, "sample-backup", "volatile.uuid", old_uuid);
+
+    // A copy keeps the ownership marks, but Incus gives it a different UUID.
+    // Both its root and its attached data volume are now on the second pool.
+    rig.fake
+        .add_volume(PROJECT, "pool2", "sample-data", old_volume.clone());
+    let mut copied = original.clone();
+    copied["project"] = json!(PROJECT);
+    for devices in ["devices", "expanded_devices"] {
+        copied[devices]["root"]["pool"] = json!("pool2");
+        copied[devices]["data"]["pool"] = json!("pool2");
+    }
+    rig.fake.add_instance(copied);
+    let copied = rig
+        .get(&instance_path)
+        .expect("the copy under the service name");
+    assert_ne!(copied["config"]["volatile.uuid"], json!(old_uuid));
+    assert_eq!(copied["config"][KERNEL_ENTRY_KEY], "service-sample");
+    assert_eq!(copied["devices"]["root"]["pool"], "pool2");
+    assert_eq!(copied["devices"]["data"]["pool"], "pool2");
+    assert_eq!(copied["devices"]["data"]["source"], "sample-data");
+    let backup_path = format!("/1.0/instances/sample-backup?project={PROJECT}");
+    assert_eq!(
+        rig.get(&backup_path).unwrap()["config"]["volatile.uuid"],
+        json!(old_uuid)
+    );
+    for (pool, user) in [("pool1", &backup_path), ("pool2", &instance_path)] {
+        let volume = rig
+            .get(&volume_path(pool))
+            .expect("both volumes still exist");
+        assert_eq!(volume["config"], old_volume["config"]);
+        assert_eq!(volume["used_by"], json!([user]));
+    }
+    assert_eq!(rig.service_config("sample").pool, "pool1");
+    let (records, _) =
+        arca_kernel::journal::read_journal(&rig.dir.join(arca::kernel::JOURNAL_FILE))
+            .expect("the effect journal");
+    let volumes: Vec<_> = records
+        .iter()
+        .filter_map(|record| match &record.inverse {
+            Some(Inverse::IncusDelete { object }) if object.kind == IncusKind::Volume => {
+                Some(object)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!volumes.is_empty());
+    assert!(
+        volumes.iter().all(|object| object.project == PROJECT
+            && object.parent.as_deref() == Some("pool1")
+            && object.name == "sample-data"
+            && object.uuid.is_none()),
+        "the journal still addresses only the old volume"
+    );
+    assert_eq!(
+        rig.kernel
+            .lock()
+            .unwrap()
+            .service_uuid(&entry, "sample")
+            .as_deref(),
+        Some(old_uuid),
+        "the journal still names the old instance"
+    );
+    let journal = journal_len(&rig);
+    let writes = rig.fake.writes().len();
+    let blocked = rig.call(
+        "service_secret_set",
+        json!({"name":"sample","key":"TOKEN","value":"after-copy"}),
+    );
+    assert!(
+        matches!(&blocked, Err(CallError::Refused { message, .. }) if message == "service ownership or UUID changed"),
+        "the copy reproduces the UUID refusal: {blocked:?}"
+    );
+    assert_eq!(
+        journal_len(&rig),
+        journal,
+        "the refusal changes no journal record"
+    );
+    assert_eq!(
+        rig.fake.writes().len(),
+        writes,
+        "the refusal changes no Incus object"
+    );
+
+    // Phase one stays red until the explicit, approved recovery verb exists.
+    // Ordinary service verbs must continue to refuse a UUID mismatch.
+    assert!(
+        rig.handlers.contains_key("service_rebind"),
+        "no explicit rebind is available; service_secret_set returned {blocked:?}"
+    );
+}
+
+#[test]
 fn service_create_list_status_round_trip() {
     let rig = Rig::new();
     rig.template("nats", nats_template());
