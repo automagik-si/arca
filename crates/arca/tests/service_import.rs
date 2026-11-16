@@ -980,8 +980,13 @@ fn one_approved_release_clears_an_old_phantom_and_frees_its_name_and_address() {
         .to_string(),
     )
     .unwrap();
-    rig.call("service_create", json!({"name":"nats","template":"nats"}))
-        .unwrap();
+    // A stopped fixture leaves no separate DHCP lease holding its address after deletion.
+    rig.call(
+        "service_create",
+        json!({"name":"nats","template":"nats","start":false}),
+    )
+    .unwrap();
+    assert!(rig.fake.leases().is_empty());
     let mut phantom = rig
         .node()
         .kernel
