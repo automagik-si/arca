@@ -160,6 +160,11 @@ fn journal(rig: &Rig) -> Vec<(String, bool)> {
 fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest() {
     let up = Arc::new(AtomicBool::new(true));
     let rig = rig(&up);
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"hold":"true", "empty":""}}),
+    )
+    .unwrap();
     let before = instance(&rig);
     let identity = rig
         .entries()
@@ -200,6 +205,14 @@ fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest(
     assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
     assert!(rig.fake.restores(PROJECT, "app").is_empty());
     let after = instance(&rig);
+    assert_eq!(
+        after["config"]["user.arca.labels"],
+        before["config"]["user.arca.labels"]
+    );
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"hold":"true", "empty":""})
+    );
     assert_eq!(after["status"], "Running");
     assert_eq!(after["devices"]["data"], before["devices"]["data"]);
     assert_eq!(after["devices"]["eth0"], before["devices"]["eth0"]);

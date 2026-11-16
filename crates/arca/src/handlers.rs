@@ -6010,6 +6010,8 @@ mod service_routes;
 pub use service_follow::{
     Attestation, FollowEdges, Followed, Follower, Version as ReleaseVersion, spawn_follower,
 };
+#[path = "service_labels.rs"]
+pub(crate) mod service_labels;
 #[path = "service_reconfigure.rs"]
 mod service_reconfigure;
 #[path = "service_update.rs"]
@@ -6082,6 +6084,7 @@ pub fn service_handlers_updating(
         "service_connect",
         "service_disconnect",
         "service_secret_set",
+        "service_labels_set",
         "service_publish",
         "service_unpublish",
         "service_create",
@@ -7612,6 +7615,7 @@ impl ServiceHandler {
             "service_remove" | "service_import" | "service_release" => &["name", "approval"],
             "service_connect" | "service_disconnect" => &["from", "to"],
             "service_secret_set" => &["name", "key", "value"],
+            "service_labels_set" => &["name", "labels"],
             "service_publish" => &["name", "reach", "approval"],
             "service_unpublish" => &["name"],
             "function_create" => &[
@@ -7676,6 +7680,7 @@ impl ServiceHandler {
             "service_connect"
                 | "service_disconnect"
                 | "service_secret_set"
+                | "service_labels_set"
                 | "service_publish"
                 | "service_unpublish"
                 | "function_create"
@@ -7731,6 +7736,7 @@ impl ServiceHandler {
                 | "service_connect"
                 | "service_disconnect"
                 | "service_secret_set"
+                | "service_labels_set"
                 | "service_import"
                 | "service_release"
                 | "function_create"
@@ -7850,6 +7856,9 @@ impl ServiceHandler {
         // One name space, two kinds: a verb of one kind never acts on a record of the other.
         if let Some(refusal) = function_handlers::kind_refusal(self.verb, &args, &all_entries) {
             return Err(refusal);
+        }
+        if self.verb == "service_labels_set" {
+            return self.call_labels(&args, &entries);
         }
         if self.verb.starts_with("route_") {
             return self.call_routes(&args, caller, &entries, now);

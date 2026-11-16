@@ -158,6 +158,7 @@ pub fn classify_object(
                     "user.arca.rawlxc",
                     "user.arca.entrypoint",
                     RUN_TMPFS_KEY,
+                    "user.arca.labels",
                 ]
             } else {
                 &[
@@ -169,6 +170,7 @@ pub fn classify_object(
                     "user.arca.envkeys",
                     "user.arca.entrypoint",
                     RUN_TMPFS_KEY,
+                    "user.arca.labels",
                 ]
             }
         }

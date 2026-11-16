@@ -8,7 +8,7 @@ use crate::Verb;
 pub const OUTSIDE_TENANT: &str = "OutsideTokenTenant";
 
 /// The reviewed verbs that accept a tenant. A new verb is refused until it is reviewed here too.
-const TENANT_VERBS: [&str; 19] = [
+const TENANT_VERBS: [&str; 20] = [
     "service_create",
     "service_list",
     "service_status",
@@ -19,6 +19,7 @@ const TENANT_VERBS: [&str; 19] = [
     "service_connect",
     "service_disconnect",
     "service_secret_set",
+    "service_labels_set",
     "snapshot_create",
     "snapshot_list",
     "snapshot_delete",
@@ -131,5 +132,44 @@ mod tests {
             verbs().iter().filter(|v| offered(v)).count(),
             TENANT_VERBS.len() + 5
         );
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use crate::limits::{ServiceLimit, check};
+    use serde_json::json;
+
+    #[test]
+    fn bound_labels_resolve_only_the_own_tenant_and_services() {
+        let v = crate::verb("service_labels_set").unwrap();
+        let mut args = json!({"name":"api","labels":{"hold":"true"}});
+        resolve(v, "abcdefgh", &mut args).unwrap();
+        assert_eq!(args["tenant"], "abcdefgh");
+        for tenant in ["ijklmnop", ""] {
+            assert!(
+                resolve(
+                    v,
+                    "abcdefgh",
+                    &mut json!({"tenant":tenant,"name":"api","labels":{}})
+                )
+                .is_err()
+            );
+        }
+        let limit = ServiceLimit::parse("abcdefgh/api").unwrap();
+        assert!(check(v, &limit, &args).is_ok());
+        assert!(
+            check(
+                v,
+                &limit,
+                &json!({"tenant":"abcdefgh","name":"other","labels":{}})
+            )
+            .is_err()
+        );
+        assert!(check(v, &limit, &json!({"name":"api","labels":{}})).is_err());
+        let own = ServiceLimit::parse("api").unwrap();
+        assert!(check(v, &own, &json!({"name":"api","labels":{}})).is_ok());
+        assert!(check(v, &own, &args).is_err());
     }
 }

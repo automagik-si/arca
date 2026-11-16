@@ -661,3 +661,47 @@ fn a_stored_tenant_bound_admin_never_authenticates_or_counts_as_the_nodes_admin(
     assert_eq!(store.skipped().len(), 1);
     assert!(arca_mcp::admin_token_ids(scratch.path()).is_empty());
 }
+
+#[test]
+fn label_writes_obey_bound_tenants_and_service_limits_before_the_handler() {
+    let door = Door::start();
+    for args in [
+        json!({"name":"web","labels":{"hold":"true"}}),
+        json!({"tenant":TENANT,"name":"web","labels":{}}),
+    ] {
+        assert_eq!(
+            refusal(&door.call(&door.limited, "service_labels_set", args)),
+            "Reached"
+        );
+        assert_eq!(
+            door.calls.lock().unwrap().last().unwrap().1["tenant"],
+            TENANT
+        );
+    }
+    let before = door.calls.lock().unwrap().len();
+    for (args, expected) in [
+        (
+            json!({"tenant":"ijklmnop","name":"web","labels":{}}),
+            "OutsideTokenTenant",
+        ),
+        (
+            json!({"tenant":"","name":"web","labels":{}}),
+            "OutsideTokenTenant",
+        ),
+        (json!({"name":"db","labels":{}}), "OutsideTokenServices"),
+    ] {
+        assert_eq!(
+            refusal(&door.call(&door.limited, "service_labels_set", args)),
+            expected
+        );
+    }
+    assert_eq!(door.calls.lock().unwrap().len(), before);
+    assert_ne!(
+        refusal(&door.call(
+            &door.viewer,
+            "service_labels_set",
+            json!({"name":"web","labels":{}})
+        )),
+        "Reached"
+    );
+}

@@ -22,7 +22,8 @@ Source: `arca_kernel::ownership::{KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY}`; test
 **Rule 3.** The other system's marks are read-only to the kernel. Any key under `user.droid.`, `user.tactu.` or `user.arca.`
 means that system owns the object. The match ignores ASCII case, and a bare namespace key counts. The kernel never writes such
 an object, and it never adds such a key to one of its own, because the writer classifies the object's config after the
-change and refuses any result that is not its entry's own. The one exception is the service import's single key (Rule 52).
+change and refuses any result that is not its entry's own. The service import has its single-key exception (Rule 52). Addressed service instances also allow their exact public
+metadata keys through `classify_object`, including `user.arca.labels` (the named service-label exception below).
 Source: `arca_kernel::ownership::DROIDD_MARK_PREFIXES`; `UnixIncusWriter::patch` in `crates/arca-incus/src/write.rs`; tests
 `droidd_namespace_matching_ignores_ascii_case_so_a_near_miss_only_refuses` (kernel) and
 `a_patch_that_would_leave_the_object_owned_by_another_owner_is_refused` (`crates/arca-incus/tests/write.rs`).
@@ -118,6 +119,39 @@ Source: `UnixIncusWriter::confirm`; tests `a_create_that_lands_and_reads_back_fo
 `a_tombstone_that_reads_back_on_another_uuid_is_applied_unconfirmed`,
 `a_project_put_that_reads_back_without_a_key_it_sent_is_applied_unconfirmed`,
 `the_refused_and_unconfirmed_errors_say_whether_a_write_was_sent` and `a_landed_write_names_its_full_target_and_the_uuid_it_read_back`.
+
+## Named exception: service labels
+
+`service_labels_set` writes caller data directly through `UnixIncusWriter::patch`, outside the effect journal. Labels
+are not desired state, an undo has no use, and they can change often. A stuck journalled label write must never block
+the node's other writes. The write still checks the entry's ownership and recorded instance UUID, uses `If-Match`,
+and reads the object back. Only a definite 412 retries: at most three attempts, each reading ownership and UUID again
+and applying the original delta to the fresh map. An uncertain PATCH answer is never replayed. Its result carries the
+map read back and `code: unconfirmed`, even when that map is the old one: a synchronous Incus config PATCH can land
+after the client gave up. If the read-back fails, `labels_unconfirmed` says the result could not be confirmed; it never
+claims that the change was not applied.
+
+The whole string map lives in the one exact instance config key `user.arca.labels`. Only an already matched service
+instance gets this exact allowance in `classify_object`; no prefix is exempted, and adoption's `classify` is unchanged.
+Reconcile, reconfigure and image rebuild preserve the key because it is outside desired state. Status and list read it
+from the instance, or show an empty map when none is present. Imported and adopted services may show existing labels,
+but label writes remain refused under the existing read-only rule. Recorded host programs show an empty map and take no
+label writes. Labels are plain data, never secrets and never rendered into configuration. A `hold` key has no special
+meaning: it changes no boot key and refuses no other operation.
+
+Merge semantics: null removes a key; an empty string is a value. Bounds apply after merging: 128 bytes per key, 4096
+bytes per value, 128 keys and 65536 bytes of compact serialized JSON. The result contains the full map and the closed
+confirmation code. Doctor scope, token tenant binding and `services=` limits apply as to other service writes.
+Source: `crates/arca/src/service_labels.rs`; tests `service_labels_merge_remove_read_back_and_never_enter_the_journal`,
+`service_labels_uncertain_patch_reads_back_without_claiming_not_applied`,
+`service_labels_reapply_original_delta_after_412_without_losing_either_writer`,
+`service_labels_retries_are_bounded_and_recheck_uuid_ownership_and_merged_bounds`,
+`labels_bounds_apply_to_the_merged_map_in_bytes_and_serialized_bytes`,
+`labels_are_allowed_only_on_the_exact_owned_service_instance`,
+`label_writes_obey_bound_tenants_and_service_limits_before_the_handler`,
+`adopted_services_show_labels_but_still_refuse_label_writes`,
+`labels_survive_reconfigure_and_hold_changes_no_boot_policy`, and
+`an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest`.
 
 ## Writes
 

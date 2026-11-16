@@ -277,6 +277,7 @@ impl Kernel {
         view["uuid"] = json!(self.service_uuid(entry, &config.instance));
         view["createdAt"] = json!(crate::handlers::iso_utc(config.created));
         view["startedAt"] = json!(live.and_then(crate::service::started_at));
+        view["labels"] = crate::handlers::service_labels::view(live);
         view["limits"] = json!(config.limits);
         view["data"] =
             json!({"volume": config.data.as_ref().map(|_| format!("{}-data", config.name))});

@@ -6454,6 +6454,13 @@
                     "description": "Present only on a program this node records and does not manage (external_add): host-program.",
                     "type": "string"
                   },
+                  "labels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Plain caller data. After merging: keys at most 128 bytes, values at most 4096 bytes, at most 128 keys and 65536 bytes of compact JSON. Null removes a key; an empty string is a value. Never secrets.",
+                    "type": "object"
+                  },
                   "lanPort": {
                     "anyOf": [
                       {
@@ -6698,6 +6705,7 @@
                   "links",
                   "published",
                   "lanPort",
+                  "labels",
                   "createdAt",
                   "data",
                   "id",
@@ -6900,6 +6908,13 @@
               "const": "host-program",
               "description": "Present only on a program this node records and does not manage (external_add): host-program.",
               "type": "string"
+            },
+            "labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Plain caller data. After merging: keys at most 128 bytes, values at most 4096 bytes, at most 128 keys and 65536 bytes of compact JSON. Null removes a key; an empty string is a value. Never secrets.",
+              "type": "object"
             },
             "lanPort": {
               "anyOf": [
@@ -7149,6 +7164,7 @@
             "links",
             "published",
             "lanPort",
+            "labels",
             "createdAt",
             "data",
             "id",
@@ -8319,6 +8335,77 @@
         }
       },
       "summary": "Remove a link: the provider's ACL rule for the consumer goes, and so do the variables it gave the consumer (applied on its next start). Returns their names.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "service_labels_set",
+      "params": [
+        {
+          "name": "labels",
+          "required": true,
+          "schema": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description": "Plain caller data. After merging: keys at most 128 bytes, values at most 4096 bytes, at most 128 keys and 65536 bytes of compact JSON. Null removes a key; an empty string is a value. Never secrets.",
+            "type": "object"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The service's name.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the token's bound tenant, or in the node's own project when the token has no tenant binding. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Unconfirmed: the PATCH answer was uncertain or its read-back differed. Labels are the map read now; the PATCH may still land later. Read service_status again before deciding what to do.",
+              "enum": [
+                "confirmed",
+                "unconfirmed"
+              ],
+              "type": "string"
+            },
+            "labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Plain caller data. After merging: keys at most 128 bytes, values at most 4096 bytes, at most 128 keys and 65536 bytes of compact JSON. Null removes a key; an empty string is a value. Never secrets.",
+              "type": "object"
+            }
+          },
+          "required": [
+            "labels",
+            "code"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Merge a service's labels: a string sets a value, including an empty string, and null removes a key. Returns the full map read back from the instance and whether the write is confirmed. Labels are plain caller data, never secrets or policy; a hold label changes no boot setting. Imported or adopted instances remain read-only.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

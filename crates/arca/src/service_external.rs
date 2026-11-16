@@ -47,6 +47,7 @@ pub(super) fn recorded_refusal(cfg: &NodeConfig, verb: &str, args: &Value) -> Op
                 | "service_connect"
                 | "service_disconnect"
                 | "service_secret_set"
+                | "service_labels_set"
                 | "service_logs"
                 | "function_create"
         )

@@ -4017,6 +4017,7 @@ pub fn base_image(row: &Value) -> Option<&str> {
 
 /// Add explicit null observations when a row has no service record.
 pub(crate) fn without_record(mut view: Value) -> Value {
+    view["labels"] = json!({});
     for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
         view[key] = Value::Null;
     }
