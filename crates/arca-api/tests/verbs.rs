@@ -2139,6 +2139,7 @@ fn node_is_an_optional_argument_of_every_read_and_of_action_propose_only() {
     assert!(verb("action_propose").expect("present").takes_node());
     assert!(verb("watch_report").expect("present").takes_node());
     assert!(verb("route_list").expect("present").takes_node());
+    assert!(verb("reach_list").expect("present").takes_node());
 }
 
 /// The support verbs: a viewer files a report and reads its state and the feed; only an operator, or a token whose list
