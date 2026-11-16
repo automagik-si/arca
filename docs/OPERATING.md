@@ -6080,10 +6080,13 @@ or where they write.
 **Sign-in: passkey or phone only for a project workspace.** Leave `accessTeamDomain`, `accessAudience` and
 `accessEmails` empty. Those settings remain available to other workspaces that use Cloudflare Access e-mail
 sign-in. The current template supports a passkey claim on the **tailnet** reach, as described below; it does not
-implement a phone route. For the reviewed image, the owner reads the one-time claim code from the container
-health log through the node operator's local access, then claims the gate and registers a passkey. This is an
-owner step: the keeper never reads or prints the code, and no Arca verb hands it out. Do not send the code through
-an assistant. The Cloudflare connector deliberately stays stopped when Access is unset, so merely clearing `accessEmails` does not create an internet passkey route.
+implement a phone route. Arca must show the owner the one-time claim code once, behind the owner's passkey,
+before the owner claims the gate and registers a passkey on-screen. That claim-code screen is not built yet:
+it is missing Arca work, and the owner has no terminal step. Until it exists, reading the container health log
+at a terminal is an interim step for the node operator only, following the image's claim procedure. The keeper
+never reads or prints the code, and no Arca verb hands it out. Do not send the code through an assistant.
+The Cloudflare connector deliberately stays stopped when Access is unset, so merely clearing `accessEmails`
+does not create an internet passkey route.
 Automagik still needs to release the image implementing the supplied entrypoint and proposed herdr paths, confirm
 its claim-log access and recovery procedure, and supply any phone or internet passkey route that the project needs.
 Do not admit a workspace that needs that missing route, and do not substitute e-mail sign-in.
@@ -6109,14 +6112,15 @@ No image is published by this template change.
 
 **First boot and checks.** After a separately approved rollout, follow the reach's existing secret and
 `instance_start` steps below. `service_status` shows the service and its settings; `service_logs` shows the keeper.
-Inside the VM, `systemctl status arca-automagik-workspace` and `/var/log/cloud-init-output.log` explain a first boot
-that did not finish. Check all of these before handing the workspace over:
+For the node operator, `systemctl status arca-automagik-workspace` and `/var/log/cloud-init-output.log` inside the
+VM explain a first boot that did not finish. The node operator checks these before handing the workspace over:
 
 - The keeper says the server and gate are healthy (HTTP 401 on their loopback ports), and the tailnet node serves
   the exact origin. A running VM alone does not establish this.
-- The owner reads the one-time claim code from the container health log and completes the gate's first claim with
-  a passkey; the keeper then says `claimed`. It infers that from the claim file's absence, so also check a real owner
-  sign-in. The code stays with the owner; do not copy it into assistant conversations or Arca's logs.
+- Owner onboarding needs Arca's missing claim-code screen: Arca must show the code once behind the owner's
+  passkey, then the owner completes the gate's first claim on-screen. The keeper then says `claimed`. It infers
+  that from the claim file's absence, so also check a real owner sign-in. Until that screen exists, the terminal
+  read is for the node operator only. Do not copy the code into assistant conversations or Arca's logs.
 - On the server container, inspect only the home, workspace, socket and pnpm variables above. Confirm the
   directories, `secrets`, `run` and `<AUTOMAGIK_HOME>/acp/clis` exist, are owned by uid:gid `1000:1000` with mode
   `0700`, and resolve through the one `WS_DATA:/data` bind. Confirm pnpm reports `10.34.6`, the real checkout is in
@@ -6133,10 +6137,13 @@ before admission. Remove any obsolete external tailnet node or tunnel route thro
 
 **Owner actions still required.** Confirm placement and capacity; deliver the real project checkout before first boot;
 obtain and review the final image digest, entrypoint, proposed herdr paths and baked pnpm path; confirm the image's
-bot registry seed, per-project base triad and versioned herdr-core artifact; confirm owner access to the container
-health log and exercise claim, passkey sign-in and recovery (and obtain a phone route if required); settle backups;
+bot registry seed, per-project base triad and versioned herdr-core artifact; exercise on-screen claim, passkey
+sign-in and recovery (and obtain a phone route if required); settle backups;
 approve the create and start; and verify the real first boot. This change performs none of those host or deployment
 actions.
+
+**Remaining Arca work.** Build the claim-code screen that shows the owner the code once, behind the owner's
+passkey. That owner flow is not available yet; an interim terminal read by the node operator does not replace it.
 
 ## An Automagik workspace in its own virtual machine
 
@@ -6259,9 +6266,9 @@ choose a machine name you do not mind the world reading.
 6. **The first claim.** A new gate has no owner. It writes a claim code into its own data, good once and for
    fifteen minutes, and the first person who opens `https://workspace1.<tailnet>.ts.net/_gate/claim` from the
    tailnet with that code registers a passkey and becomes the owner. Arca does not hand that code to you yet: the
-   step that shows it once, after your passkey on Arca's approval page, is not built. For the reviewed project
-   image, the owner reads the one-time code from the container health log through the node operator's local
-   access, as the image's claim procedure specifies. This is an owner step at a terminal, never one for an
+   step that shows it once, after your passkey on Arca's approval page, is not built. Until it is, the code can
+   only be read on the machine itself, with the command Automagik's server documentation gives for the gate's
+   container. That is a step for the person who looks after the node, at a terminal, and never one for an
    assistant: the keeper does not read the code, does not print it, and no Arca verb returns it. After the claim
    the status line says `claimed`.
 
