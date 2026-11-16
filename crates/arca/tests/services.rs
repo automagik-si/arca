@@ -3337,6 +3337,8 @@ mod nats_replica;
 mod omni;
 #[path = "services/private_port.rs"]
 mod private_port;
+#[path = "services/reach.rs"]
+mod reach;
 #[path = "services/reconfigure.rs"]
 mod reconfigure;
 #[path = "services/routes.rs"]
