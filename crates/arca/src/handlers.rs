@@ -6961,6 +6961,7 @@ fn adoption_subnet(cfg: &NodeConfig, row: &Value, cidr: &str, gateway: &str) -> 
 
 /// Adds a record for every kernel-owned marked instance without one, and keeps the kernel access of a record made this
 /// way the same as the instance's device. Nothing on the instance is read into a secret or re-rendered.
+/// Returns project/name pairs skipped for an uncertain read or a non-object response.
 fn adopt_services(
     kernel: &Mutex<Kernel>,
     cfg: &NodeConfig,
@@ -6968,13 +6969,14 @@ fn adopt_services(
     cidr: &str,
     gateway: &str,
     now: u64,
-) -> Result<(), CallError> {
+) -> Result<BTreeSet<(String, String)>, CallError> {
     // Writing callers already hold the write gate. Never acquire it after the kernel lock.
     // Removal owns this same lock through its instance deletion and journal settlement.
     let mut kernel = lock(kernel)?;
     let read = UnixIncus::new(cfg.incus.socket.clone());
     let entries = kernel.entries().to_vec();
     let mut changes = Vec::new();
+    let mut skipped = BTreeSet::new();
     for row in rows {
         if !service_owned(row) {
             continue;
@@ -7024,14 +7026,15 @@ fn adopt_services(
             config.instance, config.project
         );
         let mut row = match read.get(&path) {
-            Ok(row) => row,
+            Ok(row) if row.is_object() => row,
             Err(arca_incus::IncusError::Status { code: 404, .. }) => continue,
-            Err(_) => {
+            _ => {
                 // Never log the error body: the instance's response may contain secrets.
                 eprintln!(
                     "arca: skipped adoption of {}/{}: instance read failed; a later service call will retry",
                     config.project, config.instance
                 );
+                skipped.insert((config.project, config.instance));
                 continue;
             }
         };
@@ -7056,7 +7059,7 @@ fn adopt_services(
     if !changes.is_empty() {
         kernel.propose(changes, now).map_err(|_| internal())?;
     }
-    Ok(())
+    Ok(skipped)
 }
 
 pub(crate) fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
@@ -8427,27 +8430,40 @@ impl ServiceHandler {
                 let done = crate::service_import::import(&self.cfg, &name, &entries, now)?;
                 // The mark is on the instance now. Its record is made from it, exactly as a restart reads it.
                 // The import landed and its approval is used: the caller is told to look, never to ask for it again.
-                let rows = match read_again_once(
-                    &read,
-                    "/1.0/instances?all-projects=true&recursion=1",
-                ) {
-                    Ok(rows) => rows.as_array().cloned().unwrap_or_default(),
-                    Err(arca_incus::IncusError::Status { code: 404, .. }) => Vec::new(),
-                    Err(error) => {
-                        return Err(incus_read_told(
-                            &error,
-                            "the instances",
-                            &subject,
-                            "The instance carries Arca's mark already, and its record is made by the next service call that Incus answers: service_list shows it. Do not propose the import again.",
-                        ));
-                    }
-                };
-                adopt_services(&self.kernel, &self.cfg, &rows, &cidr, &gateway, now)?;
+                let record_pending = "The instance carries Arca's mark already, and its record is made by the next service call that Incus answers: service_list shows it. Do not propose the import again.";
+                let rows =
+                    match read_again_once(&read, "/1.0/instances?all-projects=true&recursion=1") {
+                        Ok(rows) => rows.as_array().cloned().unwrap_or_default(),
+                        Err(arca_incus::IncusError::Status { code: 404, .. }) => Vec::new(),
+                        Err(error) => {
+                            return Err(incus_read_told(
+                                &error,
+                                "the instances",
+                                &subject,
+                                record_pending,
+                            ));
+                        }
+                    };
+                let skipped = adopt_services(&self.kernel, &self.cfg, &rows, &cidr, &gateway, now)?;
                 let entries = lock(&self.kernel)?.entries().to_vec();
                 let Some((_, config)) = service_entries(&entries)
                     .into_iter()
                     .find(|(_, config)| config.name == name && config.adopted)
                 else {
+                    if self
+                        .cfg
+                        .kernel
+                        .import_services
+                        .iter()
+                        .find(|listed| listed.name == name)
+                        .is_some_and(|listed| {
+                            skipped.contains(&(listed.project.clone(), name.clone()))
+                        })
+                    {
+                        return Err(service_refused(format!(
+                            "import service {name}: {record_pending}"
+                        )));
+                    }
                     return Err(service_refused(format!(
                         "import service {name}: the instance is marked, but its keys no longer read as a service record; service_list shows it as failed, and service_release takes the mark off"
                     )));

@@ -840,6 +840,20 @@ impl FakeIncus {
         ));
     }
 
+    /// Serves the next matching GETs normally before subsequent scripted read faults.
+    pub fn pass_reads(&self, path_prefix: &str, times: u32) {
+        lock(&self.shared.read_faults).push((path_prefix.to_string(), times, ReadFault::Pass));
+    }
+
+    /// Answers the next matching GETs with a 200 success envelope containing `metadata`.
+    pub fn answer_reads(&self, path_prefix: &str, times: u32, metadata: Value) {
+        lock(&self.shared.read_faults).push((
+            path_prefix.to_string(),
+            times,
+            ReadFault::Metadata(metadata),
+        ));
+    }
+
     /// Takes the next `times` GETs whose target starts with `path_prefix` and never answers them: each is held until the
     /// client hangs up, as an Incus that has stopped answering does. A client's deadline is then the only way out of the
     /// read, however late the client's thread gets to look. An answer sent some time after the deadline instead can
@@ -1475,8 +1489,12 @@ fn console_body(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)> {
 }
 
 /// What the fake does to a read it was told to answer badly.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ReadFault {
+    /// A normal read, used to place later faults at a particular read boundary.
+    Pass,
+    /// A success envelope with the supplied metadata, including wrong-typed bodies.
+    Metadata(Value),
     /// It answers with this status and an error envelope.
     Status(u16),
     /// It never answers, and lets go of the request once the client has hung up.
@@ -1492,7 +1510,7 @@ fn take_read_fault(shared: &Shared, target: &str) -> Option<ReadFault> {
         .iter()
         .position(|(prefix, left, _)| *left > 0 && target.starts_with(prefix.as_str()))?;
     faults[index].1 -= 1;
-    Some(faults[index].2)
+    Some(faults[index].2.clone())
 }
 
 /// Reads from the client until it hangs up, or for a minute at most, and answers nothing.
@@ -1529,8 +1547,9 @@ fn handle(shared: &Shared, request: &Request, fault: Option<ReadFault>) -> (u16,
                     error_envelope(status, "the fake was told to fail this read"),
                 );
             }
+            Some(ReadFault::Metadata(metadata)) => return sync(metadata),
             Some(ReadFault::Slow(delay)) => std::thread::sleep(delay),
-            Some(ReadFault::Unanswered) | None => {}
+            Some(ReadFault::Pass | ReadFault::Unanswered) | None => {}
         }
     }
     let route = parse(&request.target);
