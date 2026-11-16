@@ -1815,6 +1815,11 @@ impl ToolHandler for ActionPropose {
             let entries = kernel.entries().to_vec();
             let name = service_reach::connect_name(&payload, kernel.host())?;
             drop(kernel);
+            if let Some(refusal) =
+                service_external::recorded_refusal(node, "service_create", &json!({"name":name}))
+            {
+                return Err(refusal);
+            }
             service_reach::edge_name(&entries)?;
             let mut create = json!({"name":name, "template":"tailscale", "start":false});
             for key in ["image", "templateDigest"] {
@@ -7733,6 +7738,9 @@ impl ServiceHandler {
             args["name"] = json!(name);
             args["template"] = json!("tailscale");
             args["start"] = json!(false);
+            if let Some(refusal) = service_external::recorded_refusal(&self.cfg, direction, &args) {
+                return Err(refusal);
+            }
         }
         let _publish = matches!(
             self.verb,

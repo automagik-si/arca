@@ -32,6 +32,10 @@ fn rig() -> (Rig, common::SkKey) {
 }
 
 fn proposed(rig: &Rig, args: Value) -> Value {
+    try_proposed(rig, args).unwrap()
+}
+
+fn try_proposed(rig: &Rig, args: Value) -> Result<Value, CallError> {
     let plans: HashMap<_, _> = arca::handlers::plan_handlers_served(
         rig.kernel.clone(),
         Arc::new(|| NOW),
@@ -44,9 +48,7 @@ fn proposed(rig: &Rig, args: Value) -> Value {
     )
     .into_iter()
     .collect();
-    plans["action_propose"]
-        .call(json!({"action":"reach_connect","args":args}), &doctor())
-        .unwrap()
+    plans["action_propose"].call(json!({"action":"reach_connect","args":args}), &doctor())
 }
 
 fn approved_args(rig: &Rig, key: &common::SkKey, proposal: &Value) -> (Value, String) {
@@ -494,6 +496,35 @@ fn an_approval_binds_the_template_and_cannot_be_replayed() {
     assert!(rig.call("reach_connect", args).is_err());
     assert!(
         rig.get(&format!("/1.0/instances/changed-ts?project={PROJECT}"))
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_keeps_the_create_namespace_rule_for_recorded_programs() {
+    let (rig, key) = rig();
+    let add = || {
+        rig.call(
+            "external_add",
+            json!({"name":"node1-ts", "kind":"host-program", "address":"http://127.0.0.1:1/mcp"}),
+        )
+        .unwrap()
+    };
+    add();
+    assert!(
+        matches!(try_proposed(&rig, json!({"kind":"tailscale"})), Err(CallError::Refused { message, .. }) if message.contains("external_remove"))
+    );
+    rig.call("external_remove", json!({"name":"node1-ts"}))
+        .unwrap();
+    let proposal = proposed(&rig, json!({"kind":"tailscale"}));
+    let (mut args, grant) = approved_args(&rig, &key, &proposal);
+    args["approval"] = json!(grant);
+    add();
+    assert!(
+        matches!(rig.call("reach_connect", args), Err(CallError::Refused { message, .. }) if message.contains("external_remove"))
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/node1-ts?project={PROJECT}"))
             .is_none()
     );
 }
