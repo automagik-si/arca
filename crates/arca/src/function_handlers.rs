@@ -379,6 +379,7 @@ impl ServiceHandler {
     pub(super) fn call_function(
         &self,
         args: &Value,
+        caller: &Caller,
         read: &UnixIncus,
         entries: &[Entry],
         rows: &[Value],
@@ -479,6 +480,16 @@ impl ServiceHandler {
                     )));
                 }
                 let id = entry.id.clone();
+                // The edges this function is linked to, with the addresses they allow the PROXY header from now: the
+                // removal takes its grant off each, and each one's Caddyfile is written again once it ran.
+                let edges = service_entries(entries)
+                    .into_iter()
+                    .filter(|(_, other)| {
+                        other.edge.is_some()
+                            && other.incoming.iter().any(|grant| grant.consumer == name)
+                    })
+                    .map(|(edge, cfg)| (edge.id, crate::route::linked(&cfg.incoming)))
+                    .collect::<Vec<_>>();
                 let removal = {
                     let _write = self.writes.lock().map_err(|_| internal())?;
                     let mut kernel = lock(&self.kernel)?;
@@ -514,6 +525,10 @@ impl ServiceHandler {
                 runner.forget(&name);
                 // The image it was fetched from with a registry's credential goes with its last user.
                 self.drop_fetched_images(read, &config);
+                // What the edge did is not part of this answer: a write it did not take is made by its next change.
+                for (edge, before) in &edges {
+                    let _ = self.edge_relinked(edge, before, caller);
+                }
                 Ok(json!({ "removed": true }))
             }
             "function_create" => {
@@ -521,7 +536,7 @@ impl ServiceHandler {
                 if !preapproved {
                     return Err(import_not_approved());
                 }
-                self.create_function(args, read, entries, rows, cidr, gateway, now)
+                self.create_function(args, caller, read, entries, rows, cidr, gateway, now)
             }
             _ => Err(service_not_found("unknown function verb")),
         }
@@ -533,6 +548,7 @@ impl ServiceHandler {
     fn create_function(
         &self,
         args: &Value,
+        caller: &Caller,
         read: &UnixIncus,
         entries: &[Entry],
         rows: &[Value],
@@ -701,6 +717,8 @@ impl ServiceHandler {
         else {
             return Err(internal());
         };
+        // The edges among the linked services, with the addresses they allowed the PROXY header from before this one.
+        let mut edges = Vec::new();
         let opened: Result<(), CallError> = (|| {
             if linked.is_empty() {
                 return Ok(());
@@ -713,6 +731,12 @@ impl ServiceHandler {
                 else {
                     return Err(service_refused("a linked service is gone"));
                 };
+                if provider.edge.is_some() {
+                    edges.push((
+                        provider_entry.id.clone(),
+                        crate::route::linked(&provider.incoming),
+                    ));
+                }
                 provider.environment_patch = Some(BTreeSet::new());
                 provider.incoming.retain(|grant| grant.consumer != name);
                 provider.incoming.push(ServiceGrant {
@@ -734,6 +758,11 @@ impl ServiceHandler {
             return Err(service_refused(format!(
                 "create function {name}: the function was created, but a linked service could not be opened to it ({why}). Its runs cannot reach that service: function_remove removes it, and the create is proposed again"
             )));
+        }
+        // Each linked edge allows the PROXY header from the function's address too. What the edge did is not part of the
+        // function's answer: a write it did not take is made by its next change.
+        for (edge, before) in &edges {
+            let _ = self.edge_relinked(edge, before, caller);
         }
         let runner = self.runner()?;
         Ok(function_view(&config, runner))

@@ -1554,7 +1554,7 @@ fn an_update_of_an_edge_writes_the_routes_it_records_onto_the_new_root_before_it
         .get(&format!("{PROJECT}/edge:{EDGE_CONFIG}"))
         .map(|bytes| String::from_utf8(bytes.clone()).unwrap())
         .expect("the edge's config");
-    assert_eq!(root, arca::route::caddyfile(&record));
+    assert_eq!(root, arca::route::caddyfile(&record, &[]));
     assert!(root.contains("second.example.com"), "{root}");
     let steps: Vec<(String, bool)> = journal(&rig);
     let at = |name: &str| steps.iter().position(|(step, _)| step == name);
@@ -1623,7 +1623,7 @@ fn an_edge_update_that_rolls_back_writes_its_routes_onto_the_old_root_too() {
         .get(&format!("{PROJECT}/edge:{EDGE_CONFIG}"))
         .map(|bytes| String::from_utf8(bytes.clone()).unwrap())
         .expect("the edge's config");
-    assert_eq!(root, arca::route::caddyfile(&record));
+    assert_eq!(root, arca::route::caddyfile(&record, &[]));
 }
 
 #[test]
