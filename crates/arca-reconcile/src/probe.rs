@@ -277,6 +277,7 @@ impl<S: JournalStore> Reconciler<S> {
         spec: &ProbeSpec,
         now_ms: u64,
     ) -> Result<Vec<ProbeRow>, ProbeError> {
+        self.settle_open_intents(now_ms);
         if self.blocked() {
             return Err(ProbeError::Effect(EffectRefusal::Provider(
                 BLOCKED_WHY.to_string(),
@@ -352,6 +353,7 @@ impl<S: JournalStore> Reconciler<S> {
         approve: impl FnOnce(&Digest) -> String,
         verifier: &mut ApprovalVerifier<V, N>,
     ) -> Result<PlanRun, ProbeError> {
+        self.settle_open_intents(now_ms);
         if self.blocked() {
             return Err(ProbeError::Approval(ApprovalRefusal::Unresolved));
         }

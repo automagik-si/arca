@@ -45,7 +45,7 @@ const MAX_WRITE_BODY: usize = 1024 * 1024;
 pub const OPERATION_DEADLINE: Duration = Duration::from_secs(600);
 /// The `timeout` a wait request carries, in seconds. The server holds the wait that long at most.
 const WAIT_SECONDS: u64 = 5;
-/// The deadline of one wait request. It is longer than the server's hold, so the hold never reads as a failure.
+/// The deadline of a PATCH or one operation wait request. Longer than the server's hold, so the hold never reads as a failure.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The pause before a wait that answered "running" is asked again, so a server that answers at once is not spun on.
 const POLL_PAUSE: Duration = Duration::from_millis(100);
@@ -974,7 +974,12 @@ impl UnixIncusWriter {
         if_match: Option<&str>,
         body: Option<&Value>,
     ) -> Result<Framed, IncusError> {
-        self.send_within(method, url, if_match, body, TIMEOUT)
+        let timeout = if method == "PATCH" {
+            WAIT_TIMEOUT
+        } else {
+            TIMEOUT
+        };
+        self.send_within(method, url, if_match, body, timeout)
     }
 
     /// Sends one request the caller has already checked, under `timeout`, as [`Self::send_within`] sends it. It skips the

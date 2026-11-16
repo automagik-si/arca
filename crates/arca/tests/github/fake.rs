@@ -54,6 +54,9 @@ pub struct Seen {
 
 pub struct FakeState {
     pub org: String,
+    pub repository_app: bool,
+    pub repository_app_slug: String,
+    pub repository_bot_login: Option<String>,
     /// The person has typed the code and authorised.
     pub authorized: bool,
     /// The person declined.
@@ -123,6 +126,9 @@ impl Fake {
         };
         let state = Arc::new(Mutex::new(FakeState {
             org: org.to_string(),
+            repository_app: false,
+            repository_app_slug: "arca-repositories".into(),
+            repository_bot_login: None,
             authorized: false,
             declined: false,
             restricted: false,
@@ -325,6 +331,32 @@ fn answer(
             && !s.app_deleted);
     let installation_path = format!("/api/app/installations/{INSTALLATION}");
     match (method, path) {
+        ("GET", p) if p.starts_with("/api/repos/") && p.ends_with("/installation") => {
+            if !s.repository_app
+                || !s.installed
+                || s.suspended
+                || s.app_deleted
+                || !app_jwt_ok(s, auth)
+            {
+                return (404, message("Not Found"));
+            }
+            let repo = p
+                .trim_start_matches("/api/repos/")
+                .trim_end_matches("/installation");
+            if !s.repositories.iter().any(|(_, name)| name == repo) {
+                return (404, message("Not Found"));
+            }
+            (200, json!({"id":INSTALLATION}))
+        }
+        ("GET", p) if p == format!("/api/users/{}%5Bbot%5D", s.repository_app_slug) => {
+            if auth != "none" {
+                return (401, message("bot lookup must not carry a credential"));
+            }
+            (
+                200,
+                json!({"id":7007,"login":s.repository_bot_login.clone().unwrap_or_else(|| format!("{}[bot]", s.repository_app_slug)),"type":"Bot"}),
+            )
+        }
         ("POST", p) if p == format!("/api/app-manifests/{MANIFEST_CODE}/conversions") => {
             if auth != "none" || s.app_made {
                 return (404, message("Not Found"));
@@ -334,7 +366,7 @@ fn answer(
                 201,
                 json!({
                     "id": APP_ID,
-                    "slug": APP_SLUG,
+                    "slug": if s.repository_app { s.repository_app_slug.as_str() } else { APP_SLUG },
                     "client_id": APP_CLIENT_ID,
                     "client_secret": "fake-app-client-secret",
                     "webhook_secret": null,

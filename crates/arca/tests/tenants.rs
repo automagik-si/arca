@@ -4,6 +4,9 @@ mod common;
 #[path = "tenants/image_import.rs"]
 mod image_import;
 
+#[path = "tenants/container_options.rs"]
+mod container_options;
+
 use arca::{
     config::NodeConfig,
     handlers::{

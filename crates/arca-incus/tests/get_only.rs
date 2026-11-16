@@ -768,3 +768,18 @@ fn the_live_summary_counts_while_the_shim_keeps_serving() {
         ShimSummary { get: 2, refused: 1 }
     );
 }
+
+#[test]
+fn an_expired_total_budget_is_shared_by_clones_and_next_reads() {
+    let dir = Scratch::new("shared-budget");
+    let fake = FakeIncus::start(&dir.0, fixture()).unwrap();
+    let client =
+        UnixIncus::new(fake.socket().to_path_buf()).with_total_budget(Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(client.clone().get("/1.0"), Err(IncusError::Timeout));
+    assert_eq!(client.get("/1.0"), Err(IncusError::Timeout));
+    assert!(
+        fake.requests().is_empty(),
+        "the next read cannot start another timeout window"
+    );
+}

@@ -10,6 +10,25 @@ property replacement explicitly. Completed steps stay in the tenant's store afte
 them. There is no import record, automatic rollback or delete. Success and refusal outcomes have closed schemas.
 Repeated completed imports send no Incus writes. No file or remote fetch is accepted. See docs/OPERATING.md.
 
+A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
+its old values may precede a late synchronous PATCH: Arca keeps the original values as its inverse and retries the
+entry on the next document, rather than claiming the change did not land. Gateway errors (502/503/504) also leave the
+answer uncertain for config and ACL array PATCHes and synchronous creates; ACL array PATCHes keep their original rules
+as the inverse when an uncertain answer still reads as the old rules. Runtime recovery polls open intents without
+waiting on Incus operations, with one 5 s Incus I/O budget; an absent synchronous create stays open until it can be read
+back present or restart recovery settles it. PATCH requests get 30 seconds, and service config errors include the
+kernel's reason in the answer and log.
+
+The effect journal supports a binding record from this release; once one is written, older Arca versions refuse the journal.
+
+Container templates may set `rootSize` and `portIsolation`. The root size counts with the data volume against a
+tenant's disk cap at create. Without these keys, containers keep their previous disk and NIC settings; created
+services keep their recorded values through reconfigure, image updates and rollback. A tenant's front rule excludes
+the service's `droiddPort` control port, leaving no front rule when that is its only port. On an existing node, a
+tenant service made from the shipped `omni-api` template loses its front rule at the next reconcile of its record;
+the host bridge's control rule stays. Approval cards show a container's requested root size in both the node and a
+tenant. See docs/OPERATING.md.
+
 ## 0.34.0 (2026-11-16)
 
 Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
@@ -54,7 +73,8 @@ whole-disk snapshot storage: kernel device origins are checked, and unreadable o
 free. A mounted mapped image now has the `system` role with no folder offer, where it could previously be `in use`
 and offered as a folder target. `storage_add` refuses these devices before an exclusive open or any write, including
 when the device becomes a mapped image after approval; SATA, NVMe (including native multipath), USB and a VM's own
-virtio disks keep their offers.
+virtio disks keep their offers. Disks attached over iSCSI, Fibre Channel or SRP, and NVMe over fabrics with native
+multipath, count as machine disks and are protected only by the usual in-use checks.
 The `automagik-workspace` template prepares workspace homes, the CLI store, workspace, secrets and run directories
 under its existing persistent `/data` mount; `HOME` and `AUTOMAGIK_HOME` are `/data`. The server runs as the configured
 image user and requires `automagikPnpm`, explicitly pinned to the image's `/usr/local/bin/pnpm`, with no fallback.
