@@ -55,6 +55,10 @@ pre-populated. The current image pin stays. The operating guide adds admission, 
 remaining owner actions for one workspace per project, with passkey/phone sign-in prerequisites. This prepares
 the template; it deploys nothing.
 
+Arca writes and syncs the console's token before publishing its PID at startup. A console reading the token as soon as
+that PID appears no longer finds a missing or previous token; a second start refused by a live node still leaves its
+token file alone.
+
 ## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it

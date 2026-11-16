@@ -1023,12 +1023,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }
         };
         tokio::select! {
-            // The pid file is published the moment the socket is this process's own, and before any request is served: a
-            // start that is refused never reaches it, so the file never names a process that holds no listener.
-            // The console's token file is written there too, so a refused start never touches a live node's file, and a
-            // file that cannot be written stops the start.
+            // Publish the pid only after this process owns the socket and its console token is written and synced,
+            // before any request is served. A refused start never touches a live node's token file; a token write
+            // failure stops the start without publishing a pid.
             result = serve_unix_bound(router.clone(), &unix_path, || {
-                publish_pid(&pid_path);
                 match &console {
                     Some(console) => console.write().map(|()| {
                         eprintln!(
@@ -1041,7 +1039,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                         format!("the console's token file was not written: {error}"),
                     )),
                     None => Ok(()),
-                }
+                }?;
+                publish_pid(&pid_path);
+                Ok(())
             }) => result,
             result = loopback => result,
             result = loopback_twin => result,
