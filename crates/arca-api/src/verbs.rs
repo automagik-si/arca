@@ -4549,6 +4549,9 @@ fn action_args() -> Value {
             }
             if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
                 properties.remove("approval");
+                if *name == "service_rebind" {
+                    properties.remove("binding");
+                }
                 for field in kernel_filled(name) {
                     if let Some(own) = properties.get_mut(*field) {
                         let words = own["description"]

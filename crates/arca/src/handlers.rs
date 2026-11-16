@@ -7134,7 +7134,19 @@ fn rebound_service_removal_refused(
             .2
             .as_ref()
             .and_then(|body| body["used_by"].as_array())
-            .is_some_and(|uses| !uses.is_empty());
+            .is_some_and(|uses| {
+                uses.iter().filter_map(Value::as_str).any(|reference| {
+                    let (path, query) = reference.split_once('?').unwrap_or((reference, ""));
+                    let Some(name) = path.strip_prefix("/1.0/instances/") else {
+                        return false;
+                    };
+                    let project = query
+                        .split('&')
+                        .find_map(|field| field.strip_prefix("project="))
+                        .unwrap_or("default");
+                    name != config.instance || project != config.project
+                })
+            });
         objects.push(format!("{} ({})", acl.0, config.acl()));
     }
     if acl_exists && !referenced {
@@ -7147,6 +7159,9 @@ fn rebound_service_removal_refused(
             .is_some_and(|rows| {
                 rows.iter().any(|row| {
                     row["project"].as_str() == Some(config.project.as_str())
+                        && row["name"]
+                            .as_str()
+                            .is_some_and(|name| name != config.instance)
                         && row["devices"].as_object().is_some_and(|devices| {
                             devices.values().any(|device| {
                                 device["security.acls"].as_str().is_some_and(|acls| {

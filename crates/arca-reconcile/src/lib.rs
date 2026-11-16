@@ -331,7 +331,9 @@ impl<S: JournalStore> Reconciler<S> {
     }
 
     /// Accept a storage projection of a committed binding without applying its
-    /// plugin. The caller projects the same facts into the durable desired store.
+    /// plugin. The caller must pass this entry from the signed document after
+    /// projecting only the live binding's storage into its durable desired store.
+    /// A gate Hold is valid when only the UUID changed: the document is unchanged.
     pub fn resume_binding(
         &mut self,
         doc: &SignedDocument,

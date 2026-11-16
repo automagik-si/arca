@@ -1844,6 +1844,9 @@ with "service ownership or UUID changed". Ask for an approved re-bind:
 Send this to `action_propose` with doctor scope. The owner's card names the old and replacement
 identities, root pools and data volumes. Arca reads them from Incus; the caller supplies only the
 service name. If identity, ownership, config or devices change before execution, propose again.
+Do not start or stop the copy between the card and approval: runtime config also participates in the check.
+If the binding is journalled but the service record cannot be saved, another re-bind is refused until a
+successful state save; restore state-directory writes and restart Arca to recover before retrying.
 The re-bind writes only Arca's state and recovers its storage record before startup reconciliation.
 The previous instance and volume stay unchanged; removal follows only the replacement.
 

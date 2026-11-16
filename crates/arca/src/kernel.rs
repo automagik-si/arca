@@ -47,6 +47,11 @@ impl AppliedSeq {
     }
 }
 
+pub(crate) enum BindingCommitFailure {
+    NotAppended,
+    Unconfirmed,
+}
+
 /// The kernel of one node: its desired-state store, its reconciler, the approval verifier for delete plans, and the inert
 /// action proposals an owner may approve with a passkey.
 pub struct Kernel {
@@ -310,6 +315,9 @@ impl Kernel {
             journal::{BindingState, EffectClass, Inverse},
             ownership::IncusKind,
         };
+        if self.store.binding_unsaved() {
+            return Err(KernelError::Journal("the previous binding is journalled but its service record is not saved; restore state-directory writes and restart Arca, or complete a successful state save, before another re-bind".into()));
+        }
         let journal = self.reconciler.journal();
         let refuse =
             || KernelError::Journal("the service has no current, converged binding".into());
@@ -366,26 +374,34 @@ impl Kernel {
         &mut self,
         event: arca_kernel::journal::BindingEvent,
         now_ms: u64,
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), BindingCommitFailure> {
         let entry_id = event.entry.clone();
-        self.reconciler.bind(event.clone())?;
-        let persisted = self.store.recover_bindings(&[event], now_ms);
-        // Even a failed cache write leaves the in-memory storage on the durable
-        // binding. Ordinary actions cannot fall back to the backup's pool.
-        let signed = self
-            .store
-            .current()
-            .cloned()
-            .ok_or_else(|| KernelError::Journal("bound service document disappeared".into()))?;
-        let entry = signed
-            .document
-            .entries
-            .iter()
-            .find(|entry| entry.id == entry_id)
-            .ok_or_else(|| KernelError::Journal("bound service record disappeared".into()))?;
-        self.reconciler.resume_binding(&signed, entry, now_ms)?;
-        self.applied_seq.publish(Some(signed.document.seq));
-        persisted
+        if self.reconciler.bind(event.clone()).is_err() {
+            return Err(if self.reconciler.journal().poisoned().is_none() {
+                BindingCommitFailure::NotAppended
+            } else {
+                BindingCommitFailure::Unconfirmed
+            });
+        }
+        (|| -> Result<(), KernelError> {
+            let persisted = self.store.recover_bindings(&[event], now_ms);
+            // Even a failed cache write leaves the in-memory storage on the durable
+            // binding. Ordinary actions cannot fall back to the backup's pool.
+            let signed =
+                self.store.current().cloned().ok_or_else(|| {
+                    KernelError::Journal("bound service document disappeared".into())
+                })?;
+            let entry = signed
+                .document
+                .entries
+                .iter()
+                .find(|entry| entry.id == entry_id)
+                .ok_or_else(|| KernelError::Journal("bound service record disappeared".into()))?;
+            self.reconciler.resume_binding(&signed, entry, now_ms)?;
+            self.applied_seq.publish(Some(signed.document.seq));
+            persisted
+        })()
+        .map_err(|_| BindingCommitFailure::Unconfirmed)
     }
 
     pub fn retained_entries(

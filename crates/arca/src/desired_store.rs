@@ -79,6 +79,8 @@ pub struct DesiredStore {
     applied: Option<Applied>,
     converged: Vec<Entry>,
     retained: Retained,
+    // A durable binding must reach the state file before another binding can replace it.
+    binding_unsaved: bool,
 }
 
 impl DesiredStore {
@@ -119,6 +121,7 @@ impl DesiredStore {
             applied,
             converged: state.converged,
             retained,
+            binding_unsaved: false,
         })
     }
 
@@ -135,6 +138,10 @@ impl DesiredStore {
     /// The document the gate last applied, if any.
     pub fn applied(&self) -> Option<&Applied> {
         self.applied.as_ref()
+    }
+
+    pub(crate) fn binding_unsaved(&self) -> bool {
+        self.binding_unsaved
     }
 
     /// The entries that applied with their current config, as the reconciler last reported them.
@@ -273,6 +280,7 @@ impl DesiredStore {
         });
         self.current = next.current.clone();
         self.converged = next.converged.clone();
+        self.binding_unsaved = true;
         self.persist(&next)
     }
 
@@ -296,7 +304,7 @@ impl DesiredStore {
 
     /// Writes `state` to a new file, makes it durable, and renames it over the state file. A failure leaves the old file in
     /// place.
-    fn persist(&self, state: &StateFile) -> Result<(), KernelError> {
+    fn persist(&mut self, state: &StateFile) -> Result<(), KernelError> {
         let bytes = serde_json::to_vec(state).map_err(|_| KernelError::Io {
             path: STATE_FILE.to_string(),
             why: "the state does not serialize".to_string(),
@@ -322,6 +330,7 @@ impl DesiredStore {
         File::open(&self.dir)
             .and_then(|dir| dir.sync_all())
             .map_err(|error| io_error(&self.dir, &error))?;
+        self.binding_unsaved = false;
         Ok(())
     }
 }
