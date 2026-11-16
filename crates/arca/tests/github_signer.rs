@@ -1382,7 +1382,10 @@ async fn repository_15_second_app_mints_one_repo_and_exact_permissions_without_c
             .unwrap();
         let manifest: Value = serde_json::from_str(&start.manifest).unwrap();
         let permissions = json!({"contents":"write","pull_requests":"write","metadata":"read"});
-        assert_eq!(manifest["name"], "Arca repositories");
+        assert_eq!(manifest["name"], format!("Arca repositories {}", &start.state[..6]));
+        let another = signer.repository_app_begin("acme", "https://arca.example", "page").unwrap();
+        let another_manifest: Value = serde_json::from_str(&another.manifest).unwrap();
+        assert_ne!(manifest["name"], another_manifest["name"]);
         assert_eq!(manifest["default_permissions"], permissions);
         assert_eq!(manifest["public"], false);
         assert_eq!(manifest["hook_attributes"]["active"], false);
