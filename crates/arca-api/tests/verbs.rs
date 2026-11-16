@@ -2270,3 +2270,40 @@ fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
         }
     }
 }
+
+#[test]
+fn tenant_image_import_exposes_closed_success_and_refusal_outcomes() {
+    let schema = (verb("tenant_image_import").unwrap().result)();
+    for kind in ["imported", "completed", "alreadyPresent"] {
+        let reply = json!({ "tenant": "abcdefgh", "project": "arcak-t-abcdefgh",
+            "fingerprint": "a".repeat(64), "alias": "app", "kind": kind,
+            "imageWrite": kind == "imported", "aliasWrite": kind != "alreadyPresent" });
+        conforms(&schema, &reply).expect("closed success");
+        let mut bad = reply.clone();
+        bad["kind"] = json!("other");
+        assert!(conforms(&schema, &bad).is_err());
+    }
+    let refusals = &schema["x-arca-refusal-data"];
+    for code in [
+        "StaleCard",
+        "AliasTaken",
+        "SourceMissing",
+        "PartialImport",
+        "ImportFailed",
+    ] {
+        let data = json!({ "refusal": code, "imageState": "present", "aliasState": "absent",
+            "imageWrite": true, "aliasWrite": false, "fingerprint": "a".repeat(64),
+            "properties": { "extra": "from default" }, "proposeAgain": true });
+        conforms(refusals, &data).expect("closed refusal");
+        let mut bad = data.clone();
+        bad["refusal"] = json!("PropertiesDiffer");
+        assert!(
+            conforms(refusals, &bad).is_err(),
+            "different properties are an explicit card, not a blind refusal"
+        );
+        let mut bad = data.clone();
+        bad["imageState"] = json!("other");
+        assert!(conforms(refusals, &bad).is_err());
+    }
+    conforms(refusals, &json!({ "refusal": "NotApproved" })).unwrap();
+}

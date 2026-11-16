@@ -121,26 +121,57 @@ fn image_import_requires_a_one_shot_approved_card_and_rejects_file() {
     );
 }
 
+fn outcome(result: Result<Value, CallError>, code: &str) -> Value {
+    let error = result.expect_err("closed refusal");
+    let data = error.refusal_data().expect("refusal data");
+    assert_eq!(data["refusal"], code, "{error:?}");
+    let schema = (arca_api::verb(VERB).unwrap().result)();
+    arca_api::conforms(&schema["x-arca-refusal-data"], &data).expect("closed refusal schema");
+    data
+}
+
+fn no_deletes(rig: &Rig, before: usize) {
+    assert!(
+        rig.fake().writes()[before..]
+            .iter()
+            .all(|write| write.method != "DELETE")
+    );
+}
+
+fn native_copy(rig: &Rig, project: &str, fingerprint: &str) {
+    image_request(
+        rig,
+        "POST",
+        &format!("/1.0/images?project={project}"),
+        json!({ "source": { "type": "image", "fingerprint": fingerprint }, "profiles": [] }),
+    );
+}
+
+fn default_properties(rig: &Rig, fingerprint: &str) -> Value {
+    native_copy(rig, "default", fingerprint);
+    let older = json!({ "extra": "from default", "type": "older" });
+    put_properties(rig, "default", fingerprint, older.clone());
+    older
+}
+
 #[test]
-fn image_import_copies_the_exact_image_and_post_publish_properties_and_repeats_without_writes() {
+fn image_import_copies_post_publish_properties_and_repeats_without_any_write_or_record() {
     let (rig, fingerprint) = setup();
     let properties = json!({ "type": "app", "architecture": "x86_64", "custom": "after publish" });
     set_properties(&rig, &fingerprint, properties.clone());
     let source = rig
         .get(&format!("/1.0/images/{fingerprint}?project={PROJECT}"))
         .unwrap();
-    let done = rig
-        .approved(VERB, args(&fingerprint))
-        .expect("approved import");
-    assert_eq!(done["fingerprint"], fingerprint);
-    let copied = target(&rig, &fingerprint).expect("the tenant's copy");
-    assert_eq!(copied["properties"], properties);
-    assert!(
-        copied["aliases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|alias| alias["name"] == "app")
+    let card = proposal(&rig, args(&fingerprint)).unwrap();
+    assert_eq!(card["args"]["destination"]["kind"], "absent");
+    let done = approve(&rig, &card).unwrap();
+    assert_eq!(done["kind"], "imported");
+    assert_eq!(done["imageWrite"], true);
+    assert_eq!(done["aliasWrite"], true);
+    arca_api::conforms(&(arca_api::verb(VERB).unwrap().result)(), &done).unwrap();
+    assert_eq!(
+        target(&rig, &fingerprint).unwrap()["properties"],
+        properties
     );
     assert!(
         rig.get(&format!("/1.0/images/{fingerprint}?project={}", project(B)))
@@ -151,273 +182,250 @@ fn image_import_copies_the_exact_image_and_post_publish_properties_and_repeats_w
             .unwrap(),
         source
     );
+    assert!(!rig.dir.join("tenant-image-imports.jsonl").exists());
     let rig = rig.restart();
     let before = rig.fake().writes().len();
-    assert_eq!(
-        rig.approved(VERB, args(&fingerprint)).unwrap()["imported"],
-        false
+    let done = rig.approved(VERB, args(&fingerprint)).unwrap();
+    assert_eq!(done["kind"], "alreadyPresent");
+    assert_eq!(done["imageWrite"], false);
+    assert_eq!(done["aliasWrite"], false);
+    assert_eq!(rig.fake().writes().len(), before);
+    rig.template(
+        "app",
+        json!({ "name": "app", "kind": "system", "image": "local:app",
+        "digest": format!("sha256:{fingerprint}") }),
     );
-    assert_eq!(
-        rig.fake().writes().len(),
-        before,
-        "repeat sends no Incus write"
-    );
-    let template = json!({ "name": "app", "kind": "system", "image": "local:app", "digest": format!("sha256:{fingerprint}") });
-    rig.template("app", template);
     rig.call(
         "service_create",
         json!({ "name": "app", "template": "app", "tenant": A }),
     )
-    .expect("pinned create from the imported image");
+    .unwrap();
 }
 
 #[test]
-fn image_import_missing_source_bad_fingerprint_and_taken_alias_write_nothing() {
+fn image_import_completes_an_equal_preexisting_image_with_only_an_alias_write() {
     let (rig, fingerprint) = setup();
-    proposal(&rig, args(&fingerprint)).expect("the valid source is available");
-    for fingerprint in [
-        "a".repeat(64),
+    native_copy(&rig, &project(A), &fingerprint);
+    let card = proposal(&rig, args(&fingerprint)).unwrap();
+    assert_eq!(card["args"]["destination"]["kind"], "sameProperties");
+    let before = rig.fake().writes().len();
+    let done = approve(&rig, &card).unwrap();
+    assert_eq!(done["kind"], "completed");
+    assert_eq!(done["imageWrite"], false);
+    assert_eq!(done["aliasWrite"], true);
+    assert_eq!(rig.fake().writes().len(), before + 1);
+    no_deletes(&rig, before);
+}
+
+#[test]
+fn image_import_replaces_different_properties_only_as_shown_on_the_card() {
+    let (rig, fingerprint) = setup();
+    set_properties(&rig, &fingerprint, json!({ "type": "approved" }));
+    native_copy(&rig, &project(A), &fingerprint);
+    let old = json!({ "type": "previous", "custom": "kept until approved" });
+    put_properties(&rig, &project(A), &fingerprint, old.clone());
+    let before = rig.fake().writes().len();
+    let card = proposal(&rig, args(&fingerprint)).unwrap();
+    assert_eq!(card["args"]["destination"]["kind"], "differentProperties");
+    assert_eq!(card["args"]["destination"]["properties"], old);
+    let words = card["details"].to_string().to_lowercase();
+    assert!(words.contains("different properties") && words.contains("approving replaces"));
+    assert_eq!(rig.fake().writes().len(), before);
+    assert_eq!(target(&rig, &fingerprint).unwrap()["properties"], old);
+    let done = approve(&rig, &card).unwrap();
+    assert_eq!(done["kind"], "completed");
+    assert_eq!(done["imageWrite"], true);
+    assert_eq!(
+        target(&rig, &fingerprint).unwrap()["properties"],
+        json!({ "type": "approved" })
+    );
+    no_deletes(&rig, before);
+}
+
+#[test]
+fn image_import_destination_changes_after_the_card_refuse_before_any_write() {
+    for change in ["appeared", "properties", "alias"] {
+        let (rig, fingerprint) = setup();
+        if change != "appeared" {
+            native_copy(&rig, &project(A), &fingerprint);
+        }
+        let card = proposal(&rig, args(&fingerprint)).unwrap();
+        match change {
+            "appeared" => native_copy(&rig, &project(A), &fingerprint),
+            "properties" => put_properties(
+                &rig,
+                &project(A),
+                &fingerprint,
+                json!({ "changed": "later" }),
+            ),
+            _ => image_request(
+                &rig,
+                "POST",
+                &format!("/1.0/images/aliases?project={}", project(A)),
+                json!({ "name": "app", "target": fingerprint }),
+            ),
+        }
+        let before = rig.fake().writes().len();
+        outcome(approve(&rig, &card), "StaleCard");
+        assert_eq!(rig.fake().writes().len(), before, "{change}");
+    }
+}
+
+#[test]
+fn image_import_a_default_record_supplies_properties_in_project_order() {
+    let (rig, fingerprint) = setup();
+    let older = default_properties(&rig, &fingerprint);
+    native_copy(&rig, &project(B), &fingerprint);
+    assert_eq!(
+        rig.get(&format!("/1.0/images/{fingerprint}?project={}", project(B)))
+            .unwrap()["properties"],
+        older
+    );
+}
+
+#[test]
+fn image_import_a_failed_default_property_correction_completes_from_a_new_card() {
+    let (rig, fingerprint) = setup();
+    set_properties(&rig, &fingerprint, json!({ "type": "approved" }));
+    let default = default_properties(&rig, &fingerprint);
+    rig.fake().fail_image_import_at("properties");
+    let before = rig.fake().writes().len();
+    let data = outcome(rig.approved(VERB, args(&fingerprint)), "PartialImport");
+    assert_eq!(data["imageState"], "present");
+    assert_eq!(data["aliasState"], "absent");
+    assert_eq!(data["fingerprint"], fingerprint);
+    assert_eq!(
+        data["properties"],
+        json!({ "type": "approved", "extra": "from default" })
+    );
+    assert_eq!(data["proposeAgain"], true);
+    no_deletes(&rig, before);
+    let rig = rig.restart();
+    let card = proposal(&rig, args(&fingerprint)).unwrap();
+    assert_eq!(card["args"]["destination"]["kind"], "differentProperties");
+    let before = rig.fake().writes().len();
+    let done = approve(&rig, &card).unwrap();
+    assert_eq!(done["kind"], "completed");
+    assert_eq!(done["imageWrite"], true);
+    assert_eq!(done["aliasWrite"], true);
+    assert_eq!(
+        rig.fake().writes().len(),
+        before + 2,
+        "PUT plus alias POST, no copy"
+    );
+    assert_eq!(
+        target(&rig, &fingerprint).unwrap()["properties"],
+        json!({ "type": "approved" })
+    );
+    assert_eq!(
+        rig.get(&format!("/1.0/images/{fingerprint}?project=default"))
+            .unwrap()["properties"],
+        default
+    );
+    assert!(!rig.dir.join("tenant-image-imports.jsonl").exists());
+    no_deletes(&rig, before);
+}
+
+#[test]
+fn image_import_failures_leave_content_and_a_new_card_completes_it() {
+    for step in ["copy", "copy_after", "alias", "alias_after"] {
+        let (rig, fingerprint) = setup();
+        rig.fake().fail_image_import_at(step);
+        let before = rig.fake().writes().len();
+        let data = outcome(
+            rig.approved(VERB, args(&fingerprint)),
+            if step == "copy" {
+                "ImportFailed"
+            } else {
+                "PartialImport"
+            },
+        );
+        assert_eq!(
+            data["imageState"],
+            if step == "copy" { "absent" } else { "present" }
+        );
+        no_deletes(&rig, before);
+        if step != "copy" {
+            assert!(target(&rig, &fingerprint).is_some());
+        }
+        let rig = rig.restart();
+        let before = rig.fake().writes().len();
+        let done = rig.approved(VERB, args(&fingerprint)).unwrap();
+        assert_eq!(
+            done["kind"],
+            match step {
+                "copy" => "imported",
+                "alias_after" => "alreadyPresent",
+                _ => "completed",
+            }
+        );
+        assert_eq!(
+            rig.fake().writes().len() - before,
+            match step {
+                "copy" => 2,
+                "alias_after" => 0,
+                _ => 1,
+            }
+        );
+        no_deletes(&rig, before);
+    }
+}
+
+#[test]
+fn image_import_an_alias_taken_during_copy_keeps_the_image_and_names_the_state() {
+    let (rig, fingerprint) = setup();
+    let other = rig.fake().add_image(&project(A), "other");
+    rig.fake().fail_image_import_at("alias_taken");
+    let before = rig.fake().writes().len();
+    let data = outcome(rig.approved(VERB, args(&fingerprint)), "AliasTaken");
+    assert_eq!(data["imageState"], "present");
+    assert_eq!(data["aliasState"], "taken");
+    assert_eq!(data["aliasTarget"], other);
+    assert!(target(&rig, &fingerprint).is_some());
+    no_deletes(&rig, before);
+}
+
+#[test]
+fn image_import_missing_source_and_a_known_taken_alias_have_closed_refusals() {
+    let (rig, fingerprint) = setup();
+    let before = rig.fake().writes().len();
+    outcome(proposal(&rig, args(&"a".repeat(64))), "SourceMissing");
+    rig.fake().add_image(&project(A), "app");
+    outcome(proposal(&rig, args(&fingerprint)), "AliasTaken");
+    assert_eq!(rig.fake().writes().len(), before);
+    for invalid in [
         "a".repeat(12),
         "A".repeat(64),
         format!("sha256:{fingerprint}"),
     ] {
+        assert!(proposal(&rig, args(&invalid)).is_err());
+    }
+}
+
+#[test]
+fn image_import_changed_source_or_tenant_is_a_stale_card_without_a_write() {
+    for change in ["source", "tenant"] {
+        let (rig, fingerprint) = setup();
+        let card = proposal(&rig, args(&fingerprint)).unwrap();
+        if change == "source" {
+            set_properties(&rig, &fingerprint, json!({ "changed": "later" }));
+        } else {
+            rig.approved("tenant_remove", json!({ "id": A })).unwrap();
+            rig.create_tenant(json!({ "id": A })).unwrap();
+        }
         let before = rig.fake().writes().len();
-        assert!(proposal(&rig, args(&fingerprint)).is_err());
+        outcome(approve(&rig, &card), "StaleCard");
         assert_eq!(rig.fake().writes().len(), before);
     }
-    let held = rig.fake().add_image(&project(A), "app");
+}
+
+#[test]
+fn image_import_does_not_read_or_change_an_obsolete_import_record() {
+    let (rig, fingerprint) = setup();
+    let path = rig.dir.join("tenant-image-imports.jsonl");
+    fs::write(&path, "not an import record\n").unwrap();
     let before = rig.fake().writes().len();
-    assert!(proposal(&rig, args(&fingerprint)).is_err());
-    assert_eq!(rig.fake().writes().len(), before);
-    assert!(target(&rig, &held).is_some());
-    assert!(target(&rig, &fingerprint).is_none());
-}
-
-#[test]
-fn image_import_rechecks_the_tenant_incarnation_even_at_the_same_timestamp() {
-    let (rig, fingerprint) = setup();
-    let proposed = proposal(&rig, args(&fingerprint)).unwrap();
-    rig.approved("tenant_remove", json!({ "id": A })).unwrap();
-    rig.create_tenant(json!({ "id": A })).unwrap();
-    let before = rig.fake().writes().len();
-    assert!(approve(&rig, &proposed).is_err());
-    assert_eq!(rig.fake().writes().len(), before);
-    assert!(target(&rig, &fingerprint).is_none());
-}
-
-#[test]
-fn image_import_rechecks_source_properties_before_any_write() {
-    let (rig, fingerprint) = setup();
-    let proposed = proposal(&rig, args(&fingerprint)).unwrap();
-    set_properties(&rig, &fingerprint, json!({ "custom": "changed" }));
-    let before = rig.fake().writes().len();
-    assert!(approve(&rig, &proposed).is_err());
-    assert_eq!(rig.fake().writes().len(), before);
-}
-
-#[test]
-fn image_import_copy_and_alias_failures_compensate_only_new_content() {
-    for step in ["copy", "copy_after", "alias", "alias_after"] {
-        let (rig, fingerprint) = setup();
-        let source = rig.get(&format!("/1.0/images/{fingerprint}?project={PROJECT}"));
-        rig.fake().fail_image_import_at(step);
-        assert!(rig.approved(VERB, args(&fingerprint)).is_err(), "{step}");
-        assert!(target(&rig, &fingerprint).is_none(), "{step}");
-        assert_eq!(
-            rig.get(&format!("/1.0/images/{fingerprint}?project={PROJECT}")),
-            source
-        );
-        // A new approval can retry after a confirmed failure and compensation.
-        rig.approved(VERB, args(&fingerprint)).expect("retry");
-    }
-}
-
-#[test]
-fn image_import_failure_keeps_a_preexisting_image_and_alias() {
-    let (rig, fingerprint) = setup();
-    let mut seed = args(&fingerprint);
-    seed["alias"] = json!("seed");
-    rig.approved(VERB, seed).unwrap();
-    let before = target(&rig, &fingerprint).unwrap();
-    rig.fake().fail_image_import_at("alias");
-    assert!(rig.approved(VERB, args(&fingerprint)).is_err());
-    assert_eq!(target(&rig, &fingerprint).unwrap(), before);
-}
-
-#[test]
-fn image_import_rollback_pins_prevent_automatic_image_deletion() {
-    let (rig, fingerprint) = setup();
-    fs::write(
-        rig.dir.join("service-updates.jsonl"),
-        format!(
-            "{}\n",
-            json!({
-                "step": "begin", "detail": { "tenant": A, "fromFingerprint": fingerprint }
-            })
-        ),
-    )
-    .unwrap();
-    rig.fake().fail_image_import_at("alias");
-    assert!(rig.approved(VERB, args(&fingerprint)).is_err());
-    assert!(
-        target(&rig, &fingerprint).is_some(),
-        "a rollback's image is retained"
-    );
-    rig.approved(VERB, args(&fingerprint))
-        .expect("retained image can be imported on a new card");
-}
-
-#[test]
-fn image_import_a_tenant_with_a_live_service_retains_an_ambiguous_failed_copy() {
-    let (rig, fingerprint) = setup();
-    rig.template("app", app_template("app"));
-    rig.call(
-        "service_create",
-        json!({ "name": "web", "template": "app", "tenant": A }),
-    )
-    .unwrap();
-    rig.fake().fail_image_import_at("alias");
-    assert!(rig.approved(VERB, args(&fingerprint)).is_err());
-    assert!(target(&rig, &fingerprint).is_some());
-}
-
-#[test]
-fn image_import_a_lost_completion_and_torn_tail_settle_by_readback_without_writes() {
-    let (rig, fingerprint) = setup();
     rig.approved(VERB, args(&fingerprint)).unwrap();
-    let path = rig.dir.join("tenant-image-imports.jsonl");
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let text = fs::read_to_string(&path).unwrap();
-    let mut rows: Vec<&str> = text.lines().collect();
-    assert_eq!(
-        serde_json::from_str::<Value>(rows.pop().unwrap()).unwrap()["phase"],
-        "Done"
-    );
-    fs::write(&path, format!("{}\n{{\"id\":", rows.join("\n"))).unwrap();
-    let rig = rig.restart();
-    let before = rig.fake().writes().len();
-    assert_eq!(
-        rig.approved(VERB, args(&fingerprint)).unwrap()["imported"],
-        false
-    );
-    assert_eq!(rig.fake().writes().len(), before);
-    let last: Value =
-        serde_json::from_str(fs::read_to_string(&path).unwrap().lines().last().unwrap()).unwrap();
-    assert_eq!(last["phase"], "Done");
-}
-
-#[test]
-fn image_import_an_unknown_copy_outcome_is_not_deleted_until_its_operation_settles() {
-    let (rig, fingerprint) = setup();
-    rig.fake().fail_reads("/1.0/operations/", 2, 500);
-    assert!(rig.approved(VERB, args(&fingerprint)).is_err());
-    assert!(
-        target(&rig, &fingerprint).is_some(),
-        "an unreadable operation never triggers a delete"
-    );
-    rig.approved(VERB, args(&fingerprint))
-        .expect("the settled operation can be recovered");
-}
-
-#[test]
-fn image_import_a_nonprivate_record_refuses_before_any_incus_write() {
-    let (rig, fingerprint) = setup();
-    let path = rig.dir.join("tenant-image-imports.jsonl");
-    fs::write(&path, "").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    let before = rig.fake().writes().len();
-    assert!(rig.approved(VERB, args(&fingerprint)).is_err());
-    assert_eq!(rig.fake().writes().len(), before);
-}
-
-#[test]
-fn image_import_recovers_an_unfinished_copy_before_its_properties_are_set() {
-    let (rig, fingerprint) = setup();
-    rig.fake().fail_reads("/1.0/operations/", 2, 500);
-    assert!(rig.approved(VERB, args(&fingerprint)).is_err());
-    // Model a crash before replacing extra database metadata on a copy reused from another project.
-    put_properties(
-        &rig,
-        &project(A),
-        &fingerprint,
-        json!({ "extra": "other project" }),
-    );
-    let rig = rig.restart();
-    rig.approved(VERB, args(&fingerprint))
-        .expect("settle the recorded copy, then retry");
-    assert_eq!(target(&rig, &fingerprint).unwrap()["properties"], json!({}));
-}
-
-#[test]
-fn image_import_replaces_extra_database_properties_reused_from_another_project() {
-    let (rig, fingerprint) = setup();
-    let older = json!({ "extra": "only in the other project" });
-    set_properties(&rig, &fingerprint, older.clone());
-    let copy = json!({ "source": { "type": "image", "fingerprint": fingerprint }, "profiles": [] });
-    image_request(
-        &rig,
-        "POST",
-        &format!("/1.0/images?project={}", project(B)),
-        copy.clone(),
-    );
-    let other = rig
-        .get(&format!("/1.0/images/{fingerprint}?project={}", project(B)))
-        .unwrap();
-    assert_eq!(
-        other["properties"], older,
-        "native copy carries database properties without request overrides"
-    );
-    // Put the node's row after the other project's row, so native reuse selects that older metadata.
-    image_request(
-        &rig,
-        "DELETE",
-        &format!("/1.0/images/{fingerprint}?project={PROJECT}"),
-        Value::Null,
-    );
-    image_request(
-        &rig,
-        "POST",
-        &format!("/1.0/images?project={PROJECT}"),
-        copy,
-    );
-    let approved = json!({ "type": "current" });
-    set_properties(&rig, &fingerprint, approved.clone());
-    rig.approved(VERB, args(&fingerprint)).unwrap();
-    assert_eq!(target(&rig, &fingerprint).unwrap()["properties"], approved);
-    let rows = fs::read_to_string(rig.dir.join("tenant-image-imports.jsonl")).unwrap();
-    assert!(rows.contains("PropertiesIntent") && rows.contains("PropertiesSent"));
-    assert_eq!(
-        rig.get(&format!("/1.0/images/{fingerprint}?project={}", project(B)))
-            .unwrap(),
-        other
-    );
-}
-
-#[test]
-fn image_import_an_unrecorded_copy_response_retains_unproven_content() {
-    let (rig, fingerprint) = setup();
-    rig.fake().fail_reads("/1.0/operations/", 2, 500);
-    assert!(rig.approved(VERB, args(&fingerprint)).is_err());
-    let path = rig.dir.join("tenant-image-imports.jsonl");
-    let text = fs::read_to_string(&path).unwrap();
-    let intent = text.lines().next().unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(intent).unwrap()["phase"],
-        "CopyIntent"
-    );
-    fs::write(&path, format!("{intent}\n")).unwrap();
-    let rig = rig.restart();
-    let before = rig.fake().writes().len();
-    assert!(rig.approved(VERB, args(&fingerprint)).is_err());
-    assert_eq!(
-        rig.fake().writes().len(),
-        before,
-        "an unrecorded response cannot prove ownership for a delete"
-    );
-    assert!(target(&rig, &fingerprint).is_some());
-    rig.approved(VERB, args(&fingerprint))
-        .expect("a new card can use the retained image");
+    assert_eq!(fs::read_to_string(path).unwrap(), "not an import record\n");
+    no_deletes(&rig, before);
 }
