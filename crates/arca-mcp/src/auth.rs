@@ -688,7 +688,7 @@ enum BodyError {
     Unknown,
 }
 
-/// Size and UTF-8 checks are the same for loading and admin enumeration; neither parses a truncated prefix.
+/// Full-file checks for loading and tenant-bound admin enumeration; unbound enumeration keeps its legacy prefix.
 fn parse_file(bytes: &[u8]) -> Result<Body, BodyError> {
     let text = std::str::from_utf8(bytes).map_err(|_| BodyError::Malformed)?;
     if bytes.len() as u64 > hash_file_budget(text) {
