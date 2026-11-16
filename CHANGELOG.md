@@ -7,6 +7,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The edge allows the PROXY protocol header from each service linked to it (`service_connect` to the edge), by the
+service's own address, besides the port device's loopback, so a connector that sends one needs no hand edit inside the
+edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the
+routes are untouched. An edge with no service linked to it keeps exactly the config it had.
+
 ## 0.32.0 (2026-11-16)
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the

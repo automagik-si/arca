@@ -6,12 +6,17 @@
 //! the kernel renders the edge's whole Caddyfile ([`caddyfile`]), writes it into the edge and reloads Caddy, and opens
 //! each target address and port in the edge's NIC rules ([`destinations`]).
 //!
+//! The services linked to the edge (`service_connect` to it) may send it the PROXY header too: [`caddyfile`] allows each
+//! one's address, and a connect, a disconnect or the removal of such a service writes the file again.
+//!
 //! The render is a pure function of the routes: sorted by hostname, every value checked when the route was made, so
 //! nothing a caller gives can add a line of its own to the file.
 
 use std::net::Ipv4Addr;
 
 use arca_netproject::destination::Destination;
+
+use crate::service::ServiceGrant;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -214,6 +219,15 @@ pub fn instance_address(full: &Value) -> Option<Ipv4Addr> {
     })
 }
 
+/// The addresses of the services linked to an edge: each `incoming` grant's, the consumer's own address on the service
+/// network, which the kernel gave it at its create and fixed on its NIC (`ipv4.address`) for its life.
+pub fn linked(incoming: &[ServiceGrant]) -> Vec<Ipv4Addr> {
+    incoming
+        .iter()
+        .filter_map(|grant| grant.address.parse().ok())
+        .collect()
+}
+
 /// The addresses and ports the edge's NIC must open for its routes: each route's target, once. An address inside the
 /// service /24 is a neighbour the edge reaches through a link, and the rules leave it out themselves.
 pub fn destinations(record: &EdgeRecord) -> Vec<Destination> {
@@ -241,7 +255,7 @@ pub fn destinations(record: &EdgeRecord) -> Vec<Destination> {
 /// - HTTP/1.1 and HTTP/2 only: the device carries tcp.
 /// - A private site answers 403 to every address outside [`PRIVATE_RANGES`].
 /// - Every site streams its answers unbuffered (`flush_interval -1`), for server-sent events and LLM completions.
-pub fn caddyfile(record: &EdgeRecord, _linked: &[Ipv4Addr]) -> String {
+pub fn caddyfile(record: &EdgeRecord, linked: &[Ipv4Addr]) -> String {
     let mut out = String::new();
     out.push_str("# Written by Arca from this node's routes (route_add, route_remove). Each change replaces the whole file.\n");
     out.push_str("{\n");
@@ -252,6 +266,12 @@ pub fn caddyfile(record: &EdgeRecord, _linked: &[Ipv4Addr]) -> String {
     out.push_str("\t\t\tproxy_protocol {\n");
     out.push_str("\t\t\t\ttimeout 5s\n");
     out.push_str("\t\t\t\tallow 127.0.0.1/32\n");
+    let mut linked = linked.to_vec();
+    linked.sort();
+    linked.dedup();
+    for address in linked {
+        out.push_str(&format!("\t\t\t\tallow {address}/32\n"));
+    }
     out.push_str("\t\t\t}\n");
     out.push_str("\t\t\ttls\n");
     out.push_str("\t\t}\n");

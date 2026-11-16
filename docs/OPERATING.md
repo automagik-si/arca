@@ -5739,6 +5739,13 @@ edge), and Caddy reads each client's own address from it. Without it every visit
 loopback and a private route could not tell the local network from the internet. The edge speaks HTTP/1.1 and HTTP/2
 (the device carries tcp, not the UDP of HTTP/3).
 
+A service linked to the edge (`service_connect` with `"to"` the edge), such as a connector that hands the edge its
+visitors, may send the PROXY header too: the Caddyfile allows it from each linked service's own address, besides the
+device's loopback. A connect or a disconnect, and the removal of a linked service, writes the file again and reloads
+Caddy (a stopped edge reads it at its next start), and the routes are left as they are. A linked service that sends no
+header is served as it is, from its own address (Caddy 2.11.9 `proxy_protocol` uses the header only when one comes);
+every other address's header is ignored, as before.
+
 ### `route_add`, `route_remove`, `route_list`
 
 - **`route_add`** `{"hostname": "app.example.com", "instance": "web", "project": "default", "port": 8080}` (and

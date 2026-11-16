@@ -8125,6 +8125,16 @@ impl ServiceHandler {
                         })?
                 };
                 self.logout_before_remove(&entry, &config, caller);
+                // The edges this service is linked to, with the addresses they allow the PROXY header from now: the
+                // removal takes its grant off each, and its Caddyfile is written again once the removal ran.
+                let edges = service_entries(&entries)
+                    .into_iter()
+                    .filter(|(_, other)| {
+                        other.edge.is_some()
+                            && other.incoming.iter().any(|grant| grant.consumer == name)
+                    })
+                    .map(|(edge, cfg)| (edge.id, crate::route::linked(&cfg.incoming)))
+                    .collect::<Vec<_>>();
                 let _write = self.writes.lock().map_err(|_| internal())?;
                 let removal = lock(&self.kernel)?
                     .remove_service_spent(spent, now)
@@ -8163,7 +8173,15 @@ impl ServiceHandler {
                 if tenant.is_none() {
                     self.drop_fetched_images(&read, &config);
                 }
-                Ok(json!({ "removed": true }))
+                let edges = edges
+                    .iter()
+                    .filter_map(|(edge, before)| self.edge_relinked(edge, before, caller))
+                    .collect::<Vec<_>>();
+                if edges.is_empty() {
+                    Ok(json!({ "removed": true }))
+                } else {
+                    Ok(json!({ "removed": true, "edges": edges }))
+                }
             }
             "service_import" => {
                 let name = service_name(&args)?;

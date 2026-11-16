@@ -333,7 +333,7 @@ impl ServiceHandler {
         preapproved: bool,
     ) -> Result<Value, CallError> {
         if matches!(self.verb, "service_connect" | "service_disconnect") {
-            return self.link(args, entries, now);
+            return self.link(args, caller, entries, now);
         }
         let name = service_name(args)?;
         let (entry, mut cfg) = record(entries, &name)?;
@@ -466,7 +466,15 @@ impl ServiceHandler {
         }
         self.publication(args, caller, &entry, &mut cfg, now, preapproved)
     }
-    fn link(&self, args: &Value, entries: &[Entry], now: u64) -> Result<Value, CallError> {
+    /// `service_connect` and `service_disconnect`. When the provider is an edge, its Caddyfile is written again after
+    /// the link changed, so it allows the PROXY header from the services linked to it ([`crate::route::caddyfile`]).
+    fn link(
+        &self,
+        args: &Value,
+        caller: &Caller,
+        entries: &[Entry],
+        now: u64,
+    ) -> Result<Value, CallError> {
         let from = arg_name(args, "from")?;
         let to = arg_name(args, "to")?;
         if from == to {
@@ -500,6 +508,14 @@ impl ServiceHandler {
         let po = self.live_owned(&pe, &provider)?;
         let original_consumer = consumer.clone();
         let original_provider = provider.clone();
+        let edge_linked = crate::route::linked(&provider.incoming);
+        let to_edge = provider.edge.is_some();
+        let edge = |mut answer: Value| {
+            if to_edge && let Some(view) = self.edge_relinked(&pe.id, &edge_linked, caller) {
+                answer["edge"] = view;
+            }
+            answer
+        };
         if self.verb == "service_disconnect" {
             let names = consumer
                 .links
@@ -543,7 +559,7 @@ impl ServiceHandler {
                 }
             }
             self.put(&[consumer], now)?;
-            return Ok(json!({"env":names}));
+            return Ok(edge(json!({"env":names})));
         }
         let t = self.template(&provider)?;
         let port = t
@@ -579,7 +595,7 @@ impl ServiceHandler {
         consumer.environment_patch = Some(env.keys().cloned().collect());
         consumer.environment.extend(env);
         self.put(&[consumer], now)?;
-        Ok(json!({"env":names}))
+        Ok(edge(json!({"env":names})))
     }
 }
 

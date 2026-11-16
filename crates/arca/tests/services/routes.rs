@@ -513,6 +513,7 @@ fn a_service_linked_to_the_edge_may_send_it_the_proxy_header_until_it_is_unlinke
         .expect("a service");
     let address = rig.service_config("nats").ipv4;
     let reloads = edge_execs(&rig);
+    reload(&rig, 0);
     let linked = rig
         .call("service_connect", json!({"from":"nats","to":"edge"}))
         .expect("linked");
@@ -529,6 +530,7 @@ fn a_service_linked_to_the_edge_may_send_it_the_proxy_header_until_it_is_unlinke
     assert_eq!(record(&rig).routes.len(), 1);
     assert_eq!(edge_execs(&rig), reloads + 1);
     assert_eq!(file(&rig, EDGE_CONFIG_KEPT).as_deref(), Some(text.as_str()));
+    reload(&rig, 0);
     let unlinked = rig
         .call("service_disconnect", json!({"from":"nats","to":"edge"}))
         .expect("unlinked");
@@ -560,6 +562,7 @@ fn an_edge_with_no_route_takes_a_linked_services_address_and_drops_it_when_the_s
         route::caddyfile(&EdgeRecord::default(), &[address.parse().unwrap()])
     );
     let reloads = edge_execs(&rig);
+    reload(&rig, 0);
     let removed = rig
         .call(
             "service_remove",
