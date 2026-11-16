@@ -755,11 +755,13 @@ fn on_a_node_set_back_to_watch_only_writes_that_would_succeed_are_refused_and_ch
         token_id: "cloud".into(),
         scope: Scope::Doctor,
         tools: Some(TOOLS.iter().map(|tool| tool.to_string()).collect()),
+        limits: Default::default(),
     };
     let doctor = Caller {
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     for (verb, args, caller) in [
         (

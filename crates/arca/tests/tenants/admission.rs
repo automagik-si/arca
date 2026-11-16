@@ -56,6 +56,7 @@ fn a_node_that_still_holds_a_tenant_never_answers_an_empty_list_when_its_config_
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     let (code, message) = refusal(list.call(json!({}), &doctor));
     assert_eq!(
@@ -105,6 +106,7 @@ fn a_node_set_back_to_watch_only_still_shows_its_tenants_and_databases() {
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     let entries = rig.entries();
     for ((verb, args), before) in reads.iter().zip(&before) {
@@ -154,6 +156,7 @@ fn a_node_set_back_to_watch_only_still_shows_its_tenants_and_databases() {
             token_id: "doctor".into(),
             scope: Scope::Doctor,
             tools: Some(tools.iter().map(|tool| tool.to_string()).collect()),
+            limits: Default::default(),
         };
         let (code, message) = refusal(handlers[verb].call(args, &caller));
         assert_eq!(

@@ -308,6 +308,7 @@ impl Rig {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
     }
@@ -674,6 +675,7 @@ fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     };
     let (send, receive) = std::sync::mpsc::channel();
     let reader = Arc::clone(&status);
@@ -704,6 +706,7 @@ fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
         .expect("status survives a poisoned kernel lock");
@@ -1094,6 +1097,7 @@ fn the_tools_operator_scope_read_only_reads_a_viewer_reads_and_changes_nothing()
         token_id: "viewer".into(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     assert!(matches!(
         rig.handlers["service_create"].call(json!({"name":"nats","template":"nats"}), &viewer),
@@ -1281,6 +1285,7 @@ fn doctor() -> Caller {
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     }
 }
 
@@ -2915,6 +2920,7 @@ fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
     });
@@ -2943,6 +2949,7 @@ fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         );
         finished.send(result).unwrap();
@@ -4777,6 +4784,7 @@ fn operator_call(
             token_id: "operator".into(),
             scope: Scope::Operator,
             tools: None,
+            limits: Default::default(),
         },
     )
 }

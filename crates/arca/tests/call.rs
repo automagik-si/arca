@@ -999,6 +999,44 @@ fn status_on_an_upgraded_node_uses_the_viewer_token_beside_the_config() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // A viewer limited to named services, first by name, is passed over: the node refuses it arca_status.
+    let limited = node.scratch.path("a-limited.secret");
+    let minted = arca()
+        .args([
+            "token",
+            "mint",
+            "--scope",
+            "viewer",
+            "--id",
+            "a-limited",
+            "--services",
+            "dev",
+            "--expires",
+            "1h",
+            "--out",
+        ])
+        .arg(&limited)
+        .arg("--config")
+        .arg(&node.config)
+        .output()
+        .expect("run token mint");
+    assert!(
+        minted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&minted.stderr)
+    );
+    wait_for_pid_file(&node);
+    let reloaded = arca()
+        .args(["token", "reload", "--config"])
+        .arg(&node.config)
+        .output()
+        .expect("run token reload");
+    assert!(
+        reloaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    copy(&limited, "a-limited.secret");
     // The viewer's token under its older name: status answers.
     copy(&node.viewer, "viewer.secret");
     let out = status();

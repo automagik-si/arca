@@ -1497,12 +1497,17 @@ fn approval_failure(error: ApprovalRefusal) -> Failure {
 }
 
 /// One line for each token file the store left out when it was last read: a file under the name approved actions
-/// run under. The node runs without it, and the line says how the file is removed.
+/// run under, and a file the store skipped ([`TokenStore::skipped`]). The node runs without them, and each line says why.
 fn say_ignored_tokens(tokens: &TokenStore) {
     for file in tokens.ignored() {
         eprintln!(
             "arca: token file {file} is ignored: it uses the name an action runs under once the owner approved it, so no token of that name is accepted. Remove it with: arca token revoke {}",
             arca_mcp::auth::APPROVED_ACTION_ID
+        );
+    }
+    for (file, why) in tokens.skipped() {
+        eprintln!(
+            "arca: token file {file} is left out, so its token is refused: {why}. The other tokens are loaded"
         );
     }
 }

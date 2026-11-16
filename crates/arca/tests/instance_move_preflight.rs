@@ -250,6 +250,7 @@ impl Rig {
                     token_id: "viewer".into(),
                     scope: Scope::Viewer,
                     tools: None,
+                    limits: Default::default(),
                 },
             )
             .expect("the preflight answers")
@@ -795,6 +796,7 @@ fn malformed_arguments_are_invalid_not_a_finding() {
                 token_id: "viewer".into(),
                 scope: Scope::Viewer,
                 tools: None,
+                limits: Default::default(),
             },
         );
         assert!(

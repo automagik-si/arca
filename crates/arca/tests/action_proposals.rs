@@ -200,6 +200,7 @@ fn a_viewer_may_propose_and_nothing_changes() {
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let proposed = rig.handlers["action_propose"]
         .call(
@@ -1163,6 +1164,7 @@ fn a_proposal_says_where_to_approve_it_when_it_expires_and_how_to_enrol_a_passke
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     // A removal: a create on a node with a config reads its template from the node's state, which this one has none of.
     let remove = |name: &str| json!({ "action": "service_remove", "args": { "name": name } });
@@ -1205,6 +1207,7 @@ fn a_proposal_on_a_node_that_trusts_another_page_hosts_keys_says_it_is_approved_
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let remove = |name: &str| json!({ "action": "service_remove", "args": { "name": name } });
     let linked = |origin: Option<&str>| {
@@ -1258,6 +1261,7 @@ fn a_proposal_on_a_public_page_with_no_passkey_says_to_enrol_one_without_an_ssh_
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let answer = served_propose(&rig, node_with_page(Some("https://arca.example.org")))
         .call(

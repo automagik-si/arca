@@ -2989,6 +2989,7 @@ impl ActionExecutor {
                 token_id: caller_id.to_string(),
                 scope: Scope::Operator,
                 tools: None,
+                limits: Default::default(),
             },
         )
     }
@@ -3196,6 +3197,7 @@ mod tests {
             token_id: "viewer".to_string(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         };
         for args in [
             json!({}),
@@ -3473,6 +3475,7 @@ mod tests {
             token_id: "viewer".to_string(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         };
         let verb = arca_api::verb("os_update").expect("the verb is in the table");
         assert_eq!(verb.min_scope, Scope::Viewer);
@@ -3563,6 +3566,7 @@ mod watch_newest_tests {
             token_id: "viewer-1".to_string(),
             scope: Scope::Viewer,
             tools: None,
+            limits: Default::default(),
         }
     }
 

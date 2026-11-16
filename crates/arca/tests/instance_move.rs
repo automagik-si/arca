@@ -343,6 +343,7 @@ impl Rig {
                 token_id: "doctor-1".to_string(),
                 scope,
                 tools: None,
+                limits: Default::default(),
             },
         );
         if let Ok(value) = &result {

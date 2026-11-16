@@ -150,6 +150,7 @@ impl Rig {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
     }
@@ -267,6 +268,7 @@ fn doctor() -> Caller {
         token_id: "doctor".into(),
         scope: Scope::Doctor,
         tools: None,
+        limits: Default::default(),
     }
 }
 

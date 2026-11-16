@@ -236,6 +236,7 @@ impl Rig {
                 token_id: "caller".into(),
                 scope,
                 tools: None,
+                limits: Default::default(),
             },
         )
     }

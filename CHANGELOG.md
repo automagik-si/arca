@@ -82,6 +82,16 @@ disk's size, what the room it needs counts, that the machine stays stopped, its 
 Ceph each side's cluster, pool and client; the finish card says the source's snapshots go with it. OPERATING.md
 ("Stopped virtual machines") says what a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
 
+A token can be limited to named services and to a time: `arca token mint --services dev,gtm --expires 12h`. A limited
+token reaches only the verbs that name a listed service (or a listed service's instance), is refused every verb that
+reaches the whole node, every GET route and every call relayed to a linked node, and reads `service_list`,
+`snapshot_list` and `watch_report` cut to its own services, with no other service's name in them. An action it proposes
+is checked against its list when it is proposed. A token past its `expires` is refused. A token file may also say
+`by=` the token that handed it down; it loads only while that token does and is no wider than it (the verb that hands
+tokens down comes later). From this release on, a token file line of a key the release does not know leaves only that
+token out instead of refusing the whole token directory. A release before this one refuses the whole directory on the
+new lines, so revoke limited tokens before downgrading past it.
+
 ## 0.32.0 (2026-11-16)
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the
