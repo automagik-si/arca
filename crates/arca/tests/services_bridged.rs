@@ -331,6 +331,36 @@ fn owner_approval(key: &common::SkKey, name: &str) -> String {
 }
 
 #[test]
+fn unsupported_vm_io_limits_undo_the_failed_start_on_both_network_kinds() {
+    for bridged in [false, true] {
+        let rig = if bridged {
+            Rig::bridged(&["br0"], None)
+        } else {
+            let mut config = managed_kernel();
+            config["vmLimits"] = roomy();
+            Rig::with(config, None, vec![])
+        };
+        let mut template = vm_template();
+        template["limits"]["diskWrite"] = json!("10MB");
+        template["limits"]["egress"] = json!("20Mbit");
+        rig.template("ws", template);
+        rig.fake.reject_device_limits_on_start();
+        let mut args = json!({"name":"ws1","template":"ws"});
+        if bridged {
+            args["bridge"] = json!("br0");
+        }
+        let message = refusal(rig.call("service_create", args));
+        assert!(message.contains("device I/O limits are not supported by this driver"), "{message}");
+        assert!(rig.get(&format!("/1.0/instances/ws1?project={PROJECT}")).is_none());
+        assert!(!rig.entries().iter().any(|entry| entry.id.0 == "service-ws1"));
+        assert!(rig.kernel.lock().unwrap().pending_plans().is_empty());
+        assert_eq!(rig.fake.writes().into_iter()
+            .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
+            .count(), 1);
+    }
+}
+
+#[test]
 fn invalid_vm_io_limits_fail_before_any_incus_write() {
     let rig = Rig::bridged(&["br0"], None);
     for (key, value) in [

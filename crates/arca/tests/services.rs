@@ -536,13 +536,50 @@ fn template_io_limit_units_are_checked_before_create() {
 }
 
 #[test]
+fn an_io_limited_create_does_not_claim_data_left_by_an_earlier_attempt() {
+    let rig = Rig::with(
+        FakeState { server: json!({}), projects: vec![], instances: vec![], networks: vec![], pools: vec![("pool1".into(), json!({}))] },
+        vec![PROJECT.into()], Some("192.0.2.0/24"),
+    );
+    let mut template = nats_template();
+    template["data"] = json!({"path":"/data"});
+    rig.template("nats", template.clone());
+    rig.fake.set_reject_config_on_post("/1.0/instances");
+    assert!(rig.call("service_create", json!({"name":"nats","template":"nats"})).is_err());
+    let path = format!("/1.0/storage-pools/pool1/volumes/custom/nats-data?project={PROJECT}");
+    let previous = rig.get(&path).expect("the earlier create left data for approval");
+    let plans = rig.kernel.lock().unwrap().pending_plans();
+    template["limits"] = json!({"diskWrite":"10MB"});
+    rig.template("nats", template);
+    let before = rig.fake.writes().len();
+    let Err(CallError::Refused { message, .. }) = rig.call("service_create", json!({"name":"nats","template":"nats"})) else {
+        panic!("the prior data must be dealt with before a fresh capped create");
+    };
+    assert!(message.contains("previous objects"), "{message}");
+    assert_eq!(rig.fake.writes().len(), before);
+    assert_eq!(rig.get(&path), Some(previous));
+    assert_eq!(rig.kernel.lock().unwrap().pending_plans(), plans);
+}
+
+#[test]
 fn unsupported_io_limits_fail_create_without_retrying_uncapped() {
-    for (key, cap) in [("diskRead", "100MB"), ("egress", "100Mbit")] {
-        let rig = Rig::new();
+    for (key, cap, run_tmpfs) in [("diskRead", "100MB", false), ("egress", "100Mbit", true)] {
+        let rig = Rig::with(
+            FakeState { server: json!({}), projects: vec![], instances: vec![], networks: vec![], pools: vec![("pool1".into(), json!({}))] },
+            vec![PROJECT.into()], Some("192.0.2.0/24"),
+        );
         let mut template = nats_template();
         template["limits"] = json!({key: cap});
+        template["runTmpfs"] = json!(run_tmpfs);
+        template["data"] = json!({"path":"/data"});
+        template["secrets"] = json!(["TOKEN"]);
+        template["generate"] = json!({"TOKEN":"test_"});
+        template["env"] = json!({"TOKEN":"{{secret:TOKEN}}"});
+        let secrets = rig.dir.join("secrets/service-nats");
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(secrets.join("owner-seeded"), "keep this").unwrap();
         rig.template("nats", template);
-        rig.fake.reject_device_limits_on_create();
+        rig.fake.reject_device_limits_on_start();
         let failed = rig.call("service_create", json!({"name":"nats","template":"nats"}));
         let Err(CallError::Refused { message, .. }) = failed else {
             panic!("unsupported {key} must fail create");
@@ -555,6 +592,12 @@ fn unsupported_io_limits_fail_create_without_retrying_uncapped() {
             rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
                 .is_none()
         );
+        assert!(!rig.entries().iter().any(|entry| entry.id.0 == "service-nats"));
+        assert!(rig.get(&format!("/1.0/network-acls/{PROJECT}-svc-nats?project=default")).is_none());
+        assert!(rig.get(&format!("/1.0/storage-pools/pool1/volumes/custom/nats-data?project={PROJECT}")).is_none());
+        assert!(!secrets.join("token").exists());
+        assert_eq!(fs::read_to_string(secrets.join("owner-seeded")).unwrap(), "keep this");
+        assert!(rig.kernel.lock().unwrap().pending_plans().is_empty());
         let attempts: Vec<_> = rig
             .fake
             .writes()
@@ -566,7 +609,7 @@ fn unsupported_io_limits_fail_create_without_retrying_uncapped() {
             1,
             "no fallback create without the requested cap"
         );
-        assert_eq!(attempts[0].status, 400);
+        assert_eq!(attempts[0].status, 202);
     }
 }
 
@@ -593,9 +636,7 @@ fn template_io_limits_reach_the_container_devices_and_status_settings() {
     let status = rig
         .call("service_status", json!({"name":"nats"}))
         .expect("status");
-    for key in ["diskRead", "diskWrite", "ingress", "egress"] {
-        assert_eq!(status["settings"]["limits"][key], limits[key]);
-    }
+    assert_eq!(status["settings"]["limits"], limits);
     let verb = arca_api::verb("service_status").expect("verb");
     arca_api::conforms(&(verb.result)(), &status).expect("status matches its schema");
 }

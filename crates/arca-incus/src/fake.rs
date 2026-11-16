@@ -708,8 +708,8 @@ impl FakeIncus {
         lock(&self.shared.reject_config).push(kind_path_prefix.to_string());
     }
 
-    /// Refuse an instance create carrying disk or NIC limits, as an unsupported driver would.
-    pub fn reject_device_limits_on_create(&self) {
+    /// Accept disk/NIC limits at create, then refuse applying them at start, as an unsupported driver would.
+    pub fn reject_device_limits_on_start(&self) {
         self.shared
             .reject_device_limits
             .store(true, Ordering::SeqCst);
@@ -2255,6 +2255,19 @@ fn lxc_split_cmd(cmd: &str, split: LxcSplit) -> Vec<String> {
     }
 }
 
+/// Driver/cgroup/tc rejection happens at start, after Incus has accepted the instance devices.
+fn device_limit_refusal(shared: &Shared, instance: &Value) -> Option<String> {
+    (shared.reject_device_limits.load(Ordering::SeqCst)
+        && instance.get("devices").and_then(Value::as_object).is_some_and(|devices| {
+            devices.values().any(|device| {
+                device.as_object().is_some_and(|device| {
+                    device.keys().any(|key| key.starts_with("limits."))
+                })
+            })
+        }))
+    .then(|| "device I/O limits are not supported by this driver".to_string())
+}
+
 /// Why a container cannot start on a node whose liblxc splits as `split` says. Incus 7.6 refuses a line break or a
 /// carriage return in any LXC config value at start, so in an `environment.*` value too, which its create lets a
 /// carriage return through. Its `oci.entrypoint` may not split or encode, or init would get other arguments than it
@@ -2328,25 +2341,6 @@ fn create(
         );
     };
     let path = request.path();
-    if path == "/1.0/instances"
-        && shared.reject_device_limits.load(Ordering::SeqCst)
-        && body
-            .get("devices")
-            .and_then(Value::as_object)
-            .is_some_and(|devices| {
-                devices.values().any(|device| {
-                    device
-                        .as_object()
-                        .is_some_and(|device| device.keys().any(|key| key.starts_with("limits.")))
-                })
-            })
-    {
-        return (
-            400,
-            String::new(),
-            error_envelope(400, "device I/O limits are not supported by this driver"),
-        );
-    }
     let rejected = body.contains_key("config")
         && lock(&shared.reject_config)
             .iter()
@@ -2563,7 +2557,9 @@ fn create(
                     Err((400, "Failed starting instance".into())),
                 );
             }
-            if let Some(reason) = start_refusal(&store.objects[at].body, *lock(&shared.lxc_split)) {
+            if let Some(reason) = start_refusal(&store.objects[at].body, *lock(&shared.lxc_split))
+                .or_else(|| device_limit_refusal(shared, &store.objects[at].body))
+            {
                 store.objects[at].body["status"] = json!("Stopped");
                 store.expand(at, false);
                 return answered(shared, store, kind, "POST", Err((400, reason)));
@@ -3870,6 +3866,7 @@ fn change_state(
         "start" => {
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
+                    .or_else(|| device_limit_refusal(shared, &store.objects[index].body))
             {
                 return answered(shared, store, "instance", "PUT", Err((400, reason)));
             }
@@ -3949,6 +3946,7 @@ fn change_state(
             // Its stop half is done when its start half cannot start the entrypoint: it ends stopped.
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
+                    .or_else(|| device_limit_refusal(shared, &store.objects[index].body))
             {
                 store.objects[index].body["status"] = json!("Stopped");
                 lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));
