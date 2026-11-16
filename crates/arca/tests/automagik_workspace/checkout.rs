@@ -431,7 +431,12 @@ fn checkout_13_nonrepo_is_untouched_and_member_target_is_used() {
     value["memberRunner"] = json!(true);
     let mut w = Workspace::new(&value);
     fs::create_dir_all(w.dir.join("runner-sockets")).unwrap();
+    fs::create_dir_all(w.dir.join("workspace")).unwrap();
+    fs::set_permissions(w.dir.join("workspace"), fs::Permissions::from_mode(0o711)).unwrap();
     boot(&mut w);
+    assert_eq!(fs::metadata(w.dir.join("workspace")).unwrap().permissions().mode() & 0o777, 0o711, "members must retain traversal through the workspace root");
+    w.stop(); boot(&mut w);
+    assert_eq!(fs::metadata(w.dir.join("workspace")).unwrap().permissions().mode() & 0o777, 0o711);
     assert!(w.dir.join("workspace/.git").exists());
     assert!(!target(&w).join(".git").exists());
 }
