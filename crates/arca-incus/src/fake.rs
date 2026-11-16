@@ -3,7 +3,7 @@
 //!
 //! GET routes: `/1.0`, `/1.0/projects?recursion=1`, `/1.0/instances?all-projects=true&recursion=1`,
 //! `/1.0/instances?all-projects=true&recursion=2`, `/1.0/storage-pools?recursion=1`, `/1.0/storage-pools/<pool>` (its driver set by
-//! [`FakeIncus::set_pool_driver`]), `/1.0/storage-pools/<pool>/resources`,
+//! [`FakeIncus::set_pool_driver`], its config by [`FakeIncus::set_pool_config`]), `/1.0/storage-pools/<pool>/resources`,
 //! `/1.0/networks?recursion=1` and `/1.0/networks/<name>/state` (the host's interfaces, set by
 //! [`FakeIncus::set_host_interfaces`]), every object path, `/1.0/operations?all-projects=true&recursion=1`, and
 //! `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
@@ -241,6 +241,8 @@ struct Shared {
     resources: Mutex<Option<Value>>,
     /// The driver each pool's own document names, by pool, set by [`FakeIncus::set_pool_driver`].
     pool_drivers: Mutex<BTreeMap<String, String>>,
+    /// The config keys each pool's own document holds, by pool, set by [`FakeIncus::set_pool_config`].
+    pool_configs: Mutex<BTreeMap<String, Map<String, Value>>>,
     /// The migrations this fake receives and sends ([`FakeIncus::link_migration`]).
     migration: Mutex<MigrationFake>,
     /// The fake a push from this one lands on, as a target daemon on the network would take it.
@@ -479,6 +481,7 @@ impl Shared {
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
             pool_drivers: Mutex::new(BTreeMap::new()),
+            pool_configs: Mutex::new(BTreeMap::new()),
             migration: Mutex::new(MigrationFake::default()),
             peer: Mutex::new(None),
         }
@@ -634,6 +637,15 @@ impl FakeIncus {
     /// holds answers `dir` until a test names another; a pool it does not hold answers 404. It records no write.
     pub fn set_pool_driver(&self, pool: &str, driver: &str) {
         lock(&self.shared.pool_drivers).insert(pool.to_string(), driver.to_string());
+    }
+
+    /// Sets the config key `key` to `value` in the pool `pool`'s own document, `GET /1.0/storage-pools/<pool>`, which
+    /// holds no key until a test sets one. It records no write.
+    pub fn set_pool_config(&self, pool: &str, key: &str, value: &str) {
+        lock(&self.shared.pool_configs)
+            .entry(pool.to_string())
+            .or_default()
+            .insert(key.to_string(), Value::String(value.to_string()));
     }
 
     /// Puts a network ACL in `project`, as a create by hand would. It records no write.
@@ -1692,7 +1704,13 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                     .get(&pool)
                     .cloned()
                     .unwrap_or_else(|| "dir".to_string());
-                sync(json!({ "name": pool, "driver": driver, "status": "Created", "config": {} }))
+                let config = lock(&shared.pool_configs)
+                    .get(&pool)
+                    .cloned()
+                    .unwrap_or_default();
+                sync(
+                    json!({ "name": pool, "driver": driver, "status": "Created", "config": config }),
+                )
             } else {
                 (404, String::new(), error_envelope(404, "not found"))
             }

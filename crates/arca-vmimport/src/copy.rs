@@ -1,8 +1,12 @@
 //! The disk copy: who holds a source image, the size of the image Incus made, and the copy from one into the other.
 //!
 //! [`RbdCopy`] does it with the `rbd` command, run through a [`Runner`]: two processes and a pipe, never a shell. It reads
-//! the source with its own Ceph client (read-only on the source pool) and writes the target with the Ceph identity Incus
-//! uses for the target pool. [`FakeCopy`] keeps everything in memory, for tests.
+//! the source with its own Ceph client (read-only on the source pool) of the source's cluster, and writes the target with
+//! the Ceph identity Incus uses for the target pool, of the target pool's cluster. The two may be one Ceph cluster or two:
+//! `rbd --cluster <name>` reads `/etc/ceph/<name>.conf` and the client's keyring beside it, so each side reaches its own
+//! cluster with its own key. The bytes stream from the reader to the writer through an OS pipe: no disk byte passes
+//! through this process, and the node holds no more of a disk than the pipe and the two `rbd` processes' own buffers.
+//! A failure names its side, the cluster and the client. [`FakeCopy`] keeps everything in memory, for tests.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -45,7 +49,8 @@ impl TargetImage {
 
 /// The disk copy an import runs.
 pub trait DiskCopy: Send + Sync {
-    /// The cluster the source pool is on.
+    /// The cluster the source pool is on, by the name its config file has on this node (`/etc/ceph/<name>.conf`). It
+    /// may differ from the target pool's.
     fn cluster(&self) -> &str;
     /// Who holds the source image open, by address. Empty when no one does.
     fn watchers(&self, source: &SourceImage) -> Result<Vec<String>, String>;
@@ -59,8 +64,34 @@ pub trait DiskCopy: Send + Sync {
 pub trait Runner: Send + Sync {
     /// Runs `argv` and returns its standard output; a failure carries its standard error.
     fn output(&self, argv: &[String]) -> Result<String, String>;
-    /// Runs `first` with its standard output piped into `second`, and waits for both.
-    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String>;
+    /// Runs `first` with its standard output piped into `second`, and waits for both. A failure says which side failed,
+    /// or both: a writer that stops first also fails its reader, which can no longer write into the pipe.
+    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), PipeFailure>;
+}
+
+/// Why a [`Runner::pipe`] failed: the reader's error, the writer's, or both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PipeFailure {
+    pub reader: Option<String>,
+    pub writer: Option<String>,
+}
+
+impl PipeFailure {
+    /// The reader failed.
+    pub fn reader(why: impl Into<String>) -> Self {
+        Self {
+            reader: Some(why.into()),
+            writer: None,
+        }
+    }
+
+    /// The writer failed.
+    pub fn writer(why: impl Into<String>) -> Self {
+        Self {
+            reader: None,
+            writer: Some(why.into()),
+        }
+    }
 }
 
 /// Runs commands as processes.
@@ -94,17 +125,24 @@ impl Runner for ProcessRunner {
         }
     }
 
-    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String> {
-        let (program, rest) = first.split_first().ok_or("no command")?;
-        let (into, into_rest) = second.split_first().ok_or("no command")?;
+    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), PipeFailure> {
+        let (program, rest) = first
+            .split_first()
+            .ok_or_else(|| PipeFailure::reader("no command"))?;
+        let (into, into_rest) = second
+            .split_first()
+            .ok_or_else(|| PipeFailure::writer("no command"))?;
         let mut reader = Command::new(program)
             .args(rest)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("{program} did not start: {error}"))?;
-        let stdout = reader.stdout.take().ok_or("the reader has no output")?;
+            .map_err(|error| PipeFailure::reader(format!("{program} did not start: {error}")))?;
+        let stdout = reader
+            .stdout
+            .take()
+            .ok_or_else(|| PipeFailure::reader("the reader has no output"))?;
         let writer = Command::new(into)
             .args(into_rest)
             .stdin(Stdio::from(stdout))
@@ -116,21 +154,30 @@ impl Runner for ProcessRunner {
             Err(error) => {
                 let _ = reader.kill();
                 let _ = reader.wait();
-                return Err(format!("{into} did not start: {error}"));
+                return Err(PipeFailure::writer(format!(
+                    "{into} did not start: {error}"
+                )));
             }
         };
         let mut reader_err = Vec::new();
         if let Some(mut stderr) = reader.stderr.take() {
             let _ = stderr.read_to_end(&mut reader_err);
         }
-        let read = reader.wait().map_err(|error| error.to_string())?;
+        let read = reader
+            .wait()
+            .map_err(|error| PipeFailure::reader(error.to_string()))?;
         let written = writer
             .wait_with_output()
-            .map_err(|error| error.to_string())?;
-        match (read.success(), written.status.success()) {
-            (true, true) => Ok(()),
-            (false, _) => Err(format!("{program} failed: {}", tail(&reader_err))),
-            (true, false) => Err(format!("{into} failed: {}", tail(&written.stderr))),
+            .map_err(|error| PipeFailure::writer(error.to_string()))?;
+        let failure = PipeFailure {
+            reader: (!read.success()).then(|| format!("{program} failed: {}", tail(&reader_err))),
+            writer: (!written.status.success())
+                .then(|| format!("{into} failed: {}", tail(&written.stderr))),
+        };
+        if failure == PipeFailure::default() {
+            Ok(())
+        } else {
+            Err(failure)
         }
     }
 }
@@ -151,6 +198,11 @@ impl<R: Runner> RbdCopy<R> {
             client: client.to_string(),
             runner,
         }
+    }
+
+    /// What runs the commands.
+    pub fn runner(&self) -> &R {
+        &self.runner
     }
 
     fn rbd(&self, client: &str, cluster: &str, rest: &[&str]) -> Vec<String> {
@@ -200,6 +252,11 @@ impl<R: Runner> RbdCopy<R> {
     }
 }
 
+/// An error of one side of the copy, with that side named: `reading the Ceph cluster b as client.arca-import: …`.
+fn side(doing: &str, cluster: &str, client: &str, why: &str) -> String {
+    format!("{doing} the Ceph cluster {cluster} as client.{client}: {why}")
+}
+
 fn names_ok(names: &[&str]) -> Result<(), String> {
     match names.iter().find(|name| !crate::source::ceph_name_ok(name)) {
         Some(name) => Err(format!("{name:?} is not a Ceph name")),
@@ -214,7 +271,10 @@ impl<R: Runner> DiskCopy for RbdCopy<R> {
 
     fn watchers(&self, source: &SourceImage) -> Result<Vec<String>, String> {
         names_ok(&[&self.cluster, &self.client, &source.pool, &source.image])?;
-        let out = self.runner.output(&self.watchers_argv(source))?;
+        let out = self
+            .runner
+            .output(&self.watchers_argv(source))
+            .map_err(|why| side("reading", &self.cluster, &self.client, &why))?;
         let status: Value =
             serde_json::from_str(&out).map_err(|_| "rbd status did not answer JSON".to_string())?;
         Ok(status
@@ -237,7 +297,10 @@ impl<R: Runner> DiskCopy for RbdCopy<R> {
 
     fn target_size(&self, target: &TargetImage) -> Result<u64, String> {
         names_ok(&[&target.cluster, &target.client, &target.pool, &target.image])?;
-        let out = self.runner.output(&self.info_argv(target))?;
+        let out = self
+            .runner
+            .output(&self.info_argv(target))
+            .map_err(|why| side("reading", &target.cluster, &target.client, &why))?;
         let info: Value =
             serde_json::from_str(&out).map_err(|_| "rbd info did not answer JSON".to_string())?;
         info.get("size")
@@ -257,14 +320,31 @@ impl<R: Runner> DiskCopy for RbdCopy<R> {
             &target.image,
         ])?;
         let (reader, writer) = self.copy_argv(source, target);
-        self.runner.pipe(&reader, &writer)
+        self.runner.pipe(&reader, &writer).map_err(|failure| {
+            let mut words = Vec::new();
+            if let Some(why) = &failure.reader {
+                words.push(side("reading", &self.cluster, &self.client, why));
+            }
+            if let Some(why) = &failure.writer {
+                words.push(side("writing", &target.cluster, &target.client, why));
+            }
+            words.join("; ")
+        })
     }
 }
 
 /// A disk copy in memory: source images with their watchers, target images with their size and what was copied in.
-#[derive(Debug, Default)]
+/// Its source pool is on the cluster `ceph` unless [`FakeCopy::on_cluster`] names another.
+#[derive(Debug)]
 pub struct FakeCopy {
+    cluster: String,
     state: Mutex<FakeCopyState>,
+}
+
+impl Default for FakeCopy {
+    fn default() -> Self {
+        Self::on_cluster("ceph")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -276,6 +356,14 @@ struct FakeCopyState {
 }
 
 impl FakeCopy {
+    /// A fake whose source pool is on the cluster `cluster`.
+    pub fn on_cluster(cluster: &str) -> Self {
+        Self {
+            cluster: cluster.to_string(),
+            state: Mutex::new(FakeCopyState::default()),
+        }
+    }
+
     /// Someone at `address` holds the source image `pool/image` open.
     pub fn watch(&self, spec: &str, address: &str) {
         self.lock()
@@ -309,7 +397,7 @@ impl FakeCopy {
 
 impl DiskCopy for FakeCopy {
     fn cluster(&self) -> &str {
-        "ceph"
+        &self.cluster
     }
 
     fn watchers(&self, source: &SourceImage) -> Result<Vec<String>, String> {
@@ -357,13 +445,23 @@ mod tests {
     impl Runner for Recorder {
         fn output(&self, argv: &[String]) -> Result<String, String> {
             self.calls.lock().expect("calls").push(argv.to_vec());
+            if self.answer == "output fails" {
+                return Err("rbd failed: timed out".to_string());
+            }
             Ok(self.answer.clone())
         }
-        fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String> {
+        fn pipe(&self, first: &[String], second: &[String]) -> Result<(), PipeFailure> {
             let mut calls = self.calls.lock().expect("calls");
             calls.push(first.to_vec());
             calls.push(second.to_vec());
-            Ok(())
+            match self.answer.as_str() {
+                "reader fails" => Err(PipeFailure::reader("rbd failed: no keyring")),
+                "both fail" => Err(PipeFailure {
+                    reader: Some("rbd failed: Broken pipe".into()),
+                    writer: Some("rbd failed: Permission denied".into()),
+                }),
+                _ => Ok(()),
+            }
         }
     }
 
@@ -420,6 +518,73 @@ mod tests {
     }
 
     #[test]
+    fn across_two_clusters_each_side_names_its_own_cluster_and_client() {
+        let copy = RbdCopy::new("source-b", "arca-import", Recorder::default());
+        copy.copy(&source(), &target()).expect("copied");
+        copy.watchers(&source())
+            .expect_err("no JSON from the recorder");
+        let calls = copy.runner.calls.lock().expect("calls").clone();
+        let (reader, writer, status) = (&calls[0], &calls[1], &calls[2]);
+        assert_eq!(
+            reader[1..5],
+            ["--cluster", "source-b", "--id", "arca-import"]
+        );
+        assert_eq!(reader[6], "export-diff");
+        assert_eq!(writer[1..5], ["--cluster", "ceph", "--id", "incus"]);
+        assert_eq!(writer[6], "import-diff");
+        assert_eq!(
+            status[1..5],
+            ["--cluster", "source-b", "--id", "arca-import"]
+        );
+        assert_eq!(status[6], "status");
+    }
+
+    #[test]
+    fn a_failed_copy_names_the_side_its_cluster_and_its_client() {
+        let reader = RbdCopy::new(
+            "source-b",
+            "arca-import",
+            Recorder {
+                answer: "reader fails".into(),
+                ..Recorder::default()
+            },
+        );
+        assert_eq!(
+            reader.copy(&source(), &target()).expect_err("fails"),
+            "reading the Ceph cluster source-b as client.arca-import: rbd failed: no keyring"
+        );
+        let both = RbdCopy::new(
+            "source-b",
+            "arca-import",
+            Recorder {
+                answer: "both fail".into(),
+                ..Recorder::default()
+            },
+        );
+        assert_eq!(
+            both.copy(&source(), &target()).expect_err("fails"),
+            "reading the Ceph cluster source-b as client.arca-import: rbd failed: Broken pipe; writing the Ceph cluster ceph as client.incus: rbd failed: Permission denied"
+        );
+        // A read that fails names its side too.
+        let reads = RbdCopy::new(
+            "source-b",
+            "arca-import",
+            Recorder {
+                answer: "output fails".into(),
+                ..Recorder::default()
+            },
+        );
+        assert_eq!(
+            reads.watchers(&source()).expect_err("fails"),
+            "reading the Ceph cluster source-b as client.arca-import: rbd failed: timed out"
+        );
+        assert_eq!(
+            reads.target_size(&target()).expect_err("fails"),
+            "reading the Ceph cluster ceph as client.incus: rbd failed: timed out"
+        );
+    }
+
+    #[test]
     fn watchers_and_size_are_read_from_rbd_json() {
         let copy = RbdCopy::new(
             "ceph",
@@ -458,5 +623,40 @@ mod tests {
         bad.image = "--help".into();
         assert!(copy.copy(&bad, &target()).is_err());
         assert!(copy.runner.calls.lock().expect("calls").is_empty());
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    /// Real processes: the side whose process exits with a failure is the side the failure names. `sh` stands in for
+    /// each `rbd`.
+    #[test]
+    fn a_real_pipe_names_the_side_whose_process_failed() {
+        let runner = ProcessRunner;
+        let reader = runner
+            .pipe(
+                &argv(&["sh", "-c", "echo gone >&2; exit 3"]),
+                &argv(&["cat"]),
+            )
+            .expect_err("the reader failed");
+        assert_eq!(reader.writer, None, "{reader:?}");
+        assert_eq!(reader.reader.as_deref(), Some("sh failed: gone"));
+        let writer = runner
+            .pipe(
+                &argv(&["echo", "x"]),
+                &argv(&["sh", "-c", "cat >/dev/null; echo denied >&2; exit 4"]),
+            )
+            .expect_err("the writer failed");
+        assert_eq!(writer.reader, None, "{writer:?}");
+        assert_eq!(writer.writer.as_deref(), Some("sh failed: denied"));
+        let both = runner
+            .pipe(
+                &argv(&["sh", "-c", "exit 3"]),
+                &argv(&["sh", "-c", "exit 4"]),
+            )
+            .expect_err("both failed");
+        assert!(both.reader.is_some() && both.writer.is_some(), "{both:?}");
+        assert_eq!(runner.pipe(&argv(&["echo", "x"]), &argv(&["cat"])), Ok(()));
     }
 }

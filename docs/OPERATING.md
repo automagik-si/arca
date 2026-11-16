@@ -3012,7 +3012,8 @@ optional `cpu` and `memoryMib` (in place of the source's size), `userData` (defa
 
 The proposal reads the description and makes the whole plan, so a description Arca cannot move (a disk that is not on
 Ceph, NICs on two bridges, a disk outside the node's source pool) is refused before the owner is asked. The card names
-the source with its description's digest, the size, the firmware, each disk with where it lands, each NIC with its MAC
+the source with its description's digest, the size, the firmware, each disk with where it lands, the Ceph cluster the
+disks are read from and the one they are written to, each NIC with its MAC
 and address, the network ACL made from the source's security groups and the rules it cannot carry, what cloud-init gets,
 what is not carried, the operator's step before approving (power the source off, never delete it), the downtime and the
 read-back.
@@ -3054,6 +3055,34 @@ ceph auth get-or-create client.arca-import mon 'allow r' osd 'profile rbd-read-o
 
 The copy writes into the Incus pool as the Ceph user Incus already uses for it (the pool's `ceph.user.name`). Without
 `kernel.instanceImport` the node refuses `instance_import` when it is proposed.
+
+**A source on another Ceph cluster.** The source pool may be on another Ceph cluster than the Incus pool, either way
+round: a node on cluster A imports from cluster B, and a node on cluster B from cluster A, with nothing else changed.
+`cephCluster` names the source's cluster by the name of its config file on this node, a name you choose:
+
+1. On the source cluster, make the read-only client there (the `ceph auth get-or-create` line above, run against the
+   source cluster) and keep its keyring.
+2. On this node, put the source cluster's config at `/etc/ceph/<name>.conf` (its `fsid` and `mon_host`; `ceph config
+   generate-minimal-conf` on the source cluster prints it) and the keyring at
+   `/etc/ceph/<name>.client.arca-import.keyring`, readable by the kernel. Leave `/etc/ceph/ceph.conf` as it is: Incus
+   uses it for its own pool.
+3. Set `"cephCluster": "<name>"` in `kernel.instanceImport` and restart `serve`, which reads it when it starts.
+
+The node must reach the source cluster's monitors (ports 3300 and 6789) and every OSD (ports 6800 to 7300) on that
+cluster's public network. `rbd --cluster <name> --id arca-import ls <source pool>` on the node checks the three steps.
+The copy reads the source cluster with that client alone and writes the Incus pool with Incus's own user on Incus's own
+cluster; Arca never writes the source cluster, and the client's read-only grant above keeps anything else run as it
+from writing there. The card's `Ceph` row names both clusters (and says when the two config files name one `fsid`: one
+cluster under two names), and the run's answer says `Copied from the Ceph cluster <name> … to the Ceph cluster
+<Incus's cluster>` (its `ceph` field). A failed copy names the side that failed, its cluster and its client. If you
+change `kernel.instanceImport` while an import waits for the owner, the restart writes that card's `Ceph` row again from
+the new config, which is what the run will read with; without `kernel.instanceImport` the card has no `Ceph` row.
+
+The copy streams through the node, from one `rbd` into the other by an OS pipe (64 KiB): the node holds that pipe and up
+to about 100 MiB per `rbd` process, whatever the disk's size. It takes the data the disk holds (unwritten parts are not sent) over the slowest of the
+source cluster's read, the network to it, and the Incus cluster's write: about 10 seconds per GiB held on 1 Gbit/s
+(100 GiB in about 16 minutes), and on 10 Gbit/s usually what the clusters give, a few hundred MB/s. The downtime row of
+the card counts from the source's power-off, so plan it with this figure.
 
 The proposal keeps the description cut down to what Arca reads: the VM's id, name, state, size, firmware, disks, NICs,
 security group rules, and of the context only the network keys, the SSH keys, the host name and the user data. Every

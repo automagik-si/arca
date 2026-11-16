@@ -64,6 +64,15 @@ security groups as an Incus network ACL, a cloud-init seed from its context, a f
 Ceph pool (read-only) into the Incus Ceph pool, and a read-back after the start. `instance_import_undo` stops and
 removes an imported VM; the source is never written. A node needs `kernel.instanceImport` for either.
 
+`instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
+refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
+the node holds that cluster's config (`/etc/ceph/<name>.conf`) and the read-only client's keyring beside it, and reads
+the source with them while it writes the Incus pool with Incus's own user on Incus's cluster. Arca only reads the
+source cluster. The card's new `Ceph` row and the answer's `ceph` field name both clusters. Each disk streams through the
+node through a pipe, with up to about 100 MiB per `rbd` process whatever the disk's size, at about 10 seconds per GiB
+held on 1 Gbit/s. A failed copy names its side, cluster and client. A card still waiting when `serve` restarts with
+another import config shows the source cluster of the new config, the one the run reads. See docs/OPERATING.md.
+
 `action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
 `service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`
 row, the node asks anonymously over HTTPS for a pull token, the repository's tags (at most 5 pages) and the digests of

@@ -1424,6 +1424,16 @@ pub fn plan_handlers_versioned(
             .and_then(crate::vm_import::ImportBackend::from_node)
             .map(Arc::new),
     );
+    // A waiting import's card names the source cluster the run reads: the one of this node's config, the config the
+    // backend above was made from. A card proposed under another config is written again before anything is served.
+    if let Ok(mut kernel) = kernel.lock() {
+        let import = node
+            .as_deref()
+            .and_then(|node| node.kernel.instance_import.as_ref());
+        kernel.reword_import_cards(|args, stored| {
+            crate::vm_import::row_after_restart(import, args, stored)
+        });
+    }
     let host_network_socket = node.as_ref().map_or_else(
         || std::path::PathBuf::from(arca_hostnet::SOCKET_FILE),
         |node| node.host_network.socket.clone(),
@@ -1889,7 +1899,7 @@ impl ToolHandler for ActionPropose {
         } else if let (ActionKind::InstanceImport, Some(node)) = (action, &self.node) {
             // A node that names no source pool, or a source whose disks are elsewhere, is refused now, so the owner is
             // never asked to approve an import this node cannot run.
-            crate::vm_import::check_proposal(node, &payload)?;
+            card_fact = Some(crate::vm_import::check_proposal(node, &payload)?);
             payload
         } else if let (ActionKind::FunctionRemove, Some(_)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
@@ -1953,6 +1963,8 @@ impl ToolHandler for ActionPropose {
             // only when it does, and otherwise why the database is created stopped. Both were read when the
             // proposal was given its template's fingerprint, from that one read of the template.
             ActionKind::ServiceCreate | ActionKind::PostgresCreate => card_fact.take(),
+            // The card of an import names the Ceph cluster its disks are read from and the one they are written to.
+            ActionKind::InstanceImport => card_fact.take(),
             // The card of a host restore says what the host has drifted from, read live from the root part now.
             ActionKind::HostNetworkRestore => Some(crate::host_network::proposal_fact(
                 &self.host_network_socket(),
