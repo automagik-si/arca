@@ -1725,3 +1725,42 @@ fn an_update_empties_the_new_roots_run_so_the_service_keeps_a_memory_run() {
     assert!(at("rebuild") < at("empty /run") && at("empty /run") < at("start"));
     assert!(steps[at("empty /run")].1, "{steps:?}");
 }
+
+#[test]
+fn labels_set_before_and_during_a_failed_update_survive_snapshot_rollback() {
+    let up = Arc::new(AtomicBool::new(false));
+    let mut rig = rig(&up);
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"before":"kept", "change":"old", "remove":"old"}}),
+    )
+    .unwrap();
+    let setter = rig.handlers["service_labels_set"].clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let changed = fired.clone();
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(), Arc::new(|| NOW), rig.cfg.clone(), None,
+        UpdateOptions {
+            probe: Arc::new(move |_, _, _| {
+                if !changed.swap(true, Ordering::SeqCst) {
+                    let answer = setter.call(json!({"name":"app", "labels":{"during":"kept", "change":"new", "remove":null}}), &Caller {token_id:"doctor".into(), scope:Scope::Doctor, tools:None, limits:Default::default()}).unwrap();
+                    assert_eq!(answer["code"], "confirmed");
+                }
+                false
+            }),
+            pace: Duration::from_millis(10),
+        },
+    ).into_iter().collect();
+    let failure = update(
+        &rig,
+        json!({"name":"app", "digest":NEW, "timeoutSeconds":1}),
+    )
+    .unwrap_err();
+    assert!(matches!(failure, CallError::Refused {code, ..} if code == "rolled_back"));
+    assert!(fired.load(Ordering::SeqCst));
+    assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"before":"kept", "during":"kept", "change":"new"})
+    );
+}
