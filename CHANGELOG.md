@@ -7,6 +7,37 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`instance_move` now moves a stopped virtual machine, where every virtual machine was refused before. It stays stopped:
+nothing starts or stops it here, its copy is made once and started on the target, and the move counts only once the
+copy's guest answers: its Incus agent, or one of its addresses answering a TCP connection from this node (an address
+Incus lists for a guest that never booted does not count). Otherwise the copy is deleted and the source is left as it
+was. A virtual machine that runs is still refused, with the words to stop it first. When the linked host's entry names
+its Ceph cluster (`approval.linkedHosts[].ceph`: `cluster`, and optionally `client` and `readClient`) and every pool the
+machine uses is Ceph on both hosts, its disks and its config image (UEFI variables, TPM state) go by `rbd export-diff |
+rbd import-diff` from this node into an empty machine Incus makes there at the source's exact size, between two Ceph
+clusters in either direction, reading the source's cluster only; a source started and stopped again during the copy
+makes the copy roll back. Otherwise Incus pushes it, as before for a container. The moved copy keeps its cloud-init
+instance id, so cloud-init does not run its first-boot steps again (containers too). The preflight now sizes a virtual
+machine's Ceph, zfs or lvm disk from what Incus says (its volume's size, its root device's, the pool's `volume.size`,
+else its volume state's), counted whole, where it said the disk could not be measured; a copy by Ceph, which takes no
+snapshot, counts the disk, its custom volumes and its config image, not its snapshots. The card names both nodes, the
+disk's size, what the room it needs counts, that the machine stays stopped, its own rollback promise, and for a copy by
+Ceph each side's cluster, pool and client; the finish card says the source's snapshots go with it. OPERATING.md
+("Stopped virtual machines") says what a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
+
+A token can be limited to named services and to a time: `arca token mint --services dev,gtm --expires 12h`. A limited
+token reaches only the verbs that name a listed service (or a listed service's instance), is refused every verb that
+reaches the whole node, every GET route and every call relayed to a linked node, and reads `service_list`,
+`snapshot_list` and `watch_report` cut to its own services, with no other service's name in them. An action it proposes
+is checked against its list when it is proposed. A token past its `expires` is refused. A token file may also say
+`by=` the token that handed it down; it loads only while that token does and is no wider than it (the verb that hands
+tokens down comes later). From this release on, a token file line of a key the release does not know leaves only that
+token out instead of refusing the whole token directory. A release before this one refuses the whole directory on the
+new lines, so revoke limited tokens before downgrading past it.
+
+
+## 0.33.0 (2026-11-16)
+
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
 refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
 the node holds that cluster's config (`/etc/ceph/<name>.conf`) and the read-only client's keyring beside it, and reads
@@ -64,33 +95,15 @@ service's own address, besides the port device's loopback, so a connector that s
 edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the
 routes are untouched. An edge with no service linked to it keeps exactly the config it had.
 
-`instance_move` now moves a stopped virtual machine, where every virtual machine was refused before. It stays stopped:
-nothing starts or stops it here, its copy is made once and started on the target, and the move counts only once the
-copy's guest answers: its Incus agent, or one of its addresses answering a TCP connection from this node (an address
-Incus lists for a guest that never booted does not count). Otherwise the copy is deleted and the source is left as it
-was. A virtual machine that runs is still refused, with the words to stop it first. When the linked host's entry names
-its Ceph cluster (`approval.linkedHosts[].ceph`: `cluster`, and optionally `client` and `readClient`) and every pool the
-machine uses is Ceph on both hosts, its disks and its config image (UEFI variables, TPM state) go by `rbd export-diff |
-rbd import-diff` from this node into an empty machine Incus makes there at the source's exact size, between two Ceph
-clusters in either direction, reading the source's cluster only; a source started and stopped again during the copy
-makes the copy roll back. Otherwise Incus pushes it, as before for a container. The moved copy keeps its cloud-init
-instance id, so cloud-init does not run its first-boot steps again (containers too). The preflight now sizes a virtual
-machine's Ceph, zfs or lvm disk from what Incus says (its volume's size, its root device's, the pool's `volume.size`,
-else its volume state's), counted whole, where it said the disk could not be measured; a copy by Ceph, which takes no
-snapshot, counts the disk, its custom volumes and its config image, not its snapshots. The card names both nodes, the
-disk's size, what the room it needs counts, that the machine stays stopped, its own rollback promise, and for a copy by
-Ceph each side's cluster, pool and client; the finish card says the source's snapshots go with it. OPERATING.md
-("Stopped virtual machines") says what a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
-
-A token can be limited to named services and to a time: `arca token mint --services dev,gtm --expires 12h`. A limited
-token reaches only the verbs that name a listed service (or a listed service's instance), is refused every verb that
-reaches the whole node, every GET route and every call relayed to a linked node, and reads `service_list`,
-`snapshot_list` and `watch_report` cut to its own services, with no other service's name in them. An action it proposes
-is checked against its list when it is proposed. A token past its `expires` is refused. A token file may also say
-`by=` the token that handed it down; it loads only while that token does and is no wider than it (the verb that hands
-tokens down comes later). From this release on, a token file line of a key the release does not know leaves only that
-token out instead of refusing the whole token directory. A release before this one refuses the whole directory on the
-new lines, so revoke limited tokens before downgrading past it.
+- Merge feat/edge-allow-linked: the edge's PROXY allow list names the services linked to it
+- Merge fix/disconnect-data-volume: a disconnect restores only the link's own names, so a plain template value no longer blocks later changes
+- Merge fix/approve-page-every-card: the approve page lists every waiting card and a tap approves only the card tapped
+- Merge feat/support-report: support reports with named-only support verbs and a refresh that never widens scope
+- Merge fix/automagik-keeper-netns: the keeper heals a gate, tunnel or relay left in an old network namespace after the server restarts
+- Merge feat/automagik-member-runner: an opt-in member runner for Automagik workspaces, uid 1000 locked down when on, placeholder pin until Automagik publishes the runner
+- Merge feat/tailscale-connector: a one-click Tailscale connector template that joins a tailnet and forwards a port inside Arca with PROXY v2
+- Merge fix/import-reword-no-lock-wait: plan handlers never wait on the kernel lock; serve rewords waiting import cards before it shares the kernel
+- Merge feat/vm-import-cross-cluster: import a VM's disk from another Ceph cluster, the card names the cluster read
 
 ## 0.32.0 (2026-11-16)
 
