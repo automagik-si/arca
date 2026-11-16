@@ -674,6 +674,101 @@ fn the_full_flow_registers_asks_the_owner_and_the_issued_token_calls_mcp_with_it
     assert!(app["grants"][0]["lastUsedAt"].is_string());
 }
 
+/// A tool list narrows a grant, except that naming a NAMED_ONLY verb (the support feed and its ack) reaches it from viewer:
+/// so a refresh of a grant the owner approved with no list may not name one its approved scope does not reach on its own.
+/// An operator grant reaches them already, so naming them there is a narrowing.
+#[test]
+fn a_refresh_never_names_a_tool_the_approved_scope_does_not_reach() {
+    let (rig, key) = Rig::new("oauth-named");
+    let (client, access, refresh) = rig.connected(&key, "Viewer app", "viewer");
+    for asked in [
+        "viewer tool:support_report_ack",
+        "viewer tool:support_reports",
+        "viewer tool:service_list tool:support_reports",
+    ] {
+        let wider = rig.refresh(&client, &refresh, Some(asked));
+        assert_eq!(wider.status, 400, "{asked}");
+        assert_eq!(error_of(&wider), "invalid_scope", "{asked}");
+        assert!(
+            wider
+                .text()
+                .contains("the owner did not approve the tool support_"),
+            "{}",
+            wider.text()
+        );
+    }
+    // Calling one is refused with a challenge that names the tool, since asking for viewer again would change nothing.
+    let refused = rig.mcp(
+        Some(&access),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "support_report_ack", "arguments": { "id": 1 } } }),
+    );
+    assert_eq!(refused.status, 403);
+    let challenge = refused.header("www-authenticate").expect("a challenge");
+    assert!(
+        challenge.starts_with(
+            "Bearer error=\"insufficient_scope\", scope=\"viewer tool:support_report_ack\""
+        ),
+        "{challenge}"
+    );
+    let tools = rig.tools(&access);
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool == "support_report_ack" || tool == "support_reports"),
+        "{tools:?}"
+    );
+    assert!(
+        tools.iter().any(|tool| tool == "support_report"),
+        "{tools:?}"
+    );
+    // A list of tools the scope reaches anyway still narrows.
+    let narrower = rig.refresh(&client, &refresh, Some("viewer tool:service_list"));
+    assert_eq!(narrower.status, 200, "{}", narrower.text());
+    assert_eq!(narrower.json()["scope"], json!("viewer tool:service_list"));
+
+    // The consent page tells the owner what naming one gives, and says nothing more for a list that only narrows.
+    let asking = rig.client("Triage");
+    let page = rig.authorize(
+        &asking,
+        &[(
+            "scope",
+            Some("viewer tool:support_reports tool:support_report_ack"),
+        )],
+    );
+    assert_eq!(page.status, 200, "{}", page.text());
+    assert!(
+        page.text().contains("Naming <code>support_reports, support_report_ack</code> gives the app that at any level"),
+        "{}",
+        page.text()
+    );
+    let page = rig.authorize(&asking, &[("scope", Some("viewer tool:service_list"))]);
+    assert!(
+        page.text()
+            .contains("Only these tools: <code>service_list</code></p>"),
+        "{}",
+        page.text()
+    );
+
+    let (client, _, refresh) = rig.connected(&key, "Operator app", "operator");
+    let triage = rig.refresh(
+        &client,
+        &refresh,
+        Some("viewer tool:support_reports tool:support_report_ack"),
+    );
+    assert_eq!(triage.status, 200, "{}", triage.text());
+    let token = triage.json()["access_token"]
+        .as_str()
+        .expect("access")
+        .to_string();
+    assert_eq!(
+        rig.tools(&token),
+        vec![
+            "support_reports".to_string(),
+            "support_report_ack".to_string()
+        ]
+    );
+}
+
 #[test]
 fn an_operator_grant_sees_operator_verbs_and_a_tool_list_narrows_it() {
     let (rig, key) = Rig::new("oauth-operator");
