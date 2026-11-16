@@ -45,6 +45,12 @@ with a template fallback for services made before this change.
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+`arca token mint --tenant <id>` binds a token to one tenant. Omitted tenant arguments resolve to that tenant;
+other tenants and node-wide operations outside a small read/proposal allowlist are refused. Scope, tools and
+service limits still apply, and proposals are checked before saving. Bare service names become tenant-local.
+Tokens without the new line keep their current behavior. Older releases skip an unknown tenant-bound token,
+or refuse the directory if they predate unknown-line skipping; revoke these tokens before that downgrade.
+
 `instance_move` now moves a stopped virtual machine, where every virtual machine was refused before. It stays stopped:
 nothing starts or stops it here, its copy is made once and started on the target, and the move counts only once the
 copy's guest answers: its Incus agent, or one of its addresses answering a TCP connection from this node (an address

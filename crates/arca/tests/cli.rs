@@ -64,6 +64,192 @@ fn arca() -> Command {
     command
 }
 
+#[test]
+fn token_mint_binds_a_tenant_and_normalizes_its_services() {
+    let scratch = Scratch::new("tenant-token");
+    let hashes = scratch.at("tokens");
+    fs::create_dir(&hashes).unwrap();
+    fs::set_permissions(&hashes, fs::Permissions::from_mode(0o700)).unwrap();
+    let secret = scratch.at("secret");
+    let out = arca()
+        .args([
+            "token",
+            "mint",
+            "--scope",
+            "doctor",
+            "--id",
+            "tenant",
+            "--tenant",
+            "abcdefgh",
+            "--services",
+            "web,abcdefgh/db",
+            "--hash-dir",
+        ])
+        .arg(&hashes)
+        .arg("--out")
+        .arg(&secret)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(said["tenant"], "abcdefgh");
+    assert_eq!(said["services"], "abcdefgh/db,abcdefgh/web");
+    let hash = fs::read_to_string(hashes.join("tenant.hash")).unwrap();
+    assert!(hash.contains("\ntenant=abcdefgh\n"));
+    assert!(
+        TokenStore::load(&hashes)
+            .unwrap()
+            .lookup(fs::read_to_string(secret).unwrap().trim())
+            .is_some()
+    );
+}
+
+#[test]
+fn token_mint_at_documented_maxima_either_loads_or_writes_nothing() {
+    let names = (0..64)
+        .map(|n| format!("a{n:02}{}", "x".repeat(37)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let qualified = names
+        .split(',')
+        .map(|name| format!("abcdefgh/{name}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for scope in [
+        arca_api::Scope::Viewer,
+        arca_api::Scope::Doctor,
+        arca_api::Scope::Operator,
+    ] {
+        let tools = arca_api::verbs()
+            .iter()
+            .filter(|v| arca_api::may_call(scope, v))
+            .map(|v| v.name)
+            .collect::<Vec<_>>()
+            .join(",");
+        for bound in [false, true] {
+            for services in [None, Some(names.as_str()), Some(qualified.as_str())] {
+                for with_tools in [false, true] {
+                    for with_expiry in [false, true] {
+                        let scratch = Scratch::new("maximum-token");
+                        let hashes = scratch.at("tokens");
+                        fs::create_dir(&hashes).unwrap();
+                        fs::set_permissions(&hashes, fs::Permissions::from_mode(0o700)).unwrap();
+                        let secret = scratch.at("secret");
+                        let mut cmd = arca();
+                        cmd.args([
+                            "token",
+                            "mint",
+                            "--scope",
+                            scope.as_str(),
+                            "--id",
+                            "maximum",
+                        ])
+                        .arg("--hash-dir")
+                        .arg(&hashes)
+                        .arg("--out")
+                        .arg(&secret);
+                        if bound {
+                            cmd.args(["--tenant", "abcdefgh"]);
+                        }
+                        if let Some(services) = services {
+                            cmd.args(["--services", services]);
+                        }
+                        if with_tools {
+                            cmd.args(["--tools", &tools]);
+                        }
+                        if with_expiry {
+                            cmd.args(["--expires", "3650d"]);
+                        }
+                        let out = cmd.output().unwrap();
+                        // Count the exact wire bytes independently, including resolved service qualifiers.
+                        let size = format!("scope={}\nsha256={}\n", scope.as_str(), "0".repeat(64))
+                            .len()
+                            + if bound { "tenant=abcdefgh\n".len() } else { 0 }
+                            + services.map_or(0, |services| {
+                                "services=\n".len()
+                                    + services.len()
+                                    + if bound && !services.contains('/') {
+                                        9 * 64
+                                    } else {
+                                        0
+                                    }
+                            })
+                            + if with_tools {
+                                "tools=\n".len() + tools.len()
+                            } else {
+                                0
+                            }
+                            + if with_expiry {
+                                "expires=2036-01-01T00:00:00Z\n".len()
+                            } else {
+                                0
+                            };
+                        let budget = if bound { 8192 } else { 4096 };
+                        assert_eq!(
+                            out.status.success(),
+                            size <= budget,
+                            "size={size}, budget={budget}: {}",
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                        if out.status.success() {
+                            let text = fs::read_to_string(hashes.join("maximum.hash")).unwrap();
+                            assert_eq!(text.len(), size);
+                            let store =
+                                TokenStore::load(&hashes).expect("every accepted mint loads");
+                            assert!(
+                                store
+                                    .lookup(fs::read_to_string(&secret).unwrap().trim())
+                                    .is_some()
+                            );
+                        } else {
+                            assert_eq!(out.status.code(), Some(2));
+                            assert!(!secret.exists());
+                            assert_eq!(fs::read_dir(&hashes).unwrap().count(), 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn token_mint_refuses_invalid_tenants_cross_tenant_services_and_bound_admins() {
+    for (scope, tenant, services) in [
+        ("doctor", "bad", "web"),
+        ("doctor", "abcdefgh", "ijklmnop/web"),
+        ("admin", "abcdefgh", "web"),
+        ("admin", "abcdefgh", ""),
+    ] {
+        let scratch = Scratch::new("bad-tenant-token");
+        let hashes = scratch.at("tokens");
+        fs::create_dir(&hashes).unwrap();
+        fs::set_permissions(&hashes, fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = scratch.at("secret");
+        let mut command = arca();
+        command.args([
+            "token", "mint", "--scope", scope, "--id", "tenant", "--tenant", tenant,
+        ]);
+        if !services.is_empty() {
+            command.args(["--services", services]);
+        }
+        let out = command
+            .arg("--hash-dir")
+            .arg(&hashes)
+            .arg("--out")
+            .arg(&secret)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(!secret.exists());
+        assert_eq!(fs::read_dir(hashes).unwrap().count(), 0);
+    }
+}
+
 /// A home directory under `scratch` as the installer leaves it: `.config/arca`, with `node.json` when `config` is given.
 fn installed_home(scratch: &Scratch, config: Option<&Value>) -> PathBuf {
     let home = scratch.at("home");
@@ -1766,7 +1952,7 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
         "  picks it: when ARCA_CONFIG names another file than the default, they refuse and say the --config to run them with.",
         "  init --watch-only [--config <file>] (back to a node that only looks)",
         "  call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]",
-        "  token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--services <comma list>] [--expires <30m|12h|7d|RFC 3339 UTC time>] [--replace] [--config <file> | --hash-dir <dir>]",
+        "  token mint --scope <viewer|doctor|operator|admin> --id <id> --out <file> [--tools <comma list>] [--tenant <id>] [--services <comma list>] [--expires <30m|12h|7d|RFC 3339 UTC time>] [--replace] [--config <file> | --hash-dir <dir>]",
         "  token reload [--config <file>] (the running node reads its tokens again)",
         "  serve [--config <file>]",
     ] {
