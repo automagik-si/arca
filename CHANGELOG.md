@@ -7,9 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-A config PATCH whose answer times out or is lost waits for Incus operations and reads the object back to settle its
-intent. Open intents are retried before later writes, so a temporary read failure no longer requires a restart once Incus
-answers again. PATCH requests get 30 seconds, and service config errors include the kernel's reason in the answer and log.
+A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
+its old values may precede a late synchronous PATCH: Arca keeps the original values as its inverse and retries the
+entry on the next document, rather than claiming the change did not land. Runtime recovery polls open intents without
+waiting on Incus operations, with one 5 s Incus I/O budget; an absent synchronous create stays open until it can be read
+back present or restart recovery settles it. PATCH requests get 30 seconds, and service config errors include the
+kernel's reason in the answer and log.
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
 refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:

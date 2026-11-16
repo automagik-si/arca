@@ -2,7 +2,7 @@
 //! each one is read back with a GET and settled from what the host shows, so the journal is a legal history again and the removal
 //! that follows sees what landed.
 //!
-//! The rules, by the kind of intent:
+//! The restart rules, by the kind of intent (runtime differences follow below):
 //!
 //! - A create. An object the entry owns at the intent's place is adopted, with the delete that undoes it. Nothing there means the
 //!   create never landed, and the intent is reverted. Any other object is not the entry's, so the intent is failed and reported.
@@ -12,9 +12,13 @@
 //! - A delete (an intent marked [`IntentKind::Delete`]). An object still there is kept, and the intent is failed, so the next removal
 //!   retries it. An absent object means the delete landed, so the intent and the create it undid are reverted.
 //!
-//! Nothing here sends a write. A read that cannot be answered leaves its intent open, and [`Reconciler::open`] then refuses.
+//! Nothing here sends a provider write. A read that cannot be answered leaves its intent open: opening the reconciler or
+//! the next write call then refuses. Runtime recovery never waits on operations and shares a 5 s Incus I/O budget for all intents.
+//! At runtime, an absent synchronous create stays open, and a patch showing its pre-image is recorded as may-have-landed
+//! with its original inverse. The restart path keeps its existing absence and pre-image rules.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use arca_kernel::KernelError;
 use arca_kernel::desired::EntryId;
@@ -23,6 +27,10 @@ use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::ReadBack;
 
 use crate::Reconciler;
+
+/// Reads on a loaded daemon can exceed a fraction of a second. Share five seconds across the whole pass, rather
+/// than restarting a long wait for each intent. Running operations are only polled, never waited on.
+const RUNTIME_RESOLUTION_BUDGET: Duration = Duration::from_secs(5);
 
 /// Why a create's intent is failed when the name holds an object the entry does not own.
 const NAME_HELD: &str = "the name holds an object the entry does not own; the create did not land";
@@ -58,19 +66,32 @@ enum Step {
 }
 
 impl<S: JournalStore> Reconciler<S> {
-    /// Settles every open intent before opening the reconciler or trying another reconciliation or approved write. Each one is
+    /// Settles every intent left open when the reconciler starts. Each one is
     /// read back and settled by the rules in the module's documentation. The resolution is kept for [`Reconciler::resolution`].
     ///
     /// Returns [`KernelError::Unresolved`] with the ids of the intents it could not settle, because a read could not be answered.
     /// Those intents stay open and keep writes blocked. Calling it again settles nothing that is already settled.
     pub fn resolve(&mut self, now_ms: u64) -> Result<Resolution, KernelError> {
+        self.resolve_with(now_ms, None)
+    }
+
+    /// Polls open intents without waiting on operations. One daemon I/O budget covers the whole batch, not each object.
+    pub(crate) fn resolve_runtime(&mut self, now_ms: u64) -> Result<Resolution, KernelError> {
+        self.resolve_with(now_ms, Some(Instant::now() + RUNTIME_RESOLUTION_BUDGET))
+    }
+
+    fn resolve_with(
+        &mut self,
+        now_ms: u64,
+        until: Option<Instant>,
+    ) -> Result<Resolution, KernelError> {
         let mut resolution = Resolution {
             at_ms: now_ms,
             ..Resolution::default()
         };
         let mut open = Vec::new();
         for record in self.journal.unresolved() {
-            if let Step::Open = self.settle(&record, &mut resolution)? {
+            if let Step::Open = self.settle(&record, &mut resolution, until)? {
                 open.push(record.id);
             }
         }
@@ -105,16 +126,21 @@ impl<S: JournalStore> Reconciler<S> {
     }
 
     /// Settles one unresolved intent.
-    fn settle(&mut self, record: &EffectRecord, out: &mut Resolution) -> Result<Step, KernelError> {
+    fn settle(
+        &mut self,
+        record: &EffectRecord,
+        out: &mut Resolution,
+        until: Option<Instant>,
+    ) -> Result<Step, KernelError> {
         if record.intent == Some(IntentKind::Delete) {
-            return self.settle_delete(record, out);
+            return self.settle_delete(record, out, until);
         }
         if let Some(patch) = &record.acl_patch {
-            return self.settle_acl_patch(record, patch, out);
+            return self.settle_acl_patch(record, patch, out, until);
         }
         match record.pre_image.clone() {
-            Some(pre_image) => self.settle_patch(record, &pre_image, out),
-            None => self.settle_create(record, out),
+            Some(pre_image) => self.settle_patch(record, &pre_image, out, until),
+            None => self.settle_create(record, out, until),
         }
     }
 
@@ -123,21 +149,42 @@ impl<S: JournalStore> Reconciler<S> {
         &self,
         record: &EffectRecord,
         pre_image: Option<&BTreeMap<String, Option<String>>>,
+        until: Option<Instant>,
     ) -> Option<ReadBack> {
-        self.provider
-            .read_back(&record.entry, &record.target, pre_image)
-            .ok()
+        match until {
+            None => self
+                .provider
+                .read_back(&record.entry, &record.target, pre_image)
+                .ok(),
+            Some(until) => self
+                .provider
+                .read_back_now(
+                    &record.entry,
+                    &record.target,
+                    pre_image,
+                    until.saturating_duration_since(Instant::now()),
+                )
+                .ok(),
+        }
     }
 
     fn settle_create(
         &mut self,
         record: &EffectRecord,
         out: &mut Resolution,
+        until: Option<Instant>,
     ) -> Result<Step, KernelError> {
-        let Some(back) = self.read(record, None) else {
+        let Some(back) = self.read(record, None, until) else {
             return Ok(Step::Open);
         };
         match back {
+            ReadBack::Absent
+                if until.is_some()
+                    && record.target.kind != arca_kernel::ownership::IncusKind::Instance =>
+            {
+                // A synchronous create can still land after this read. Only restart recovery treats absence as final.
+                return Ok(Step::Open);
+            }
             ReadBack::Absent => {
                 self.journal.reverted(record.id);
                 out.reverted.push(record.id);
@@ -169,8 +216,9 @@ impl<S: JournalStore> Reconciler<S> {
         record: &EffectRecord,
         pre_image: &BTreeMap<String, Option<String>>,
         out: &mut Resolution,
+        until: Option<Instant>,
     ) -> Result<Step, KernelError> {
-        let Some(back) = self.read(record, Some(pre_image)) else {
+        let Some(back) = self.read(record, Some(pre_image), until) else {
             return Ok(Step::Open);
         };
         out.held.push(record.entry.clone());
@@ -188,7 +236,7 @@ impl<S: JournalStore> Reconciler<S> {
                 if !owned || !same {
                     self.journal.failed(record.id, NOT_THE_ENTRYS)?;
                     out.drift.push(object);
-                } else if holds_pre_image {
+                } else if holds_pre_image && until.is_none() {
                     self.journal.failed(record.id, NOT_LANDED)?;
                 } else {
                     // The patch may have landed. Its inverse is the pre-image, the values it replaced, so the removal restores them.
@@ -210,11 +258,20 @@ impl<S: JournalStore> Reconciler<S> {
         record: &EffectRecord,
         patch: &arca_kernel::journal::AclPatch,
         out: &mut Resolution,
+        until: Option<Instant>,
     ) -> Result<Step, KernelError> {
-        let Ok(back) = self
-            .provider
-            .read_back_acl(&record.entry, &record.target, patch)
-        else {
+        let back = match until {
+            None => self
+                .provider
+                .read_back_acl(&record.entry, &record.target, patch),
+            Some(until) => self.provider.read_back_acl_now(
+                &record.entry,
+                &record.target,
+                patch,
+                until.saturating_duration_since(Instant::now()),
+            ),
+        };
+        let Ok(back) = back else {
             return Ok(Step::Open);
         };
         out.held.push(record.entry.clone());
@@ -222,8 +279,8 @@ impl<S: JournalStore> Reconciler<S> {
             ReadBack::Present {
                 object,
                 owned: true,
-                holds_pre_image: false,
-            } => {
+                holds_pre_image,
+            } if !holds_pre_image || until.is_some() => {
                 self.journal.applied(
                     record.id,
                     object.clone(),
@@ -252,8 +309,9 @@ impl<S: JournalStore> Reconciler<S> {
         &mut self,
         record: &EffectRecord,
         out: &mut Resolution,
+        until: Option<Instant>,
     ) -> Result<Step, KernelError> {
-        let Some(back) = self.read(record, None) else {
+        let Some(back) = self.read(record, None, until) else {
             return Ok(Step::Open);
         };
         match back {

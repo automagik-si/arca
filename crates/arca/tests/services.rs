@@ -115,6 +115,29 @@ impl Provider for PausedProvider {
     ) -> Result<ReadBack, EffectRefusal> {
         self.inner.read_back_acl(entry, target, patch)
     }
+    fn read_back_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre: Option<&std::collections::BTreeMap<String, Option<String>>>,
+        budget: std::time::Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        if target.kind == IncusKind::Instance
+            && *self.unknown_create.lock().expect("unknown switch")
+        {
+            return Err(EffectRefusal::Unresolved);
+        }
+        self.inner.read_back_now(entry, target, pre, budget)
+    }
+    fn read_back_acl_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+        budget: std::time::Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back_acl_now(entry, target, patch, budget)
+    }
     fn retire(
         &mut self,
         entry: &EntryId,

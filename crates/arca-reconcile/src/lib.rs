@@ -647,7 +647,7 @@ impl<S: JournalStore> Reconciler<S> {
     /// a journal failure leaves the journal poisoned, so the existing blocked checks still stop every effect.
     fn settle_open_intents(&mut self, now_ms: u64) {
         if self.journal.poisoned().is_none() && !self.journal.unresolved().is_empty() {
-            let _ = self.resolve(now_ms);
+            let _ = self.resolve_runtime(now_ms);
         }
     }
 

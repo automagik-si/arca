@@ -2019,3 +2019,79 @@ fn a_disconnect_stores_no_plain_value_of_the_consumers_environment_and_the_consu
         }
     }
 }
+
+#[test]
+fn runtime_settlement_releases_the_kernel_for_approval_page_and_sign_in_readers() {
+    let rig = Rig::new();
+    rig.template("two",json!({"name":"two","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[],"secrets":["FIRST"],"env":{"FIRST":"{{secret:FIRST}}"}}));
+    rig.call("service_create", json!({"name":"two","template":"two"}))
+        .unwrap();
+    let cfg = rig.service_config("two");
+    let path = format!("/1.0/instances/{}?project={}", cfg.instance, cfg.project);
+    rig.fake.drop_patch_answer(&path, false);
+    rig.fake.set_operations_unreadable(true);
+    let error = op(
+        &rig,
+        "service_secret_set",
+        json!({"name":"two","key":"FIRST","value":"synthetic-first"}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error,CallError::Refused {message,..} if message.contains("intent stays open"))
+    );
+    rig.fake.set_operations_unreadable(false);
+    let held = rig.fake.hold_operation(&ObjectRef {
+        kind: IncusKind::Instance,
+        project: cfg.project.clone(),
+        parent: None,
+        name: cfg.instance.clone(),
+        uuid: None,
+    });
+    let from = rig.fake.requests().len();
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rig_ref = &rig;
+        let write = scope.spawn(move || {
+            tx.send(op(
+                rig_ref,
+                "service_secret_set",
+                json!({"name":"two","key":"FIRST","value":"synthetic-second"}),
+            ))
+            .unwrap();
+        });
+        let until = Instant::now() + Duration::from_secs(3);
+        while !rig.fake.requests()[from..]
+            .iter()
+            .any(|q| q.path == arca_incus::OPERATIONS_PATH)
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let probed = rig.fake.requests()[from..]
+            .iter()
+            .any(|q| q.path == arca_incus::OPERATIONS_PATH);
+        let kernel = rig.kernel.clone();
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel();
+        let owner = scope.spawn(move || {
+            let kernel = kernel.lock().unwrap();
+            // These are the actual kernel reads used by the approval page and OAuth owner_lines.
+            let _ = kernel.pending_plans();
+            let _ = kernel.owner_passkey_lines();
+            owner_tx.send(()).unwrap();
+        });
+        let prompt = matches!(rx.recv_timeout(Duration::from_millis(500)), Ok(Err(_)));
+        let owner_prompt = owner_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        rig.fake.release_operation(&held);
+        write.join().unwrap();
+        owner.join().unwrap();
+        assert!(
+            probed && prompt && owner_prompt,
+            "runtime recovery must release the owner-facing kernel mutex"
+        );
+    });
+    assert!(
+        !rig.fake.requests()[from..]
+            .iter()
+            .any(|q| q.path.contains("/wait"))
+    );
+}

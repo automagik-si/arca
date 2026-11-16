@@ -4451,6 +4451,8 @@ fn custom_volume_observe_checks_pool_route_family_project_and_ownership() {
 
 #[test]
 fn a_patch_whose_operation_wait_times_out_is_settled_from_read_back() {
+    // Defensive handling of an async protocol response, not Incus's normal synchronous config PATCH.
+    // The delayed synchronous PATCH regression has no operation and does not rely on this case.
     const OP: &str = "00000000-0000-4000-8000-0000000000aa";
     let mut patched = false;
     let script = Script::start("patch-timeout", move |method, target| {

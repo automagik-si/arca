@@ -25,6 +25,7 @@ struct Fault {
     create: bool,
     delete: bool,
     lands: bool,
+    read_budget: Option<Duration>,
     creates: usize,
     deletes: usize,
 }
@@ -71,6 +72,30 @@ impl Provider for Unsure {
     ) -> Result<ReadBack, EffectRefusal> {
         self.inner.read_back(entry, target, pre)
     }
+    fn read_back_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre: Option<&std::collections::BTreeMap<String, Option<String>>>,
+        budget: std::time::Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        let budget = self
+            .fault
+            .lock()
+            .unwrap()
+            .read_budget
+            .map_or(budget, |limit| limit.min(budget));
+        self.inner.read_back_now(entry, target, pre, budget)
+    }
+    fn read_back_acl_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &arca_kernel::journal::AclPatch,
+        budget: Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back_acl_now(entry, target, patch, budget)
+    }
     fn retire(
         &mut self,
         entry: &EntryId,
@@ -94,6 +119,8 @@ impl Provider for Unsure {
 #[derive(Deserialize)]
 struct Config {
     instance: bool,
+    #[serde(default)]
+    patch_acl: bool,
 }
 struct Creator;
 impl Plugin for Creator {
@@ -126,6 +153,20 @@ impl Plugin for Creator {
                 "/1.0/network-acls/box?project=default".into(),
             )
         };
+        if cfg.patch_acl {
+            ctx.effect(EffectOp::IncusPatchAclField {
+                object: ObjectRef {
+                    kind,
+                    project: project.into(),
+                    parent: None,
+                    name: "box".into(),
+                    uuid: None,
+                },
+                field: arca_kernel::journal::AclField::Ingress,
+                rules: vec![json!({"action":"allow","protocol":"tcp","destination_port":"8443"})],
+            })?;
+            return Ok(());
+        }
         if ctx.observe(Observe::IncusGet { path }).is_ok() {
             return Ok(());
         }
@@ -134,7 +175,11 @@ impl Plugin for Creator {
             project: project.into(),
             parent: None,
             name: "box".into(),
-            body: json!({"name":"box","config":{}}),
+            body: if kind == IncusKind::Acl {
+                json!({"name":"box","config":{},"ingress":[],"egress":[]})
+            } else {
+                json!({"name":"box","config":{}})
+            },
         })?;
         Ok(())
     }
@@ -356,7 +401,7 @@ fn runtime_pending_operation_does_not_hold_the_mutex_needed_by_approval_and_sign
         owner_tx.send(()).unwrap();
     });
     let prompt = rx.recv_timeout(Duration::from_millis(500)).is_ok();
-    let owner_prompt = owner_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+    let owner_prompt = owner_rx.recv_timeout(Duration::from_millis(500)).is_ok();
     fake.release_operation(&op);
     write.join().unwrap();
     read.join().unwrap();
@@ -369,5 +414,75 @@ fn runtime_pending_operation_does_not_hold_the_mutex_needed_by_approval_and_sign
             .iter()
             .any(|q| q.path.contains("/wait")),
         "runtime settlement must never wait on an operation"
+    );
+}
+
+#[test]
+fn runtime_unanswered_read_stays_open_and_uses_one_short_io_budget() {
+    let mut r = Rig::new(false, true, true);
+    r.fault.lock().unwrap().read_budget = Some(Duration::from_millis(100));
+    r.fake.unanswered_reads(OPERATIONS_PATH, 1);
+    let next = r.next(2, &r.first, true);
+    let start = Instant::now();
+    r.reconciler.reconcile(&next, NOW + 1);
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "a hung read is bounded, not the default 10-second transport wait"
+    );
+    assert_eq!(r.reconciler.journal().unresolved().len(), 1);
+    let later = r.next(3, &next, true);
+    r.reconciler.reconcile(&later, NOW + 2);
+    assert!(r.reconciler.journal().unresolved().is_empty());
+    assert_eq!(r.fault.lock().unwrap().creates, 1);
+}
+
+#[test]
+fn runtime_a_read_slower_than_one_hundred_ms_still_settles_inside_the_pass_budget() {
+    let mut r = Rig::new(false, true, true);
+    r.fake
+        .slow_reads(OPERATIONS_PATH, 1, Duration::from_millis(150));
+    let next = r.next(2, &r.first, true);
+    let start = Instant::now();
+    r.reconciler.reconcile(&next, NOW + 1);
+    assert!(start.elapsed() >= Duration::from_millis(150));
+    assert!(
+        r.reconciler.journal().unresolved().is_empty(),
+        "a loaded daemon must still settle without restart"
+    );
+    assert_eq!(r.states(1), vec![EffectState::Intent, EffectState::Applied]);
+    assert_eq!(r.fault.lock().unwrap().creates, 1);
+}
+
+#[test]
+fn runtime_uncertain_acl_pre_image_preserves_its_original_rules() {
+    let mut r = Rig::new(false, false, false);
+    r.fault.lock().unwrap().create = true;
+    let patch = |seq, prev| {
+        signed(
+            &r.key,
+            seq,
+            Some(prev),
+            vec![entry(
+                "creator",
+                Creator::ID,
+                json!({"instance":false,"patch_acl":true}),
+            )],
+        )
+    };
+    let first = patch(2, r.first.document.digest());
+    r.reconciler.reconcile(&first, NOW + 1);
+    assert_eq!(r.reconciler.journal().unresolved().len(), 1);
+    let next = patch(3, first.document.digest());
+    r.reconciler.reconcile(&next, NOW + 2);
+    assert!(r.reconciler.journal().unresolved().is_empty());
+    assert_eq!(r.states(2), vec![EffectState::Intent, EffectState::Applied]);
+    let records = std::fs::read_to_string(r.scratch.path("journal")).unwrap();
+    let record = records
+        .lines()
+        .map(|line| serde_json::from_str::<arca_kernel::journal::EffectRecord>(line).unwrap())
+        .find(|record| record.id == 2 && record.state == EffectState::Applied)
+        .unwrap();
+    assert!(
+        matches!(record.inverse, Some(Inverse::IncusRestoreAclField { rules, .. }) if rules.is_empty())
     );
 }
