@@ -200,6 +200,7 @@ fn a_viewer_may_propose_and_nothing_changes() {
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let proposed = rig.handlers["action_propose"]
         .call(
@@ -321,9 +322,11 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "instances": 4, "containers": 4, "virtualMachines": 1, "cpu": 8,
                 "memory": "16GiB", "disk": "100GiB" } }),
             ActionKind::TenantRemove => json!({ "id": "abcdefgh" }),
-            ActionKind::TenantImageImport => json!({ "tenant": "abcdefgh", "project": "arcak-t-abcdefgh",
+            ActionKind::TenantImageImport => {
+                json!({ "tenant": "abcdefgh", "project": "arcak-t-abcdefgh",
                 "fingerprint": "c".repeat(64), "alias": "app", "tenantIncarnation": "3",
-                "properties": { "type": "app", "architecture": "x86_64" } }),
+                "properties": { "type": "app", "architecture": "x86_64" } })
+            }
             ActionKind::DeployRemove => json!({ "tenant": "abcdefgh", "deploy": "d1" }),
             ActionKind::ServicePublish => json!({ "name": "nats", "reach": "tailnet" }),
             ActionKind::ServiceConnect | ActionKind::ServiceDisconnect => {
@@ -673,15 +676,42 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
         }
         if action == ActionKind::TenantImageImport {
             let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
-            assert_eq!(labels, ["Fingerprint", "Project", "Tenant incarnation", "Alias", "Source properties", "Effect", "Tenant"]);
+            assert_eq!(
+                labels,
+                [
+                    "Fingerprint",
+                    "Project",
+                    "Tenant incarnation",
+                    "Alias",
+                    "Source properties",
+                    "Effect",
+                    "Tenant"
+                ]
+            );
             assert_eq!(details[0].value, "c".repeat(64));
             assert_eq!(details[1].value, "arcak-t-abcdefgh");
             assert_eq!(details[2].value, "3");
             assert_eq!(details[3].value, "app");
-            assert_eq!(serde_json::from_str::<Value>(&details[4].value).unwrap(), prepared["properties"]);
+            assert_eq!(
+                serde_json::from_str::<Value>(&details[4].value).unwrap(),
+                prepared["properties"]
+            );
             assert_eq!(details[6].value, "abcdefgh");
-            assert!(action.params_schema()["properties"].as_object().unwrap().keys().all(|field|
-                ["tenant", "project", "fingerprint", "alias", "tenantIncarnation", "properties"].contains(&field.as_str())));
+            assert!(
+                action.params_schema()["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|field| [
+                        "tenant",
+                        "project",
+                        "fingerprint",
+                        "alias",
+                        "tenantIncarnation",
+                        "properties"
+                    ]
+                    .contains(&field.as_str()))
+            );
             continue;
         }
         if action == ActionKind::TenantCreate {
@@ -1179,6 +1209,7 @@ fn a_proposal_says_where_to_approve_it_when_it_expires_and_how_to_enrol_a_passke
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     // A removal: a create on a node with a config reads its template from the node's state, which this one has none of.
     let remove = |name: &str| json!({ "action": "service_remove", "args": { "name": name } });
@@ -1221,6 +1252,7 @@ fn a_proposal_on_a_node_that_trusts_another_page_hosts_keys_says_it_is_approved_
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let remove = |name: &str| json!({ "action": "service_remove", "args": { "name": name } });
     let linked = |origin: Option<&str>| {
@@ -1274,6 +1306,7 @@ fn a_proposal_on_a_public_page_with_no_passkey_says_to_enrol_one_without_an_ssh_
         token_id: "viewer".to_string(),
         scope: Scope::Viewer,
         tools: None,
+        limits: Default::default(),
     };
     let answer = served_propose(&rig, node_with_page(Some("https://arca.example.org")))
         .call(

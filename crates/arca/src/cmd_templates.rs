@@ -61,6 +61,33 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
+    // 0.32.0: before the edge provided its target and the Cloudflare template named its connector kind.
+    (
+        "arca-edge.json",
+        "56e40fd9a6d77b8c6c35fac7a61575488ef5db044a45177660c682af31ca8a71",
+    ),
+    (
+        "cloudflare-tunnel.json",
+        "ab2bbb77cd12d1b4c6fb0bd5a75ee2901552cdfbc01dedbc76b5c5b1ceb611e1",
+    ),
+    // Installed from the unreleased Tailscale template: before linked targets and optional secrets.
+    (
+        "tailscale.json",
+        "6afdbdaf54a0f91590aa1f1e86cde5c1677a3f8447693e4c69296a28fd868145",
+    ),
+    (
+        "tailscale.sh",
+        "5cc08fec28a57c18c16a641239a7cfd98524beaa371da60bfdbc4cc7c87ba38f",
+    ),
+    // 0.33.0: before explicit persistent homes and the required baked pnpm path.
+    (
+        "automagik-workspace.json",
+        "c1a098c97ea945418f3113f4e6a87ff4a5b4c106226dc3d7d53adcb8a91e4bea",
+    ),
+    (
+        "automagik-workspace.sh",
+        "1cc3119c26c9a7b16c97cdf8be1f271494433229e582c0ffb87d00125e3c1cf5",
+    ),
     // 0.1.0-alpha.7 to 0.14.0: before its image's name carried the inputs it is built from.
     (
         "automagik.json",

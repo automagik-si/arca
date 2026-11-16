@@ -185,7 +185,13 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("tenant_status", VerbClass::L, Scope::Viewer, false, false),
         ("tenant_usage", VerbClass::L, Scope::Viewer, false, false),
         ("tenant_remove", VerbClass::L, Scope::Doctor, true, true),
-        ("tenant_image_import", VerbClass::L, Scope::Doctor, true, false),
+        (
+            "tenant_image_import",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            false,
+        ),
         ("deploy_confirm", VerbClass::L, Scope::Doctor, true, false),
         ("deploy_rollback", VerbClass::L, Scope::Doctor, true, true),
         ("deploy_remove", VerbClass::L, Scope::Doctor, true, true),
@@ -2070,7 +2076,11 @@ fn a_field_the_kernel_fills_in_is_taken_at_the_door_with_any_value() {
         for field in fields {
             let rule = &own["properties"][*field];
             assert!(rule.is_object(), "{action} takes {field}");
-            let off_rule = if conforms(rule, &off_rule).is_ok() { json!(7) } else { off_rule.clone() };
+            let off_rule = if conforms(rule, &off_rule).is_ok() {
+                json!(7)
+            } else {
+                off_rule.clone()
+            };
             assert!(
                 conforms(rule, &off_rule).is_err(),
                 "{action}/{field}: off its rule"

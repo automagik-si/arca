@@ -1,6 +1,6 @@
 {
   "name": "automagik-workspace",
-  "description": "One Automagik workspace in its own virtual machine (Debian 13 cloud image; 2 CPUs, 4GiB, 20GiB): the Automagik server and its gate (one image, by digest: Automagik 3.146.5, pulled once its provenance verifies) and, as settings.reach says, a Cloudflare Tunnel connector (cloudflared 2026.10.7) or a tailnet node (Tailscale 1.104.4). Give reach, publicUrl, the Access settings and memberRunner (off) at create. Created stopped: set TUNNEL_TOKEN or TAILSCALE_AUTHKEY, then instance_start.",
+  "description": "One Automagik workspace per VM (Debian 13; 2 CPUs, 4GiB, 20GiB). Server and gate: Automagik 3.146.5, by verified digest; cloudflared 2026.10.7 or Tailscale 1.104.4. Homes and CLI store persist under /data. automagikPnpm pins the baked pnpm 10 path. Final reviewed image digest goes only in settings.serverImage; current pin stays. Give reach, publicUrl, Access settings and memberRunner at create. Created stopped: set TUNNEL_TOKEN or TAILSCALE_AUTHKEY, then instance_start.",
   "kind": "virtual-machine",
   "image": "images:debian/13/cloud",
   "limits": { "cpu": "2", "memory": "4GiB" },
@@ -9,7 +9,7 @@
   "firstBoot": { "file": "automagik-workspace.sh" },
   "update": { "pin": "serverImage" },
   "secrets": ["TUNNEL_TOKEN", "TAILSCALE_AUTHKEY"],
-  "createSettings": ["reach", "publicUrl", "accessTeamDomain", "accessAudience", "accessEmails", "memberRunner"],
+  "createSettings": ["reach", "publicUrl", "accessTeamDomain", "accessAudience", "accessEmails", "memberRunner", "automagikPnpm"],
   "settings": {
     "reach": "cloudflare",
     "publicUrl": "",
@@ -17,6 +17,7 @@
     "accessAudience": "",
     "accessEmails": "",
     "memberRunner": false,
+    "automagikPnpm": "/usr/local/bin/pnpm",
     "serverImage": "ghcr.io/automagik-si/automagik-server@sha256:cc804cb0c3a60219e4db57d309d8029e2b47c3450fdb7c435eabfe98a568a8dd"
   }
 }

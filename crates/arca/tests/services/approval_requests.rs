@@ -47,6 +47,7 @@ fn caller(token: &str, scope: Scope) -> Caller {
         token_id: token.to_string(),
         scope,
         tools: None,
+        limits: Default::default(),
     }
 }
 

@@ -370,6 +370,7 @@ pub fn caller(scope: arca_api::Scope) -> Caller {
         token_id: "test-caller".to_string(),
         scope,
         tools: None,
+        limits: Default::default(),
     }
 }
 

@@ -1908,6 +1908,7 @@ fn a_no_in_the_owners_session_declines_the_plan_and_the_admin_tokens_no_leaves_i
         token_id: "admin1".to_string(),
         scope: Scope::Admin,
         tools: None,
+        limits: Default::default(),
     };
     assert!(
         !terminal.decline(&stop, created(&rig, &stop), &admin),

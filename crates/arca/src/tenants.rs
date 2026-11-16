@@ -1102,9 +1102,14 @@ pub fn tenant_handlers(
             }) as Arc<dyn ToolHandler>,
         )
     })
-    .chain(std::iter::once(("tenant_image_import", Arc::new(super::tenant_images::Handler {
-        kernel: kernel.clone(), cfg: cfg.clone(), writes: writes.clone(),
-    }) as Arc<dyn ToolHandler>)))
+    .chain(std::iter::once((
+        "tenant_image_import",
+        Arc::new(super::tenant_images::Handler {
+            kernel: kernel.clone(),
+            cfg: cfg.clone(),
+            writes: writes.clone(),
+        }) as Arc<dyn ToolHandler>,
+    )))
     .collect()
 }
 

@@ -502,6 +502,7 @@ fn a_service_update_keeps_the_device_and_checks_the_service_through_the_private_
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
         .expect("the update");
@@ -650,6 +651,7 @@ fn a_failed_health_check_names_the_private_port_it_probed_and_not_the_first_port
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
                 tools: None,
+                limits: Default::default(),
             },
         )
         .expect_err("the check fails");
