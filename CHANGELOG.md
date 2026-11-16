@@ -52,6 +52,13 @@ the old version's after a rollback), and an `Unreachable` answer reads the list 
 the page writes one log line with its outcome code: `approved`, `approved, then failed <code>` (the approval was spent
 and the action failed), `refused <code>`, `unreachable` or `declined`.
 
+`service_disconnect` works again for a consumer whose template environment has a plain value, such as `"true"`. A
+disconnect used to store every value of the consumer's own environment as one of its secret files. The provider hides a
+stored value wherever it reads it back, so a value like `true` hid the mark on the consumer's own network ACL: the
+disconnect was refused after the provider's side had closed, and every later change to that service was refused the
+same way. A disconnect now rebuilds only the names the link gave. A node that already holds such a file keeps
+refusing until the file goes: it is `secrets/service-<name>/v-<sha256 of the value>`, and no record refers to it.
+
 ## 0.32.0 (2026-11-16)
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the
