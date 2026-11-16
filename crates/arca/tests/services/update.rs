@@ -1787,3 +1787,94 @@ fn labels_set_before_and_during_a_failed_update_survive_snapshot_rollback() {
         json!({"before":"kept", "during":"kept", "change":"new"})
     );
 }
+
+fn rollback_with_unavailable_label_preservation(pre_read_fails: bool) {
+    let up = Arc::new(AtomicBool::new(false));
+    let mut rig = rig(&up);
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"version":"snapshot"}}),
+    )
+    .unwrap();
+    let setter = rig.handlers["service_labels_set"].clone();
+    let fake = Arc::clone(&rig.fake);
+    let fired = Arc::new(AtomicBool::new(false));
+    let armed = Arc::clone(&fired);
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe: Arc::new(move |_, _, _| {
+                if !armed.swap(true, Ordering::SeqCst) {
+                    let answer = setter
+                        .call(
+                            json!({"name":"app", "labels":{"version":"during-update"}}),
+                            &Caller {
+                                token_id: "doctor".into(),
+                                scope: Scope::Doctor,
+                                tools: None,
+                                limits: Default::default(),
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(answer["code"], "confirmed");
+                    if pre_read_fails {
+                        // The rollback stop reads before its PUT and reads it back afterward. Fail only the
+                        // following read: label preservation's ownership/config read, not dev's restore read.
+                        fake.slow_reads("/1.0/instances/app?", 2, Duration::ZERO);
+                        fake.fail_reads("/1.0/instances/app?", 1, 503);
+                    } else {
+                        fake.set_reject_patch("/1.0/instances/app");
+                    }
+                }
+                false
+            }),
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
+    let failure = update(
+        &rig,
+        json!({"name":"app", "digest":NEW, "timeoutSeconds":1}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(failure, CallError::Refused {ref code, ..} if code == "rolled_back"),
+        "{failure:?}"
+    );
+    assert!(fired.load(Ordering::SeqCst));
+    assert_eq!(
+        rig.fake.restores(PROJECT, "app").len(),
+        1,
+        "the root was restored"
+    );
+    assert_eq!(
+        instance(&rig)["status"],
+        "Running",
+        "the old instance restarted"
+    );
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"version":"snapshot"})
+    );
+    let requests = rig.fake.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.status == if pre_read_fails { 503 } else { 400 }),
+        "the intended fault was reached"
+    );
+}
+
+#[test]
+fn rollback_still_succeeds_when_label_pre_read_fails() {
+    rollback_with_unavailable_label_preservation(true);
+}
+
+#[test]
+fn rollback_still_succeeds_when_label_put_back_fails() {
+    rollback_with_unavailable_label_preservation(false);
+}

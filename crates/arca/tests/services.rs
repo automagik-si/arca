@@ -162,7 +162,7 @@ impl Provider for PausedProvider {
 
 struct Rig {
     dir: PathBuf,
-    fake: FakeIncus,
+    fake: Arc<FakeIncus>,
     kernel: Arc<Mutex<Kernel>>,
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     fail_observe: Arc<Mutex<Option<String>>>,
@@ -239,7 +239,7 @@ impl Rig {
         ));
         fs::create_dir(&dir).expect("scratch");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("0700");
-        let fake = FakeIncus::start(&dir, state).expect("fake");
+        let fake = Arc::new(FakeIncus::start(&dir, state).expect("fake"));
         fake.add_profile(
             "default",
             json!({"name":"default","config":{},"devices":{"root":{"type":"disk","pool":"pool1","path":"/"}}}),
