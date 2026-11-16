@@ -109,6 +109,106 @@ fn token_mint_binds_a_tenant_and_normalizes_its_services() {
 }
 
 #[test]
+fn token_mint_at_documented_maxima_either_loads_or_writes_nothing() {
+    let names = (0..64)
+        .map(|n| format!("a{n:02}{}", "x".repeat(37)))
+        .collect::<Vec<_>>()
+        .join(",");
+    for scope in [
+        arca_api::Scope::Viewer,
+        arca_api::Scope::Doctor,
+        arca_api::Scope::Operator,
+    ] {
+        let tools = arca_api::verbs()
+            .iter()
+            .filter(|v| arca_api::may_call(scope, v))
+            .map(|v| v.name)
+            .collect::<Vec<_>>()
+            .join(",");
+        for bound in [false, true] {
+            for with_services in [false, true] {
+                for with_tools in [false, true] {
+                    for with_expiry in [false, true] {
+                        let scratch = Scratch::new("maximum-token");
+                        let hashes = scratch.at("tokens");
+                        fs::create_dir(&hashes).unwrap();
+                        fs::set_permissions(&hashes, fs::Permissions::from_mode(0o700)).unwrap();
+                        let secret = scratch.at("secret");
+                        let mut cmd = arca();
+                        cmd.args([
+                            "token",
+                            "mint",
+                            "--scope",
+                            scope.as_str(),
+                            "--id",
+                            "maximum",
+                        ])
+                        .arg("--hash-dir")
+                        .arg(&hashes)
+                        .arg("--out")
+                        .arg(&secret);
+                        if bound {
+                            cmd.args(["--tenant", "abcdefgh"]);
+                        }
+                        if with_services {
+                            cmd.args(["--services", &names]);
+                        }
+                        if with_tools {
+                            cmd.args(["--tools", &tools]);
+                        }
+                        if with_expiry {
+                            cmd.args(["--expires", "3650d"]);
+                        }
+                        let out = cmd.output().unwrap();
+                        // Count the exact wire bytes independently, including resolved service qualifiers.
+                        let size = format!("scope={}\nsha256={}\n", scope.as_str(), "0".repeat(64))
+                            .len()
+                            + if bound { "tenant=abcdefgh\n".len() } else { 0 }
+                            + if with_services {
+                                "services=\n".len() + names.len() + if bound { 9 * 64 } else { 0 }
+                            } else {
+                                0
+                            }
+                            + if with_tools {
+                                "tools=\n".len() + tools.len()
+                            } else {
+                                0
+                            }
+                            + if with_expiry {
+                                "expires=2036-01-01T00:00:00Z\n".len()
+                            } else {
+                                0
+                            };
+                        let budget = if bound { 8192 } else { 4096 };
+                        assert_eq!(
+                            out.status.success(),
+                            size <= budget,
+                            "size={size}, budget={budget}: {}",
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                        if out.status.success() {
+                            let text = fs::read_to_string(hashes.join("maximum.hash")).unwrap();
+                            assert_eq!(text.len(), size);
+                            let store =
+                                TokenStore::load(&hashes).expect("every accepted mint loads");
+                            assert!(
+                                store
+                                    .lookup(fs::read_to_string(&secret).unwrap().trim())
+                                    .is_some()
+                            );
+                        } else {
+                            assert_eq!(out.status.code(), Some(2));
+                            assert!(!secret.exists());
+                            assert_eq!(fs::read_dir(&hashes).unwrap().count(), 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn token_mint_refuses_invalid_tenants_cross_tenant_services_and_bound_admins() {
     for (scope, tenant, services) in [
         ("doctor", "bad", "web"),
