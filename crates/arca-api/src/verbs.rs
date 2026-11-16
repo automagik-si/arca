@@ -167,7 +167,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 94] = [
+static VERBS: [Verb; 96] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",

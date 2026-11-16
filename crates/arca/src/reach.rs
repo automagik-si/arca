@@ -163,7 +163,19 @@ pub(crate) fn reach_rows(
                         record.instance, record.project
                     ))
                     .unwrap_or_default();
-                if log.lines().any(|line| line.starts_with("boot: ") && line.ends_with("failed to auth tailscale: tailscale up failed: context deadline exceeded")) {
+                let mut timed_out = false;
+                for line in log.lines().filter(|line| line.starts_with("boot: ")) {
+                    if line.ends_with("Starting tailscaled")
+                        || line.ends_with("Startup complete, waiting for shutdown signal")
+                    {
+                        timed_out = false;
+                    } else if line.ends_with(
+                        "failed to auth tailscale: tailscale up failed: context deadline exceeded",
+                    ) {
+                        timed_out = true;
+                    }
+                }
+                if timed_out {
                     row["state"] = json!("gave-up");
                 }
             }

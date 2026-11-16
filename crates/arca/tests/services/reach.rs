@@ -303,6 +303,12 @@ fn stopped_connectors_only_gave_up_on_the_authentication_timeout_line() {
     assert_eq!(state(), "stopped");
     rig.fake.set_console_log(PROJECT, "node-ts", "boot: 2026/01/01 12:00:00 failed to auth tailscale: tailscale up failed: context deadline exceeded\n");
     assert_eq!(state(), "gave-up");
+    rig.fake.set_console_log(PROJECT, "node-ts", "boot: 2026/01/01 12:00:00 failed to auth tailscale: tailscale up failed: context deadline exceeded\nboot: 2026/01/01 12:01:00 Starting tailscaled\nboot: 2026/01/01 12:01:01 Startup complete, waiting for shutdown signal\n");
+    assert_eq!(
+        state(),
+        "stopped",
+        "an old timeout cannot describe a later stop"
+    );
 }
 
 #[test]

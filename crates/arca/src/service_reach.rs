@@ -1,5 +1,6 @@
 //! Approved connector creation through the existing service create, link and lifecycle paths.
 use super::*;
+use crate::service;
 use arca_kernel::desired::Entry;
 
 pub(super) fn connect_name(args: &Value, host: &str) -> Result<String, CallError> {
