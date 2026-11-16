@@ -325,6 +325,29 @@ impl<S: JournalStore> Reconciler<S> {
         &self.journal
     }
 
+    /// Rebind only the durable addresses. No provider effect or plugin apply runs.
+    pub fn bind(&mut self, event: arca_kernel::journal::BindingEvent) -> Result<(), KernelError> {
+        self.journal.bind(event)
+    }
+
+    /// Accept a storage projection of a committed binding without applying its
+    /// plugin. The caller projects the same facts into the durable desired store.
+    pub fn resume_binding(
+        &mut self,
+        doc: &SignedDocument,
+        entry: &Entry,
+        now_ms: u64,
+    ) -> Result<(), KernelError> {
+        if !self.journal.bindings().any(|event| event.entry == entry.id) {
+            return Err(KernelError::Journal("no live binding to resume".into()));
+        }
+        self.gate
+            .accept(doc, now_ms)
+            .map_err(KernelError::Refused)?;
+        self.converged.insert(entry.id.clone(), entry.clone());
+        Ok(())
+    }
+
     /// Accepts `doc` at `now_ms` and reconciles toward it. Returns one outcome per applied entry, removal step or refusal.
     pub fn reconcile(&mut self, doc: &SignedDocument, now_ms: u64) -> Vec<Outcome> {
         match self.gate.accept(doc, now_ms) {

@@ -63,6 +63,7 @@ pub mod self_update;
 pub mod service;
 pub mod service_exec;
 pub mod service_import;
+mod service_rebind;
 pub mod storage;
 pub mod support_reports;
 pub mod vm_import;

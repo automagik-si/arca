@@ -658,6 +658,7 @@ impl ServiceHandler {
             limits: Some(definition.limits.clone()),
             autostart: false,
             data: None,
+            data_volume: None,
             lan: None,
             private_port: None,
             start: false,

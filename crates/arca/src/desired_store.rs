@@ -221,6 +221,61 @@ impl DesiredStore {
         Ok(signed)
     }
 
+    /// Binding facts are already durable. Publish the repaired in-memory record
+    /// even if its cache cannot be saved; reopen repeats this before any apply.
+    pub(crate) fn recover_bindings(
+        &mut self,
+        events: &[arca_kernel::journal::BindingEvent],
+        now_ms: u64,
+    ) -> Result<(), KernelError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let Some(mut signed) = self.current.clone() else {
+            return Ok(());
+        };
+        let old = signed.document.clone();
+        let mut converged = self.converged.clone();
+        for event in events {
+            for entry in signed
+                .document
+                .entries
+                .iter_mut()
+                .chain(converged.iter_mut())
+            {
+                crate::service_rebind::project(entry, event)?;
+            }
+        }
+        if signed.document.entries == old.entries && converged == self.converged {
+            return Ok(());
+        }
+        if signed.document.entries != old.entries {
+            signed.document.seq = old.seq + 1;
+            signed.document.prev = Some(old.digest());
+            signed.document.issued_at = iso_utc(now_ms);
+            signed.document.expires_at = iso_utc(now_ms.saturating_add(DOCUMENT_TTL_MS));
+            signed = sign_document(signed.document, &self.key);
+            let mut gate = DesiredStateGate::new(self.signer(), self.applied.clone());
+            if !matches!(gate.accept(&signed, now_ms), Ok(Target::Apply(_))) {
+                return Err(KernelError::Journal(
+                    "repaired binding document was refused".into(),
+                ));
+            }
+        }
+        let next = StateFile {
+            current: Some(signed.clone()),
+            converged,
+            retained: records(&self.retained),
+        };
+        self.applied = Some(Applied {
+            seq: signed.document.seq,
+            digest: signed.document.digest(),
+        });
+        self.current = next.current.clone();
+        self.converged = next.converged.clone();
+        self.persist(&next)
+    }
+
     /// Persists the converged set and the retained set the reconciler now holds, keeping the current document. Nothing changes
     /// in memory unless the state is written.
     pub fn save_applied(

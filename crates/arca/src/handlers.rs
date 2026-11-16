@@ -1794,6 +1794,10 @@ impl ToolHandler for ActionPropose {
             enrich_gpu(gpu.as_ref(), &payload)?
         } else if let Some(storage) = storage {
             crate::storage::enrich(storage, action, &payload, now)?
+        } else if action == ActionKind::ServiceRebind {
+            let node = self.node.as_deref().ok_or_else(import_not_approved)?;
+            let kernel = lock(&self.kernel)?;
+            crate::service_rebind::enrich(node, &kernel, &payload)?
         } else if let (ActionKind::ServiceCreate, Some(node)) = (action, &self.node) {
             // The arguments are held to the verb's schema first, so a proposal with a bad name is told about the
             // name and not about what the node holds. What the node fills in below is checked again after it.
@@ -2962,6 +2966,7 @@ impl ActionExecutor {
                 | "service_reconfigure"
                 | "service_publish"
                 | "service_import"
+                | "service_rebind"
                 | "service_release"
                 | "gpu_attach"
                 | "gpu_detach"
@@ -6092,6 +6097,7 @@ pub fn service_handlers_updating(
         "service_update",
         "service_reconfigure",
         "service_import",
+        "service_rebind",
         "service_release",
         "route_add",
         "route_remove",
@@ -6893,6 +6899,7 @@ pub(crate) fn adopted_config(
         limits: None,
         autostart: false,
         data: None,
+        data_volume: None,
         lan: None,
         private_port: None,
         start: false,
@@ -7077,6 +7084,96 @@ fn service_removal_refused(
     ))
 }
 
+/// A re-bound service can leave its ACL referenced by the untouched backup.
+fn rebound_service_removal_refused(
+    read: &impl IncusRead,
+    config: &crate::service::ServiceConfig,
+    record_removed: bool,
+) -> CallError {
+    let state = |path: String, label: &str| match read.get(&path) {
+        Ok(body) => (format!("{label} remains"), false, Some(body)),
+        Err(arca_incus::IncusError::Status { code: 404, .. }) => {
+            (format!("{label} removed"), true, None)
+        }
+        Err(_) => (format!("{label} state unknown"), false, None),
+    };
+    let instance = state(
+        format!(
+            "/1.0/instances/{}?project={}",
+            config.instance, config.project
+        ),
+        "instance",
+    );
+    let mut objects = vec![format!("{} ({})", instance.0, config.instance)];
+    let data_removed = if config.data.is_some() {
+        let volume = config.data_locator();
+        let data = state(
+            format!(
+                "/1.0/storage-pools/{}/volumes/custom/{}?project={}",
+                volume.pool, volume.name, volume.project
+            ),
+            "data volume",
+        );
+        objects.push(format!(
+            "{} ({}/{}/{})",
+            data.0, volume.project, volume.pool, volume.name
+        ));
+        data.1
+    } else {
+        true
+    };
+    let mut referenced = false;
+    let mut acl_exists = false;
+    if !config.on_host_bridge() {
+        let acl = state(
+            format!("/1.0/network-acls/{}?project=default", config.acl()),
+            "ACL",
+        );
+        acl_exists = acl.2.is_some();
+        referenced = acl
+            .2
+            .as_ref()
+            .and_then(|body| body["used_by"].as_array())
+            .is_some_and(|uses| !uses.is_empty());
+        objects.push(format!("{} ({})", acl.0, config.acl()));
+    }
+    if acl_exists && !referenced {
+        // Some readers omit used_by. A kept instance's own NIC still supplies
+        // positive evidence for why this service's ACL cannot be removed.
+        referenced = read
+            .get("/1.0/instances?all-projects=true&recursion=1")
+            .ok()
+            .and_then(|rows| rows.as_array().cloned())
+            .is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["project"].as_str() == Some(config.project.as_str())
+                        && row["devices"].as_object().is_some_and(|devices| {
+                            devices.values().any(|device| {
+                                device["security.acls"].as_str().is_some_and(|acls| {
+                                    acls.split(',').any(|acl| acl.trim() == config.acl())
+                                })
+                            })
+                        })
+                })
+            });
+    }
+    if !referenced {
+        return service_removal_refused(read, config);
+    }
+    let why = "; the ACL remains because another instance still references it";
+    let next = if record_removed && instance.1 && data_removed && referenced {
+        "the service record is removed and the approval is spent; remove the old instance or its ACL reference, then normal reconciliation (including a restart) can finish the remaining ACL. A second service_remove cannot find the removed record"
+    } else {
+        "the owner's approval is spent, so another try needs a new one"
+    };
+    service_refused(format!(
+        "remove service {}: partial removal ({}{}); {next}",
+        config.name,
+        objects.join("; "),
+        why
+    ))
+}
+
 fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConfig, CallError> {
     let source = crate::service::source(parts.template).map_err(service_template_error)?;
     let entrypoint = parts.content.entrypoint().map_err(service_template_error)?;
@@ -7112,6 +7209,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         limits: parts.template.limits.clone(),
         autostart: parts.template.autostart,
         data: parts.template.data.clone(),
+        data_volume: None,
         lan: parts.template.lan.clone(),
         private_port: parts.private_port,
         start,
@@ -7195,6 +7293,7 @@ fn vm_service_config(
         limits: template.limits.clone(),
         autostart: template.autostart,
         data: None,
+        data_volume: None,
         lan: None,
         private_port: None,
         start: template.secrets.is_empty(),
@@ -7601,6 +7700,7 @@ impl ServiceHandler {
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
             ],
+            "service_rebind" => &["name", "binding", "approval"],
             "service_remove" | "service_import" | "service_release" => &["name", "approval"],
             "service_connect" | "service_disconnect" => &["from", "to"],
             "service_secret_set" => &["name", "key", "value"],
@@ -7637,7 +7737,11 @@ impl ServiceHandler {
         // A publication, an import and a release act on the node and take no tenant: the field is not theirs.
         let takes_tenant = !matches!(
             self.verb,
-            "service_publish" | "service_unpublish" | "service_import" | "service_release"
+            "service_publish"
+                | "service_unpublish"
+                | "service_import"
+                | "service_rebind"
+                | "service_release"
         ) && !self.verb.starts_with("function_")
             && !self.verb.starts_with("route_");
         if let Some(key) = object
@@ -7656,6 +7760,7 @@ impl ServiceHandler {
                 | "service_update"
                 | "service_reconfigure"
                 | "service_import"
+                | "service_rebind"
                 | "service_release"
         ) && caller.scope < Scope::Doctor
         {
@@ -7701,6 +7806,7 @@ impl ServiceHandler {
                 | "service_reconfigure"
                 | "service_publish"
                 | "service_import"
+                | "service_rebind"
                 | "service_release"
                 | "function_create"
                 | "function_remove"
@@ -7712,6 +7818,9 @@ impl ServiceHandler {
                     .map(|mut kernel| kernel.consume_action_grant(self.verb, &args, grant))
                     .unwrap_or(false)
             });
+        if self.verb == "service_rebind" && !preapproved {
+            return Err(import_not_approved());
+        }
         let _publish = matches!(
             self.verb,
             "service_publish" | "service_unpublish" | "service_remove"
@@ -7724,6 +7833,7 @@ impl ServiceHandler {
                 | "service_disconnect"
                 | "service_secret_set"
                 | "service_import"
+                | "service_rebind"
                 | "service_release"
                 | "function_create"
                 | "function_secret_set"
@@ -8170,6 +8280,14 @@ impl ServiceHandler {
                     return Err(refusal);
                 }
                 let id = entry.id.clone();
+                let rebound = lock(&self.kernel)?.service_has_binding(&id);
+                let removal_refused = |record_removed| {
+                    if rebound {
+                        rebound_service_removal_refused(&read, &config, record_removed)
+                    } else {
+                        service_removal_refused(&read, &config)
+                    }
+                };
                 let spent = if preapproved {
                     lock(&self.kernel)?.spend_service_removal_authorized(&id)
                 } else {
@@ -8214,9 +8332,7 @@ impl ServiceHandler {
                                 message: refusal.to_string(),
                             }
                         }
-                        crate::kernel::ServiceRemovalError::Proposal(_) => {
-                            service_removal_refused(&read, &config)
-                        }
+                        crate::kernel::ServiceRemovalError::Proposal(_) => removal_refused(false),
                         // A function came to link to it after the check above: the kernel refused under its own
                         // lock, and the approval this removal ran on is spent.
                         crate::kernel::ServiceRemovalError::LinkedFunctions(functions) => {
@@ -8234,7 +8350,7 @@ impl ServiceHandler {
                         .as_ref()
                         .map_or(true, |run| run.as_ref().is_some_and(|run| run.partial))
                 {
-                    return Err(service_removal_refused(&read, &config));
+                    return Err(removal_refused(true));
                 }
                 let secrets = self.cfg.state_dir.join("secrets").join(&id.0);
                 let _ = std::fs::remove_dir_all(secrets);
@@ -8251,6 +8367,10 @@ impl ServiceHandler {
                 } else {
                     Ok(json!({ "removed": true, "edges": edges }))
                 }
+            }
+            "service_rebind" => {
+                let mut kernel = lock(&self.kernel)?;
+                crate::service_rebind::execute(&self.cfg, &mut kernel, &args, now)
             }
             "service_import" => {
                 let name = service_name(&args)?;

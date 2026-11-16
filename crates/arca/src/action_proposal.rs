@@ -59,6 +59,7 @@ pub enum ActionKind {
     ServiceUpdate,
     ServiceReconfigure,
     ServiceImport,
+    ServiceRebind,
     ServiceRelease,
     ServicePublish,
     ServiceUnpublish,
@@ -144,12 +145,13 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 31] = [
+    pub const ALL: [ActionKind; 32] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
         Self::ServiceReconfigure,
         Self::ServiceImport,
+        Self::ServiceRebind,
         Self::ServiceRelease,
         Self::ServicePublish,
         Self::ServiceUnpublish,
@@ -194,6 +196,9 @@ impl ActionKind {
             }
             Self::ServiceReconfigure => {
                 "Change the template back and ask your assistant to reconfigure the service again: the card then shows the way back. If the node refuses the change or the restart fails, Arca puts the old settings back by itself."
+            }
+            Self::ServiceRebind => {
+                "The old instance and volume stay unchanged. Swap back to a previous copy and propose another re-bind to follow it."
             }
             Self::ServiceImport => {
                 "Ask your assistant to release it. The service itself is not changed either way."
@@ -294,6 +299,7 @@ impl ActionKind {
             Self::ServiceUpdate => "service_update",
             Self::ServiceReconfigure => "service_reconfigure",
             Self::ServiceImport => "service_import",
+            Self::ServiceRebind => "service_rebind",
             Self::ServiceRelease => "service_release",
             Self::ServicePublish => "service_publish",
             Self::ServiceUnpublish => "service_unpublish",
@@ -453,6 +459,13 @@ impl ActionKind {
             }
         })?;
         match self {
+            Self::ServiceRebind => {
+                if args.get("binding").is_none() {
+                    return Err(
+                        "args/binding: the kernel resolves it when the proposal is made".into(),
+                    );
+                }
+            }
             Self::ServiceCreate => {
                 // The digest the owner approves covers the MAC in the one form the record keeps.
                 if let Some(mac) = args.get("mac") {
@@ -668,6 +681,41 @@ impl ActionKind {
                 rows
             }
             Self::ServiceReconfigure => reconfigure_rows(args),
+            Self::ServiceRebind => {
+                let mut rows = vec![row("Name", text("name"))];
+                for (label, key) in [("Old binding", "from"), ("Replacement", "to")] {
+                    let state = &args["binding"][key];
+                    rows.push(row(
+                        label,
+                        &format!(
+                            "{}/{} UUID {}",
+                            state["instance"]["project"].as_str().unwrap_or_default(),
+                            state["instance"]["name"].as_str().unwrap_or_default(),
+                            state["instance"]["uuid"].as_str().unwrap_or_default()
+                        ),
+                    ));
+                    rows.push(row(
+                        "Root pool",
+                        state["root_pool"].as_str().unwrap_or_default(),
+                    ));
+                    let volume = &state["data_volume"];
+                    rows.push(row(
+                        "Data volume",
+                        &if volume.is_null() {
+                            "none".into()
+                        } else {
+                            format!(
+                                "{}/{}/{}",
+                                volume["project"].as_str().unwrap_or_default(),
+                                volume["parent"].as_str().unwrap_or_default(),
+                                volume["name"].as_str().unwrap_or_default()
+                            )
+                        },
+                    ));
+                }
+                rows.push(row("Effect","Arca follows the replacement. No instance or volume is changed or deleted; the old backup stays unchanged."));
+                rows
+            }
             Self::ServiceImport => vec![
                 row("Name", text("name")),
                 row(
@@ -1035,6 +1083,10 @@ impl ActionKind {
                 "Reconfigure the service {} as its template says now: {} (restarting it once if it runs)",
                 text("name"),
                 reconfigure_count(&args["changes"])
+            ),
+            Self::ServiceRebind => format!(
+                "Re-bind service {} to its observed replacement and storage",
+                text("name")
             ),
             Self::ServiceImport => format!(
                 "Import the service {}, which another manager created, where it stands",

@@ -4,7 +4,7 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
-The effect journal supports a binding record from this release; once one is written, older Arca versions refuse the journal.
+`service_rebind` follows an approved replacement instance and its observed root/data storage without changing backups; after one re-bind the node cannot go back to an older Arca, whose reader refuses the binding record.
 
 Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
 `TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:

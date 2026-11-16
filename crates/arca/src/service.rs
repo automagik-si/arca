@@ -431,6 +431,9 @@ pub struct ServiceConfig {
     pub autostart: bool,
     #[serde(default)]
     pub data: Option<Data>,
+    /// The observed custom data volume after a re-bind. Legacy records derive it from pool and name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_volume: Option<DataVolumeLocator>,
     #[serde(default)]
     pub lan: Option<Lan>,
     /// Present on a service with a private port. Every other record never carries the key.
@@ -556,7 +559,34 @@ pub const FOLLOW_AUTOMAGIK: &str = "automagik";
 /// The `follow` value that keeps a service where it is.
 pub const FOLLOW_NONE: &str = "none";
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataVolumeLocator {
+    pub project: String,
+    pub pool: String,
+    pub name: String,
+}
+impl DataVolumeLocator {
+    pub fn object(&self) -> arca_kernel::ownership::ObjectRef {
+        arca_kernel::ownership::ObjectRef {
+            kind: IncusKind::Volume,
+            project: self.project.clone(),
+            parent: Some(self.pool.clone()),
+            name: self.name.clone(),
+            uuid: None,
+        }
+    }
+}
 impl ServiceConfig {
+    pub fn data_locator(&self) -> DataVolumeLocator {
+        self.data_volume
+            .clone()
+            .unwrap_or_else(|| DataVolumeLocator {
+                project: self.project.clone(),
+                pool: self.pool.clone(),
+                name: format!("{}-data", self.name),
+            })
+    }
     /// Whether a service of this record can follow Automagik at all: a container of the node's own project, made from
     /// Automagik's server image by digest. A virtual machine, a function, an adopted service and a tenant's service
     /// cannot.
@@ -1058,8 +1088,8 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     if let Some(data) = &cfg.data {
         devices.insert(
             "data".into(),
-            json!({"type":"disk", "path":data.path, "pool":cfg.pool,
-            "source":format!("{}-data", cfg.name)}),
+            json!({"type":"disk", "path":data.path, "pool":cfg.data_locator().pool,
+            "source":cfg.data_locator().name}),
         );
     }
     if let Some(lan) = &cfg.lan {
@@ -1332,13 +1362,14 @@ impl Plugin for Service {
             }
         }
         if let Some(data) = &cfg.data {
-            let name = format!("{}-data", cfg.name);
+            let locator = cfg.data_locator();
+            let name = locator.name;
             // `observed` refuses a volume that does not carry this entry's mark, so an existing volume is never adopted.
             if observed(
                 ctx,
                 format!(
                     "/1.0/storage-pools/{}/volumes/custom/{name}?project={}",
-                    cfg.pool, cfg.project
+                    locator.pool, locator.project
                 ),
             )?
             .is_none()
@@ -1355,8 +1386,8 @@ impl Plugin for Service {
                 }
                 ctx.effect(EffectOp::IncusCreate {
                     kind: IncusKind::Volume,
-                    project: cfg.project.clone(),
-                    parent: Some(cfg.pool.clone()),
+                    project: locator.project.clone(),
+                    parent: Some(locator.pool.clone()),
                     name: name.clone(),
                     body: json!({"name":name, "config":config}),
                 })?;

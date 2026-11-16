@@ -186,6 +186,7 @@ impl Kernel {
         let retained = RetainedSet::new(store.retained().clone());
         let provider = provider(retained.clone())?;
         let journal = Journal::open(FileJournal::open(&state_dir.join(JOURNAL_FILE))?)?;
+        store.recover_bindings(&journal.bindings().cloned().collect::<Vec<_>>(), now_ms)?;
         {
             let mut held: BTreeSet<EntryId> = journal.live_entries().into_iter().collect();
             held.extend(
@@ -279,6 +280,112 @@ impl Kernel {
                     && (o.project == arca_netproject::PROJECT
                         || arca_kernel::ownership::tenant_of_project(&o.project).is_some())
             })
+    }
+
+    pub(crate) fn service_has_binding(&self, entry: &EntryId) -> bool {
+        self.reconciler
+            .journal()
+            .bindings()
+            .any(|event| &event.entry == entry)
+    }
+
+    pub(crate) fn binding_projects(
+        &self,
+        projects: &[String],
+    ) -> Result<BTreeSet<String>, KernelError> {
+        let mut family = self
+            .tenants
+            .snapshot()
+            .map_err(|_| KernelError::Journal("project family is unreadable".into()))?;
+        family.extend(projects.iter().cloned());
+        Ok(family)
+    }
+
+    pub(crate) fn binding_source(
+        &self,
+        entry: &arca_kernel::desired::Entry,
+        cfg: &crate::service::ServiceConfig,
+    ) -> Result<arca_kernel::journal::BindingState, KernelError> {
+        use arca_kernel::{
+            journal::{BindingState, EffectClass, Inverse},
+            ownership::IncusKind,
+        };
+        let journal = self.reconciler.journal();
+        let refuse =
+            || KernelError::Journal("the service has no current, converged binding".into());
+        if journal.poisoned().is_some()
+            || !journal.unresolved().is_empty()
+            || self
+                .retained
+                .entries()
+                .map_err(retained_failure)?
+                .contains_key(&entry.id)
+            || !self.reconciler.converged().contains(entry)
+        {
+            return Err(refuse());
+        }
+        let creates: Vec<_> = journal
+            .live(&entry.id)
+            .into_iter()
+            .filter(|record| record.class == EffectClass::B)
+            .filter_map(|record| match record.inverse {
+                Some(Inverse::IncusDelete { object }) => Some(object),
+                _ => None,
+            })
+            .collect();
+        let instances: Vec<_> = creates
+            .iter()
+            .filter(|object| object.kind == IncusKind::Instance)
+            .collect();
+        let [instance] = instances.as_slice() else {
+            return Err(refuse());
+        };
+        if instance.name != cfg.instance
+            || instance.project != cfg.project
+            || instance.uuid.as_ref().is_none_or(String::is_empty)
+            || cfg.pool.is_empty()
+        {
+            return Err(refuse());
+        }
+        let expected = cfg.data.as_ref().map(|_| cfg.data_locator().object());
+        let volumes: Vec<_> = creates
+            .iter()
+            .filter(|object| object.kind == IncusKind::Volume)
+            .collect();
+        if volumes != expected.iter().collect::<Vec<_>>() {
+            return Err(refuse());
+        }
+        Ok(BindingState {
+            instance: (*instance).clone(),
+            root_pool: cfg.pool.clone(),
+            data_volume: expected,
+        })
+    }
+
+    pub(crate) fn commit_binding(
+        &mut self,
+        event: arca_kernel::journal::BindingEvent,
+        now_ms: u64,
+    ) -> Result<(), KernelError> {
+        let entry_id = event.entry.clone();
+        self.reconciler.bind(event.clone())?;
+        let persisted = self.store.recover_bindings(&[event], now_ms);
+        // Even a failed cache write leaves the in-memory storage on the durable
+        // binding. Ordinary actions cannot fall back to the backup's pool.
+        let signed = self
+            .store
+            .current()
+            .cloned()
+            .ok_or_else(|| KernelError::Journal("bound service document disappeared".into()))?;
+        let entry = signed
+            .document
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .ok_or_else(|| KernelError::Journal("bound service record disappeared".into()))?;
+        self.reconciler.resume_binding(&signed, entry, now_ms)?;
+        self.applied_seq.publish(Some(signed.document.seq));
+        persisted
     }
 
     pub fn retained_entries(

@@ -37,6 +37,12 @@ fn instance(rig: &Rig, name: &str) -> Value {
 fn volume_path(pool: &str) -> String {
     format!("/1.0/storage-pools/{pool}/volumes/custom/sample-data?project={PROJECT}")
 }
+fn journal_lines(rig: &Rig) -> usize {
+    fs::read_to_string(rig.dir.join("journal.jsonl"))
+        .unwrap()
+        .lines()
+        .count()
+}
 fn unchanged(rig: &Rig, journal: usize, writes: usize) {
     assert_eq!(journal_len(rig), journal);
     assert_eq!(rig.fake.writes().len(), writes);
@@ -48,9 +54,10 @@ fn approved_rebind_recovers_secrets_and_storage_without_touching_the_backups() {
     let backup = instance(&rig, "sample-backup");
     let old_volume = rig.get(&volume_path("pool1")).unwrap();
     let writes = rig.fake.writes().len();
-    let journal = journal_len(&rig);
+    let journal = journal_lines(&rig);
     let proposal = propose(&rig, json!({"name":"sample"})).unwrap();
-    unchanged(&rig, journal, writes);
+    assert_eq!(journal_lines(&rig), journal);
+    assert_eq!(rig.fake.writes().len(), writes);
     let shown = proposal["details"].to_string();
     assert!(shown.contains("pool1") && shown.contains("pool2"));
     assert!(shown.contains(backup["config"]["volatile.uuid"].as_str().unwrap()));
@@ -81,7 +88,11 @@ fn approved_rebind_recovers_secrets_and_storage_without_touching_the_backups() {
         writes,
         "rebind writes only Arca state"
     );
-    assert_eq!(journal_len(&rig), journal + 1, "one durable binding event");
+    assert_eq!(
+        journal_lines(&rig),
+        journal + 1,
+        "one durable binding event"
+    );
     let cfg = rig.service_config("sample");
     let cfg = serde_json::to_value(cfg).unwrap();
     assert_eq!(cfg["pool"], "pool2");
@@ -197,7 +208,11 @@ fn rebind_refuses_a_retiring_volume() {
     refused_case(|r| {
         let mut v = r.get(&volume_path("pool2")).unwrap();
         v["config"]["user.arcakernel.retiring"] = json!("plan");
-        r.edit("PUT", &volume_path("pool2"), v);
+        r.edit(
+            "PATCH",
+            &volume_path("pool2"),
+            json!({"config":v["config"]}),
+        );
     });
 }
 #[test]
@@ -205,7 +220,11 @@ fn rebind_refuses_a_foreign_volume() {
     refused_case(|r| {
         let mut v = r.get(&volume_path("pool2")).unwrap();
         v["config"][KERNEL_ENTRY_KEY] = json!("service-other");
-        r.edit("PUT", &volume_path("pool2"), v);
+        r.edit(
+            "PATCH",
+            &volume_path("pool2"),
+            json!({"config":v["config"]}),
+        );
     });
 }
 #[test]
@@ -264,7 +283,11 @@ fn a_rebind_card_cannot_pick_a_later_uuid_config_or_device_layout() {
             _ => {
                 let mut v = rig.get(&volume_path("pool2")).unwrap();
                 v["config"]["user.note"] = json!("changed");
-                rig.edit("PUT", &volume_path("pool2"), v);
+                rig.edit(
+                    "PATCH",
+                    &volume_path("pool2"),
+                    json!({"config":v["config"]}),
+                );
             }
         }
         let journal = journal_len(&rig);
@@ -468,6 +491,18 @@ fn rebind_keeps_root_and_data_locators_independent_and_supports_no_data() {
                 .set_instance_config(PROJECT, "sample", "volatile.uuid", "replacement");
             rig
         };
+        if data {
+            rig.fake.add_volume(
+                PROJECT,
+                "pool2",
+                "copied-data",
+                rig.get(&volume_path("pool2")).unwrap(),
+            );
+            let mut disk = instance(&rig, "sample")["devices"]["data"].clone();
+            disk["source"] = json!("copied-data");
+            rig.fake
+                .set_instance_device(PROJECT, "sample", "data", disk);
+        }
         rig.fake.set_instance_device(
             PROJECT,
             "sample",
@@ -480,6 +515,7 @@ fn rebind_keeps_root_and_data_locators_independent_and_supports_no_data() {
         assert_eq!(config["pool"], "pool1");
         if data {
             assert_eq!(config["dataVolume"]["pool"], "pool2");
+            assert_eq!(config["dataVolume"]["name"], "copied-data");
         } else {
             assert!(config["dataVolume"].is_null());
         }
@@ -490,6 +526,10 @@ fn rebind_keeps_root_and_data_locators_independent_and_supports_no_data() {
         .unwrap();
         if data {
             assert_eq!(instance(&rig, "sample")["devices"]["data"]["pool"], "pool2");
+            assert_eq!(
+                instance(&rig, "sample")["devices"]["data"]["source"],
+                "copied-data"
+            );
         }
     }
 }
@@ -528,6 +568,10 @@ fn a_fsynced_binding_repairs_old_current_and_converged_storage_before_restart_ap
             journal.push(b'\n');
         }
         fs::write(snapshot.join("journal.jsonl"), journal).unwrap();
+        fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o700)).unwrap();
+        for file in ["desired.json", "journal.jsonl"] {
+            fs::set_permissions(snapshot.join(file), fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let mut plugins = PluginSet::new();
         plugins.add::<arca_netproject::NetProject>().unwrap();
         plugins.add::<Service>().unwrap();
@@ -622,4 +666,34 @@ fn rebind_refuses_missing_or_ambiguous_data_devices() {
         assert!(propose(&r, json!({"name":"sample"})).is_err());
         unchanged(&r, journal, writes);
     }
+}
+
+#[test]
+fn a_durable_binding_keeps_storage_current_when_the_record_cache_cannot_be_saved() {
+    let rig = copied_service_binding_fixture();
+    let proposal = propose(&rig, json!({"name":"sample"})).unwrap();
+    let journal = journal_lines(&rig);
+    let writes = rig.fake.writes().len();
+    let temporary = rig.dir.join("desired.json.tmp");
+    fs::create_dir(&temporary).unwrap();
+    assert!(run(&rig, &proposal).is_err());
+    assert_eq!(
+        journal_lines(&rig),
+        journal + 1,
+        "the event is already durable"
+    );
+    assert_eq!(
+        rig.service_config("sample").pool,
+        "pool2",
+        "memory follows the durable event even on a cache error"
+    );
+    assert_eq!(rig.fake.writes().len(), writes);
+    fs::remove_dir(&temporary).unwrap();
+    rig.kernel.lock().unwrap().propose(vec![], NOW).unwrap();
+    assert_eq!(
+        rig.fake.writes().len(),
+        writes,
+        "the next proposal must not reapply the old storage"
+    );
+    assert!(rig.get(&volume_path("pool1")).is_some());
 }

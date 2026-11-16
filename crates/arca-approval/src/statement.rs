@@ -26,6 +26,7 @@ pub enum ArcaAction {
     ServiceUpdate,
     ServiceReconfigure,
     ServiceImport,
+    ServiceRebind,
     ServiceRelease,
     ServicePublish,
     ServiceUnpublish,
@@ -76,6 +77,7 @@ impl ArcaAction {
             Self::ServiceUpdate => "service_update",
             Self::ServiceReconfigure => "service_reconfigure",
             Self::ServiceImport => "service_import",
+            Self::ServiceRebind => "service_rebind",
             Self::ServiceRelease => "service_release",
             Self::ServicePublish => "service_publish",
             Self::ServiceUnpublish => "service_unpublish",
@@ -122,6 +124,7 @@ impl ArcaAction {
             "service_update" => Some(Self::ServiceUpdate),
             "service_reconfigure" => Some(Self::ServiceReconfigure),
             "service_import" => Some(Self::ServiceImport),
+            "service_rebind" => Some(Self::ServiceRebind),
             "service_release" => Some(Self::ServiceRelease),
             "service_publish" => Some(Self::ServicePublish),
             "service_unpublish" => Some(Self::ServiceUnpublish),
@@ -333,7 +336,7 @@ pub fn parse_statement(bytes: &[u8]) -> Result<OwnerApproval, ApprovalRefusal> {
     let action = ArcaAction::from_statement(field("action")).ok_or_else(|| {
         bad(
             "action",
-            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_import, service_release, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create, snapshot_delete, instance_start, instance_stop, instance_restart or enroll",
+            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_import, service_rebind, service_release, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create, snapshot_delete, instance_start, instance_stop, instance_restart or enroll",
         )
     })?;
     let target = field("target");
