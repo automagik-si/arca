@@ -2200,28 +2200,46 @@ fn support_verbs_have_their_schemas_scopes_and_marks() {
     );
 }
 
-/// `support_report_ack` is the one verb a token reaches only as an operator or by naming it: a viewer or a doctor with no
-/// list, or with a list that leaves it out, is refused; a viewer whose list names it is admitted.
+/// `support_reports` and `support_report_ack` are the verbs a token reaches only as an operator or by naming them: a viewer
+/// or a doctor with no list, or with a list that leaves the verb out, is refused; a viewer whose list names it is admitted.
 #[test]
-fn support_report_ack_needs_an_operator_or_a_list_that_names_it() {
+fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
     use arca_api::may_call_listed;
     use arca_api::verbs::NAMED_ONLY;
-    assert_eq!(NAMED_ONLY, ["support_report_ack"]);
-    let ack = verb("support_report_ack").expect("present");
-    let named = vec![
-        "support_reports".to_string(),
-        "support_report_ack".to_string(),
-    ];
-    let other = vec!["support_reports".to_string()];
-    assert!(!may_call_listed(Scope::Viewer, None, ack));
-    assert!(!may_call_listed(Scope::Doctor, None, ack));
-    assert!(may_call_listed(Scope::Operator, None, ack));
-    assert!(may_call_listed(Scope::Admin, None, ack));
-    assert!(may_call_listed(Scope::Viewer, Some(&named), ack));
-    assert!(!may_call_listed(Scope::Viewer, Some(&other), ack));
-    assert!(!may_call_listed(Scope::Operator, Some(&other), ack));
+    assert_eq!(NAMED_ONLY, ["support_reports", "support_report_ack"]);
+    let list = |tools: &[&str]| {
+        tools
+            .iter()
+            .map(|tool| tool.to_string())
+            .collect::<Vec<_>>()
+    };
+    for name in NAMED_ONLY {
+        let v = verb(name).expect("present");
+        let other = NAMED_ONLY.iter().find(|n| **n != name).expect("the other");
+        assert!(!may_call_listed(Scope::Viewer, None, v), "{name}");
+        assert!(!may_call_listed(Scope::Doctor, None, v), "{name}");
+        assert!(may_call_listed(Scope::Operator, None, v), "{name}");
+        assert!(may_call_listed(Scope::Admin, None, v), "{name}");
+        assert!(
+            may_call_listed(Scope::Viewer, Some(&list(&[name])), v),
+            "{name}"
+        );
+        assert!(
+            may_call_listed(Scope::Doctor, Some(&list(&["service_list", name])), v),
+            "{name}"
+        );
+        assert!(
+            !may_call_listed(Scope::Viewer, Some(&list(&[other])), v),
+            "{name}"
+        );
+        assert!(
+            !may_call_listed(Scope::Operator, Some(&list(&[other])), v),
+            "{name}"
+        );
+    }
     // Every other verb is as before: the scope order and the list.
-    for v in verbs().iter().filter(|v| v.name != "support_report_ack") {
+    let narrow = list(&["service_list"]);
+    for v in verbs().iter().filter(|v| !NAMED_ONLY.contains(&v.name)) {
         for scope in [Scope::Viewer, Scope::Doctor, Scope::Operator, Scope::Admin] {
             assert_eq!(
                 may_call_listed(scope, None, v),
@@ -2230,8 +2248,8 @@ fn support_report_ack_needs_an_operator_or_a_list_that_names_it() {
                 v.name
             );
             assert_eq!(
-                may_call_listed(scope, Some(&other), v),
-                may_call(scope, v) && v.name == "support_reports",
+                may_call_listed(scope, Some(&narrow), v),
+                may_call(scope, v) && v.name == "service_list",
                 "{}",
                 v.name
             );

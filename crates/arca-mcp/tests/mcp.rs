@@ -475,8 +475,7 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "os_update",
             "route_list",
             "support_report",
-            "support_report_status",
-            "support_reports"
+            "support_report_status"
         ]
     );
 }

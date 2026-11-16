@@ -9,11 +9,12 @@ Write under this comment only what a reader needs beyond those lines; the releas
 
 Support reports: `support_report` (any viewer) files a report, with a title of at most 200 characters, a body of at most
 16 KiB, and optionally a severity, a service and a tenant, as one line of `<stateDir>/support-reports.jsonl`; a token
-files at most 10 an hour, and no field holds a control character except a newline in the body. It changes nothing and
-needs no approval. The support side pulls the reports from `GET /reports?after=<id>` (NDJSON, the same shape and token
-check as `/alerts`) or `support_reports`, with the caller's words under `report` and marked untrusted, and marks one
-picked up with `POST /reports/<id>/ack` or `support_report_ack`, which only an operator token, or a token whose tool list
-names that verb, may call. `support_report_status` tells the filer whether its report was picked up. The kernel sends
+files at most 10 an hour, and no field holds a control character (except a newline in the body) or a bidi override. It
+changes nothing and needs no approval. The support side pulls the reports from `GET /reports?after=<id>` (NDJSON, the
+same shape and paging as `/alerts`) or `support_reports`, with the caller's words under `report` and marked untrusted,
+and marks one picked up with `POST /reports/<id>/ack` or `support_report_ack`. Only an operator token, or a token whose
+tool list names the verb, reads the feed or acks: a plain viewer never reads other people's reports. An OAuth refresh may
+not name either verb unless the owner approved operator, and the consent page says what naming one gives. `support_report_status` tells the filer whether its report was picked up. The kernel sends
 nothing outward and holds no credential of the support side.
 
 ## 0.32.0 (2026-11-16)

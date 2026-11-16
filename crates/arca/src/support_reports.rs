@@ -2,12 +2,14 @@
 //! each one picked up, and the filer reads that mark with `support_report_status`.
 //!
 //! - `support_report` (viewer): `{title, body, severity?, service?, tenant?}`. The title is one line of at most 200
-//!   characters, the body at most 16 KiB with newlines kept; no field carries any other control character. One line is
+//!   characters, the body at most 16 KiB with newlines kept; no field carries any other control character or a bidi
+//!   override. One line is
 //!   appended to `<stateDir>/support-reports.jsonl` (mode 0600, never through a link) with the id, the time, the token id
 //!   and its scope. A token files at most ten reports in an hour. It changes nothing: it is never a plan and needs no
 //!   approval.
-//! - `support_reports` (viewer) and `GET /reports?after=<id>`: the reports with an id above `after`, oldest first, one
-//!   page of at most [`FEED_PAGE`]. The caller's words are under `report`, and every record says they are untrusted.
+//! - `support_reports` and `GET /reports?after=<id>`: an operator token, or a token whose tool list names the verb, reads
+//!   the reports with an id above `after`, oldest first, one page of at most [`FEED_PAGE`]. The caller's words are under
+//!   `report`, and every record says they are untrusted. A plain viewer never reads them: they are other people's words.
 //! - `support_report_ack` and `POST /reports/<id>/ack`: an operator token, or a token whose tool list names the verb,
 //!   marks a report picked up. The first mark's time is kept.
 //! - `support_report_status` (viewer): `open` or `picked_up`, with no report text.
@@ -43,8 +45,9 @@ pub const UNTRUSTED_NOTE: &str =
 /// The longest service and tenant names a report takes, in characters.
 const SERVICE_MAX: usize = 253;
 const TENANT_MAX: usize = 63;
-/// `O_NOFOLLOW`: the reports file is never opened through a link.
-const NOFOLLOW: i32 = 0o400_000;
+/// `O_NOFOLLOW` as this platform defines it (x86_64 and aarch64 disagree), so the reports file is never opened through a
+/// link.
+const NOFOLLOW: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
 
 /// One line of the reports file: a report, or the acknowledgement of one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,23 +260,24 @@ impl SupportReports {
         Ok(json!({ "id": id, "state": "picked_up", "pickedUpAt": iso_utc(now), "already": false }))
     }
 
-    /// Reads the file. A line that does not parse (a torn write) is skipped; an ack of no report is ignored.
+    /// Reads the file as bytes, a line at a time. A line that does not parse (a torn write, even one that cut a
+    /// character in two) is skipped, so it never stops the other lines; an ack of no report is ignored.
     fn load(&self) -> Result<Ledger, CallError> {
-        let mut text = String::new();
+        let mut bytes = Vec::new();
         match OpenOptions::new()
             .read(true)
             .custom_flags(NOFOLLOW)
             .open(&self.path)
         {
             Ok(mut file) => {
-                file.read_to_string(&mut text).map_err(|_| internal())?;
+                file.read_to_end(&mut bytes).map_err(|_| internal())?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Err(internal()),
         }
         let mut reports: Vec<Report> = Vec::new();
-        for raw in text.lines() {
-            let Ok(line) = serde_json::from_str::<Line>(raw) else {
+        for raw in bytes.split(|byte| *byte == b'\n') {
+            let Ok(line) = serde_json::from_slice::<Line>(raw) else {
                 continue;
             };
             match line {
@@ -297,7 +301,7 @@ impl SupportReports {
         reports.sort_by_key(Report::id);
         Ok(Ledger {
             reports,
-            ends_clean: text.is_empty() || text.ends_with('\n'),
+            ends_clean: bytes.last().is_none_or(|byte| *byte == b'\n'),
         })
     }
 
@@ -405,6 +409,11 @@ fn text(
             format!("{key} may not hold a control character")
         }));
     }
+    if text.chars().any(bidi) {
+        return Err(invalid(format!(
+            "{key} may not hold a bidi control character"
+        )));
+    }
     Ok(Some(text.to_string()))
 }
 
@@ -455,10 +464,25 @@ fn no_such_report(error: CallError) -> CallError {
     }
 }
 
-/// Whether `caller` may mark a report picked up: as the door admits it to `support_report_ack`. Checked again here, so
-/// a handler reached any other way holds the same line.
+/// A character that reorders the text around it when shown: the bidi marks, embeddings, overrides and isolates
+/// (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069). A person reading the feed would see other text than was
+/// written.
+fn bidi(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Whether `caller` may call the named-only verb `name` (the feed or the ack): as the door admits it. Checked again
+/// here, so a handler reached any other way holds the same line.
+fn admitted(caller: &Caller, name: &str) -> bool {
+    arca_api::verb(name).is_some_and(|verb| caller.admits(verb))
+}
+
 fn may_ack(caller: &Caller) -> bool {
-    arca_api::verb("support_report_ack").is_some_and(|verb| caller.admits(verb))
+    admitted(caller, "support_report_ack")
+}
+
+fn may_read(caller: &Caller) -> bool {
+    admitted(caller, "support_reports")
 }
 
 /// The four support verbs.
@@ -473,6 +497,11 @@ impl ToolHandler for SupportReportHandler {
             "support_report" => self.reports.file(&args, caller),
             "support_report_status" => self.reports.status(id_of(&args)?).map_err(no_such_report),
             "support_reports" => {
+                if !may_read(caller) {
+                    return Err(CallError::Forbidden {
+                        verb: self.verb.to_string(),
+                    });
+                }
                 let object = args
                     .as_object()
                     .ok_or_else(|| invalid("the arguments must be an object"))?;
@@ -537,7 +566,12 @@ pub struct ReportsExport {
 }
 
 impl GetHandler for ReportsExport {
-    fn get(&self, query: Option<&str>, _caller: &Caller) -> Result<GetReply, CallError> {
+    fn get(&self, query: Option<&str>, caller: &Caller) -> Result<GetReply, CallError> {
+        if !may_read(caller) {
+            return Err(CallError::Forbidden {
+                verb: "support_reports".to_string(),
+            });
+        }
         let after = after_of(query)?;
         let mut body = String::new();
         for record in self.reports.after(after)? {
@@ -768,6 +802,21 @@ mod tests {
                 "{bad:?} in the title"
             );
         }
+        for bad in [
+            '\u{202E}', '\u{202A}', '\u{2066}', '\u{2069}', '\u{200F}', '\u{061C}',
+        ] {
+            for key in ["title", "body", "service", "tenant"] {
+                let mut args = json!({ "title": "t", "body": "" });
+                args[key] = json!(format!("paid{bad}gnp.exe"));
+                assert_eq!(
+                    invalid_text(file(&f, args)),
+                    format!("{key} may not hold a bidi control character"),
+                    "{bad:?} in {key}"
+                );
+            }
+        }
+        // Other format characters, and right-to-left text itself, are kept.
+        file(&f, json!({ "title": "שלום", "body": "a\u{200B}b" })).expect("kept");
         for key in ["title", "service", "tenant"] {
             let mut args = json!({ "title": "t", "body": "" });
             args[key] = json!("a\nb");
@@ -777,7 +826,7 @@ mod tests {
                 "a newline in {key}"
             );
         }
-        assert_eq!(f.reports.after(0).expect("feed").len(), 1);
+        assert_eq!(f.reports.after(0).expect("feed").len(), 2);
     }
 
     #[test]
@@ -842,13 +891,14 @@ mod tests {
             verb: "support_reports",
             reports: Arc::new(SupportReports::new(&f.dir, "node-1", Arc::new(|| NOW))),
         };
+        let triage = caller("triage", Scope::Viewer, Some(&["support_reports"]));
         let page = handler
-            .call(json!({ "after": 3 }), &viewer())
+            .call(json!({ "after": 3 }), &triage)
             .expect("a page");
         assert_eq!(page["reports"][0]["id"], 4);
         assert_eq!(page["next"], FEED_PAGE as u64 + 3);
         let empty = handler
-            .call(json!({ "after": 999 }), &viewer())
+            .call(json!({ "after": 999 }), &triage)
             .expect("an empty page");
         assert_eq!(empty, json!({ "reports": [], "next": 999 }));
     }
@@ -1016,6 +1066,80 @@ mod tests {
             .filter_map(|r| r["id"].as_u64())
             .collect();
         assert_eq!(ids, [1, 2]);
+    }
+
+    #[test]
+    fn a_torn_character_skips_its_own_line_and_never_stops_the_verbs() {
+        let f = fixture("torn-utf8");
+        file(&f, json!({ "title": "café", "body": "über" })).expect("filed");
+        let path = f.dir.join(REPORTS_FILE);
+        let mut bytes = std::fs::read(&path).expect("read");
+        // A write cut inside "é" (0xC3 0xA9): the file is no longer UTF-8.
+        bytes.extend_from_slice(b"{\"kind\":\"report\",\"id\":2,\"at\":1,\"title\":\"caf\xC3");
+        std::fs::write(&path, bytes).expect("tear the file");
+        assert_eq!(f.reports.after(0).expect("feed").len(), 1);
+        assert_eq!(f.reports.status(1).expect("status")["state"], "open");
+        let triage = caller("triage", Scope::Viewer, Some(&["support_report_ack"]));
+        f.reports.ack(1, &triage).expect("an ack");
+        assert_eq!(
+            file(&f, json!({ "title": "two", "body": "" })).expect("filed")["id"],
+            2
+        );
+        let ids: Vec<u64> = f
+            .reports
+            .after(0)
+            .expect("feed")
+            .iter()
+            .filter_map(|r| r["id"].as_u64())
+            .collect();
+        assert_eq!(ids, [1, 2]);
+    }
+
+    #[test]
+    fn the_feed_handlers_refuse_a_token_that_is_neither_an_operator_nor_named() {
+        let f = fixture("feed-scope");
+        file(&f, json!({ "title": "private words", "body": "" })).expect("filed");
+        let reports = Arc::new(SupportReports::new(&f.dir, "node-1", Arc::new(|| NOW)));
+        let handler = SupportReportHandler {
+            verb: "support_reports",
+            reports: Arc::clone(&reports),
+        };
+        let get = ReportsExport { reports };
+        for refused in [
+            caller("v", Scope::Viewer, None),
+            caller("d", Scope::Doctor, None),
+            caller("ack-only", Scope::Viewer, Some(&["support_report_ack"])),
+            caller("op-listed", Scope::Operator, Some(&["support_report_ack"])),
+        ] {
+            assert_eq!(
+                handler.call(json!({}), &refused),
+                Err(CallError::Forbidden {
+                    verb: "support_reports".into()
+                }),
+                "{}",
+                refused.token_id
+            );
+            assert!(
+                matches!(get.get(None, &refused), Err(CallError::Forbidden { .. })),
+                "{}",
+                refused.token_id
+            );
+        }
+        for admitted in [
+            caller("op", Scope::Operator, None),
+            caller("triage", Scope::Viewer, Some(&["support_reports"])),
+        ] {
+            assert_eq!(
+                handler.call(json!({}), &admitted).expect("a page")["reports"][0]["report"]["title"],
+                "private words"
+            );
+            let reply = get.get(Some("after=0"), &admitted).expect("a page");
+            assert!(
+                String::from_utf8(reply.body)
+                    .expect("text")
+                    .contains("private words")
+            );
+        }
     }
 
     #[test]

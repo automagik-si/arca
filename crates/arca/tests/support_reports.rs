@@ -314,7 +314,7 @@ fn the_feed_pages_by_after_as_ndjson_with_the_callers_words_marked_untrusted() {
 }
 
 #[test]
-fn the_feed_is_held_to_its_verb_like_alerts() {
+fn the_feed_is_read_only_by_an_operator_or_a_token_that_names_it() {
     let node = start("feed-auth");
     node.ok("seat", "support_report", report(1));
     assert_eq!(node.send("GET", "/reports", None, "").0, 401);
@@ -322,16 +322,27 @@ fn the_feed_is_held_to_its_verb_like_alerts() {
         send(&node.socket, "GET", "/reports", Some("arca_unknown"), "").0,
         401
     );
-    // A token whose list leaves the feed out is refused it, whatever its scope.
-    assert_eq!(
-        node.send("GET", "/reports", Some("filer"), ""),
-        (403, String::new())
-    );
-    for id in ["seat", "doctor", "operator", "feed", "triage", "op-feed"] {
-        assert_eq!(node.send("GET", "/reports", Some(id), "").0, 200, "{id}");
+    // Other people's words: a plain viewer or doctor, even the filer itself, and a token whose list leaves the feed out
+    // are refused it, with no body, and are not offered the verb.
+    for id in ["seat", "doctor", "filer"] {
+        assert_eq!(
+            node.send("GET", "/reports", Some(id), ""),
+            (403, String::new()),
+            "{id}"
+        );
+        assert_eq!(node.call(id, "support_reports", json!({})).0, 403, "{id}");
+        assert!(
+            !node.tools(id).contains(&"support_reports".to_string()),
+            "{id}"
+        );
     }
-    let (status, _) = node.call("filer", "support_reports", json!({}));
-    assert_eq!(status, 403);
+    for id in ["operator", "feed", "triage", "op-feed"] {
+        assert_eq!(node.send("GET", "/reports", Some(id), "").0, 200, "{id}");
+        assert!(
+            node.tools(id).contains(&"support_reports".to_string()),
+            "{id}"
+        );
+    }
 }
 
 #[test]

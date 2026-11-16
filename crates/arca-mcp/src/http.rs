@@ -248,6 +248,12 @@ impl Server {
                 scope.push_str(" tool:");
                 scope.push_str(tool);
             }
+        } else if arca_api::verbs::NAMED_ONLY.contains(&verb.name) && caller.scope < Scope::Operator
+        {
+            // A verb reached only by naming it: the scope the token holds is not enough, and asking the owner for it again
+            // changes nothing, so the challenge names the tool.
+            scope.push_str(" tool:");
+            scope.push_str(verb.name);
         }
         challenge(
             StatusCode::FORBIDDEN,
