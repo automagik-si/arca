@@ -243,7 +243,119 @@ mod tests {
         assert!(tailnet_name("https://login.tailscale.com/a/synthetic").is_none());
         assert!(login_link("https://login.tailscale.com/a/synthetic"));
         assert!(!login_link("https://login.tailscale.com/admin/machines"));
-        // Keep the crate-visible page interface exercised until its caller arrives.
-        let _page_read = reach_sign_in;
+    }
+    #[test]
+    fn sign_in_reads_only_the_link_and_keeps_it_out_of_the_exec_audit() {
+        use arca_approval::{
+            ApprovalVerifier, FileNonces, OwnerKeys, PasskeyVerifier, SshSigVerifier,
+        };
+        use arca_incus::{FakeIncus, FakeState, fake::ExecScript};
+        use arca_kernel::identity::NodeKey;
+        use arca_providers::incus::{Family, IncusProvider};
+        use arca_reconcile::PluginSet;
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("rg4-sign-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeIncus::start(
+            &dir,
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                networks: vec![],
+                pools: vec![],
+            },
+        )
+        .unwrap();
+        fake.add_profile("default", json!({"name":"default","config":{},"devices":{"root":{"type":"disk","pool":"pool1","path":"/"}}}));
+        let cfg: Arc<NodeConfig> = Arc::new(serde_json::from_value(json!({"stateDir":dir,"incus":{"socket":fake.socket()},"listen":{"unix":dir.join("arca.sock")},"tokens":{"hashDir":dir.join("tokens")},"kernel":{"projects":[arca_netproject::PROJECT],"serviceCidr":"192.0.2.0/24"}})).unwrap());
+        let mut plugins = PluginSet::new();
+        plugins.add::<arca_netproject::NetProject>().unwrap();
+        plugins.add::<service::Service>().unwrap();
+        let verifier = ApprovalVerifier::new(
+            "node1".into(),
+            OwnerKeys::new(
+                SshSigVerifier::new(vec![]),
+                PasskeyVerifier::refusing(arca_approval::ApprovalRefusal::NoVerifier),
+            ),
+            FileNonces::open(&dir.join("nonces")).unwrap(),
+        );
+        let kernel = Arc::new(Mutex::new(
+            Kernel::open(
+                &dir,
+                NodeKey::load_or_create(&dir.join("node.key")).unwrap(),
+                plugins,
+                verifier,
+                "node1".into(),
+                None,
+                |retained| {
+                    Ok(Box::new(
+                        IncusProvider::new(
+                            fake.socket().into(),
+                            Family {
+                                projects: vec![arca_netproject::PROJECT.into()],
+                                scratch: false,
+                                droidd_projects: vec![],
+                                reserved_cidrs: vec![],
+                            },
+                            dir.join("secrets"),
+                            retained,
+                        )
+                        .unwrap(),
+                    ))
+                },
+                1000,
+            )
+            .unwrap(),
+        ));
+        fs::create_dir(dir.join("templates")).unwrap();
+        fs::write(dir.join("templates/tailscale.json"), json!({"name":"tailscale","kind":"oci","image":"docker.io/library/example","digest":format!("sha256:{}", "a".repeat(64)),"connector":"tailscale","env":{}}).to_string()).unwrap();
+        let caller = Caller {
+            token_id: "doctor".into(),
+            scope: arca_api::Scope::Doctor,
+            tools: None,
+        };
+        let handlers =
+            crate::handlers::service_handlers(kernel.clone(), Arc::new(|| 1000), cfg.clone());
+        handlers
+            .iter()
+            .find(|(verb, _)| *verb == "service_create")
+            .unwrap()
+            .1
+            .call(json!({"name":"node-ts","template":"tailscale"}), &caller)
+            .unwrap();
+        let exec = ServiceExec::new(cfg.clone());
+        let link = "https://login.tailscale.com/a/synthetic123";
+        fake.script_exec(ExecScript::new(
+            ExecCommand::ConnectorStatus.argv(),
+            0,
+            &json!({"AuthURL":link,"Unrelated":"ignored"}).to_string(),
+        ));
+        assert_eq!(
+            reach_sign_in(&kernel, &cfg, &exec, &caller, "node-ts")
+                .unwrap()
+                .as_deref(),
+            Some(link)
+        );
+        fake.script_exec(ExecScript::new(
+            ExecCommand::ConnectorStatus.argv(),
+            0,
+            r#"{"AuthURL":"https://example.com/wrong"}"#,
+        ));
+        assert!(
+            reach_sign_in(&kernel, &cfg, &exec, &caller, "node-ts")
+                .unwrap()
+                .is_none()
+        );
+        assert!(reach_sign_in(&kernel, &cfg, &exec, &caller, "missing").is_err());
+        assert!(
+            !fs::read_to_string(dir.join(crate::service_exec::AUDIT_FILE))
+                .unwrap()
+                .contains(link)
+        );
+        drop(handlers);
+        drop(kernel);
+        drop(fake);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

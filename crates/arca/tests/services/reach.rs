@@ -92,17 +92,24 @@ fn status(rig: &Rig, state: &str) {
 }
 
 fn assert_private(rig: &Rig, needle: &str) {
-    // Journals and kernel audit files are all direct state files; no raw exec recording is kept there.
-    for entry in fs::read_dir(&rig.dir).unwrap().flatten() {
-        if entry.path().is_file() {
-            let bytes = fs::read(entry.path()).unwrap();
-            assert!(
-                !String::from_utf8_lossy(&bytes).contains(needle),
-                "{} leaked a private value",
-                entry.path().display()
-            );
+    fn walk(path: &std::path::Path, needle: &str) {
+        for entry in fs::read_dir(path).unwrap().flatten() {
+            if entry.file_name() == "secrets" {
+                continue;
+            }
+            if entry.path().is_dir() {
+                walk(&entry.path(), needle);
+            } else if entry.path().is_file() {
+                let bytes = fs::read(entry.path()).unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&bytes).contains(needle),
+                    "{} leaked a private value",
+                    entry.path().display()
+                );
+            }
         }
     }
+    walk(&rig.dir, needle);
 }
 
 #[test]
@@ -391,4 +398,68 @@ fn a_node_without_an_edge_explains_it_and_creates_nothing() {
         matches!(error, Err(CallError::Refused { message, .. }) if message.contains("no edge"))
     );
     assert!(rig.entries().is_empty());
+}
+
+#[test]
+fn legacy_connector_records_use_the_template_and_other_kinds_have_no_tailnet_fields() {
+    let (rig, _) = rig();
+    let mut template = json!({"name":"legacy","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"env":{}});
+    rig.template("legacy", template.clone());
+    rig.call(
+        "service_create",
+        json!({"name":"legacy","template":"legacy"}),
+    )
+    .unwrap();
+    assert!(rig.service_config("legacy").connector.is_none());
+    template["connector"] = json!("cloudflare");
+    rig.template("legacy", template);
+    let listed = rig.call("reach_list", json!({})).unwrap();
+    assert_eq!(
+        listed["connectors"],
+        json!([{"name":"legacy","kind":"cloudflare","edge":null,"state":"running"}])
+    );
+    assert!(
+        !rig.fake
+            .service_requests()
+            .iter()
+            .any(|request| request.path.contains("/instances/legacy/exec"))
+    );
+}
+
+#[test]
+fn an_approval_binds_the_template_and_cannot_be_replayed() {
+    let (rig, key) = rig();
+    let proposal = proposed(&rig, json!({"kind":"tailscale","name":"node-ts"}));
+    assert!(
+        proposal["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["label"] == "Image")
+    );
+    assert!(
+        proposal["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["label"] == "Template content")
+    );
+    let (mut args, grant) = grant(&rig, &key, &proposal);
+    args["approval"] = json!(grant);
+    rig.call("reach_connect", args.clone()).unwrap();
+    assert!(
+        matches!(rig.call("reach_connect", args), Err(CallError::Refused { code, .. }) if code == "NotApproved")
+    );
+    let proposal = proposed(&rig, json!({"kind":"tailscale","name":"changed-ts"}));
+    let (mut args, grant) = grant(&rig, &key, &proposal);
+    args["approval"] = json!(grant);
+    let template = rig.dir.join("templates/tailscale.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&template).unwrap()).unwrap();
+    value["digest"] = json!(DIGEST);
+    fs::write(template, value.to_string()).unwrap();
+    assert!(rig.call("reach_connect", args).is_err());
+    assert!(
+        rig.get(&format!("/1.0/instances/changed-ts?project={PROJECT}"))
+            .is_none()
+    );
 }
