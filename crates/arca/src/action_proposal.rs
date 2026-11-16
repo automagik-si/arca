@@ -1351,7 +1351,8 @@ const USES_MAX: usize = 512;
 /// The card's `Uses` line for a create from `template`: what the new service takes of this node, read from the template
 /// the proposal's fingerprint binds. A container runs at Arca's service profile's share of CPUs and memory where its
 /// template sets no limit of its own, so the line names that share and says it is the default. A container's root disk
-/// has no size of its own on the node; in a tenant (`in_tenant`) it has the tenant profile's fixed size.
+/// uses the template's root size when set. Otherwise it has the tenant profile's fixed size in a tenant (`in_tenant`),
+/// or takes the disk its files need on the node.
 pub fn uses_words(template: &crate::service::Template, in_tenant: bool) -> String {
     use arca_netproject::tenant::{CONTAINER_ROOT_SIZE, PROFILE_CPU, PROFILE_MEMORY};
     let limits = template.limits.as_ref();
@@ -1397,7 +1398,9 @@ pub fn uses_words(template: &crate::service::Template, in_tenant: bool) -> Strin
         cpus(cpu.unwrap_or(&default_cpu)),
         memory.unwrap_or(PROFILE_MEMORY)
     );
-    let root = if in_tenant {
+    let root = if let Some(size) = template.root_size.as_deref() {
+        format!("a {size} disk")
+    } else if in_tenant {
         format!("a {CONTAINER_ROOT_SIZE} disk")
     } else {
         "the disk its files take".to_string()
@@ -3528,7 +3531,7 @@ mod tests {
 
     /// Issue 117: what a create from a template takes of the node, read from the template its fingerprint is of. A
     /// container whose template sets no limit runs at the share of Arca's service profile, so the card names that share;
-    /// a container in a tenant also has a root disk of a fixed size.
+    /// a container with no root size in its template takes the tenant profile's root size in a tenant.
     #[test]
     fn a_create_says_what_it_uses_of_the_node() {
         let template = |extra: Value| -> crate::service::Template {
@@ -3588,6 +3591,28 @@ mod tests {
         assert_eq!(arca_netproject::tenant::PROFILE_CPU, 2);
         assert_eq!(arca_netproject::tenant::PROFILE_MEMORY, "2GiB");
         assert_eq!(arca_netproject::tenant::CONTAINER_ROOT_SIZE, "16GiB");
+    }
+
+    #[test]
+    fn container_options_card_names_the_root_size_on_the_node_and_in_a_tenant() {
+        for kind in ["oci", "system"] {
+            for root in ["30GiB", "500GiB"] {
+                let template: crate::service::Template = serde_json::from_value(json!({
+                    "name": "app", "kind": kind, "image": "local:app", "rootSize": root,
+                    "data": { "path": "/data", "size": "10GiB" }
+                }))
+                .unwrap();
+                for in_tenant in [false, true] {
+                    assert_eq!(
+                        uses_words(&template, in_tenant),
+                        format!(
+                            "Up to 2 CPUs and 2GiB of memory (Arca's default for a service), a {root} disk, and a 10GiB disk for its data."
+                        ),
+                        "{kind}, tenant={in_tenant}"
+                    );
+                }
+            }
+        }
     }
 
     /// Only a create says what it uses: a proposal of another action is given no `uses`, and a journal line that

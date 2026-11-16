@@ -1100,6 +1100,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         lan: None,
         private_port: None,
         root_size: None,
+        port_isolation: false,
         first_boot: None,
         settings: None,
         create_settings: Vec::new(),

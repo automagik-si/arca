@@ -15,6 +15,14 @@ kernel's reason in the answer and log.
 
 The effect journal supports a binding record from this release; once one is written, older Arca versions refuse the journal.
 
+Container templates may set `rootSize` and `portIsolation`. The root size counts with the data volume against a
+tenant's disk cap at create. Without these keys, containers keep their previous disk and NIC settings; created
+services keep their recorded values through reconfigure, image updates and rollback. A tenant's front rule excludes
+the service's `droiddPort` control port, leaving no front rule when that is its only port. On an existing node, a
+tenant service made from the shipped `omni-api` template loses its front rule at the next reconcile of its record;
+the host bridge's control rule stays. Approval cards show a container's requested root size in both the node and a
+tenant. See docs/OPERATING.md.
+
 ## 0.34.0 (2026-11-16)
 
 Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
