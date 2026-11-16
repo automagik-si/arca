@@ -1925,3 +1925,21 @@ fn a_netproject_read_failure_does_not_refuse_a_service_connect() {
         json!({"env":["DATABASE_URL"]})
     );
 }
+
+#[test]
+fn a_service_config_failure_reports_the_kernel_reason() {
+    let rig = Rig::new();
+    rig.template("two", json!({"name":"two","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[],"secrets":["FIRST"],"env":{"FIRST":"{{secret:FIRST}}"}}));
+    rig.call("service_create", json!({"name":"two","template":"two"}))
+        .unwrap();
+    rig.fake.set_reject_patch("/1.0/instances/");
+    let error = op(
+        &rig,
+        "service_secret_set",
+        json!({"name":"two","key":"FIRST","value":"synthetic-replacement"}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, CallError::Refused { message, .. } if message.contains("the patch did not land"))
+    );
+}

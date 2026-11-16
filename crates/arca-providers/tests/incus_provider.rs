@@ -4432,3 +4432,54 @@ fn custom_volume_observe_checks_pool_route_family_project_and_ownership() {
     }
     assert_eq!(fake.requests().len(), before);
 }
+
+#[test]
+fn a_patch_whose_operation_wait_times_out_is_settled_from_read_back() {
+    const OP: &str = "00000000-0000-4000-8000-0000000000aa";
+    let mut patched = false;
+    let script = Script::start("patch-timeout", move |method, target| {
+        if method == "PATCH" {
+            patched = true;
+            return http(
+                202,
+                None,
+                &json!({"type":"async", "status":"Operation created", "status_code":100,
+                "operation":format!("/1.0/operations/{OP}"), "error_code":0, "error":"", "metadata":null}),
+            );
+        }
+        if target.contains("/wait") {
+            return http(
+                200,
+                None,
+                &sync_env(json!({"id":OP, "status":"Running", "status_code":103})),
+            );
+        }
+        if target == OPERATIONS_PATH {
+            // The operation ended after the writer's short injected deadline.
+            return http(200, None, &sync_env(json!({})));
+        }
+        if method == "GET" && target.starts_with("/1.0/instances/slow") {
+            let config = if patched {
+                json!({MARK:"toy", "user.note":"after"})
+            } else {
+                json!({MARK:"toy"})
+            };
+            return object_reply(&instance_meta(config), "\"e1\"");
+        }
+        not_found()
+    });
+    let secrets = Scratch::new("patch-timeout-secrets");
+    let mut provider = script
+        .provider(&secrets.0)
+        .with_operation_deadline(Duration::from_millis(20));
+    let op = patch(
+        object(IncusKind::Instance, "svc", None, "slow"),
+        &[("user.note", Some("after"))],
+    );
+    let mut journal = Journal::open(MemJournal::new()).unwrap();
+    Ctx::new(entry("toy"), &manifest(), &mut provider, &mut journal, 1)
+        .effect(op)
+        .expect("read-back settles the timed-out PATCH");
+    assert!(journal.unresolved().is_empty());
+    assert_eq!(script.count("PATCH"), 1);
+}

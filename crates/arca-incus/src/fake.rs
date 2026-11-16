@@ -209,6 +209,7 @@ struct Shared {
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
     reject_patch: Mutex<Vec<String>>,
+    dropped_patches: Mutex<Vec<(String, bool)>>,
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
     /// How the node's liblxc splits a container's command, which decides whether its entrypoint starts.
@@ -460,6 +461,7 @@ impl Shared {
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
             reject_patch: Mutex::new(Vec::new()),
+            dropped_patches: Mutex::new(Vec::new()),
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
             lxc_split: Mutex::new(LxcSplit::default()),
@@ -719,6 +721,11 @@ impl FakeIncus {
 
     pub fn set_reject_patch(&self, path_prefix: &str) {
         lock(&self.shared.reject_patch).push(path_prefix.to_string());
+    }
+
+    /// Drops the next matching PATCH's answer, after applying it when `apply` is true. No retry is made by the fake.
+    pub fn drop_patch_answer(&self, path_prefix: &str, apply: bool) {
+        lock(&self.shared.dropped_patches).push((path_prefix.to_string(), apply));
     }
 
     /// Starts an operation that names `target` and runs until the test releases or fails it. It changes no object. It shows in
@@ -1193,6 +1200,22 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         record(shared, &request, 0);
         hold_until_hung_up(&mut stream);
         return;
+    }
+    if request.method == "PATCH" {
+        let apply = {
+            let mut faults = lock(&shared.dropped_patches);
+            faults
+                .iter()
+                .position(|(prefix, _)| request.target.starts_with(prefix))
+                .map(|index| faults.remove(index).1)
+        };
+        if let Some(apply) = apply {
+            if apply {
+                handle(shared, &request, None);
+            }
+            record(shared, &request, 0);
+            return;
+        }
     }
     let (status, extra, envelope) = handle(shared, &request, fault);
     record(shared, &request, status);
