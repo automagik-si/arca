@@ -372,10 +372,12 @@ struct Ran {
     err: String,
     serve: Option<String>,
     boot_env: Option<String>,
+    /// The key file containerboot was pointed at, as it found it: its content and its mode.
+    key_file: Option<(String, u32)>,
 }
 
 /// `tailscale.sh` as the template names it (`<shell> -ec <script> tailscale`), with `env` as its environment and a fake
-/// `containerboot` that records the serve config it is pointed at and its own environment.
+/// `containerboot` that records the serve config it is pointed at, its own environment and the key file it is given.
 fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
     let template = service::load_template(&shipped(), TEMPLATE).expect("the template");
     let parts = template.entrypoint.expect("an entrypoint");
@@ -390,13 +392,20 @@ fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
     ));
     fs::create_dir_all(&work).expect("a work dir");
     let (serve_dir, seen, boot_env) = (work.join("serve"), work.join("seen"), work.join("env"));
+    let (key_dir, key_seen, key_mode) = (
+        work.join("key"),
+        work.join("key-seen"),
+        work.join("key-mode"),
+    );
     let boot = work.join("containerboot");
     fs::write(
         &boot,
         format!(
-            "#!/bin/sh\ncat \"$TS_SERVE_CONFIG\" > '{}'\nenv | sort > '{}'\n",
+            "#!/bin/sh\ncat \"$TS_SERVE_CONFIG\" > '{}'\nenv | sort > '{}'\ncase \"$TS_AUTHKEY\" in file:*) [ -f \"${{TS_AUTHKEY#file:}}\" ] && {{ cat \"${{TS_AUTHKEY#file:}}\" > '{}'; stat -c %a \"${{TS_AUTHKEY#file:}}\" > '{}'; }} ;; esac\n",
             seen.display(),
-            boot_env.display()
+            boot_env.display(),
+            key_seen.display(),
+            key_mode.display()
         ),
     )
     .unwrap();
@@ -410,6 +419,7 @@ fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
         .env("PATH", "/usr/bin:/bin")
         .env("ARCA_TS_SERVE_DIR", &serve_dir)
         .env("ARCA_TS_CONTAINERBOOT", &boot)
+        .env("ARCA_TS_KEY_DIR", &key_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in env {
@@ -421,6 +431,13 @@ fn run_in(shell: &[&str], env: &[(&str, &str)]) -> Ran {
         err: String::from_utf8_lossy(&output.stderr).into_owned(),
         serve: fs::read_to_string(&seen).ok(),
         boot_env: fs::read_to_string(&boot_env).ok(),
+        key_file: fs::read_to_string(&key_seen).ok().map(|text| {
+            let mode = fs::read_to_string(&key_mode).expect("the key file's mode");
+            (
+                text,
+                u32::from_str_radix(mode.trim(), 8).expect("an octal mode"),
+            )
+        }),
     };
     fs::remove_dir_all(&work).expect("the work dir goes");
     ran
@@ -451,10 +468,17 @@ fn the_script_forwards_tcp_443_to_the_target_with_a_proxy_v2_header_and_execs_co
             json!({"TCP":{"443":{"TCPForward":TARGET,"ProxyProtocol":2}}}),
             "{shell:?}"
         );
-        // containerboot gets the template's environment as it is, and the serve config's path.
+        // containerboot gets the template's environment as it is, the serve config's path, and the key by file: a file
+        // of its own, mode 600, that `tailscale up` reads, so the key is on no command line and in no environment.
         let env = ran.boot_env.expect("containerboot ran");
+        assert!(!env.contains(KEY), "{shell:?}");
+        assert!(
+            env.lines()
+                .any(|l| l.starts_with("TS_AUTHKEY=file:") && l.ends_with("/key/authkey")),
+            "{shell:?}"
+        );
+        assert_eq!(ran.key_file, Some((format!("{KEY}\n"), 0o600)), "{shell:?}");
         for line in [
-            format!("TS_AUTHKEY={KEY}"),
             "TS_HOSTNAME=edge-ts".to_string(),
             "TS_STATE_DIR=/data".to_string(),
             "TS_USERSPACE=true".to_string(),
@@ -486,6 +510,9 @@ fn the_script_refuses_a_target_that_is_not_one_address_and_port_and_starts_nothi
         "192.0.2.11:8443\"}",
         "192.0.2.11 :8443",
         "unix:/var/run/tailscale/tailscaled.sock",
+        // tailscaled reads a target that starts with unix: as a socket path.
+        "unix:443",
+        "edge@unix:443",
         // A tailnet name before the target that is no DNS label, or a second @.
         "@192.0.2.11:8443",
         "-edge@192.0.2.11:8443",
@@ -557,4 +584,26 @@ fn a_name_before_the_target_is_the_nodes_tailnet_name_in_place_of_the_services_o
             );
         }
     }
+}
+
+#[test]
+fn a_node_with_no_key_is_given_none_and_a_key_by_file_is_passed_as_it_is() {
+    // A node that logs in from its state needs no key: nothing is written and containerboot gets no TS_AUTHKEY.
+    let mut env = good();
+    env.retain(|(key, _)| *key != "TS_AUTHKEY");
+    let ran = run_in(&["/bin/sh"], &env);
+    assert_eq!(ran.code, Some(0), "{}", ran.err);
+    assert!(ran.key_file.is_none());
+    let boot = ran.boot_env.expect("containerboot ran");
+    assert!(!boot.lines().any(|l| l.starts_with("TS_AUTHKEY=")));
+    // A key that is a file reference already is not written again.
+    let mut env = good();
+    env.retain(|(key, _)| *key != "TS_AUTHKEY");
+    env.push(("TS_AUTHKEY", "file:/run/secrets/synthetic-key"));
+    let ran = run_in(&["/bin/sh"], &env);
+    let boot = ran.boot_env.expect("containerboot ran");
+    assert!(
+        boot.lines()
+            .any(|l| l == "TS_AUTHKEY=file:/run/secrets/synthetic-key")
+    );
 }

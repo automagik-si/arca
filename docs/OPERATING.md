@@ -5838,7 +5838,8 @@ its TLS port first among its ports). As for the Cloudflare connector, the Arca s
 
 1. **Tailscale admin console, "Settings" > "Keys".** Generate an auth key: for one use, not ephemeral, pre-approved if
    your tailnet asks for device approval, and with a tag, so that the node's own key does not expire. Copy it; treat it
-   like a password.
+   like a password. The tag must already be in your tailnet policy's `tagOwners` ("Access controls"), and the policy's
+   rules must let your devices reach that tag on TCP 443; without such a rule the node joins but nothing reaches it.
 2. **Arca: `service_status`** with `{"name": "app"}`. Note its `ipv4` and its first `ports` entry, for example
    `192.0.2.11` and `8443`.
 3. **Arca: `service_create`** with `{"name": "app-ts", "template": "tailscale"}`. The service's name is also the node's
@@ -5872,7 +5873,9 @@ What to know:
   STUN (UDP 3478) and direct WireGuard paths (UDP 41641), which Arca's service network allows like any other internet
   traffic. Peers on private ranges are reached through Tailscale's relays. No incoming port is opened.
 - **Where the key and the target live.** In private files in Arca's `secrets/` directory, and in the container's
-  environment in Incus, as for every template secret. `service_logs` replaces both with `[secret]`. The tailnet name
+  environment in Incus, as for every template secret. `service_logs` replaces both with `[secret]`. Inside the
+  container the key is handed to Tailscale as a file of its own (mode 600, under `/run`, which is in memory), so it is
+  never on a command line. The tailnet name
   rides on `TS_TARGET` because every secret a template names must be set before it starts, so an optional value cannot
   be a secret of its own.
 - **The image.** The template pins `docker.io/tailscale/tailscale` release 1.104.7 by digest, so it never updates by
