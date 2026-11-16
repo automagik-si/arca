@@ -15271,6 +15271,7 @@
                 "stopped",
                 "waiting-sign-in",
                 "gave-up",
+                "unknown",
                 "running"
               ],
               "type": "string"
@@ -15339,6 +15340,7 @@
                       "stopped",
                       "waiting-sign-in",
                       "gave-up",
+                      "unknown",
                       "running"
                     ],
                     "type": "string"
@@ -15367,7 +15369,7 @@
           "type": "object"
         }
       },
-      "summary": "The node's connectors and their edge and state. Tailscale reports stopped, waiting-sign-in, gave-up or running, with its tailnet name and address when available. Never returns a sign-in link.",
+      "summary": "The node's connectors and their edge and state. Tailscale reports stopped, waiting-sign-in, gave-up, unknown or running, with its tailnet name and address when available. Never returns a sign-in link.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
