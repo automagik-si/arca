@@ -173,6 +173,15 @@
     animation: spin .8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* what went wrong with one card, on the card */
+  .card.gone { display: flex; align-items: center; justify-content: center; border-style: dashed; box-shadow: none; color: var(--arca-muted); font-size: var(--arca-text-sm); text-align: center; }
+  .card-note {
+    --tone: var(--arca-bad); --tone-soft: var(--arca-bad-soft);
+    margin-top: var(--arca-space-3); padding: var(--arca-space-2) var(--arca-space-3);
+    border-left: 3px solid var(--tone); border-radius: var(--arca-r-sm);
+    background: var(--tone-soft); font-size: var(--arca-text-sm);
+  }
+  .card-note[data-tone="warn"] { --tone: var(--arca-warn); --tone-soft: var(--arca-warn-soft); }
 
   /* sections and cards */
   .sections { display: flex; flex-direction: column; gap: var(--arca-space-6); }
@@ -376,11 +385,6 @@
     <div id="plans" class="plans"><div class="card loading">Loading…</div></div>
   </section>
 
-  <section id="requests-section" aria-labelledby="requests-title" hidden>
-    <h2 id="requests-title">Asked by your assistant</h2>
-    <div id="requests" class="plans"></div>
-  </section>
-
   <section id="apps-section" aria-labelledby="apps-title" hidden>
     <h2 id="apps-title">Connected apps</h2>
     <div id="apps" class="plans"></div>
@@ -470,8 +474,34 @@ const KINDS = {
 // How Arca begins the message of an approved action that then failed (`APPROVED_BUT_FAILED` in handlers.rs).
 const APPROVED_BUT_FAILED = "The approval was accepted, but";
 
+// How often the page reads what is waiting again while it is in view: a card's statement lives 10 minutes
+// (STATEMENT_TTL_MS in handlers.rs), and a card proposed after the page loaded shows up within this.
+const REFRESH_MS = 60000;
+// The prefix of every challenge the passkey signs, before the statement.
+const APPROVAL_PREFIX = "arca-kernel-approval/v1\narca-kernel-approve\n";
+// Cards mid-approve or mid-decline: the page does not redraw the list under them.
+let busy = 0;
+// The latest listing asked for: an older answer that comes back later never replaces a newer one.
+let listing = 0;
+// What went wrong on a card, by card, kept across a redraw of the list until that card is tapped again or is gone.
+const cardNotes = new Map();
+// The cards drawn now, in the order they stand on the page (see placeCards): the plans, the passkey lists and the
+// requests an assistant made, in one list, so a new card of any kind goes after every card already drawn.
+const drawnPlans = [];
+// Whether the list has been drawn once (cards or "Nothing to approve"): from then on a change holds taps.
+let listShown = false;
+// How long a tap is held off after the cards moved, the timer that lets taps through again, the lists it holds, and
+// the button or field that had the keyboard focus when the hold began (it gets it back when the hold ends).
+const HOLD_MS = 1000;
+let holding = 0;
+const HELD_LISTS = ["plans", "apps", "passkeys"];
+let heldFocus = null;
+// Marks a request an assistant made (owner_approval_request) among the cards; a symbol, so it is not in the card's shape.
+const REQUEST = Symbol("request");
+
 const REFUSALS = {
   Expired: "This approval ran out of time. Reload the page and try again.",
+  Unreachable: "The machine did not answer in time. It may still be working on it: the list shows what is still waiting, so check this card again in a minute.",
   Replayed: "This approval was already used. Reload the page to see what is still waiting.",
   NoSuchPlan: "This plan is no longer waiting. Reload the page to see what is left.",
   Untrusted: "Arca does not trust this passkey. Use the passkey you set up for Arca.",
@@ -526,13 +556,42 @@ function plain(error) {
   return /[.!?…]$/.test(text) ? text : text + ".";
 }
 
-function fail(error) {
+// Says what went wrong in the status line. A failure of one card is also said on the card, and the card's note is what
+// comes into view (`onCard`); any other failure brings the status line into view.
+function fail(error, onCard) {
   const message = String((error && error.message) || error);
   let tone = "bad";
   if (error && error.name === "NotAllowedError") tone = "warn";
   else if (/locked|^Wait /.test(message)) tone = "warn";
   if (message === "A code is already on your screen") tone = "";
   status(plain(error), tone);
+  // On a phone the status line is often scrolled out of view: bring it back so the failure is seen.
+  if (tone && !onCard) document.getElementById("status").scrollIntoView({ block: "nearest" });
+}
+
+// The key a card's note is kept under: its machine and its id.
+function cardKey(plan) {
+  return (plan.linkedHost || "") + "\n" + (plan.id || plan.plan);
+}
+
+// Says on the card itself what went wrong with it (and keeps it for the card's next drawing), or clears it.
+function noteCard(plan, card, text, tone) {
+  const key = cardKey(plan);
+  if (text) cardNotes.set(key, { text, tone: tone || "bad" });
+  else cardNotes.delete(key);
+  if (card) drawNote(plan, card, true);
+}
+
+function drawNote(plan, card, fresh) {
+  const old = card.querySelector(".card-note");
+  if (old) old.remove();
+  const note = cardNotes.get(cardKey(plan));
+  if (!note) return;
+  const line = el("p", "card-note", note.text);
+  line.dataset.tone = note.tone;
+  if (fresh) line.setAttribute("role", "alert");
+  card.append(line);
+  if (fresh) line.scrollIntoView({ block: "nearest" });
 }
 
 function icon(name) {
@@ -627,7 +686,9 @@ function inSentence(text) {
   return /[.!?]$/.test(lowered) ? lowered : lowered + ".";
 }
 
-function planCard(plan) {
+// The cards below take `current`: the card's item as last listed. A refresh that keeps a card in place gives it the
+// item it just read (the same plan, with a fresh statement), and a tap reads it once, when it starts.
+function planCard(plan, current = () => plan) {
   const card = el("article", "card plan");
   const objects = Array.isArray(plan.objects) ? plan.objects : [];
 
@@ -685,18 +746,23 @@ function planCard(plan) {
   row.append(el("span", "digest-label", "Fingerprint"), chip, copy);
   digest.append(row, full);
 
-  const button = approveButton(title, (button) => approve(plan, button));
+  const button = approveButton(title, (button) => approve(current(), button));
 
   const more = moreDetails(title);
   more.box.append(digest);
 
   card.append(meta, heading);
+  // A plan that waits on a linked machine names it: approving it here deletes on that machine, not this one.
+  if (plan.linkedHost) card.append(el("p", "notice-text", "On " + String(plan.linkedHost)));
   if (count) card.append(list);
+  // The linked machine does not take this page's token for a delete yet: what the owner changes, before the tap.
+  if (plan.relayNote) card.append(el("p", "notice-text", String(plan.relayNote)));
   card.append(more.box, button);
+  drawNote(plan, card, false);
   return card;
 }
 
-function actionCard(plan) {
+function actionCard(plan, current = () => plan) {
   const card = el("article", "card plan action");
   const meta = el("div", "plan-meta");
   const expiry = el("time", "expiry");
@@ -738,19 +804,20 @@ function actionCard(plan) {
   audit("Fingerprint", digest, true);
 
   const buttons = el("div", "actions");
-  const approving = approveButton(plan.summary, (button) => approve(plan, button));
+  const approving = approveButton(plan.summary, (button) => approve(current(), button));
   const declineButton = el("button", "btn btn-secondary", "Decline");
   declineButton.type = "button";
-  declineButton.addEventListener("click", () => decline(plan, declineButton));
+  declineButton.addEventListener("click", () => decline(current(), declineButton));
   buttons.append(approving, declineButton);
 
   card.append(meta, heading, facts, more.box, buttons);
+  drawNote(plan, card, false);
   return card;
 }
 
 // A card for a passkey list another machine keeps in sync from this page: the owner approves it with a passkey that
 // machine already trusts, and this page relays the signed statement with the list. No passkey line is shown.
-function peerKeysCard(card) {
+function peerKeysCard(card, current = () => card) {
   const node = el("article", "card plan action");
   const meta = el("div", "plan-meta");
   meta.append(el("span", "badge", "Passkeys"));
@@ -763,16 +830,17 @@ function peerKeysCard(card) {
   }
   const heading = el("h3", "", card.title);
   const text = el("p", "notice-text", card.linkedHost + " will trust " + card.keys + " passkey" + (card.keys === 1 ? "" : "s") + " from this page for approvals. Confirm with a passkey it already trusts.");
-  const button = approveButton(card.title, (button) => trustPeerKeys(card, button));
+  const button = approveButton(card.title, (button) => trustPeerKeys(current(), button));
   node.append(meta, heading, text, button);
   return node;
 }
 
 async function trustPeerKeys(card, button) {
   button.disabled = true;
+  busy++;
   status("Confirm with your passkey…", "wait");
   try {
-    const proof = await trustedProof(card.statement);
+    const proof = await trustedProof(card.statement, card.challenge);
     const answer = await fetch("/approve/peer-keys", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -790,15 +858,17 @@ async function trustPeerKeys(card, button) {
   } catch (error) {
     fail(error);
     button.disabled = false;
+  } finally {
+    busy--;
   }
 }
 
 const REQUEST_WORDS = { delete: "Delete", publish: "Publish", spend: "Spend on" };
 
 // A request an agent made with owner_approval_request. Everything in it is the agent's words, so every part is set as text.
-function requestCard(request) {
+function requestCard(request, current = () => request) {
   const fields = request.fields || {};
-  const card = el("article", "card plan action");
+  const card = el("article", "card plan action request");
   const meta = el("div", "plan-meta");
   const expiresAt = Date.parse(request.expiresAt);
   const expiry = el("time", "expiry");
@@ -834,10 +904,10 @@ function requestCard(request) {
   more.add("Fingerprint", String(fields.paramsDigest || ""), true);
 
   const buttons = el("div", "actions");
-  const approving = approveButton(title, (button) => approveRequest(request, button));
+  const approving = approveButton(title, (button) => approveRequest(current(), button));
   const denyButton = el("button", "btn btn-secondary", "Decline");
   denyButton.type = "button";
-  denyButton.addEventListener("click", () => denyRequest(request, denyButton));
+  denyButton.addEventListener("click", () => denyRequest(current(), denyButton));
   buttons.append(approving, denyButton);
 
   card.append(meta, heading, ...(code ? [code] : []), facts, more.box, buttons);
@@ -863,6 +933,7 @@ async function requestPost(path, body) {
 // and that statement.
 async function approveRequest(request, button) {
   button.disabled = true;
+  busy++;
   status("Confirm with your passkey…", "wait");
   try {
     const begun = await requestPost("/approve/requests/begin", { id: request.id });
@@ -873,11 +944,14 @@ async function approveRequest(request, button) {
   } catch (error) {
     fail(error);
     button.disabled = false;
+  } finally {
+    busy--;
   }
 }
 
 async function denyRequest(request, button) {
   button.disabled = true;
+  busy++;
   status("Declining…", "wait");
   try {
     await requestPost("/approve/requests/deny", { id: request.id });
@@ -886,15 +960,9 @@ async function denyRequest(request, button) {
   } catch (error) {
     fail(error);
     button.disabled = false;
+  } finally {
+    busy--;
   }
-}
-
-function showRequests(requests) {
-  const section = document.getElementById("requests-section");
-  const target = document.getElementById("requests");
-  const pending = (Array.isArray(requests) ? requests : []).filter((request) => request.state === "pending");
-  target.replaceChildren(...pending.map(requestCard));
-  section.hidden = pending.length === 0;
 }
 
 function showTrusted(count) {
@@ -906,23 +974,137 @@ function showTrusted(count) {
   field.hidden = count > 0;
 }
 
-async function loadPlans() {
+// A card's item without what a listing renews each time (its statement and its challenge), and whether a passkey is
+// trusted (its Approve button says so): two listings of the same card with the same shape draw
+// the same card.
+function cardShape(item) {
+  const { statement, challenge, ...rest } = item;
+  return document.body.dataset.trusted + JSON.stringify(rest);
+}
+
+// Draws the cards of one list without moving one the owner may be reading or about to tap. A card still listed keeps
+// its place, its open Details and its focus, and takes the fresh item for its next tap; one whose words changed is drawn
+// again in its own place. A new card goes after the others. A card no longer listed leaves a placeholder of its height
+// (it lapsed, or was approved or declined somewhere else), and the owner's own next action (a listing that is not
+// `quiet`) takes the placeholders away. Says whether anything on the list was drawn, drawn again or taken away.
+function placeCards(target, drawn, items, keyOf, draw, quiet) {
+  const listed = new Map(items.map((item) => [keyOf(item), item]));
+  if (!drawn.length && items.length) target.replaceChildren();
+  let moved = false;
+  const kept = [];
+  for (const entry of drawn) {
+    const item = listed.get(entry.key);
+    listed.delete(entry.key);
+    if (!item) {
+      if (!quiet) {
+        entry.node.remove();
+        moved = true;
+        continue;
+      }
+      if (!entry.gone) {
+        const gone = el("div", "card gone", "No longer waiting: it lapsed, or was approved or declined somewhere else.");
+        gone.style.minHeight = entry.node.offsetHeight + "px";
+        entry.node.replaceWith(gone);
+        entry.node = gone;
+        entry.gone = true;
+        moved = true;
+      }
+      kept.push(entry);
+      continue;
+    }
+    entry.item = item;
+    const shape = cardShape(item);
+    if (entry.gone || shape !== entry.shape) {
+      const node = draw(item, () => entry.item);
+      entry.node.replaceWith(node);
+      entry.node = node;
+      entry.gone = false;
+      entry.shape = shape;
+      moved = true;
+    } else {
+      const expiry = entry.node.querySelector("time.expiry");
+      const at = typeof item.expiresAt === "number" ? item.expiresAt : Date.parse(item.expiresAt);
+      if (expiry && !item.heldForSession && Number.isFinite(at)) {
+        expiry.replaceChildren(icon("clock"), expiryText(at));
+        expiry.classList.toggle("soon", at - Date.now() < 5 * 60000);
+      }
+    }
+    kept.push(entry);
+  }
+  for (const [key, item] of listed) {
+    const entry = { key, item, shape: cardShape(item), gone: false };
+    entry.node = draw(item, () => entry.item);
+    target.append(entry.node);
+    kept.push(entry);
+    moved = true;
+  }
+  drawn.splice(0, drawn.length, ...kept);
+  return moved;
+}
+
+// For a moment after the cards moved, a tap does nothing: it was aimed at what stood there before. Every list below
+// the cards is held too, since it moved with them. What had the keyboard focus in a held list gets it back after.
+function holdTaps() {
+  const lists = HELD_LISTS.map((id) => document.getElementById(id)).filter(Boolean);
+  const active = document.activeElement;
+  if (active && lists.some((list) => list.contains(active))) heldFocus = active;
+  for (const list of lists) list.inert = true;
+  clearTimeout(holding);
+  holding = setTimeout(() => {
+    for (const list of lists) list.inert = false;
+    const back = heldFocus;
+    heldFocus = null;
+    // Only when the focus is still lost: if the owner put it somewhere during the hold, it stays there.
+    const lost = !document.activeElement || document.activeElement === document.body;
+    if (back && lost && back.isConnected && !back.disabled) back.focus({ preventScroll: true });
+  }, HOLD_MS);
+}
+
+// Reads what is waiting and draws it. Every card gets its challenge now, so a tap goes straight to the passkey. A quiet
+// read (the page's own refresh) leaves the list and the status line as they were when it fails. `quiet` is true for the
+// page's own refresh, which never draws under a tap in progress, or "keep" for a reading after a refused tap, which draws
+// even then: neither takes a card away (a card no longer listed stays a placeholder), so the card the owner is asked to
+// tap again stays where it is.
+async function loadPlans(quiet) {
   const target = document.getElementById("plans");
+  const mine = ++listing;
   try {
     const response = await fetch("/approve/plans", { headers: { Accept: "application/json" } });
     if (!response.ok) throw new Error("the plan list answered " + response.status);
     const body = await response.json();
-    showTrusted(body.passkeysTrusted || 0);
-    showRequests(body.approvalRequests);
-    target.replaceChildren();
     const peerKeys = Array.isArray(body.peerKeys) ? body.peerKeys : [];
-    if (!body.plans.length && !peerKeys.length) {
-      target.append(notice("empty", "Nothing to approve", "When Arca wants to change or delete something, it will wait here for your OK."));
-      return;
+    for (const card of peerKeys) card.kind = "peerKeys";
+    await Promise.all([...body.plans, ...peerKeys].map(async (card) => {
+      if (typeof card.statement !== "string") return;
+      try { card.challenge = await challengeOf(card.statement); } catch { /* computed at the tap instead */ }
+    }));
+    // A refresh that a tap overtook draws nothing: the card being approved keeps its place and its disabled button.
+    if (mine !== listing || (quiet === true && busy)) return;
+    // Taps are held only once the list was drawn: the first drawing moves nothing a finger was aimed at.
+    const before = listShown;
+    showTrusted(body.passkeysTrusted || 0);
+    const requests = (Array.isArray(body.approvalRequests) ? body.approvalRequests : [])
+      .filter((request) => request.state === "pending");
+    for (const request of requests) request[REQUEST] = true;
+    const listed = new Set(body.plans.map(cardKey));
+    for (const key of [...cardNotes.keys()]) if (!listed.has(key)) cardNotes.delete(key);
+    const keyOf = (item) => {
+      if (item[REQUEST]) return "request\n" + String(item.id);
+      return item.kind === "peerKeys" ? "keys\n" + item.linkedHost : "plan\n" + cardKey(item);
+    };
+    const draw = (item, current) => {
+      if (item[REQUEST]) return requestCard(item, current);
+      if (item.kind === "peerKeys") return peerKeysCard(item, current);
+      return item.kind === "action" ? actionCard(item, current) : planCard(item, current);
+    };
+    const moved = placeCards(target, drawnPlans, [...peerKeys, ...body.plans, ...requests], keyOf, draw, quiet);
+    if (!drawnPlans.length && !target.querySelector(".notice:not(.problem)")) {
+      target.replaceChildren(notice("empty", "Nothing to approve", "When Arca wants to change or delete something, it will wait here for your OK."));
     }
-    for (const card of peerKeys) target.append(peerKeysCard(card));
-    for (const plan of body.plans) target.append(plan.kind === "action" ? actionCard(plan) : planCard(plan));
+    listShown = true;
+    if (moved && before) holdTaps();
   } catch (error) {
+    if (quiet || mine !== listing) return;
     const card = notice("problem", "Couldn't load what's waiting", "Your plans are safe. Nothing changes until you approve it.");
     const retry = el("button", "btn btn-secondary", "Try again");
     retry.type = "button";
@@ -932,9 +1114,17 @@ async function loadPlans() {
       loadPlans();
     });
     card.append(retry);
+    drawnPlans.length = 0;
     target.replaceChildren(card);
+    // The notice moved what is below it: the next drawing holds taps.
+    listShown = true;
     fail(error);
   }
+}
+
+// The page's own refresh: while it is in view, and never under a card being approved or declined.
+function refreshPlans() {
+  if (document.visibilityState === "visible" && !busy) loadPlans(true);
 }
 
 async function getCode() {
@@ -1036,17 +1226,21 @@ async function register() {
   }
 }
 
-async function trustedProof(statement) {
-  const challenge = await crypto.subtle.digest(
-    "SHA-256",
-    enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + statement),
-  );
+// The challenge the passkey signs for `statement`. The list computes it for every card when it loads.
+function challengeOf(statement) {
+  return crypto.subtle.digest("SHA-256", enc.encode(APPROVAL_PREFIX + statement));
+}
+
+// The passkey's proof over `statement`. With the card's `challenge` computed when the list loaded, nothing is awaited
+// before credentials.get: Safari carries the tap into the passkey prompt only then, and a later tap otherwise brings no
+// prompt at all.
+async function trustedProof(statement, challenge) {
   if (!allowCredentials.length) {
     throw new Error(NO_PASSKEY);
   }
   const credential = await navigator.credentials.get({
     publicKey: {
-      challenge,
+      challenge: challenge || await challengeOf(statement),
       rpId: location.hostname,
       userVerification: "required",
       timeout: 60000,
@@ -1124,10 +1318,13 @@ async function loadPasskeys() {
 
 async function approve(plan, button) {
   button.disabled = true;
+  busy++;
+  const card = button.closest("article");
+  noteCard(plan, card, "");
   status("Confirm with your passkey…", "wait");
   let slow;
   try {
-    const proof = await trustedProof(plan.statement);
+    const proof = await trustedProof(plan.statement, plan.challenge);
     const approval = b64(enc.encode(plan.statement)) + "." + b64(enc.encode(JSON.stringify(proof)));
     const id = plan.id || plan.plan;
     // The answer comes when the action has finished, which can take minutes for a new virtual machine.
@@ -1150,6 +1347,7 @@ async function approve(plan, button) {
       }
       const refused = new Error(body.refusal || ("the approval answered " + answer.status));
       refused.refusal = body.refusal;
+      if (body.refusal === "LinkToken" && typeof body.message === "string") refused.message = body.message;
       throw refused;
     }
     clearTimeout(slow);
@@ -1163,20 +1361,38 @@ async function approve(plan, button) {
     await loadPasskeys();
   } catch (error) {
     clearTimeout(slow);
-    fail(error);
     button.disabled = false;
+    if (error && error.refusal === "Expired") {
+      // The card's statement outlived its 10 minutes: the list is read again, with fresh statements, and the owner taps
+      // the same card once more.
+      const again = "This card had been open too long, so Arca renewed it. Tap Approve again.";
+      noteCard(plan, card, again, "warn");
+      status(again, "warn");
+      await loadPlans("keep");
+      return;
+    }
+    const said = error && error.refusal === "LinkToken" ? error.message : plain(error);
+    fail(error && error.refusal === "LinkToken" ? new Error(said) : error, true);
+    noteCard(plan, card, said, error && error.name === "NotAllowedError" ? "warn" : "bad");
+    // A machine that did not answer may still have run it: what is waiting is read again.
+    if (error && error.refusal === "Unreachable") await loadPlans("keep");
+  } finally {
+    busy--;
   }
 }
 
 async function decline(plan, button) {
   button.disabled = true;
+  busy++;
+  const card = button.closest("article");
+  noteCard(plan, card, "");
   status("Declining…", "wait");
   try {
     const id = plan.id || plan.plan;
     const answer = await fetch("/approve/decline", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ plan: id }),
+      body: JSON.stringify(plan.linkedHost ? { plan: id, host: plan.linkedHost } : { plan: id }),
     });
     const body = await answer.json().catch(() => ({}));
     if (!answer.ok) {
@@ -1187,8 +1403,11 @@ async function decline(plan, button) {
     status("Declined. Nothing changed.", "ok");
     await loadPlans();
   } catch (error) {
-    fail(error);
+    fail(error, true);
+    noteCard(plan, card, plain(error));
     button.disabled = false;
+  } finally {
+    busy--;
   }
 }
 
@@ -1244,12 +1463,14 @@ async function loadApps() {
 document.getElementById("get-code").addEventListener("click", getCode);
 document.getElementById("register").addEventListener("click", register);
 loadPlans();
+setInterval(refreshPlans, REFRESH_MS);
+document.addEventListener("visibilitychange", refreshPlans);
 loadApps().catch(() => {});
 loadPasskeys().catch(fail);
 // Opening the page syncs this host's passkey list with the machines that keep it, so a changed list shows its card now.
 fetch("/approve/peer-keys/sync", { method: "POST" })
   .then((answer) => (answer.ok ? answer.json() : null))
-  .then((body) => { if (body && Array.isArray(body.peerKeys) && body.peerKeys.length) loadPlans(); })
+  .then((body) => { if (body && Array.isArray(body.peerKeys) && body.peerKeys.length) loadPlans("keep"); })
   .catch(() => {});
 </script>
 </body>

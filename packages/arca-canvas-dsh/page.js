@@ -2220,7 +2220,14 @@
         headers: { Accept: "application/json" }
       });
       if (!response.ok) throw new Error(`The approval list answered ${response.status}.`);
-      return parseApprovalPlans(await response.json());
+      const parsed = parseApprovalPlans(await response.json());
+      await Promise.all([...parsed.plans.values()].map(async (plan) => {
+        try {
+          plan.challenge = await approvalChallenge(plan.statement);
+        } catch {
+        }
+      }));
+      return parsed;
     }
     async function refreshApprovals() {
       if (approvals.fetching) return approvalInflight;
@@ -2236,6 +2243,9 @@
         approvals.fetchStartedAt = Date.now();
         try {
           const next = await readApprovalPlans();
+          if (next.passkeysTrusted !== approvals.passkeysTrusted) approvals.credentialIds = null;
+          if (!approvals.credentialIds && next.passkeysTrusted > 0) loadCredentialIds().catch(() => {
+          });
           const now = Date.now();
           for (const [id, plan] of next.plans) {
             const card = approvals.cards.get(id);
@@ -2435,27 +2445,30 @@
         ids = [];
       }
       if (!Array.isArray(ids)) ids = [];
-      approvals.credentialIds = ids.filter((value) => typeof value === "string" && value).map((value) => ({ type: "public-key", id: fromB64url(value) }));
-      return approvals.credentialIds;
+      const trusted = ids.filter((value) => typeof value === "string" && value).map((value) => ({ type: "public-key", id: fromB64url(value) }));
+      approvals.credentialIds = trusted.length ? trusted : null;
+      return trusted;
     }
-    async function passkeyProof(statement) {
+    async function approvalChallenge(statement) {
+      return new Uint8Array(await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(`${APPROVAL_DOMAIN}
+${APPROVAL_NAMESPACE}
+${statement}`)
+      ));
+    }
+    async function passkeyProof(statement, challenge) {
       if (!navigator.credentials || typeof navigator.credentials.get !== "function") {
         throw new Error("This browser cannot use passkeys.");
       }
       if (typeof crypto?.subtle?.digest !== "function") {
         throw new Error("Passkeys can't be used at this page's address.");
       }
-      const allowCredentials = await loadCredentialIds();
+      const allowCredentials = approvals.credentialIds || await loadCredentialIds();
       if (!allowCredentials.length) throw new Error("No passkey is set up for this Arca.");
-      const challenge = new Uint8Array(await crypto.subtle.digest(
-        "SHA-256",
-        new TextEncoder().encode(`${APPROVAL_DOMAIN}
-${APPROVAL_NAMESPACE}
-${statement}`)
-      ));
       const credential = await navigator.credentials.get({
         publicKey: {
-          challenge,
+          challenge: challenge || await approvalChallenge(statement),
           rpId: location.hostname,
           userVerification: "required",
           timeout: 6e4,
@@ -2495,7 +2508,7 @@ ${statement}`)
       card.note = "";
       updatePanel();
       try {
-        const proof = await passkeyProof(plan.statement);
+        const proof = await passkeyProof(plan.statement, plan.challenge);
         const statementBytes = new TextEncoder().encode(plan.statement);
         const proofBytes = new TextEncoder().encode(JSON.stringify(proof));
         const approval = `${b64(statementBytes)}.${b64(proofBytes)}`;

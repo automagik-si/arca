@@ -249,7 +249,8 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
         .iter()
         .map(|t| t["name"].as_str().expect("a name").to_string())
         .collect();
-    // The viewer's reads of the table include the ontology. No write verb is listed.
+    // The viewer's reads of the table include the ontology. No write verb is listed, and neither support_reports nor
+    // support_report_ack: a viewer reaches them only through a tool list that names them.
     assert_eq!(
         names,
         vec![
@@ -282,7 +283,9 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "github_bindings",
             "github_audit",
             "os_update",
-            "route_list"
+            "route_list",
+            "support_report",
+            "support_report_status"
         ]
     );
 }

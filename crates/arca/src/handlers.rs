@@ -1027,7 +1027,7 @@ impl GetHandler for AlertsExport {
 }
 
 /// The `after` of a query string: the value of its first `after=` pair, or 0 when there is none.
-fn after_of(query: Option<&str>) -> Result<u64, CallError> {
+pub(crate) fn after_of(query: Option<&str>) -> Result<u64, CallError> {
     let value = query
         .unwrap_or("")
         .split('&')
@@ -6012,7 +6012,10 @@ mod service_reconfigure;
 mod service_update;
 #[path = "service_wiring.rs"]
 mod service_wiring;
-pub use service_update::{Probe as UpdateProbe, UpdateOptions, digest_ok as service_digest_ok};
+pub use service_update::{
+    DEFAULT_HEALTH_SECONDS, MAX_HEALTH_SECONDS, OLD_ANSWERS_SECONDS, Probe as UpdateProbe,
+    STEP_DEADLINE, UpdateOptions, digest_ok as service_digest_ok,
+};
 #[path = "tenants.rs"]
 mod tenants;
 pub use tenants::{SnapshotListInTenant, spawn_front_sync, sync_front, tenant_handlers};

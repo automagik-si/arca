@@ -24,11 +24,11 @@ use crate::config::LinkedHost;
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The margin a relayed approval waits beyond the longest action it can run.
 const APPROVAL_MARGIN: Duration = Duration::from_secs(30);
-/// The longest a relayed approval may take: the linked kernel runs the approved action before it answers, and the door
-/// sends nothing until then. The longest such action is a graceful instance stop or restart, so the relay waits past its
-/// whole budget: a slow stop still answers through the relay, as done or as its own refusal, never as "could not be
-/// reached" while it goes on.
-const APPROVAL_TIMEOUT: Duration =
+/// The longest a relayed approval may take: the linked kernel runs the approved action (or the plan's delete) before it
+/// answers, and the door sends nothing until then. A graceful instance stop or restart may take its whole call budget, so
+/// the relay waits past it: a slow stop still answers through the relay, as done or as its own refusal, never as "could
+/// not be reached" while it goes on. An action with its own longer wait gets that too ([`approval_wait`]).
+pub const APPROVAL_TIMEOUT: Duration =
     Duration::from_secs(arca_incus::CALL_BUDGET.as_secs() + APPROVAL_MARGIN.as_secs());
 /// The longest a listing or a status read may take. The canvas polls the list, so a linked kernel that hangs must not hold
 /// the page's own list.
@@ -53,20 +53,77 @@ pub enum RelayError {
 
 /// Calls `verb` with `arguments` on the linked kernel `host`, and returns its structured result.
 pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, RelayError> {
-    answer_of(&reply(host, verb, arguments)?)
+    call_within(host, verb, arguments, timeout_for(verb))
+}
+
+/// [`call`], waiting up to `timeout` for the answer: an approval waits as long as its own action can run
+/// ([`approval_wait`]).
+pub fn call_within(
+    host: &LinkedHost,
+    verb: &str,
+    arguments: Value,
+    timeout: Duration,
+) -> Result<Value, RelayError> {
+    answer_of(&rpc(
+        host,
+        "tools/call",
+        json!({ "name": verb, "arguments": arguments }),
+        timeout,
+    )?)
 }
 
 /// Calls `verb` with `arguments` on the linked kernel `host`, and returns its JSON-RPC reply as it wrote it: an object
 /// with its `result` or its `error`.
 pub fn reply(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, RelayError> {
+    rpc(
+        host,
+        "tools/call",
+        json!({ "name": verb, "arguments": arguments }),
+        timeout_for(verb),
+    )
+}
+
+/// Whether the token this kernel holds for `host` admits `verb` there, as the linked kernel's own `tools/list` says (the
+/// list is the caller's own: its scope and its list of tools). `None` when the list cannot be read. It only reads.
+pub fn admits(host: &LinkedHost, verb: &str) -> Option<bool> {
+    let listed = rpc(host, "tools/list", json!({}), LIST_TIMEOUT).ok()?;
+    let tools = listed.pointer("/result/tools")?.as_array()?;
+    Some(tools.iter().any(|tool| tool["name"] == json!(verb)))
+}
+
+/// How long the page waits for a linked kernel's answer to the approval of action `action` with arguments `args`: the
+/// kernel runs the action before it answers. A `service_update` can take far longer than any other action: one Incus
+/// step of its rebuild may take up to `STEP_DEADLINE` (600 s, a registry pull included), its new version then has
+/// `timeoutSeconds` (120 by default) to answer, and after a rollback the old version has up to `OLD_ANSWERS_SECONDS`
+/// (30 s, never more than `timeoutSeconds`). It waits all of that beyond every other action's wait.
+pub fn approval_wait(action: &str, args: &Value) -> Duration {
+    if action != "service_update" {
+        return APPROVAL_TIMEOUT;
+    }
+    let health = args
+        .get("timeoutSeconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(crate::handlers::DEFAULT_HEALTH_SECONDS)
+        .min(crate::handlers::MAX_HEALTH_SECONDS);
+    let old_answers = health.min(crate::handlers::OLD_ANSWERS_SECONDS);
+    APPROVAL_TIMEOUT + crate::handlers::STEP_DEADLINE + Duration::from_secs(health + old_answers)
+}
+
+/// One JSON-RPC `method` with `params` to the linked kernel `host`, and its reply as it wrote it.
+fn rpc(
+    host: &LinkedHost,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, RelayError> {
     let token = read_token(host)?;
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "tools/call",
-        "params": { "name": verb, "arguments": arguments },
+        "method": method,
+        "params": params,
     });
-    let (status, body) = post(host, &token, &request, timeout_for(verb))?;
+    let (status, body) = post(host, &token, &request, timeout)?;
     match status {
         200 => {}
         401 | 403 => return Err(RelayError::Token),
@@ -156,10 +213,10 @@ fn answer_of(reply: &Value) -> Result<Value, RelayError> {
 }
 
 /// How long a relayed call of `verb` waits for the linked kernel's answer.
-fn timeout_for(verb: &str) -> Duration {
+pub fn timeout_for(verb: &str) -> Duration {
     match verb {
         "plan_list" | "arca_status" => LIST_TIMEOUT,
-        "action_approve" => APPROVAL_TIMEOUT,
+        "action_approve" | "approval_submit" => APPROVAL_TIMEOUT,
         _ => TIMEOUT,
     }
 }
@@ -295,9 +352,41 @@ mod tests {
         let approval = timeout_for("action_approve");
         assert!(approval >= arca_incus::CALL_BUDGET + APPROVAL_MARGIN);
         assert!(approval > Duration::from_secs(arca_incus::GRACE_SECONDS));
+        // A relayed delete plan waits as an action does.
+        assert_eq!(timeout_for("approval_submit"), APPROVAL_TIMEOUT);
         // The polled reads stay short, and a decline runs nothing.
         assert_eq!(timeout_for("plan_list"), LIST_TIMEOUT);
         assert_eq!(timeout_for("arca_status"), LIST_TIMEOUT);
         assert_eq!(timeout_for("plan_decline"), TIMEOUT);
+    }
+
+    #[test]
+    fn a_service_update_waits_for_one_slow_step_and_both_health_checks_beyond_the_approval_wait() {
+        let step = crate::handlers::STEP_DEADLINE;
+        // The 2026-11-15 card: service_update with timeoutSeconds 300 ran past the old flat 180 s. It waits one 600 s
+        // Incus step, 300 s for the new version and 30 s for the old one after a rollback.
+        let card = approval_wait("service_update", &json!({ "timeoutSeconds": 300 }));
+        assert_eq!(card, APPROVAL_TIMEOUT + step + Duration::from_secs(330));
+        assert_eq!(card, Duration::from_secs(180 + 600 + 330));
+        // Without timeoutSeconds the update checks for its default 120 s.
+        assert_eq!(
+            approval_wait("service_update", &json!({})),
+            APPROVAL_TIMEOUT + step + Duration::from_secs(150)
+        );
+        // A timeout under 30 s gives the old version no more than that.
+        assert_eq!(
+            approval_wait("service_update", &json!({ "timeoutSeconds": 10 })),
+            APPROVAL_TIMEOUT + step + Duration::from_secs(20)
+        );
+        // A value past the most the update takes waits no longer than that most.
+        assert_eq!(
+            approval_wait("service_update", &json!({ "timeoutSeconds": 100_000 })),
+            APPROVAL_TIMEOUT + step + Duration::from_secs(crate::handlers::MAX_HEALTH_SECONDS + 30)
+        );
+        // Every other action waits as before.
+        assert_eq!(
+            approval_wait("instance_stop", &json!({ "timeoutSeconds": 300 })),
+            APPROVAL_TIMEOUT
+        );
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "tailscale",
-  "description": "Tailscale connector: Tailscale 1.104.7 (tailscale/tailscale by digest), a tailnet node in userspace networking (no tun, no capability). It forwards tailnet TCP 443 to one linked service as raw TCP with a PROXY v2 header. A link to the edge gives its forward target. TS_TARGET ([NAME@]ADDRESS:PORT; NAME is its tailnet name, the service's own by default) overrides that target. TS_AUTHKEY and TS_TARGET are optional secrets set with service_secret_set; it may start with no key. Its state is on its data volume, so it logs in once. No port of its own; it reaches only what it is linked to.",
+  "description": "Tailscale connector: Tailscale 1.104.7 by digest, in userspace networking (no tun or capability). Forwards tailnet TCP 443 to the linked edge with PROXY v2, using the link's target. TS_TARGET ([NAME@]ADDRESS:PORT) overrides it; NAME overrides the service's tailnet name. TS_AUTHKEY and TS_TARGET are optional secrets (service_secret_set). May start with no key. State lives on its data volume, so it logs in once. No port of its own; reaches only linked services.",
   "kind": "oci",
   "connector": "tailscale",
   "image": "docker.io/tailscale/tailscale",

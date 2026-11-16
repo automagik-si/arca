@@ -54,11 +54,11 @@ pub const MAX_HEALTH_SECONDS: u64 = 900;
 /// One TCP attempt of the health check gives up after this long.
 const CONNECT_WAIT: Duration = Duration::from_secs(2);
 /// How long Incus may take over one step, a registry pull included: what a create allows for its fetch.
-const STEP_DEADLINE: Duration = Duration::from_secs(600);
+pub const STEP_DEADLINE: Duration = Duration::from_secs(600);
 /// A service the node cannot reach has to stay running this long (at most the call's timeout).
 const STAY_RUNNING_SECONDS: u64 = 10;
 /// The old version, started again after a rollback, is given this long to answer.
-const OLD_ANSWERS_SECONDS: u64 = 30;
+pub const OLD_ANSWERS_SECONDS: u64 = 30;
 
 /// One attempt of the health check: whether `address` answers on `port` now.
 /// `forwarded` is true when the address is the node's own side of a proxy: the proxy takes the connection before it dials

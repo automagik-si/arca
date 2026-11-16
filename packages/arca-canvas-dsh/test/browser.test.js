@@ -289,6 +289,8 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
   const approvalRequests = [];
   const declines = [];
   let retryAttempts = 0;
+  // The passkeys the fake approval page trusts: how many, and their ids as its body lists them.
+  let passkeys = { trusted: 1, ids: '["AQID"]' };
   let holdNextPlans = null;
   const holdPlans = () => {
     let capturedResolve;
@@ -323,13 +325,13 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     }
     if (path === '/approve') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<!doctype html><html><body data-credential-ids=\'["AQID"]\'></body></html>');
+      res.end(`<!doctype html><html><body data-credential-ids='${passkeys.ids}'></body></html>`);
       return;
     }
     if (path === '/approve/plans') {
       // Snapshot the row list before a held response waits: a poll that started before a click may
       // still carry the plan after the card has finished.
-      const payload = JSON.stringify({ plans: approvalPlans, passkeysTrusted: 1 });
+      const payload = JSON.stringify({ plans: approvalPlans, passkeysTrusted: passkeys.trusted });
       const hold = holdNextPlans;
       if (hold) {
         holdNextPlans = null;
@@ -365,6 +367,13 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
       const plan = approvalPlans.find((row) => row.id === EXPIRING_ID);
       plan.expiresAt = Date.now() - 1000;
       plan.statement = approvalStatement(plan);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
+    if (path === '/test/passkeys') {
+      const asked = new URL(req.url, 'http://local').searchParams;
+      passkeys = { trusted: Number(asked.get('trusted')), ids: asked.get('ids') };
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');
       return;
@@ -463,16 +472,30 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
       for (const byte of bytes) text += String.fromCharCode(byte);
       return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     };
-    window.__arcaPasskey = { calls: [] };
+    window.__arcaPasskey = { calls: [], inClick: false };
+    // Whether a passkey request came inside a click listener, before it returned: anything awaited first (a digest, a
+    // fetch, even a promise already settled) runs after the listener, and Safari then drops the gesture. Every click
+    // listener is wrapped so the mark covers its own run and nothing after it.
+    const listen = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function (type, listener, options) {
+      if (type !== 'click' || typeof listener !== 'function') return listen.call(this, type, listener, options);
+      return listen.call(this, type, function (event) {
+        window.__arcaPasskey.inClick = true;
+        try { return listener.call(this, event); } finally { window.__arcaPasskey.inClick = false; }
+      }, options);
+    };
     Object.defineProperty(navigator, 'credentials', {
       configurable: true,
       value: {
         async get(options) {
+          // The passkeys offered, kept even when the prompt is cancelled.
+          window.__arcaPasskey.offered = options.publicKey.allowCredentials.map((entry) => Array.from(entry.id));
           if (window.__arcaPasskey.cancelNext) {
             window.__arcaPasskey.cancelNext = false;
             throw new DOMException('The operation was cancelled.', 'NotAllowedError');
           }
           window.__arcaPasskey.calls.push({
+            inClick: window.__arcaPasskey.inClick,
             challenge: Array.from(new Uint8Array(options.publicKey.challenge)),
             rpId: options.publicKey.rpId,
             userVerification: options.publicKey.userVerification,
@@ -681,6 +704,9 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     };
     const approval = `${b64(plan.statement)}.${b64(JSON.stringify(proof))}`;
     const card = page.locator(`.arca-chat-view .arca-proposal[data-proposal="${CHAT_ID}"]`);
+    // The trusted passkeys were read with the list, before the tap: the tap reads nothing more.
+    assert.ok(requests.some((entry) => entry.method === 'GET' && entry.path === '/approve'), 'the passkeys were read with the list');
+    const pagesRead = requests.filter((entry) => entry.method === 'GET' && entry.path === '/approve').length;
     await card.locator('.arca-approve').click();
     await page.waitForFunction((id) => document.querySelector(`.arca-chat-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'done', CHAT_ID);
     assert.equal(approvalRequests.length, 1);
@@ -690,6 +716,8 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     assert.equal(passkey.rpId, '127.0.0.1');
     assert.equal(passkey.userVerification, 'required');
     assert.deepEqual(passkey.allowCredentials, [{ type: 'public-key', id: [1, 2, 3] }]);
+    assert.equal(passkey.inClick, true, 'the passkey was asked inside the click, with nothing awaited first');
+    assert.equal(requests.filter((entry) => entry.method === 'GET' && entry.path === '/approve').length, pagesRead, 'the tap read no passkey list');
     assert.match(await card.locator('.arca-approval-status').innerText(), /The service nats was created and is running/);
 
     if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
@@ -875,6 +903,36 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     assert.equal(approvalRequests.length, before, 'a cancelled prompt posts nothing');
     assert.match(await card.locator('.arca-card-note').innerText(), /Passkey cancelled/);
     assert.equal(await card.locator('.arca-approve').isEnabled(), true);
+  });
+
+  await t.test('a canvas opened before the first passkey reads the passkeys again once one is trusted', async () => {
+    const card = page.locator(`.arca-chat-view .arca-proposal[data-proposal="${HOSTILE_ID}"]`);
+    const setPasskeys = (trusted, ids) => fetch(`${origin}/test/passkeys?trusted=${trusted}&ids=${encodeURIComponent(ids)}`);
+    const noPasskey = (want) => page.waitForFunction(([id, want]) => {
+      const notes = [...document.querySelectorAll(`.arca-chat-view .arca-proposal[data-proposal="${id}"] .arca-card-note`)];
+      return notes.some((note) => /No passkey is set up/.test(note.textContent)) === want;
+    }, [HOSTILE_ID, want], { timeout: 15000 });
+    await setPasskeys(0, '[]');
+    await noPasskey(true);
+    // The first passkey is trusted on the approval page: the next list reads its id, and the tap offers it.
+    const pagesRead = () => requests.filter((entry) => entry.method === 'GET' && entry.path === '/approve').length;
+    const read = pagesRead();
+    await setPasskeys(1, '["BAUG"]');
+    await noPasskey(false);
+    for (const until = Date.now() + 15000; pagesRead() === read;) {
+      assert.ok(Date.now() < until, 'the list that showed the passkey read its id');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    await page.evaluate(() => { window.__arcaPasskey.cancelNext = true; window.__arcaPasskey.offered = null; });
+    await card.locator('.arca-approve').click();
+    await page.waitForFunction(() => window.__arcaPasskey.offered !== null);
+    await page.waitForFunction((id) => document.querySelector(`.arca-chat-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'waiting', HOSTILE_ID);
+    assert.deepEqual(await page.evaluate(() => window.__arcaPasskey.offered), [[4, 5, 6]], 'the tap offered the passkey trusted after the canvas opened');
+    // Back to the first id, through a count change, for the tests after this one.
+    await setPasskeys(0, '[]');
+    await noPasskey(true);
+    await setPasskeys(1, '["AQID"]');
+    await noPasskey(false);
   });
 
   await t.test('model markup renders as text and never as an element', async () => {

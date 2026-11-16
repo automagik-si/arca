@@ -530,7 +530,10 @@ impl ServiceHandler {
             let template = self.template(&consumer)?;
             let values = self.values(&consumer, &template)?;
             let mut remaining = BTreeMap::new();
-            for (key, pattern) in &template.env {
+            // Only a name the link gave is rebuilt, from the consumer's own template where it names it too. A plain value
+            // is never stored as one of the consumer's secret files: the provider hides a stored value wherever it reads
+            // it back, and a value such as `true` would hide the ACL's own mark, so no later reconcile could apply.
+            for (key, pattern) in template.env.iter().filter(|(key, _)| names.contains(key)) {
                 if let Some(value) = service::render(
                     pattern,
                     &consumer.name,
