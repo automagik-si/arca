@@ -3942,6 +3942,9 @@ fn credential_patterns() -> &'static [(regex::Regex, &'static str)] {
             (r#"(?i)\b((?:access_|refresh_|id_|auth_)?token|api[_-]?key|apikey|auth[_-]?key|client_secret|secret|passw(?:or)?d)=[^\s&"'<>]+"#, "$1=[secret]"),
             (r#"(?i)(authorization["']?\s*[:=]\s*["']?)(?:(?:bearer|basic|token)\s+)?[^\s"',]+"#, "$1[secret]"),
             (r#"(?i)\b(bearer)\s+[A-Za-z0-9._~+/-]{16,}=*"#, "$1 [secret]"),
+            // Repository installation tokens are minted in memory, never stored secret references.
+            // Covers both opaque and stateless GitHub installation-token formats.
+            (r"\bghs_[A-Za-z0-9_.-]+", "[secret]"),
             (r"\btskey-[A-Za-z0-9-]*", "[secret]"),
             (r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:@/?#]*):[^\s@/?#]+@", "$1:[secret]@"),
             (r"\bomni_sk_[A-Za-z0-9*]+", "[secret]"),
