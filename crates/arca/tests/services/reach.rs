@@ -354,6 +354,170 @@ fn logs_hide_login_split_by_carriage_return() {
     assert_split_login_hidden("visit https://login.tailscale.com/a/synthetic\r123\n");
 }
 
+fn privacy_log_lines(rig: &Rig, name: &str, raw: &str) -> Vec<String> {
+    rig.fake.set_console_log(PROJECT, name, raw);
+    rig.call("service_logs", json!({"name":name})).unwrap()["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn privacy_non_connector_lines(raw: &str) -> Vec<String> {
+    let hidden = arca::service::values_to_hide(&[]);
+    arca::service::redact_blocks(raw)
+        .split(['\n', '\r'])
+        .map(arca::service::clean_log)
+        .filter(|line| !line.is_empty())
+        .map(|line| arca::service::redact_hidden(&line, &hidden))
+        .collect()
+}
+
+fn privacy_cases(cases: &[(&str, String)], id: &str, placeholder: bool) {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let mut failures = Vec::new();
+    for (label, raw) in cases {
+        let lines = privacy_log_lines(&rig, "node-ts", raw);
+        if lines.concat().contains(id)
+            || (placeholder && !lines.concat().contains("[sign-in link]"))
+        {
+            failures.push(format!("{label}: {lines:?}"));
+        }
+        assert_eq!(
+            privacy_log_lines(&rig, "edge", raw),
+            privacy_non_connector_lines(raw),
+            "{label}"
+        );
+    }
+    assert_private(&rig, id);
+    assert!(
+        failures.is_empty(),
+        "{} of {} rows failed: {}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn logs_privacy_terminal_wrappers() {
+    let id = "syntheticTerminal1234";
+    let url = format!("https://login.tailscale.com/a/{id}");
+    privacy_cases(
+        &[
+            (
+                "osc",
+                format!("visit \u{1b}]8;;{url}\u{1b}\\{url}\u{1b}]8;;\u{1b}\\\n"),
+            ),
+            ("bare", format!("visit \u{1b}{url}\n")),
+            ("csi", format!("visit \u{1b}[1;32{url}\u{1b}[0m\n")),
+        ],
+        id,
+        true,
+    );
+}
+
+#[test]
+fn logs_privacy_host_and_scheme_views() {
+    let id = "syntheticHost1234";
+    privacy_cases(
+        &[
+            (
+                "host",
+                format!("visit https://\u{1b}login.tailscale.com/a/{id}\n"),
+            ),
+            ("scheme-less", format!("visit login.tailscale.com/a/{id}\n")),
+        ],
+        id,
+        false,
+    );
+}
+
+#[test]
+fn logs_privacy_whitespace_after_path() {
+    let id = "syntheticSpace1234";
+    privacy_cases(
+        &["\n", " ", "\t", "\r"].map(|space| {
+            (
+                space,
+                format!("visit https://login.tailscale.com/a/{space}{id}\n"),
+            )
+        }),
+        id,
+        false,
+    );
+}
+
+#[test]
+fn logs_privacy_every_link_offset() {
+    let id = "syntheticSweep1234";
+    let url = format!("https://login.tailscale.com/a/{id}");
+    let inserts = [
+        "\u{1b}",
+        "\u{1b}[",
+        "\u{1b}]8;;",
+        "\u{1b}[1;32",
+        "\0",
+        "\r",
+        "\u{7}",
+    ];
+    let mut cases = Vec::new();
+    for offset in 0..=url.len() {
+        for insert in inserts {
+            cases.push((
+                format!("offset={offset} insert={insert:?}"),
+                format!("visit {}{insert}{}\n", &url[..offset], &url[offset..]),
+            ));
+        }
+    }
+    println!("privacy sweep rows={}", cases.len());
+    privacy_cases(
+        &cases
+            .iter()
+            .map(|(label, raw)| (label.as_str(), raw.clone()))
+            .collect::<Vec<_>>(),
+        id,
+        false,
+    );
+}
+
+#[test]
+fn logs_privacy_two_inserts() {
+    let id = "syntheticDouble1234";
+    privacy_cases(
+        &[(
+            "host and identifier",
+            "visit https://\u{1b}login.tailscale.com/a/synthetic\0Double1234\n".into(),
+        )],
+        id,
+        false,
+    );
+}
+
+#[test]
+fn logs_privacy_ordinary_output_and_short_identifiers() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let raw = "To authenticate, visit:\n\thttps://login.tailscale.com/a/syntheticPlain1234\nlogin.tailscale.com/admin/machines\ngo on and stay up\nhttps://login.tailscale.com/a/go\ngo on\n";
+    assert_eq!(
+        privacy_log_lines(&rig, "node-ts", raw),
+        [
+            "To authenticate, visit:",
+            "[sign-in link]",
+            "login.tailscale.com/admin/machines",
+            "go on and stay up",
+            "[sign-in link]",
+            "go on"
+        ]
+    );
+    assert_eq!(
+        privacy_log_lines(&rig, "edge", raw),
+        privacy_non_connector_lines(raw)
+    );
+}
+
 #[test]
 fn unreadable_running_connector_status_is_unknown() {
     let (rig, key) = rig();
