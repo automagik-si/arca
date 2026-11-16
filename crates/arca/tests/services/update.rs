@@ -10,6 +10,41 @@ mod with_template;
 
 const NEW: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
+#[test]
+fn container_options_update_and_rollback_preserve_the_recorded_nic_and_root() {
+    for healthy in [true, false] {
+        let up = Arc::new(AtomicBool::new(healthy));
+        let rig = bare_node(&up, None);
+        let mut template = app_template();
+        template["portIsolation"] = json!(true);
+        template["rootSize"] = json!("30GiB");
+        rig.template("app", template);
+        rig.call(
+            "service_create",
+            json!({ "name": "app", "template": "app" }),
+        )
+        .expect("create");
+        let before = instance(&rig)["devices"].clone();
+        assert_eq!(before["eth0"]["security.port_isolation"], "true");
+        assert_eq!(before["root"]["size"], "30GiB");
+        // An image-only update keeps the record even if the installed template changes.
+        rig.template("app", app_template());
+        let result = update(
+            &rig,
+            json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+        );
+        if healthy {
+            assert_eq!(result.expect("updated")["updated"], true);
+        } else {
+            assert_eq!(refusal_words(result).0, "rolled_back");
+        }
+        assert_eq!(instance(&rig)["devices"], before);
+        let record = serde_json::to_value(rig.service_config("app")).unwrap();
+        assert_eq!(record["portIsolation"], true);
+        assert_eq!(record["rootSize"], "30GiB");
+    }
+}
+
 fn app_template() -> Value {
     json!({
         "name": "app",

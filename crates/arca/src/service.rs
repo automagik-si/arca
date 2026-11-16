@@ -3116,6 +3116,70 @@ mod tests {
     }
 
     #[test]
+    fn container_options_leave_default_bodies_and_records_unchanged() {
+        let value = json!({
+            "name": "app", "template": "app", "instance": "app", "ipv4": "192.0.2.10",
+            "ports": [8080], "created": 0, "source": { "type": "image", "alias": "app" },
+            "pool": "default", "project": PROJECT, "bridge": BRIDGE, "gateway": "192.0.2.1"
+        });
+        for tenant in [
+            None,
+            Some(json!({ "id": "aaaaaaaa", "block": "192.0.2.248/29" })),
+        ] {
+            let mut value = value.clone();
+            if let Some(tenant) = tenant {
+                value["tenant"] = tenant;
+            }
+            let old: ServiceConfig = serde_json::from_value(value.clone()).unwrap();
+            let before = create_body(&old);
+            assert_eq!(
+                before["devices"]["eth0"]["security.port_isolation"],
+                "false"
+            );
+            if old.tenant.is_some() {
+                assert_eq!(before["devices"]["root"]["size"], "16GiB");
+            } else {
+                assert!(before["devices"]["root"].get("size").is_none());
+            }
+            let saved = serde_json::to_value(&old).unwrap();
+            assert!(saved.get("rootSize").is_none());
+            assert!(saved.get("portIsolation").is_none());
+            value["portIsolation"] = json!(false);
+            let explicit: ServiceConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(create_body(&explicit), before);
+            assert_eq!(serde_json::to_value(explicit).unwrap(), saved);
+            value["rootSize"] = json!("30GiB");
+            value["portIsolation"] = json!(true);
+            let custom: ServiceConfig = serde_json::from_value(value).unwrap();
+            let mut expected = before;
+            expected["devices"]["root"]["size"] = json!("30GiB");
+            expected["devices"]["eth0"]["security.port_isolation"] = json!("true");
+            assert_eq!(create_body(&custom), expected);
+        }
+    }
+
+    #[test]
+    fn container_options_root_size_is_validated_for_both_container_kinds() {
+        let dir = Path::new(".");
+        for (kind, image) in [
+            ("oci", "registry.example/app"),
+            ("system", "images:alpine/3.20"),
+        ] {
+            let mut value = json!({ "name": "app", "kind": kind, "image": image,
+                "digest": format!("sha256:{}", "a".repeat(64)), "rootSize": "30GiB" });
+            let template = |value| serde_json::from_value::<Template>(value).unwrap();
+            assert!(validate_template(&template(value.clone()), dir).is_ok());
+            for size in ["0GiB", "bad", "-1GiB"] {
+                value["rootSize"] = json!(size);
+                assert!(
+                    validate_template(&template(value.clone()), dir).is_err(),
+                    "{kind}: {size}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_image_of_a_template_is_what_boots_and_then_the_version_a_machine_runs() {
         let template =
             |value: Value| -> Template { serde_json::from_value(value).expect("a template") };

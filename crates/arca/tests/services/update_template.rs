@@ -2,6 +2,39 @@
 //! owner card and one restart, and a rollback puts back both. Every value is synthetic.
 use super::*;
 
+#[test]
+fn container_options_template_update_and_rollback_keep_the_creation_settings() {
+    for healthy in [true, false] {
+        let key = common::SkKey::from_seed(81);
+        let up = Arc::new(AtomicBool::new(healthy));
+        let rig = bare_node(&up, Some(&key));
+        let mut template = first();
+        template["portIsolation"] = json!(true);
+        template["rootSize"] = json!("30GiB");
+        rig.template("app", template);
+        rig.call(
+            "service_create",
+            json!({ "name": "app", "template": "app" }),
+        )
+        .expect("created");
+        let devices = instance(&rig)["devices"].clone();
+        assert_eq!(devices["eth0"]["security.port_isolation"], "true");
+        assert_eq!(devices["root"]["size"], "30GiB");
+        rig.template("app", second());
+        let proposed = propose_update(&rig, with_template()).expect("proposed");
+        let result = approve(&rig, &key, &proposed);
+        if healthy {
+            result.expect("updated");
+        } else {
+            assert_eq!(refusal_words(result).0, "rolled_back");
+        }
+        assert_eq!(instance(&rig)["devices"], devices);
+        let record = serde_json::to_value(rig.service_config("app")).unwrap();
+        assert_eq!(record["portIsolation"], true);
+        assert_eq!(record["rootSize"], "30GiB");
+    }
+}
+
 /// The shell-form start command of the second template, quotes and `$HOME` in it, as an operator writes it.
 const SHELL_SCRIPT: &str =
     "unset APP_PATH; cd \"$HOME\"; exec /opt/app/bin/app serve --no-active-app --port 8080";
