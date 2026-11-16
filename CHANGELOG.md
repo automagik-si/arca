@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+`service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
+rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
+uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents
+the rollback or changes its result.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows

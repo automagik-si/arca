@@ -873,6 +873,16 @@ images and vendored npm lockfile. Five of them, `workspace-vm`, `github-runner-p
 virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners", "A pool
 of GitLab runners" and "An Automagik workspace in its own virtual machine").
 
+`service_labels_set {tenant?, name, labels}` lets a doctor merge plain caller data onto a service; labels are never
+secrets or policy, and do not change boot behavior. A string sets a value (including an empty string), and null removes
+a key. Bounds apply after merging: 128 bytes per key, 4096 bytes per value, 128 keys and 65536 bytes of compact JSON.
+The full map is returned and appears as `labels` in `service_status` and `service_list`, empty when none is stored.
+Label writes check ownership and If-Match, read the instance back, and are not journalled. Result `code: unconfirmed`
+means the PATCH answer was uncertain: the returned map is what was read, and the write may still land later; read
+status again before deciding what to do. If read-back is unavailable, `labels_unconfirmed` reports that uncertainty.
+Adopted and imported services show existing labels but take no label write. Snapshot rollback keeps labels best effort;
+a label read or repair failure is logged without values and never prevents an otherwise successful rollback.
+
 **Templates an earlier release installed.** A release may change a shipped template: up to 0.12.0, for one, the
 shipped `postgres-autopg` template declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped
 until a `doctor` token set the secret. A node keeps no such template by accident. `arca templates install`, which
