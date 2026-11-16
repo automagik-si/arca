@@ -6127,7 +6127,10 @@ What to know:
   the server's and the gate's containers: HTTP 401 on the loopback port, the answer to a visitor who has not signed
   in. A part that stops is started again after a pause that doubles up to five minutes. A tunnel that keeps
   stopping usually has a token Cloudflare does not accept. When the server's container is replaced, the gate and
-  the connector are started again beside it, since they live in its network namespace. When Docker itself does not
+  the connector are started again beside it, since they live in its network namespace. So are they when Docker
+  starts the server again in place (`docker restart automagik-server`): the server then has a new namespace, and a
+  gate left in the old one would stay healthy on its own loopback while it reaches nothing (HTTP 502, "DSH
+  unavailable"). The keeper compares the namespaces themselves, from `/proc`, at every look. When Docker itself does not
   answer, the keeper says so and touches nothing: a container is only removed or started once Docker has said that
   it stopped or is not there. A keeper that cannot start at all (a missing command, settings that cannot be used)
   stays up and repeats the reason every five minutes.
