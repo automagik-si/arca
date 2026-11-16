@@ -9,10 +9,10 @@ Write under this comment only what a reader needs beyond those lines; the releas
 
 The approval page approves every card in one sitting. It reads what is waiting again every minute while it is in view
 and when it comes back into view (never under a card being approved), so a card's ten-minute statement no longer goes
-stale on an open page, and a card proposed after the page loaded shows up by itself. Its own readings never move a card:
+stale on an open page, and a card proposed after the page loaded shows up by itself. Its own readings, and the reading after a refused tap, never move a card:
 plans and the assistant's requests stand in one list, a new card of any kind goes after every card drawn, a card that
-stopped waiting leaves a placeholder of its height, and open Details stay open. The owner's own approval or decline
-closes up the cards below it. For a second after the cards changed, a tap on them, the connected apps or the passkey
+stopped waiting leaves a placeholder of its height, and open Details stay open. The owner's own approval or decline (or
+a passkey registered or removed) closes up the cards below. For a second after the cards changed, a tap on them, the connected apps or the passkey
 list does nothing, and the keyboard focus comes back after. A card refused `Expired` anyway is
 renewed and asks for one more tap. Each card's passkey challenge is computed when the list loads, so a tap goes straight
 to the passkey prompt; in Safari a later tap could bring no prompt at all before. What went wrong with a card is said on

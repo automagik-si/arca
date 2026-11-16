@@ -1054,12 +1054,17 @@ function holdTaps() {
     for (const list of lists) list.inert = false;
     const back = heldFocus;
     heldFocus = null;
-    if (back && back.isConnected && !back.disabled) back.focus({ preventScroll: true });
+    // Only when the focus is still lost: if the owner put it somewhere during the hold, it stays there.
+    const lost = !document.activeElement || document.activeElement === document.body;
+    if (back && lost && back.isConnected && !back.disabled) back.focus({ preventScroll: true });
   }, HOLD_MS);
 }
 
 // Reads what is waiting and draws it. Every card gets its challenge now, so a tap goes straight to the passkey. A quiet
-// read (the page's own refresh) leaves the list and the status line as they were when it fails.
+// read (the page's own refresh) leaves the list and the status line as they were when it fails. `quiet` is true for the
+// page's own refresh, which never draws under a tap in progress, or "keep" for a reading after a refused tap, which draws
+// even then: neither takes a card away (a card no longer listed stays a placeholder), so the card the owner is asked to
+// tap again stays where it is.
 async function loadPlans(quiet) {
   const target = document.getElementById("plans");
   const mine = ++listing;
@@ -1074,7 +1079,7 @@ async function loadPlans(quiet) {
       try { card.challenge = await challengeOf(card.statement); } catch { /* computed at the tap instead */ }
     }));
     // A refresh that a tap overtook draws nothing: the card being approved keeps its place and its disabled button.
-    if (mine !== listing || (quiet && busy)) return;
+    if (mine !== listing || (quiet === true && busy)) return;
     // Taps are held only once the list was drawn: the first drawing moves nothing a finger was aimed at.
     const before = listShown;
     showTrusted(body.passkeysTrusted || 0);
@@ -1111,6 +1116,8 @@ async function loadPlans(quiet) {
     card.append(retry);
     drawnPlans.length = 0;
     target.replaceChildren(card);
+    // The notice moved what is below it: the next drawing holds taps.
+    listShown = true;
     fail(error);
   }
 }
@@ -1361,14 +1368,14 @@ async function approve(plan, button) {
       const again = "This card had been open too long, so Arca renewed it. Tap Approve again.";
       noteCard(plan, card, again, "warn");
       status(again, "warn");
-      await loadPlans();
+      await loadPlans("keep");
       return;
     }
     const said = error && error.refusal === "LinkToken" ? error.message : plain(error);
     fail(error && error.refusal === "LinkToken" ? new Error(said) : error, true);
     noteCard(plan, card, said, error && error.name === "NotAllowedError" ? "warn" : "bad");
     // A machine that did not answer may still have run it: what is waiting is read again.
-    if (error && error.refusal === "Unreachable") await loadPlans();
+    if (error && error.refusal === "Unreachable") await loadPlans("keep");
   } finally {
     busy--;
   }
@@ -1463,7 +1470,7 @@ loadPasskeys().catch(fail);
 // Opening the page syncs this host's passkey list with the machines that keep it, so a changed list shows its card now.
 fetch("/approve/peer-keys/sync", { method: "POST" })
   .then((answer) => (answer.ok ? answer.json() : null))
-  .then((body) => { if (body && Array.isArray(body.peerKeys) && body.peerKeys.length) loadPlans(); })
+  .then((body) => { if (body && Array.isArray(body.peerKeys) && body.peerKeys.length) loadPlans("keep"); })
   .catch(() => {});
 </script>
 </body>

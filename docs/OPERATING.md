@@ -3913,8 +3913,10 @@ to tap. Every card waits in one list: the delete plans, the actions, a linked ma
 assistant made (each with its own badge). A card still waiting keeps its place and its open Details, and its next tap
 signs the statement just read for it. A new card of any kind goes after every card already drawn, wherever the server
 lists it. A card that stopped waiting while the page was open (it lapsed, or was approved or declined somewhere else)
-leaves a placeholder of its height. The owner's own approval or decline does move cards: it takes the placeholders and
-that card away, and the cards below close up. For a second after any reading that changed what is drawn (from "Nothing to
+leaves a placeholder of its height. The reading after a refused tap (`Expired`, which asks for one more tap, or
+`Unreachable`) takes nothing away either, so the card the owner is asked to tap again stays where it is. The owner's own
+approval or decline, and registering or removing a passkey, do move cards: they take the placeholders (and the approved
+or declined card) away, and the cards below close up. For a second after any reading that changed what is drawn (from "Nothing to
 approve" too), the cards, the connected apps and the passkey list take no tap, so a tap aimed at what stood there before
 does nothing. A button that had the keyboard focus gets it back when that second ends.
 

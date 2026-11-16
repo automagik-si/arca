@@ -1261,13 +1261,30 @@ fn two_approvals_in_one_page_load_both_reach_the_server_and_a_later_card_shows_u
         "one page load, and each tap reached the passkey before its click handler returned"
     );
 
-    // A card proposed after the page loaded shows up by itself within one refresh (60 s), with no reload.
+    // A card proposed after the page loaded shows up by itself within one refresh (60 s), with no reload. The list read
+    // "Nothing to approve" before it, and the card moved what is below the list: taps are held.
+    wait_for(
+        &mut chrome,
+        "!!document.querySelector('#plans .notice') && !document.getElementById('plans').inert",
+        "the list says nothing waits, and taps are let through",
+        WAIT,
+    );
+    chrome.eval(
+        "(() => { window.__held = []; for (const id of ['plans', 'passkeys']) { const list = document.getElementById(id); \
+         new MutationObserver(() => { if (list.inert && !window.__held.includes(id)) window.__held.push(id); }) \
+           .observe(list, { attributes: true, attributeFilter: ['inert'] }); } return true; })()",
+    );
     propose(3, "natsc");
     wait_for(
         &mut chrome,
         "window.__sameLoad === true && [...document.querySelectorAll('#plans article.action h3')].some((h) => h.textContent.includes('service natsc from'))",
         "the later card shows up within one refresh",
         Duration::from_secs(75),
+    );
+    assert_eq!(
+        chrome.eval("[...window.__held].sort()"),
+        json!(["passkeys", "plans"]),
+        "the first card after Nothing to approve held taps"
     );
 
     drop(chrome);
@@ -1285,6 +1302,9 @@ fn two_approvals_in_one_page_load_both_reach_the_server_and_a_later_card_shows_u
 /// - Review 2: a request an assistant made stands in the same list. A plan proposed after it goes after it, so a real tap
 ///   at the request's old place after the hold approves the request, never the plan. The keyboard focus comes back after
 ///   the hold, and the passkeys list below is held with the cards.
+/// - Review 3: a card refused `Expired` while the card above it stopped waiting. The reading after the refusal leaves a
+///   placeholder where the card above stood, so the card the page asks to tap again stays where it is, and a real tap at
+///   the same spot never approves the card below.
 #[test]
 #[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
 fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and_a_linked_decline_reaches_its_host()
@@ -1608,7 +1628,7 @@ fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and
         (at[0].as_f64().expect("x"), at[1].as_f64().expect("y"))
     };
     chrome.eval(&format!(
-        "{}.scrollIntoView({{ block: 'center' }}); window.scrollBy(0, 0); true",
+        "status(''); {}.scrollIntoView({{ block: 'center' }}); true",
         card("natsb")
     ));
     let before = place(&mut chrome, "natsb");
@@ -1860,6 +1880,106 @@ fn a_refresh_never_moves_a_card_under_the_tap_an_expired_card_asks_once_more_and
         &mut chrome,
         &format!("!!{}", card("natsf")),
         "the new plan still waits",
+    );
+
+    // 7. Three cards: natsh, natsi and natsj. natsi's next listing carries a statement past its ten minutes, and natsh is
+    //    declined on node1 while it is still drawn. A real tap on natsi is refused Expired; the reading after it leaves
+    //    a placeholder where natsh stood, so natsi stays where it was. The page has no scroll anchoring here, as in
+    //    Safari. A real tap at the same spot approves natsi or nothing, never natsj.
+    let natsh = propose(&socket1, &viewer1, 12, "natsh");
+    propose(&socket1, &viewer1, 13, "natsi");
+    propose(&socket1, &viewer1, 14, "natsj");
+    chrome.eval(
+        "document.documentElement.style.overflowAnchor = 'none'; document.body.style.overflowAnchor = 'none'; refreshPlans(); true",
+    );
+    wait_for(
+        &mut chrome,
+        &format!(
+            "!!{} && !document.getElementById('plans').inert",
+            card("natsj")
+        ),
+        "the three cards show up, and taps are let through",
+    );
+    chrome.eval(
+        "(() => { const listed = window.fetch; window.__ageName = 'natsi'; \
+         window.fetch = async (url, options) => { \
+           const answer = await listed(url, options); \
+           if (String(url) !== '/approve/plans' || !window.__ageName) return answer; \
+           const name = window.__ageName; window.__ageName = null; \
+           const body = await answer.json(); \
+           for (const plan of body.plans) if (String(plan.summary).includes('service ' + name + ' from')) { \
+             const statement = JSON.parse(plan.statement); \
+             const older = (stamp) => new Date(Date.parse(stamp) - 11 * 60000).toISOString(); \
+             statement.issuedAt = older(statement.issuedAt); statement.expiresAt = older(statement.expiresAt); \
+             plan.statement = JSON.stringify(statement); \
+           } \
+           return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }); \
+         }; \
+         return loadPlans(true).then(() => true); })()",
+    );
+    assert_eq!(chrome.eval("window.__ageName === null"), json!(true));
+    result(
+        &mcp(
+            &socket1,
+            &doctor1,
+            15,
+            "plan_decline",
+            json!({ "plan": natsh }),
+        ),
+        "plan_decline",
+    );
+    let approve_of = |name: &str| {
+        format!(
+            "(() => {{ const r = {}.querySelector('button.approve').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()",
+            card(name)
+        )
+    };
+    // The status line is cleared first: a change of its height moves every card.
+    chrome.eval(&format!(
+        "status(''); {}.scrollIntoView({{ block: 'center' }}); true",
+        card("natsi")
+    ));
+    let height = chrome
+        .eval(&format!("{}.getBoundingClientRect().height", card("natsh")))
+        .as_f64()
+        .expect("natsh's height");
+    let first = chrome.eval(&approve_of("natsi"));
+    let (x, y) = (first[0].as_f64().expect("x"), first[1].as_f64().expect("y"));
+    chrome.tap_at(x, y);
+    wait_for(
+        &mut chrome,
+        &format!(
+            "(() => {{ const c = {}; const note = c && c.querySelector('.card-note'); \
+               return !!note && note.textContent.includes('Tap Approve again') && !c.querySelector('button.approve').disabled \
+                 && !!c.previousElementSibling && c.previousElementSibling.matches('.card.gone') \
+                 && !document.getElementById('plans').inert; }})()",
+            card("natsi")
+        ),
+        "the Expired card asks for one more tap, natsh's place is a placeholder, and taps are let through",
+    );
+    let again = chrome.eval(&approve_of("natsi"));
+    let moved = (again[1].as_f64().expect("y") - y).abs();
+    assert!(
+        moved < height / 2.0,
+        "natsi stayed where the owner tapped it ({moved} px against a card of {height} px)"
+    );
+    assert!(
+        !instance_exists(&fake1, "natsi"),
+        "nothing ran on the stale statement"
+    );
+    // The owner taps again where they tapped before, with the page as it is (its status line asks for the tap).
+    let gets = chrome.eval("window.__gets");
+    chrome.tap_at(x, y);
+    thread::sleep(Duration::from_millis(1500));
+    if chrome.eval("window.__gets") == gets {
+        // The same spot hit no button (the status line grew): the owner taps the button where it now is.
+        chrome.tap_at(again[0].as_f64().expect("x"), again[1].as_f64().expect("y"));
+    }
+    chrome.status_ok("Approved. Done: create the service natsi ", &serve);
+    assert!(instance_exists(&fake1, "natsi"), "the renewed card ran");
+    assert!(
+        !instance_exists(&fake1, "natsj"),
+        "the card below was never approved"
     );
 
     assert_eq!(
