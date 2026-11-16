@@ -12,6 +12,7 @@ pub fn postgres_file_of_0_12_0(name: &str) -> String {
         .expect("a shipped file");
     let before = match name {
         "postgres-autopg.json" => now
+            .replace(",\n  \"runTmpfs\": false", "")
             .replace(", which Arca makes at create and never shows", "")
             .replace("  \"generate\": { \"POSTGRES_PASSWORD\": \"\" },\n", "")
             .replace(

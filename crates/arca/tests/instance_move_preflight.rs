@@ -1195,7 +1195,7 @@ fn a_virtual_machines_block_disk_is_sized_from_incus_and_counted_whole() {
         let rig = Rig::new(source, target);
         if let Some(pool_size) = pool_size {
             rig.source
-                .set_pool_config("default", json!({ "volume.size": pool_size }));
+                .set_pool_config("default", "volume.size", pool_size);
         }
         let answer = rig.preflight(&["db"]);
         let size_check = check(&answer["rows"][0], "size");

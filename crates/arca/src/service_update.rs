@@ -383,6 +383,27 @@ pub(super) fn state_changer_for(
     Ok(changer)
 }
 
+/// Why a service that keeps `/run` in memory has it on its disk, as its answer says it.
+pub(super) const RUN_ON_DISK: &str = "/run stays on the container's disk, as its image has it: an entry there is not root's (a directory a non-root image keeps for its own user, which it needs), or Arca could not remove what the image keeps there, and Incus mounts a memory /run only on an empty one. A secret staged under /run touches the disk";
+
+/// Says in the answer of a service that keeps `/run` in memory where its container's `/run` is, read from Incus:
+/// `run: "memory"` (for a stopped one, from its next start), or `run: "disk"` with `runNote` saying why, or
+/// `run: "unknown"` when it could not be read.
+pub(super) fn say_run(cfg: &NodeConfig, config: &ServiceConfig, answer: &mut Value) {
+    let place = state_changer_for(cfg, config).ok().and_then(|changer| {
+        let seen = changer.read(&config.project, &config.instance).ok()?;
+        changer.run_in_memory(&seen).ok()
+    });
+    match place {
+        Some(true) => answer["run"] = json!("memory"),
+        Some(false) => {
+            answer["run"] = json!("disk");
+            answer["runNote"] = json!(RUN_ON_DISK);
+        }
+        None => answer["run"] = json!("unknown"),
+    }
+}
+
 /// Where the service's template declares a data volume while its instance has no `data` device: the path its data is
 /// kept at inside the container, which a rebuild of the root erases. The template is read as the record kept it, then
 /// as installed on the node, then as this build ships it: an installed file that is stale, edited or half installed
@@ -1283,7 +1304,7 @@ impl Run<'_> {
                 let Some(template) = self.template else {
                     self.journal
                         .step("end", true, json!({ "digest": self.digest }));
-                    return Ok(json!({
+                    let mut answer = json!({
                         "updated": true,
                         "service": name,
                         "digest": self.digest,
@@ -1292,12 +1313,16 @@ impl Run<'_> {
                             "service {name} runs {} and its port {} answered",
                             self.digest, self.port,
                         ),
-                    }));
+                    });
+                    if self.config.run_tmpfs {
+                        say_run(&self.handler.cfg, self.config, &mut answer);
+                    }
+                    return Ok(answer);
                 };
                 let differs = self.read_back(template);
                 self.journal
                     .step("end", differs.is_empty(), json!({ "digest": self.digest }));
-                return Ok(json!({
+                let mut answer = json!({
                     "updated": true,
                     "service": name,
                     "digest": self.digest,
@@ -1314,7 +1339,15 @@ impl Run<'_> {
                             format!("its config read back differs at {}: service_status shows how it is", differs.join(", "))
                         },
                     ),
-                }));
+                });
+                let record = template
+                    .ready
+                    .as_ref()
+                    .map_or(self.config, |ready| &ready.next);
+                if record.run_tmpfs {
+                    say_run(&self.handler.cfg, record, &mut answer);
+                }
+                return Ok(answer);
             }
             Err(failure) => failure,
         };
@@ -1440,6 +1473,25 @@ impl Run<'_> {
         }
     }
 
+    /// A service that keeps `/run` in memory has just been given a root (an image's, or its snapshot's), which may keep
+    /// files under `/run`: they are removed while the instance is stopped, so its start mounts a memory `/run`. A
+    /// removal Incus does not take is journalled and the update goes on, with `/run` on the disk as before.
+    /// `memory` is whether the record the instance starts with says so: the template's, when this update writes it, so
+    /// a service whose template now keeps `/run` in memory has it from the one start, as a reconfigure gives it.
+    fn run_emptied(&self, instance: &InstanceState, memory: bool) {
+        if memory {
+            let emptied = self.changer.empty_run(instance);
+            self.journal.step(
+                "empty /run",
+                emptied.is_ok(),
+                match emptied {
+                    Ok(removed) => json!({ "removed": removed }),
+                    Err(error) => json!({ "why": incus_words(&error) }),
+                },
+            );
+        }
+    }
+
     fn started(&self, instance: &mut InstanceState) -> Result<(), Failure> {
         self.changer
             .change(instance, StateAction::Start)
@@ -1504,7 +1556,9 @@ impl Run<'_> {
         self.journal
             .step("rebuild", true, json!({ "digest": self.digest }));
         self.edge_root();
+        // The template's record goes in first: whether `/run` is memory from this start is what it says.
         self.apply_template()?;
+        self.run_emptied(instance, self.memory_run());
         self.started(instance)?;
         self.journal.step("start", true, json!({}));
         self.healthy()?;
@@ -1659,11 +1713,13 @@ impl Run<'_> {
                     .map_err(|error| Failure::of("restore", &error))?;
                 self.journal
                     .step("restore", true, json!({ "snapshot": snapshot }));
+                self.run_emptied(instance, self.config.run_tmpfs);
             }
             Back::OldImage => match self.rebuild_from(instance, &self.config.source) {
                 Ok(()) => {
                     self.journal.step("rebuild back", true, json!({}));
                     self.edge_root();
+                    self.run_emptied(instance, self.config.run_tmpfs);
                 }
                 Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
                     root_kept = true;
@@ -1720,6 +1776,14 @@ impl Run<'_> {
                 ))
             }
         }
+    }
+
+    /// Whether the instance keeps `/run` in memory from the start this update gives it: as the template's record says
+    /// when this update writes one, else as the service's record does.
+    fn memory_run(&self) -> bool {
+        self.template
+            .and_then(|step| step.ready.as_ref())
+            .map_or(self.config.run_tmpfs, |ready| ready.next.run_tmpfs)
     }
 
     /// Puts the old record back when the template's was written: `None` when there was nothing to put back, else whether

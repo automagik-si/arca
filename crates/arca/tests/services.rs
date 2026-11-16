@@ -443,14 +443,19 @@ fn service_create_list_status_round_trip() {
     assert_eq!(created["links"], json!([]));
     assert_eq!(created["published"], Value::Null);
     assert_eq!(created["lanPort"], Value::Null);
+    assert_eq!(created["run"], "memory");
     let listed = rig.call("service_list", json!({})).expect("list");
-    assert_eq!(listed["services"], json!([created]));
+    let mut row = created.clone();
+    row.as_object_mut()
+        .expect("the create's answer")
+        .remove("run");
+    assert_eq!(listed["services"], json!([row]));
     let status = rig
         .call("service_status", json!({"name":"nats"}))
         .expect("status");
     // The status is the create's view, with the version the service runs beside the one its template names: the
     // same here, so the listing above carries no such key.
-    let mut expected = created.clone();
+    let mut expected = row.clone();
     let pin = format!("docker.io/library/nats@{DIGEST}");
     expected["update"] = json!({ "pin": pin, "templatePin": pin, "state": "same" });
     assert_eq!(status, expected);
@@ -650,6 +655,7 @@ fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
     let kernel = rig.kernel.lock().expect("kernel");
     let seq = kernel.applied_seq().expect("applied sequence");
     let status = Arc::new(StatusHandler {
+        update: None,
         node: "node1".into(),
         mode: "kernel",
         applied_seq: kernel.applied_seq_reader(),
@@ -745,6 +751,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         kernel_access: None,
         no_new_privileges: false,
         raw_lxc: Vec::new(),
+        run_tmpfs: true,
         edge: false,
         update: None,
     }
@@ -955,7 +962,7 @@ fn service_create_puts_each_service_in_the_project_with_desired_service_nic_its_
         .expect("create");
     assert_eq!(
         created,
-        json!({"name":"nats","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[4222],"links":[],"published":null,"lanPort":null})
+        json!({"name":"nats","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[4222],"links":[],"published":null,"lanPort":null,"run":"memory"})
     );
     let instance = rig
         .get(&format!("/1.0/instances/nats?project={PROJECT}"))
@@ -3331,6 +3338,8 @@ mod private_port;
 mod reconfigure;
 #[path = "services/routes.rs"]
 mod routes;
+#[path = "services/run_tmpfs.rs"]
+mod run_tmpfs;
 #[path = "services/tunnel.rs"]
 mod tunnel;
 #[path = "services/update.rs"]
@@ -3435,10 +3444,16 @@ fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
 const AUTOMAGIK_3_136_4: &str =
     "sha256:49e997e36dc35b79b704fac45f2f14cc07cbe7cf3c943e0a5ceebb5a4c1d5dcc";
 
-/// A new Automagik starts from Automagik's own published image, pulled by its digest: the server template and the
-/// workspace's server name the same release, and neither names an image built on the node.
+/// Automagik's published release 3.146.5 (tag v3.146.5, commit 393254f; its release record, server-image.json, names
+/// this digest): the image a new workspace starts from.
+const AUTOMAGIK_3_146_5: &str =
+    "sha256:cc804cb0c3a60219e4db57d309d8029e2b47c3450fdb7c435eabfe98a568a8dd";
+
+/// A new Automagik starts from Automagik's own published image, pulled by its digest: the server template names
+/// release 3.136.4, the workspace's server release 3.146.5 from the same repository, and neither names an image built
+/// on the node.
 #[test]
-fn the_server_and_the_workspace_pin_automagiks_published_release_by_one_digest() {
+fn the_server_and_the_workspace_pin_automagiks_published_releases_by_digest() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let server = service::load_template(&dir, "automagik-server").unwrap();
     assert_eq!(server.digest.as_deref(), Some(AUTOMAGIK_3_136_4));
@@ -3455,7 +3470,7 @@ fn the_server_and_the_workspace_pin_automagiks_published_release_by_one_digest()
     let workspace = service::load_template(&dir, "automagik-workspace").unwrap();
     assert_eq!(
         workspace.settings.as_ref().unwrap()["serverImage"],
-        format!("{}@{AUTOMAGIK_3_136_4}", server.image)
+        format!("{}@{AUTOMAGIK_3_146_5}", server.image)
     );
     assert!(
         server

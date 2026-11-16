@@ -141,6 +141,7 @@ fn the_status_exposes_the_chosen_mode_and_reason() {
     let fake = fake(&scratch, "another-host");
     let (_, choice) = new_sampler(&config(fake.socket(), None));
     let status = StatusHandler {
+        update: None,
         node: "node1".to_string(),
         mode: "watch-only",
         applied_seq: AppliedSeq::default(),

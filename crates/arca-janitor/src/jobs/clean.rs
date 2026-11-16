@@ -262,6 +262,19 @@ pub fn check(item: &Item, env: &Env) -> Result<(), String> {
     check_with(item, env, true)
 }
 
+/// The reason a check gives when the job stopped (cancel or budget) before the check was done. Callers turn it into
+/// the job's stop, never into a skip.
+pub const STOPPED: &str = "the job stopped before this check was done";
+
+/// `check`, with a stop of the job during it (cancel or budget) returned as that stop, never as a refusal.
+pub fn check_or_stop(item: &Item, env: &Env) -> Result<Result<(), String>, crate::jobs::Stop> {
+    let checked = check(item, env);
+    if checked.as_ref().is_err_and(|r| r == STOPPED) {
+        env.checkpoint()?;
+    }
+    Ok(checked)
+}
+
 /// Check an item now, with or without the guards that judge recency (`Guard::is_recency`).
 pub fn check_with(item: &Item, env: &Env, recency: bool) -> Result<(), String> {
     if let Some(path) = item.action.path() {
@@ -353,11 +366,11 @@ pub fn check_with(item: &Item, env: &Env, recency: bool) -> Result<(), String> {
                     return Err(format!("{program} is not installed"));
                 }
             }
-            Guard::NoUnsavedGit => {
-                if let Some(why) = crate::git::unsaved_work(path, mounts) {
-                    return Err(why);
-                }
-            }
+            Guard::NoUnsavedGit => match crate::git::unsaved_work(path, mounts, env.ctx) {
+                Ok(None) => {}
+                Ok(Some(why)) => return Err(why),
+                Err(_) => return Err(STOPPED.to_string()),
+            },
         }
     }
     Ok(())
@@ -409,7 +422,7 @@ pub fn make_plan(
         }
         for mut item in found.items {
             env.checkpoint()?;
-            match check(&item, &env) {
+            match check_or_stop(&item, &env)? {
                 Ok(()) => {
                     item.id = plan.items.len();
                     if matches!(item.action, Action::Quarantine { .. }) {
@@ -806,7 +819,14 @@ pub fn apply_plan_with(
             result.stopped = Some(stop_reason(stop));
             return Ok(result);
         }
-        match check(item, &env) {
+        let checked = check(item, &env);
+        if checked.as_ref().is_err_and(|r| r == STOPPED)
+            && let Err(stop) = env.checkpoint()
+        {
+            result.stopped = Some(stop_reason(stop));
+            return Ok(result);
+        }
+        match checked {
             Ok(()) => passed.push(item),
             Err(reason) => result.skipped.push(Skip {
                 category: item.category.clone(),
@@ -846,6 +866,12 @@ pub fn apply_plan_with(
                 .refresh_live(platform::live(env.uid()), platform::mount_points());
         }
         if let Err(reason) = check_with(item, &env, false) {
+            if reason == STOPPED
+                && let Err(stop) = env.checkpoint()
+            {
+                result.stopped = Some(stop_reason(stop));
+                break;
+            }
             result.skipped.push(Skip {
                 category: item.category.clone(),
                 label: item.action.label(),

@@ -64,6 +64,11 @@ to run their services.
 - **It ends with the node's own answer** to `arca_status`: the mode (`watch-only`), where the token's file is (never the
   token), and the two ways to connect an assistant from step 4 below, with the one line that adds the node to Claude
   Code and one line that says where the cautions are (`arca status --security`). Exit code 0 means the node runs, answered, and reaches Incus.
+- **It looks for updates by itself.** The node looks for a newer release every six hours. It installs one by itself
+  once Arca's releases are signed, with the same checks, the same templates step and a rollback when it does not come
+  back (see ["Keeping Arca up to date: the kernel update"](OPERATING.md#keeping-arca-up-to-date-the-kernel-update)).
+  Releases are not signed yet: until they are, `arca_status` says which release is available, and a second run of the
+  installer installs it.
 - **A second run** replaces the program in place and restarts the service. Where the node already has service
   templates (it ran `arca init`), the run also brings them up to the release: a template that is an earlier
   release's own file is replaced and named, and one you edited is kept and named, with the command that replaces it. `sh install.sh --uninstall` removes the

@@ -26,7 +26,7 @@ use arca_kernel::identity::NodeKey;
 use arca_mcp::{CallError, Caller, ToolHandler};
 use arca_providers::incus::{Family, IncusProvider};
 use arca_reconcile::PluginSet;
-use arca_vmimport::Runner;
+use arca_vmimport::{PipeFailure, Runner};
 use common::{HOST, NOW, Scratch, SkKey, approve_statement, verifier_for};
 use serde_json::{Value, json};
 
@@ -622,7 +622,7 @@ impl Runner for CephFake {
         }
     }
 
-    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String> {
+    fn pipe(&self, first: &[String], second: &[String]) -> Result<(), PipeFailure> {
         if let Some(hook) = self.during_copy.lock().unwrap().take() {
             hook();
         }
@@ -630,7 +630,7 @@ impl Runner for CephFake {
         calls.push(first.to_vec());
         calls.push(second.to_vec());
         match self.fail_copy.lock().unwrap().clone() {
-            Some(message) => Err(message),
+            Some(message) => Err(PipeFailure::writer(message)),
             None => Ok(()),
         }
     }
@@ -679,14 +679,9 @@ fn vm_with_volume() -> Value {
 fn ceph_pools(rig: &Rig, here: &str, there: &str) {
     for (fake, cluster) in [(&rig.source, here), (&rig.target, there)] {
         fake.set_pool_driver("default", "ceph");
-        fake.set_pool_config(
-            "default",
-            json!({
-                "ceph.cluster_name": "ceph",
-                "ceph.osd.pool_name": format!("incus-{cluster}"),
-                "ceph.user.name": format!("incus-{cluster}"),
-            }),
-        );
+        fake.set_pool_config("default", "ceph.cluster_name", "ceph");
+        fake.set_pool_config("default", "ceph.osd.pool_name", &format!("incus-{cluster}"));
+        fake.set_pool_config("default", "ceph.user.name", &format!("incus-{cluster}"));
     }
 }
 

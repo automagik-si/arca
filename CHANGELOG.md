@@ -24,6 +24,55 @@ disk's size, that the machine stays stopped, its own rollback promise, and for a
 and client; the finish card says the source's snapshots go with it. OPERATING.md ("Stopped virtual machines") says what
 a copy by Ceph needs on the node. Not yet run between two real Ceph clusters.
 
+## 0.32.0 (2026-11-16)
+
+`automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the
+gate. A `service_create` that gives a list is now refused (`expected a string`), since the template's default is text;
+a workspace made before with a list keeps working, as its own keeper reads it. It pins Automagik 3.146.5, and its
+keeper pulls the server's image only once the image's GitHub build provenance (repository `automagik-si/automagik`)
+verifies with cosign v3.1.4, pinned by version and sha256; an image that does not verify is not pulled and the server
+does not start. Its first boot downloads cosign from github.com and release-assets.githubusercontent.com.
+
+- Merge origin/dev v0.31.0 release into dev
+- Merge feat/automagik-template-text-emails: automagik-workspace takes accessEmails as text, pins Automagik 3.146.5 and verifies its build provenance before the pull
+
+## 0.31.0 (2026-11-15)
+
+A container service made from an OCI image keeps `/run` in memory (a tmpfs), never on the container's disk: a
+short-lived secret staged there no longer touches the disk. Incus mounts a tmpfs on an OCI container's `/run` only
+when the image keeps nothing there, so Arca now empties the image's `/run` on the root disk before the first start,
+after each `service_update` rebuild, and in a `service_reconfigure` of a service made before (its card says
+`/run becomes memory, restart once`), or in the one restart of a `service_update` with `withTemplate`, which carries
+the same `/run` row. No project restriction is loosened and it works in tenants too. The mount has `mode=755` but
+neither `nosuid` nor `nodev`, and no size of its own: the service's memory limit bounds it when the template sets
+`limits.memory`. Arca leaves `/run` on the disk, untouched, when an entry there is not root's (a non-root image's own
+directory, which it needs) or cannot be read back by its name, and `postgres-autopg` says `"runTmpfs": false`, since
+its image keeps its socket directory there. A template says `"runTmpfs": false` for any other image that needs its own
+files in `/run`. The answers say `run: "memory"`, or `run: "disk"` with the reason when `/run` was left on the disk,
+in which case the service runs as before.
+
+Arca can keep itself up to date. Every node looks for a newer release of `automagik-si/arca` every six hours (the new
+`update` config key: on by default, releases only, at any hour; a window, the pre-release channel and the interval can
+be set). It installs a release by itself only when the release's `SHA256SUMS` is signed by a key the program holds, and
+no release signing key exists yet: until one is made, a node says which release is available (`unsigned`) and installs
+nothing. The release workflow signs `SHA256SUMS` once the `ARCA_RELEASE_SIGNING_KEY` secret exists. A signed release is
+installed with nobody at a terminal: the run finds every systemd unit that runs an Arca program (the installer's
+`arca.service`, the guide's hand-made units, links, nodes with their own program path), checks the binary and the
+release's `install.sh` against `SHA256SUMS`, replaces each program behind the release and keeps the old one as
+`<program>.previous`, and restarts shims, then nodes, then links, one at a time. Each unit must come back within
+`update.healthSeconds`, a node must answer on its own socket, and the unit must then stay up for `update.healthSeconds`
+on the release's version. A unit that does not rolls every program back, fires the new `kernel-update-failed` alert,
+and holds that release back until a newer one is published. A run cut off half-way is finished or rolled back by the
+next one. A build from a branch is never replaced, and a node with an owner approval card waiting is not restarted until
+none waits. The templates are brought up to the release as the installer does. `arca_status` shows the current and
+available versions under `update`; `arca update check` says what a run would do, and `arca update run` is the run
+itself. On Arca OS the program is in the read-only image, and the OS update brings it (`os-managed`); a program its user
+may not write is staged in that user's state, and `serve`, `shim` and `link serve` hand over to it at their start.
+
+- Merge feat/auto-update: arca updates itself from signed releases, with health watch, roll back and a one-fd hand-over
+- Merge feat/janitor-hardening: no lazy fetch from a scanned partial clone, plus review 1 hardening
+- Merge fix/service-run-tmpfs: /run in memory for services, kept across reconfigure, update withTemplate and rollback
+
 ## 0.30.0 (2026-11-15)
 
 `instance_import` moves one virtual machine from an outside hypervisor (the `onevm show -x` XML, passed in by
@@ -31,6 +80,15 @@ the operator) into Incus behind one owner card: the same CPUs, memory, firmware,
 security groups as an Incus network ACL, a cloud-init seed from its context, a full sparse disk copy from the source
 Ceph pool (read-only) into the Incus Ceph pool, and a read-back after the start. `instance_import_undo` stops and
 removes an imported VM; the source is never written. A node needs `kernel.instanceImport` for either.
+
+`instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
+refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
+the node holds that cluster's config (`/etc/ceph/<name>.conf`) and the read-only client's keyring beside it, and reads
+the source with them while it writes the Incus pool with Incus's own user on Incus's cluster. Arca only reads the
+source cluster. The card's new `Ceph` row and the answer's `ceph` field name both clusters. Each disk streams through the
+node through a pipe, with up to about 100 MiB per `rbd` process whatever the disk's size, at about 10 seconds per GiB
+held on 1 Gbit/s. A failed copy names its side, cluster and client. A card still waiting when `serve` restarts with
+another import config shows the source cluster of the new config, the one the run reads. See docs/OPERATING.md.
 
 `action_propose` now reaches ghcr.io when a card shows Omni's API image (`ghcr.io/automagik-si/omni-api`): a
 `service_create`, with or without `digest`, or a `service_update` of it. To name the build on the card's `Version`

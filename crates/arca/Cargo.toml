@@ -33,6 +33,7 @@ arca-watch.workspace = true
 arca-vmimport.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rsa.workspace = true
 rustls.workspace = true
 rustix.workspace = true

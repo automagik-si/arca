@@ -4384,18 +4384,15 @@ pub fn handlers(moves: Arc<Moves>) -> Vec<(&'static str, Arc<dyn ToolHandler>)> 
     ]
 }
 
-/// The `rbd` command lines of a stopped virtual machine's copy between two Ceph clusters.
+/// The `rbd` command lines of a stopped virtual machine's copy between two Ceph clusters, run by `arca_vmimport`'s
+/// [`RbdCopy`](arca_vmimport::RbdCopy), the import's own copy.
 ///
 /// Each side names its own cluster (`--cluster <name>` reads `/etc/ceph/<name>.conf` and the client's keyring beside it)
 /// and its own client, so the same code runs whichever way the move goes. The source is only read: `rbd status`, `rbd
-/// info` and `rbd export-diff`. The copy is `rbd export-diff <source> - | rbd import-diff - <target>`, run by
-/// `arca_vmimport`'s [`Runner`]: two processes and a pipe, never a shell; the bytes stream from the reader to the writer.
-// TODO(PR 201): once `arca_vmimport::copy` has `PipeFailure` and side-named errors, map them here, and fold
-// `incus_image` into `arca_vmimport::incus_rbd_image` with the content type.
+/// info` and `rbd export-diff`. The copy is `rbd export-diff <source> - | rbd import-diff - <target>`: two processes and
+/// a pipe, never a shell; the bytes stream from the reader to the writer, and a failure names the side that failed.
 mod rbd {
-    use arca_vmimport::Runner;
-    use arca_vmimport::source::ceph_name_ok;
-    use serde_json::Value;
+    use arca_vmimport::{DiskCopy, PipeFailure, RbdCopy, Runner, SourceImage, TargetImage};
 
     /// One Ceph image, with the cluster and the client that reach it from this node.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4414,83 +4411,70 @@ mod rbd {
             format!("{}/{}", self.pool, self.image)
         }
 
-        fn names_ok(&self) -> Result<(), String> {
-            match [&self.cluster, &self.client, &self.pool, &self.image]
-                .into_iter()
-                .find(|name| !ceph_name_ok(name))
-            {
-                Some(name) => Err(format!("{name:?} is not a Ceph name")),
-                None => Ok(()),
+        /// The copy that reads this image's cluster as its client.
+        fn reader<'a>(&self, runner: &'a dyn Runner) -> RbdCopy<Borrowed<'a>> {
+            RbdCopy::new(&self.cluster, &self.client, Borrowed(runner))
+        }
+
+        fn as_source(&self) -> SourceImage {
+            SourceImage {
+                pool: self.pool.clone(),
+                image: self.image.clone(),
+                size_mib: 0,
             }
         }
 
-        fn argv(&self, rest: &[&str]) -> Vec<String> {
-            [
-                "rbd",
-                "--cluster",
-                &self.cluster,
-                "--id",
-                &self.client,
-                "--no-progress",
-            ]
-            .iter()
-            .chain(rest)
-            .map(|part| (*part).to_string())
-            .collect()
+        fn as_target(&self) -> TargetImage {
+            TargetImage {
+                cluster: self.cluster.clone(),
+                client: self.client.clone(),
+                pool: self.pool.clone(),
+                image: self.image.clone(),
+            }
         }
     }
 
-    /// The Ceph image Incus keeps a volume in: `virtual-machine_<project>_<name>` for a virtual machine's config volume
-    /// (its UEFI variables and TPM state), with `.block` for its disk; `custom_<project>_<name>` for a custom volume,
-    /// with `.block` for a block one. The project prefix is left out in the `default` project.
+    /// The runner the move holds, lent to an [`RbdCopy`].
+    struct Borrowed<'a>(&'a dyn Runner);
+
+    impl Runner for Borrowed<'_> {
+        fn output(&self, argv: &[String]) -> Result<String, String> {
+            self.0.output(argv)
+        }
+        fn pipe(&self, first: &[String], second: &[String]) -> Result<(), PipeFailure> {
+            self.0.pipe(first, second)
+        }
+    }
+
+    /// The Ceph image Incus keeps a volume in, as [`arca_vmimport::incus_rbd_image`] names a block one:
+    /// `virtual-machine_<project>_<name>.block` for a virtual machine's disk, `custom_<project>_<name>.block` for a block
+    /// custom volume. Without `block`, the same name with no suffix: a virtual machine's config volume (its UEFI
+    /// variables and TPM state), or a filesystem custom volume. The project prefix is left out in the `default` project.
     pub fn incus_image(kind: &str, project: &str, name: &str, block: bool) -> String {
-        let volume = if project == "default" {
-            name.to_string()
+        let image = arca_vmimport::incus_rbd_image(kind, project, name);
+        if block {
+            image
         } else {
-            format!("{project}_{name}")
-        };
-        let suffix = if block { ".block" } else { "" };
-        format!("{kind}_{volume}{suffix}")
+            image.trim_end_matches(".block").to_string()
+        }
     }
 
     /// Who holds `image` open, by address. Empty when no one does.
     pub fn watchers(runner: &dyn Runner, image: &RbdImage) -> Result<Vec<String>, String> {
-        image.names_ok()?;
-        let out = runner.output(&image.argv(&["status", "--format", "json", &image.spec()]))?;
-        let status: Value =
-            serde_json::from_str(&out).map_err(|_| "rbd status did not answer JSON".to_string())?;
-        Ok(status["watchers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|watcher| {
-                watcher["address"]
-                    .as_str()
-                    .unwrap_or("an unnamed client")
-                    .to_string()
-            })
-            .collect())
+        image.reader(runner).watchers(&image.as_source())
     }
 
     /// The size of `image`, in bytes.
     pub fn size(runner: &dyn Runner, image: &RbdImage) -> Result<u64, String> {
-        image.names_ok()?;
-        let out = runner.output(&image.argv(&["info", "--format", "json", &image.spec()]))?;
-        let info: Value =
-            serde_json::from_str(&out).map_err(|_| "rbd info did not answer JSON".to_string())?;
-        info["size"]
-            .as_u64()
-            .ok_or_else(|| "rbd info names no size".to_string())
+        image.reader(runner).target_size(&image.as_target())
     }
 
-    /// Copies every byte `source` holds into `target`, which exists and has the source's size.
+    /// Copies every byte `source` holds into `target`, which exists and has the source's size. A failure names the side
+    /// that failed, or both: `reading the Ceph cluster east as client.incus-east: …`.
     pub fn copy(runner: &dyn Runner, source: &RbdImage, target: &RbdImage) -> Result<(), String> {
-        source.names_ok()?;
-        target.names_ok()?;
-        runner.pipe(
-            &source.argv(&["export-diff", &source.spec(), "-"]),
-            &target.argv(&["import-diff", "-", &target.spec()]),
-        )
+        source
+            .reader(runner)
+            .copy(&source.as_source(), &target.as_target())
     }
 
     #[cfg(test)]
@@ -4509,7 +4493,7 @@ mod rbd {
                 self.calls.lock().expect("calls").push(argv.to_vec());
                 Ok(self.answer.clone())
             }
-            fn pipe(&self, first: &[String], second: &[String]) -> Result<(), String> {
+            fn pipe(&self, first: &[String], second: &[String]) -> Result<(), PipeFailure> {
                 let mut calls = self.calls.lock().expect("calls");
                 calls.push(first.to_vec());
                 calls.push(second.to_vec());
@@ -4586,6 +4570,29 @@ mod rbd {
             bad.image = "a b".into();
             assert!(size(&runner, &bad).is_err());
             assert!(runner.calls.lock().expect("calls").is_empty());
+        }
+
+        #[test]
+        fn a_failed_copy_names_the_side_that_failed() {
+            struct Failing;
+            impl Runner for Failing {
+                fn output(&self, _: &[String]) -> Result<String, String> {
+                    Ok(String::new())
+                }
+                fn pipe(&self, _: &[String], _: &[String]) -> Result<(), PipeFailure> {
+                    Err(PipeFailure::writer("rbd failed: no space left"))
+                }
+            }
+            let why = copy(
+                &Failing,
+                &image("east", "incus-east", "osd-east"),
+                &image("west", "incus-west", "osd-west"),
+            )
+            .expect_err("failed");
+            assert_eq!(
+                why,
+                "writing the Ceph cluster west as client.incus-west: rbd failed: no space left"
+            );
         }
 
         #[test]

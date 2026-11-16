@@ -230,6 +230,75 @@
               "minLength": 64,
               "type": "string"
             },
+            "update": {
+              "properties": {
+                "automatic": {
+                  "type": "boolean"
+                },
+                "available": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "channel": {
+                  "enum": [
+                    "stable",
+                    "prerelease"
+                  ],
+                  "type": "string"
+                },
+                "current": {
+                  "type": "string"
+                },
+                "failed": {
+                  "type": "boolean"
+                },
+                "lastCheckAt": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "lastReason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lastResult": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lastUpdateAt": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "window": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "automatic",
+                "channel",
+                "window",
+                "current",
+                "available",
+                "lastCheckAt",
+                "lastResult",
+                "lastReason",
+                "lastUpdateAt",
+                "failed"
+              ],
+              "type": "object"
+            },
             "uptimeS": {
               "minimum": 0,
               "type": "integer"
@@ -2810,7 +2879,7 @@
                 ],
                 "properties": {
                   "changes": {
-                    "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                    "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges, runTmpfs (whether /run is memory) and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "confirm": {
                     "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
@@ -2850,7 +2919,7 @@
                     "type": "integer"
                   },
                   "withTemplate": {
-                    "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
+                    "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint, whether /run is memory): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
                     "type": "boolean"
                   }
                 },
@@ -2862,7 +2931,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The args of service_reconfigure: Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched. Example: {\"name\":\"web\"}",
+                "description": "The args of service_reconfigure: Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint, whether /run is memory), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched. Example: {\"name\":\"web\"}",
                 "examples": [
                   {
                     "name": "web"
@@ -2870,7 +2939,7 @@
                 ],
                 "properties": {
                   "changes": {
-                    "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                    "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges, runTmpfs (whether /run is memory) and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference. The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "confirm": {
                     "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
@@ -6125,6 +6194,20 @@
               "description": "Present only on a recorded program: true. The node holds a record of it, and nothing more.",
               "type": "boolean"
             },
+            "run": {
+              "description": "Present for a container service that keeps /run in memory (its template does not say runTmpfs: false): where its /run is, read from Incus. memory: a tmpfs (for a stopped service, from its next start); disk: the files its image keeps in /run could not be removed, so /run stays on the container's disk (runNote says so); unknown: it could not be read.",
+              "enum": [
+                "memory",
+                "disk",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "runNote": {
+              "description": "Present with run: disk: that /run stays on the container's disk, and why.",
+              "maxLength": 1024,
+              "type": "string"
+            },
             "state": {
               "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
               "enum": [
@@ -7065,7 +7148,7 @@
           "required": false,
           "schema": {
             "additionalProperties": false,
-            "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference.",
+            "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges, runTmpfs (whether /run is memory) and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference.",
             "properties": {
               "entrypoint": {
                 "type": "object"
@@ -7083,6 +7166,9 @@
                 "type": "object"
               },
               "rawLxc": {
+                "type": "object"
+              },
+              "runTmpfs": {
                 "type": "object"
               },
               "secrets": {
@@ -7159,7 +7245,7 @@
           "name": "withTemplate",
           "required": false,
           "schema": {
-            "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
+            "description": "Say true to make the service, in the same rebuild, also what its CURRENT template says, as service_reconfigure would (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint, whether /run is memory): one owner card, one restart. Only an approved proposal runs it (propose it with action_propose): the card shows the new digest and every setting that changes, secrets by name only, and the approval binds both. The settings are written while the service is stopped after the rebuild, then it is started once; if anything fails, the old image and the old settings are put back. Give it with a digest the service does not run yet; not with follow or noNewPrivileges. Absent or false: the update keeps the service's settings, as without it.",
             "type": "boolean"
           }
         }
@@ -7211,6 +7297,20 @@
             "restarted": {
               "description": "Present with noNewPrivileges: whether the service was restarted for it (true when it was running).",
               "type": "boolean"
+            },
+            "run": {
+              "description": "Present for a container service that keeps /run in memory (its template does not say runTmpfs: false): where its /run is, read from Incus. memory: a tmpfs (for a stopped service, from its next start); disk: the files its image keeps in /run could not be removed, so /run stays on the container's disk (runNote says so); unknown: it could not be read.",
+              "enum": [
+                "memory",
+                "disk",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "runNote": {
+              "description": "Present with run: disk: that /run stays on the container's disk, and why.",
+              "maxLength": 1024,
+              "type": "string"
             },
             "service": {
               "type": "string"
@@ -7269,7 +7369,7 @@
           "required": false,
           "schema": {
             "additionalProperties": false,
-            "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
+            "description": "The difference between the service and its template now, as the owner's card shows it: environment (rows of key and change, added, changed or removed, with the value when it holds no secret, the secrets' names when it does, or the link that gives it), secrets (rows of name and change: declared, a secret whose value is set separately; generated, made by Arca now; removed), ports, rawLxc, noNewPrivileges, runTmpfs (whether /run is memory) and entrypoint ({from, to} each; an entrypoint is shown whole when short, else by its size and SHA-256 start, with the template's scripts named). A proposal made with action_propose fills it in; the approved call applies it only while it is still the difference.",
             "properties": {
               "entrypoint": {
                 "type": "object"
@@ -7287,6 +7387,9 @@
                 "type": "object"
               },
               "rawLxc": {
+                "type": "object"
+              },
+              "runTmpfs": {
                 "type": "object"
               },
               "secrets": {
@@ -7357,6 +7460,20 @@
               "description": "Whether the service was restarted (once) for the change: true when it was running.",
               "type": "boolean"
             },
+            "run": {
+              "description": "Present for a container service that keeps /run in memory (its template does not say runTmpfs: false): where its /run is, read from Incus. memory: a tmpfs (for a stopped service, from its next start); disk: the files its image keeps in /run could not be removed, so /run stays on the container's disk (runNote says so); unknown: it could not be read.",
+              "enum": [
+                "memory",
+                "disk",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "runNote": {
+              "description": "Present with run: disk: that /run stays on the container's disk, and why.",
+              "maxLength": 1024,
+              "type": "string"
+            },
             "running": {
               "description": "Whether the service runs after the change, as read back.",
               "type": "boolean"
@@ -7375,7 +7492,7 @@
           "type": "object"
         }
       },
-      "summary": "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
+      "summary": "Make a container service what its CURRENT template says (environment, links' values, declared secrets, ports, rawLxc, no-new-privileges, entrypoint, whether /run is memory), behind one owner card. Propose it with action_propose: the card shows the exact difference key by key, secrets by name only, never a value. The approved call applies exactly that difference, or changes nothing if the service or template changed since; then it restarts the service once if it runs and reads its config back. Image and data volume are untouched.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

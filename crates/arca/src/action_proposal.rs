@@ -899,12 +899,21 @@ impl ActionKind {
                     "The edge stops serving this address and no longer opens its instance's port for it. The instance itself is not touched.",
                 ),
             ],
+            // The plan's rows, with the node's fact (the `Ceph` row: the source's cluster and the target's) after the
+            // last disk.
             Self::InstanceImport => match arca_vmimport::plan_of(args) {
-                Ok(plan) => plan
-                    .card()
-                    .into_iter()
-                    .map(|(label, value)| row(&label, &shown(&value, 1200)))
-                    .collect(),
+                Ok(plan) => {
+                    let mut rows = plan.card();
+                    let at = rows
+                        .iter()
+                        .rposition(|(label, _)| label.starts_with("Disk"))
+                        .map_or(rows.len(), |last| last + 1);
+                    let fact = crate::instance_move::fact_rows(gpu_product).unwrap_or_default();
+                    rows.splice(at..at, fact);
+                    rows.into_iter()
+                        .map(|(label, value)| row(&label, &shown(&value, 1200)))
+                        .collect()
+                }
                 Err(why) => vec![row("Source", &shown(&why, 400))],
             },
             Self::InstanceImportUndo => vec![
@@ -1491,12 +1500,22 @@ fn reconfigure_count(changes: &Value) -> String {
     if changes.get("entrypoint").is_some() {
         parts.push("its entrypoint".to_string());
     }
+    if changes.get("runTmpfs").is_some() {
+        parts.push("its /run".to_string());
+    }
     if parts.is_empty() {
         "no change".to_string()
     } else {
         parts.join("; ")
     }
 }
+
+/// The label of the card row that says a container's `/run` changes.
+pub const RUN_TMPFS_LABEL: &str = "/run";
+/// What a reconfigure's card says when a container's `/run` becomes memory.
+pub const RUN_TO_MEMORY: &str = "/run becomes memory, restart once: a secret staged there never touches the disk. What the image keeps in /run is read first and removed from the container's disk (a running service is stopped and started for it, a stopped one has it from its next start), unless an entry there is not root's: a non-root image keeps its own directory there and needs it, so /run is then left on the disk as it is, and the answer says run: disk. Other images may need their files in /run too: the template says runTmpfs: false for one. It holds what the service writes there, counted in the service's memory limit when the template sets one";
+/// What a reconfigure's card says when a container's `/run` goes back to its disk.
+pub const RUN_TO_DISK: &str = "Arca no longer keeps /run in memory (the template says runTmpfs: false), restart once. The files the image kept in /run come back with the next service_update to a new digest, which gives the container a new root (an update with withTemplate gives it in the same restart); until then Incus still mounts a memory /run, since the disk holds nothing there";
 
 /// The label of the card row that shows a container's `raw.lxc` lines.
 pub const RAW_LXC_LABEL: &str = "Low-level container settings (raw.lxc)";
@@ -1629,6 +1648,16 @@ fn template_rows(label: &str, changes: &Value) -> Vec<ActionDetail> {
                 if on { "on" } else { "off" },
                 if on { "can no longer" } else { "can again" }
             ),
+        ));
+    }
+    if let Some(on) = changes["runTmpfs"]["to"].as_bool() {
+        rows.push(row(
+            RUN_TMPFS_LABEL.into(),
+            if on {
+                RUN_TO_MEMORY.to_string()
+            } else {
+                RUN_TO_DISK.to_string()
+            },
         ));
     }
     if let Some(entrypoint) = changes.get("entrypoint") {
@@ -1835,6 +1864,31 @@ fn loaded_rows(
             },
         );
     }
+    // An import's `Ceph` row was read from the node's config and from Incus when it was proposed, and is not in its
+    // arguments either: the journal's rows are kept when they are, row for row, the card this action writes for these
+    // arguments with one `Ceph` row of the shape the kernel writes, after the last disk. Anything else is rebuilt, which
+    // drops the row rather than show one the kernel did not write.
+    if action == ActionKind::InstanceImport {
+        let ceph: Vec<&ActionDetail> = stored_details
+            .iter()
+            .filter(|row| row.label == "Ceph")
+            .collect();
+        let fits = match ceph.as_slice() {
+            [row] if row.value.starts_with(crate::vm_import::CEPH_ROW_START) => {
+                let fact = crate::vm_import::ceph_fact(&row.value);
+                stored_details == action.details_with_gpu(args, Some(&fact)).as_slice()
+            }
+            _ => false,
+        };
+        return (
+            action.summary(args),
+            if fits {
+                stored_details.to_vec()
+            } else {
+                action.details(args)
+            },
+        );
+    }
     // What the node read from its database template when a database was proposed (that the template generates the
     // password, or why the database is created stopped) is not in the arguments either: the journal's rows are kept
     // when they are the rows this action writes for these arguments, with that claim or with such a `Start` row.
@@ -1946,6 +2000,37 @@ impl ActionProposalStore {
         store.waiting.retain(|proposal| !proposal.expired(now));
         store.compact();
         store
+    }
+
+    /// Writes each waiting import's `Ceph` row again as `row_of` gives it for the import's arguments and the row it shows
+    /// now (`None`: no row), and rewrites the journal when a card changed. The row was read from the node's config when
+    /// the import was proposed; `serve` calls this with the config it runs with, so a card never names a source cluster
+    /// the run would not read. The arguments, their digest and every other row stay as they are.
+    pub fn reword_imports(&mut self, row_of: impl Fn(&Value, Option<&str>) -> Option<String>) {
+        let action = ActionKind::InstanceImport;
+        let mut changed = false;
+        for proposal in &mut self.waiting {
+            if proposal.action != action.as_str() {
+                continue;
+            }
+            let stored = proposal
+                .details
+                .iter()
+                .find(|row| row.label == "Ceph")
+                .map(|row| row.value.as_str());
+            let details = match row_of(&proposal.args, stored) {
+                Some(row) => action
+                    .details_with_gpu(&proposal.args, Some(&crate::vm_import::ceph_fact(&row))),
+                None => action.details(&proposal.args),
+            };
+            if details != proposal.details {
+                proposal.details = details;
+                changed = true;
+            }
+        }
+        if changed {
+            self.compact();
+        }
     }
 
     /// The waiting proposals, in the order they were made.
@@ -2863,6 +2948,170 @@ mod tests {
         assert_eq!(store.waiting()[0].details, proposed.details);
         assert_eq!(store.waiting()[0].summary, proposed.summary);
         assert!(store.waiting()[0].details[3].value.contains("shared"));
+    }
+
+    fn import_args() -> Value {
+        ActionKind::InstanceImport
+            .prepare(
+                &json!({
+                    "name": "web-1", "project": "people", "pool": "remote", "bridge": "br-lan",
+                    "source": include_str!("../../arca-vmimport/tests/fixtures/uefi-two-disks-sg.xml"),
+                }),
+                None,
+            )
+            .expect("valid import arguments")
+    }
+
+    const IMPORT_CEPH_ROW: &str = "Arca reads the source pool src-pool on the Ceph cluster source-b as client.arca-import, set up to only read, and never writes it. It copies to the Ceph cluster ceph, writing only the images Incus made in the Incus pool remote";
+
+    fn labels(details: &[ActionDetail]) -> Vec<&str> {
+        details.iter().map(|row| row.label.as_str()).collect()
+    }
+
+    #[test]
+    fn an_import_card_keeps_its_ceph_row_across_a_restart() {
+        let dir = Temp::new("import-ceph");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let fact = crate::vm_import::ceph_fact(IMPORT_CEPH_ROW);
+        let proposed = store
+            .propose(
+                ActionKind::InstanceImport,
+                import_args(),
+                1_000,
+                Some(&fact),
+            )
+            .expect("an import proposal");
+        let at = labels(&proposed.details)
+            .iter()
+            .position(|label| *label == "Ceph")
+            .expect("a Ceph row");
+        assert_eq!(proposed.details[at - 1].label, "Disk 2");
+        assert_eq!(proposed.details[at].value, IMPORT_CEPH_ROW);
+        drop(store);
+
+        // A restart shows the card the owner was shown: the row is not in the arguments, the journal is the kernel's.
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
+        assert_eq!(store.waiting().len(), 1);
+        assert_eq!(store.waiting()[0].details, proposed.details);
+        assert_eq!(store.waiting()[0].summary, proposed.summary);
+    }
+
+    #[test]
+    fn an_import_card_names_the_source_cluster_of_the_config_serve_starts_with() {
+        let dir = Temp::new("import-reword");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let fact = crate::vm_import::ceph_fact(IMPORT_CEPH_ROW);
+        let proposed = store
+            .propose(
+                ActionKind::InstanceImport,
+                import_args(),
+                1_000,
+                Some(&fact),
+            )
+            .expect("an import proposal");
+        drop(store);
+        let config = |cluster: &str| -> crate::config::InstanceImportConfig {
+            serde_json::from_value(json!({ "sourcePool": "src-pool", "cephCluster": cluster }))
+                .expect("an import config")
+        };
+        let reopened = |import: Option<&crate::config::InstanceImportConfig>| {
+            let mut store = ActionProposalStore::open(&dir.0, 2_000, None);
+            store.reword_imports(|args, stored| {
+                crate::vm_import::row_after_restart(import, args, stored)
+            });
+            let details = store.waiting()[0].details.clone();
+            drop(store);
+            // The journal holds the card as it was written again.
+            assert_eq!(
+                ActionProposalStore::open(&dir.0, 2_000, None).waiting()[0].details,
+                details
+            );
+            details
+        };
+        let ceph = |details: &[ActionDetail]| -> Option<String> {
+            details
+                .iter()
+                .find(|row| row.label == "Ceph")
+                .map(|row| row.value.clone())
+        };
+
+        // The config the card was proposed under: the card stays as it was.
+        assert_eq!(reopened(Some(&config("source-b"))), proposed.details);
+        // Another source cluster: the row names it, and the target's cluster is left to Incus.
+        let other = reopened(Some(&config("source-c")));
+        assert_eq!(
+            ceph(&other).as_deref(),
+            Some(
+                "Arca reads the source pool src-pool on the Ceph cluster source-c as client.arca-import, set up to only read, and never writes it. It writes only the images Incus makes in the Incus pool remote, on the cluster Incus names for it when the import runs"
+            )
+        );
+        assert_eq!(labels(&other), labels(&proposed.details));
+        // A source pool that does not hold the disks: the run refuses, and the card has no row.
+        let elsewhere: crate::config::InstanceImportConfig =
+            serde_json::from_value(json!({ "sourcePool": "one", "cephCluster": "source-c" }))
+                .expect("an import config");
+        assert_eq!(ceph(&reopened(Some(&elsewhere))), None);
+        // No import config: no row, and every other row as it was.
+        let none = reopened(None);
+        assert_eq!(ceph(&none), None);
+        assert_eq!(none, ActionKind::InstanceImport.details(&import_args()));
+        assert_eq!(
+            ActionProposalStore::open(&dir.0, 2_000, None).waiting()[0].args_digest,
+            proposed.args_digest
+        );
+    }
+
+    #[test]
+    fn an_import_card_with_a_row_the_kernel_did_not_write_is_rebuilt() {
+        let args = import_args();
+        let line = |details: Vec<ActionDetail>| -> String {
+            let mut line: Value =
+                serde_json::from_str(&proposed_line("instance_import", &args, 1_000))
+                    .expect("a journal line");
+            line["proposal"]["details"] = serde_json::to_value(details).expect("rows");
+            line.to_string()
+        };
+        let row = |value: &str| ActionDetail {
+            label: "Ceph".to_string(),
+            value: value.to_string(),
+        };
+        let plain = ActionKind::InstanceImport.details(&args);
+        let at = labels(&plain)
+            .iter()
+            .rposition(|label| label.starts_with("Disk"))
+            .expect("a disk row")
+            + 1;
+        let with = |rows: &[ActionDetail], at: usize| {
+            let mut details = plain.clone();
+            details.splice(at..at, rows.iter().cloned());
+            details
+        };
+        for forged in [
+            // Not a row the kernel writes.
+            with(&[row("Writes nothing anywhere")], at),
+            // Two rows.
+            with(&[row(IMPORT_CEPH_ROW), row(IMPORT_CEPH_ROW)], at),
+            // In the wrong place.
+            with(&[row(IMPORT_CEPH_ROW)], 0),
+        ] {
+            let dir = Temp::new("import-forged");
+            write_journal(&dir.0, &format!("{}\n", line(forged)));
+            let store = ActionProposalStore::open(&dir.0, 2_000, None);
+            assert_eq!(store.waiting().len(), 1);
+            assert_eq!(store.waiting()[0].details, plain);
+        }
+        // Another row changed beside a good Ceph row is rebuilt too.
+        let mut changed = with(&[row(IMPORT_CEPH_ROW)], at);
+        changed[0].value = "a VM the owner did not see".to_string();
+        let dir = Temp::new("import-changed");
+        write_journal(&dir.0, &format!("{}\n", line(changed)));
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
+        assert_eq!(store.waiting()[0].details, plain);
+        // A card without the row stays without it.
+        let dir = Temp::new("import-plain");
+        write_journal(&dir.0, &format!("{}\n", line(plain.clone())));
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
+        assert_eq!(store.waiting()[0].details, plain);
     }
 
     #[test]

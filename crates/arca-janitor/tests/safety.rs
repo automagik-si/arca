@@ -199,7 +199,14 @@ fn an_item_that_vanished_or_became_a_link_is_skipped_and_nothing_behind_the_link
 // ------------------------------------------------------------------------------------------------ git work
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    git_with(dir, args, None);
+}
+
+/// Run git in `dir`, with `input` on its stdin if given, as a test author with no global config; its stdout.
+fn git_with(dir: &Path, args: &[&str], input: Option<&str>) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -208,13 +215,23 @@ fn git(dir: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "dev@example.com")
         .env("GIT_COMMITTER_NAME", "acme")
         .env("GIT_COMMITTER_EMAIL", "dev@example.com")
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    if let Some(input) = input {
+        stdin.write_all(input.as_bytes()).unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 fn repo(dir: &Path) {
@@ -491,4 +508,180 @@ fn stale_scratch_with_git_work_found_nowhere_else_is_never_moved() {
         );
     }
     assert!(!marker.exists(), "the repository's filter command was run");
+}
+
+/// A repository's own config can name commands git runs: a filter driver (set directly, through an include, in one
+/// worktree's own config, or in a submodule's config), `gpg.program`, and the transport command of a partial clone's
+/// promisor remote, which git runs to fetch a missing object. The check reads such a repository without running any
+/// of them, and keeps it.
+#[test]
+fn commands_named_in_a_scanned_repositorys_config_are_never_run() {
+    if !arca_janitor::util::on_path("git") {
+        eprintln!("skipped: git is not installed");
+        return;
+    }
+    let t = TempDir::new("git-commands");
+    let home = t.path().join("home");
+    let scratch = home.join("scratch");
+    fs::create_dir_all(home.join("work")).unwrap();
+    let remote = t.path().join("remote.git");
+    fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    let markers = t.path().join("markers");
+    fs::create_dir_all(&markers).unwrap();
+    // A filter command that leaves a marker named after its case.
+    let leaves = |name: &str| format!("touch {}; cat", markers.join(name).display());
+    let pushed_repo = |name: &str, ignore: &str| -> PathBuf {
+        let r = scratch.join(name);
+        repo(&r);
+        fs::write(r.join(".gitattributes"), "* filter=x\n").unwrap();
+        git(&r, &["add", ".gitattributes"]);
+        git(&r, &["commit", "-q", "-m", "attributes"]);
+        git(&r, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&r, &["push", "-q", "origin", &format!("main:{name}")]);
+        git(&r, &["fetch", "-q", "origin"]);
+        git(&r, &["branch", "-q", "-u", &format!("origin/{name}")]);
+        fs::write(r.join(".git/info/exclude"), format!("{ignore}\n")).unwrap();
+        r
+    };
+
+    // A filter set through an include file.
+    let r = pushed_repo("include", "");
+    fs::write(
+        r.join(".git/extra.conf"),
+        format!("[filter \"x\"]\n\tclean = {}\n", leaves("include")),
+    )
+    .unwrap();
+    git(&r, &["config", "include.path", "extra.conf"]);
+
+    // A filter set in one worktree's own config.
+    let r = pushed_repo("wtconfig", ".wt/");
+    git(&r, &["config", "extensions.worktreeConfig", "true"]);
+    git(&r, &["worktree", "add", "-q", "-b", "wt-feat", ".wt/feat"]);
+    git(&r, &["push", "-q", "origin", "wt-feat"]);
+    git(
+        &r.join(".wt/feat"),
+        &[
+            "config",
+            "--worktree",
+            "filter.x.clean",
+            &leaves("wtconfig"),
+        ],
+    );
+
+    // A submodule whose own config sets a filter: the outer repository's status must not run it.
+    let sub_src = t.path().join("sub-src");
+    repo(&sub_src);
+    fs::write(sub_src.join(".gitattributes"), "* filter=x\n").unwrap();
+    git(&sub_src, &["add", ".gitattributes"]);
+    git(&sub_src, &["commit", "-q", "-m", "attributes"]);
+    let r = pushed_repo("submodule", "");
+    git(
+        &r,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    git(&r, &["commit", "-q", "-m", "submodule"]);
+    git(&r, &["push", "-q", "origin", "main:submodule"]);
+    git(
+        &r.join("sub"),
+        &["config", "filter.x.clean", &leaves("submodule")],
+    );
+
+    // A stash whose commit carries a signature, with gpg.program set to a command and signatures shown in logs.
+    let r = pushed_repo("signed-stash", "");
+    let tree = git_with(&r, &["rev-parse", "HEAD^{tree}"], None);
+    let head = git_with(&r, &["rev-parse", "HEAD"], None);
+    let commit = format!(
+        "tree {tree}\nparent {head}\nauthor acme <dev@example.com> 1700000000 +0000\n\
+         committer acme <dev@example.com> 1700000000 +0000\n\
+         gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEz\n -----END PGP SIGNATURE-----\n\nstash\n"
+    );
+    let sha = git_with(
+        &r,
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        Some(&commit),
+    );
+    git(
+        &r,
+        &[
+            "update-ref",
+            "--create-reflog",
+            "-m",
+            "stash",
+            "refs/stash",
+            &sha,
+        ],
+    );
+    let gpg = t.path().join("fake-gpg");
+    fs::write(
+        &gpg,
+        format!(
+            "#!/bin/sh\ntouch {}\nexit 1\n",
+            markers.join("gpg").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&gpg, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    git(&r, &["config", "gpg.program", gpg.to_str().unwrap()]);
+    git(&r, &["config", "log.showSignature", "true"]);
+
+    // A partial clone whose HEAD tree is missing, with an upload-pack command for its promisor remote: a lazy fetch
+    // of the tree would run it.
+    let r = scratch.join("promisor");
+    repo(&r);
+    git(&r, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(&r, &["push", "-q", "origin", "main:promisor"]);
+    git(&r, &["fetch", "-q", "origin"]);
+    for (key, value) in [
+        ("core.repositoryformatversion", "1".to_string()),
+        ("extensions.partialClone", "origin".to_string()),
+        ("remote.origin.promisor", "true".to_string()),
+        (
+            "remote.origin.uploadpack",
+            format!(
+                "touch {}; git-upload-pack",
+                markers.join("promisor").display()
+            ),
+        ),
+    ] {
+        git(&r, &["config", key, &value]);
+    }
+    let tree = git_with(&r, &["rev-parse", "HEAD^{tree}"], None);
+    fs::remove_file(r.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+    age_tree(&home, 30);
+
+    let plan = plan_only(&config(&home), "stale-scratch");
+    let ran: Vec<String> = fs::read_dir(&markers)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        ran.is_empty(),
+        "commands from a scanned config ran: {ran:?}"
+    );
+    assert!(plan.items.is_empty(), "{:?}", plan.items);
+    for (name, why) in [
+        ("include", "filter"),
+        ("wtconfig", "filter"),
+        ("submodule", "filter"),
+        ("signed-stash", "stash"),
+        ("promisor", "cannot be read"),
+    ] {
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|s| s.label.ends_with(&format!("/{name}")) && s.reason.contains(why)),
+            "{name}: {:?}",
+            plan.skipped
+        );
+    }
 }

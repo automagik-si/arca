@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.30.0"
+version = "0.32.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/automagik-si/arca"
@@ -56,6 +56,8 @@ rsa = { version = "=0.9.10", default-features = false, features = ["std", "u64_d
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
 # The outside hypervisor's VM description (instance_import). In the lock already through plist (iroh).
 quick-xml = "=0.42.0"
+# The kernel updater verifies a release's Ed25519 signature of SHA256SUMS. In the lock already through rustls.
+ring = "=0.17.14"
 # SQLite is compiled from its bundled source, so the static musl build needs no system library.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 # The browser passkey test's TLS front, and the GitHub signer's client config. Both are in the lock already through iroh;

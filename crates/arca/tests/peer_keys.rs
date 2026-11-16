@@ -186,6 +186,7 @@ impl Gamma {
 
 fn status_of(peer: Option<PeerPasskeys>) -> Value {
     StatusHandler {
+        update: None,
         node: "c".repeat(64),
         mode: "kernel",
         applied_seq: AppliedSeq::default(),
@@ -777,6 +778,7 @@ impl Sources {
     /// `arca_status`'s `approval`, as `arca serve` fills it for this config.
     fn approval_status(&self) -> Value {
         let status = StatusHandler {
+            update: None,
             node: "c".repeat(64),
             mode: "kernel",
             applied_seq: AppliedSeq::default(),
@@ -1320,6 +1322,7 @@ impl Remote {
         gamma_server = gamma_server.handle(
             "arca_status",
             Arc::new(StatusHandler {
+                update: None,
                 node: "c".repeat(64),
                 mode: "kernel",
                 applied_seq: AppliedSeq::default(),

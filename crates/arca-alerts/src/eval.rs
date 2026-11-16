@@ -27,6 +27,9 @@ pub const OSD_MAX_AGE_MS: u64 = 900_000;
 pub const HOST_NETWORK_MAX_AGE_MS: u64 = 180_000;
 /// The runner pools' sign-in board may be this old, in milliseconds, before it is unknown.
 pub const RUNNER_SIGNIN_MAX_AGE_MS: u64 = 15_000;
+/// The kernel updater's record may be this old, in milliseconds, before it is unknown. The tick reads the record each
+/// time, so a reading is as old as the tick.
+pub const KERNEL_UPDATE_MAX_AGE_MS: u64 = 15_000;
 /// A SMART reading may be this old, in milliseconds, before it is unknown (2 hours).
 pub const SMART_MAX_AGE_MS: u64 = 7_200_000;
 
@@ -48,10 +51,11 @@ pub enum RuleId {
     GpuGone,
     HostNetwork,
     RunnerSignIn,
+    KernelUpdateFailed,
 }
 
 impl RuleId {
-    pub const ALL: [RuleId; 12] = [
+    pub const ALL: [RuleId; 13] = [
         Self::DiskPoolFull,
         Self::MemPsiHigh,
         Self::CpuHot,
@@ -64,6 +68,7 @@ impl RuleId {
         Self::GpuGone,
         Self::HostNetwork,
         Self::RunnerSignIn,
+        Self::KernelUpdateFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -80,6 +85,7 @@ impl RuleId {
             Self::GpuGone => "gpu-gone",
             Self::HostNetwork => "host-network-drift",
             Self::RunnerSignIn => "runner-signin",
+            Self::KernelUpdateFailed => "kernel-update-failed",
         }
     }
 
@@ -136,7 +142,7 @@ impl Rule {
 pub struct Rules(pub Vec<Rule>);
 
 impl Default for Rules {
-    /// The twelve defaults. Disk is percent used, `mem-psi-high` the memory `some` avg10, `cpu-hot` °C. The yes-or-no rules
+    /// The thirteen defaults. Disk is percent used, `mem-psi-high` the memory `some` avg10, `cpu-hot` °C. The yes-or-no rules
     /// read 1 when bad, `drift` a count, and `crash-loop` the starts of the last 10 minutes.
     fn default() -> Rules {
         use RuleId as R;
@@ -176,6 +182,9 @@ impl Default for Rules {
             // A runner pool whose GitHub credential is refused (401), whose App is not installed (404) or lacks the
             // permission (403): no job can reach the pool until someone acts.
             Rule::default_of(R::RunnerSignIn, 0.0, 0.0, Critical),
+            // The kernel's own update failed: a release that did not verify, or one that did not come back healthy and was
+            // rolled back. It clears when a later run ends up to date or updated.
+            Rule::default_of(R::KernelUpdateFailed, 0.0, 0.0, Warning),
         ])
     }
 }
@@ -221,6 +230,8 @@ pub struct Inputs {
     pub host_network: Option<Timed<Vec<HostNetworkItem>>>,
     /// Each runner pool's sign-in state. A node with no pools has a known, empty list.
     pub runner_signin: Option<Timed<Vec<RunnerSignInUse>>>,
+    /// Whether the kernel updater's last run on this node failed. A node the updater never ran on reads `false`.
+    pub kernel_update: Option<Timed<KernelUpdateUse>>,
     /// The rules whose reading this node can never provide, such as PSI and CPU temperature on a remote metrics source.
     /// A firing alert of one resolves with `no data` after its clear window; a transient outage never does.
     pub unavailable: BTreeSet<RuleId>,
@@ -301,6 +312,12 @@ pub struct HostNetworkItem {
 pub struct RunnerSignInUse {
     pub pool: String,
     pub reason: Option<String>,
+}
+
+/// The kernel updater's last result on this node: `failed` when it ended failed or rolled back, with the release it tried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelUpdateUse {
+    pub failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -630,6 +647,12 @@ fn source_of(id: RuleId, inputs: &Inputs, now: u64) -> Source {
                     })
                     .collect()
             },
+        ),
+        RuleId::KernelUpdateFailed => read(
+            &inputs.kernel_update,
+            KERNEL_UPDATE_MAX_AGE_MS,
+            now,
+            |update| single(Some(bad_as(update.failed))),
         ),
         RuleId::GpuGone => read(&inputs.gpus_gone, SAMPLE_MAX_AGE_MS, now, |gone| {
             gone.iter()

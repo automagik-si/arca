@@ -408,6 +408,11 @@ fn inputs_at(at: u64, sample: &HostSample) -> Inputs {
         }),
         // A node with no runner pools reads an empty board, as the ticker does.
         runner_signin: Some(Timed { at, value: vec![] }),
+        // A serving node always reads the kernel updater's record; one it never ran on has not failed.
+        kernel_update: Some(Timed {
+            at,
+            value: arca_alerts::eval::KernelUpdateUse { failed: false },
+        }),
         ..Inputs::default()
     }
 }

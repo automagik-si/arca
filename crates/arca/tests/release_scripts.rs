@@ -1246,13 +1246,25 @@ fn the_release_workflow_runs_on_dev_and_by_hand_only_one_run_at_a_time() {
         "pull_request_target",
         "workflow_run",
         "schedule:",
-        "secrets.",
     ] {
         assert!(
             !rules.contains(never),
             "the release workflow has no {never}"
         );
     }
+    // One secret, the release signing key, read once: by the publishing job, which runs nothing of the repository, in
+    // the step that signs SHA256SUMS, from the job's own environment.
+    assert_eq!(rules.matches("secrets.").count(), 1, "one secret");
+    let publish = job(&rules, "publish");
+    assert!(publish.contains("    environment: release-signing\n"));
+    assert!(publish.contains(
+        "      - name: Sign SHA256SUMS\n        if: steps.check.outputs.commit != ''\n        env:\n          SIGNING_KEY: ${{ secrets.ARCA_RELEASE_SIGNING_KEY }}\n"
+    ));
+    assert_eq!(
+        rules.matches("environment:").count(),
+        1,
+        "one job has an environment"
+    );
     // One run at a time across all its jobs, and a run that started is never cancelled.
     let top = &rules[..rules.find("\njobs:\n").expect("jobs")];
     assert!(
@@ -1466,9 +1478,12 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
     ));
     assert!(!publish.contains("sha256sum --check"));
     // The installer is published as the release commit holds it, and the cutting job hands it over with the rest.
+    // The signature joins them when the signing step wrote one.
     assert!(publish.contains(
-        "gh release create \"v${VERSION}\" \"arca-${VERSION}-linux-x86_64\" \"arca-${VERSION}-linux-aarch64\" install.sh SHA256SUMS \"${flags[@]}\""
+        "files=(\"arca-${VERSION}-linux-x86_64\" \"arca-${VERSION}-linux-aarch64\" install.sh SHA256SUMS)\n"
     ));
+    assert!(publish.contains("[[ ! -f SHA256SUMS.sig ]] || files+=(SHA256SUMS.sig)\n"));
+    assert!(publish.contains("gh release create \"v${VERSION}\" \"${files[@]}\" \"${flags[@]}\""));
     assert!(publish.contains("git hash-object --no-filters \"${HANDOVER}/install.sh\""));
     assert!(job(&rules, "cut").contains(
         "cp \"dist/arca-${VERSION}-linux-x86_64\" dist/install.sh dist/SHA256SUMS dist/RELEASE-NOTES.md handover/"

@@ -96,6 +96,8 @@ node takes a new token after `arca token reload` or a restart.
 | `arca metrics --json [--sample-for <s>] [--config <file>]` | the host and the configured pools | the `node_metrics` result |
 | `arca store check [--config <file>]` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
 | `arca templates install [--config <file>] [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept", "replaced" }` as JSON. A file that is an earlier release's own, byte for byte, is brought up to this release's and named under `replaced`; any other file that differs is the owner's edit and is kept unless `--replace` is given |
+| `arca update check [--config <file>]` | the releases and this systemd manager's units: nothing is changed and nothing is written | `{ "result", "reason", "available", "current", "detail": { "programs": [...] } }`: `available` when a program is behind the newest release; each program with its path, version, units and whether it is behind. See "Keeping Arca up to date: the kernel update" |
+| `arca update run [--config <file>]` | the same, and installs the release into every program behind it, restarts their units, and rolls back a unit that does not come back; what `serve` starts on its schedule | the same object, with the units moved under `detail.units`; exit 1 when the run `failed`, was `rolled-back` or `held-back` |
 | `arca probe consumer add --name <n> --image <fingerprint> [--config <file>]` / `remove --name <n> [--config <file>]` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve [--config <file>]` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca init --enable-changes [--config <file>] [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan and two questions; it writes the config's missing keys after a yes, and ends in five lines: what changed, who does not wait for the page, the one next step, where a database comes from, and one pointer to the rest. See "Turning on changes" |
@@ -180,6 +182,7 @@ refused without the value being echoed back.
 | `kernel.serviceListenAddresses` | no | `["<one IPv4 address>", ...]`, at most 8: the host addresses a service's private port may listen on, each an address of an interface of this host, such as the address of a private link to a second node. Empty by default: no service has a private port. An entry alone opens nothing. See "A service port on one host address". |
 | `link` | no | The node link: `name`, `forward`, `pairMinutes`, `localOnly`, `port` and `peers`. See "The link". |
 | `follow.intervalSeconds` | no | Seconds between two looks of the Automagik follower at Automagik's published record, 60 to 86400. 600 when absent. |
+| `update.automatic`, `update.channel`, `update.checkEverySeconds`, `update.window`, `update.source`, `update.healthSeconds` | no | The kernel update: whether the node looks for a newer Arca release and installs it on its own (`true`), which releases (`stable`; `prerelease` takes pre-releases too), how often it looks (600 to 604800 seconds, 21600 when absent), when an install may start (`HH:MM-HH:MM` in UTC; absent, at any hour), where the releases are listed (`https://api.github.com/repos/automagik-si/arca`), and how long a restarted unit has to come back and then stay up (5 to 600 seconds, 30). A node installs only a signed release, and no signing key exists yet. See "Keeping Arca up to date: the kernel update". |
 | `hostNetwork.socket`, `hostNetwork.status` | no | Absolute paths of the root part's socket and status file; `/run/arca-host-network/host-network.sock` and `/run/arca-host-network/status.json` when absent. See "Host forwarding and the firewall". |
 | `console.tokenFile` | no | Absolute path of the file `serve` writes the machine's own console's token to: one viewer token limited to `node_metrics`, `arca_status`, `alerts_list` and `service_list`, made at each start and held in memory only. Absent, no such token is made. See "The console's token". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
@@ -804,7 +807,8 @@ program holds their SHA-256 hashes):
 - a template and the script it reads move together: where one of the two is edited, the other is kept as it is too,
   though it is an earlier release's, so a new template is never paired with a script it was not shipped with.
 
-The installer runs this step on an upgrade (`sh install.sh` on a machine that has Arca), for the node it runs as
+The kernel update runs this step after every update it installs, for every node that has templates (see "Keeping Arca
+up to date: the kernel update"). The installer runs it on an upgrade (`sh install.sh` on a machine that has Arca), for the node it runs as
 a service and only where templates are already installed: a node that only looks has none and gets none. Its
 report names what it brought up to this release, and what it kept because it was edited, with the one command that
 replaces those (`arca templates install --replace --config <file>`). Where the run puts an older program over a
@@ -918,14 +922,14 @@ instance's delete as its inverse). The service's record holds `start: false`. On
 created stopped, and can be started later", and the summary ends "and leave it stopped"), and for a
 template that is created stopped whatever the call says ("No: it is created stopped because ...", with the reason).
 
-A new Automagik starts from Automagik's published image, and nothing is built on the node. Two templates run it, both
-pinned to Automagik's release 3.136.4 by its digest (`ghcr.io/automagik-si/automagik-server@sha256:49e997e3…`, one
-linux/amd64 image, about 190 MiB to pull): `automagik-server`, a container on the node reachable on its LAN address at
-port 3081, and `automagik-workspace`, a virtual machine of its own reached through a Cloudflare Tunnel or the tailnet
-(see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
+A new Automagik starts from Automagik's published image, and nothing is built on the node. Two templates run it, each
+pinned to one of Automagik's releases by its digest: `automagik-server`, a container on the node reachable on its LAN
+address at port 3081, at 3.136.4 (`ghcr.io/automagik-si/automagik-server@sha256:49e997e3…`, one linux/amd64 image,
+about 190 MiB to pull), and `automagik-workspace`, a virtual machine of its own reached through a Cloudflare Tunnel or
+the tailnet, at 3.146.5 (`…@sha256:cc804cb0…`; see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
 registry by that digest at the create. A workspace is created stopped, and Docker inside its machine pulls the image
-by the same digest when the keeper first starts the server, after `instance_start`; the machine needs a route to
-`ghcr.io` then. Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
+by its digest when the keeper first starts the server, after `instance_start`, once the image's GitHub build
+provenance verifies; the machine needs a route to `ghcr.io` then. Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
 that loses the plugin. They come through the welcome once Automagik's fixed release is pinned here. The hand-built
 `automagik` template below stays as it is for what the published image does not give today: the Omni channels plugin
 until then, and being published on the tailnet with `service_publish`, which an OCI service cannot be. Build
@@ -935,7 +939,12 @@ A node that installed `automagik-server` or `automagik-workspace` up to Arca 0.1
 Automagik 3.95.0, the workspace a build of Automagik's commit `5fe0be6`) gets both brought up to 3.136.4 by the
 upgrade, as any shipped template nobody edited. A service made before keeps running the image it was created with: it
 is its own instance, and the upgrade does not touch it. Its `service_status` shows the newer release under `update`
-(`"state": "differs"`, the new digest as `templatePin`). A new service pulls 3.136.4.
+(`"state": "differs"`, the new digest as `templatePin`). A new `automagik-server` service pulls 3.136.4.
+
+From the release after 0.30.0, an unedited `automagik-workspace` moves to Automagik 3.146.5 the same way, with the
+provenance check before the pull and `accessEmails` as text. A workspace made before keeps its machine, its keeper,
+its image and its list of addresses: a virtual machine is not updated in place. Its `service_status` shows the pin as
+`differs`; `service_remove` and `service_create` give a new one at 3.146.5.
 
 Keep a running service on the release it has, unless you move it yourself: Arca does not move one to its template's
 version by itself. A container moves in place with `service_update {name, digest}`: to the digest an OCI template now
@@ -1069,6 +1078,54 @@ template").
 If the owner later sets `restricted.containers.lowlevel` back to `block`, Incus refuses every later write of the
 instance config of a service that has the key, since the whole config is checked: a secret, a link or an environment
 change then fails for that service. Dropping the key still works, through the update above.
+
+#### `/run` is memory (`runTmpfs`)
+
+A container service made from an OCI image (`"kind": "oci"`) keeps its `/run` in memory (a tmpfs), never on the
+container's disk, so a short-lived credential an agent or a script stages under `/run` never touches the disk.
+`runTmpfs` defaults to true; such a template says `"runTmpfs": false` for an image that needs the files it ships in
+`/run`. A system container's init mounts its own `/run`, and a virtual machine has its own, so their templates take no
+part in it.
+
+How it works: Incus mounts a tmpfs (mode 0755) on an OCI container's `/run` at every start when the container's root
+holds nothing under `/run`, and mounts nothing when the image ships files there (a Debian base keeps `/run/lock`), so
+`/run` was then a directory on the container's disk. Arca empties `/run` on the root disk while the container is stopped,
+and Incus's own rule does the rest: the create makes the container stopped, removes what the image keeps under `/run`,
+then starts it as the call asked; `service_update` does the same after each rebuild (and after putting an old version
+back); `service_reconfigure` does it for a service made before (below). Some images need what they ship in `/run`: an
+image that runs as a user other than root and keeps that user's directory there (a socket directory made at its build)
+cannot make it again in a memory `/run`, which is root's with mode 0755. So Arca reads the whole of `/run` first, and
+when any entry there is not owned by the container's root, or its owner is not said, or `/run` lists an entry that
+cannot be read back by its name (Incus lists a name that is not UTF-8 with U+FFFD in its place), it removes nothing: `/run` is left on the disk as the image
+has it, and the answer says `run: "disk"` with `runNote`. Otherwise the image's files under `/run` are removed and `/run`
+holds only what the service writes there after its start. Arca's own database template, `postgres-autopg`, says
+`"runTmpfs": false`: its image keeps its socket directory, `/var/run/autopg`, for its user. A template whose image needs
+root-owned files in `/run` says `"runTmpfs": false` too.
+Nothing is loosened for it: no `raw.lxc`, no host-path disk, and no project restriction changes, so it works the same in
+the node's own project and in a tenant's. What this mount does not have: `nosuid` and `nodev` (Incus sets only
+`mode=755`), and a size limit of its own. What a service writes in `/run` counts in its memory: when the template sets
+`limits.memory`, that bounds it; a template that sets none leaves it bounded only by the kernel's default for a tmpfs,
+half of the host's memory. The instance carries `user.arca.runtmpfs=true` as its mark, and the record keeps
+`runTmpfs: true`.
+
+The create's answer, `service_update`'s and `service_reconfigure`'s say where `/run` is: `run: "memory"` or `run:
+"disk"` with `runNote` when Arca left `/run` on the disk (an entry there that is not root's, or one it cannot read) or could not remove what
+the image keeps there (more than 256 entries, a `/run` that is not a directory, a removal Incus refused): the service is then created and runs as it did before this change, with
+`/run` on its disk, and nothing is refused for it. For a stopped service it is read from Incus (the root holds nothing
+under `/run`, so its next start mounts a memory one). A running container's mount table cannot be read through Incus's
+files API, so for a running service it is what Arca saw when it emptied that container's `/run`, just before the start.
+`run: "unknown"` means Incus could not be read, or Arca has not emptied the running container since its daemon began.
+
+A service made before this change keeps the `/run` it has. `service_reconfigure` shows `/run becomes memory, restart
+once` on its card for it, and an approved card stops the service, removes what the image keeps under `/run` (unless an
+entry there is not root's, as above: then nothing is removed and the answer says `run: "disk"`), and starts it again (a
+stopped service has it from its next start). The template default is on, so every card for such a service carries this
+row, whatever else it changes, until its template says `"runTmpfs": false`. A template that turns `runTmpfs` off shows on the card that
+Arca no longer keeps `/run` in memory, and the service is restarted once: the image's files that were removed come back
+with the next `service_update` to a new digest, which gives the container a new root, and until then Incus still mounts
+a memory `/run`, since the disk holds nothing there.
+
+To check by hand on a node, inside the container: `stat -f -c %T /run` prints `tmpfs`.
 
 `data` names an absolute printable mount `path` of at most 255 bytes that is not the root (`/`, `//` and `/.` are
 refused) and has no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit), and an optional `size` such as
@@ -1763,10 +1820,10 @@ two restarts. With `withTemplate: true` one card does both, with one restart:
 Install the changed template first (`arca templates install`), then propose it with `action_propose`; only the owner's
 approval runs it, and a direct call is refused with "Nothing was changed". When the proposal is made, the node works
 out what `service_reconfigure` would apply from the CURRENT template (environment, links' values, declared secrets,
-ports, `rawLxc`, no-new-privileges, entrypoint; see "Reconfiguring a service from its template") and writes it into
-the proposal as `changes`, so the card shows the digest, a `Template changes` row counting them, one row per key,
-secret, port list, low-level setting and entrypoint that changes (secrets by name only), and the summary says it is one
-restart. The approval binds the digest and `changes` together. What a caller sends as `changes` is never kept. When
+ports, `rawLxc`, no-new-privileges, entrypoint, whether `/run` is memory; see "Reconfiguring a service from its
+template") and writes it into the proposal as `changes`, so the card shows the digest, a `Template changes` row counting
+them, one row per key, secret, port list, low-level setting, entrypoint and `/run` that changes (secrets by name only),
+and the summary says it is one restart. The approval binds the digest and `changes` together. What a caller sends as `changes` is never kept. When
 the approved call runs it works the difference out again and changes nothing unless it is the one on the card ("the
 service or its template changed since the owner's card was made ... propose it again"): an edit of the template after
 the proposal needs a new card.
@@ -1783,6 +1840,13 @@ a link or a secret set since the card was made fails the step, and the update is
 the new digest is recorded and the config is read back; the answer adds `changes` and `readBack: {matches, differs}`,
 as `service_reconfigure`'s does. The journal has `apply` after `rebuild`, and `read back` before `end`, with key and
 secret names only.
+
+`/run` follows the record the start takes. When the template's settings keep `/run` in memory (a service made before
+`runTmpfs` whose template does not say `runTmpfs: false`), the card has the `/run` row, and after `apply` the new root's
+`/run` is emptied while the instance is stopped, exactly as a reconfigure empties it (see "`/run` is memory"), so the
+one start mounts a memory `/run`. An entry there that is not root's leaves it on the disk as the image has it. The
+journal has `empty /run`, and the answer adds `run` (and `runNote` for `disk`). A rollback empties the old root's
+`/run` only when the old record kept it in memory.
 
 A failure after the settings were written puts back both: the old record exactly (its environment, ports, secrets,
 links, low-level settings and its entrypoint) first, then the old root (the snapshot, or a rebuild from the old digest),
@@ -1853,6 +1917,10 @@ difference from its record, which it writes into the proposal as `changes`:
 - `ports`, `rawLxc` and `noNewPrivileges`: `{from, to}` when the template says otherwise; `rawLxc` is the container's
   `raw.lxc` lines whole, `lxc.no_new_privs=1` among them when it is set. A tenant's service keeps its low-level
   container settings.
+- `runTmpfs`: `{from, to}` when the template's `runTmpfs` (true unless it says `false`) is not the service's, in the
+  node's own project and in a tenant's alike (see "`/run` is memory"). The card says `/run becomes memory, restart
+  once`; the run then stops the service, empties `/run` on its disk and starts it, in place of the restart, and the
+  answer says `run: "memory"` or `run: "disk"` with `runNote`.
 - `entrypoint`: `{from, to}` when the template's entrypoint, with the scripts it reads from the templates directory as
   they are now, is not the one the service runs. Each side is shown whole when short, or else by its size and the start
   of its SHA-256 (a script goes as one long base64 word), and `scripts` names the template's scripts. It is applied as
@@ -2668,6 +2736,148 @@ kept beyond the version token. `lastResult` and `lastReason` are the OS's own wo
 The canvas's Fleet view reads this verb on every configured host. The update server's newest version for a channel is not
 in the update document, so the view compares a node with the newest version reported on the fleet's own nodes.
 
+## Keeping Arca up to date: the kernel update
+
+Every node keeps the Arca programs of its machine on the newest release by itself. Nobody runs anything and nobody types
+anything: the look, the download, the check, the install, the restarts and a rollback all happen without a person.
+`sh install.sh` is only for the first install.
+
+A node installs a release by itself only when the release is signed: its `SHA256SUMS.sig` must be an Ed25519 signature of
+its `SHA256SUMS` by a key the node's own program holds. **No release signing key exists yet.** Until one does, every
+node looks and says which release is available (`unsigned`, which raises no alert), and installs nothing; a release is
+installed by hand with `sh install.sh`, as before. Once the key is made, its private half is the release workflow's
+`ARCA_RELEASE_SIGNING_KEY` secret (in the `release-signing` environment), its public half is in the program
+(`RELEASE_KEYS` in `crates/arca/src/self_update.rs`), and a node updates by itself from the first release whose program
+holds the key.
+
+### When it runs
+
+`arca serve` looks on a schedule: five minutes after it starts, then every `update.checkEverySeconds` (six hours when
+absent). It looks only when systemd runs it as a service; a `serve` started by hand has no unit to restart, and never
+looks. It starts the run as a transient unit of its own manager (`systemd-run`, `arca-update-<time>.service`), so the
+run outlives the restarts it makes. The run is `arca update run --config <the node's config>`, which can also be run by
+hand; `arca update check` does the same look, changes nothing and writes nothing, and says what a run would do.
+
+| Key | Absent | What it does |
+|-----|--------|--------------|
+| `update.automatic` | `true` | `false`: the node never looks on its own. `arca update run` still works by hand. |
+| `update.channel` | `stable` | `stable` takes releases only; `prerelease` takes pre-releases too. A draft is never taken. |
+| `update.checkEverySeconds` | 21600 | Seconds between two looks, 600 to 604800. |
+| `update.window` | any hour | `HH:MM-HH:MM` in UTC (`"02:00-05:00"`, or `"23:00-01:00"` over midnight): an install starts only inside it. A look outside it still says what is available. |
+| `update.source` | `https://api.github.com/repos/automagik-si/arca` | The releases API of the repository. Another `https` address is a mirror; `http` is taken only for a loopback address. |
+| `update.healthSeconds` | 30 | How long a restarted unit has to come back, and then how long it must stay up, before the update counts; 5 to 600. |
+
+A look that was put off (a waiting owner card, a closed window, no answer from the releases) is tried again within
+fifteen minutes. Several nodes on one machine share one result: a run records it in the state directory of every node
+it found, so the next node whose look is due sees that the machine was just looked at. One run holds the machine's
+update lock (`$XDG_RUNTIME_DIR/arca-update.lock`, `/run/arca-update.lock` for root, or `update.lock` in the staging
+directory below when there is no runtime directory); a second run that finds it held ends as `busy` and changes
+nothing.
+
+### What one run does
+
+1. When an earlier run changed programs and stopped before it confirmed every unit it restarted (the machine went down,
+   the run was killed), it left `<stateDir>/kernel-update/pending.json`. The run settles that first: when every unit
+   the record names runs the release and is healthy now (a node answers on its socket), the update is finished
+   (`finished`, then `updated`); otherwise every program it changed is put back and its units are restarted on it
+   (`rolled-back`).
+2. It reads the releases and takes the newest of the channel: a `v<version>` tag, by semantic version.
+3. It finds every unit of its own systemd manager whose `ExecStart` runs an Arca program: the installer's `arca.service`,
+   the guide's hand-made `arca-shim.service` and `arca-watch.service`, a link (`arca link serve`), a second node, and a
+   unit that runs its own copy of the program from another path. A program is a file whose name starts with `arca`
+   and that answers `--version` with `Automagik Arca <version>`. Units whose paths lead to one file share that program.
+4. A program as new as the release, or newer, is kept as it is, and its units are not restarted. An older program is
+   never put over a newer one. A program older than the release is replaced only when it is, byte for byte, the
+   published binary of the version it says (by that release's `SHA256SUMS`); a build from a branch that says an older
+   version, or a version never published, is kept (`branch-build`, no alert), and the look names it. A program on a
+   read-only file system belongs to the OS image and is left to the OS update (`os-managed`, no alert; see "On Arca
+   OS").
+5. A release this machine rolled back is not tried again (`held-back`, the alert stays) until a newer one is published.
+6. Outside `update.window` it stops here (`waiting-for-window`). While a node it would restart has an owner approval
+   card waiting (an action plan, a delete plan or an owner approval request, the rows `owner_approval_pending` lists),
+   it stops here too (`deferred`): a restart would take the card's page and the owner's session away from the owner.
+   Each `serve` writes its count of waiting cards each minute for this; a count older than three minutes is not read.
+7. It downloads the release's `SHA256SUMS` and `SHA256SUMS.sig` and checks the signature (above): no signature, or a
+   program with no key, is `unsigned`; a signature that does not verify is `failed`. Then it downloads
+   `arca-<version>-linux-<arch>` for this machine (`x86_64` or `aarch64`) and the release's `install.sh`, and checks
+   both against `SHA256SUMS`. A checksum that does not match, a file the release does not have, or a binary that does
+   not answer `--version` with the release's version on this machine keeps every program as it was (`failed`).
+8. It writes the binary beside each program, on the same file system, and runs it there once (`--version`). Then it
+   writes `pending.json` into every node's record, and only then puts each binary in place as the installer does:
+   renamed over the program in one step, so a unit that starts in between finds a whole program. The old program is
+   kept beside it as `<program>.previous`. Where the installer's own note names the old program
+   (`~/.local/state/arca-install/program.sha256`), it names the new one, so `sh install.sh --uninstall` still removes
+   it. A program in a directory this user may not write is staged instead (see "A program this user may not write").
+9. It restarts the units of the programs it changed, one at a time: shims first, then nodes, then links, then any
+   other. A unit that was stopped is not started; its program is replaced all the same, so it starts on the release.
+   After each restart the unit must be running within `update.healthSeconds`; a node must also answer on its own socket
+   (`listen.unix`) within that time. Then the unit is watched for `update.healthSeconds` more: it must stay the same
+   process and never be restarted by systemd. Last, the version its main process runs is read
+   (`/proc/<pid>/exe --version`), and it must be the release's.
+10. When a unit does not come back that way, every program the run changed is put back (the `.previous` file, or the
+    staged program before), the units it had restarted are restarted again, and their versions are read back. The run
+    ends `rolled-back`, the release is remembered as rolled back, and the `kernel-update-failed` alert fires.
+11. When every unit came back, `pending.json` is removed, and it runs `arca templates install --config <config>` with
+    the new program for each node that has templates (`<stateDir>/templates`), as the installer does on an upgrade (see
+    "Templates an earlier release installed"). A template the owner edited is kept, as always.
+
+A rollback puts the old program back; it does not put back what the new one wrote. A release whose store moves to a
+newer schema at its start leaves a store the old program may refuse, so a rollback after such a release can leave the
+node down until the release (or a newer one) is installed by hand.
+
+### What it records
+
+Each node the run found keeps:
+
+- `<stateDir>/kernel-update/journal.jsonl`: one JSON line for every look (`check`, with its `result`) and every step
+  (`deferred`, `download`, `install` with `from`, `to` and `how`, `restart` with the version read back, `templates`,
+  `updated`, `finished`, `failed`, `rolled-back`), each with `atMs`;
+- `<stateDir>/kernel-update/state.json`: the last look's `result`, `reason`, `available` and `checkedAtMs`, whether it
+  `failed`, the time and units of the last update (`updatedAtMs`, `updated`), and the release it last rolled back
+  (`rolledBack`, cleared by the next update);
+- `<stateDir>/kernel-update/pending.json` while an update is between its first rename and its last confirmed unit.
+
+`arca_status` answers with `update`:
+
+| Field | Meaning |
+|-------|---------|
+| `automatic`, `channel`, `window` | The node's `update` settings. |
+| `current` | The version this node runs. |
+| `available` | The newest release of the channel at the last look, or null before one. |
+| `lastCheckAt`, `lastResult`, `lastReason` | The last look: when (epoch milliseconds), what it ended with (`up-to-date`, `updated`, `deferred`, `waiting-for-window`, `check-failed`, `busy`, `unsigned`, `branch-build`, `os-managed`, `failed`, `rolled-back`, `held-back`) and why. |
+| `lastUpdateAt` | When the last update finished. |
+| `failed` | Whether the last settled run failed, was rolled back or held a rolled-back release back: the `kernel-update-failed` alert's reading. |
+
+`kernel-update-failed` (warning) reads 1 while the last settled run ended `failed`, `rolled-back` or `held-back`, and
+clears when a later run ends `updated`, `up-to-date`, `unsigned`, `branch-build` or `os-managed`. A look that was put
+off or got no answer from the releases (`deferred`, `waiting-for-window`, `check-failed`, `busy`) leaves it as it was;
+it is tried again within fifteen minutes.
+
+### A program this user may not write
+
+A node run by a user who may not write its program's directory (a program in `/usr/local/bin` with a user unit) gets
+the release staged in that user's own staging directory: `~/.local/state/arca-update/<key>/arca-<version>`
+(`/var/lib/arca-update/<key>/` for root), `<key>` named after the program's path, with the file and its SHA-256 in
+`current.json` (the manifest before it is kept as `previous.json`). At its start, before it does anything else, `arca
+serve`, `arca shim` and `arca link serve` look there for their own program: a staged release newer than themselves, a
+regular file of their own user that nobody else may write, whose SHA-256 is the manifest's, is opened once, hashed
+through that open file, and run in their place with the same arguments. A program older than the one it runs never
+takes over. A staged release is used only when every running unit of the program is a shim, a node or a link, which
+all do this; another unit of it (an `arca watch`, say) would keep running the old program, so the run refuses before
+anything changes (`failed`, naming the unit). The rest of the run is the same: the restarts, the watch, the version
+read back from the process, the rollback (the manifest before is put back, or removed when there was none). Staging
+removes only staged releases (`arca-<version>`) that are neither the current one nor the one before it.
+
+### On Arca OS
+
+Arca OS runs the node as the system unit `arca.service`, from `/usr/local/bin/arca` in the OS image, which is read-only;
+its other file systems may not run programs (`noexec`). The kernel update finds that program, sees that it is on a
+read-only file system, and leaves it alone: the look says `os-managed` (no alert, nothing downloaded, nothing staged).
+The Arca program on Arca OS comes with the OS image, so it is brought up to date by the OS update (incus-osd's channel,
+read by `os_update`): a new image carries the newer `arca`, and the node runs it from its next boot. The kernel update
+and the OS update therefore never touch the same program. A node on Arca OS that runs a program of its own outside the
+image (a link from a writable path, say) still has that program updated by the kernel update.
+
 ## Starting, stopping and restarting instances
 
 `instance_start`, `instance_stop` and `instance_restart` take `{project, instance}` and change the power state of one
@@ -2802,7 +3012,8 @@ optional `cpu` and `memoryMib` (in place of the source's size), `userData` (defa
 
 The proposal reads the description and makes the whole plan, so a description Arca cannot move (a disk that is not on
 Ceph, NICs on two bridges, a disk outside the node's source pool) is refused before the owner is asked. The card names
-the source with its description's digest, the size, the firmware, each disk with where it lands, each NIC with its MAC
+the source with its description's digest, the size, the firmware, each disk with where it lands, the Ceph cluster the
+disks are read from and the one they are written to, each NIC with its MAC
 and address, the network ACL made from the source's security groups and the rules it cannot carry, what cloud-init gets,
 what is not carried, the operator's step before approving (power the source off, never delete it), the downtime and the
 read-back.
@@ -2844,6 +3055,34 @@ ceph auth get-or-create client.arca-import mon 'allow r' osd 'profile rbd-read-o
 
 The copy writes into the Incus pool as the Ceph user Incus already uses for it (the pool's `ceph.user.name`). Without
 `kernel.instanceImport` the node refuses `instance_import` when it is proposed.
+
+**A source on another Ceph cluster.** The source pool may be on another Ceph cluster than the Incus pool, either way
+round: a node on cluster A imports from cluster B, and a node on cluster B from cluster A, with nothing else changed.
+`cephCluster` names the source's cluster by the name of its config file on this node, a name you choose:
+
+1. On the source cluster, make the read-only client there (the `ceph auth get-or-create` line above, run against the
+   source cluster) and keep its keyring.
+2. On this node, put the source cluster's config at `/etc/ceph/<name>.conf` (its `fsid` and `mon_host`; `ceph config
+   generate-minimal-conf` on the source cluster prints it) and the keyring at
+   `/etc/ceph/<name>.client.arca-import.keyring`, readable by the kernel. Leave `/etc/ceph/ceph.conf` as it is: Incus
+   uses it for its own pool.
+3. Set `"cephCluster": "<name>"` in `kernel.instanceImport` and restart `serve`, which reads it when it starts.
+
+The node must reach the source cluster's monitors (ports 3300 and 6789) and every OSD (ports 6800 to 7300) on that
+cluster's public network. `rbd --cluster <name> --id arca-import ls <source pool>` on the node checks the three steps.
+The copy reads the source cluster with that client alone and writes the Incus pool with Incus's own user on Incus's own
+cluster; Arca never writes the source cluster, and the client's read-only grant above keeps anything else run as it
+from writing there. The card's `Ceph` row names both clusters (and says when the two config files name one `fsid`: one
+cluster under two names), and the run's answer says `Copied from the Ceph cluster <name> … to the Ceph cluster
+<Incus's cluster>` (its `ceph` field). A failed copy names the side that failed, its cluster and its client. If you
+change `kernel.instanceImport` while an import waits for the owner, the restart writes that card's `Ceph` row again from
+the new config, which is what the run will read with; without `kernel.instanceImport` the card has no `Ceph` row.
+
+The copy streams through the node, from one `rbd` into the other by an OS pipe (64 KiB): the node holds that pipe and up
+to about 100 MiB per `rbd` process, whatever the disk's size. It takes the data the disk holds (unwritten parts are not sent) over the slowest of the
+source cluster's read, the network to it, and the Incus cluster's write: about 10 seconds per GiB held on 1 Gbit/s
+(100 GiB in about 16 minutes), and on 10 Gbit/s usually what the clusters give, a few hundred MB/s. The downtime row of
+the card counts from the source's power-off, so plan it with this figure.
 
 The proposal keeps the description cut down to what Arca reads: the VM's id, name, state, size, firmware, disks, NICs,
 security group rules, and of the context only the network keys, the SSH keys, the host name and the user data. Every
@@ -4756,6 +4995,7 @@ default is `forS` 60 and `clearForS` 120, so a condition that lasts 59 seconds n
 | `gpu-gone` | 1 for each card that was in the inventory and is gone from it now | 0 | 0 | critical |
 | `host-network-drift` | 1 for each item of the host's declared forwarding and firewall that is not as declared, keyed by `item`, from the root part's status file (see "Host forwarding and the firewall") | 0 | 0 | critical |
 | `runner-signin` | 1 for each runner pool whose last exchange with GitHub failed for a credential reason (401 bad credentials, 404 App not installed, 403 forbidden, or no credential in the kernel), keyed by `pool` (see [`RUNNERS.md`](RUNNERS.md)) | 0 | 0 | critical |
+| `kernel-update-failed` | 1 while the kernel update's last settled run on this node ended `failed` (a release that did not verify), `rolled-back` (a unit that did not come back on it) or `held-back` (the newest release is one it rolled back), from `<stateDir>/kernel-update/state.json`; 0 when it never ran (see "Keeping Arca up to date: the kernel update") | 0 | 0 | warning |
 
 A yes-or-no rule reads 1 when it is bad and 0 when it is fine, so its threshold of 0 fires on 1. The thresholds are a
 starting point. Tune them after a week of data.
@@ -5718,7 +5958,7 @@ token passes through that assistant's conversation.
    Audience (AUD) Tag" on its overview. From now on Cloudflare asks every visitor of that address to prove one of the
    listed e-mail addresses before anything reaches the workspace.
 3. **Arca: `service_create`**, with the workspace's own settings in the call:
-   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"publicUrl": "https://workspace.example.com", "accessTeamDomain": "<your team>.cloudflareaccess.com", "accessAudience": "<the audience tag>", "accessEmails": ["owner@example.com"]}}`.
+   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"publicUrl": "https://workspace.example.com", "accessTeamDomain": "<your team>.cloudflareaccess.com", "accessAudience": "<the audience tag>", "accessEmails": "owner@example.com"}}`.
    `publicUrl` is the address the workspace will have, with no closing slash; the three Access settings are the two
    values noted in step 2 and the same addresses as the policy. No copy of the template is made: these settings are
    given at create, and `service_status` shows them afterwards. The machine is created and stays `stopped`, because
@@ -5750,8 +5990,8 @@ create to choose.
 | Setting | Meaning |
 |---------|---------|
 | `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. It ships empty, which means "not set": the server then starts alone, no gate is started, and every status line says so. |
-| `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the list of e-mail addresses that may sign in (1 to 16, one address in each entry). None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS` (the addresses joined by commas). |
-| `serverImage` | The Automagik server's public image, pinned by digest. The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below). |
+| `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the e-mail addresses that may sign in: text, one address or several separated by commas (`"owner@example.com, second@example.com"`, 1 to 16). A create that gives a list is refused (`settings.accessEmails: expected a string, the type of the template's default`); a workspace made before with a list keeps it, and its own keeper reads it. None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS`: the text unchanged (the gate trims each address and compares without regard to case). An address the script does not take stops the workspace with `settings.accessEmails is 1 to 16 e-mail addresses ...`. |
+| `serverImage` | The Automagik server's public image, pinned by digest (Automagik 3.146.5). The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below), and one with GitHub build provenance from `automagik-si/automagik` (see "The image's provenance" below). |
 
 | `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
 
@@ -5836,8 +6076,9 @@ What to know about this reach:
 
 What to know:
 
-- **The pinned server image.** `settings.serverImage` is Automagik's published release 3.136.4 (the Automagik
-  repository's commit `7aaa512`), the same image the `automagik-server` template pins. It has the gate, its
+- **The pinned server image.** `settings.serverImage` is Automagik's published release 3.146.5 (the Automagik
+  repository's commit `393254f`, image tag `3.146.5-393254fa`), the digest its release record `server-image.json`
+  names. It is no longer the image the `automagik-server` template pins (3.136.4). It has the gate, its
   Cloudflare Access sign-in, and the gate's own sign-in with passkeys, which the tailnet reach uses; both reaches run
   it. The gate's files (`compose.gate.yml`, `gate-entrypoint.mjs`, `gate-access.mjs`, `gate-claim.mjs`) are the same
   as at commit `5fe0be6`, the build pinned up to Arca 0.16.0. The image's health check was rewritten since; it still
@@ -5846,7 +6087,21 @@ What to know:
   `5fe0be6`. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
   tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
   (three paths, the two ports, the claim code's place and the seven variable names) is in one block at the top of
-  `automagik-workspace.sh`, as commit `7aaa512` has them; check the block when you move the pin to a later build.
+  `automagik-workspace.sh`, as commit `393254f` (release 3.146.5) has them; check the block when you move the pin to
+  a later build.
+- **The image's provenance.** The keeper pulls the server's image only once its GitHub build-provenance attestation
+  verifies: a SLSA v1 attestation of that digest whose signing certificate GitHub Actions issued to a workflow of
+  `automagik-si/automagik` (Automagik's `server-image.yml` makes it at each release). The verifier is cosign v3.1.4,
+  Sigstore's own binary for the machine's architecture, which the first boot downloads from Sigstore's GitHub release
+  and keeps only when its sha256 is the one the script fixes; a mismatch fails the first boot with both sums. Each
+  download try is bounded (30 seconds to connect, 600 in all), six tries, and then the first boot fails and says so. It
+  trusts Sigstore's public root, which it carries, and needs no account, key or token. An image that does not
+  verify is not pulled: the status line says `the server is not started: its image's build provenance did not verify,
+  so the image is not pulled (cosign says: ...)` and the keeper tries again after a pause. Every container from the
+  server's image starts with `--pull never`, so Docker never pulls it past the check. The machine needs a route to
+  `github.com` and `release-assets.githubusercontent.com` (where GitHub serves the release's file) at its first boot,
+  and to Sigstore's `tuf-repo-cdn.sigstore.dev` when it verifies. Builds before 3.146.4 that Arca pinned (3.136.4) have
+  no attestation and do not verify.
 - **The first sign-in.** The server signs a browser in with a link that it writes once into its own data. Arca
   never reads that link, the keeper never reads the server's or the gate's data, and the keeper never copies their
   output to the console, so the link is in no `service_logs` answer and reaches no assistant. The way in is
@@ -7243,8 +7498,10 @@ loopback), a server alone when no public address is set, a Docker that does not 
 started), a keeper that cannot start (it stays up and says why), the wait for the token, an empty token, a new token replacing the connector only, each part
 stopping, the gate and the connector following a replaced server, the health words for 401, 200, another code and
 no answer, a start that Docker refuses, the settings that are refused (by the keeper and, on the console, by the
-first boot), the first boot's packages, unit and console lines, its three failures, and that the token is in no
-output, no file outside the machine's memory and no command line.
+first boot), `accessEmails` as text and as a list, the first boot's packages, verifier download, unit and console
+lines, its failures (a verifier whose sha256 is not the fixed one among them), the provenance check before the one
+pull of the server's image (and no start when it fails), `--pull never` on every container from that image, and that
+the token is in no output, no file outside the machine's memory and no command line. It does not run cosign itself.
 
 For the tailnet reach it covers the node's exact command line (a namespace of its own, never the server's,
 userspace networking, the key as a file's path, the state directory), the private network and the relay's command

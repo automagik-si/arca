@@ -10,6 +10,7 @@
       "user.arca.address": "192.0.2.10",
       "user.arca.envkeys": "MODE,URL",
       "user.arca.ports": "8080",
+      "user.arca.runtmpfs": "true",
       "user.arca.template": "oci",
       "user.arcakernel.entry": "service-c1"
     },
@@ -48,7 +49,7 @@
       "server": "https://docker.io",
       "type": "image"
     },
-    "start": true,
+    "start": false,
     "type": "container"
   },
   "s1": {

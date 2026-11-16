@@ -515,6 +515,7 @@ fn an_unreadable_trust_file_adds_no_key_and_arca_status_says_why() {
     assert_eq!(pair.beta_runs.load(Ordering::SeqCst), 0);
 
     let status = StatusHandler {
+        update: None,
         node: "b".repeat(64),
         mode: "kernel",
         applied_seq: AppliedSeq::default(),
@@ -1115,6 +1116,7 @@ fn a_caller_that_may_not_propose_here_may_not_propose_on_a_linked_node() {
 /// A status handler for a kernel whose node id is `node`, with no Incus to reach.
 fn status_of(node: &str) -> StatusHandler {
     StatusHandler {
+        update: None,
         node: node.to_string(),
         mode: "kernel",
         applied_seq: AppliedSeq::default(),

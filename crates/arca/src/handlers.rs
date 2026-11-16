@@ -365,6 +365,7 @@ pub struct Ticker<S: TickStore> {
     host_network: Option<std::path::PathBuf>,
     os_update: Option<OsUpdatePublished>,
     runners: Option<arca_runners::SignInBoard>,
+    kernel_update: Option<std::path::PathBuf>,
 }
 
 impl<S: TickStore> Ticker<S> {
@@ -384,7 +385,15 @@ impl<S: TickStore> Ticker<S> {
             host_network: None,
             os_update: None,
             runners: None,
+            kernel_update: None,
         }
+    }
+
+    /// The same ticker, which reads the kernel updater's last result in the state directory `dir` on each tick for the
+    /// `kernel-update-failed` rule.
+    pub fn with_kernel_update(mut self, dir: std::path::PathBuf) -> Self {
+        self.kernel_update = Some(dir);
+        self
     }
 
     /// The same ticker, which publishes the sampler's newest update state to `cell` on each tick, for `os_update`.
@@ -446,6 +455,9 @@ impl<S: TickStore> Ticker<S> {
         }
         // A node without pools has a known, empty list: the rule is never unknown there.
         inputs.runner_signin = Some(crate::runners::alert_input(self.runners.as_ref(), now_ms));
+        if let Some(dir) = &self.kernel_update {
+            inputs.kernel_update = Some(crate::self_update::alert_input(dir, now_ms));
+        }
         let points = export::points(&self.sampler, &inputs);
         let mut snapshot = self.engine.tick(&inputs, points, now_ms);
         snapshot.sample_at = self.sampler.latest().map(|sample| sample.at);
@@ -492,6 +504,8 @@ pub fn run_row<R: IncusRead>(sampler: &Sampler<R>, now: u64) -> Value {
 
 /// `arca_status`: the node, whether Incus answers now, and how long the server has run.
 pub struct StatusHandler {
+    /// The kernel updater's settings and the state directory its last result is in, for `update`.
+    pub update: Option<(crate::config::UpdateConfig, PathBuf)>,
     pub node: String,
     pub mode: &'static str,
     pub applied_seq: AppliedSeq,
@@ -853,6 +867,9 @@ impl ToolHandler for StatusHandler {
         }
         if let Some(page) = &self.page {
             status["approvalPage"] = page.json();
+        }
+        if let Some((update, dir)) = &self.update {
+            status["update"] = crate::self_update::status_json(update, dir);
         }
         Ok(status)
     }
@@ -1407,6 +1424,16 @@ pub fn plan_handlers_versioned(
             .and_then(crate::vm_import::ImportBackend::from_node)
             .map(Arc::new),
     );
+    // A waiting import's card names the source cluster the run reads: the one of this node's config, the config the
+    // backend above was made from. A card proposed under another config is written again before anything is served.
+    if let Ok(mut kernel) = kernel.lock() {
+        let import = node
+            .as_deref()
+            .and_then(|node| node.kernel.instance_import.as_ref());
+        kernel.reword_import_cards(|args, stored| {
+            crate::vm_import::row_after_restart(import, args, stored)
+        });
+    }
     let host_network_socket = node.as_ref().map_or_else(
         || std::path::PathBuf::from(arca_hostnet::SOCKET_FILE),
         |node| node.host_network.socket.clone(),
@@ -1872,7 +1899,7 @@ impl ToolHandler for ActionPropose {
         } else if let (ActionKind::InstanceImport, Some(node)) = (action, &self.node) {
             // A node that names no source pool, or a source whose disks are elsewhere, is refused now, so the owner is
             // never asked to approve an import this node cannot run.
-            crate::vm_import::check_proposal(node, &payload)?;
+            card_fact = Some(crate::vm_import::check_proposal(node, &payload)?);
             payload
         } else if let (ActionKind::FunctionRemove, Some(_)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
@@ -1936,6 +1963,8 @@ impl ToolHandler for ActionPropose {
             // only when it does, and otherwise why the database is created stopped. Both were read when the
             // proposal was given its template's fingerprint, from that one read of the template.
             ActionKind::ServiceCreate | ActionKind::PostgresCreate => card_fact.take(),
+            // The card of an import names the Ceph cluster its disks are read from and the one they are written to.
+            ActionKind::InstanceImport => card_fact.take(),
             // The card of a host restore says what the host has drifted from, read live from the root part now.
             ActionKind::HostNetworkRestore => Some(crate::host_network::proposal_fact(
                 &self.host_network_socket(),
@@ -2692,6 +2721,34 @@ fn terminal_question(proposal: &Value, session: bool) -> String {
         "Approving here is recorded as approved in the terminal by the admin token, not by the owner's passkey."
     });
     text
+}
+
+/// How many cards wait for the owner now: the rows `owner_approval_pending` lists (action plans that have not lapsed,
+/// delete plans within their time, and pending owner approval requests), counted. `None` when the requests cannot be
+/// read. The kernel updater waits while it is above zero.
+pub fn waiting_cards(
+    kernel: &Mutex<Kernel>,
+    requests: &crate::approval_requests::ApprovalRequests,
+    now: u64,
+) -> Option<usize> {
+    let kernel = kernel.lock().ok()?;
+    let actions = kernel
+        .action_proposals()
+        .iter()
+        .filter(|proposal| !proposal.expired(now))
+        .count();
+    let plans = kernel
+        .pending_plans()
+        .iter()
+        .filter(|plan| now.saturating_sub(plan.created_ms) <= PLAN_TTL_MS)
+        .count();
+    let requests = requests
+        .list(&kernel, now)
+        .ok()?
+        .iter()
+        .filter(|request| request["state"] == "pending")
+        .count();
+    Some(actions + plans + requests)
 }
 
 /// The verb that lists everything waiting for the owner and asks the owner's signed-in session about each plan.
@@ -5954,7 +6011,9 @@ mod service_follow;
 mod service_omni;
 #[path = "service_routes.rs"]
 mod service_routes;
-pub use service_follow::{Attestation, FollowEdges, Followed, Follower, spawn_follower};
+pub use service_follow::{
+    Attestation, FollowEdges, Followed, Follower, Version as ReleaseVersion, spawn_follower,
+};
 #[path = "service_reconfigure.rs"]
 mod service_reconfigure;
 #[path = "service_update.rs"]
@@ -6854,6 +6913,7 @@ pub(crate) fn adopted_config(
         follow_version: None,
         no_new_privileges: false,
         raw_lxc: Vec::new(),
+        run_tmpfs: false,
         edge: None,
     })
 }
@@ -7066,6 +7126,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         follow_version: None,
         no_new_privileges: parts.template.no_new_privileges,
         raw_lxc: parts.template.raw_lxc.clone(),
+        run_tmpfs: parts.template.memory_run(),
         edge: parts.template.edge.then(crate::route::EdgeRecord::default),
     })
 }
@@ -7153,6 +7214,7 @@ fn vm_service_config(
         follow_version: None,
         no_new_privileges: false,
         raw_lxc: Vec::new(),
+        run_tmpfs: false,
         edge: None,
     })
 }
@@ -8598,6 +8660,9 @@ impl ServiceHandler {
                 )?;
                 if !config.start {
                     made["stoppedBecause"] = json!(stopped_because(start, forced));
+                }
+                if config.run_tmpfs {
+                    service_update::say_run(&self.cfg, &config, &mut made);
                 }
                 // The node's front was made, or made again at another address: every tenant service's ACL follows now.
                 let front = self
