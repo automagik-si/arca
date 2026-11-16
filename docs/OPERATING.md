@@ -8221,3 +8221,28 @@ the CPUs and memory the job sees, and the seconds the toolchain, the build and t
 the class (`arca-large`, which `test` uses, or `arca`). With `pool_cache` off, both build from nothing, which
 compares the machines; with it on, the pool uses its kept cache as `ci.yml` does, which shows what an everyday run
 costs.
+
+
+The workspace template requires `repoUrl` at creation: a GitHub HTTPS URL with an owner and repository, with no
+credentials. `repoRef` may name a branch or tag; leaving it empty selects the remote default branch. Checkout delivery
+runs before the first server launch. A stopped server waits when the checkout identity or roster provenance cannot be
+verified. Existing commits and untracked files are retained; the keeper never fetches or resets an existing checkout.
+
+The keeper records checkout provenance in `/var/lib/automagik-workspace/checkout.json`, outside `/data`. File backups
+must carry this marker and any pending `checkout.json.new` alongside the workspace's `data/` and `gate/` directories.
+VM snapshots already include them. Restoring a checkout with an untracked roster but without its marker leaves its
+provenance UNKNOWN and prevents seeding. The roster remains intact. Independent receipt verification and an owner
+recovery screen are UNAVAILABLE; no roster identity is inferred from its origin or JSON format.
+
+Both repository roster paths are protected: `.herdr/bots.json` (v1) and `.automagik/bots/bots.json` (v2). Either is
+foreign when tracked at clone or present before this instance's first server launch. The home registry at
+`/data/bots/bots.json` is separate. The keeper persists `seedStartedAt` before launching the container, so a fast
+entrypoint may safely create this instance's roster before Docker returns.
+
+Arca supplies `GITHUB_TOKEN`, with one repository's contents and pull requests write permissions and metadata read
+permission. The keeper copies rotations into `/data/secrets/github-token`, owned by the image user with mode 0600,
+and configures only an absent GitHub credential helper. It preserves any effective Git author identity; when both
+name and email are absent, the App bot's verified numeric user ID supplies its no-reply email. The companion repository
+App change supplies that metadata. The App is created and installed by the owner later; no live installation is part
+of template delivery. An Arca outage longer than the credential lifetime interrupts Git operations until refresh
+resumes; it does not shut down the workspace.

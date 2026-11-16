@@ -220,13 +220,13 @@ RELAY_PROGRAM='const net=require("net");const [ip,port]=process.argv.slice(1);ne
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it.
 WS_PROGRAMS='docker jq systemctl apt-get hostname sha256sum install tr cut date sleep cat chmod chown mv rm grep
-tail mkdir stat curl uname readlink'
+tail mkdir stat curl uname readlink git setpriv find rmdir'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
 # which docker.io only recommends. The ones the image already carries are named too, so the list says what the script
 # stands on.
-WS_PACKAGES='docker.io docker-cli jq ca-certificates coreutils curl'
+WS_PACKAGES='docker.io docker-cli jq ca-certificates coreutils curl git util-linux findutils'
 
 say() { printf 'arca-automagik-workspace: %s\n' "$*"; }
 now() { date +%s; }
@@ -606,6 +606,18 @@ load_settings() {
     refuse "settings.automagikPnpm must name the absolute path of pnpm 10 baked into the image; AUTOMAGIK_PNPM is required to start the CLI store"
     return
   fi
+  REPO_URL=$(jq -r '.repoUrl | if type == "string" then . else "" end' "$WS_SETTINGS")
+  REPO_REF=$(jq -r '.repoRef | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
+  if ! [[ $REPO_URL =~ ^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] ||
+    ! REPO_IDENTITY=$(github_identity "$REPO_URL"); then
+    refuse "settings.repoUrl is required: https://github.com/<owner>/<repo>[.git], with no credentials or other host"
+    return
+  fi
+  if [ -n "$REPO_REF" ] && { ! [[ $REPO_REF =~ ^[A-Za-z0-9._/-]+$ ]] ||
+    ! git check-ref-format --branch "$REPO_REF" >/dev/null 2>&1; }; then
+    refuse "settings.repoRef must be a plain Git ref name; empty selects the remote default branch"
+    return
+  fi
   # The gate takes its origin exactly as a browser writes it, and stops when it is written another way: no path, no
   # closing slash, and a port only when it is not https's own 443.
   if [ -z "$url" ]; then
@@ -661,6 +673,258 @@ load_settings() {
 
 pinned() {
   [[ $1 =~ ^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$ ]]
+}
+
+# Git always runs as the image user, with the same HOME as its agents. No secret is in argv or the environment.
+checkout_git() {
+  HOME=$WS_DATA setpriv --reuid "${WS_DATA_OWNER%%:*}" --regid "${WS_DATA_OWNER##*:}" --clear-groups -- git "$@"
+}
+
+# Accept only GitHub HTTPS identities. Userinfo in an existing origin is discarded before any log is made.
+github_identity() {
+  local value=${1,,} path
+  [[ $value =~ ^https://([^/@]+@)?github\.com/([a-z0-9-]+)/([a-z0-9._-]+)$ ]] || return 1
+  path=${BASH_REMATCH[2]}/${BASH_REMATCH[3]}
+  path=${path%.git}
+  [ "${path#*/}" != . ] && [ "${path#*/}" != .. ] && [ -n "${path#*/}" ] || return 1
+  printf 'github.com/%s' "$path"
+}
+
+checkout_wait() {
+  CHECKOUT_READY=false
+  if [ "$CHECKOUT_REASON" != "$*" ]; then
+    say "checkout not ready: $*"
+    CHECKOUT_REASON=$*
+  fi
+  return 1
+}
+
+# A copied value is used only as file contents. Digest changes bypass the clone's existing backoff.
+checkout_token() {
+  local digest
+  [ -s "$WS_SECRETS/GITHUB_TOKEN" ] || return 0
+  digest=$(sha256sum <"$WS_SECRETS/GITHUB_TOKEN" | cut -d' ' -f1)
+  [ "$digest" != "$CHECKOUT_TOKEN_DIGEST" ] || return 0
+  install -d -m 0700 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$WS_RUN-github" || return 1
+  install -m 0600 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" \
+    "$WS_SECRETS/GITHUB_TOKEN" "$WS_RUN-github/token.new" || return 1
+  mv "$WS_RUN-github/token.new" "$WS_RUN-github/token" || return 1
+  install -m 0600 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" \
+    "$WS_RUN-github/token" "$WS_DATA/secrets/github-token.new" || return 1
+  mv "$WS_DATA/secrets/github-token.new" "$WS_DATA/secrets/github-token" || return 1
+  CHECKOUT_TOKEN_DIGEST=$digest
+  proven checkout
+}
+
+# The API's diagnostics and body never reach logs. A failure means offline, not an identity match.
+checkout_repo_id() {
+  local token answer
+  CHECKOUT_REMOTE_ID=null
+  [ -s "$WS_RUN-github/token" ] || return 1
+  token=$(cat "$WS_RUN-github/token")
+  [[ $token =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  answer=$(curl --silent --fail --connect-timeout 5 --max-time 15 --config - \
+    "https://api.github.com/repos/${REPO_IDENTITY#github.com/}" 2>/dev/null <<EOF
+header = "Authorization: Bearer $token"
+header = "Accept: application/vnd.github+json"
+header = "X-GitHub-Api-Version: 2022-11-28"
+EOF
+  ) || return 1
+  CHECKOUT_REMOTE_ID=$(jq -er '.id | select(type == "number" and . > 0 and floor == .)' <<<"$answer" 2>/dev/null) || { CHECKOUT_REMOTE_ID=null; return 1; }
+}
+
+checkout_marker_valid() {
+  jq -e --arg repo "$REPO_IDENTITY" '
+    type == "object" and .repo == $repo and
+    (.repoId == null or (.repoId | type == "number" and . > 0 and floor == .)) and
+    (.clonedAt | type == "number" and . > 0) and
+    (.rosterTrackedAtClone | type == "boolean") and
+    (.rosterBeforeSeed == null or (.rosterBeforeSeed | type == "boolean")) and
+    (.seedStartedAt == null or (.seedStartedAt | type == "number" and . > 0)) and
+    (if .seedStartedAt != null then .rosterBeforeSeed == false else true end)
+  ' "$1" >/dev/null 2>&1
+}
+
+checkout_tracked_roster() {
+  checkout_git -C "$1" ls-files --error-unmatch .herdr/bots.json >/dev/null 2>&1 ||
+    checkout_git -C "$1" ls-files --error-unmatch .automagik/bots/bots.json >/dev/null 2>&1
+}
+checkout_current_roster_tracked() {
+  checkout_git -C "$CHECKOUT_TARGET" cat-file -e HEAD:.herdr/bots.json >/dev/null 2>&1 ||
+    checkout_git -C "$CHECKOUT_TARGET" cat-file -e HEAD:.automagik/bots/bots.json >/dev/null 2>&1
+}
+checkout_has_roster() {
+  local path
+  for path in .herdr/bots.json .automagik/bots/bots.json; do
+    [ ! -e "$CHECKOUT_TARGET/$path" ] && [ ! -L "$CHECKOUT_TARGET/$path" ] || return 0
+  done
+  return 1
+}
+checkout_roster_valid() {
+  # Automagik's file contracts: .herdr is v1; .automagik/bots is the repository's v2 registry.
+  # The separate /data/bots/bots.json is the home's registry, never checkout provenance.
+  if [ -e "$CHECKOUT_TARGET/.herdr/bots.json" ] || [ -L "$CHECKOUT_TARGET/.herdr/bots.json" ]; then
+    jq -e 'type == "object" and .version == 1 and (.bots | type == "array")' \
+      "$CHECKOUT_TARGET/.herdr/bots.json" >/dev/null 2>&1 || return 1
+  fi
+  if [ -e "$CHECKOUT_TARGET/.automagik/bots/bots.json" ] || [ -L "$CHECKOUT_TARGET/.automagik/bots/bots.json" ]; then
+    jq -e 'type == "object" and .version == 2 and (.bots | type == "array") and
+      (has("projects") or has("shown") | not) and
+      ([.. | objects | has("sessionId") or has("sessions") or has("segments")] | any | not)' \
+      "$CHECKOUT_TARGET/.automagik/bots/bots.json" >/dev/null 2>&1 || return 1
+  fi
+}
+
+# Marker writes are root 0600 in a root-only directory outside /data and outside the checkout.
+checkout_marker_new() {
+  local tracked=$1
+  (umask 077; jq -n --arg repo "$REPO_IDENTITY" --argjson id "$CHECKOUT_REMOTE_ID" \
+    --argjson at "$(now)" --argjson tracked "$tracked" \
+    '{repo:$repo,repoId:$id,clonedAt:$at,rosterTrackedAtClone:$tracked,rosterBeforeSeed:null,seedStartedAt:null}' >"$CHECKOUT_MARKER.new")
+}
+
+checkout_authorship() {
+  local helper name email
+  helper=$(checkout_git config --file "$WS_DATA/.gitconfig" --get credential.https://github.com.helper 2>/dev/null) || helper=''
+  # Presence, even an empty helper, belongs to the owner.
+  if ! checkout_git config --file "$WS_DATA/.gitconfig" --get credential.https://github.com.helper >/dev/null 2>&1; then
+    # Expanded by Git's helper shell, never by this keeper.
+    # shellcheck disable=SC2016
+    helper='!f() { if [ "$1" = get ]; then printf "username=x-access-token\\npassword="; cat /data/secrets/github-token; printf "\\n"; fi; }; f'
+    checkout_git config --file "$WS_DATA/.gitconfig" credential.https://github.com.helper "$helper" || return 1
+  fi
+  name=$(checkout_git -C "$CHECKOUT_TARGET" config --get user.name 2>/dev/null) || name=''
+  email=$(checkout_git -C "$CHECKOUT_TARGET" config --get user.email 2>/dev/null) || email=''
+  if [ -z "$name$email" ]; then
+    # GitHub's verified bot identity is delivered with the credential; never infer its user ID from an App ID.
+    [ -s "$WS_SECRETS/GITHUB_BOT_IDENTITY" ] || return 0
+    local identity bot_id bot_login
+    # Read the verified ID and login as one bundle; separate file updates must not mix two identities.
+    identity=$(cat "$WS_SECRETS/GITHUB_BOT_IDENTITY") || return 1
+    bot_id=$(jq -er '.id | select(type == "string" and test("^[1-9][0-9]*$"))' <<<"$identity" 2>/dev/null) || return 1
+    bot_login=$(jq -er '.login | select(type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\[bot\\]$"))' <<<"$identity" 2>/dev/null) || return 1
+    checkout_git config --file "$WS_DATA/.gitconfig" user.name "$bot_login" &&
+      checkout_git config --file "$WS_DATA/.gitconfig" user.email "$bot_id+$bot_login@users.noreply.github.com" || return 1
+  fi
+}
+
+CHECKOUT_READY=false CHECKOUT_REASON='' CHECKOUT_TOKEN_DIGEST='' CHECKOUT_ID_CHECKED=false
+keep_checkout() {
+  local origin tracked=false temp marker_id clone_mode=0700
+  CHECKOUT_READY=false
+  CHECKOUT_TARGET=$WS_DATA/workspace
+  if [ "$MEMBER_RUNNER" = true ]; then
+    CHECKOUT_TARGET=$WS_WORKSPACE
+    clone_mode=0711
+  fi
+  CHECKOUT_MARKER=${WS_DATA%/*}/checkout.json
+  temp=$CHECKOUT_TARGET.arca-clone
+  checkout_token || { checkout_wait 'the credential copy failed; it will be tried again'; return; }
+  if [ ! -e "$CHECKOUT_TARGET/.git" ]; then
+    # Only the reserved, disposable clone is removed. Other target contents are never touched.
+    if [ -d "$CHECKOUT_TARGET" ]; then
+      local entries
+      entries=$(find "$CHECKOUT_TARGET" -mindepth 1 -maxdepth 1 -print -quit)
+      [ -z "$entries" ] || { checkout_wait 'the target is not empty and has no .git; keep its data and choose an empty checkout'; return; }
+    elif [ -e "$CHECKOUT_TARGET" ] || [ -L "$CHECKOUT_TARGET" ]; then
+      checkout_wait 'the target is not a directory; keep its data and choose an empty checkout'; return
+    fi
+    due checkout || return 0
+    rm -rf -- "$temp"
+    rm -f -- "$CHECKOUT_MARKER.new"
+    [ -s "$WS_RUN-github/token" ] || { failed checkout; checkout_wait 'checkout waits for GITHUB_TOKEN; Arca must mint a repository token'; return; }
+    install -d -m "$clone_mode" -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$temp" || return 1
+    local helper
+    # Path is configuration, never the credential. A single-quoted shell word protects it in Git's helper shell.
+    helper="!f() { if [ \"\$1\" = get ]; then printf 'username=x-access-token\\npassword='; cat '${WS_RUN//\'/\'\\\'\'}-github/token'; printf '\\n'; fi; }; f"
+    local ref=()
+    [ -z "$REPO_REF" ] || ref=(--branch "$REPO_REF")
+    if ! checkout_git -c credential.helper= -c "credential.helper=$helper" clone "${ref[@]}" -- "$REPO_URL" "$temp" >/dev/null 2>&1; then
+      rm -rf -- "$temp"; rm -f -- "$CHECKOUT_MARKER.new"
+      failed checkout
+      checkout_wait 'clone failed (credential, permission or network); Arca must supply a token with repository access; retrying after a pause'
+      return
+    fi
+    checkout_tracked_roster "$temp" && tracked=true
+    checkout_repo_id || CHECKOUT_REMOTE_ID=null
+    if ! checkout_marker_new "$tracked"; then rm -rf -- "$temp"; return 1; fi
+    # rmdir is the final empty-target check: no file that arrived while cloning can be replaced.
+    if { [ ! -d "$CHECKOUT_TARGET" ] || rmdir -- "$CHECKOUT_TARGET"; } && mv -- "$temp" "$CHECKOUT_TARGET"; then
+      mv -- "$CHECKOUT_MARKER.new" "$CHECKOUT_MARKER" || return 1
+    else
+      rm -rf -- "$temp"; rm -f -- "$CHECKOUT_MARKER.new"
+      checkout_wait 'the target changed during clone; its data is kept; retry with an empty target'; return
+    fi
+  fi
+  origin=$(checkout_git -C "$CHECKOUT_TARGET" config --get remote.origin.url 2>/dev/null) || origin=''
+  origin=$(github_identity "$origin") || { checkout_wait 'origin is not a GitHub URL; set the intended origin before starting'; return; }
+  [ "$origin" = "$REPO_IDENTITY" ] || { checkout_wait "origin is $origin, repoUrl is $REPO_IDENTITY; choose the intended repository before starting"; return; }
+  if [ ! -e "$CHECKOUT_MARKER" ] && checkout_marker_valid "$CHECKOUT_MARKER.new"; then
+    mv -- "$CHECKOUT_MARKER.new" "$CHECKOUT_MARKER" || return 1
+  fi
+  if [ -e "$CHECKOUT_MARKER" ] && ! checkout_marker_valid "$CHECKOUT_MARKER"; then
+    # Never overwrite an earlier corrupt marker: it may be needed for owner recovery.
+    [ ! -e "$CHECKOUT_MARKER.corrupt" ] || { checkout_wait 'checkout marker is corrupt; the earlier corrupt marker is kept for the owner'; return; }
+    mv -- "$CHECKOUT_MARKER" "$CHECKOUT_MARKER.corrupt" || return 1
+  fi
+  if [ ! -e "$CHECKOUT_MARKER" ]; then
+    if checkout_has_roster; then
+      if checkout_current_roster_tracked; then
+        checkout_wait 'foreign roster tracked in the checkout; the roster is kept and the seed is blocked'
+      else
+        checkout_wait 'roster provenance unknown: marker missing; the roster is kept'
+      fi
+      # Receipt verification and the owner's recovery screen are UNAVAILABLE. Never infer provenance.
+      return
+    fi
+    checkout_repo_id || CHECKOUT_REMOTE_ID=null
+    checkout_marker_new false && mv -- "$CHECKOUT_MARKER.new" "$CHECKOUT_MARKER" || return 1
+  fi
+  if [ "$CHECKOUT_ID_CHECKED" != true ]; then
+    if checkout_repo_id; then
+      marker_id=$(jq -r '.repoId' "$CHECKOUT_MARKER")
+      if [ "$marker_id" != null ] && [ "$marker_id" != "$CHECKOUT_REMOTE_ID" ]; then
+        checkout_wait 'repository id changed; keep this checkout and ask the owner to select the intended repository'; return
+      fi
+      if [ "$marker_id" = null ]; then
+        (umask 077; jq --argjson id "$CHECKOUT_REMOTE_ID" '.repoId=$id' "$CHECKOUT_MARKER" >"$CHECKOUT_MARKER.new") &&
+          mv -- "$CHECKOUT_MARKER.new" "$CHECKOUT_MARKER" || return 1
+      fi
+    else
+      say 'checkout repository id check skipped: GitHub is unavailable; the origin matches; checked again at the next boot'
+    fi
+    CHECKOUT_ID_CHECKED=true
+  fi
+  if [ "$(jq -r '.rosterTrackedAtClone' "$CHECKOUT_MARKER")" = true ] ||
+    [ "$(jq -r '.rosterBeforeSeed' "$CHECKOUT_MARKER")" = true ]; then
+    checkout_wait 'foreign roster predates this seed; the roster is kept and the seed is blocked'; return
+  fi
+  if checkout_has_roster; then
+    if [ "$(jq -r '.seedStartedAt' "$CHECKOUT_MARKER")" = null ]; then
+      (umask 077; jq '.rosterBeforeSeed=true' "$CHECKOUT_MARKER" >"$CHECKOUT_MARKER.new") &&
+        mv -- "$CHECKOUT_MARKER.new" "$CHECKOUT_MARKER" || return 1
+      checkout_wait 'foreign roster is present before seed; the roster is kept and the seed is blocked'; return
+    fi
+    if ! checkout_roster_valid; then
+      checkout_wait 'foreign roster is not the expected roster format; the roster is kept and the seed is blocked'; return
+    fi
+  fi
+  checkout_authorship || { checkout_wait 'Git authentication or authorship could not be configured; retry after fixing the configuration'; return; }
+  CHECKOUT_READY=true CHECKOUT_REASON=''
+  proven checkout
+}
+
+# Persist provenance BEFORE docker run: the entrypoint may seed before docker returns.
+checkout_before_seed() {
+  local before=false
+  [ "$CHECKOUT_READY" = true ] || return 1
+  if [ "$(jq -r '.seedStartedAt' "$CHECKOUT_MARKER")" = null ]; then
+    checkout_has_roster && before=true
+    (umask 077; jq --argjson before "$before" --argjson at "$(now)" \
+      '.rosterBeforeSeed=$before | .seedStartedAt=(if $before then null else $at end)' \
+      "$CHECKOUT_MARKER" >"$CHECKOUT_MARKER.new") && mv -- "$CHECKOUT_MARKER.new" "$CHECKOUT_MARKER" || return 1
+    [ "$before" = false ] || { checkout_wait 'foreign roster present before the first server start; the roster is kept'; return; }
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -779,6 +1043,7 @@ keep_server() {
     failed server
     return 0
   fi
+  [ "$CHECKOUT_READY" = true ] || return 0
   due server || return 0
   server_image_here || return 0
   say "starting the server"
@@ -789,6 +1054,7 @@ keep_server() {
   [ "${MEMBER_RUNNER:-false}" != true ] ||
     mounts+=(--mount "type=bind,source=$WS_WORKSPACE,target=$WS_WORKSPACE"
       --mount "type=bind,source=$WS_RUNNER_SOCKETS,target=$WS_RUNNER_SOCKETS")
+  checkout_before_seed || return 0
   if out=$(docker run -d --name "$SERVER" --pull never --restart no "${mounts[@]}" \
     --user "$WS_DATA_OWNER" -e "HOME=$NATIVE_HOME" \
     -e "AUTOMAGIK_HOME=$AUTOMAGIK_HOME" -e "AUTOMAGIK_BOTS_HOME=$AUTOMAGIK_BOTS_HOME" \
@@ -1327,6 +1593,9 @@ keep_workspace() {
     say "workspace $WS_NAME: the server, the gate on loopback port $GATE_PORT and the tunnel, in one network namespace; $(public_state)"
   fi
   while :; do
+    if ! keep_checkout && [ -z "$CHECKOUT_REASON" ]; then
+      checkout_wait 'checkout files could not be prepared; fix disk space and directory permissions before retrying'
+    fi
     keep_server
     keep_gate
     keep_relay
