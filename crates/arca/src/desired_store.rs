@@ -79,6 +79,8 @@ pub struct DesiredStore {
     applied: Option<Applied>,
     converged: Vec<Entry>,
     retained: Retained,
+    // Each entry must save its durable binding before another binding can replace it.
+    unsaved_bindings: BTreeSet<EntryId>,
 }
 
 impl DesiredStore {
@@ -119,6 +121,7 @@ impl DesiredStore {
             applied,
             converged: state.converged,
             retained,
+            unsaved_bindings: BTreeSet::new(),
         })
     }
 
@@ -135,6 +138,10 @@ impl DesiredStore {
     /// The document the gate last applied, if any.
     pub fn applied(&self) -> Option<&Applied> {
         self.applied.as_ref()
+    }
+
+    pub(crate) fn binding_unsaved(&self, entry: &EntryId) -> bool {
+        self.unsaved_bindings.contains(entry)
     }
 
     /// The entries that applied with their current config, as the reconciler last reported them.
@@ -221,6 +228,67 @@ impl DesiredStore {
         Ok(signed)
     }
 
+    /// Binding facts are already durable. Publish the repaired in-memory record
+    /// even if its cache cannot be saved; reopen repeats this before any apply.
+    pub(crate) fn recover_bindings(
+        &mut self,
+        events: &[arca_kernel::journal::BindingEvent],
+        now_ms: u64,
+    ) -> Result<(), KernelError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let Some(mut signed) = self.current.clone() else {
+            return Ok(());
+        };
+        let old = signed.document.clone();
+        let mut converged = self.converged.clone();
+        let mut projected = BTreeSet::new();
+        for event in events {
+            for entry in signed
+                .document
+                .entries
+                .iter_mut()
+                .chain(converged.iter_mut())
+            {
+                let before = entry.digest.clone();
+                crate::service_rebind::project(entry, event)?;
+                if entry.digest != before {
+                    projected.insert(entry.id.clone());
+                }
+            }
+        }
+        if signed.document.entries == old.entries && converged == self.converged {
+            return Ok(());
+        }
+        if signed.document.entries != old.entries {
+            signed.document.seq = old.seq + 1;
+            signed.document.prev = Some(old.digest());
+            signed.document.issued_at = iso_utc(now_ms);
+            signed.document.expires_at = iso_utc(now_ms.saturating_add(DOCUMENT_TTL_MS));
+            signed = sign_document(signed.document, &self.key);
+            let mut gate = DesiredStateGate::new(self.signer(), self.applied.clone());
+            if !matches!(gate.accept(&signed, now_ms), Ok(Target::Apply(_))) {
+                return Err(KernelError::Journal(
+                    "repaired binding document was refused".into(),
+                ));
+            }
+        }
+        let next = StateFile {
+            current: Some(signed.clone()),
+            converged,
+            retained: records(&self.retained),
+        };
+        self.applied = Some(Applied {
+            seq: signed.document.seq,
+            digest: signed.document.digest(),
+        });
+        self.current = next.current.clone();
+        self.converged = next.converged.clone();
+        self.unsaved_bindings.extend(projected);
+        self.persist(&next)
+    }
+
     /// Persists the converged set and the retained set the reconciler now holds, keeping the current document. Nothing changes
     /// in memory unless the state is written.
     pub fn save_applied(
@@ -241,7 +309,7 @@ impl DesiredStore {
 
     /// Writes `state` to a new file, makes it durable, and renames it over the state file. A failure leaves the old file in
     /// place.
-    fn persist(&self, state: &StateFile) -> Result<(), KernelError> {
+    fn persist(&mut self, state: &StateFile) -> Result<(), KernelError> {
         let bytes = serde_json::to_vec(state).map_err(|_| KernelError::Io {
             path: STATE_FILE.to_string(),
             why: "the state does not serialize".to_string(),
@@ -267,6 +335,7 @@ impl DesiredStore {
         File::open(&self.dir)
             .and_then(|dir| dir.sync_all())
             .map_err(|error| io_error(&self.dir, &error))?;
+        self.unsaved_bindings.clear();
         Ok(())
     }
 }

@@ -12,6 +12,8 @@ bring its record back; a failed candidate read is skipped until a later service 
 `service_release` can forget a missing adopted instance without an import allowlist entry, freeing its name and
 address for `service_create`.
 
+`service_rebind` follows an approved replacement instance and its observed root/data storage without changing backups; after one re-bind the node cannot go back to an older Arca, whose reader refuses the binding record.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows

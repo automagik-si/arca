@@ -25,6 +25,12 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
         "paramsDigest": "b".repeat(64),
         "statement": "s",
     });
+    let binding = |uuid: &str| {
+        json!({
+            "instance":{"kind":"instance","project":"arcak-svc","name":"db1","uuid":uuid},
+            "root_pool":"pool1","data_volume":null
+        })
+    };
     vec![
         (
             "approval_submit",
@@ -74,6 +80,12 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
                 }
             }),
             "confirm is false: nothing was imported and no approval was spent",
+        ),
+        (
+            "service_rebind",
+            json!({ "name": "db1", "approval": "0123456789abcdef" }),
+            json!({ "rebound": true, "name": "db1", "from": binding("old"), "to": binding("new") }),
+            "confirm is false: nothing was rebound and no approval was spent",
         ),
         (
             "service_release",

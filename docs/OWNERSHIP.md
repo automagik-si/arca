@@ -206,6 +206,18 @@ Source: `arca_kernel::ownership::IncusKind::has_uuid`, `write::uuid_of`, `UnixIn
 (`crates/arca-providers/tests/incus_provider.rs`), and `the_journal_an_earlier_probe_left_opens_with_its_volume_adopted_by_name`
 (`crates/arca-reconcile/tests/probe.rs`, over the journal fixture `crates/arca-reconcile/tests/fixtures/journal-volume-without-uuid.jsonl`).
 
+An owned service replaced by a copy may follow its new UUID only through an approved
+`service_rebind`. Its observed entry mark must still be its own, with no contested, retiring or
+retained ownership; complete family evidence must identify one replacement under the service's
+own name and project. Approval binds the observed UUIDs, config and root/data storage, checked
+again immediately before the append. One durable binding event translates the live create and
+patch addresses, including the custom volume's project, pool and source name. The explicit data
+locator has the old pool/name fallback for older service records; the root pool is separate.
+Replay projects these storage facts into the service record before resolve or reconciliation.
+A renamed backup is allowed, but no backup is rewritten, detached or deleted by this action.
+Its surviving ACL reference can prevent ACL removal after the current service objects are gone.
+Source: `arca::service_rebind`, `DesiredStore::recover_bindings` and `Kernel::commit_binding`.
+
 **Rule 21.** A delete reaches an object only through a tombstone that the writer has read back. A plugin cannot ask the
 kernel to delete an object through its context.
 Source: `arca_kernel::plugin::Ctx::effect` refuses `IncusDelete` (`NotDeclared`); test

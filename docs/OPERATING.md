@@ -1872,6 +1872,33 @@ lock. Any reconciliation failure or partial plan run is a typed refusal naming w
 the approval is spent, so another try needs a new one. Secret files are removed only after full success. An adopted
 record is refused.
 
+### Following a service instance replaced by a copy
+
+If a copy was swapped into a service's name, its new UUID makes ordinary service verbs refuse
+with "service ownership or UUID changed". Ask for an approved re-bind:
+
+```json
+{"action":"service_rebind","args":{"name":"sample"}}
+```
+
+Send this to `action_propose` with doctor scope. The owner's card names the old and replacement
+identities, root pools and data volumes. Arca reads them from Incus; the caller supplies only the
+service name. If identity, ownership, config or devices change before execution, propose again.
+Do not start or stop the copy between the card and approval: runtime config also participates in the check.
+If the binding is journalled but the service record cannot be saved, another re-bind of that service is
+refused until a successful state save; restore state-directory writes and restart Arca to recover before retrying.
+The re-bind writes only Arca's state and recovers its storage record before startup reconciliation.
+The previous instance and volume stay unchanged; removal follows only the replacement.
+
+Remove the old instance, or its reference to the ACL, before removing the service.
+If the backup still uses the ACL, removal names the removed instance and data volume and the ACL
+left behind, with the reason. The service record is already gone: a second `service_remove`
+returns not found. After the reference is gone, normal reconciliation, including a `serve` restart,
+can finish the remaining journalled ACL. Remove backups separately through Incus after checking
+which instance and volume they are and whether anything still uses them.
+
+After one re-bind, the node cannot go back to an older Arca: older readers refuse the journal's binding record.
+
 ### Updating a service to a new image digest
 
 `service_update` takes `{name, digest, timeoutSeconds?, eraseData?, withTemplate?, tenant?}` (or `{name, follow}`, see

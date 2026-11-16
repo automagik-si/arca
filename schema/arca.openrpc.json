@@ -2521,6 +2521,7 @@
                           "service_update",
                           "service_reconfigure",
                           "service_import",
+                          "service_rebind",
                           "service_release",
                           "service_publish",
                           "service_unpublish",
@@ -2661,6 +2662,7 @@
               "service_update",
               "service_reconfigure",
               "service_import",
+              "service_rebind",
               "service_release",
               "service_publish",
               "service_unpublish",
@@ -2985,6 +2987,31 @@
                   "name"
                 ],
                 "title": "service_import",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of service_rebind: Re-bind an owned service after a copy replaces its instance UUID. The approved card binds the observed replacement and its root and data storage. Incus and the backup are left unchanged. Propose it with action_propose using only the service name. Example: {\"name\":\"web\"}",
+                "examples": [
+                  {
+                    "name": "web"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The owned service's name.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "service_rebind",
                 "type": "object"
               },
               {
@@ -4230,6 +4257,7 @@
                 "service_update",
                 "service_reconfigure",
                 "service_import",
+                "service_rebind",
                 "service_release",
                 "service_publish",
                 "service_unpublish",
@@ -4735,6 +4763,7 @@
                 "service_update",
                 "service_reconfigure",
                 "service_import",
+                "service_rebind",
                 "service_release",
                 "service_publish",
                 "service_unpublish",
@@ -7893,6 +7922,421 @@
         }
       },
       "summary": "Take over a service another manager created, where it stands: write one key on its instance, the kernel's import mark, and record it as an adopted service. Only a service kernel.importServices lists, only from an approved proposal. Nothing is stopped, moved or changed otherwise.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "service_rebind",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The owned service's name.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "binding",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "description": "Read by Arca when the proposal is made. Callers supply only the service name.",
+            "properties": {
+              "evidenceDigest": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "from": {
+                "additionalProperties": false,
+                "properties": {
+                  "data_volume": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "volume",
+                            "type": "string"
+                          },
+                          "name": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "parent": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "project": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "uuid": {
+                            "type": "null"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "project",
+                          "parent",
+                          "name",
+                          "uuid"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "instance": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "instance",
+                        "type": "string"
+                      },
+                      "name": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "project": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "uuid": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "project",
+                      "name",
+                      "uuid"
+                    ],
+                    "type": "object"
+                  },
+                  "root_pool": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "instance",
+                  "root_pool",
+                  "data_volume"
+                ],
+                "type": "object"
+              },
+              "recordDigest": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "to": {
+                "additionalProperties": false,
+                "properties": {
+                  "data_volume": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "volume",
+                            "type": "string"
+                          },
+                          "name": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "parent": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "project": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "uuid": {
+                            "type": "null"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "project",
+                          "parent",
+                          "name",
+                          "uuid"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "instance": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "instance",
+                        "type": "string"
+                      },
+                      "name": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "project": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "uuid": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "project",
+                      "name",
+                      "uuid"
+                    ],
+                    "type": "object"
+                  },
+                  "root_pool": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "instance",
+                  "root_pool",
+                  "data_volume"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "from",
+              "to",
+              "recordDigest",
+              "evidenceDigest"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "from": {
+              "additionalProperties": false,
+              "properties": {
+                "data_volume": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "kind": {
+                          "const": "volume",
+                          "type": "string"
+                        },
+                        "name": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "parent": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "project": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "uuid": {
+                          "type": "null"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "project",
+                        "parent",
+                        "name",
+                        "uuid"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "instance": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "instance",
+                      "type": "string"
+                    },
+                    "name": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "project": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "uuid": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "project",
+                    "name",
+                    "uuid"
+                  ],
+                  "type": "object"
+                },
+                "root_pool": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "instance",
+                "root_pool",
+                "data_volume"
+              ],
+              "type": "object"
+            },
+            "name": {
+              "description": "The re-bound service.",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+              "type": "string"
+            },
+            "rebound": {
+              "const": true,
+              "type": "boolean"
+            },
+            "to": {
+              "additionalProperties": false,
+              "properties": {
+                "data_volume": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "kind": {
+                          "const": "volume",
+                          "type": "string"
+                        },
+                        "name": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "parent": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "project": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "uuid": {
+                          "type": "null"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "project",
+                        "parent",
+                        "name",
+                        "uuid"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "instance": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "instance",
+                      "type": "string"
+                    },
+                    "name": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "project": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "uuid": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "project",
+                    "name",
+                    "uuid"
+                  ],
+                  "type": "object"
+                },
+                "root_pool": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "instance",
+                "root_pool",
+                "data_volume"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "rebound",
+            "name",
+            "from",
+            "to"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Re-bind an owned service after a copy replaces its instance UUID. The approved card binds the observed replacement and its root and data storage. Incus and the backup are left unchanged. Propose it with action_propose using only the service name.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

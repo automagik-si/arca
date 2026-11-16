@@ -171,7 +171,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 94] = [
+static VERBS: [Verb; 95] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -575,6 +575,21 @@ static VERBS: [Verb; 94] = [
         cut: no_cut,
         params: service_import_params,
         result: service_import_result,
+        target: Target::Service("name"),
+    },
+    Verb {
+        name: "service_rebind",
+        summary: "Re-bind an owned service after a copy replaces its instance UUID. The approved card binds the observed replacement and its root and data storage. Incus and the backup are left unchanged. Propose it with action_propose using only the service name.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_rebind,
+        cut: no_cut,
+        params: service_rebind_params,
+        result: service_rebind_result,
         target: Target::Service("name"),
     },
     Verb {
@@ -3693,6 +3708,7 @@ fn not_confirmed(name: &str) -> String {
     let undone = match name {
         "service_remove" => "nothing was removed",
         "service_import" => "nothing was imported",
+        "service_rebind" => "nothing was rebound",
         "service_release" => "nothing was released",
         "service_update" => "nothing was updated",
         "service_reconfigure" => "nothing was reconfigured",
@@ -4342,12 +4358,13 @@ fn plan_list_result() -> Value {
 }
 
 /// The twenty-nine verbs an action proposal may name. The list is closed here and checked by the handler again.
-pub(crate) const ACTION_NAMES: [&str; 31] = [
+pub(crate) const ACTION_NAMES: [&str; 32] = [
     "service_create",
     "service_remove",
     "service_update",
     "service_reconfigure",
     "service_import",
+    "service_rebind",
     "service_release",
     "service_publish",
     "service_unpublish",
@@ -4448,7 +4465,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 31] = [
+const ACTION_EXAMPLES: [(&str, &str); 32] = [
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (
@@ -4457,6 +4474,7 @@ const ACTION_EXAMPLES: [(&str, &str); 31] = [
     ),
     ("service_reconfigure", r#"{"name":"web"}"#),
     ("service_import", r#"{"name":"web"}"#),
+    ("service_rebind", r#"{"name":"web"}"#),
     ("service_release", r#"{"name":"web"}"#),
     ("service_publish", r#"{"name":"dash","reach":"tailnet"}"#),
     ("service_unpublish", r#"{"name":"dash"}"#),
@@ -4531,6 +4549,9 @@ fn action_args() -> Value {
             }
             if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
                 properties.remove("approval");
+                if *name == "service_rebind" {
+                    properties.remove("binding");
+                }
                 for field in kernel_filled(name) {
                     if let Some(own) = properties.get_mut(*field) {
                         let words = own["description"]
@@ -5779,6 +5800,43 @@ fn service_import_params() -> Value {
         "required": ["name", "approval"],
         "type": "object"
     }))
+}
+
+fn rebind_state_schema() -> Value {
+    let instance = json!({"type":"object","additionalProperties":false,"properties":{
+        "kind":{"const":"instance","type":"string"},"project":{"type":"string","minLength":1},
+        "name":{"type":"string","minLength":1},"uuid":{"type":"string","minLength":1}
+    },"required":["kind","project","name","uuid"]});
+    let volume = json!({"type":"object","additionalProperties":false,"properties":{
+        "kind":{"const":"volume","type":"string"},"project":{"type":"string","minLength":1},
+        "parent":{"type":"string","minLength":1},"name":{"type":"string","minLength":1},"uuid":{"type":"null"}
+    },"required":["kind","project","parent","name","uuid"]});
+    json!({"type":"object","additionalProperties":false,"properties":{
+        "instance":instance,"root_pool":{"type":"string","minLength":1},
+        "data_volume":{"anyOf":[volume,{"type":"null"}]}
+    },"required":["instance","root_pool","data_volume"]})
+}
+fn service_rebind_params() -> Value {
+    let mut schema = service_import_params();
+    schema["properties"]["name"] = service_name_schema("The owned service's name.");
+    schema["properties"]["binding"] = json!({
+        "description":"Read by Arca when the proposal is made. Callers supply only the service name.",
+        "type":"object","additionalProperties":false,"properties":{
+            "from":rebind_state_schema(),"to":rebind_state_schema(),
+            "recordDigest":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+            "evidenceDigest":{"type":"string","pattern":"^[0-9a-f]{64}$"}
+        },"required":["from","to","recordDigest","evidenceDigest"]
+    });
+    schema
+}
+fn service_rebind_result() -> Value {
+    json!({"type":"object","additionalProperties":false,"properties":{
+        "rebound":{"type":"boolean","const":true},"name":service_name_schema("The re-bound service."),
+        "from":rebind_state_schema(),"to":rebind_state_schema()
+    },"required":["rebound","name","from","to"]})
+}
+fn summary_service_rebind(_: &Value) -> String {
+    "Service re-bound; the backup is unchanged.".into()
 }
 
 fn service_release_params() -> Value {

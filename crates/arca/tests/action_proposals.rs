@@ -315,6 +315,11 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     "rawLxc": { "from": [], "to": ["lxc.sched.core=0"] }
                 },
             }),
+            ActionKind::ServiceRebind => json!({"name":"nats","binding":{
+                "from":{"instance":{"kind":"instance","project":"arcak-svc","name":"nats","uuid":"old"},"root_pool":"pool1","data_volume":null},
+                "to":{"instance":{"kind":"instance","project":"arcak-svc","name":"nats","uuid":"new"},"root_pool":"pool2","data_volume":null},
+                "recordDigest":"1".repeat(64),"evidenceDigest":"2".repeat(64)
+            }}),
             ActionKind::ServiceUnpublish
             | ActionKind::ServiceImport
             | ActionKind::ServiceRelease => json!({ "name": "nats" }),
@@ -423,6 +428,27 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             );
             continue;
         }
+        if action == ActionKind::ServiceRebind {
+            let shown = details
+                .iter()
+                .map(|row| row.value.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            for value in [
+                "nats",
+                "arcak-svc",
+                "old",
+                "new",
+                "pool1",
+                "pool2",
+                "unchanged",
+            ] {
+                assert!(shown.contains(value), "re-bind card lacks {value}: {shown}");
+            }
+            // Fingerprints bind config without displaying secret config values.
+            continue;
+        }
+
         if action.is_storage() {
             // Every value the owner approves is on the card in plain words; the kernel-read facts are bound in args.
             let shown: String = details
@@ -2277,7 +2303,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(all.len(), 31);
+    assert_eq!(all.len(), 32);
     assert_eq!(
         failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
         format!(
