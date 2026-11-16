@@ -461,6 +461,90 @@ fn says(workspace: &Workspace, words: &str) {
 }
 
 #[test]
+fn project_homes_and_native_home_are_private_and_persist_in_the_existing_data_mount() {
+    let mut value = settings(URL);
+    value["automagikPnpm"] = json!("/opt/pnpm/10/bin/pnpm");
+    let mut workspace = Workspace::new(&value);
+    workspace.start();
+    says(&workspace, "the server is started from");
+    let run = &workspace.runs("automagik-server")[0];
+    for (name, path) in [
+        ("HOME", "home"),
+        ("AUTOMAGIK_HOME", "automagik"),
+        ("AUTOMAGIK_BOTS_HOME", "bots"),
+        ("DSH_HOME", "dsh"),
+        ("HERDR_APP_HOME", "herdr"),
+    ] {
+        assert!(run.contains(&format!(" -e {name}=/data/{path} ")), "{run}");
+        let directory = workspace.dir.join("data").join(path);
+        let metadata = fs::metadata(&directory).expect("a persistent home");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        use std::os::unix::fs::MetadataExt;
+        let data = fs::metadata(workspace.dir.join("data")).expect("data");
+        assert_eq!((metadata.uid(), metadata.gid()), (data.uid(), data.gid()));
+    }
+    assert!(run.contains(&format!(" --user {} ", me())), "{run}");
+    assert!(
+        run.contains(" -e AUTOMAGIK_PNPM=/opt/pnpm/10/bin/pnpm "),
+        "{run}"
+    );
+    assert_eq!(run.matches(" -v ").count(), 1, "one existing data mount");
+    let clis = workspace.dir.join("data/automagik/acp/clis");
+    assert!(clis.is_dir());
+    fs::write(clis.join("installed"), "persistent CLI state").expect("CLI state");
+    assert_eq!(workspace.stop(), Some(0));
+    workspace.end("automagik-server", 0);
+    workspace.start();
+    wait_for(&workspace, "a fresh server", || {
+        workspace.started("automagik-server", 2)
+    });
+    assert_eq!(
+        fs::read_to_string(clis.join("installed")).unwrap(),
+        "persistent CLI state"
+    );
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn the_cli_store_does_not_start_without_an_explicit_absolute_baked_pnpm_path() {
+    for pnpm in [
+        None,
+        Some(json!("")),
+        Some(json!(null)),
+        Some(json!(10)),
+        Some(json!("pnpm")),
+        Some(json!("/opt/../pnpm")),
+        Some(json!("/opt/pnpm\nextra")),
+    ] {
+        let mut value = settings(URL);
+        if let Some(pnpm) = pnpm {
+            value["automagikPnpm"] = pnpm;
+        } else {
+            value.as_object_mut().unwrap().remove("automagikPnpm");
+        }
+        let mut workspace = Workspace::new(&value);
+        workspace.start();
+        wait_for(&workspace, "a refusal or a server start", || {
+            workspace.output().contains("settings.automagikPnpm")
+                || !workspace.runs("automagik-server").is_empty()
+        });
+        assert!(
+            workspace
+                .output()
+                .lines()
+                .any(|line| line.contains("settings.automagikPnpm")
+                    && line.contains("pnpm 10")
+                    && line.contains("AUTOMAGIK_PNPM")),
+            "{}",
+            workspace.output()
+        );
+        assert!(workspace.read("docker/calls.log").is_empty());
+        assert_eq!(workspace.stop(), Some(0));
+    }
+}
+
+#[test]
 fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pins() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let template =
