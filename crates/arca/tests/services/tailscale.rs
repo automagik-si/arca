@@ -153,7 +153,7 @@ fn the_shipped_tailscale_template_loads_pinned_by_digest_with_no_port_a_state_vo
 }
 
 #[test]
-fn a_connector_is_an_unprivileged_container_with_its_state_volume_and_no_port_and_waits_for_its_key()
+fn a_connector_is_an_unprivileged_container_with_its_state_volume_and_no_port_and_may_start_without_a_key()
  {
     let rig = ts_rig();
     let status = rig
@@ -163,12 +163,12 @@ fn a_connector_is_an_unprivileged_container_with_its_state_volume_and_no_port_an
     assert_eq!(status["ports"], json!([]));
     assert_eq!(status["lanPort"], Value::Null);
     assert_eq!(status["published"], Value::Null);
-    // Without its key and its target it is created and not started.
-    assert_eq!(status["state"], "stopped");
-    assert!(!rig.service_config("edge-ts").start);
+    // Optional secrets are absent; the template does not stop a keyless connector.
+    assert_eq!(status["state"], "running");
+    assert!(rig.service_config("edge-ts").start);
     let live = instance(&rig, "edge-ts");
     assert_eq!(live["type"], "container");
-    assert_eq!(live["status"], "Stopped");
+    assert_eq!(live["status"], "Running");
     let config = live["config"].as_object().unwrap();
     assert!(config.get(service::PORTS_KEY).is_none());
     assert!(config.get("environment.TS_AUTHKEY").is_none());
@@ -229,11 +229,11 @@ fn the_key_and_the_target_are_set_like_a_tunnel_token_and_the_connector_starts_o
     )
     .expect("set the key");
     assert_eq!(answer, json!({"ok":true}));
-    // With the key alone it still waits for its target.
+    // Setting the key keeps the connector startable without a target override.
     assert_eq!(
         rig.call("service_status", json!({"name":"edge-ts"}))
             .unwrap()["state"],
-        "stopped"
+        "running"
     );
     op(
         &rig,
@@ -534,16 +534,24 @@ fn the_script_refuses_a_target_that_is_not_one_address_and_port_and_starts_nothi
     let mut env = good();
     env.retain(|(key, _)| *key != "TS_TARGET");
     let ran = run_in(&["/bin/sh"], &env);
-    assert_ne!(ran.code, Some(0));
-    assert!(ran.err.contains("TS_TARGET is not set"), "{}", ran.err);
+    assert_eq!(ran.code, Some(64));
+    assert!(
+        ran.err.contains("TS_TARGET") && ran.err.contains("ARCA_EDGE_TARGET"),
+        "{}",
+        ran.err
+    );
     assert!(ran.boot_env.is_none());
     // An empty target is no target.
     let mut env = good();
     env.retain(|(key, _)| *key != "TS_TARGET");
     env.push(("TS_TARGET", ""));
     let ran = run_in(&["/bin/sh"], &env);
-    assert_ne!(ran.code, Some(0));
-    assert!(ran.err.contains("TS_TARGET is not set"), "{}", ran.err);
+    assert_eq!(ran.code, Some(64));
+    assert!(
+        ran.err.contains("TS_TARGET") && ran.err.contains("ARCA_EDGE_TARGET"),
+        "{}",
+        ran.err
+    );
     assert!(ran.boot_env.is_none());
     // A host name in place of the address is a target too.
     let mut env = good();
@@ -569,6 +577,7 @@ fn a_name_before_the_target_is_the_nodes_tailnet_name_in_place_of_the_services_o
             let mut env = good();
             env.retain(|(key, _)| *key != "TS_TARGET");
             env.push(("TS_TARGET", target.as_str()));
+            env.push(("ARCA_EDGE_TARGET", "192.0.2.99:443"));
             let ran = run_in(&shell, &env);
             assert_eq!(ran.code, Some(0), "{shell:?} {target}: {}", ran.err);
             let boot = ran.boot_env.expect("containerboot ran");
@@ -605,5 +614,161 @@ fn a_node_with_no_key_is_given_none_and_a_key_by_file_is_passed_as_it_is() {
     assert!(
         boot.lines()
             .any(|l| l == "TS_AUTHKEY=file:/run/secrets/synthetic-key")
+    );
+}
+
+/// The shipped edge on the fake service network. A host listener is unrelated to the connector's link, so this
+/// fixture leaves out privatePort; its port, provided values, secrets, script and edge behavior are the shipped ones.
+fn linked_edge(rig: &Rig) -> String {
+    let mut edge: Value =
+        serde_json::from_slice(&fs::read(shipped().join("arca-edge.json")).unwrap()).unwrap();
+    edge.as_object_mut().unwrap().remove("privatePort");
+    rig.template("arca-edge", edge);
+    rig.call(
+        "service_create",
+        json!({"name":"edge","template":"arca-edge"}),
+    )
+    .expect("create the edge");
+    rig.call("service_connect", json!({"from":"edge-ts","to":"edge"}))
+        .expect("link the connector");
+    format!("{}:443", rig.service_config("edge").ipv4)
+}
+
+/// Feed exactly the fake Incus environment to the shipped script, as the container would see it.
+fn run_instance(rig: &Rig) -> Ran {
+    let live = instance(rig, "edge-ts");
+    let env: Vec<_> = live["config"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter_map(|(key, value)| Some((key.strip_prefix("environment.")?, value.as_str()?)))
+        .collect();
+    run_in(&["/bin/sh"], &env)
+}
+
+#[test]
+fn a_connector_with_only_an_authkey_forwards_to_its_linked_edges_address_and_port() {
+    let rig = ts_rig();
+    op(
+        &rig,
+        "service_secret_set",
+        json!({"name":"edge-ts","key":"TS_AUTHKEY","value":KEY}),
+    )
+    .expect("the key");
+    let target = linked_edge(&rig);
+    start(&rig, "edge-ts").expect("start with no target override");
+    let live = instance(&rig, "edge-ts");
+    assert_eq!(live["config"]["environment.ARCA_EDGE_TARGET"], target);
+    assert!(live["config"].get("environment.TS_TARGET").is_none());
+    let ran = run_instance(&rig);
+    assert_eq!(ran.code, Some(0), "{}", ran.err);
+    let serve: Value = serde_json::from_str(ran.serve.as_deref().expect("serve config")).unwrap();
+    assert_eq!(
+        serve,
+        json!({"TCP":{"443":{"TCPForward":target,"ProxyProtocol":2}}})
+    );
+    assert!(
+        ran.boot_env
+            .unwrap()
+            .lines()
+            .any(|line| line == "TS_HOSTNAME=edge-ts")
+    );
+}
+
+#[test]
+fn a_linked_connector_starts_without_a_key_and_containerboot_receives_no_authkey() {
+    let rig = ts_rig();
+    let target = linked_edge(&rig);
+    assert!(
+        rig.service_config("edge-ts").start,
+        "environment rendering must allow missing optional secrets"
+    );
+    start(&rig, "edge-ts").expect("a keyless start");
+    assert!(
+        instance(&rig, "edge-ts")["config"]
+            .get("environment.TS_AUTHKEY")
+            .is_none()
+    );
+    let ran = run_instance(&rig);
+    assert_eq!(ran.code, Some(0), "{}", ran.err);
+    let serve: Value = serde_json::from_str(ran.serve.as_deref().expect("serve config")).unwrap();
+    assert_eq!(serve["TCP"]["443"]["TCPForward"], target);
+    assert!(
+        !ran.boot_env
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("TS_AUTHKEY="))
+    );
+    assert!(ran.key_file.is_none());
+}
+
+#[test]
+fn connector_records_keep_the_kind_their_shipped_templates_name() {
+    let rig = ts_rig();
+    assert_eq!(
+        serde_json::to_value(rig.service_config("edge-ts")).unwrap()["connector"],
+        "tailscale"
+    );
+    rig.call(
+        "service_create",
+        json!({"name":"cf","template":"cloudflare-tunnel"}),
+    )
+    .expect("cloudflare connector");
+    assert_eq!(
+        serde_json::to_value(rig.service_config("cf")).unwrap()["connector"],
+        "cloudflare"
+    );
+    assert!(
+        serde_json::to_value(rig.service_config("web"))
+            .unwrap()
+            .get("connector")
+            .is_none()
+    );
+}
+
+#[test]
+fn optional_secrets_omit_the_whole_variable_but_an_unset_required_secret_still_stops_start() {
+    let rig = ts_rig();
+    let template: service::Template = serde_json::from_value(json!({
+        "name":"mixed", "kind":"oci", "image":"docker.io/library/example", "digest":DIGEST,
+        "secrets":["OPTIONAL", "REQUIRED"], "optionalSecrets":["OPTIONAL"],
+        "env":{"OPTIONAL_VALUE":"prefix-{{secret:OPTIONAL}}", "REQUIRED_VALUE":"{{secret:REQUIRED}}"}
+    })).expect("optionalSecrets is a template field");
+    let secrets = rig.dir.join("secrets");
+    let (env, ready) = service::environment(
+        &template,
+        "service-mixed",
+        "mixed",
+        "192.0.2.50",
+        "192.0.2.1",
+        &secrets,
+    )
+    .unwrap();
+    assert!(env.is_empty());
+    assert!(!ready);
+    assert_eq!(
+        service::template_stopped_reason(&template, "service-mixed", &secrets).as_deref(),
+        Some("its template needs the secret REQUIRED, which is not set yet")
+    );
+    service::write_secret(
+        &service::secret_file(&secrets, "service-mixed", "REQUIRED").unwrap(),
+        "synthetic-required",
+    )
+    .unwrap();
+    let (env, ready) = service::environment(
+        &template,
+        "service-mixed",
+        "mixed",
+        "192.0.2.50",
+        "192.0.2.1",
+        &secrets,
+    )
+    .unwrap();
+    assert!(ready);
+    assert!(!env.contains_key("OPTIONAL_VALUE"));
+    assert!(env.contains_key("REQUIRED_VALUE"));
+    assert_eq!(
+        service::template_stopped_reason(&template, "service-mixed", &secrets),
+        None
     );
 }
