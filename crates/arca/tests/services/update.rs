@@ -146,6 +146,18 @@ fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest(
             .config["id"],
         identity
     );
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(rig.dir.join(arca::desired_store::STATE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(
+        persisted["current"]["document"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == "service-app")
+            .unwrap()["config"]["id"],
+        identity
+    );
     let snapshot = done["snapshot"].as_str().expect("a snapshot").to_string();
     assert!(snapshot.starts_with("pre-update-"));
 

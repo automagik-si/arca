@@ -1441,7 +1441,8 @@ mod tests {
         );
 
         let list = arca_api::verb("service_list").unwrap();
-        let row = json!({"name":"svc","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[],"links":[],"published":null,"lanPort":null});
+        let row = json!({"name":"svc","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[],"links":[],"published":null,"lanPort":null,
+            "id":null,"uuid":null,"createdAt":null,"startedAt":null,"limits":null,"data":null});
         let original = json!({"services": vec![row; 259]});
         let cut = arca_api::verbs::service_cut_description(list.name, &original).unwrap();
         let capped = (list.cut)(&original).unwrap();

@@ -252,6 +252,30 @@ impl Kernel {
             .and_then(|object| object.uuid)
     }
 
+    fn service_id(&self, entry: &EntryId, config: &crate::service::ServiceConfig) -> String {
+        config.id.clone().unwrap_or_else(|| {
+            crate::service::legacy_id(&self.store.signer(), &entry.0, config.created)
+        })
+    }
+
+    /// Status observations join the service record to journal identity and the already-read Incus row.
+    pub fn service_view(
+        &self,
+        entry: &EntryId,
+        config: &crate::service::ServiceConfig,
+        live: Option<&Value>,
+    ) -> Value {
+        let mut view = crate::service::view(config, live);
+        view["id"] = json!(self.service_id(entry, config));
+        view["uuid"] = json!(self.service_uuid(entry, &config.instance));
+        view["createdAt"] = json!(crate::handlers::iso_utc(config.created));
+        view["startedAt"] = json!(live.and_then(crate::service::started_at));
+        view["limits"] = json!(config.limits);
+        view["data"] =
+            json!({"volume": config.data.as_ref().map(|_| format!("{}-data", config.name))});
+        view
+    }
+
     /// The instance `instance` that `entry` created, as the effect journal records it: its project and its uuid. This
     /// is Arca's own record of where the instance is; a caller's word for the project is never used in its place.
     pub fn service_object(
@@ -878,9 +902,30 @@ impl Kernel {
     /// reconciled, and the converged and retained sets are persisted after.
     pub fn propose(
         &mut self,
-        changes: Vec<EntryChange>,
+        mut changes: Vec<EntryChange>,
         now_ms: u64,
     ) -> Result<Vec<Outcome>, KernelError> {
+        // Migrate only the service record this normal write already changes. Reads and unrelated writes do nothing.
+        for change in &mut changes {
+            if let EntryChange::Put(entry) = change
+                && entry.plugin.0 == "arca.service"
+                && let Ok(config) =
+                    serde_json::from_value::<crate::service::ServiceConfig>(entry.config.clone())
+                && config.function.is_none()
+                && config.id.is_none()
+            {
+                let previous = self
+                    .entries()
+                    .iter()
+                    .find(|held| held.id == entry.id)
+                    .and_then(|held| {
+                        serde_json::from_value::<crate::service::ServiceConfig>(held.config.clone())
+                            .ok()
+                    });
+                entry.config["id"] =
+                    json!(self.service_id(&entry.id, previous.as_ref().unwrap_or(&config)));
+            }
+        }
         let signed = self.store.propose(changes, now_ms)?;
         self.applied_seq.publish(Some(signed.document.seq));
         // A tenant the document adds is in the family before its entry applies; one it removes stays until its removal

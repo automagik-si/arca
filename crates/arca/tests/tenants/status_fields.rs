@@ -199,7 +199,18 @@ fn status_fields_never_started_missing_and_unknown_instances_have_explicit_nulls
         let row = observed(&rig);
         assert!(row.get("startedAt").unwrap().is_null(), "{time}");
     }
-    let row = json!({"name": "unknown", "config": {}, "devices": {}});
+    let entry = record(&rig);
+    let config = serde_json::from_value(entry.config.clone()).unwrap();
+    let missing = rig.kernel.lock().unwrap().service_view(
+        &arca_kernel::desired::EntryId("service-unrecorded-instance".into()),
+        &config,
+        None,
+    );
+    assert_eq!(missing["id"], entry.config["id"]);
+    assert!(missing.get("uuid").unwrap().is_null());
+    assert!(missing.get("startedAt").unwrap().is_null());
+    let row = json!({"name": "unknown", "config": {"volatile.uuid": "listing-only-uuid"},
+        "last_used_at": "2026-11-01T12:34:56Z", "devices": {"data": {"source": "other-data"}}});
     for view in [
         arca::service::unknown_view(&row).unwrap(),
         arca::service::failed_view(&row).unwrap(),

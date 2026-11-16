@@ -514,6 +514,7 @@ impl GetHandler for Page {
 
 fn view(name: &str, links: &[&str]) -> Value {
     json!({
+        "id": null, "uuid": null, "createdAt": null, "startedAt": null, "limits": null, "data": null,
         "name": name,
         "template": "nats",
         "state": "running",

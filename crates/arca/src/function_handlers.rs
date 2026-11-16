@@ -627,6 +627,7 @@ impl ServiceHandler {
             .map_err(|_| service_refused("the default profile does not name a storage pool"))?;
         let mut changes = ensure_netproject(entries, &self.cfg).map_err(no_service_project)?;
         let mut config = ServiceConfig {
+            id: None,
             name: name.clone(),
             template: function::TEMPLATE.to_string(),
             instance: name.clone(),

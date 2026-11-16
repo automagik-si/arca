@@ -1613,6 +1613,7 @@ fn service_observation_schemas_admit_nullable_identity_times_limits_and_volume_a
             assert!(conforms(field, &Value::Null).is_ok(), "{name}: {key}");
         }
         assert_eq!(row["properties"]["limits"]["additionalProperties"], false);
+        assert!(conforms(&row["properties"]["limits"], &json!({"cpu": "2", "memory": "1GiB", "diskRead": "10MiB", "diskWrite": "5MiB", "ingress": "20Mbit", "egress": "10Mbit"})).is_ok());
         assert_eq!(row["properties"]["data"]["additionalProperties"], false);
         assert!(conforms(&row["properties"]["id"], &json!("svc_bad")).is_err());
         assert!(
@@ -1622,6 +1623,30 @@ fn service_observation_schemas_admit_nullable_identity_times_limits_and_volume_a
             )
             .is_err()
         );
+    }
+}
+
+#[test]
+fn service_observation_schemas_equal_the_frozen_contract() {
+    let rows: Value =
+        serde_json::from_str(include_str!("fixtures/service-observations.json")).unwrap();
+    for name in ["service_status", "service_list"] {
+        assert_eq!((verb(name).unwrap().result)(), rows[name], "{name}");
+    }
+}
+
+#[test]
+fn status_observations_do_not_expand_create_or_import_rows() {
+    for name in ["service_create", "service_import"] {
+        let result = (verb(name).unwrap().result)();
+        let row = if name == "service_import" {
+            &result["properties"]["service"]
+        } else {
+            &result
+        };
+        for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+            assert!(row["properties"].get(key).is_none(), "{name}: {key}");
+        }
     }
 }
 

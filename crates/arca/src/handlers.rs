@@ -6871,6 +6871,7 @@ pub(crate) fn adopted_config(
         });
     }
     Some(crate::service::ServiceConfig {
+        id: Some(crate::service::fresh_id().ok()?),
         name: name.to_string(),
         template: template.to_string(),
         instance: name.to_string(),
@@ -7090,6 +7091,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
     )
     .map_err(service_template_error)?;
     Ok(crate::service::ServiceConfig {
+        id: Some(crate::service::fresh_id().map_err(|_| internal())?),
         name: parts.name.to_string(),
         template: parts.template.name.clone(),
         instance: parts.name.to_string(),
@@ -7173,6 +7175,7 @@ fn vm_service_config(
         ),
     };
     Ok(crate::service::ServiceConfig {
+        id: Some(crate::service::fresh_id().map_err(|_| internal())?),
         name: name.to_string(),
         template: template.name.clone(),
         instance: name.to_string(),
@@ -7474,10 +7477,10 @@ impl ToolHandler for ServiceHandler {
             && let Ok(Some(record)) = crate::external::find(&self.cfg.state_dir, name)
         {
             let up = crate::external::reachable(&record.address);
-            return Ok(crate::external::view(
+            return Ok(crate::service::without_record(crate::external::view(
                 &record,
                 if up { "up" } else { "down" },
-            ));
+            )));
         }
         let mut answer = self.call_service(args.clone(), caller)?;
         // The list shows each recorded program as a row of its own kind, beside the services.
@@ -7487,10 +7490,9 @@ impl ToolHandler for ServiceHandler {
             && let Ok(held) = crate::external::read(&self.cfg.state_dir)
             && !held.is_empty()
         {
-            rows.extend(
-                held.iter()
-                    .map(|record| crate::external::view(record, "recorded")),
-            );
+            rows.extend(held.iter().map(|record| {
+                crate::service::without_record(crate::external::view(record, "recorded"))
+            }));
             rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         }
         Ok(answer)
@@ -7828,14 +7830,14 @@ impl ServiceHandler {
                     .map(|(_, config)| config.instance.clone())
                     .collect();
                 let mut templates = BTreeMap::new();
-                for (_, config) in &records {
+                for (entry, config) in &records {
                     // A function is not a service: function_list shows it. Its instance's name stays known, so the
                     // rows below never show it as an instance nobody recorded.
                     if config.function.is_some() {
                         continue;
                     }
                     let live = service_live_in(&rows, &config.project, &config.instance);
-                    let mut view = crate::service::view(config, live);
+                    let mut view = lock(&self.kernel)?.service_view(&entry.id, config, live);
                     // A machine on a host bridge takes its address from that network: it is in no record, and the
                     // list reads no live state. Said so, so an empty address is not read as "has none".
                     if config.on_host_bridge() {
@@ -7881,9 +7883,9 @@ impl ServiceHandler {
                 let record = service_entries(&entries)
                     .into_iter()
                     .find(|(_, config)| config.name == name);
-                if let Some((_, config)) = record {
+                if let Some((entry, config)) = record {
                     let live = service_live_in(&rows, &config.project, &config.instance);
-                    let mut view = crate::service::view(&config, live);
+                    let mut view = lock(&self.kernel)?.service_view(&entry.id, &config, live);
                     // A machine on a host bridge has its address only in its live state, so this one call reads the
                     // state of this one instance, when it runs. A service on the service network has its address
                     // in its record, and nothing is read for it. A read that fails still answers: the address is
