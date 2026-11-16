@@ -206,7 +206,7 @@ Source: `arca_kernel::ownership::IncusKind::has_uuid`, `write::uuid_of`, `UnixIn
 (`crates/arca-providers/tests/incus_provider.rs`), and `the_journal_an_earlier_probe_left_opens_with_its_volume_adopted_by_name`
 (`crates/arca-reconcile/tests/probe.rs`, over the journal fixture `crates/arca-reconcile/tests/fixtures/journal-volume-without-uuid.jsonl`).
 
-An owned service replaced by a copy may follow its new UUID only through an approved
+**Rule 78.** An owned service replaced by a copy may follow its new UUID only through an approved
 `service_rebind`. Its observed entry mark must still be its own, with no contested, retiring or
 retained ownership; complete family evidence must identify one replacement under the service's
 own name and project. Approval binds the observed UUIDs, config and root/data storage, checked
