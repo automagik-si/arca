@@ -9,6 +9,8 @@ bring its record back; existing adopted records of instances the kernel journal 
 on the next managed service call, and an approved release can forget a missing adopted instance without an import
 allowlist entry.
 
+## 0.35.0 (2026-11-16)
+
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
 its old values may precede a late synchronous PATCH: Arca keeps the original values as its inverse and retries the
 entry on the next document, rather than claiming the change did not land. Gateway errors (502/503/504) also leave the
@@ -27,6 +29,15 @@ the service's `droiddPort` control port, leaving no front rule when that is its 
 tenant service made from the shipped `omni-api` template loses its front rule at the next reconcile of its record;
 the host bridge's control rule stays. Approval cards show a container's requested root size in both the node and a
 tenant. See docs/OPERATING.md.
+
+- Merge PR 224 follow-up f8fdd73c: services_bridged accepts a container template's root size (test-only, diff read by the Orchestrator)
+- Merge PR 224: a tenant gets a desktop template with port-isolated services and a root size in the node's own project
+- Merge origin/dev v0.34.0 release commit d6075d08 into local dev
+- Merge docs/review-wording-followups (PR 225): review wording follow-ups for PRs 216, 217 and 223, comments and docs only (diff read by the Kernel Captain and the Orchestrator at 696a22f2)
+- Merge PR 222: a workspace gets a one-repository GitHub App token under a unique App name with the returned slug and bot login; reach secrets are delivered before any repository work
+- Merge PR 221: a workspace clones its project's repository once into its home, keeping the 0711 root for member runners
+- Merge feat/journal-binding-event (PR 219): the journal records which service owns a moved instance and refuses a destination owned by another entry or on another entry's source data volume
+- Merge fix/patch-timeout-settles (PR 215): an Incus write that times out or answers 502/503/504 is settled as may-have-landed with its original pre-image, never journalled as not landed
 
 ## 0.34.0 (2026-11-16)
 
