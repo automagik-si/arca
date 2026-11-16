@@ -235,11 +235,13 @@ pub fn destinations(record: &EdgeRecord) -> Vec<Destination> {
 ///
 /// - Certificates come by ACME DNS challenge through Cloudflare, with the token the edge's environment holds.
 /// - The edge is reached through an Incus proxy device that sends the PROXY protocol header, so Caddy reads the
-///   client's own address from it; only the device's loopback connection may send one.
+///   client's own address from it; only the device's loopback connection may send one, and each service `linked` to the
+///   edge (`service_connect` to it: a connector such as a tailnet node sends one too), by its own address, each once
+///   in order. A source the list allows that sends no header is served as it is, from its own address.
 /// - HTTP/1.1 and HTTP/2 only: the device carries tcp.
 /// - A private site answers 403 to every address outside [`PRIVATE_RANGES`].
 /// - Every site streams its answers unbuffered (`flush_interval -1`), for server-sent events and LLM completions.
-pub fn caddyfile(record: &EdgeRecord) -> String {
+pub fn caddyfile(record: &EdgeRecord, _linked: &[Ipv4Addr]) -> String {
     let mut out = String::new();
     out.push_str("# Written by Arca from this node's routes (route_add, route_remove). Each change replaces the whole file.\n");
     out.push_str("{\n");
@@ -341,8 +343,8 @@ mod tests {
         let mut two = EdgeRecord::default();
         two.put(route("a.example.com", Reach::Public));
         two.put(route("b.example.com", Reach::Private));
-        assert_eq!(caddyfile(&one), caddyfile(&two));
-        let text = caddyfile(&one);
+        assert_eq!(caddyfile(&one, &[]), caddyfile(&two, &[]));
+        let text = caddyfile(&one, &[]);
         assert!(text.find("a.example.com {").unwrap() < text.find("b.example.com {").unwrap());
     }
 
@@ -351,7 +353,7 @@ mod tests {
         let mut record = EdgeRecord::default();
         record.put(route("private.example.com", Reach::Private));
         record.put(route("public.example.com", Reach::Public));
-        let text = caddyfile(&record);
+        let text = caddyfile(&record, &[]);
         let private = &text[text.find("private.example.com {").unwrap()..];
         let private = &private[..private.find("\n}\n").unwrap()];
         assert!(private.contains(
@@ -369,13 +371,53 @@ mod tests {
     #[test]
     fn the_global_options_read_the_client_address_from_the_proxy_header_and_use_the_dns_challenge()
     {
-        let text = caddyfile(&EdgeRecord::default());
+        let text = caddyfile(&EdgeRecord::default(), &[]);
         assert!(text.contains("acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}"));
         assert!(text.contains("proxy_protocol {"));
         assert!(text.contains("allow 127.0.0.1/32"));
         assert!(text.contains("protocols h1 h2"));
         // With no route there is no site at all.
         assert!(!text.contains("reverse_proxy"));
+    }
+
+    /// The global options of an edge no service is linked to, as every edge had them before links counted.
+    const GLOBAL: &str = "# Written by Arca from this node's routes (route_add, route_remove). Each change replaces the whole file.\n{\n\tadmin localhost:2019\n\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}\n\tservers {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\ttimeout 5s\n\t\t\t\tallow 127.0.0.1/32\n\t\t\t}\n\t\t\ttls\n\t\t}\n\t\tprotocols h1 h2\n\t}\n}\n";
+
+    #[test]
+    fn an_edge_with_no_linked_service_renders_the_bytes_it_always_had() {
+        assert_eq!(caddyfile(&EdgeRecord::default(), &[]), GLOBAL);
+        let mut record = EdgeRecord::default();
+        record.put(route("a.example.com", Reach::Public));
+        assert!(caddyfile(&record, &[]).starts_with(&format!("{GLOBAL}\n# a.example.com")));
+    }
+
+    #[test]
+    fn each_linked_service_may_send_the_proxy_header_from_its_own_address_once_in_order() {
+        let one = caddyfile(&EdgeRecord::default(), &[Ipv4Addr::new(10, 0, 0, 5)]);
+        assert_eq!(
+            one,
+            GLOBAL.replace(
+                "allow 127.0.0.1/32\n",
+                "allow 127.0.0.1/32\n\t\t\t\tallow 10.0.0.5/32\n"
+            )
+        );
+        let two = [Ipv4Addr::new(10, 0, 0, 12), Ipv4Addr::new(10, 0, 0, 5)];
+        let mut record = EdgeRecord::default();
+        record.put(route("a.example.com", Reach::Private));
+        let text = caddyfile(&record, &two);
+        assert!(text.contains(
+            "\t\t\t\tallow 127.0.0.1/32\n\t\t\t\tallow 10.0.0.5/32\n\t\t\t\tallow 10.0.0.12/32\n\t\t\t}\n"
+        ));
+        // Any order, and an address given twice, render the same bytes; the routes are what they were.
+        let again = [two[1], two[0], two[1]];
+        assert_eq!(caddyfile(&record, &again), text);
+        assert_eq!(
+            text.replace(
+                "\t\t\t\tallow 10.0.0.5/32\n\t\t\t\tallow 10.0.0.12/32\n",
+                ""
+            ),
+            caddyfile(&record, &[])
+        );
     }
 
     #[test]
@@ -387,7 +429,7 @@ mod tests {
         let mut zero = route("zero.example.com", Reach::Private);
         zero.port = 0;
         record.routes.push(zero);
-        let text = caddyfile(&record);
+        let text = caddyfile(&record, &[]);
         assert!(!text.contains("evil"));
         assert!(!text.contains("zero.example.com"));
     }

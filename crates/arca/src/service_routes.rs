@@ -281,7 +281,7 @@ impl ServiceHandler {
             .write_service_file(
                 &owned,
                 &ServiceFile::EdgeConfig,
-                route::caddyfile(record).as_bytes(),
+                route::caddyfile(record, &[]).as_bytes(),
             )
             .map_err(|_| "Incus did not take the edge's config file".to_string())
     }
@@ -308,7 +308,7 @@ impl ServiceHandler {
             .exec
             .writer(&target, Duration::from_secs(10))
             .map_err(|_| "this node could not reach Incus".to_string())?;
-        let rendered = route::caddyfile(record);
+        let rendered = route::caddyfile(record, &[]);
         writer
             .write_service_file(&owned, &ServiceFile::EdgeConfig, rendered.as_bytes())
             .map_err(|_| "Incus did not take the edge's config file".to_string())?;
@@ -335,7 +335,7 @@ impl ServiceHandler {
                 .write_service_file(
                     &owned,
                     &ServiceFile::EdgeConfig,
-                    route::caddyfile(before).as_bytes(),
+                    route::caddyfile(before, &[]).as_bytes(),
                 )
                 .is_ok();
             return Err(match error {
