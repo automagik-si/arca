@@ -119,6 +119,148 @@ impl Plugin for Patcher {
     }
 }
 
+#[test]
+fn a_binding_replays_before_resolution_and_removal_undoes_and_deletes_only_the_new_uuid() {
+    use arca_kernel::journal::{BindingEvent, BindingState};
+    let scratch = Scratch::new("bind");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![patcher_entry("v1")]);
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        r.reconcile(&first, NOW),
+        vec![Outcome::Applied { entry: pe_id() }]
+    );
+    let path = instance_path("p-box-q");
+    let old = get(&fake, &path).unwrap()["config"]["volatile.uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(r);
+    fake.set_instance_config(PROJECT, "p-box-q", "volatile.uuid", "replacement");
+    let writes = fake.writes().len();
+    {
+        let mut journal =
+            Journal::open(FileJournal::open(&scratch.path("journal.jsonl")).unwrap()).unwrap();
+        journal
+            .bind(BindingEvent {
+                entry: pe_id(),
+                at_ms: NOW,
+                from: BindingState {
+                    instance: instance_object("p-box-q", Some(&old)),
+                    root_pool: "pool1".into(),
+                    data_volume: None,
+                },
+                to: BindingState {
+                    instance: instance_object("p-box-q", Some("replacement")),
+                    root_pool: "pool2".into(),
+                    data_volume: None,
+                },
+            })
+            .unwrap();
+        // A later unresolved patch makes restart exercise resolve() as well as
+        // folding the binding. Its unchanged pre-image proves it never landed.
+        journal
+            .intend(
+                &pe_id(),
+                EffectClass::A,
+                Digest::of(b"pending"),
+                instance_object("p-box-q", Some("replacement")),
+                Some(BTreeMap::from([("user.pending".into(), None)])),
+                NOW,
+            )
+            .unwrap();
+    }
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .unwrap();
+    assert_eq!(r.journal().bindings().next().unwrap().to.root_pool, "pool2");
+    assert!(r.journal().unresolved().is_empty());
+    assert_eq!(
+        fake.writes().len(),
+        writes,
+        "replay and resolution send no host write"
+    );
+    let (object, config) = r
+        .journal()
+        .live(&pe_id())
+        .into_iter()
+        .find_map(|record| match record.inverse {
+            Some(Inverse::IncusRestoreConfig { object, config })
+                if object.kind == IncusKind::Instance =>
+            {
+                Some((object, config))
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(object, instance_object("p-box-q", Some("replacement")));
+    // Instance patches are class B and normally go with the delete. Execute
+    // this recorded undo explicitly to prove its address passes the UUID guard.
+    let mut undo_provider = provider(&scratch, &fake, &retained);
+    let mut undo_journal = Journal::open(arca_kernel::journal::MemJournal::new()).unwrap();
+    Ctx::new(
+        pe_id(),
+        &Patcher::manifest(),
+        &mut undo_provider,
+        &mut undo_journal,
+        NOW,
+    )
+    .effect(EffectOp::IncusPatchConfig { object, config })
+    .unwrap();
+    assert!(get(&fake, &path).unwrap()["config"]["user.env"].is_null());
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    let outcomes = r.reconcile(&second, NOW);
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Failed { .. })),
+        "{outcomes:?}"
+    );
+    let plan = r
+        .pending_plans()
+        .into_iter()
+        .find(|plan| plan.entry == pe_id())
+        .unwrap();
+    assert_eq!(
+        plan.objects,
+        [instance_object("p-box-q", Some("replacement"))]
+    );
+    let run = approve_and_run(&mut r, &scratch, &plan, "bound");
+    assert!(!run.partial);
+    assert!(get(&fake, &path).is_none());
+    drop(r);
+    let r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&second),
+    )
+    .unwrap();
+    assert!(r.journal().live(&pe_id()).is_empty());
+    assert!(
+        r.journal().bindings().next().is_none(),
+        "removed lineages cannot restore stale storage facts"
+    );
+}
+
 fn patcher_entry(value: &str) -> arca_kernel::desired::Entry {
     entry(PE, PATCHER, json!({ "tag": "q", "value": value }))
 }

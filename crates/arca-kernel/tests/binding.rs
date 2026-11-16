@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::EntryId;
-use arca_kernel::journal::{EffectClass, FileJournal, Inverse, Journal, JournalSink, removal};
+use arca_kernel::journal::{
+    BindingEvent, EffectClass, EffectRecord, FileJournal, Inverse, Journal, JournalRecord,
+    JournalSink, JournalStore, read_journal, removal,
+};
 use arca_kernel::ownership::{IncusKind, ObjectRef};
 use serde_json::{Value, json};
 
@@ -244,4 +247,155 @@ fn later_effect_states_and_a_second_binding_follow_the_effective_history() {
     drop(journal);
     let journal = Journal::open(FileJournal::open(&scratch.0).unwrap()).unwrap();
     assert_eq!(journal.live(&EntryId("service-sample".into())).len(), 2);
+}
+
+#[test]
+fn the_append_api_writes_one_line_and_replays_storage_facts_without_rewriting_history() {
+    let scratch = Scratch::new();
+    seed(&scratch.0);
+    let before = fs::read(&scratch.0).unwrap();
+    let event: BindingEvent = serde_json::from_value(event()["binding"].clone()).unwrap();
+    let mut journal = Journal::open(FileJournal::open(&scratch.0).unwrap()).unwrap();
+    journal.bind(event.clone()).unwrap();
+    assert_eq!(journal.bindings().next().unwrap().to.root_pool, "pool2");
+    let after = fs::read(&scratch.0).unwrap();
+    assert!(after.starts_with(&before));
+    assert_eq!(
+        after[before.len()..]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count(),
+        1
+    );
+    assert!(
+        journal.bind(event).is_err(),
+        "a stale or duplicate source is refused"
+    );
+    assert_eq!(fs::read(&scratch.0).unwrap(), after);
+    let (listed, _) = read_journal(&scratch.0).unwrap();
+    assert!(
+        listed
+            .iter()
+            .filter(|record| record.id == 2)
+            .all(|record| record.target.uuid.as_deref() == Some("new"))
+    );
+    drop(journal);
+    let journal = Journal::open(FileJournal::open(&scratch.0).unwrap()).unwrap();
+    let facts = journal.bindings().next().unwrap();
+    assert_eq!(facts.to.root_pool, "pool2");
+    assert_eq!(facts.to.data_volume, Some(volume("pool2")));
+    assert!(
+        journal.unresolved().is_empty(),
+        "a binding has no external effect to resolve"
+    );
+}
+
+#[test]
+fn a_failed_binding_append_poisons_the_writer_and_reopen_decides_what_landed() {
+    struct Uncertain {
+        inner: FileJournal,
+        land: bool,
+    }
+    impl JournalStore for Uncertain {
+        fn append(&mut self, record: &EffectRecord) -> Result<(), arca_kernel::KernelError> {
+            self.inner.append(record)
+        }
+        fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), arca_kernel::KernelError> {
+            self.inner.load()
+        }
+        fn history(
+            &self,
+        ) -> Result<(Vec<JournalRecord>, Option<String>), arca_kernel::KernelError> {
+            self.inner.history()
+        }
+        fn append_binding(&mut self, event: &BindingEvent) -> Result<(), arca_kernel::KernelError> {
+            if self.land {
+                self.inner.append_binding(event)?;
+            }
+            Err(arca_kernel::KernelError::Journal("uncertain append".into()))
+        }
+    }
+    for land in [false, true] {
+        let scratch = Scratch::new();
+        seed(&scratch.0);
+        let mut journal = Journal::open(Uncertain {
+            inner: FileJournal::open(&scratch.0).unwrap(),
+            land,
+        })
+        .unwrap();
+        let event: BindingEvent = serde_json::from_value(event()["binding"].clone()).unwrap();
+        assert!(journal.bind(event.clone()).is_err());
+        assert!(journal.poisoned().is_some());
+        assert!(journal.bind(event).is_err());
+        assert!(
+            journal.bindings().next().is_none(),
+            "memory changes only after append succeeds"
+        );
+        drop(journal);
+        let journal = Journal::open(FileJournal::open(&scratch.0).unwrap()).unwrap();
+        assert_eq!(journal.bindings().next().is_some(), land);
+        assert_eq!(
+            removal(&journal, &EntryId("service-sample".into()), 30)
+                .plan
+                .unwrap()
+                .objects,
+            if land {
+                vec![volume("pool2"), instance("new")]
+            } else {
+                vec![volume("pool1"), instance("old")]
+            }
+        );
+    }
+}
+
+#[test]
+fn a_pending_effect_or_invalid_destination_refuses_a_binding_before_any_append() {
+    for (pointer, value) in [
+        ("/to/instance/uuid", json!("old")),
+        ("/to/instance/project", json!("another-project")),
+        ("/to/data_volume/project", json!("another-project")),
+        ("/to/data_volume/uuid", json!("not-a-volume-identity")),
+        ("/to/data_volume", Value::Null),
+        ("/to/root_pool", json!("")),
+    ] {
+        let scratch = Scratch::new();
+        seed(&scratch.0);
+        let before = fs::read(&scratch.0).unwrap();
+        let mut data = event()["binding"].clone();
+        *data.pointer_mut(pointer).unwrap() = value;
+        let mut journal = Journal::open(FileJournal::open(&scratch.0).unwrap()).unwrap();
+        assert!(
+            journal.bind(serde_json::from_value(data).unwrap()).is_err(),
+            "{pointer}"
+        );
+        assert_eq!(fs::read(&scratch.0).unwrap(), before);
+        assert!(
+            journal.poisoned().is_none(),
+            "a bad request does not poison a healthy journal"
+        );
+    }
+    let scratch = Scratch::new();
+    seed(&scratch.0);
+    let mut journal = Journal::open(FileJournal::open(&scratch.0).unwrap()).unwrap();
+    let id = journal
+        .intend(
+            &EntryId("service-sample".into()),
+            EffectClass::A,
+            Digest::of(b"open"),
+            instance("old"),
+            Some(BTreeMap::new()),
+            12,
+        )
+        .unwrap();
+    let before = fs::read(&scratch.0).unwrap();
+    assert!(
+        journal
+            .bind(serde_json::from_value(event()["binding"].clone()).unwrap())
+            .is_err()
+    );
+    assert_eq!(fs::read(&scratch.0).unwrap(), before);
+    journal.failed(id, "not applied").unwrap();
+    journal
+        .bind(serde_json::from_value(event()["binding"].clone()).unwrap())
+        .unwrap();
 }

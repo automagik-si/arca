@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The effect journal supports a binding record from this release; once one is written, older Arca versions refuse the journal.
+
 ## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
