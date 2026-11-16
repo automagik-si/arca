@@ -149,7 +149,9 @@ impl GuestSecrets {
     /// Writes the stored secrets of the virtual-machine service whose instance is `instance` in `project` into its
     /// guest. `Ok(None)` when there is nothing to write: no service record of Arca's names that instance in that
     /// project, it is not a virtual machine Arca created, or none of its secrets is set. `Ok(Some(names))` names the
-    /// secrets written.
+    /// secrets written. Stored reach secrets are written before the optional repository mint. If those writes
+    /// succeed but the mint fails, that failure is logged separately and the result names only the files written.
+    /// A legacy workspace without repoUrl does not attempt a mint.
     ///
     /// `project` and `instance` are the caller's words and only find the record. Where the files are sent is Arca's
     /// own: the instance the record's entry created, as the effect journal holds it (project and uuid), which must be
@@ -215,7 +217,7 @@ impl GuestSecrets {
                 .map_err(|_| NotWritten::later("the kernel's retained set could not be read"))?;
             (entry, record, object, retained)
         };
-        // Every value is read before anything is sent, so a secret that cannot be read leaves the guest as it was. It
+        // Every stored value is read before any stored value is sent, so an unreadable secret leaves the guest as it was. It
         // is read by the provider's own rule: this entry's secret, in private directories, a private file of this
         // process's user, and the file that was checked is the file that is read.
         let secrets = self.cfg.state_dir.join("secrets");
@@ -264,68 +266,94 @@ impl GuestSecrets {
         if owned.tombstone().is_some() {
             return Err(NotWritten::fixed("its instance is being removed"));
         }
+        // Reach credentials are independent of GitHub: complete the stored writes before any mint attempt.
+        let mut written = self.write_files(&target, &owned, files)?;
+        if target.service.template == "automagik-workspace" {
+            match self.deliver_repository(&target, &object, &owned, repository_only) {
+                Ok(names) => written.extend(names),
+                Err(why) if !written.is_empty() => {
+                    eprintln!(
+                        "arca: stored workspace secrets were written; repository credential delivery failed: {}",
+                        why.why
+                    );
+                }
+                Err(why) => return Err(why),
+            }
+        }
+        Ok((!written.is_empty()).then_some(written))
+    }
+
+    fn deliver_repository(
+        &self,
+        target: &ExecTarget,
+        object: &arca_kernel::ownership::ObjectRef,
+        owned: &arca_incus::Owned,
+        repository_only: bool,
+    ) -> Result<Vec<String>, NotWritten> {
+        let settings = target
+            .service
+            .vm
+            .as_ref()
+            .and_then(|vm| vm.guest_settings());
+        let Some(repo) = settings
+            .as_ref()
+            .and_then(|s| s["repoUrl"].as_str())
+            .filter(|repo| !repo.is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        let project = target.service.project.as_str();
+        let instance = target.service.instance.as_str();
+        let mut files = Vec::new();
         let repository_key = (
             project.to_string(),
             instance.to_string(),
             object.uuid.clone().unwrap_or_default(),
         );
-        let workspace = target.service.template == "automagik-workspace";
-        if workspace {
-            // Ownership and UUID were checked above. Read power state before minting, including on a refresh:
-            // a stopped VM gets neither a token nor any guest-file request.
-            let family = arca_incus::ProjectFamily::new(
-                self.cfg.kernel.projects.iter().map(String::as_str),
-                self.cfg.kernel.droidd_projects.iter().map(String::as_str),
-            )
-            .map_err(|_| NotWritten::fixed("the node project family cannot be read"))?;
-            let family = if target.service.tenant.is_some() {
-                family
-                    .with_tenants([project])
-                    .map_err(|_| NotWritten::fixed("the workspace tenant is not in place"))?
-            } else {
-                family
-            };
-            let power = arca_incus::StateChanger::new(self.cfg.incus.socket.clone(), family)
-                .read(project, instance)
-                .map_err(|_| NotWritten::later("the workspace power state could not be read"))?;
-            if power.uuid != object.uuid {
-                return Err(NotWritten::fixed(
-                    "the workspace UUID changed; nothing was written",
-                ));
-            }
-            if !power.is_running() {
-                return Ok(None);
-            }
-            if repository_only
-                && self
-                    .repository_written
-                    .lock()
-                    .map_err(|_| NotWritten::fixed("the repository refresh state cannot be read"))?
-                    .get(&repository_key)
-                    .is_some_and(|at| {
-                        (self.repository_clock)().saturating_sub(*at)
-                            < REPOSITORY_REFRESH.as_secs() * 1000
-                    })
-            {
-                return Ok(None);
-            }
-            let settings = target
-                .service
-                .vm
-                .as_ref()
-                .and_then(|vm| vm.guest_settings())
-                .ok_or_else(|| {
-                    NotWritten::fixed("the workspace has no recorded repository settings")
-                })?;
-            let repo = settings["repoUrl"]
-                .as_str()
-                .ok_or_else(|| NotWritten::fixed("the workspace has no recorded repoUrl"))?;
-            let mint = self
-                .repository_mint
-                .as_ref()
-                .ok_or_else(|| NotWritten::fixed("the owner must connect the repository App"))?;
-            let credential = mint(repo)?;
-            for (key, value) in [
+        // Ownership and UUID were checked above. Read power state before minting, including on a refresh:
+        // a stopped VM gets neither a repository mint nor a repository file write.
+        let family = arca_incus::ProjectFamily::new(
+            self.cfg.kernel.projects.iter().map(String::as_str),
+            self.cfg.kernel.droidd_projects.iter().map(String::as_str),
+        )
+        .map_err(|_| NotWritten::fixed("the node project family cannot be read"))?;
+        let family = if target.service.tenant.is_some() {
+            family
+                .with_tenants([project])
+                .map_err(|_| NotWritten::fixed("the workspace tenant is not in place"))?
+        } else {
+            family
+        };
+        let power = arca_incus::StateChanger::new(self.cfg.incus.socket.clone(), family)
+            .read(project, instance)
+            .map_err(|_| NotWritten::later("the workspace power state could not be read"))?;
+        if power.uuid != object.uuid {
+            return Err(NotWritten::fixed(
+                "the workspace UUID changed; nothing was written",
+            ));
+        }
+        if !power.is_running() {
+            return Ok(Vec::new());
+        }
+        if repository_only
+            && self
+                .repository_written
+                .lock()
+                .map_err(|_| NotWritten::fixed("the repository refresh state cannot be read"))?
+                .get(&repository_key)
+                .is_some_and(|at| {
+                    (self.repository_clock)().saturating_sub(*at)
+                        < REPOSITORY_REFRESH.as_secs() * 1000
+                })
+        {
+            return Ok(Vec::new());
+        }
+        let mint = self
+            .repository_mint
+            .as_ref()
+            .ok_or_else(|| NotWritten::fixed("the owner must connect the repository App"))?;
+        let credential = mint(repo)?;
+        for (key, value) in [
                 ("GITHUB_TOKEN", credential.token.expose().to_string()),
                 ("GITHUB_BOT_ID", credential.bot_id.to_string()),
                 ("GITHUB_BOT_IDENTITY", serde_json::json!({"id":credential.bot_id.to_string(), "login":credential.bot_login}).to_string()),
@@ -337,14 +365,38 @@ impl GuestSecrets {
                     value,
                 ));
             }
+
+        let written = self.write_files(target, owned, files)?;
+        self.repository_written
+            .lock()
+            .map_err(|_| NotWritten::fixed("the repository refresh state cannot be written"))?
+            .insert(repository_key, (self.repository_clock)());
+        Ok(written)
+    }
+
+    fn write_files(
+        &self,
+        target: &ExecTarget,
+        owned: &arca_incus::Owned,
+        files: Vec<(String, SecretName, String)>,
+    ) -> Result<Vec<String>, NotWritten> {
+        if files.is_empty() {
+            return Ok(Vec::new());
         }
+        let writer = || {
+            writer_for(&self.cfg, target, REQUEST_BUDGET).map_err(|_| {
+                NotWritten::fixed(
+                    "its record's project is not one this node writes; nothing was sent",
+                )
+            })
+        };
         // The directory first: a new file is made before its mode is set, and only root enters the directory. It is
         // read before it is made, so a directory an earlier start made is left as it is and nothing depends on how
         // Incus answers a request to make one that exists. Anything else at the path is refused: a secret is never
         // written under a directory another user can enter.
         let until = Instant::now() + self.wait;
         loop {
-            match writer()?.guest_secrets_dir(&owned) {
+            match writer()?.guest_secrets_dir(owned) {
                 Ok(GuestSecretsDir::Private) => break,
                 Ok(GuestSecretsDir::NotPrivate) => {
                     return Err(NotWritten::fixed(format!(
@@ -353,7 +405,7 @@ impl GuestSecrets {
                 }
                 Ok(GuestSecretsDir::Missing) => {
                     if writer()?
-                        .write_service_file(&owned, &ServiceFile::GuestSecretsDir, &[])
+                        .write_service_file(owned, &ServiceFile::GuestSecretsDir, &[])
                         .is_ok()
                     {
                         break;
@@ -373,7 +425,7 @@ impl GuestSecrets {
         let mut written = Vec::new();
         for (key, name, value) in files {
             writer()?
-                .write_service_file(&owned, &ServiceFile::GuestSecret(name), value.as_bytes())
+                .write_service_file(owned, &ServiceFile::GuestSecret(name), value.as_bytes())
                 .map_err(|_| {
                     NotWritten::later(format!(
                         "the secret {key} could not be written to {GUEST_SECRETS_DIR} in the guest"
@@ -381,13 +433,7 @@ impl GuestSecrets {
                 })?;
             written.push(key);
         }
-        if workspace {
-            self.repository_written
-                .lock()
-                .map_err(|_| NotWritten::fixed("the repository refresh state cannot be written"))?
-                .insert(repository_key, (self.repository_clock)());
-        }
-        Ok(Some(written))
+        Ok(written)
     }
 }
 
