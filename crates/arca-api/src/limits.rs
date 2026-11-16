@@ -410,6 +410,12 @@ mod tests {
             json!({"tenant": "abcdefgh", "instance": "web-abcdefgh"})
         ));
         assert!(!ok(json!({"tenant": "abcdefgh", "instance": "web"})));
+        // The dash is the instance name's own: `webabcdefgh` is not the instance of `web`.
+        assert!(!ok(
+            json!({"tenant": "abcdefgh", "instance": "webabcdefgh"})
+        ));
+        assert!(!list.allows_instance("arcak-t-abcdefgh", "webabcdefgh"));
+        assert!(list.allows_instance("arcak-t-abcdefgh", "web-abcdefgh"));
         assert!(!ok(
             json!({"tenant": "abcdefgh", "instance": "web-bcdefghi"})
         ));
