@@ -48,6 +48,71 @@ fn unchanged(rig: &Rig, journal: usize, writes: usize) {
     assert_eq!(rig.fake.writes().len(), writes);
 }
 
+fn reopen(rig: &Rig, snapshot: &std::path::Path) -> Result<Kernel, arca_kernel::KernelError> {
+    let mut plugins = PluginSet::new();
+    plugins.add::<arca_netproject::NetProject>().unwrap();
+    plugins.add::<Service>().unwrap();
+    let verifier = ApprovalVerifier::new(
+        "node1".into(),
+        OwnerKeys::new(
+            SshSigVerifier::new(vec![]),
+            PasskeyVerifier::refusing(arca_approval::ApprovalRefusal::NoVerifier),
+        ),
+        FileNonces::open(&snapshot.join("nonces")).unwrap(),
+    );
+    Kernel::open(
+        snapshot,
+        NodeKey::load_or_create(&rig.dir.join("node.key")).unwrap(),
+        plugins,
+        verifier,
+        "node1".into(),
+        None,
+        |retained| {
+            Ok(Box::new(
+                IncusProvider::new(
+                    rig.fake.socket().to_path_buf(),
+                    Family {
+                        projects: vec![PROJECT.into()],
+                        scratch: false,
+                        droidd_projects: vec!["other".into()],
+                        reserved_cidrs: vec![],
+                    },
+                    rig.dir.join("secrets"),
+                    retained,
+                )
+                .unwrap(),
+            ))
+        },
+        NOW,
+    )
+}
+
+fn remove_approved(rig: &Rig) -> Result<Value, CallError> {
+    // Terminal approval yields the same one-shot grant the normal owner path uses.
+    let proposal = rig
+        .kernel
+        .lock()
+        .unwrap()
+        .propose_action(
+            arca::action_proposal::ActionKind::ServiceRemove,
+            json!({"name":"sample"}),
+            NOW,
+            None,
+        )
+        .unwrap();
+    let approved = rig
+        .kernel
+        .lock()
+        .unwrap()
+        .approve_action_in_terminal(&proposal.id, "test-admin", NOW, NOW)
+        .unwrap();
+    arca::handlers::ActionExecutor::new(rig.handlers.iter().map(|(k, v)| (*k, v.clone()))).run(
+        &approved.action,
+        &approved.args,
+        &approved.grant,
+    )
+}
+
 #[test]
 fn approved_rebind_recovers_secrets_and_storage_without_touching_the_backups() {
     let rig = copied_service_binding_fixture();
@@ -307,28 +372,7 @@ fn removing_a_rebound_service_keeps_an_acl_the_backup_still_references() {
         "/1.0/network-acls/{}?project=default",
         rig.service_config("sample").acl()
     );
-    // Terminal approval yields the same one-shot grant the normal owner path uses.
-    let proposal = rig
-        .kernel
-        .lock()
-        .unwrap()
-        .propose_action(
-            arca::action_proposal::ActionKind::ServiceRemove,
-            json!({"name":"sample"}),
-            NOW,
-            None,
-        )
-        .unwrap();
-    let approved = rig
-        .kernel
-        .lock()
-        .unwrap()
-        .approve_action_in_terminal(&proposal.id, "test-admin", NOW, NOW)
-        .unwrap();
-    let error =
-        arca::handlers::ActionExecutor::new(rig.handlers.iter().map(|(k, v)| (*k, v.clone())))
-            .run(&approved.action, &approved.args, &approved.grant)
-            .unwrap_err();
+    let error = remove_approved(&rig).unwrap_err();
     let CallError::Refused { message: words, .. } = error else {
         panic!("unexpected removal result: {error:?}")
     };
@@ -348,12 +392,8 @@ fn removing_a_rebound_service_keeps_an_acl_the_backup_still_references() {
         json!({}),
     );
     assert!(
-        rig.call(
-            "service_remove",
-            json!({"name":"sample","approval":"unused"})
-        )
-        .is_err(),
-        "the desired service record is already gone"
+        matches!(rig.call("service_remove", json!({"name":"sample","approval":"unused"})),
+        Err(CallError::Refused { code, message }) if code == "not_found" && message == "service sample: not found")
     );
     // The live ACL inverse remains available for the next normal reconciliation.
     rig.kernel.lock().unwrap().propose(vec![], NOW).unwrap();
@@ -572,44 +612,8 @@ fn a_fsynced_binding_repairs_old_current_and_converged_storage_before_restart_ap
         for file in ["desired.json", "journal.jsonl"] {
             fs::set_permissions(snapshot.join(file), fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let mut plugins = PluginSet::new();
-        plugins.add::<arca_netproject::NetProject>().unwrap();
-        plugins.add::<Service>().unwrap();
-        let verifier = ApprovalVerifier::new(
-            "node1".into(),
-            OwnerKeys::new(
-                SshSigVerifier::new(vec![]),
-                PasskeyVerifier::refusing(arca_approval::ApprovalRefusal::NoVerifier),
-            ),
-            FileNonces::open(&snapshot.join("nonces")).unwrap(),
-        );
         let writes = rig.fake.writes().len();
-        let reopened = Kernel::open(
-            &snapshot,
-            NodeKey::load_or_create(&rig.dir.join("node.key")).unwrap(),
-            plugins,
-            verifier,
-            "node1".into(),
-            None,
-            |retained| {
-                Ok(Box::new(
-                    IncusProvider::new(
-                        rig.fake.socket().to_path_buf(),
-                        Family {
-                            projects: vec![PROJECT.into()],
-                            scratch: false,
-                            droidd_projects: vec!["other".into()],
-                            reserved_cidrs: vec![],
-                        },
-                        rig.dir.join("secrets"),
-                        retained,
-                    )
-                    .unwrap(),
-                ))
-            },
-            NOW,
-        )
-        .unwrap();
+        let reopened = reopen(&rig, &snapshot).unwrap();
         let service = reopened
             .entries()
             .iter()
@@ -696,4 +700,107 @@ fn a_durable_binding_keeps_storage_current_when_the_record_cache_cannot_be_saved
         "the next proposal must not reapply the old storage"
     );
     assert!(rig.get(&volume_path("pool1")).is_some());
+    next_copy(&rig);
+    let second = propose(&rig, json!({"name":"sample"})).unwrap();
+    run(&rig, &second).unwrap();
+    assert_eq!(rig.service_config("sample").data_locator().name, "copied-c");
+}
+
+fn next_copy(rig: &Rig) {
+    rig.fake.add_volume(
+        PROJECT,
+        "pool2",
+        "copied-c",
+        rig.get(&volume_path("pool2")).unwrap(),
+    );
+    rig.fake
+        .set_instance_config(PROJECT, "sample", "volatile.uuid", "replacement-c");
+    rig.fake.set_instance_device(
+        PROJECT,
+        "sample",
+        "data",
+        json!({"type":"disk","path":"/data","pool":"pool2","source":"copied-c"}),
+    );
+}
+fn copy_saved_state(rig: &Rig) -> PathBuf {
+    let snapshot = rig.dir.join("reopen");
+    fs::create_dir(&snapshot).unwrap();
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o700)).unwrap();
+    for file in ["desired.json", "journal.jsonl"] {
+        fs::copy(rig.dir.join(file), snapshot.join(file)).unwrap();
+        fs::set_permissions(snapshot.join(file), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    snapshot
+}
+#[test]
+fn rebind_refuses_a_second_binding_until_the_first_storage_record_is_saved() {
+    let rig = copied_service_binding_fixture();
+    let first = propose(&rig, json!({"name":"sample"})).unwrap();
+    fs::create_dir(rig.dir.join("desired.json.tmp")).unwrap();
+    assert!(run(&rig, &first).is_err());
+    next_copy(&rig);
+    let journal = journal_lines(&rig);
+    let writes = rig.fake.writes().len();
+    let second = propose(&rig, json!({"name":"sample"}));
+    if let Ok(proposal) = &second {
+        assert!(run(&rig, proposal).is_err());
+    }
+    let reopened = reopen(&rig, &copy_saved_state(&rig)).unwrap();
+    let config = &reopened
+        .entries()
+        .iter()
+        .find(|e| e.id.0 == "service-sample")
+        .unwrap()
+        .config;
+    assert!(
+        matches!(second, Err(CallError::Refused { message, .. }) if message.contains("not saved")),
+        "a second binding must wait for saved storage; reopened record: {config}"
+    );
+    assert_eq!(journal_lines(&rig), journal);
+    assert_eq!(config["pool"], "pool2");
+    assert_eq!(config["dataVolume"]["name"], "sample-data");
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+#[test]
+fn rebind_reopen_refuses_storage_outside_the_latest_binding_without_host_writes() {
+    let rig = copied_service_binding_fixture();
+    let first = propose(&rig, json!({"name":"sample"})).unwrap();
+    fs::create_dir(rig.dir.join("desired.json.tmp")).unwrap();
+    assert!(run(&rig, &first).is_err());
+    next_copy(&rig);
+    let snapshot = copy_saved_state(&rig);
+    let from = first["args"]["binding"]["to"].clone();
+    let mut to = from.clone();
+    to["instance"]["uuid"] = json!("replacement-c");
+    to["data_volume"]["name"] = json!("copied-c");
+    let mut journal = fs::read(snapshot.join("journal.jsonl")).unwrap();
+    journal.extend(
+        serde_json::to_vec(&json!({"kind":"binding","binding":{
+            "entry":"service-sample","at_ms":NOW,"from":from,"to":to
+        }}))
+        .unwrap(),
+    );
+    journal.push(b'\n');
+    fs::write(snapshot.join("journal.jsonl"), journal).unwrap();
+    let writes = rig.fake.writes().len();
+    let error = reopen(&rig, &snapshot)
+        .err()
+        .expect("mixed storage must refuse to open");
+    assert!(error.to_string().contains("service-sample"), "{error}");
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+#[test]
+fn rebind_removal_does_not_blame_another_instance_for_its_own_remaining_nic() {
+    let rig = copied_service_binding_fixture();
+    let proposal = propose(&rig, json!({"name":"sample"})).unwrap();
+    run(&rig, &proposal).unwrap();
+    rig.edit(
+        "DELETE",
+        &format!("/1.0/instances/sample-backup?project={PROJECT}"),
+        json!({}),
+    );
+    rig.fake.set_reject_delete("sample");
+    let error = remove_approved(&rig).unwrap_err();
+    assert!(matches!(error, CallError::Refused { message, .. }
+        if message.contains("instance remains") && !message.contains("another instance")));
 }

@@ -1966,6 +1966,9 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         }
         let fields = own["properties"].as_object_mut().expect("properties");
         fields.remove("approval");
+        if *action == "service_rebind" {
+            fields.remove("binding");
+        }
         for field in kernel_filled(action) {
             let said = fields[*field]["description"]
                 .as_str()
@@ -2259,4 +2262,17 @@ fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
             );
         }
     }
+}
+
+#[test]
+fn a_rebind_proposal_accepts_only_the_callers_name() {
+    let schema = (verb("action_propose").unwrap().params)();
+    let branch = schema["properties"]["args"]["anyOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["title"] == "service_rebind")
+        .unwrap();
+    assert!(branch["properties"].get("binding").is_none());
+    assert!(conforms(branch, &json!({"name":"sample","binding":{}})).is_err());
 }
