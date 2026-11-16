@@ -190,6 +190,7 @@ impl ExecCommand {
                 "--socket=/tmp/tailscaled.sock".into(),
                 "status".into(),
                 "--json".into(),
+                "--peers=false".into(),
             ],
             Self::TailnetStatus => vec![
                 "/usr/bin/tailscale".into(),

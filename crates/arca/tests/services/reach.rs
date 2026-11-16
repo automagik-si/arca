@@ -93,6 +93,7 @@ fn status(rig: &Rig, state: &str) {
         "--socket=/tmp/tailscaled.sock",
         "status",
         "--json",
+        "--peers=false",
     ];
     rig.fake.script_exec(ExecScript::new(argv.into_iter().map(str::to_string).collect(), 0,
         &json!({"BackendState":state,"AuthURL":LOGIN,"TailscaleIPs":["100.64.0.7"],"Self":{"DNSName":"node.example.ts.net.","HostName":"node"}}).to_string()));

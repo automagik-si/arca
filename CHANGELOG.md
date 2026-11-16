@@ -7,7 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 `reach_connect` creates, links and starts a Tailscale connector after the owner approves a proposal bound to the
 template's image and content digest. `reach_list` shows connector state and tailnet details without the sign-in link.
 Keyless startup allows 10 minutes for sign-in; connector logs hide the login link, and a timed-out connector is
-shown as `gave-up`. Keys remain separate, through `service_secret_set` and a restart.
+shown as `gave-up`. An unreadable Tailscale status is `unknown`, and status reads omit peers to keep large tailnets
+within the output limit. Keys remain separate, through `service_secret_set` and a restart.
 
 ## 0.35.0 (2026-11-16)
 

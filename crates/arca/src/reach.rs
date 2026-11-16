@@ -122,15 +122,15 @@ pub(crate) fn reach_rows(
         if kind == "tailscale" {
             if running {
                 let bytes = read(exec, &target(kernel, entry, record)?, caller)?;
-                // Missing, new or malformed fields leave the connector waiting, never authenticated by inference.
+                // Unreadable status or a missing backend state cannot establish whether sign-in is needed.
                 let status = bytes
                     .as_deref()
                     .and_then(|bytes| serde_json::from_slice::<Status>(bytes).ok())
                     .unwrap_or_default();
-                row["state"] = json!(if status.backend_state.as_deref() == Some("Running") {
-                    "running"
-                } else {
-                    "waiting-sign-in"
+                row["state"] = json!(match status.backend_state.as_deref() {
+                    Some("Running") => "running",
+                    Some(state) if !state.is_empty() => "waiting-sign-in",
+                    _ => "unknown",
                 });
                 if row["state"] == "running" {
                     if let Some(address) = status
@@ -231,11 +231,24 @@ fn login_link(url: &str) -> bool {
         })
 }
 
-/// Hide exactly the vendor's node-login URL shape; preserve punctuation, admin URLs and other text.
+/// Hide node-login URLs, including HTTP and case variants; preserve punctuation, admin URLs and other text.
 pub(crate) fn redact_login_links(text: &str) -> String {
     static LINKS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"https://login\.tailscale\.com/a/[A-Za-z0-9_-]+")
-            .expect("fixed login-link pattern")
+        // Carriage returns inside a URL must not leave an identifier fragment on another answered line.
+        // Outside a matching URL they remain ordinary log-line separators.
+        let across_returns = |literal: &str| {
+            literal
+                .chars()
+                .map(|ch| regex::escape(&ch.to_string()))
+                .collect::<Vec<_>>()
+                .join(r"\r*")
+        };
+        regex::Regex::new(&format!(
+            r"(?i){}(?:\r*s)?\r*{}\r*[A-Za-z0-9_-]+(?:\r+[A-Za-z0-9_-]+)*",
+            across_returns("http"),
+            across_returns("://login.tailscale.com/a/")
+        ))
+        .expect("fixed login-link pattern")
     });
     LINKS.replace_all(text, "[sign-in link]").into_owned()
 }

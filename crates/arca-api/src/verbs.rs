@@ -1470,7 +1470,7 @@ static VERBS: [Verb; 96] = [
     },
     Verb {
         name: "reach_list",
-        summary: "The node's connectors and their edge and state. Tailscale reports stopped, waiting-sign-in, gave-up or running, with its tailnet name and address when available. Never returns a sign-in link.",
+        summary: "The node's connectors and their edge and state. Tailscale reports stopped, waiting-sign-in, gave-up, unknown or running, with its tailnet name and address when available. Never returns a sign-in link.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: false,
@@ -1938,7 +1938,7 @@ fn reach_row() -> Value {
         "properties": {
             "name":{"type":"string"}, "kind":{"type":"string"},
             "edge":{"type":["string", "null"]},
-            "state":{"type":"string", "enum":["stopped", "waiting-sign-in", "gave-up", "running"]},
+            "state":{"type":"string", "enum":["stopped", "waiting-sign-in", "gave-up", "unknown", "running"]},
             "tailnetName":{"type":"string"}, "tailnetAddress":{"type":"string"}
         }, "required":["name", "kind", "edge", "state"]})
 }

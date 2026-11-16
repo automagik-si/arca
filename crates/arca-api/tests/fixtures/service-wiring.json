@@ -332,6 +332,7 @@
             "stopped",
             "waiting-sign-in",
             "gave-up",
+            "unknown",
             "running"
           ],
           "type": "string"
@@ -391,6 +392,7 @@
                   "stopped",
                   "waiting-sign-in",
                   "gave-up",
+                  "unknown",
                   "running"
                 ],
                 "type": "string"

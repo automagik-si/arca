@@ -6173,7 +6173,8 @@ by `-ts` (or `tailscale` when that does not fit); an optional `name` chooses ano
 template's image and content digest. A node without an edge explains what to create first.
 
 `reach_list` (doctor scope) shows each connector's name, kind, edge and state. A Tailscale connector is
-`waiting-sign-in` until it joins, then `running` with its tailnet name and address when available. A stopped connector
+`waiting-sign-in` until it joins, then `running` with its tailnet name and address when available. A running instance
+whose Tailscale status cannot be read is `unknown`; retry the read to check whether sign-in is needed. A stopped connector
 whose console records containerboot's authentication deadline is `gave-up`; restart it to retry. Other stops are
 `stopped`. Every keyless startup allows 10 minutes for sign-in, preserving an
 explicit `TS_BOOT_TIMEOUT`. This is a process deadline, not a known lifetime for the sign-in link. The link never
