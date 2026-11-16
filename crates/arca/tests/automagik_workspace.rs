@@ -257,6 +257,7 @@ impl Workspace {
         .expect("test Git transport");
         workspace.secret_named("GITHUB_TOKEN", "synthetic-repository-credential");
         workspace.secret_named("GITHUB_BOT_ID", "42");
+        workspace.secret_named("GITHUB_BOT_IDENTITY", r#"{"id":"42","login":"arca-repositories[bot]"}"#);
         // Privilege switching is the only fake: CI runs unprivileged, already as the target uid.
         // Remove the listed-program symlink before installing a stand-in.
         let _ = fs::remove_file(workspace.dir.join("bin/setpriv"));

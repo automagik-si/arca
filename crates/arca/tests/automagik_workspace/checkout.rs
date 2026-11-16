@@ -238,9 +238,11 @@ fn checkout_06_own_v1_v2_roster_survives_and_invalid_roster_blocks() {
 }
 #[test]
 fn checkout_07_identity_and_helper_only_when_unset() {
+    for login in ["project-custom-repositories[bot]", "arca-repositories[bot]"] {
     for level in ["none", "global", "local", "partial"] {
         let mut w = Workspace::new(&settings(URL));
         import(&w);
+        w.secret_named("GITHUB_BOT_IDENTITY", &json!({"id":"42","login":login}).to_string());
         if level == "local" || level == "partial" {
             git_at(&target(&w), &["config", "user.name", "Owner"]);
         }
@@ -258,9 +260,10 @@ fn checkout_07_identity_and_helper_only_when_unset() {
         boot(&mut w);
         let global = w.read("data/.gitconfig");
         if level == "none" {
-            assert!(global.contains("arca-repositories[bot]"));
+            assert_eq!(git_at(&target(&w), &["config", "--file", w.dir.join("data/.gitconfig").to_str().unwrap(), "--get", "user.name"]), login);
+            assert_eq!(git_at(&target(&w), &["config", "--file", w.dir.join("data/.gitconfig").to_str().unwrap(), "--get", "user.email"]), format!("42+{login}@users.noreply.github.com"));
         } else {
-            assert!(!global.contains("arca-repositories[bot]"));
+            assert!(!global.contains(login));
         }
         if level == "global" {
             assert!(global.contains("owner-helper"));
@@ -269,6 +272,7 @@ fn checkout_07_identity_and_helper_only_when_unset() {
             assert!(global.contains("github-token"));
         }
     }
+}
 }
 #[test]
 fn checkout_08_recovery_keeps_data_and_unknown_rosters_block() {
