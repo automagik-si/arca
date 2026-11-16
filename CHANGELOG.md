@@ -4,6 +4,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
+`TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:
+a connector may start with no key, and an unset optional secret is absent from the container's environment. Other
+templates keep requiring their secrets. Connector records now keep their template's kind (`tailscale` or `cloudflare`),
+with a template fallback for services made before this change.
+
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 

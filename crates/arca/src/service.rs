@@ -459,6 +459,9 @@ pub struct ServiceConfig {
     /// renders into the edge's Caddyfile. Absent on every other service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge: Option<crate::route::EdgeRecord>,
+    /// The connector kind named by its template. Older records fall back to their template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
 }
 
 /// An image digest and the version Automagik published it as.
@@ -1475,6 +1478,9 @@ pub struct Template {
     pub provides: Option<Value>,
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Declared secrets that may be unset at a start; a variable needing one is then absent.
+    #[serde(default)]
+    pub optional_secrets: Vec<String>,
     #[serde(default)]
     pub publishable: bool,
     #[serde(default)]
@@ -1550,6 +1556,27 @@ pub struct Template {
     /// each client's own address. Off unless the template says `true`.
     #[serde(default)]
     pub edge: bool,
+    /// The connector kind, such as tailscale or cloudflare. Absent for other services.
+    #[serde(default)]
+    pub connector: Option<String>,
+}
+
+/// A service's connector kind, including a service made before its record carried the kind.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the next reach change uses connector kinds to show sign-in links"
+    )
+)]
+pub(crate) fn connector_kind<'a>(
+    record: &'a ServiceConfig,
+    template: Option<&'a Template>,
+) -> Option<&'a str> {
+    record
+        .connector
+        .as_deref()
+        .or_else(|| template?.connector.as_deref())
 }
 
 /// One rule of a template's `settingRules`: `{ "need": <amount>, "atLeast": <amount>, "why": "<words>" }`. An amount
@@ -2878,20 +2905,31 @@ pub fn environment(
             references.insert(key.clone(), secret_reference(owner, key));
         }
     }
-    let mut env = BTreeMap::new();
-    for (key, value) in &template.env {
-        match render(
+    // Only the readiness check treats missing optional secrets as present. The actual render still omits the
+    // whole variable, including any literal text around the missing placeholder.
+    let mut for_start = references.clone();
+    for key in &template.optional_secrets {
+        if template.secrets.contains(key) {
+            for_start.entry(key.clone()).or_default();
+        }
+    }
+    let render_value = |value: &str, secrets: &BTreeMap<String, String>| {
+        render(
             value,
             name,
             ipv4,
             gateway,
             template.ports.first().copied(),
-            &references,
-        ) {
+            secrets,
+        )
+    };
+    let mut env = BTreeMap::new();
+    for (key, value) in &template.env {
+        match render_value(value, &references) {
             Some(value) => {
                 env.insert(key.clone(), value);
             }
-            None => start = false,
+            None => start &= render_value(value, &for_start).is_some(),
         }
     }
     Ok((env, start))
@@ -2900,8 +2938,8 @@ pub fn environment(
 /// Why a new service of this template is created stopped whatever the call's `start` says, in words that finish
 /// "it is created stopped because ...". `None` when a create starts it. A virtual machine whose template declares
 /// secrets is one: they are written into its guest by `instance_start`. A container is one while its environment names
-/// a secret that is neither stored for the entry `owner` nor made by the template. Nothing is read but whether each
-/// secret's file exists, and nothing is written: a secret is named, never shown.
+/// a required secret that is neither stored for the entry `owner` nor made by the template. Nothing is read but whether
+/// each secret's file exists, and nothing is written: a secret is named, never shown.
 pub fn template_stopped_reason(
     template: &Template,
     owner: &str,
@@ -2929,7 +2967,11 @@ pub fn template_stopped_reason(
             let Some(end) = after.find("}}") else { break };
             let key = &after[..end];
             let held = template.secrets.iter().any(|declared| declared == key)
-                && (template.generate.contains_key(key)
+                && (template
+                    .optional_secrets
+                    .iter()
+                    .any(|optional| optional == key)
+                    || template.generate.contains_key(key)
                     || secret_file(secrets_dir, owner, key).is_some_and(|file| file.is_file()));
             if !held {
                 missing.insert(key);
@@ -3005,6 +3047,30 @@ fn generated_secret_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_kind_uses_the_record_then_the_template_for_an_older_service() {
+        let mut record: ServiceConfig = serde_json::from_value(json!({
+            "name":"edge-ts", "template":"tailscale", "instance":"edge-ts", "ipv4":"192.0.2.10",
+            "ports":[], "created":0, "source":{}, "pool":"pool1", "project":PROJECT,
+            "bridge":BRIDGE, "gateway":"192.0.2.1"
+        }))
+        .unwrap();
+        let mut template: Template = serde_json::from_value(json!({
+            "name":"tailscale", "kind":"oci", "image":"docker.io/tailscale/tailscale"
+        }))
+        .unwrap();
+        assert!(record.connector.is_none());
+        assert!(template.connector.is_none());
+        assert!(template.optional_secrets.is_empty());
+        assert_eq!(connector_kind(&record, None), None);
+        assert_eq!(connector_kind(&record, Some(&template)), None);
+        template.connector = Some("tailscale".into());
+        assert_eq!(connector_kind(&record, Some(&template)), Some("tailscale"));
+        record.connector = Some("cloudflare".into());
+        assert_eq!(connector_kind(&record, Some(&template)), Some("cloudflare"));
+        assert_eq!(connector_kind(&record, None), Some("cloudflare"));
+    }
 
     #[test]
     fn a_templates_fingerprint_is_of_its_bytes_as_they_stand_and_no_byte_passes_between_parts() {

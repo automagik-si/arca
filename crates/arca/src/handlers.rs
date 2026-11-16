@@ -6914,6 +6914,7 @@ pub(crate) fn adopted_config(
         raw_lxc: Vec::new(),
         run_tmpfs: false,
         edge: None,
+        connector: None,
     })
 }
 
@@ -7127,6 +7128,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         raw_lxc: parts.template.raw_lxc.clone(),
         run_tmpfs: parts.template.memory_run(),
         edge: parts.template.edge.then(crate::route::EdgeRecord::default),
+        connector: parts.template.connector.clone(),
     })
 }
 
@@ -7215,6 +7217,7 @@ fn vm_service_config(
         raw_lxc: Vec::new(),
         run_tmpfs: false,
         edge: None,
+        connector: None,
     })
 }
 

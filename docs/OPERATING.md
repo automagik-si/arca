@@ -6103,30 +6103,34 @@ more service. It joins your tailnet under the service's name and hands every con
 address to one service you link it to, as raw TCP: it does not decrypt anything, so the target serves its own TLS. The
 node calls out to Tailscale; nothing calls in from the internet.
 
-You need a Tailscale account (a tailnet), and a service in Arca that serves TLS itself (here it is called `app`, with
-its TLS port first among its ports). As for the Cloudflare connector, the Arca steps are Arca's own verbs, and
-`service_secret_set` needs an assistant that holds a `doctor`-scope token.
+You need a Tailscale account (a tailnet), and this node's edge with the routes you want to reach. The link gives the
+connector the edge's address and port 443 and puts the connector on the edge's PROXY allow list. As for the Cloudflare
+connector, the Arca steps are Arca's own verbs, and `service_secret_set` needs an assistant that holds a `doctor`-scope
+token.
 
 1. **Tailscale admin console, "Settings" > "Keys".** Generate an auth key: for one use, not ephemeral, pre-approved if
    your tailnet asks for device approval, and with a tag, so that the node's own key does not expire. Copy it; treat it
    like a password. The tag must already be in your tailnet policy's `tagOwners` ("Access controls"), and the policy's
    rules must let your devices reach that tag on TCP 443; without such a rule the node joins but nothing reaches it.
-2. **Arca: `service_status`** with `{"name": "app"}`. Note its `ipv4` and its first `ports` entry, for example
-   `192.0.2.11` and `8443`.
-3. **Arca: `service_create`** with `{"name": "app-ts", "template": "tailscale"}`. The service's name is also the node's
-   name on your tailnet, unless step 4 gives it another. The service is created with its state volume and stays
-   `stopped`, because it has no key yet.
-4. **Arca: `service_secret_set`** with `{"name": "app-ts", "key": "TS_AUTHKEY", "value": "<the key>"}`, and again with
-   `{"name": "app-ts", "key": "TS_TARGET", "value": "192.0.2.11:8443"}`: the address and port from step 2. To give the
-   node a tailnet name other than the service's, put it in front with an `@`: `"value": "app@192.0.2.11:8443"` (lower
-   case letters, digits and dashes, at most 63, not starting or ending with a dash).
-5. **Arca: `service_connect`** with `{"from": "app-ts", "to": "app"}`. This is what lets the node reach `app`, on `app`'s
-   first port and nothing else.
-6. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "app-ts"}`. The node logs in with the key and
-   appears in the admin console's "Machines" list under its tailnet name (`app-ts`, or the name from step 4).
-7. **Check.** The node is listed as connected in the admin console. From a device on your tailnet, a connection to port
-   443 of the node (its name `app-ts` or its tailnet address) reaches `app`, which answers with its own certificate:
-   use a name that certificate is for, pointed at the node.
+2. **Arca: `service_create`** with `{"name": "app-ts", "template": "tailscale", "start": false}`. The service's name is
+   also the node's name on your tailnet. Leaving it stopped lets you set its key and link before its first start.
+3. **Arca: `service_secret_set`** with `{"name": "app-ts", "key": "TS_AUTHKEY", "value": "<the key>"}`. The key is
+   optional: a connector may start with no `TS_AUTHKEY`, including one whose state already holds its login.
+4. **Arca: `service_connect`** with `{"from": "app-ts", "to": "edge"}` (use your edge service's name). This lets the
+   connector reach the edge on port 443, gives it `ARCA_EDGE_TARGET`, and allows its PROXY header at the edge. No target
+   address needs to be typed.
+5. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "app-ts"}`. With a key, the node logs in and
+   appears in the admin console's "Machines" list under its tailnet name (`app-ts`).
+6. **Check.** The node is listed as connected in the admin console. From a device on your tailnet, a connection to port
+   443 of the node reaches the edge. Point a name served by one of the edge's routes at the node; the edge answers with
+   that route's certificate and forwards the request to its target.
+
+`TS_TARGET` is an optional override. To reach another service that accepts PROXY protocol, link the connector to it
+and set `TS_TARGET` with `service_secret_set` to its `ADDRESS:PORT`, such as `192.0.2.11:8443`. It takes precedence over
+`ARCA_EDGE_TARGET`, so an existing connector with a typed target keeps forwarding there after an update. To give the
+node a tailnet name other than the service's, prefix the override with `NAME@`, such as `app@192.0.2.11:8443` (lower
+case letters, digits and dashes, at most 63, not starting or ending with a dash). With neither target, the script exits
+and says to link the service to the edge or set `TS_TARGET`.
 
 What to know:
 
@@ -6137,7 +6141,7 @@ What to know:
   tailnet client's own address. The target must accept that header from the node's address (`service_status` of
   `app-ts`, its `ipv4`), and only from it. A target that does not speak PROXY protocol refuses these connections.
   When the target is this node's edge, linking the node to it (`service_connect` from `app-ts` to the edge) is enough:
-  Arca adds the node's address to the edge's PROXY allow list and reloads Caddy.
+  Arca adds the node's address to the edge's PROXY allow list, reloads Caddy, and supplies the forward target.
 - **Only port 443, only one target.** Nothing else is served. A connection to any other port of the node's tailnet
   address goes to that port on the node's own loopback, and the node is alone in its container, so nothing listens
   there. To change the target or the tailnet name, set `TS_TARGET` again and restart the node (`instance_restart`).
@@ -6148,9 +6152,8 @@ What to know:
 - **Where the key and the target live.** In private files in Arca's `secrets/` directory, and in the container's
   environment in Incus, as for every template secret. `service_logs` replaces both with `[secret]`. Inside the
   container the key is handed to Tailscale as a file of its own (mode 600, under `/run`, which is in memory), so it is
-  never on a command line. The tailnet name
-  rides on `TS_TARGET` because every secret a template names must be set before it starts, so an optional value cannot
-  be a secret of its own.
+  never on a command line. Unset optional secrets are absent from the environment. The target supplied by the link
+  follows the same private-file and environment path as other provided connection values.
 - **The image.** The template pins `docker.io/tailscale/tailscale` release 1.104.7 by digest, so it never updates by
   itself. A later Arca release moves the pin.
 
