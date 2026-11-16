@@ -59,6 +59,11 @@ disconnect was refused after the provider's side had closed, and every later cha
 same way. A disconnect now rebuilds only the names the link gave. A node that already holds such a file keeps
 refusing until the file goes: it is `secrets/service-<name>/v-<sha256 of the value>`, and no record refers to it.
 
+The edge allows the PROXY protocol header from each service linked to it (`service_connect` to the edge), by the
+service's own address, besides the port device's loopback, so a connector that sends one needs no hand edit inside the
+edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the
+routes are untouched. An edge with no service linked to it keeps exactly the config it had.
+
 A token can be limited to named services and to a time: `arca token mint --services dev,gtm --expires 12h`. A limited
 token reaches only the verbs that name a listed service (or a listed service's instance), is refused every verb that
 reaches the whole node, every GET route and every call relayed to a linked node, and reads `service_list`,

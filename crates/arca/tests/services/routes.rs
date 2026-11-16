@@ -16,7 +16,12 @@ fn edge_template() -> Value {
 
 /// A node with an edge (running) and an instance `app` in the project `other`, which Arca does not manage.
 fn edge_rig() -> Rig {
-    let rig = Rig::with(
+    edge_rig_with(None)
+}
+
+/// The same node, whose owner signs approvals with `key`.
+fn edge_rig_with(key: Option<&common::SkKey>) -> Rig {
+    let rig = Rig::with_key(
         FakeState {
             server: json!({}),
             projects: vec![],
@@ -30,6 +35,7 @@ fn edge_rig() -> Rig {
         },
         vec![PROJECT.to_string()],
         Some("192.0.2.0/24"),
+        key,
     );
     rig.template("edge", edge_template());
     rig.call("service_create", json!({"name":"edge","template":"edge"}))
@@ -51,6 +57,25 @@ fn file(rig: &Rig, path: &str) -> Option<String> {
         .service_files()
         .get(&format!("{PROJECT}/edge:{path}"))
         .map(|bytes| String::from_utf8(bytes.clone()).unwrap())
+}
+
+/// How many times a command ran in the edge: each reload of Caddy is one.
+fn edge_execs(rig: &Rig) -> usize {
+    rig.fake
+        .service_requests()
+        .iter()
+        .filter(|request| request.path.contains("/instances/edge/exec"))
+        .count()
+}
+
+/// The allow lines of the edge's PROXY header: the device's loopback, then each address in order.
+fn allows(addresses: &[&str]) -> String {
+    let mut out = "\t\t\t\tallow 127.0.0.1/32\n".to_string();
+    for address in addresses {
+        out.push_str(&format!("\t\t\t\tallow {address}/32\n"));
+    }
+    out.push_str("\t\t\t}\n");
+    out
 }
 
 fn record(rig: &Rig) -> EdgeRecord {
@@ -126,7 +151,7 @@ fn route_add_records_the_route_writes_the_whole_config_reloads_and_opens_the_tar
         reach: Reach::Private,
     };
     assert_eq!(record(&rig).routes, vec![expected]);
-    assert_eq!(written(&rig), route::caddyfile(&record(&rig)));
+    assert_eq!(written(&rig), route::caddyfile(&record(&rig), &[]));
     assert!(written(&rig).contains("reverse_proxy 10.20.30.63:8317"));
     assert!(written(&rig).contains("respond @outside 403"));
     assert!(opens(&egress(&rig), TARGET, 8317));
@@ -194,7 +219,7 @@ fn a_config_caddy_took_is_kept_on_the_data_volume_and_a_refused_one_is_taken_bac
         json!({"hostname":"app.example.com","instance":"app","project":"other","port":8080}),
     )
     .expect("the route");
-    let good = route::caddyfile(&record(&rig));
+    let good = route::caddyfile(&record(&rig), &[]);
     assert_eq!(written(&rig), good);
     assert_eq!(file(&rig, EDGE_CONFIG_KEPT).as_deref(), Some(good.as_str()));
     // Caddy refuses the next one: the root file goes back to the config that serves, and the kept copy stays.
@@ -321,8 +346,8 @@ fn the_edge_entrypoint_puts_the_kept_config_back_after_a_rebuild_and_keeps_a_new
         port: 8080,
         reach: Reach::Private,
     });
-    let kept = route::caddyfile(&routed);
-    let newer = route::caddyfile(&EdgeRecord::default());
+    let kept = route::caddyfile(&routed, &[]);
+    let newer = route::caddyfile(&EdgeRecord::default(), &[]);
     let stock = ":80 {\n\troot * /usr/share/caddy\n\tfile_server\n}\n";
     // A rebuilt root holds the image's own file: the kept copy goes back, and Caddy runs it.
     let (live, args, _) = edge_script(Some(stock), Some(&kept));
@@ -472,4 +497,122 @@ fn a_route_to_an_arca_service_rides_the_edges_link() {
         .expect("the route");
     assert_eq!(answer["project"], PROJECT);
     assert_eq!(answer["address"], rig.service_config("nats").ipv4);
+}
+
+#[test]
+fn a_service_linked_to_the_edge_may_send_it_the_proxy_header_until_it_is_unlinked() {
+    let rig = edge_rig();
+    reload(&rig, 0);
+    rig.call(
+        "route_add",
+        json!({"hostname":"llm.example.com","instance":"app","project":"other","port":8317}),
+    )
+    .expect("the route");
+    let routed = written(&rig);
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("a service");
+    let address = rig.service_config("nats").ipv4;
+    let reloads = edge_execs(&rig);
+    reload(&rig, 0);
+    let linked = rig
+        .call("service_connect", json!({"from":"nats","to":"edge"}))
+        .expect("linked");
+    assert_eq!(linked["edge"]["name"], "edge");
+    assert_eq!(linked["edge"]["reloaded"], true);
+    let text = written(&rig);
+    assert!(text.contains(&allows(&[&address])), "{text}");
+    assert_eq!(
+        text,
+        route::caddyfile(&record(&rig), &[address.parse().unwrap()])
+    );
+    // The routes are what they were, Caddy was reloaded, and the volume keeps what it took.
+    assert_eq!(text.replace(&allows(&[&address]), &allows(&[])), routed);
+    assert_eq!(record(&rig).routes.len(), 1);
+    assert_eq!(edge_execs(&rig), reloads + 1);
+    assert_eq!(file(&rig, EDGE_CONFIG_KEPT).as_deref(), Some(text.as_str()));
+    reload(&rig, 0);
+    let unlinked = rig
+        .call("service_disconnect", json!({"from":"nats","to":"edge"}))
+        .expect("unlinked");
+    assert_eq!(unlinked["edge"]["reloaded"], true);
+    assert_eq!(written(&rig), routed);
+    assert_eq!(record(&rig).routes.len(), 1);
+    assert_eq!(edge_execs(&rig), reloads + 2);
+    // A link the edge makes to a service is not one to the edge: nothing is written for it.
+    rig.call("service_connect", json!({"from":"edge","to":"nats"}))
+        .expect("the edge linked to nats");
+    assert_eq!(written(&rig), routed);
+    assert_eq!(edge_execs(&rig), reloads + 2);
+}
+
+#[test]
+fn an_edge_with_no_route_takes_a_linked_services_address_and_drops_it_when_the_service_is_removed()
+{
+    let key = common::SkKey::from_seed(9);
+    let rig = edge_rig_with(Some(&key));
+    reload(&rig, 0);
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("a service");
+    let address = rig.service_config("nats").ipv4;
+    rig.call("service_connect", json!({"from":"nats","to":"edge"}))
+        .expect("linked");
+    assert_eq!(
+        written(&rig),
+        route::caddyfile(&EdgeRecord::default(), &[address.parse().unwrap()])
+    );
+    let reloads = edge_execs(&rig);
+    reload(&rig, 0);
+    let removed = rig
+        .call(
+            "service_remove",
+            json!({"name":"nats","approval":owner_approval(&key, "nats")}),
+        )
+        .expect("removed");
+    assert_eq!(removed["removed"], true);
+    assert!(rig.service_config("edge").incoming.is_empty());
+    assert_eq!(written(&rig), route::caddyfile(&EdgeRecord::default(), &[]));
+    assert_eq!(edge_execs(&rig), reloads + 1);
+}
+
+/// Through the MCP door, which checks every answer against its verb's result schema: a link to the edge, its undoing
+/// and the removal of a service linked to it answer what the edge did, never "the tool failed" after the link or the
+/// removal already ran.
+#[test]
+fn a_link_to_the_edge_and_the_removal_of_a_linked_service_answer_in_their_schemas() {
+    let key = common::SkKey::from_seed(9);
+    let rig = edge_rig_with(Some(&key));
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("a service");
+    let address = rig.service_config("nats").ipv4;
+    let door = super::external::Door::over(&rig);
+    reload(&rig, 0);
+    assert_eq!(
+        door.call("service_connect", json!({"from":"nats","to":"edge"})),
+        "ok"
+    );
+    assert!(written(&rig).contains(&allows(&[&address])));
+    reload(&rig, 0);
+    assert_eq!(
+        door.call("service_disconnect", json!({"from":"nats","to":"edge"})),
+        "ok"
+    );
+    assert!(written(&rig).contains(&allows(&[])));
+    reload(&rig, 0);
+    assert_eq!(
+        door.call("service_connect", json!({"from":"nats","to":"edge"})),
+        "ok"
+    );
+    reload(&rig, 0);
+    assert_eq!(
+        door.call(
+            "service_remove",
+            json!({"name":"nats","approval":owner_approval(&key, "nats")}),
+        ),
+        "ok"
+    );
+    assert!(rig.service_config("edge").incoming.is_empty());
+    assert!(written(&rig).contains(&allows(&[])));
 }
