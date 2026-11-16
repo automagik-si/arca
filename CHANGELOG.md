@@ -5,9 +5,9 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 ## Unreleased
 
 Service adoption rechecks an instance under the kernel lock before recording it, so an overlapping removal cannot
-bring its record back; existing adopted records of instances the kernel journal proves it created and retired heal
-on the next managed service call, and an approved release can forget a missing adopted instance without an import
-allowlist entry.
+bring its record back; a failed candidate read is skipped until a later service call. An owner-approved
+`service_release` can forget a missing adopted instance without an import allowlist entry, freeing its name and
+address for `service_create`.
 
 ## 0.35.0 (2026-11-16)
 

@@ -281,42 +281,6 @@ impl Kernel {
             })
     }
 
-    /// Proof for forgetting an adopted phantom: this entry has no live effects, and this kernel
-    /// settled both an instance creation and a later deletion of that exact project/name/UUID.
-    pub(crate) fn service_instance_retired(
-        &self,
-        entry: &EntryId,
-        project: &str,
-        instance: &str,
-    ) -> bool {
-        use arca_kernel::journal::{EffectClass, EffectState, IntentKind, Inverse};
-        use arca_kernel::ownership::IncusKind;
-        let journal = self.reconciler.journal();
-        if !journal.live(entry).is_empty() {
-            return false;
-        }
-        let effects = journal.effects(entry);
-        effects.iter().any(|created| {
-            let Some(Inverse::IncusDelete { object }) = &created.inverse else {
-                return false;
-            };
-            created.class == EffectClass::B
-                && created.intent.is_none()
-                && created.state == EffectState::Reverted
-                && object.kind == IncusKind::Instance
-                && object.project == project
-                && object.name == instance
-                && object.uuid.as_ref().is_some_and(|uuid| !uuid.is_empty())
-                && effects.iter().any(|deleted| {
-                    deleted.id > created.id
-                        && deleted.class == EffectClass::B
-                        && deleted.intent == Some(IntentKind::Delete)
-                        && deleted.state == EffectState::Reverted
-                        && deleted.target == *object
-                })
-        })
-    }
-
     pub fn retained_entries(
         &self,
     ) -> Result<

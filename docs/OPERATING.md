@@ -8034,9 +8034,9 @@ capability needs a separate review of the closed journal vocabulary.
 Publication needs `serveHost` (this process's serve DNS name) and `tailnet` (the owner's tailnet label, without `.ts.net`)
 in node config. Both must agree, for example `host.example.ts.net` and `example`. They are never discovered by a lookup.
 Adopted services support list, status and console logs. Their write verbs return an explicit `adopted` refusal.
-Adoption rechecks the instance under the kernel lock; a missing adopted instance whose creation and retirement are
-settled in this kernel's journal loses its record at the next managed service call, and an approved `service_release`
-can forget a missing adopted instance even without a `kernel.importServices` entry, writing nothing to Incus.
+Adoption rechecks each candidate under the kernel lock and skips a failed read until a later call; existing adopted
+records whose instances are gone stay until an owner-approved `service_release` forgets them, even without a
+`kernel.importServices` entry, freeing their names and addresses for `service_create`.
 
 ### Omni verbs
 

@@ -493,15 +493,6 @@ impl<S: JournalStore> Journal<S> {
         self.settle(id, EffectState::Reverted);
     }
 
-    /// The newest state of each of the entry's effects, including settled retirements, in id order.
-    pub fn effects(&self, entry: &EntryId) -> Vec<EffectRecord> {
-        self.latest
-            .values()
-            .filter(|record| &record.entry == entry)
-            .cloned()
-            .collect()
-    }
-
     /// The entry's effects that still count: each one's newest record in id order, leaving out reverted and failed effects.
     /// An intent with no outcome is included, so a caller can see it.
     pub fn live(&self, entry: &EntryId) -> Vec<EffectRecord> {
