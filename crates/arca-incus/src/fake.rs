@@ -212,6 +212,7 @@ struct Shared {
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
     image_failure: Mutex<Option<String>>,
+    image_races: Mutex<Vec<images::PropertyRace>>,
     reject_device_limits: AtomicBool,
     reject_patch: Mutex<Vec<String>>,
     dropped_patches: Mutex<Vec<(String, bool)>>,
@@ -487,6 +488,7 @@ impl Shared {
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
             image_failure: Mutex::new(None),
+            image_races: Mutex::new(Vec::new()),
             reject_device_limits: AtomicBool::new(false),
             reject_patch: Mutex::new(Vec::new()),
             dropped_patches: Mutex::new(Vec::new()),
@@ -723,6 +725,25 @@ impl FakeIncus {
     /// Injects one image-copy (copy/copy_after) or alias POST failure, without changing other routes.
     pub fn fail_image_import_at(&self, step: &str) {
         *lock(&self.shared.image_failure) = Some(step.to_string());
+    }
+
+    /// Changes an image's properties just before the matching GET or PUT, after `skip` matching requests.
+    /// Models one out-of-band writer; it records no request of its own.
+    pub fn race_image_properties(
+        &self,
+        project: &str,
+        fingerprint: &str,
+        method: &str,
+        skip: usize,
+        properties: Value,
+    ) {
+        lock(&self.shared.image_races).push(images::PropertyRace {
+            project: project.into(),
+            fingerprint: fingerprint.into(),
+            method: method.into(),
+            skip,
+            properties,
+        });
     }
 
     /// Puts an image with the alias `alias` in the store `project` reads, as a copy by hand would, and returns its fingerprint.
@@ -1711,6 +1732,11 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         Route::Object(address) => Route::Object(store.served_from(address)),
         other => other,
     };
+    if let Route::Object(address) = &route
+        && address.kind == "image"
+    {
+        images::race(shared, store, request, address);
+    }
     match (request.method.as_str(), route) {
         (_, Route::ImageAliases(project, name)) => {
             images::aliases(shared, store, request, &project, name.as_deref())

@@ -438,3 +438,207 @@ fn image_import_does_not_read_or_change_an_obsolete_import_record() {
     assert_eq!(fs::read_to_string(path).unwrap(), "not an import record\n");
     no_deletes(&rig, before);
 }
+
+#[test]
+fn image_import_recheck_after_copy_is_partial_but_before_copy_is_stale() {
+    for copied in [false, true] {
+        let (rig, fingerprint) = setup();
+        let card = proposal(&rig, args(&fingerprint)).unwrap();
+        let changed = json!({ "changed": "outside this run" });
+        // First source read is the pre-write recheck; second follows the landed copy.
+        rig.fake().race_image_properties(
+            PROJECT,
+            &fingerprint,
+            "GET",
+            usize::from(copied),
+            changed,
+        );
+        let before = rig.fake().writes().len();
+        let data = outcome(
+            approve(&rig, &card),
+            if copied { "PartialImport" } else { "StaleCard" },
+        );
+        assert_eq!(data["imageWrite"], copied);
+        assert_eq!(data["aliasWrite"], false);
+        assert_eq!(
+            data["imageState"],
+            if copied { "present" } else { "absent" }
+        );
+        assert_eq!(data["aliasState"], "absent");
+        if copied {
+            assert_eq!(
+                data["properties"],
+                target(&rig, &fingerprint).unwrap()["properties"]
+            );
+        }
+        assert_eq!(rig.fake().writes().len() - before, usize::from(copied));
+        no_deletes(&rig, before);
+    }
+}
+
+#[test]
+fn image_import_property_read_compares_the_expected_map_before_put() {
+    for copied in [false, true] {
+        let (rig, fingerprint) = setup();
+        set_properties(&rig, &fingerprint, json!({ "type": "approved" }));
+        if copied {
+            default_properties(&rig, &fingerprint);
+        } else {
+            native_copy(&rig, &project(A), &fingerprint);
+            put_properties(
+                &rig,
+                &project(A),
+                &fingerprint,
+                json!({ "type": "on the card" }),
+            );
+        }
+        let card = proposal(&rig, args(&fingerprint)).unwrap();
+        let changed = json!({ "foreign": "must survive" });
+        // Two rechecks precede the writer's GET; a copy adds its read-back between them.
+        rig.fake().race_image_properties(
+            &project(A),
+            &fingerprint,
+            "GET",
+            if copied { 3 } else { 2 },
+            changed.clone(),
+        );
+        let before = rig.fake().writes().len();
+        let data = outcome(
+            approve(&rig, &card),
+            if copied { "PartialImport" } else { "StaleCard" },
+        );
+        assert_eq!(data["properties"], changed);
+        assert_eq!(data["imageWrite"], copied);
+        assert_eq!(data["aliasWrite"], false);
+        assert_eq!(target(&rig, &fingerprint).unwrap()["properties"], changed);
+        assert_eq!(
+            rig.fake().writes().len() - before,
+            usize::from(copied),
+            "no property PUT is sent"
+        );
+        no_deletes(&rig, before);
+    }
+}
+
+#[test]
+fn image_import_property_put_uses_if_match_and_rechecks_a_412() {
+    for copied in [false, true] {
+        for now_approved in [false, true] {
+            let (rig, fingerprint) = setup();
+            let approved = json!({ "type": "approved" });
+            set_properties(&rig, &fingerprint, approved.clone());
+            if copied {
+                default_properties(&rig, &fingerprint);
+            } else {
+                native_copy(&rig, &project(A), &fingerprint);
+                put_properties(
+                    &rig,
+                    &project(A),
+                    &fingerprint,
+                    json!({ "type": "on the card" }),
+                );
+            }
+            let card = proposal(&rig, args(&fingerprint)).unwrap();
+            let changed = if now_approved {
+                approved
+            } else {
+                json!({ "foreign": "must survive" })
+            };
+            rig.fake()
+                .race_image_properties(&project(A), &fingerprint, "PUT", 0, changed.clone());
+            let before = rig.fake().writes().len();
+            let result = approve(&rig, &card);
+            if now_approved {
+                let done = result.expect("another writer already set the approved properties");
+                assert_eq!(done["kind"], if copied { "imported" } else { "completed" });
+                assert_eq!(
+                    done["imageWrite"], copied,
+                    "the rejected PUT changed nothing"
+                );
+                assert_eq!(done["aliasWrite"], true);
+            } else {
+                let data = outcome(result, if copied { "PartialImport" } else { "StaleCard" });
+                assert_eq!(data["properties"], changed);
+                assert_eq!(data["imageWrite"], copied);
+                assert_eq!(data["aliasWrite"], false);
+            }
+            assert_eq!(target(&rig, &fingerprint).unwrap()["properties"], changed);
+            let writes = rig.fake().writes();
+            let puts: Vec<_> = writes[before..]
+                .iter()
+                .filter(|write| write.method == "PUT")
+                .collect();
+            assert_eq!(puts.len(), 1, "a 412 is not retried");
+            assert_eq!(puts[0].status, 412);
+            let requests = rig.fake().service_requests();
+            let put = requests.iter().rev().find(|r| r.method == "PUT").unwrap();
+            assert!(
+                put.headers
+                    .iter()
+                    .any(|(key, value)| key == "if-match" && !value.is_empty())
+            );
+            no_deletes(&rig, before);
+        }
+    }
+}
+
+#[test]
+fn image_import_unchanged_property_map_is_replaced_once_under_if_match() {
+    let (rig, fingerprint) = setup();
+    native_copy(&rig, &project(A), &fingerprint);
+    put_properties(
+        &rig,
+        &project(A),
+        &fingerprint,
+        json!({ "type": "on the card" }),
+    );
+    let card = proposal(&rig, args(&fingerprint)).unwrap();
+    let before = rig.fake().writes().len();
+    let done = approve(&rig, &card).unwrap();
+    assert_eq!(done["imageWrite"], true);
+    let writes = rig.fake().writes();
+    let puts: Vec<_> = writes[before..]
+        .iter()
+        .filter(|write| write.method == "PUT")
+        .collect();
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].status, 200);
+    let requests = rig.fake().service_requests();
+    let put = requests.iter().rev().find(|r| r.method == "PUT").unwrap();
+    assert!(
+        put.headers
+            .iter()
+            .any(|(key, value)| key == "if-match" && !value.is_empty())
+    );
+    no_deletes(&rig, before);
+}
+
+#[test]
+fn image_import_unreadable_recheck_reports_whether_this_run_already_wrote() {
+    for copied in [false, true] {
+        let (rig, fingerprint) = setup();
+        if !copied {
+            native_copy(&rig, &project(A), &fingerprint);
+        }
+        let card = proposal(&rig, args(&fingerprint)).unwrap();
+        // After a copy: pre-write GET, read-back GET, then the recheck before adding the alias.
+        rig.fake().race_image_properties(
+            &project(A),
+            &fingerprint,
+            "GET",
+            if copied { 2 } else { 0 },
+            Value::Null,
+        );
+        let before = rig.fake().writes().len();
+        let data = outcome(
+            approve(&rig, &card),
+            if copied { "PartialImport" } else { "StaleCard" },
+        );
+        assert_eq!(data["imageWrite"], copied);
+        assert_eq!(data["aliasWrite"], false);
+        assert_eq!(data["imageState"], "unknown");
+        assert_eq!(data["aliasState"], "absent");
+        assert_eq!(rig.fake().writes().len() - before, usize::from(copied));
+        no_deletes(&rig, before);
+    }
+}

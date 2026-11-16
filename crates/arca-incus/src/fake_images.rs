@@ -1,6 +1,33 @@
 //! Image copy uses the existing database image and merges request properties, as Incus imageDownload/imgPostRemoteInfo do.
 use super::*;
 
+pub(super) struct PropertyRace {
+    pub project: String,
+    pub fingerprint: String,
+    pub method: String,
+    pub skip: usize,
+    pub properties: Value,
+}
+
+pub(super) fn race(shared: &Shared, store: &mut Store, request: &Request, address: &Address) {
+    let mut races = lock(&shared.image_races);
+    let Some(slot) = races.iter().position(|race| {
+        race.project == address.project
+            && race.fingerprint == address.name
+            && race.method == request.method
+    }) else {
+        return;
+    };
+    if races[slot].skip > 0 {
+        races[slot].skip -= 1;
+        return;
+    }
+    let race = races.remove(slot);
+    if let Some(index) = store.find(address) {
+        store.objects[index].body["properties"] = race.properties;
+    }
+}
+
 type Reply = (u16, String, Value);
 fn bad(code: u16, text: &str) -> Reply {
     (code, String::new(), error_envelope(code, text))
