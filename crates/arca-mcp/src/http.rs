@@ -475,7 +475,7 @@ async fn serve_get(
     };
     // The route is its verb's reading over GET: a token the verb does not admit, by scope or by tool list, is refused
     // here as a `tools/call` of the verb is. A route's answer has no cut to a token's services, so a token limited to
-    // named services is refused every route.
+    // named services or bound to a tenant is refused every route.
     let admitted = caller.limits.tenant.is_none()
         && caller.limits.services.is_none()
         && server
@@ -503,8 +503,9 @@ async fn serve_post(
     };
     // The route is its verb's action over POST: a token the verb does not admit is refused here as a `tools/call` of the
     // verb is, before the handler reads the path. A route names no service, so a token limited to named services is
-    // refused every route.
-    let admitted = caller.limits.services.is_none()
+    // refused every route, as is a tenant-bound token: routes do not resolve or filter a tenant.
+    let admitted = caller.limits.tenant.is_none()
+        && caller.limits.services.is_none()
         && server
             .verbs
             .iter()

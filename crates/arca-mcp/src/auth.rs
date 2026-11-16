@@ -434,7 +434,17 @@ pub fn admin_token_ids(dir: &Path) -> Vec<String> {
                 .take(MAX_TENANT_FILE_BYTES + 1)
                 .read_to_end(&mut bytes)
                 .ok()?;
-            let Ok(Body { scope, limits, .. }) = parse_file(&bytes) else {
+            // Keep unbound enumeration's historical 4 KiB prefix, even for an oversized file the loader refuses.
+            // Inspect the full bound-token budget first, so a valid tenant line beyond that prefix cannot count as admin.
+            let budget = hash_file_budget(&String::from_utf8_lossy(&bytes));
+            let body = if budget == MAX_FILE_BYTES {
+                std::str::from_utf8(&bytes[..bytes.len().min(budget as usize)])
+                    .map_err(|_| BodyError::Malformed)
+                    .and_then(parse_body)
+            } else {
+                parse_file(&bytes)
+            };
+            let Ok(Body { scope, limits, .. }) = body else {
                 return None;
             };
             (scope == Scope::Admin && limits.services.is_none() && limits.tenant.is_none())

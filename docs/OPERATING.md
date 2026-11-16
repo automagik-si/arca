@@ -714,10 +714,10 @@ are refused. The file and mint answer spell these service limits as `<id>/<servi
 
 The token reaches the tenant-aware service, instance and snapshot verbs, plus `deploy_confirm`, `deploy_rollback` and `deploy_remove`,
 within its scope, tool list and service list. Of the verbs without `tenant`, only `arca_status`, `tenant_list`, `tenant_status`, `tenant_usage` and
-`action_propose` are available. The tenant list contains only its own row; status and usage require its own `id`.
+`action_propose` are available. The tenant list contains only its own row; status and usage default an omitted `id` to its own and refuse another.
 A proposal resolves its inner arguments and checks the action's tenant, scope, tools and services before saving it.
 Every other node verb, including `node_metrics` and `watch_report`, is refused. Every linked-node argument and every
-GET route is refused too. The tool list applies these same limits. No binding gives an approval or a standing grant.
+GET and POST route outside `/mcp` is refused too. The tool list applies these same limits. No binding gives an approval or a standing grant.
 
 A token handed down by a bound parent must bind to the same tenant and remain within the parent's other limits.
 An unbound parent may hand down a bound child when that child's resolved services are within its own list.
