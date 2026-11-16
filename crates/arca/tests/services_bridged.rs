@@ -550,15 +550,35 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
 
     // List, status and logs work.
     // The list reads no live state, and a machine on a host bridge has its address nowhere else: its row says so.
-    let listed = rig.call("service_list", json!({})).expect("list");
+    let mut listed = rig.call("service_list", json!({})).expect("list");
+    let mut status = rig
+        .call("service_status", json!({"name":"ws1"}))
+        .expect("status");
+    assert_eq!(listed["services"][0]["labels"], json!({}));
+    for key in [
+        "id",
+        "uuid",
+        "createdAt",
+        "startedAt",
+        "limits",
+        "data",
+        "labels",
+    ] {
+        let observation = listed["services"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(key)
+            .expect("observation present");
+        assert_eq!(
+            status.as_object_mut().unwrap().remove(key),
+            Some(observation),
+            "{key}"
+        );
+    }
     let mut row = created.clone();
     row["ipv4In"] = json!("state");
     assert_eq!(listed["services"], json!([row]));
-    assert_eq!(
-        rig.call("service_status", json!({"name":"ws1"}))
-            .expect("status"),
-        created
-    );
+    assert_eq!(status, created);
     rig.fake
         .set_console_log(PROJECT, "ws1", "booted\nlogin: \n");
     assert_eq!(
