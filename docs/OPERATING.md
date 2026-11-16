@@ -873,6 +873,8 @@ the root size plus any data volume counts against its disk cap, checked before a
 A container template may also set `"portIsolation": true`: its NIC is created with
 `security.port_isolation=true`. The default is false. This setting is recorded at create and kept through
 reconfigure, image updates (including `withTemplate`) and rollback. The service's firewall rules still apply.
+Incus's NIC option prevents two services that both have `portIsolation: true` from reaching each other over the
+bridge, even when linked.
 
 A local image may be pinned: a `digest` (`sha256:` and 64 lowercase hex digits, the image's Incus fingerprint) beside
 `local:<alias>`, in a container template or a virtual machine's. Without it the alias is trusted for whatever image

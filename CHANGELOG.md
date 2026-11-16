@@ -10,8 +10,10 @@ Write under this comment only what a reader needs beyond those lines; the releas
 Container templates may set `rootSize` and `portIsolation`. The root size counts with the data volume against a
 tenant's disk cap at create. Without these keys, containers keep their previous disk and NIC settings; created
 services keep their recorded values through reconfigure, image updates and rollback. A tenant's front rule excludes
-the service's `droiddPort` control port, leaving no front rule when that is its only port. The host's control access
-is unchanged. See docs/OPERATING.md.
+the service's `droiddPort` control port, leaving no front rule when that is its only port. On an existing node, a
+tenant service made from the shipped `omni-api` template loses its front rule at the next reconcile of its record;
+the host bridge's control rule stays. Approval cards show a container's requested root size in both the node and a
+tenant. See docs/OPERATING.md.
 
 ## 0.33.0 (2026-11-16)
 
