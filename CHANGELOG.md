@@ -4,6 +4,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.34.0 (2026-11-16)
+
 Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
 `TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:
 a connector may start with no key, and an unset optional secret is absent from the container's environment. Other
@@ -66,6 +68,15 @@ initial start fails, its instance, record and other new service resources are ro
 the create are kept. Unset caps leave the old behaviour unchanged.
 `service_status` shows the recorded limits under `settings.limits`. See "Service disk and network limits" in
 docs/OPERATING.md for units and storage-driver requirements.
+
+- Merge feat/service-io-limits (PR 220): per-service disk read/write and network ingress/egress caps; a fresh capped create whose first start fails rolls back everything it added
+- Merge fix/console-token-before-ready (PR 223): the node writes and syncs the console token before it publishes its pid, so a reader keyed on the pid never sees a stale token
+- Merge feat/workspace-homes (PR 218): one Automagik workspace per project gets explicit persistent homes on /data for uid 1000 and a required pnpm path
+- Merge fix/storage-mapped-devices (PR 217): storage_list and storage_add never offer mapped RBD/NBD/loop/dm/zvol/DRBD/zram devices; native NVMe multipath stays a machine disk
+- Merge feat/reach-g2 (PR 216): linking a tailscale connector to the edge supplies its forward target; TS_TARGET/TS_AUTHKEY optional
+- Merge origin/dev (v0.33.0 release) into dev
+- Merge feat/token-service-scope: a token can be limited to named services and a time
+- Merge feat/instance-move-stopped-vm: a stopped VM moves between hosts, Ceph moves size without snapshots
 
 ## 0.33.0 (2026-11-16)
 
