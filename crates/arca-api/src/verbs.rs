@@ -1183,7 +1183,7 @@ static VERBS: [Verb; 94] = [
     },
     Verb {
         name: "instance_move_plan",
-        summary: "Freeze the plan of a move of containers to a linked host, for the owner's one card. It runs instance_move_preflight again: any no-go blocks the plan with its reasons, and a virtual machine is not movable yet. An ephemeral container or an unreadable spot-check file blocks it too. When all pass it keeps the plan and answers its digest: source, target and credential, each instance's uuid and measured bytes, the copy rounds and cutover, the checks, the transport (Incus pushes from this host) and the rollback promise. The plan expires an hour after it is first made, never renewed; a changed source gives another digest. Nothing is stopped, copied or created.",
+        summary: "Freeze the plan of a move of containers and stopped virtual machines to a linked host, for the owner's one card. It runs instance_move_preflight again: any no-go blocks the plan, as does a virtual machine that is not stopped, an ephemeral container or an unreadable spot-check file. When all pass it keeps the plan and answers its digest: source, target, credential, each instance's uuid and bytes, the rounds and cutover, the checks, how each is copied (an Incus push, or rbd for a virtual machine on Ceph when the linked host names its cluster) and the rollback promise. It expires an hour after it is first made; a changed source gives another digest. Nothing is stopped, copied or created.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -1197,7 +1197,7 @@ static VERBS: [Verb; 94] = [
     },
     Verb {
         name: "instance_move",
-        summary: "Move the containers of a frozen plan to its linked host, only from the owner's approved card, once. It refuses a plan that expired, ran, is not the approved one, or whose instances changed, another move holds, or have an earlier copy that may run. Per instance, Incus pushes it and its volumes in rounds while it runs, stops it, sends the last round (the whole volume today), starts the copy once the source reads Stopped, and checks it; downtime runs from the stop to the passed checks. A failure rolls that instance back, never deleting the only copy or leaving both running: only the recorded copy is removed, once the source is read back. The source is kept, stopped, until instance_move_finish.",
+        summary: "Move a frozen plan's instances to its linked host, only from the owner's approved card, once. It refuses a plan that expired, ran, is not the approved one, or whose instances changed, another move holds, or have a copy that may run. Incus pushes a container in rounds while it runs, stops it, sends the last round, starts the copy once the source reads Stopped, and checks it. A stopped virtual machine is copied once as it stays stopped (an Incus push, or rbd into an empty machine), started there, and counts once its guest answers. A failure rolls that instance back, never deleting the only copy or leaving both running. The source is kept, stopped, until instance_move_finish.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
