@@ -53,7 +53,7 @@ impl Plugin for Patcher {
     }
 }
 
-fn lost_answer(apply: bool, read_fails: bool) {
+fn lost_answer(apply: bool, read_fails: bool, late: bool) {
     let scratch = Scratch::new("patch-settle");
     let mut state = fake_state();
     state.instances.push(json!({"name":"box", "project":PROJECT, "config":{
@@ -82,38 +82,14 @@ fn lost_answer(apply: bool, read_fails: bool) {
             vec![entry("patch", Patcher::ID, json!({"value":value}))],
         )
     };
-    fake.drop_patch_answer(PATH, apply);
-    let operation = fake.hold_operation(&ObjectRef {
-        kind: IncusKind::Instance,
-        project: PROJECT.into(),
-        parent: None,
-        name: "box".into(),
-        uuid: None,
-    });
+    if late {
+        fake.patch_after_next_get(PATH);
+    } else {
+        fake.drop_patch_answer(PATH, apply);
+    }
+    fake.set_operations_unreadable(read_fails);
     let first = doc(1, None, "first");
-    let outcomes = std::thread::scope(|scope| {
-        let release = scope.spawn(|| {
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !fake
-                .requests()
-                .iter()
-                .any(|request| request.path.contains("/wait"))
-            {
-                assert!(
-                    std::time::Instant::now() < until,
-                    "settlement must wait for the operation"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            if read_fails {
-                fake.fail_reads(PATH, 1, 500);
-            }
-            fake.release_operation(&operation);
-        });
-        let outcomes = reconciler.reconcile(&first, NOW);
-        release.join().unwrap();
-        outcomes
-    });
+    let outcomes = reconciler.reconcile(&first, NOW);
     if read_fails {
         assert!(
             outcomes
@@ -122,7 +98,6 @@ fn lost_answer(apply: bool, read_fails: bool) {
         );
         assert_eq!(reconciler.journal().unresolved().len(), 1);
         let blocked = doc(2, Some(first.document.digest()), "second");
-        fake.fail_reads(PATH, 1, 500);
         let outcomes = reconciler.reconcile(&blocked, NOW + 1);
         assert!(
             outcomes.iter().any(
@@ -130,6 +105,7 @@ fn lost_answer(apply: bool, read_fails: bool) {
             )
         );
         assert_eq!(patches(&fake), 1, "an open intent is never replayed");
+        fake.set_operations_unreadable(false);
         let next = doc(3, Some(blocked.document.digest()), "third");
         assert!(
             reconciler
@@ -142,7 +118,7 @@ fn lost_answer(apply: bool, read_fails: bool) {
             reconciler.journal().unresolved().is_empty(),
             "the lost answer must settle: {outcomes:?}"
         );
-        if apply {
+        if apply && !late {
             assert!(
                 outcomes
                     .iter()
@@ -150,7 +126,7 @@ fn lost_answer(apply: bool, read_fails: bool) {
             );
         } else {
             assert!(outcomes.iter().any(
-                |out| matches!(out, Outcome::Failed { why, .. } if why.contains("did not land"))
+                |out| matches!(out, Outcome::Failed { why, .. } if why.contains("may have landed"))
             ));
         }
         let next = doc(2, Some(first.document.digest()), "second");
@@ -174,15 +150,14 @@ fn lost_answer(apply: bool, read_fails: bool) {
         .iter()
         .find(|record| record.id == 1 && record.state != EffectState::Intent)
         .unwrap();
-    assert_eq!(
-        first_outcome.state,
-        if apply {
-            EffectState::Applied
-        } else {
-            EffectState::Failed
-        }
-    );
-    assert_eq!(live, if apply { 2 } else { 1 });
+    assert_eq!(first_outcome.state, EffectState::Applied);
+    assert_eq!(live, 2);
+    let Some(arca_kernel::journal::Inverse::IncusRestoreConfig { config, .. }) =
+        &first_outcome.inverse
+    else {
+        panic!("original inverse must be preserved")
+    };
+    assert_eq!(config.get("user.note"), Some(&Some("before".into())));
 }
 
 fn patches(fake: &FakeIncus) -> usize {
@@ -194,15 +169,25 @@ fn patches(fake: &FakeIncus) -> usize {
 
 #[test]
 fn a_lost_patch_answer_is_applied_from_read_back_and_the_next_write_works() {
-    lost_answer(true, false);
+    lost_answer(true, false, false);
 }
 
 #[test]
-fn a_lost_patch_that_did_not_land_is_failed_and_the_next_write_works() {
-    lost_answer(false, false);
+fn an_uncertain_pre_image_keeps_its_original_inverse_and_the_next_write_works() {
+    lost_answer(false, false, false);
 }
 
 #[test]
 fn an_unreadable_patch_stays_blocked_then_a_later_write_settles_it_without_restart() {
-    lost_answer(true, true);
+    lost_answer(true, true, false);
+}
+
+#[test]
+fn a_sync_patch_landing_after_the_first_get_keeps_the_original_pre_image() {
+    lost_answer(false, false, true);
+}
+
+#[test]
+fn runtime_settlement_of_an_uncertain_patch_pre_image_keeps_its_inverse() {
+    lost_answer(false, true, false);
 }

@@ -2182,8 +2182,8 @@ fn serve_patch_then_drop(mut stream: UnixStream, seen: &Mutex<Vec<(String, Strin
 }
 
 #[test]
-fn a_patch_whose_answer_is_an_io_error_is_failed_when_read_back_shows_the_pre_image() {
-    // Once no operation can still apply the patch, its pre-image proves that it did not land.
+fn a_patch_whose_answer_is_an_io_error_preserves_its_pre_image_as_may_have_landed() {
+    // A synchronous PATCH can still land after this read, even when the operations list is empty.
     let dir = Scratch::new("patch-io");
     let socket = dir.0.join("patch-io.sock");
     let listener = UnixListener::bind(&socket).expect("bind");
@@ -2216,7 +2216,16 @@ fn a_patch_whose_answer_is_an_io_error_is_failed_when_read_back_shows_the_pre_im
     server.join().expect("the server thread");
     assert_eq!(
         result,
-        Err(EffectRefusal::Provider("the patch did not land".into()))
+        Err(EffectRefusal::Landed(Box::new(
+            arca_kernel::plugin::Landed {
+                object: object(IncusKind::Instance, "svc", None, "io1"),
+                inverse: Inverse::IncusRestoreConfig {
+                    object: object(IncusKind::Instance, "svc", None, "io1"),
+                    config: BTreeMap::from([("user.note".into(), None)]),
+                },
+                why: "the patch may have landed; its original pre-image is kept".into(),
+            }
+        )))
     );
     let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert!(
