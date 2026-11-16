@@ -122,7 +122,7 @@ Source: `UnixIncusWriter::confirm`; tests `a_create_that_lands_and_reads_back_fo
 
 ## Named exception: service labels
 
-`service_labels_set` writes caller data directly through `UnixIncusWriter::patch`, outside the effect journal. Labels
+**Rule 80.** `service_labels_set` writes caller data directly through `UnixIncusWriter::patch`, outside the effect journal. Labels
 are not desired state, an undo has no use, and they can change often. A stuck journalled label write must never block
 the node's other writes. The write still checks the entry's ownership and recorded instance UUID, uses `If-Match`,
 and reads the object back. Only a definite 412 retries: at most three attempts, each reading ownership and UUID again
