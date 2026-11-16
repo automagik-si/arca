@@ -11,6 +11,63 @@ A config PATCH whose answer times out or is lost waits for Incus operations and 
 intent. Open intents are retried before later writes, so a temporary read failure no longer requires a restart once Incus
 answers again. PATCH requests get 30 seconds, and service config errors include the kernel's reason in the answer and log.
 
+`instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it
+refused before ("the copy needs one cluster"). `kernel.instanceImport.cephCluster` now names the source's own cluster:
+the node holds that cluster's config (`/etc/ceph/<name>.conf`) and the read-only client's keyring beside it, and reads
+the source with them while it writes the Incus pool with Incus's own user on Incus's cluster. Arca only reads the
+source cluster. The card's new `Ceph` row and the answer's `ceph` field name both clusters. Each disk streams through the
+node through a pipe, with up to about 100 MiB per `rbd` process whatever the disk's size, at about 10 seconds per GiB
+held on 1 Gbit/s. A failed copy names its side, cluster and client. A card still waiting when `serve` restarts with
+another import config shows the source cluster of the new config, the one the run reads. See docs/OPERATING.md.
+
+A new shipped template, `tailscale`, is the Cloudflare connector's twin for a tailnet: one service that runs Tailscale's
+own node (release 1.104.7, by digest) in userspace networking, with no tun device and no capability, under the service's
+name (or another one given with the target), and forwards TCP 443 on its tailnet address to one linked service as raw
+TCP with a PROXY protocol v2 header, TLS left to the target. The auth key (`TS_AUTHKEY`) and the target (`TS_TARGET`,
+`[NAME@]ADDRESS:PORT`) are set with `service_secret_set`; it is created stopped and `instance_start` starts it. Its
+state is on its own data volume, so it logs in once and a single-use key is enough. Like the Cloudflare connector it has
+no port and reaches only what it is linked to. docs/OPERATING.md, "Reaching a service over your own tailnet
+(Tailscale)", has the steps.
+
+Support reports: `support_report` (any viewer) files a report, with a title of at most 200 characters, a body of at most
+16 KiB, and optionally a severity, a service and a tenant, as one line of `<stateDir>/support-reports.jsonl`; a token
+files at most 10 an hour, and no field holds a control character (except a newline in the body) or a bidi override. It
+changes nothing and needs no approval. The support side pulls the reports from `GET /reports?after=<id>` (NDJSON, the
+same shape and paging as `/alerts`) or `support_reports`, with the caller's words under `report` and marked untrusted,
+and marks one picked up with `POST /reports/<id>/ack` or `support_report_ack`. Only an operator token, or a token whose
+tool list names the verb, reads the feed or acks: a plain viewer never reads other people's reports. An OAuth refresh may
+not name either verb unless the owner approved operator, and the consent page says what naming one gives. `support_report_status` tells the filer whether its report was picked up. The kernel sends
+nothing outward and holds no credential of the support side.
+
+The approval page approves every card in one sitting. It reads what is waiting again every minute while it is in view
+and when it comes back into view (never under a card being approved), so a card's ten-minute statement no longer goes
+stale on an open page, and a card proposed after the page loaded shows up by itself. Its own readings, and the reading after a refused tap, never move a card:
+plans and the assistant's requests stand in one list, a new card of any kind goes after every card drawn, a card that
+stopped waiting leaves a placeholder of its height, and open Details stay open. The owner's own approval or decline (or
+a passkey registered or removed) closes up the cards below. For a second after the cards changed, a tap on them, the connected apps or the passkey
+list does nothing, and the keyboard focus comes back after. A card refused `Expired` anyway is
+renewed and asks for one more tap. Each card's passkey challenge is computed when the list loads, so a tap goes straight
+to the passkey prompt; in Safari a later tap could bring no prompt at all before. What went wrong with a card is said on
+that card. Decline on a linked machine's card now declines it there, not on the page's own machine. A linked machine's
+delete plans are listed and approved through the relay (`approval_submit`); its relay token needs `approval_submit` on
+its list of tools, and the card says so when it is missing. A relayed approval waits as long as its action can run (a
+`service_update` with `timeoutSeconds` 300 waits 1110 seconds, not 180: one slow Incus step, its own health check and
+the old version's after a rollback), and an `Unreachable` answer reads the list again. Each approval or decline from
+the page writes one log line with its outcome code: `approved`, `approved, then failed <code>` (the approval was spent
+and the action failed), `refused <code>`, `unreachable` or `declined`.
+
+`service_disconnect` works again for a consumer whose template environment has a plain value, such as `"true"`. A
+disconnect used to store every value of the consumer's own environment as one of its secret files. The provider hides a
+stored value wherever it reads it back, so a value like `true` hid the mark on the consumer's own network ACL: the
+disconnect was refused after the provider's side had closed, and every later change to that service was refused the
+same way. A disconnect now rebuilds only the names the link gave. A node that already holds such a file keeps
+refusing until the file goes: it is `secrets/service-<name>/v-<sha256 of the value>`, and no record refers to it.
+
+The edge allows the PROXY protocol header from each service linked to it (`service_connect` to the edge), by the
+service's own address, besides the port device's loopback, so a connector that sends one needs no hand edit inside the
+edge. Connect, disconnect and the removal of a linked service write the edge's Caddyfile again and reload Caddy; the
+routes are untouched. An edge with no service linked to it keeps exactly the config it had.
+
 ## 0.32.0 (2026-11-16)
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the

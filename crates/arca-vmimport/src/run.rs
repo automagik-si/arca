@@ -161,7 +161,9 @@ fn undo_made(incus: &dyn ImportIncus, made: Vec<Made>, failure: &mut Failure) {
     }
 }
 
-/// Runs `plan`. `source_pool` is the one source pool this node reads.
+/// Runs `plan`. `source_pool` is the one source pool this node reads. The source pool may be on another Ceph cluster than
+/// the Incus pool: `copy` reads it on its own cluster ([`DiskCopy::cluster`]) and writes on the Incus pool's, and the
+/// answer names both.
 pub fn run(
     plan: &Plan,
     source_pool: &str,
@@ -182,17 +184,6 @@ pub fn run(
             format!(
                 "the Incus pool {} uses the {} driver; an import copies into a Ceph pool",
                 request.pool, place.pool.driver
-            ),
-        ));
-    }
-    if place.pool.cluster != copy.cluster() {
-        return Err(fail(
-            "Checking the target pool",
-            format!(
-                "the Incus pool {} is on the Ceph cluster {}, and the source pool on {}; the copy needs one cluster",
-                request.pool,
-                place.pool.cluster,
-                copy.cluster()
             ),
         ));
     }
@@ -337,6 +328,11 @@ pub fn run(
             "from": format!("{}/{}", step.source.pool, step.source.image),
             "sizeMib": step.source.size_mib,
         })).collect::<Vec<_>>(),
+        "ceph": {
+            "from": copy.cluster(),
+            "to": place.pool.cluster,
+            "copied": copied_words(source_pool, copy.cluster(), &request.pool, &place.pool),
+        },
         "started": request.start,
         "readBack": {
             "agent": agent,
@@ -345,6 +341,27 @@ pub fn run(
         },
         "note": note,
     }))
+}
+
+/// Where the disks were copied from and to, in words: `Copied from the Ceph cluster X to the Ceph cluster Y`.
+pub fn copied_words(
+    source_pool: &str,
+    source_cluster: &str,
+    pool: &str,
+    target: &PoolInfo,
+) -> String {
+    let to = if source_cluster == target.cluster {
+        format!("the same cluster, into the Incus pool {pool}")
+    } else {
+        format!(
+            "the Ceph cluster {}, into the Incus pool {pool}",
+            target.cluster
+        )
+    };
+    format!(
+        "Copied from the Ceph cluster {source_cluster} (the pool {source_pool}, which Arca only read) to {to} (written as client.{})",
+        target.client
+    )
 }
 
 /// Asks the agent and the port until the port answers or the tries run out.

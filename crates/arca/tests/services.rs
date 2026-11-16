@@ -2302,7 +2302,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_fourteen_templates_and_nothing_else_load_and_are_pinned() {
+fn the_fifteen_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -2328,6 +2328,7 @@ fn the_fourteen_templates_and_nothing_else_load_and_are_pinned() {
             "nats-replica",
             "omni-api",
             "postgres-autopg",
+            "tailscale",
             "workspace-vm"
         ]
     );
@@ -3345,6 +3346,8 @@ mod reconfigure;
 mod routes;
 #[path = "services/run_tmpfs.rs"]
 mod run_tmpfs;
+#[path = "services/tailscale.rs"]
+mod tailscale;
 #[path = "services/tunnel.rs"]
 mod tunnel;
 #[path = "services/update.rs"]
@@ -3945,7 +3948,8 @@ fn every_shipped_entrypoint_reaches_init_as_its_own_words_on_either_liblxc() {
             "nats",
             "nats-primary",
             "nats-replica",
-            "postgres-autopg"
+            "postgres-autopg",
+            "tailscale"
         ]
     );
     let script = fs::read_to_string(dir.join("postgres-autopg.sh")).expect("the script");
@@ -4498,7 +4502,7 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
         service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
         service::first_boot(&loaded, &dir).expect("its first-boot script is installed with it");
     }
-    assert_eq!(templates, 14);
+    assert_eq!(templates, 15);
     assert!(installed.contains(&"postgres-autopg.sh"));
     // One script serves nats and nats-primary; the replica has its own.
     assert!(installed.contains(&"nats.sh"));
@@ -4507,6 +4511,7 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
     // One script serves both sizes of the GitLab pool.
     assert!(installed.contains(&"gitlab-runner-pool.sh"));
     assert!(installed.contains(&"automagik-workspace.sh"));
+    assert!(installed.contains(&"tailscale.sh"));
     assert_eq!(
         fs::metadata(&dir).expect("dir").permissions().mode() & 0o777,
         0o700

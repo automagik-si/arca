@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arca::action_proposal::ActionKind;
-use arca::handlers::{ActionExecutor, plan_handlers};
+use arca::config::NodeConfig;
+use arca::handlers::{ActionExecutor, ActionSlot, plan_handlers_served};
 use arca::kernel::Kernel;
-use arca::vm_import::{ImportBackend, handlers as import_handlers};
+use arca::vm_import::{ImportBackend, handlers as import_handlers, reword_waiting_imports};
 use arca_mcp::{CallError, ToolHandler};
 use arca_vmimport::{FakeCopy, Probe};
 use common::*;
@@ -39,28 +40,68 @@ struct Rig {
     copy: Arc<FakeCopy>,
 }
 
+/// The node config `serve` reads, with `import` as its `kernel.instanceImport`.
+fn node(scratch: &Scratch, fake: &arca_incus::FakeIncus, import: Option<Value>) -> NodeConfig {
+    let mut kernel = json!({ "projects": ["arcak-svc"], "droiddProjects": ["people"] });
+    if let Some(import) = import {
+        kernel["instanceImport"] = import;
+    }
+    serde_json::from_value(json!({
+        "stateDir": scratch.dir.join("node-state"),
+        "incus": { "socket": fake.socket() },
+        "listen": { "unix": scratch.dir.join("arca.sock") },
+        "tokens": { "hashDir": scratch.dir.join("tokens") },
+        "kernel": kernel
+    }))
+    .expect("the node config")
+}
+
+/// The plan handlers `serve` makes for `node`.
+fn served(
+    kernel: &Arc<Mutex<Kernel>>,
+    clock: Arc<AtomicU64>,
+    node: NodeConfig,
+) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
+    plan_handlers_served(
+        Arc::clone(kernel),
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+        None,
+        None,
+        None,
+        None,
+        ActionSlot::default(),
+        Some(Arc::new(node)),
+    )
+    .into_iter()
+    .collect()
+}
+
 fn rig(tag: &str, key: &SkKey) -> Rig {
     let scratch = Scratch::new(tag);
     let mut state = fake_state();
     state.projects.push(json!({ "name": "people", "description": "", "config": { "features.storage.volumes": "true" } }));
     state.pools.push(("remote".to_string(), json!({})));
+    state.pools.push(("local".to_string(), json!({})));
     state.networks.push(json!({ "name": "br-lan", "project": "default", "managed": true, "type": "bridge", "config": {} }));
     let fake = arca_incus::FakeIncus::start(&scratch.dir, state).expect("the fake serves");
     fake.set_pool_driver("remote", "ceph");
+    fake.set_pool_config("remote", "ceph.cluster_name", "cluster-b");
     let verifier = verifier_for(&scratch, &[key], tag);
     let kernel = Arc::new(Mutex::new(
         kernel_with_image(&scratch, &fake, verifier, NOW, None).expect("the kernel opens"),
     ));
     let clock = Arc::new(AtomicU64::new(NOW));
-    let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = plan_handlers(
-        Arc::clone(&kernel),
-        Arc::new(move || clock.load(Ordering::SeqCst)),
-        None,
-        None,
-    )
-    .into_iter()
-    .collect();
-    let copy = Arc::new(FakeCopy::default());
+    // The node reads the source pool on a Ceph cluster of its own, `source-b`; the Incus pool is on `cluster-b`.
+    let handlers = served(
+        &kernel,
+        clock,
+        node(
+            &scratch,
+            &fake,
+            Some(json!({ "sourcePool": "src-pool", "cephCluster": "source-b" })),
+        ),
+    );
+    let copy = Arc::new(FakeCopy::on_cluster("source-b"));
     copy.target(
         "remote/virtual-machine_people_web-1.block",
         30_720 * 1024 * 1024,
@@ -141,6 +182,145 @@ impl Rig {
     }
 }
 
+/// The `Ceph` row of a proposal's card.
+fn ceph_row(proposal: &Value) -> String {
+    proposal["details"]
+        .as_array()
+        .expect("the card's rows")
+        .iter()
+        .find(|row| row["label"] == "Ceph")
+        .and_then(|row| row["value"].as_str())
+        .expect("a Ceph row")
+        .to_string()
+}
+
+#[test]
+fn a_pool_incus_does_not_have_or_that_is_not_ceph_still_gets_a_card_that_says_so() {
+    let key = SkKey::from_seed(44);
+    let rig = rig("import-pools", &key);
+    let mut args = import_args();
+    args["pool"] = json!("nowhere");
+    let unread = rig.propose("instance_import", args).expect("proposed");
+    assert!(
+        ceph_row(&unread).ends_with(
+            "It writes only the images Incus makes in the Incus pool nowhere, on the cluster Incus names for it when the import runs"
+        ),
+        "{}",
+        ceph_row(&unread)
+    );
+    let mut args = import_args();
+    args["pool"] = json!("local");
+    let not_ceph = rig.propose("instance_import", args).expect("proposed");
+    assert!(
+        ceph_row(&not_ceph).ends_with(
+            "The Incus pool local is not a Ceph pool (its driver is dir), so the import stops before it makes anything"
+        ),
+        "{}",
+        ceph_row(&not_ceph)
+    );
+    assert!(rig.writes().is_empty(), "a proposal changes nothing");
+}
+
+#[test]
+fn after_a_restart_the_card_names_the_source_cluster_the_run_reads() {
+    let key = SkKey::from_seed(45);
+    let tag = "import-restart";
+    let rig = rig(tag, &key);
+    let proposal = rig
+        .propose("instance_import", import_args())
+        .expect("proposed");
+    let proposed = ceph_row(&proposal);
+    assert!(proposed.contains("on the Ceph cluster source-b as client.arca-import"));
+    let Rig {
+        _scratch: scratch,
+        fake,
+        kernel,
+        handlers,
+        executor,
+        ..
+    } = rig;
+    drop((handlers, executor, kernel));
+
+    // `serve` starts again with `import` as its config: the waiting card, as the approval page reads it.
+    let reopened = |import: Option<Value>| -> Value {
+        let verifier = verifier_for(&scratch, &[&key], tag);
+        let mut kernel =
+            kernel_with_image(&scratch, &fake, verifier, NOW, None).expect("the kernel opens");
+        let node = node(&scratch, &fake, import);
+        // What `serve` does once the kernel opens, before it shares it.
+        reword_waiting_imports(&mut kernel, &node);
+        let kernel = Arc::new(Mutex::new(kernel));
+        let handlers = served(&kernel, Arc::new(AtomicU64::new(NOW)), node);
+        let waiting = kernel.lock().expect("the kernel lock").action_proposals()[0].clone();
+        drop((handlers, kernel));
+        assert_eq!(
+            waiting.args_digest, proposal["argsDigest"],
+            "the digest stays"
+        );
+        serde_json::to_value(waiting).expect("the card")
+    };
+
+    // The same config: the card as the owner was first shown it.
+    let same = reopened(Some(
+        json!({ "sourcePool": "src-pool", "cephCluster": "source-b" }),
+    ));
+    assert_eq!(ceph_row(&same), proposed);
+    // The source is now on `source-c`, which is what the run would read: the card says so.
+    let moved = reopened(Some(
+        json!({ "sourcePool": "src-pool", "cephCluster": "source-c" }),
+    ));
+    assert_eq!(
+        ceph_row(&moved),
+        "Arca reads the source pool src-pool on the Ceph cluster source-c as client.arca-import, set up to only read, and never writes it. It writes only the images Incus makes in the Incus pool remote, on the cluster Incus names for it when the import runs"
+    );
+    // A node that no longer imports: no row; its run refuses.
+    let off = reopened(None);
+    assert!(
+        off["details"]
+            .as_array()
+            .expect("the card's rows")
+            .iter()
+            .all(|row| row["label"] != "Ceph"),
+        "{off}"
+    );
+}
+
+#[test]
+fn the_handlers_are_made_while_another_thread_holds_the_kernel_lock() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let key = SkKey::from_seed(46);
+    let tag = "import-lock-held";
+    let rig = rig(tag, &key);
+    rig.propose("instance_import", import_args())
+        .expect("proposed");
+    let Rig {
+        _scratch: scratch,
+        fake,
+        kernel,
+        ..
+    } = rig;
+    // Another call owns the kernel while the handlers are made, with an import config that differs from the card's.
+    let held = kernel.lock().expect("the kernel lock");
+    let (made, answer) = mpsc::channel();
+    let builder = {
+        let kernel = Arc::clone(&kernel);
+        let node = node(
+            &scratch,
+            &fake,
+            Some(json!({ "sourcePool": "src-pool", "cephCluster": "source-c" })),
+        );
+        std::thread::spawn(move || {
+            let handlers = served(&kernel, Arc::new(AtomicU64::new(NOW)), node);
+            made.send(handlers.len()).expect("report the handlers");
+        })
+    };
+    let count = answer.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    builder.join().expect("the builder thread");
+    assert!(count.expect("the handlers are made without waiting on the kernel lock") > 0);
+}
+
 fn import_args() -> Value {
     json!({ "name": "web-1", "project": "people", "pool": "remote", "bridge": "br-lan", "source": UEFI })
 }
@@ -157,6 +337,27 @@ fn an_approved_import_makes_the_vm_copies_the_disks_and_reads_back_and_the_undo_
         "Move the VM build & test (id 21) from the outside hypervisor into the instance web-1 in project people"
     );
     assert!(rig.writes().is_empty(), "a proposal changes nothing");
+    // The card names the cluster the disks are read from and the one they are written to, after the last disk.
+    let rows: Vec<(&str, &str)> = proposal["details"]
+        .as_array()
+        .expect("the card's rows")
+        .iter()
+        .map(|row| {
+            (
+                row["label"].as_str().unwrap_or_default(),
+                row["value"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let at = rows
+        .iter()
+        .position(|(label, _)| *label == "Ceph")
+        .expect("a Ceph row");
+    assert_eq!(rows[at - 1].0, "Disk 2");
+    assert_eq!(
+        rows[at].1,
+        "Arca reads the source pool src-pool on the Ceph cluster source-b as client.arca-import, set up to only read, and never writes it. It copies to the Ceph cluster cluster-b, writing only the images Incus made in the Incus pool remote"
+    );
 
     // A direct call without the owner's approval runs nothing.
     let refused = rig
@@ -173,6 +374,14 @@ fn an_approved_import_makes_the_vm_copies_the_disks_and_reads_back_and_the_undo_
     assert_eq!(result["acls"], json!(["arca-import-web-1"]));
     assert_eq!(result["volumes"], json!(["web-1-disk1"]));
     assert_eq!(result["readBack"]["answered"], true);
+    assert_eq!(
+        result["ceph"],
+        json!({
+            "from": "source-b",
+            "to": "cluster-b",
+            "copied": "Copied from the Ceph cluster source-b (the pool src-pool, which Arca only read) to the Ceph cluster cluster-b, into the Incus pool remote (written as client.admin)"
+        })
+    );
     assert_eq!(
         rig.copy.copied(),
         [

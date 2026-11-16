@@ -10,7 +10,7 @@
 //! Both writes take a doctor token, or run from a proposal the owner approved (`action_propose`), as `service_connect`
 //! does. `route_list` is a read.
 use super::*;
-use crate::route::{self, EdgeRecord, Reach, Route};
+use crate::route::{self, Reach, Route};
 use crate::service::ServiceConfig;
 use arca_incus::exec::{ExecCommand, ServiceFile};
 use arca_kernel::desired::Entry;
@@ -135,7 +135,14 @@ impl ServiceHandler {
             edge.environment_patch = Some(BTreeSet::new());
             self.put(std::slice::from_ref(&edge), now)?;
         }
-        let applied = self.write_edge(&edge_entry, &edge, &record, &before, caller);
+        let linked = route::linked(&edge.incoming);
+        let applied = self.write_edge(
+            &edge_entry,
+            &edge,
+            &route::caddyfile(&record, &linked),
+            &route::caddyfile(&before, &linked),
+            caller,
+        );
         answer["edge"] = json!({
             "name": edge.name,
             "address": edge_address(&edge),
@@ -281,21 +288,70 @@ impl ServiceHandler {
             .write_service_file(
                 &owned,
                 &ServiceFile::EdgeConfig,
-                route::caddyfile(record).as_bytes(),
+                route::caddyfile(record, &route::linked(&edge.incoming)).as_bytes(),
             )
             .map_err(|_| "Incus did not take the edge's config file".to_string())
     }
 
-    /// Writes the Caddyfile of `record` into the edge, and reloads Caddy when the edge runs. Once Caddy took it, the copy
+    /// After the services linked to the edge of the entry `id` changed (a connect to it, a disconnect from it, or the removal of a
+    /// service linked to it): writes its Caddyfile again from its record as the kernel holds it now, and reloads Caddy
+    /// when it runs, as a route change does. `before` is the linked addresses the edge had, whose render goes back on a
+    /// reload Caddy refuses. What it did, for the answer: `None` when the entry is not an edge. The link itself is made or
+    /// gone either way; a write the edge did not take is said, and the next change on the edge writes the file again.
+    pub(super) fn edge_relinked(
+        &self,
+        id: &arca_kernel::desired::EntryId,
+        before: &[std::net::Ipv4Addr],
+        caller: &Caller,
+    ) -> Option<Value> {
+        let held = lock(&self.kernel).ok().and_then(|kernel| {
+            service_entries(kernel.entries())
+                .into_iter()
+                .find(|(entry, cfg)| entry.id == *id && cfg.edge.is_some())
+        })?;
+        let (entry, edge) = held;
+        let record = edge.edge.clone().unwrap_or_default();
+        let applied = self.write_edge(
+            &entry,
+            &edge,
+            &route::caddyfile(&record, &route::linked(&edge.incoming)),
+            &route::caddyfile(&record, before),
+            caller,
+        );
+        let mut view = json!({
+            "name": edge.name,
+            "applied": applied.is_ok(),
+            "reloaded": matches!(applied, Ok(Applied { reloaded: true, .. })),
+        });
+        let note = match applied {
+            Ok(Applied { reloaded: true, kept: true }) => None,
+            Ok(Applied { reloaded: true, kept: false }) => Some(
+                "Caddy took the edge's new config, but its copy on the edge's data volume could not be written: an update of the edge would allow the PROXY header from the linked services as before this change until the next change on the edge"
+                    .to_string(),
+            ),
+            Ok(Applied { reloaded: false, .. }) => Some(
+                "the edge is not running: its new config is written and Caddy reads it when the edge starts".to_string(),
+            ),
+            Err(why) => Some(format!(
+                "the edge did not take its new config: {why}. The next route_add, route_remove, service_connect or service_disconnect on the edge writes it again"
+            )),
+        };
+        if let Some(note) = note {
+            view["note"] = json!(note);
+        }
+        Some(view)
+    }
+
+    /// Writes the Caddyfile `rendered` into the edge, and reloads Caddy when the edge runs. Once Caddy took it, the copy
     /// on the data volume is written too, so the volume only ever keeps a config Caddy accepted. A reload Caddy refuses
-    /// puts the render of `before` back on the root, so the edge still starts on the config it serves. `reloaded` is false
+    /// puts `before` back on the root, so the edge still starts on the config it serves. `reloaded` is false
     /// when the edge does not run: the file is there for its next start.
     fn write_edge(
         &self,
         entry: &Entry,
         edge: &ServiceConfig,
-        record: &EdgeRecord,
-        before: &EdgeRecord,
+        rendered: &str,
+        before: &str,
         caller: &Caller,
     ) -> Result<Applied, String> {
         let owned = self
@@ -308,7 +364,6 @@ impl ServiceHandler {
             .exec
             .writer(&target, Duration::from_secs(10))
             .map_err(|_| "this node could not reach Incus".to_string())?;
-        let rendered = route::caddyfile(record);
         writer
             .write_service_file(&owned, &ServiceFile::EdgeConfig, rendered.as_bytes())
             .map_err(|_| "Incus did not take the edge's config file".to_string())?;
@@ -332,11 +387,7 @@ impl ServiceHandler {
         );
         if let Err(error) = reload {
             let restored = writer
-                .write_service_file(
-                    &owned,
-                    &ServiceFile::EdgeConfig,
-                    route::caddyfile(before).as_bytes(),
-                )
+                .write_service_file(&owned, &ServiceFile::EdgeConfig, before.as_bytes())
                 .is_ok();
             return Err(match error {
                 crate::service_exec::ExecError::Failed(why) if restored => {

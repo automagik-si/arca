@@ -21,11 +21,15 @@
 //! mints the statement, the passkey signs it, and `POST /approve/requests/approve` takes the request id, that statement and
 //! the proof (see `crate::approval_requests`). `POST /approve/requests/deny` declines one without a passkey.
 //!
-//! With `approval.linkedHosts`, the page also lists the waiting action proposals of other kernels on this machine and relays
-//! the owner's signed approval or decline for one of them to that kernel over its own socket (see `crate::linked`). The page
-//! never checks or spends another kernel's approval, and never asks its own kernel about another kernel's id.
+//! With `approval.linkedHosts`, the page also lists the waiting action proposals and delete plans of other kernels on this
+//! machine and relays the owner's signed approval (or an action's decline) for one of them to that kernel over its own
+//! socket (see `crate::linked`). The page never checks or spends another kernel's approval, and never asks its own kernel
+//! about another kernel's id.
+//!
+//! Every approval and decline from the page writes one log line on this host with its outcome code alone (`approved`,
+//! `refused <code>`, `unreachable`, `declined`), never the statement or the proof.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -57,7 +61,7 @@ use crate::canvas::{self, Canvas};
 use crate::config::LinkedHost;
 use crate::handlers::{
     ActionExecutor, Clock, action_statement, approve_plan, decline_plan, fresh_nonce, list_plans,
-    run_approved_action,
+    plan_statement, run_approved_action,
 };
 use crate::kernel::Kernel;
 use crate::linked::{self, RelayError};
@@ -135,6 +139,9 @@ struct PageState {
     chat_slots: Arc<Semaphore>,
     actions: ActionExecutor,
     linked: Arc<Vec<LinkedHost>>,
+    /// How long the relay waits for each linked action card's approval, by `host\nid`, as the last listing read its action
+    /// and arguments. A card not listed since this page started waits [`linked::APPROVAL_TIMEOUT`].
+    linked_waits: Arc<Mutex<HashMap<String, Duration>>>,
     peer_sync: Option<PeerSyncer>,
     requests: Option<Arc<ApprovalRequests>>,
     gate: Option<PageGate>,
@@ -332,6 +339,7 @@ impl Page {
                 chat_slots: Arc::new(Semaphore::new(canvas::CHAT_CONCURRENCY)),
                 actions: ActionExecutor::default(),
                 linked: Arc::new(Vec::new()),
+                linked_waits: Arc::new(Mutex::new(HashMap::new())),
                 peer_sync: None,
                 requests: None,
                 gate: None,
@@ -1089,11 +1097,60 @@ async fn plans(State(state): State<Arc<PageState>>) -> Response {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let (rows, hosts) = listed;
+    if let Ok(mut waits) = state.linked_waits.lock() {
+        keep_waits(&mut waits, &rows, &hosts);
+    }
     if let Some(plans) = body["plans"].as_array_mut() {
         plans.extend(rows);
     }
     body["linkedHosts"] = json!(hosts);
     Json(body).into_response()
+}
+
+/// Records how long an approval of each listed linked action may wait (`host\nid`). A host read just now replaces its
+/// waits; one that could not be read keeps the waits it was last listed with.
+fn keep_waits(waits: &mut HashMap<String, Duration>, rows: &[Value], hosts: &[Value]) {
+    let read: HashSet<&str> = hosts
+        .iter()
+        .filter(|host| host["read"] == json!(true))
+        .filter_map(|host| host["name"].as_str())
+        .collect();
+    waits.retain(|key, _| {
+        key.split_once('\n')
+            .is_some_and(|(host, _)| !read.contains(host))
+    });
+    for row in rows.iter().filter(|row| row["kind"] == json!("action")) {
+        if let (Some(host), Some(id), Some(action)) = (
+            row["linkedHost"].as_str(),
+            row["id"].as_str(),
+            row["action"].as_str(),
+        ) {
+            waits.insert(
+                format!("{host}\n{id}"),
+                linked::approval_wait(action, &row["args"]),
+            );
+        }
+    }
+}
+
+/// Where a linked approval of `id` goes on `host`, and how long it waits: an action to `action_approve`, as long as the
+/// card was listed to take; a delete plan's digest to `approval_submit`. `None` for any other id.
+fn relay_route(
+    waits: &HashMap<String, Duration>,
+    host: &str,
+    id: &str,
+) -> Option<(&'static str, Duration)> {
+    if id.starts_with("act-") {
+        let wait = waits
+            .get(&format!("{host}\n{id}"))
+            .copied()
+            .unwrap_or(linked::APPROVAL_TIMEOUT);
+        Some(("action_approve", wait))
+    } else if is_plan_digest(id) {
+        Some(("approval_submit", linked::APPROVAL_TIMEOUT))
+    } else {
+        None
+    }
 }
 
 /// The changed passkey lists waiting for the owner, one card per linked host: the host, the statement it issued, how many
@@ -1188,14 +1245,15 @@ async fn peer_keys_trust(State(state): State<Arc<PageState>>, body: Bytes) -> Re
             value["host"] = json!(name);
             Json(value).into_response()
         }
-        Ok(Err(error)) => relay_error_response(&name, error),
+        Ok(Err(error)) => relay_error_response(&name, "peer_keys_sync", error),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-/// The waiting action proposals of every linked kernel, each with `linkedHost` naming it and a fresh statement that names
-/// the host the linked kernel says its statements carry, and one `{name, read}` per linked kernel. A kernel that does not
-/// answer adds no row. A linked kernel's delete plans are not listed: the page relays only action proposals.
+/// The waiting action proposals and delete plans of every linked kernel, each with `linkedHost` naming it and a fresh
+/// statement that names the host the linked kernel says its statements carry, and one `{name, read}` per linked kernel. A
+/// kernel that does not answer adds no row. A delete plan is approved there with `approval_submit`: when the token this
+/// page holds for that kernel does not admit it, the plan's row says so in `relayNote`, with what the owner changes.
 fn linked_plans(linked: &[LinkedHost], now: u64) -> (Vec<Value>, Vec<Value>) {
     let mut rows = Vec::new();
     let mut hosts = Vec::new();
@@ -1205,8 +1263,15 @@ fn linked_plans(linked: &[LinkedHost], now: u64) -> (Vec<Value>, Vec<Value>) {
         let Ok(listed) = listed else {
             continue;
         };
+        let mut deletes = Vec::new();
         for row in listed["plans"].as_array().into_iter().flatten() {
+            let Ok(nonce) = fresh_nonce() else {
+                continue;
+            };
             if row["kind"] != json!("action") {
+                if let Some(row) = linked_delete_row(row, now, &nonce) {
+                    deletes.push(row);
+                }
                 continue;
             }
             let (Some(target), Some(id), Some(action), Some(digest)) = (
@@ -1217,9 +1282,6 @@ fn linked_plans(linked: &[LinkedHost], now: u64) -> (Vec<Value>, Vec<Value>) {
             ) else {
                 continue;
             };
-            let Ok(nonce) = fresh_nonce() else {
-                continue;
-            };
             let Ok(statement) = action_statement(target, id, action, digest, now, &nonce) else {
                 continue;
             };
@@ -1228,8 +1290,55 @@ fn linked_plans(linked: &[LinkedHost], now: u64) -> (Vec<Value>, Vec<Value>) {
             row["statement"] = json!(statement);
             rows.push(row);
         }
+        if deletes.is_empty() {
+            continue;
+        }
+        // Read only when there is a delete plan to approve: the relay token is often minted for the action verbs alone.
+        let note = match linked::admits(host, "approval_submit") {
+            Some(false) => Some(token_words(&host.name, "approval_submit")),
+            _ => None,
+        };
+        for mut row in deletes {
+            row["linkedHost"] = json!(host.name);
+            if let Some(note) = &note {
+                row["relayNote"] = json!(note);
+            }
+            rows.push(row);
+        }
     }
     (rows, hosts)
+}
+
+/// A linked kernel's delete plan as the page lists it: its row with a fresh statement minted here, for the host its own
+/// statement names. `None` for a row that is not a delete plan, or one whose statement names no host.
+fn linked_delete_row(row: &Value, now: u64, nonce: &str) -> Option<Value> {
+    let plan = row["plan"].as_str().filter(|plan| is_plan_digest(plan))?;
+    let target = serde_json::from_str::<Value>(row["statement"].as_str()?)
+        .ok()?
+        .get("host")?
+        .as_str()?
+        .to_string();
+    let statement = plan_statement(&target, plan, now, nonce).ok()?;
+    let mut row = row.clone();
+    row["statement"] = json!(statement);
+    Some(row)
+}
+
+/// A delete plan's id: 64 lowercase hexadecimal digits.
+fn is_plan_digest(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// What the owner reads when the token this page holds for linked host `name` does not admit `verb` there: what to change.
+fn token_words(name: &str, verb: &str) -> String {
+    format!(
+        "{name} does not accept this page's token for {verb}. On {name}, mint the token this page holds for it again with \
+         scope doctor and {verb} on its list of tools (beside plan_list, action_approve and plan_decline), and put it in \
+         the token file approval.linkedHosts names for {name}."
+    )
 }
 
 /// The linked host a request names, when it names one. `Ok(None)` is this page's own kernel; a name the page does not
@@ -1265,27 +1374,50 @@ impl IntoResponse for HostRefusal {
     }
 }
 
-/// Relays one call to a linked kernel and answers with what it said: its result with `host` added, its exact refusal, or
-/// a plain reason when it could not be asked.
-async fn relay(host: LinkedHost, verb: &'static str, arguments: Value) -> Response {
+/// Relays one call to a linked kernel, waiting up to `wait`, and returns what it said: its result with `host` added, or
+/// why it did not answer one.
+async fn relay(
+    host: LinkedHost,
+    verb: &'static str,
+    arguments: Value,
+    wait: Duration,
+) -> Result<Value, RelayError> {
     let name = host.name.clone();
-    let outcome = tokio::task::spawn_blocking(move || linked::call(&host, verb, arguments)).await;
+    let outcome =
+        tokio::task::spawn_blocking(move || linked::call_within(&host, verb, arguments, wait))
+            .await;
     match outcome {
         Ok(Ok(mut value)) => {
             if let Some(object) = value.as_object_mut() {
                 object.remove("truncated");
             }
             value["host"] = json!(name);
-            Json(value).into_response()
+            Ok(value)
         }
-        Ok(Err(error)) => relay_error_response(&name, error),
-        Err(_) => relay_error_response(&name, RelayError::Unreachable),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(RelayError::Unreachable),
+    }
+}
+
+/// A relayed call's answer as the page sends it, and its log outcome.
+fn relay_answer(name: &str, verb: &str, answer: Result<Value, RelayError>) -> (Outcome, Response) {
+    match answer {
+        Ok(value) => (Outcome::Approved, Json(value).into_response()),
+        Err(error) => {
+            let outcome = match &error {
+                RelayError::Refused { code, message } => refusal_outcome(code, message),
+                RelayError::Failed(message) => refusal_outcome("Failed", message),
+                RelayError::Token => Outcome::Refused("LinkToken".to_string()),
+                RelayError::Unreachable => Outcome::Unreachable,
+            };
+            (outcome, relay_error_response(name, verb, error))
+        }
     }
 }
 
 /// A relayed call's failure as the page answers it: the linked kernel's exact refusal, or a plain reason when it could not
-/// be asked.
-fn relay_error_response(name: &str, error: RelayError) -> Response {
+/// be asked. A token the linked kernel does not take for `verb` is told with what the owner changes.
+fn relay_error_response(name: &str, verb: &str, error: RelayError) -> Response {
     match error {
         RelayError::Refused { code, message } => refused(&code, &message),
         RelayError::Failed(message) => (
@@ -1297,7 +1429,7 @@ fn relay_error_response(name: &str, error: RelayError) -> Response {
             StatusCode::BAD_GATEWAY,
             Json(json!({
                 "refusal": "LinkToken",
-                "message": format!("{name} does not accept this page's token"),
+                "message": token_words(name, verb),
             })),
         )
             .into_response(),
@@ -1310,6 +1442,77 @@ fn relay_error_response(name: &str, error: RelayError) -> Response {
         )
             .into_response(),
     }
+}
+
+/// What became of one approval or decline from the page, for its log line.
+enum Outcome {
+    Approved,
+    /// The approval was accepted and spent, and the action then failed with this code.
+    ApprovedThenFailed(String),
+    Declined,
+    Refused(String),
+    Unreachable,
+}
+
+/// A refusal's outcome: an approval that was accepted and whose action then failed says so, not `refused`. Only the
+/// message's opening words are read; the message never reaches the log.
+fn refusal_outcome(code: &str, message: &str) -> Outcome {
+    if message.starts_with(crate::handlers::APPROVED_BUT_FAILED) {
+        Outcome::ApprovedThenFailed(code.to_string())
+    } else {
+        Outcome::Refused(code.to_string())
+    }
+}
+
+/// The one log line of an approval or decline from the page: the id, the host and the outcome code. Never the statement,
+/// the proof or a message; an id of any other shape is written as `-`.
+fn log_outcome(state: &PageState, id: &str, host: &str, outcome: &Outcome) {
+    write_outcome(&state.log, id, host, outcome);
+}
+
+/// [`log_outcome`] to the log `log`.
+fn write_outcome(log: &Arc<dyn Fn(&str) + Send + Sync>, id: &str, host: &str, outcome: &Outcome) {
+    let shaped = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 80
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    let id = if shaped(id) { id } else { "-" };
+    let host = if shaped(host) { host } else { "-" };
+    let said = match outcome {
+        Outcome::Approved => "approved".to_string(),
+        Outcome::ApprovedThenFailed(code) if shaped(code) => {
+            format!("approved, then failed {code}")
+        }
+        Outcome::ApprovedThenFailed(_) => "approved, then failed -".to_string(),
+        Outcome::Declined => "declined".to_string(),
+        Outcome::Refused(code) if shaped(code) => format!("refused {code}"),
+        Outcome::Refused(_) => "refused -".to_string(),
+        Outcome::Unreachable => "unreachable".to_string(),
+    };
+    log(&format!("arca: approval of {id} on {host}: {said}"));
+}
+
+/// A local call's failure as its log outcome.
+fn call_outcome(error: &CallError) -> Outcome {
+    match error {
+        CallError::Refused { code, message }
+        | CallError::UntrustedRefused { code, message }
+        | CallError::RefusedWith { code, message, .. } => refusal_outcome(code, message),
+        CallError::Invalid(message) => refusal_outcome("Invalid", message),
+        _ => Outcome::Refused("Internal".to_string()),
+    }
+}
+
+/// The host name this page's own kernel puts in its statements, for a log line.
+fn own_host(state: &PageState) -> String {
+    state
+        .kernel
+        .lock()
+        .map(|kernel| kernel.host().to_string())
+        .unwrap_or_default()
 }
 
 fn refused(code: &str, message: &str) -> Response {
@@ -1332,45 +1535,66 @@ async fn approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let now = (state.clock)();
-    let action = plan_id(&args).is_some_and(|id| id.starts_with("act-"));
+    let id = plan_id(&args).unwrap_or_default().to_string();
+    let action = id.starts_with("act-");
     match linked_host(&state, &args) {
         Err(refusal) => return refusal.into_response(),
         Ok(Some(host)) => {
-            // Another host's approval is never checked here: its bytes go to that kernel's own verifier.
-            let (Some(id), Some(approval)) = (
-                plan_id(&args).filter(|_| action),
-                args.get("approval").and_then(Value::as_str),
-            ) else {
+            // Another host's approval is never checked here: its bytes go to that kernel's own verifier. An action goes to
+            // its `action_approve`, waiting as long as the action can run; a delete plan to its `approval_submit`.
+            let Some(approval) = args.get("approval").and_then(Value::as_str) else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
-            return relay(
+            let route = state
+                .linked_waits
+                .lock()
+                .ok()
+                .and_then(|waits| relay_route(&waits, &host.name, &id));
+            let Some((verb, wait)) = route else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            let name = host.name.clone();
+            let answer = relay(
                 host,
-                "action_approve",
+                verb,
                 json!({ "plan": id, "approval": approval }),
+                wait,
             )
             .await;
+            let (outcome, response) = relay_answer(&name, verb, answer);
+            log_outcome(&state, &id, &name, &outcome);
+            return response;
         }
         Ok(None) => {}
     }
-    if action {
+    let here = own_host(&state);
+    let outcome = if action {
         let kernel = Arc::clone(&state.kernel);
         let actions = state.actions.clone();
-        let outcome =
-            tokio::task::spawn_blocking(move || run_approved_action(&kernel, &actions, &args, now))
-                .await;
-        return match outcome {
-            Ok(Ok(result)) => Json(result).into_response(),
-            Ok(Err(error)) => call_error_response(error),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        match tokio::task::spawn_blocking(move || {
+            run_approved_action(&kernel, &actions, &args, now)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        let mut kernel = match state.kernel.lock() {
+            Ok(kernel) => kernel,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-    }
-    let mut kernel = match state.kernel.lock() {
-        Ok(kernel) => kernel,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        approve_plan(&mut kernel, &args, now)
     };
-    match approve_plan(&mut kernel, &args, now) {
-        Ok(result) => Json(result).into_response(),
-        Err(error) => call_error_response(error),
+    match outcome {
+        Ok(result) => {
+            log_outcome(&state, &id, &here, &Outcome::Approved);
+            Json(result).into_response()
+        }
+        Err(error) => {
+            log_outcome(&state, &id, &here, &call_outcome(&error));
+            call_error_response(error)
+        }
     }
 }
 
@@ -1386,21 +1610,44 @@ async fn decline(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
                 .to_string(),
         });
     }
+    let id = plan_id(&args).unwrap_or_default().to_string();
     match linked_host(&state, &args) {
         Err(refusal) => return refusal.into_response(),
         Ok(Some(host)) => {
-            let id = plan_id(&args).unwrap_or_default().to_string();
-            return relay(host, "plan_decline", json!({ "plan": id })).await;
+            let name = host.name.clone();
+            let answer = relay(
+                host,
+                "plan_decline",
+                json!({ "plan": id }),
+                linked::timeout_for("plan_decline"),
+            )
+            .await;
+            let (outcome, response) = relay_answer(&name, "plan_decline", answer);
+            let outcome = match outcome {
+                Outcome::Approved => Outcome::Declined,
+                other => other,
+            };
+            log_outcome(&state, &id, &name, &outcome);
+            return response;
         }
         Ok(None) => {}
     }
+    let here = own_host(&state);
     let mut kernel = match state.kernel.lock() {
         Ok(kernel) => kernel,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    match decline_plan(&mut kernel, &args) {
-        Ok(result) => Json(result).into_response(),
-        Err(error) => call_error_response(error),
+    let outcome = decline_plan(&mut kernel, &args);
+    drop(kernel);
+    match outcome {
+        Ok(result) => {
+            log_outcome(&state, &id, &here, &Outcome::Declined);
+            Json(result).into_response()
+        }
+        Err(error) => {
+            log_outcome(&state, &id, &here, &call_outcome(&error));
+            call_error_response(error)
+        }
     }
 }
 
@@ -2134,6 +2381,112 @@ mod test_passkey;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_linked_approval_waits_as_long_as_its_card_was_listed_to_take_and_an_unread_host_keeps_its_waits()
+     {
+        let row = |host: &str, id: &str, action: &str, args: Value| json!({ "kind": "action", "linkedHost": host, "id": id, "action": action, "args": args });
+        let update = linked::approval_wait("service_update", &json!({ "timeoutSeconds": 300 }));
+        assert!(update > linked::APPROVAL_TIMEOUT);
+        let mut waits = HashMap::new();
+        keep_waits(
+            &mut waits,
+            &[
+                row(
+                    "beta",
+                    "act-1",
+                    "service_update",
+                    json!({ "timeoutSeconds": 300 }),
+                ),
+                row(
+                    "gamma",
+                    "act-2",
+                    "service_update",
+                    json!({ "timeoutSeconds": 300 }),
+                ),
+                row("beta", "act-3", "instance_stop", json!({})),
+            ],
+            &[
+                json!({ "name": "beta", "read": true }),
+                json!({ "name": "gamma", "read": true }),
+            ],
+        );
+        assert_eq!(
+            relay_route(&waits, "beta", "act-1"),
+            Some(("action_approve", update))
+        );
+        assert_eq!(
+            relay_route(&waits, "beta", "act-3"),
+            Some(("action_approve", linked::APPROVAL_TIMEOUT))
+        );
+        // The wait is the card's own host's: the same id on another host is not that card.
+        assert_eq!(
+            relay_route(&waits, "delta", "act-1"),
+            Some(("action_approve", linked::APPROVAL_TIMEOUT))
+        );
+        // beta is read again without act-1; gamma cannot be read and keeps act-2's wait.
+        keep_waits(
+            &mut waits,
+            &[],
+            &[
+                json!({ "name": "beta", "read": true }),
+                json!({ "name": "gamma", "read": false }),
+            ],
+        );
+        assert_eq!(
+            relay_route(&waits, "beta", "act-1"),
+            Some(("action_approve", linked::APPROVAL_TIMEOUT))
+        );
+        assert_eq!(
+            relay_route(&waits, "gamma", "act-2"),
+            Some(("action_approve", update))
+        );
+        // A delete plan's digest goes to approval_submit; any other id goes nowhere.
+        let digest = "a".repeat(64);
+        assert_eq!(
+            relay_route(&waits, "beta", &digest),
+            Some(("approval_submit", linked::APPROVAL_TIMEOUT))
+        );
+        assert_eq!(relay_route(&waits, "beta", "plan-1"), None);
+    }
+
+    #[test]
+    fn an_approval_accepted_whose_action_then_failed_is_logged_as_approved_then_failed() {
+        let failed = format!(
+            "{} service_update did not complete: no room",
+            crate::handlers::APPROVED_BUT_FAILED
+        );
+        let said = |outcome: Outcome| {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let kept = Arc::clone(&lines);
+            let log: Arc<dyn Fn(&str) + Send + Sync> =
+                Arc::new(move |line: &str| kept.lock().expect("the log").push(line.to_string()));
+            write_outcome(&log, "act-1", "beta", &outcome);
+            let said = lines.lock().expect("the log").first().cloned();
+            said.expect("one line")
+        };
+        assert_eq!(
+            said(refusal_outcome("NoRoom", &failed)),
+            "arca: approval of act-1 on beta: approved, then failed NoRoom"
+        );
+        assert_eq!(
+            said(refusal_outcome("Expired", "the approval has expired")),
+            "arca: approval of act-1 on beta: refused Expired"
+        );
+        assert_eq!(
+            said(call_outcome(&CallError::Refused {
+                code: "NoRoom".to_string(),
+                message: failed.clone()
+            })),
+            "arca: approval of act-1 on beta: approved, then failed NoRoom"
+        );
+        assert_eq!(
+            said(call_outcome(&CallError::Invalid("bad".to_string()))),
+            "arca: approval of act-1 on beta: refused Invalid"
+        );
+        // The message never reaches the line.
+        assert!(!said(refusal_outcome("NoRoom", &failed)).contains("no room"));
+    }
 
     #[test]
     fn state_line_append_is_idempotent_by_credential_or_fingerprint() {

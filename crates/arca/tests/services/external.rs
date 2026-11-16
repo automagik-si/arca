@@ -348,14 +348,14 @@ fn through_the_door_the_schemas_hold_the_arguments_and_the_rows_and_the_answers_
 }
 
 /// The MCP door over the rig's handlers, with the real verb table, and one doctor's token.
-struct Door {
+pub(crate) struct Door {
     socket: PathBuf,
     doctor: String,
     _runtime: tokio::runtime::Runtime,
 }
 
 impl Door {
-    fn over(rig: &Rig) -> Door {
+    pub(crate) fn over(rig: &Rig) -> Door {
         use arca_mcp::{Server, TokenStore, mint, serve_unix};
         let tokens = rig.dir.join("door-tokens");
         fs::create_dir(&tokens).expect("the token directory");
@@ -391,7 +391,7 @@ impl Door {
     }
 
     /// A `tools/call` through the door: `"ok"`, or what the door said instead.
-    fn call(&self, name: &str, arguments: Value) -> String {
+    pub(crate) fn call(&self, name: &str, arguments: Value) -> String {
         use std::io::{Read as _, Write as _};
         let body = serde_json::to_vec(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",

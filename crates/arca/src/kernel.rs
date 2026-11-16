@@ -317,6 +317,12 @@ impl Kernel {
         }
     }
 
+    /// Writes each waiting import's `Ceph` row again from the node's import config: see
+    /// [`ActionProposalStore::reword_imports`].
+    pub fn reword_import_cards(&mut self, row_of: impl Fn(&Value, Option<&str>) -> Option<String>) {
+        self.action_proposals.reword_imports(row_of);
+    }
+
     /// The action proposals still on disk. Callers leave out the lapsed ones.
     pub fn action_proposals(&self) -> &[ActionProposal] {
         self.action_proposals.waiting()

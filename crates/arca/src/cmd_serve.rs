@@ -257,7 +257,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // Both checks come before the kernel opens, because opening it reconciles the desired state: a node whose mode was
     // switched must not create or repair anything of the other mode first.
     check_bridged_start(&cfg, std::path::Path::new("/sys/class/net"))?;
-    let kernel = Kernel::open_with_tenants(
+    let mut kernel = Kernel::open_with_tenants(
         &cfg.state_dir,
         key,
         plugins,
@@ -269,6 +269,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         now_ms(),
     )
     .map_err(kernel_failure)?;
+    // A waiting import's card names the source cluster the run reads, the one of this config: a card proposed under
+    // another is written again here, while this start still owns the kernel and nothing is served.
+    crate::vm_import::reword_waiting_imports(&mut kernel, &cfg);
     let applied_seq = kernel.applied_seq_reader();
     let kernel = Arc::new(Mutex::new(kernel));
 
@@ -343,6 +346,13 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // peer_keys_sync is served only to a kernel whose config keeps another machine's page host's passkeys.
     let keeps_peer_keys = !peers.is_empty();
     // A node that only looks says so in every answer: what a reader is shown is there, and none of it can be changed here.
+    // Support reports: filed by any viewer, pulled by the support side from GET /reports, which marks each one picked up
+    // with POST /reports/<id>/ack. Nothing is sent outward.
+    let support = Arc::new(crate::support_reports::SupportReports::new(
+        &cfg.state_dir,
+        node.clone(),
+        Arc::clone(&clock),
+    ));
     let mut server = Server::new(served_verbs(relayed, keeps_peer_keys), tokens.clone())
         .only_looks(!kernel_mode)
         .handle(
@@ -423,7 +433,24 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             "/metrics",
             "node_metrics",
             Arc::new(MetricsExport { node, alerts }),
+        )
+        .get_route(
+            "/reports",
+            "support_reports",
+            Arc::new(crate::support_reports::ReportsExport {
+                reports: Arc::clone(&support),
+            }),
+        )
+        .post_route(
+            crate::support_reports::ACK_ROUTE,
+            "support_report_ack",
+            Arc::new(crate::support_reports::ReportAck {
+                reports: Arc::clone(&support),
+            }),
         );
+    for (verb, handler) in crate::support_reports::handlers(&support) {
+        server = server.handle(verb, handler);
+    }
     // A watch-only node has no device writer. A kernel-mode node writes GPU devices only in its own project family, and
     // only reads local telemetry for the VM-in-use check when the metrics source is a settled local daemon.
     let gpu: Option<Arc<dyn crate::gpu::GpuBackend>> = if kernel_mode {

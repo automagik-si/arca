@@ -20,8 +20,8 @@ real Ceph cluster or a real outside hypervisor yet.
 
 - **outside hypervisor**: the system that runs the VM today. Arca reads nothing from it.
 - **source description**: the XML the outside hypervisor gives for one VM, passed to Arca as text.
-- **source pool**: the Ceph pool that holds the source VM's disks. Incus does not manage it. It is on the same Ceph
-  cluster as the node's Incus Ceph pool.
+- **source pool**: the Ceph pool that holds the source VM's disks. Incus does not manage it. It is on the Ceph cluster
+  of the node's Incus Ceph pool, or on another Ceph cluster the node can reach (see "Two Ceph clusters").
 - **target pool**: the node's Incus storage pool whose driver is `ceph`.
 
 ## What the action takes
@@ -155,9 +155,38 @@ version before the first real import.
 The copy is two processes and a pipe, no shell:
 
 ```
-rbd --cluster <c> --id <source client> export-diff <source pool>/<image> -
-  | rbd --cluster <c> --id <ceph.user.name of the target pool> import-diff - <target osd pool>/<incus image>
+rbd --cluster <source cluster> --id <source client> export-diff <source pool>/<image> -
+  | rbd --cluster <ceph.cluster_name of the target pool> --id <ceph.user.name of the target pool> import-diff - <target osd pool>/<incus image>
 ```
+
+### Two Ceph clusters
+
+The source pool may be on another Ceph cluster than the target pool, in either direction: nothing in the import says
+which cluster is which. `kernel.instanceImport.cephCluster` names the source's cluster by its config file on the node
+(`/etc/ceph/<name>.conf`, with that cluster's `mon_host` and `fsid`), and the source client's keyring sits beside it
+(`/etc/ceph/<name>.client.<client>.keyring`). The target pool's cluster is the one Incus names for it
+(`ceph.cluster_name`, default `ceph`). Each `rbd` reads its own cluster's config and key, so the reader holds no key of
+the target cluster and the writer none of the source's. Arca's commands only read the source cluster: `status`, `info`
+and `export-diff` to the pipe; a recorded-command test holds the run to that, in both directions and on a failed copy.
+That the source client can only read is the operator's grant (below), which Arca does not check.
+
+The copy streams through the node: the reader's output is the writer's input through an OS pipe (64 KiB by default), and
+no disk byte passes through Arca's own process. Each `rbd` holds its in-flight requests, which librados caps at about
+100 MiB by default, and the writer its librbd cache, so the node holds a 64 KiB pipe and up to about 100 MiB per `rbd`
+process, whatever the disk's size. Its time is the data the disk holds (`export-diff` sends no unwritten
+extent) over the slowest of the source cluster's read, the network between the node and the source cluster's OSDs, and
+the target cluster's write. On 1 Gbit/s that is about 110 MB/s: about 10 seconds per GiB held, so 100 GiB in about 16
+minutes. On 10 Gbit/s the clusters are usually the limit, a few hundred MB/s.
+
+The card's `Ceph` row names both clusters, as the node's config and Incus say when the proposal is made, and the run's
+answer says `Copied from the Ceph cluster <source> … to the Ceph cluster <target>`. Two config names are two clusters
+on the card unless their files name one `fsid`, which the row then says. A target pool that is not Ceph, or one Incus
+does not answer for, gets a row that says so; neither refuses the proposal. When `serve` restarts with the proposal
+waiting, the row is kept if the node's import config still names the same source pool, cluster and client, the ones the
+run reads with. Otherwise the row is written again from the config the run reads, with the target's cluster left to
+Incus; a node with no `kernel.instanceImport` any more shows no row, and its run refuses. The arguments and their digest
+never change. A failed `rbd` names its side, cluster and client (`reading the Ceph cluster b as client.arca-import: …`,
+`writing the Ceph cluster ceph as client.admin: …`).
 
 ## Ceph access
 
@@ -242,15 +271,17 @@ string).
   "kernel": { "instanceImport": { "sourcePool": "src-pool", "cephClient": "arca-import", "cephCluster": "ceph" } }
   ```
 
-  `cephClient` defaults to `arca-import` and `cephCluster` to `ceph`. The kernel runs `rbd`, so the node needs
-  `ceph-common` and the client's keyring at `/etc/ceph/<cluster>.client.<client>.keyring`, readable by the kernel.
+  `cephClient` defaults to `arca-import` and `cephCluster` to `ceph`. `cephCluster` is the source pool's cluster, which
+  may be another than the Incus pool's. The kernel runs `rbd`, so the node needs `ceph-common`, the source cluster's
+  config at `/etc/ceph/<cluster>.conf` and the client's keyring at `/etc/ceph/<cluster>.client.<client>.keyring`, both
+  readable by the kernel.
 
 The imported VM carries no `user.arcakernel.entry`: to the journal writer and to the instance verbs it is not Arca's
 yet. Taking it into a project with a person (K3) and a person's start, stop and console (K4) are later steps.
 
 ## Not in K1
 
-- A source disk that is not on Ceph, or on another Ceph cluster than the target pool.
+- A source disk that is not on Ceph.
 - NICs on more than one bridge (K2 carries per-NIC bridges), and fixed addresses held by Incus (`ipv4.address`): the
   address lives in the guest's own config, from the seed.
 - GPU or PCI passthrough, memory hot-plug, NUMA pinning, the source's snapshots (only the head is copied).
