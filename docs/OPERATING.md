@@ -2136,14 +2136,14 @@ kernel's terminal is never asked about a plan that waits on another node.
 
 The three `owner_approval_*` reads take no `node`: their rows are the calling token's own requests, and a relayed call
 is made with the linked token. The token in `tokenFile` must admit each verb relayed: the page's token minted with
-`--tools plan_list,action_approve,plan_decline` admits only those, so `watch_report` through it is refused `LinkToken`.
+`--tools plan_list,action_approve,plan_decline,approval_submit` admits only those, so `watch_report` through it is refused `LinkToken`.
 To read and propose through the door as well, mint the linked kernel's token with the page's verbs, `action_propose` and
 the reads, and nothing else (never without `--tools`: that token would hold every `doctor` write on the linked kernel,
 and the door relays none of them):
 
 ```sh
 arca token mint --scope doctor --id relay-alpha \
-  --tools plan_list,action_approve,plan_decline,action_propose,arca_status,node_metrics,watch_report,journal_list,alerts_list,postgres_list,ontology_query,service_list,service_status,service_logs,omni_status,storage_list,snapshot_list,tenant_list,tenant_status,tenant_usage,function_list,function_runs,registry_list,instance_move_preflight,github_connect_status,github_bindings,github_audit,os_update,route_list \
+  --tools plan_list,action_approve,plan_decline,approval_submit,action_propose,arca_status,node_metrics,watch_report,journal_list,alerts_list,postgres_list,ontology_query,service_list,service_status,service_logs,omni_status,storage_list,snapshot_list,tenant_list,tenant_status,tenant_usage,function_list,function_runs,registry_list,instance_move_preflight,github_connect_status,github_bindings,github_audit,os_update,route_list \
   --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
 ```
 
@@ -3923,13 +3923,35 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
   `approval_submit` path; an `act-…` id verifies the passkey against the proposal's statement and runs its action once.
 - `POST /approve/decline` takes `{ "plan": "<act-id>" }` and declines only an action proposal. The open page has no
   credential for a delete plan; that decline stays with the doctor-scope `plan_decline`.
-- With `approval.linkedHosts` set, `GET /approve/plans` also lists each linked kernel's waiting action proposals, and
-  `POST /approve/approve` and `POST /approve/decline` take an optional `"host"`. See the next section.
+- With `approval.linkedHosts` set, `GET /approve/plans` also lists each linked kernel's waiting action proposals and
+  delete plans, and `POST /approve/approve` and `POST /approve/decline` take an optional `"host"`. See
+  [Approving on another kernel of this machine](#approving-on-another-kernel-of-this-machine).
 - With linked hosts that keep this host's passkeys, `GET /approve/plans` adds `peerKeys` cards, `POST /approve/peer-keys`
   approves one and `POST /approve/peer-keys/sync` syncs now. See [Approving on another machine](#approving-on-another-machine).
 - `POST /approve/register` takes `{ "credentialId": "<base64url>", "publicKey": "<base64>", "publicKeyAlgorithm": -7 }`,
   plus `"setupCode"` while no passkey is trusted, and returns `{ "trusted": true, "line": "<line>" }`; without `setupCode`
   it returns `{ "line": "<line>" }` as the developer answer.
+
+The page reads what is waiting again every minute while it is in view, and as soon as it comes back into view, but
+never while a card is being approved or declined: every card's statement lasts ten minutes, so a card left open longer
+would be refused `Expired`, and a card proposed after the page loaded shows up within that minute. An approval refused
+`Expired` anyway reads the list again and asks for one more tap on the renewed card. A relayed approval that ends
+`Unreachable` reads the list again too, since the other machine may still have run it. The page computes every card's
+passkey challenge when it reads the list, so a tap goes straight to the passkey prompt (Safari keeps a tap's gesture only
+when nothing is awaited before the prompt). What went wrong with one card is said on that card, as well as in the status
+line at the top.
+
+The page's own readings (every minute, and on coming back into view) never move a card the owner may be reading or about
+to tap. Every card waits in one list: the delete plans, the actions, a linked machine's passkey list and the requests an
+assistant made (each with its own badge). A card still waiting keeps its place and its open Details, and its next tap
+signs the statement just read for it. A new card of any kind goes after every card already drawn, wherever the server
+lists it. A card that stopped waiting while the page was open (it lapsed, or was approved or declined somewhere else)
+leaves a placeholder of its height. The reading after a refused tap (`Expired`, which asks for one more tap, or
+`Unreachable`) takes nothing away either, so the card the owner is asked to tap again stays where it is. The owner's own
+approval or decline, and registering or removing a passkey, do move cards: they take the placeholders (and the approved
+or declined card) away, and the cards below close up. For a second after any reading that changed what is drawn (from "Nothing to
+approve" too), the cards, the connected apps and the passkey list take no tap, so a tap aimed at what stood there before
+does nothing. A button that had the keyboard focus gets it back when that second ends.
 
 Every route of the page, the canvas routes below among them, answers the same with one trailing slash as without it
 (`/approve/` is `/approve`, `/approve/plans/` is `/approve/plans`): the same handler under the same rules, not a
@@ -4110,12 +4132,13 @@ the file holding a token for it:
 ```
 
 `name` is the name the canvas knows that machine by (its `hosts[].name` in the canvas config). The token is minted on the
-linked kernel with scope `doctor`, limited to the verbs relayed with it. For the page alone that is its three verbs; to
-read and propose on that kernel through this kernel's MCP door as well, list those verbs too (see
-[Asking a linked node: `node`](#asking-a-linked-node-node)):
+linked kernel with scope `doctor`, limited to the verbs relayed with it. For the page alone that is its four verbs
+(`approval_submit` approves that kernel's delete plans; a token without it still relays actions, and each delete card
+says what to change); to read and propose on that kernel through this kernel's MCP door as well, list those verbs too
+(see [Asking a linked node: `node`](#asking-a-linked-node-node)):
 
 ```sh
-arca token mint --scope doctor --id relay-alpha --tools plan_list,action_approve,plan_decline \
+arca token mint --scope doctor --id relay-alpha --tools plan_list,action_approve,plan_decline,approval_submit \
   --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
 ```
 
@@ -4139,21 +4162,32 @@ whose `origin` is listed are trusted. A file that is missing, unreadable or refu
 reason. The sign-in route of beta's own canvas never uses these keys, and neither does a passkey change: only beta's own
 passkeys (its root file and its state file) can add or remove one of beta's passkeys, and a passkey trusted from another
 kernel's file is refused with "only this machine's own passkeys can change its passkeys". The trusted keys approve action
-proposals only. With no `approval` key, a kernel trusts only its own owner keys and does not serve `action_approve`, as
+proposals and delete plans only. With no `approval` key, a kernel trusts only its own owner keys and does not serve `action_approve`, as
 before.
 
 Then:
 
-- `GET /approve/plans` adds each linked kernel's waiting action proposals. Each row carries `linkedHost` (the linked
-  name), `host` (the host that kernel's statements name) and a fresh `statement` that names that host. The answer adds
-  `linkedHosts: [{ "name", "read" }]`; a kernel that does not answer (`read: false`) adds no row. A linked kernel's delete
-  plans are not listed.
-- `POST /approve/approve` with `"host": "<linked name>"` relays `{plan, approval}` to that kernel's `action_approve` and
-  answers what it said: its result with `host` added, or its exact refusal (403 `{refusal, message}`, for example
-  `WrongHost`, `BadSignature` or `Replayed`). `POST /approve/decline` with a `host` relays to `plan_decline` the same way.
+- `GET /approve/plans` adds each linked kernel's waiting action proposals and delete plans. Each row carries `linkedHost`
+  (the linked name) and a fresh `statement` that names the host that kernel's statements name (an action row also says
+  it in `host`). The answer adds `linkedHosts: [{ "name", "read" }]`; a kernel that does not answer (`read: false`) adds
+  no row. When a kernel has a delete plan waiting, the page reads that kernel's `tools/list` with its token, and when
+  `approval_submit` is not on it, each of its delete rows carries `relayNote`: what to change, which the card shows.
+- `POST /approve/approve` with `"host": "<linked name>"` relays `{plan, approval}` to that kernel: an action id
+  (`act-…`) to its `action_approve`, a delete plan's digest to its `approval_submit`. It answers what that kernel said:
+  its result with `host` added, or its exact refusal (403 `{refusal, message}`, for example `WrongHost`, `BadSignature`,
+  `Expired` or `Replayed`). `POST /approve/decline` with a `host` relays an action's decline to `plan_decline` the same
+  way. The page waits for a relayed approval as long as the action can run: 180 seconds, and for a `service_update`
+  longer: one Incus step of its rebuild may take 600 seconds (a registry pull included), its new version has its
+  `timeoutSeconds` (120 by default) to answer, and after a rollback the old one has up to 30 more. A `service_update`
+  with `timeoutSeconds` 300 waits 1110 seconds. The wait comes from the card as last listed: a linked host the page
+  could not read keeps the wait it was listed with before.
 - A `host` the page does not list is refused 403 `{ "refusal": "NotLinked", "message": "this machine is not linked for
-  approvals yet" }`. A linked kernel that refuses the token answers 502 `LinkToken`; one that does not answer, 502
-  `Unreachable`. Nothing is relayed in either case.
+  approvals yet" }`. A linked kernel that refuses the token answers 502 `LinkToken`, with a message that says what to
+  change; one that does not answer, 502 `Unreachable`. Nothing is relayed in either case.
+- Every approval and decline from the page, of its own kernel's cards or a linked one's, writes one line to the page
+  host's log: `arca: approval of <id> on <host>: approved`, `approved, then failed <code>` (the approval was accepted
+  and spent, and the action then failed), `refused <code>`, `unreachable` or `declined`. The line never holds the
+  statement, its nonce, the proof or a message.
 - Without a `host`, the page approves only on its own kernel, as before. It never calls its own kernel for another
   kernel's id.
 
@@ -4186,7 +4220,7 @@ The token is minted on gamma with scope `doctor`, limited to the verbs the page 
 
 ```sh
 arca token mint --scope doctor --id relay-alpha \
-  --tools arca_status,plan_list,action_approve,plan_decline,peer_keys_sync \
+  --tools arca_status,plan_list,action_approve,plan_decline,approval_submit,peer_keys_sync \
   --out gamma-relay.secret --config /etc/arca/gamma.json
 ```
 
@@ -7729,7 +7763,7 @@ A token keeps at most 5 pending requests and Arca at most 20 (past either, the r
 request. The request names the passkey page in `dashboard`. Requests and statuses are a doctor's or an operator's, and
 `owner_approval_list` is a viewer's too. The list's arguments and fields are untrusted, because the assistant wrote them.
 
-The request waits on the passkey page under "Asked by your assistant", drawn as text. One tap on Approve asks Arca for the
+The request waits on the passkey page among the other cards, with its own `Request` badge, drawn as text. One tap on Approve asks Arca for the
 statement (this host, the request's action, target and argument digest, a fresh nonce, valid 15 minutes), the passkey signs
 it, and Arca checks the proof as the call will, spending nothing. The owner has 120 seconds from the tap. Only passkeys made
 for the page's address are offered; a passkey made for an earlier address is refused with `passkey_rp_changed`, and the
