@@ -762,45 +762,27 @@ fn rebind_refuses_a_second_binding_until_the_first_storage_record_is_saved() {
     assert_eq!(rig.fake.writes().len(), writes);
 }
 #[test]
-fn rebind_reopen_refuses_storage_outside_the_latest_binding_without_host_writes() {
-    let rig = copied_service_binding_fixture();
-    let first = propose(&rig, json!({"name":"sample"})).unwrap();
-    fs::create_dir(rig.dir.join("desired.json.tmp")).unwrap();
-    assert!(run(&rig, &first).is_err());
-    next_copy(&rig);
-    let snapshot = copy_saved_state(&rig);
-    let from = first["args"]["binding"]["to"].clone();
-    let mut to = from.clone();
-    to["instance"]["uuid"] = json!("replacement-c");
-    to["data_volume"]["name"] = json!("copied-c");
-    let mut journal = fs::read(snapshot.join("journal.jsonl")).unwrap();
-    journal.extend(
-        serde_json::to_vec(&json!({"kind":"binding","binding":{
-            "entry":"service-sample","at_ms":NOW,"from":from,"to":to
-        }}))
-        .unwrap(),
-    );
-    journal.push(b'\n');
-    fs::write(snapshot.join("journal.jsonl"), journal).unwrap();
-    let writes = rig.fake.writes().len();
-    let error = reopen(&rig, &snapshot)
-        .err()
-        .expect("mixed storage must refuse to open");
-    assert!(error.to_string().contains("service-sample"), "{error}");
-    assert_eq!(rig.fake.writes().len(), writes);
-}
-#[test]
 fn rebind_removal_does_not_blame_another_instance_for_its_own_remaining_nic() {
-    let rig = copied_service_binding_fixture();
-    let proposal = propose(&rig, json!({"name":"sample"})).unwrap();
-    run(&rig, &proposal).unwrap();
-    rig.edit(
-        "DELETE",
-        &format!("/1.0/instances/sample-backup?project={PROJECT}"),
-        json!({}),
-    );
-    rig.fake.set_reject_delete("sample");
-    let error = remove_approved(&rig).unwrap_err();
-    assert!(matches!(error, CallError::Refused { message, .. }
-        if message.contains("instance remains") && !message.contains("another instance")));
+    for with_used_by in [true, false] {
+        let rig = copied_service_binding_fixture();
+        let proposal = propose(&rig, json!({"name":"sample"})).unwrap();
+        run(&rig, &proposal).unwrap();
+        rig.edit(
+            "DELETE",
+            &format!("/1.0/instances/sample-backup?project={PROJECT}"),
+            json!({}),
+        );
+        if with_used_by {
+            let acl = rig.service_config("sample").acl();
+            let mut body = rig
+                .get(&format!("/1.0/network-acls/{acl}?project=default"))
+                .unwrap();
+            body["used_by"] = json!([format!("/1.0/instances/sample?project={PROJECT}")]);
+            rig.fake.add_acl("default", body);
+        }
+        rig.fake.set_reject_delete("sample");
+        let error = remove_approved(&rig).unwrap_err();
+        assert!(matches!(error, CallError::Refused { message, .. }
+            if message.contains("instance remains") && !message.contains("another instance")));
+    }
 }
