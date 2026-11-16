@@ -2260,3 +2260,50 @@ fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
         }
     }
 }
+
+#[test]
+fn journal_binding_fixture_has_a_closed_bounded_schema_and_keeps_legacy_results() {
+    let schema = (verb("journal_list").unwrap().result)();
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/journal-list.json")).unwrap();
+    conforms(&schema, &fixture).unwrap();
+    let mut old_client = schema.clone();
+    let properties = old_client["properties"].as_object_mut().unwrap();
+    properties.remove("bindings");
+    properties.remove("bindingsTruncated");
+    conforms(&old_client, &fixture).expect("old clients ignore the new top-level keys");
+    conforms(&schema, &json!({"records":[]})).unwrap();
+    assert_eq!(schema["properties"]["bindings"]["maxItems"], 100);
+    for pointer in [
+        "/bindings/0",
+        "/bindings/0/from",
+        "/bindings/0/to/instance",
+        "/bindings/0/from/data_volume",
+    ] {
+        let mut invalid = fixture.clone();
+        invalid.pointer_mut(pointer).unwrap()["unexpected"] = json!("private");
+        assert!(
+            conforms(&schema, &invalid).is_err(),
+            "{pointer} must be closed"
+        );
+    }
+    let mut invalid = fixture.clone();
+    invalid["bindings"][0]["kind"] = json!("effect");
+    assert!(conforms(&schema, &invalid).is_err());
+    invalid = fixture.clone();
+    invalid["bindings"][0]["from"]["instance"]["kind"] = json!("volume");
+    assert!(conforms(&schema, &invalid).is_err());
+    invalid = fixture.clone();
+    invalid["bindings"][0]["to"]["data_volume"]
+        .as_object_mut()
+        .unwrap()
+        .remove("parent");
+    assert!(conforms(&schema, &invalid).is_err());
+    invalid = fixture.clone();
+    invalid["bindings"] = json!(vec![fixture["bindings"][0].clone(); 101]);
+    assert!(conforms(&schema, &invalid).is_err());
+    let mut no_volume = fixture;
+    no_volume["bindings"][0]["from"]["data_volume"] = Value::Null;
+    no_volume["bindings"][0]["to"]["data_volume"] = Value::Null;
+    no_volume["bindings"][0]["afterEffect"] = Value::Null;
+    conforms(&schema, &no_volume).unwrap();
+}
