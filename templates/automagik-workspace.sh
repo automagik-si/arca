@@ -810,10 +810,13 @@ checkout_authorship() {
 
 CHECKOUT_READY=false CHECKOUT_REASON='' CHECKOUT_TOKEN_DIGEST='' CHECKOUT_ID_CHECKED=false
 keep_checkout() {
-  local origin tracked=false temp marker_id
+  local origin tracked=false temp marker_id clone_mode=0700
   CHECKOUT_READY=false
   CHECKOUT_TARGET=$WS_DATA/workspace
-  [ "$MEMBER_RUNNER" != true ] || CHECKOUT_TARGET=$WS_WORKSPACE
+  if [ "$MEMBER_RUNNER" = true ]; then
+    CHECKOUT_TARGET=$WS_WORKSPACE
+    clone_mode=0711
+  fi
   CHECKOUT_MARKER=${WS_DATA%/*}/checkout.json
   temp=$CHECKOUT_TARGET.arca-clone
   checkout_token || { checkout_wait 'the credential copy failed; it will be tried again'; return; }
@@ -830,7 +833,7 @@ keep_checkout() {
     rm -rf -- "$temp"
     rm -f -- "$CHECKOUT_MARKER.new"
     [ -s "$WS_RUN-github/token" ] || { failed checkout; checkout_wait 'checkout waits for GITHUB_TOKEN; Arca must mint a repository token'; return; }
-    install -d -m 0700 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$temp" || return 1
+    install -d -m "$clone_mode" -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$temp" || return 1
     local helper
     # Path is configuration, never the credential. A single-quoted shell word protects it in Git's helper shell.
     helper="!f() { if [ \"\$1\" = get ]; then printf 'username=x-access-token\\npassword='; cat '${WS_RUN//\'/\'\\\'\'}-github/token'; printf '\\n'; fi; }; f"
