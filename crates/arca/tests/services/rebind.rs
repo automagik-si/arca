@@ -786,3 +786,101 @@ fn rebind_removal_does_not_blame_another_instance_for_its_own_remaining_nic() {
             if message.contains("instance remains") && !message.contains("another instance")));
     }
 }
+
+#[test]
+fn unsaved_bindings_block_only_their_own_services_and_one_save_clears_both() {
+    for second_save_fails in [true, false] {
+        let rig = copied_service_binding_fixture();
+        rig.call("service_create", json!({"name":"other","template":"nats"}))
+            .unwrap();
+        rig.call(
+            "service_secret_set",
+            json!({"name":"other","key":"TOKEN","value":"before-copy"}),
+        )
+        .unwrap();
+        let old_volume = rig
+            .get(&format!(
+                "/1.0/storage-pools/pool1/volumes/custom/other-data?project={PROJECT}"
+            ))
+            .unwrap();
+        rig.fake
+            .add_volume(PROJECT, "pool2", "other-data", old_volume);
+        rig.fake
+            .set_instance_config(PROJECT, "other", "volatile.uuid", "other-b");
+        rig.fake.set_instance_device(
+            PROJECT,
+            "other",
+            "root",
+            json!({"type":"disk","path":"/","pool":"pool2"}),
+        );
+        rig.fake.set_instance_device(
+            PROJECT,
+            "other",
+            "data",
+            json!({"type":"disk","path":"/data","pool":"pool2","source":"other-data"}),
+        );
+        let first = propose(&rig, json!({"name":"sample"})).unwrap();
+        let temporary = rig.dir.join("desired.json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        let journal = journal_lines(&rig);
+        let writes = rig.fake.writes().len();
+        assert!(
+            matches!(run(&rig, &first), Err(CallError::Refused { message, .. }) if message.contains("not confirmed"))
+        );
+        assert_eq!(journal_lines(&rig), journal + 1);
+        next_copy(&rig);
+        let unsaved = |name| {
+            assert!(matches!(propose(&rig, json!({"name":name})),
+            Err(CallError::Refused { message, .. }) if message.contains("not saved")))
+        };
+        unsaved("sample");
+        if !second_save_fails {
+            fs::remove_dir(&temporary).unwrap();
+        }
+        let second =
+            propose(&rig, json!({"name":"other"})).expect("an unrelated service remains eligible");
+        let result = run(&rig, &second);
+        if second_save_fails {
+            assert!(
+                matches!(result, Err(CallError::Refused { message, .. }) if message.contains("not confirmed"))
+            );
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            journal_lines(&rig),
+            journal + 2,
+            "both first bindings appended"
+        );
+        rig.fake
+            .set_instance_config(PROJECT, "other", "volatile.uuid", "other-c");
+        if second_save_fails {
+            unsaved("sample");
+            unsaved("other");
+            assert_eq!(
+                journal_lines(&rig),
+                journal + 2,
+                "neither entry may append twice while unsaved"
+            );
+            fs::remove_dir(&temporary).unwrap();
+            rig.kernel.lock().unwrap().propose(vec![], NOW).unwrap();
+        }
+        propose(&rig, json!({"name":"sample"})).expect("the full save cleared sample");
+        propose(&rig, json!({"name":"other"})).expect("the full save cleared other");
+        let reopened = reopen(&rig, &copy_saved_state(&rig)).unwrap();
+        for name in ["sample", "other"] {
+            let entry = reopened
+                .entries()
+                .iter()
+                .find(|entry| entry.id.0 == format!("service-{name}"))
+                .unwrap();
+            assert_eq!(entry.config["pool"], "pool2");
+            assert_eq!(entry.config["dataVolume"]["name"], format!("{name}-data"));
+        }
+        assert_eq!(
+            rig.fake.writes().len(),
+            writes,
+            "binding and reopen change only Arca state"
+        );
+    }
+}
