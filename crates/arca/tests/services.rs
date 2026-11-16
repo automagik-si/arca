@@ -3391,7 +3391,65 @@ fn a_service_call_with_a_listing_taken_during_removal_does_not_readopt_it() {
 }
 
 #[test]
-fn a_retired_service_phantom_heals_and_its_name_and_address_can_be_created_again() {
+fn failed_adoption_reads_do_not_refuse_other_calls_and_are_retried_later() {
+    for status in [403, 503] {
+        let rig = Rig::with(
+            FakeState {
+                instances: vec![adopted_instance(
+                    "svc1",
+                    "arca",
+                    "postgres-autopg",
+                    "192.0.2.10",
+                    "5432",
+                    "uuid-svc1",
+                )],
+                ..empty_state()
+            },
+            vec![PROJECT.into(), "arca".into()],
+            Some("192.0.2.0/24"),
+        );
+        rig.template("nats", nats_template());
+        let path = "/1.0/instances/svc1?project=arca";
+        rig.fake.fail_reads(path, 2, status);
+        rig.call("service_list", json!({}))
+            .expect("a failed candidate read must not refuse the list");
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1")
+        );
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+            .expect("a failed candidate read must not refuse another service's create");
+        assert!(
+            rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-nats")
+        );
+        assert!(
+            !rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1")
+        );
+        assert_eq!(
+            rig.fake
+                .requests()
+                .iter()
+                .filter(|request| request.path == path && request.status == status)
+                .count(),
+            2
+        );
+        rig.call("service_list", json!({}))
+            .expect("a later call retries adoption");
+        assert!(
+            rig.entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-svc1" && entry.config["adopted"] == true)
+        );
+    }
+}
+
+#[test]
+fn a_missing_adoption_is_preserved_despite_old_retirement_history() {
     let key = common::SkKey::from_seed(9);
     let rig = Rig::with_key(
         empty_state(),
@@ -3407,7 +3465,6 @@ fn a_retired_service_phantom_heals_and_its_name_and_address_can_be_created_again
         .into_iter()
         .find(|entry| entry.id.0 == "service-pg")
         .unwrap();
-    let address = phantom.config["ipv4"].clone();
     rig.call(
         "service_remove",
         json!({"name":"pg","approval":owner_approval(&key, "pg")}),
@@ -3427,16 +3484,15 @@ fn a_retired_service_phantom_heals_and_its_name_and_address_can_be_created_again
         .unwrap()
         .propose(vec![arca::desired_store::EntryChange::Put(phantom)], NOW)
         .unwrap();
+    let before = rig.entries();
     let writes = rig.fake.writes();
     rig.call("service_list", json!({})).unwrap();
-    assert!(
-        !rig.entries().iter().any(|entry| entry.id.0 == "service-pg"),
-        "the retired phantom must heal"
+    assert_eq!(
+        rig.entries(),
+        before,
+        "an old retirement does not authorize forgetting an adopted record without approval"
     );
-    assert_eq!(rig.fake.writes(), writes, "healing never writes to Incus");
-    rig.call("service_create", json!({"name":"pg","template":"pg"}))
-        .expect("name is free again");
-    assert_eq!(rig.service_config("pg").ipv4, address.as_str().unwrap());
+    assert_eq!(rig.fake.writes(), writes);
 }
 
 #[test]

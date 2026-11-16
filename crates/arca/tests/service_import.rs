@@ -967,6 +967,66 @@ fn release_forgets_a_missing_adopted_service_in_the_managed_project() {
 }
 
 #[test]
+fn one_approved_release_clears_an_old_phantom_and_frees_its_name_and_address() {
+    let rig = Rig::new("release-phantom", vec![], json!([]));
+    fs::create_dir_all(rig.state_dir().join("templates")).unwrap();
+    fs::write(
+        rig.state_dir().join("templates/nats.json"),
+        json!({
+            "name":"nats", "kind":"oci", "image":"docker.io/library/nats",
+            "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ports":[4222], "env":{}, "publishable":false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .unwrap();
+    let mut phantom = rig
+        .node()
+        .kernel
+        .lock()
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|entry| entry.id.0 == "service-nats")
+        .unwrap()
+        .clone();
+    let address = phantom.config["ipv4"].clone();
+    rig.approved("service_remove", "nats").unwrap();
+    // The record an older build made from the stale listing after its approved removal.
+    phantom.config["adopted"] = json!(true);
+    phantom.config["source"] = json!({});
+    phantom.config["start"] = json!(false);
+    phantom.config["pool"] = json!("");
+    phantom.config["bridge"] = json!("");
+    phantom.config["autostart"] = json!(false);
+    rig.node()
+        .kernel
+        .lock()
+        .unwrap()
+        .propose(vec![arca::desired_store::EntryChange::Put(phantom)], NOW)
+        .unwrap();
+    let writes = rig.fake.writes();
+    let released = rig
+        .approved("service_release", "nats")
+        .expect("one approved release forgets the old phantom");
+    assert_eq!(
+        released,
+        json!({"released":true,"restored":false,"preImage":null,"alreadyGone":true})
+    );
+    assert!(rig.entry("service-nats").is_none());
+    assert_eq!(
+        rig.fake.writes(),
+        writes,
+        "the release writes nothing to Incus"
+    );
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("the released name can be used again");
+    assert_eq!(rig.entry("service-nats").unwrap()["ipv4"], address);
+}
+
+#[test]
 fn release_of_a_present_unlisted_instance_keeps_the_exact_refusal() {
     let mut rig = standard();
     rig.approved("service_import", "db1").unwrap();
