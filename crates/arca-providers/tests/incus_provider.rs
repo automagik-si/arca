@@ -3722,8 +3722,15 @@ fn acl_unchanged_response(reply: Vec<u8>, rules: Vec<Value>, succeeds: bool) {
         ));
     } else {
         assert!(matches!(result, Err(EffectRefusal::Provider(_))));
-        assert_eq!(last_patch.state, EffectState::Failed);
-        assert_eq!(script.count("POST"), 0, "a failed patch stops the create");
+        assert_eq!(last_patch.state, EffectState::Applied);
+        assert!(
+            matches!(&last_patch.inverse, Some(Inverse::IncusRestoreAclField {rules, ..}) if rules.is_empty())
+        );
+        assert_eq!(
+            script.count("POST"),
+            0,
+            "an uncertain patch stops the create"
+        );
     }
 }
 
@@ -3751,7 +3758,7 @@ fn acl_noop_without_operation_is_applied_and_allows_the_next_create() {
 }
 
 #[test]
-fn acl_patch_that_does_not_land_is_failed_not_left_at_intent() {
+fn acl_patch_with_an_unconfirmed_answer_keeps_its_inverse_not_an_open_intent() {
     acl_unchanged_response(
         http(200, None, &sync_env(Value::Null)),
         vec![json!({"action":"reject"})],
@@ -4500,4 +4507,222 @@ fn a_patch_whose_operation_wait_times_out_is_settled_from_read_back() {
         .expect("read-back settles the timed-out PATCH");
     assert!(journal.unresolved().is_empty());
     assert_eq!(script.count("PATCH"), 1);
+}
+
+#[test]
+fn gateway_patch_statuses_preserve_the_original_config_inverse() {
+    for status in [502, 503, 504] {
+        let script = Script::start("gateway-config", move |method, target| {
+            if method == "PATCH" {
+                return http(status, None, &error_env(status));
+            }
+            if target == OPERATIONS_PATH {
+                return http(200, None, &sync_env(json!({})));
+            }
+            object_reply(
+                &instance_meta(json!({MARK:"toy", "user.note":"before"})),
+                "\"e1\"",
+            )
+        });
+        let secrets = Scratch::new("gateway-config-secret");
+        let mut provider = script.provider(&secrets.0);
+        let target = object(IncusKind::Instance, "svc", None, "c1");
+        let op = patch(target.clone(), &[("user.note", Some("after"))]);
+        let plan = provider.plan(&entry("toy"), &op).unwrap();
+        let result = provider.effect(&entry("toy"), &op, &plan);
+        assert!(
+            matches!(result, Err(EffectRefusal::Landed(ref landed))
+            if landed.inverse == Inverse::IncusRestoreConfig {
+                object: target,
+                config: BTreeMap::from([("user.note".into(), Some("before".into()))]),
+            }),
+            "status {status}: {result:?}"
+        );
+        assert_eq!(script.count("PATCH"), 1);
+    }
+}
+
+#[test]
+fn definite_patch_statuses_with_the_pre_image_prove_the_patch_did_not_land() {
+    for status in [400, 422, 500] {
+        let script = Script::start("definite-config", move |method, _| {
+            if method == "PATCH" {
+                return http(status, None, &error_env(status));
+            }
+            object_reply(&instance_meta(json!({MARK:"toy"})), "\"e1\"")
+        });
+        let secrets = Scratch::new("definite-config-secret");
+        let mut provider = script.provider(&secrets.0);
+        let op = patch(
+            object(IncusKind::Instance, "svc", None, "c1"),
+            &[("user.note", Some("after"))],
+        );
+        let plan = provider.plan(&entry("toy"), &op).unwrap();
+        assert_eq!(
+            provider.effect(&entry("toy"), &op, &plan),
+            Err(EffectRefusal::Provider("the patch did not land".into())),
+            "status {status}"
+        );
+        assert_eq!(script.count("PATCH"), 1);
+    }
+}
+
+#[test]
+fn gateway_create_statuses_stay_unresolved_when_the_sync_object_is_absent() {
+    for status in [502, 503, 504] {
+        let script = Script::start("gateway-create", move |method, _| {
+            if method == "POST" {
+                return http(status, None, &error_env(status));
+            }
+            not_found()
+        });
+        let secrets = Scratch::new("gateway-create-secret");
+        let mut provider = script.provider(&secrets.0);
+        let op = create(
+            IncusKind::Acl,
+            "default",
+            None,
+            "gateway-acl",
+            json!({"name":"gateway-acl", "config":{}, "ingress":[], "egress":[]}),
+        );
+        let plan = provider.plan(&entry("toy"), &op).unwrap();
+        assert_eq!(
+            provider.effect(&entry("toy"), &op, &plan),
+            Err(EffectRefusal::Unresolved),
+            "status {status}"
+        );
+        assert_eq!(script.count("POST"), 1);
+    }
+}
+
+fn acl_status_pre_image(status: u16, uncertain: bool) {
+    use arca_kernel::journal::AclField;
+    let script = Script::start("acl-status", move |method, target| {
+        if method == "PATCH" {
+            return http(status, None, &error_env(status));
+        }
+        if target == OPERATIONS_PATH {
+            return http(200, None, &sync_env(json!({})));
+        }
+        object_reply(
+            &json!({"name":"own", "config":{MARK:"toy"}, "ingress":[{"action":"reject"}], "egress":[]}),
+            "\"e1\"",
+        )
+    });
+    let secrets = Scratch::new("acl-status-secret");
+    let mut provider = script.provider(&secrets.0);
+    let path = secrets.0.join("journal.jsonl");
+    let mut journal = Journal::open(FileJournal::open(&path).unwrap()).unwrap();
+    let target = object(IncusKind::Acl, "default", None, "own");
+    let op = EffectOp::IncusPatchAclField {
+        object: target.clone(),
+        field: AclField::Ingress,
+        rules: vec![json!({"action":"allow"})],
+    };
+    let result = Ctx::new(
+        entry("toy"),
+        &manifest_with_default(),
+        &mut provider,
+        &mut journal,
+        1,
+    )
+    .effect(op);
+    assert!(journal.unresolved().is_empty());
+    drop(journal);
+    let (records, _) = FileJournal::open(&path).unwrap().load().unwrap();
+    let last = records.last().unwrap();
+    if uncertain {
+        assert!(
+            matches!(result, Err(EffectRefusal::Provider(ref why)) if why.contains("may have landed")),
+            "status {status}: {result:?}"
+        );
+        assert_eq!(last.state, EffectState::Applied);
+        assert_eq!(
+            last.inverse,
+            Some(Inverse::IncusRestoreAclField {
+                object: target,
+                field: AclField::Ingress,
+                rules: vec![json!({"action":"reject"})]
+            })
+        );
+    } else {
+        assert_eq!(
+            result,
+            Err(EffectRefusal::Provider(
+                "the ACL array patch did not land".into()
+            ))
+        );
+        assert_eq!(last.state, EffectState::Failed);
+    }
+    assert_eq!(script.count("PATCH"), 1);
+}
+
+#[test]
+fn gateway_acl_patch_statuses_journal_the_original_rules_as_may_have_landed() {
+    for status in [502, 503, 504] {
+        acl_status_pre_image(status, true);
+    }
+}
+
+#[test]
+fn definite_acl_patch_statuses_with_the_pre_image_are_failed() {
+    for status in [400, 422, 500] {
+        acl_status_pre_image(status, false);
+    }
+}
+
+#[test]
+fn a_live_acl_patch_landing_after_the_next_get_keeps_its_original_inverse() {
+    use arca_kernel::journal::AclField;
+    let (scratch, fake) = start("acl-late");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let target = make_acl(&mut provider, "late-acl");
+    let path = scratch.0.join("journal.jsonl");
+    let mut journal = Journal::open(FileJournal::open(&path).unwrap()).unwrap();
+    let op = EffectOp::IncusPatchAclField {
+        object: target.clone(),
+        field: AclField::Ingress,
+        rules: vec![json!({"action":"allow"})],
+    };
+    fake.patch_after_next_get("/1.0/network-acls/late-acl?project=default");
+    let result = Ctx::new(
+        entry("toy"),
+        &manifest_with_default(),
+        &mut provider,
+        &mut journal,
+        1,
+    )
+    .effect(op.clone());
+    assert!(
+        matches!(result, Err(EffectRefusal::Provider(ref why)) if why.contains("may have landed")),
+        "{result:?}"
+    );
+    assert!(journal.unresolved().is_empty());
+    let original = Inverse::IncusRestoreAclField {
+        object: target.clone(),
+        field: AclField::Ingress,
+        rules: vec![json!({"action":"reject"})],
+    };
+    assert_eq!(journal.live(&entry("toy"))[0].inverse, Some(original));
+    assert_eq!(
+        read(&fake, "/1.0/network-acls/late-acl?project=default")["ingress"],
+        json!([{"action":"allow"}])
+    );
+    Ctx::new(
+        entry("toy"),
+        &manifest_with_default(),
+        &mut provider,
+        &mut journal,
+        2,
+    )
+    .effect(op)
+    .unwrap();
+    assert_eq!(journal.live(&entry("toy")).len(), 2);
+    assert_eq!(
+        fake.writes().iter().filter(|w| w.method == "PATCH").count(),
+        2
+    );
+    drop(journal);
+    let (records, _) = FileJournal::open(&path).unwrap().load().unwrap();
+    assert_eq!(records[1].state, EffectState::Applied);
 }
