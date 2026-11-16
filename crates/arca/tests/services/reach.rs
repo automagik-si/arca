@@ -20,7 +20,7 @@ fn rig() -> (Rig, common::SkKey) {
         Some(&key),
     );
     arca::cmd_templates::install_into(&rig.dir.join("templates"), false).unwrap();
-    rig.template("edge", json!({"name":"edge","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[443],"env":{},"lan":{"port":443},"edge":true,"provides":{"ARCA_EDGE_TARGET":"{{address}}:{{port}}"}}));
+    rig.template("edge", json!({"name":"edge","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[443],"env":{},"lan":{"port":443},"edge":true,"provides":{"env":{"ARCA_EDGE_TARGET":"{{host}}:{{port}}"}}}));
     rig.call("service_create", json!({"name":"edge","template":"edge"}))
         .unwrap();
     (rig, key)
@@ -120,6 +120,12 @@ fn approved_connect_links_starts_and_lists_without_the_sign_in_link() {
     assert!(!made.to_string().contains(LOGIN));
     let cfg = rig.service_config("node1-ts");
     assert_eq!(cfg.links[0].to, "edge");
+    assert!(cfg.start && cfg.autostart);
+    assert_eq!(
+        rig.get(&format!("/1.0/instances/node1-ts?project={PROJECT}"))
+            .unwrap()["config"]["environment.ARCA_EDGE_TARGET"],
+        format!("{}:443", rig.service_config("edge").ipv4)
+    );
     assert_eq!(
         rig.get(&format!("/1.0/instances/node1-ts?project={PROJECT}"))
             .unwrap()["status"],
@@ -345,6 +351,19 @@ fn connector_status_is_the_only_new_exec_power_and_only_connectors_receive_it() 
         )
         .is_err()
     );
+    for name in ["edge", "plain"] {
+        assert!(
+            seam.run(
+                &target(name),
+                "doctor",
+                "reach_list",
+                &ExecCommand::ConnectorStatus,
+                &[],
+                None
+            )
+            .is_err()
+        );
+    }
     assert_private(&rig, LOGIN);
 }
 

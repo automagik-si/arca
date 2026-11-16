@@ -823,3 +823,44 @@ fn the_script_uses_the_link_target_when_the_override_is_empty_under_each_shell()
         assert!(!boot.lines().any(|line| line.starts_with("TS_AUTHKEY=")));
     }
 }
+
+#[test]
+fn keyless_first_boot_waits_ten_minutes_and_keeps_explicit_timeouts_and_state() {
+    let mut env = good();
+    env.retain(|(key, _)| *key != "TS_AUTHKEY");
+    let boot = run_in(&["/bin/sh"], &env).boot_env.unwrap();
+    assert!(boot.lines().any(|line| line == "TS_BOOT_TIMEOUT=10m"));
+    env.push(("TS_BOOT_TIMEOUT", "45s"));
+    assert!(
+        run_in(&["/bin/sh"], &env)
+            .boot_env
+            .unwrap()
+            .lines()
+            .any(|line| line == "TS_BOOT_TIMEOUT=45s")
+    );
+    env.retain(|(key, _)| *key != "TS_BOOT_TIMEOUT");
+    let kept = std::env::temp_dir().join(format!(
+        "arca-kept-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir(&kept).unwrap();
+    fs::write(kept.join("tailscaled.state"), "synthetic persisted state").unwrap();
+    env.retain(|(key, _)| *key != "TS_STATE_DIR");
+    env.push(("TS_STATE_DIR", kept.to_str().unwrap()));
+    assert!(
+        !run_in(&["/bin/sh"], &env)
+            .boot_env
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("TS_BOOT_TIMEOUT="))
+    );
+    fs::remove_dir_all(kept).unwrap();
+    assert!(
+        !run_in(&["/bin/sh"], &good())
+            .boot_env
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("TS_BOOT_TIMEOUT="))
+    );
+}

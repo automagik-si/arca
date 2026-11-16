@@ -118,6 +118,8 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "github_mint_job",
             "github_disconnect",
             "os_update",
+            "reach_connect",
+            "reach_list",
             "route_add",
             "route_remove",
             "route_list",
@@ -1945,7 +1947,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 31);
+    assert_eq!(actions.len(), 32);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));

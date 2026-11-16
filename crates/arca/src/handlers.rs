@@ -1809,6 +1809,32 @@ impl ToolHandler for ActionPropose {
                 &mut card_uses,
                 now,
             )?
+        } else if let (ActionKind::ReachConnect, Some(node)) = (action, &self.node) {
+            action.prepare(&payload, None).map_err(CallError::Invalid)?;
+            let kernel = lock(&self.kernel)?;
+            let entries = kernel.entries().to_vec();
+            let name = service_reach::connect_name(&payload, kernel.host())?;
+            drop(kernel);
+            service_reach::edge_name(&entries)?;
+            let mut create = json!({"name":name, "template":"tailscale", "start":false});
+            for key in ["image", "templateDigest"] {
+                if let Some(value) = payload.get(key) {
+                    create[key] = value.clone();
+                }
+            }
+            let bound = enrich_service_create(
+                node,
+                &entries,
+                &create,
+                &mut card_fact,
+                &mut card_uses,
+                now,
+            )?;
+            let mut payload = payload.clone();
+            payload["name"] = json!(name);
+            payload["image"] = bound["image"].clone();
+            payload["templateDigest"] = bound["templateDigest"].clone();
+            payload
         } else if let (ActionKind::PostgresCreate, Some(node)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
             enrich_postgres_create(node, &entries, &payload, &mut card_fact, &mut card_uses)?
@@ -2962,6 +2988,7 @@ impl ActionExecutor {
                 | "service_reconfigure"
                 | "service_publish"
                 | "service_import"
+                | "reach_connect"
                 | "service_release"
                 | "gpu_attach"
                 | "gpu_detach"
@@ -6001,6 +6028,8 @@ mod service_external;
 mod service_follow;
 #[path = "service_omni.rs"]
 mod service_omni;
+#[path = "service_reach.rs"]
+mod service_reach;
 #[path = "service_routes.rs"]
 mod service_routes;
 pub use service_follow::{
@@ -6092,6 +6121,8 @@ pub fn service_handlers_updating(
         "route_add",
         "route_remove",
         "route_list",
+        "reach_connect",
+        "reach_list",
     ]
     .into_iter()
     .chain(function_verbs.iter().copied())
@@ -6739,7 +6770,7 @@ fn service_live_in<'a>(rows: &'a [Value], project: &str, name: &str) -> Option<&
         .find(|row| row["name"].as_str() == Some(name) && row["project"].as_str() == Some(project))
 }
 
-fn service_entries(
+pub(crate) fn service_entries(
     entries: &[arca_kernel::desired::Entry],
 ) -> Vec<(arca_kernel::desired::Entry, crate::service::ServiceConfig)> {
     entries
@@ -7475,7 +7506,29 @@ impl ToolHandler for ServiceHandler {
                 if up { "up" } else { "down" },
             ));
         }
-        let mut answer = self.call_service(args.clone(), caller)?;
+        if self.verb == "reach_list" {
+            if caller.scope < Scope::Doctor {
+                return Err(CallError::Forbidden {
+                    verb: self.verb.into(),
+                });
+            }
+            arca_api::conforms(
+                &(arca_api::verb("reach_list")
+                    .expect("registered verb")
+                    .params)(),
+                &args,
+            )
+            .map_err(CallError::Invalid)?;
+            return Ok(
+                json!({"connectors":crate::reach::reach_rows(&self.kernel, &self.cfg, &self.exec, caller)?}),
+            );
+        }
+        let direction = if self.verb == "reach_connect" {
+            "service_create"
+        } else {
+            self.verb
+        };
+        let mut answer = self.call_service(args.clone(), caller, direction)?;
         // The list shows each recorded program as a row of its own kind, beside the services.
         if self.verb == "service_list"
             && args.get("tenant").is_none()
@@ -7494,8 +7547,14 @@ impl ToolHandler for ServiceHandler {
 }
 
 impl ServiceHandler {
-    fn call_service(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
+    fn call_service(
+        &self,
+        mut args: Value,
+        caller: &Caller,
+        direction: &str,
+    ) -> Result<Value, CallError> {
         let allowed: &[&str] = match self.verb {
+            "reach_connect" => &["kind", "name", "approval", "image", "templateDigest"],
             "service_create" => &[
                 "name",
                 "template",
@@ -7580,7 +7639,11 @@ impl ServiceHandler {
         // A publication, an import and a release act on the node and take no tenant: the field is not theirs.
         let takes_tenant = !matches!(
             self.verb,
-            "service_publish" | "service_unpublish" | "service_import" | "service_release"
+            "service_publish"
+                | "service_unpublish"
+                | "service_import"
+                | "service_release"
+                | "reach_connect"
         ) && !self.verb.starts_with("function_")
             && !self.verb.starts_with("route_");
         if let Some(key) = object
@@ -7599,6 +7662,7 @@ impl ServiceHandler {
                 | "service_update"
                 | "service_reconfigure"
                 | "service_import"
+                | "reach_connect"
                 | "service_release"
         ) && caller.scope < Scope::Doctor
         {
@@ -7644,6 +7708,7 @@ impl ServiceHandler {
                 | "service_reconfigure"
                 | "service_publish"
                 | "service_import"
+                | "reach_connect"
                 | "service_release"
                 | "function_create"
                 | "function_remove"
@@ -7655,6 +7720,20 @@ impl ServiceHandler {
                     .map(|mut kernel| kernel.consume_action_grant(self.verb, &args, grant))
                     .unwrap_or(false)
             });
+        if self.verb == "reach_connect" {
+            if !preapproved {
+                return Err(import_not_approved());
+            }
+            if args["kind"] != "tailscale" {
+                return Err(CallError::Invalid("kind: expected tailscale".into()));
+            }
+            // Consume the grant against the original reach arguments before reusing the create path.
+            let name = service_reach::connect_name(&args, lock(&self.kernel)?.host())?;
+            args.as_object_mut().expect("checked object").remove("kind");
+            args["name"] = json!(name);
+            args["template"] = json!("tailscale");
+            args["start"] = json!(false);
+        }
         let _publish = matches!(
             self.verb,
             "service_publish" | "service_unpublish" | "service_remove"
@@ -7667,6 +7746,7 @@ impl ServiceHandler {
                 | "service_disconnect"
                 | "service_secret_set"
                 | "service_import"
+                | "reach_connect"
                 | "service_release"
                 | "function_create"
                 | "function_secret_set"
@@ -7730,7 +7810,7 @@ impl ServiceHandler {
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
         let subject = read_subject(self.verb, &args);
         // Only a create needs an instance's live state: the addresses and the interfaces that are in no record.
-        let picks_an_address = matches!(self.verb, "service_create" | "function_create");
+        let picks_an_address = matches!(direction, "service_create" | "function_create");
         let rows = service_listing(
             &read,
             None,
@@ -7815,7 +7895,7 @@ impl ServiceHandler {
                 preapproved,
             );
         }
-        match self.verb {
+        match direction {
             "service_list" => {
                 let mut views = Vec::new();
                 let records = service_entries(&entries);
@@ -8055,6 +8135,11 @@ impl ServiceHandler {
                 }
                 // A PEM block is hidden whole before the log is cut into lines: cut first, its lines are no longer
                 // one block. Each line is then cleaned and hidden again, a secret of several lines line by line.
+                let text = if crate::reach::kind(&self.cfg, &config).is_some() {
+                    crate::reach::redact_login_links(&text)
+                } else {
+                    text
+                };
                 let text = crate::service::redact_blocks(&text);
                 let hidden = crate::service::values_to_hide(&secrets);
                 let mut lines_out = Vec::new();
@@ -8268,6 +8353,9 @@ impl ServiceHandler {
                 }))
             }
             "service_create" => {
+                if self.verb == "reach_connect" {
+                    service_reach::edge_name(&entries)?;
+                }
                 let name = service_name(&args)?;
                 let template_name = args["template"]
                     .as_str()
@@ -8691,6 +8779,9 @@ impl ServiceHandler {
                 if tenant.is_none() && front == Some(name.as_str()) {
                     // This create holds the write gate already.
                     let _ = tenants::sync_front_held(&self.kernel, &self.cfg, now);
+                }
+                if self.verb == "reach_connect" {
+                    return self.finish_reach(&name, caller, now, template.autostart);
                 }
                 Ok(made)
             }

@@ -56,6 +56,7 @@ pub mod move_preflight;
 pub mod omni;
 mod passkey_change;
 pub mod peer_sync;
+pub(crate) mod reach;
 pub mod registry;
 pub mod route;
 pub mod runners;

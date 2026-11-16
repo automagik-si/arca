@@ -29,6 +29,12 @@ set -eu
 SERVE_DIR=${ARCA_TS_SERVE_DIR:-/tmp/arca-tailscale}
 KEY_DIR=${ARCA_TS_KEY_DIR:-/run/arca-tailscale}
 BOOT=${ARCA_TS_CONTAINERBOOT:-/usr/local/bin/containerboot}
+# The owner taps sign-in just after approving: keep an unclaimed link open briefly. A restart retries it.
+SIGN_IN_BOOT_TIMEOUT=10m
+if [ -z "${TS_AUTHKEY:-}" ] && [ ! -s "${TS_STATE_DIR:-/data}/tailscaled.state" ]; then
+  TS_BOOT_TIMEOUT=${TS_BOOT_TIMEOUT-$SIGN_IN_BOOT_TIMEOUT}
+  export TS_BOOT_TIMEOUT
+fi
 
 TARGET=${TS_TARGET:-${ARCA_EDGE_TARGET:-}}
 if [ -z "$TARGET" ]; then

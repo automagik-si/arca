@@ -333,7 +333,13 @@ impl ServiceHandler {
         preapproved: bool,
     ) -> Result<Value, CallError> {
         if matches!(self.verb, "service_connect" | "service_disconnect") {
-            return self.link(args, caller, entries, now);
+            return self.link(
+                args,
+                caller,
+                entries,
+                now,
+                self.verb == "service_disconnect",
+            );
         }
         let name = service_name(args)?;
         let (entry, mut cfg) = record(entries, &name)?;
@@ -468,12 +474,13 @@ impl ServiceHandler {
     }
     /// `service_connect` and `service_disconnect`. When the provider is an edge, its Caddyfile is written again after
     /// the link changed, so it allows the PROXY header from the services linked to it ([`crate::route::caddyfile`]).
-    fn link(
+    pub(super) fn link(
         &self,
         args: &Value,
         caller: &Caller,
         entries: &[Entry],
         now: u64,
+        disconnect: bool,
     ) -> Result<Value, CallError> {
         let from = arg_name(args, "from")?;
         let to = arg_name(args, "to")?;
@@ -516,7 +523,7 @@ impl ServiceHandler {
             }
             answer
         };
-        if self.verb == "service_disconnect" {
+        if disconnect {
             let names = consumer
                 .links
                 .iter()
