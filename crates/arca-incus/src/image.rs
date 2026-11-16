@@ -8,6 +8,9 @@ use arca_kernel::{desired::EntryId, ownership::tenant_of_project};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
+/// The one source store for this closed writer.
+pub const SOURCE_PROJECT: &str = "arcak-svc";
+
 pub struct ImageWriter {
     socket: PathBuf,
     project: String,
@@ -117,51 +120,32 @@ impl ImageWriter {
 
     pub fn copy(&self, properties: &Value) -> Result<Option<String>, IncusError> {
         self.send("POST", &format!("/1.0/images?project={}", self.project), Some(&json!({
-            "source": { "type": "image", "fingerprint": self.fingerprint, "project": "arcak-svc" },
+            "source": { "type": "image", "fingerprint": self.fingerprint, "project": SOURCE_PROJECT },
             "properties": properties, "profiles": [], "public": false, "auto_update": false
         })))
     }
 
     pub fn set_properties(&self, properties: &Value) -> Result<Option<String>, IncusError> {
-        self.send("PUT", &format!("/1.0/images/{}?project={}", self.fingerprint, self.project),
-            Some(&json!({ "properties": properties, "profiles": [], "public": false, "auto_update": false })))
+        let image = self
+            .image()?
+            .ok_or_else(|| IncusError::Refused("image missing".into()))?;
+        // PUT replaces these fields too; approval changes only the property map.
+        let body = json!({ "properties": properties,
+            "public": image["public"].as_bool().unwrap_or(false),
+            "auto_update": image["auto_update"].as_bool().unwrap_or(false),
+            "profiles": image.get("profiles").cloned().unwrap_or(json!([])) });
+        self.send(
+            "PUT",
+            &format!("/1.0/images/{}?project={}", self.fingerprint, self.project),
+            Some(&body),
+        )
     }
 
-    pub fn add_alias(&self, mark: &str) -> Result<Option<String>, IncusError> {
+    pub fn add_alias(&self) -> Result<Option<String>, IncusError> {
         self.send(
             "POST",
             &format!("/1.0/images/aliases?project={}", self.project),
-            Some(&json!({ "name": self.alias, "target": self.fingerprint, "description": mark })),
-        )
-    }
-
-    pub fn delete_alias(&self, mark: &str) -> Result<Option<String>, IncusError> {
-        let Some(alias) = self.alias()? else {
-            return Ok(None);
-        };
-        if alias["name"] != self.alias
-            || alias["target"] != self.fingerprint
-            || alias["description"] != mark
-        {
-            return Err(IncusError::Refused(
-                "the imported alias changed; it was kept".into(),
-            ));
-        }
-        self.send(
-            "DELETE",
-            &format!(
-                "/1.0/images/aliases/{}?project={}",
-                self.alias, self.project
-            ),
-            None,
-        )
-    }
-
-    pub fn delete_image(&self) -> Result<Option<String>, IncusError> {
-        self.send(
-            "DELETE",
-            &format!("/1.0/images/{}?project={}", self.fingerprint, self.project),
-            None,
+            Some(&json!({ "name": self.alias, "target": self.fingerprint })),
         )
     }
 }

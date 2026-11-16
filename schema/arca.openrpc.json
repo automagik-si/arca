@@ -3651,7 +3651,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The args of tenant_image_import: Copy an image already in the node's own store by its full fingerprint into one tenant, including its source properties, and set a new alias. Runs only from an approved proposal; existing content is not replaced. Example: {\"alias\":\"app\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tenant\":\"abcdefgh\"}",
+                "description": "The args of tenant_image_import: Import an image from the node's own store by full fingerprint, only through an approved proposal. The card binds the source, tenant incarnation and destination image properties and alias. It may explicitly approve replacing different destination properties. Success kinds: imported, completed, alreadyPresent; imageWrite and aliasWrite say which write requests were issued. Refusals: NotApproved, StaleCard, AliasTaken, SourceMissing, PartialImport, ImportFailed; their closed data schema is result.schema.x-arca-refusal-data. Completed steps stay in the tenant's store: no import record, rollback or deletion. Example: {\"alias\":\"app\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tenant\":\"abcdefgh\"}",
                 "examples": [
                   {
                     "alias": "app",
@@ -3664,6 +3664,9 @@
                     "maxLength": 128,
                     "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
                     "type": "string"
+                  },
+                  "destination": {
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
                   },
                   "fingerprint": {
                     "pattern": "^[0-9a-f]{64}$",
@@ -11516,6 +11519,45 @@
           }
         },
         {
+          "name": "destination",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "properties": {
+              "aliasTarget": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "absent",
+                  "sameProperties",
+                  "differentProperties"
+                ],
+                "type": "string"
+              },
+              "properties": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "properties",
+              "aliasTarget"
+            ],
+            "type": "object"
+          }
+        },
+        {
           "name": "project",
           "required": false,
           "schema": {
@@ -11544,15 +11586,29 @@
       "result": {
         "name": "result",
         "schema": {
+          "additionalProperties": false,
           "properties": {
             "alias": {
               "type": "string"
             },
+            "aliasWrite": {
+              "description": "This run issued an alias-create request.",
+              "type": "boolean"
+            },
             "fingerprint": {
               "type": "string"
             },
-            "imported": {
+            "imageWrite": {
+              "description": "This run issued an image copy or property-write request.",
               "type": "boolean"
+            },
+            "kind": {
+              "enum": [
+                "imported",
+                "completed",
+                "alreadyPresent"
+              ],
+              "type": "string"
             },
             "project": {
               "type": "string"
@@ -11568,12 +11624,93 @@
             "project",
             "fingerprint",
             "alias",
-            "imported"
+            "kind",
+            "imageWrite",
+            "aliasWrite"
           ],
-          "type": "object"
+          "type": "object",
+          "x-arca-refusal-data": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "refusal": {
+                    "const": "NotApproved"
+                  }
+                },
+                "required": [
+                  "refusal"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "aliasState": {
+                    "enum": [
+                      "absent",
+                      "matching",
+                      "taken",
+                      "unknown"
+                    ],
+                    "type": "string"
+                  },
+                  "aliasTarget": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "aliasWrite": {
+                    "type": "boolean"
+                  },
+                  "fingerprint": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "imageState": {
+                    "enum": [
+                      "absent",
+                      "present",
+                      "unknown"
+                    ],
+                    "type": "string"
+                  },
+                  "imageWrite": {
+                    "type": "boolean"
+                  },
+                  "properties": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "proposeAgain": {
+                    "const": true
+                  },
+                  "refusal": {
+                    "enum": [
+                      "StaleCard",
+                      "AliasTaken",
+                      "SourceMissing",
+                      "PartialImport",
+                      "ImportFailed"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "refusal",
+                  "imageState",
+                  "aliasState",
+                  "imageWrite",
+                  "aliasWrite"
+                ],
+                "type": "object"
+              }
+            ]
+          }
         }
       },
-      "summary": "Copy an image already in the node's own store by its full fingerprint into one tenant, including its source properties, and set a new alias. Runs only from an approved proposal; existing content is not replaced.",
+      "summary": "Import an image from the node's own store by full fingerprint, only through an approved proposal. The card binds the source, tenant incarnation and destination image properties and alias. It may explicitly approve replacing different destination properties. Success kinds: imported, completed, alreadyPresent; imageWrite and aliasWrite say which write requests were issued. Refusals: NotApproved, StaleCard, AliasTaken, SourceMissing, PartialImport, ImportFailed; their closed data schema is result.schema.x-arca-refusal-data. Completed steps stay in the tenant's store: no import record, rollback or deletion.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

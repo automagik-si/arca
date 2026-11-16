@@ -1049,7 +1049,7 @@ static VERBS: [Verb; 95] = [
     },
     Verb {
         name: "tenant_image_import",
-        summary: "Copy an image already in the node's own store by its full fingerprint into one tenant, including its source properties, and set a new alias. Runs only from an approved proposal; existing content is not replaced.",
+        summary: "Import an image from the node's own store by full fingerprint, only through an approved proposal. The card binds the source, tenant incarnation and destination image properties and alias. It may explicitly approve replacing different destination properties. Success kinds: imported, completed, alreadyPresent; imageWrite and aliasWrite say which write requests were issued. Refusals: NotApproved, StaleCard, AliasTaken, SourceMissing, PartialImport, ImportFailed; their closed data schema is result.schema.x-arca-refusal-data. Completed steps stay in the tenant's store: no import record, rollback or deletion.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -4416,7 +4416,7 @@ fn action_propose_params() -> Value {
 pub const KERNEL_FILLED: [(&str, &[&str]); 8] = [
     (
         "tenant_image_import",
-        &["project", "tenantIncarnation", "properties"],
+        &["project", "tenantIncarnation", "properties", "destination"],
     ),
     ("service_reconfigure", &["changes"]),
     ("service_update", &["changes"]),
@@ -6933,6 +6933,27 @@ fn tenant_image_import_params() -> Value {
             json!({ "type": "string", "minLength": 1, "maxLength": 16384,
             "description": "The one-shot grant of an approved proposal. Without it the verb returns NotApproved." }),
         ),
+        (
+            "destination",
+            false,
+            params(vec![
+                (
+                    "kind",
+                    true,
+                    one_of(&["absent", "sameProperties", "differentProperties"]),
+                ),
+                (
+                    "properties",
+                    true,
+                    json!({ "type": ["object", "null"], "additionalProperties": { "type": "string" } }),
+                ),
+                (
+                    "aliasTarget",
+                    true,
+                    json!({ "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }),
+                ),
+            ]),
+        ),
         ("project", false, string()),
         (
             "tenantIncarnation",
@@ -6948,19 +6969,49 @@ fn tenant_image_import_params() -> Value {
 }
 
 fn tenant_image_import_result() -> Value {
-    result(vec![
+    let mut schema = params(vec![
         ("tenant", true, tenant_id_schema()),
         ("project", true, string()),
         ("fingerprint", true, string()),
         ("alias", true, string()),
-        ("imported", true, boolean()),
-    ])
+        (
+            "kind",
+            true,
+            one_of(&["imported", "completed", "alreadyPresent"]),
+        ),
+        (
+            "imageWrite",
+            true,
+            json!({ "type": "boolean", "description": "This run issued an image copy or property-write request." }),
+        ),
+        (
+            "aliasWrite",
+            true,
+            json!({ "type": "boolean", "description": "This run issued an alias-create request." }),
+        ),
+    ]);
+    schema["x-arca-refusal-data"] = json!({ "anyOf": [
+        params(vec![("refusal", true, json!({ "const": "NotApproved" }))]),
+        params(vec![
+            ("refusal", true, one_of(&["StaleCard", "AliasTaken", "SourceMissing", "PartialImport", "ImportFailed"])),
+            ("imageState", true, one_of(&["absent", "present", "unknown"])),
+            ("aliasState", true, one_of(&["absent", "matching", "taken", "unknown"])),
+            ("imageWrite", true, boolean()),
+            ("aliasWrite", true, boolean()),
+            ("fingerprint", false, json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" })),
+            ("properties", false, json!({ "type": "object", "additionalProperties": { "type": "string" } })),
+            ("aliasTarget", false, json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" })),
+            ("proposeAgain", false, json!({ "const": true })),
+        ]),
+    ] });
+    schema
 }
 
 pub fn summary_tenant_image_import(result: &Value) -> String {
-    if result["imported"] == true {
-        "Image imported into the tenant's store".into()
-    } else {
-        "Image and alias already present in the tenant's store".into()
+    match result["kind"].as_str() {
+        Some("imported") => "Image imported into the tenant's store",
+        Some("completed") => "Image import completed from the approved destination state",
+        _ => "Image and alias already present in the tenant's store",
     }
+    .into()
 }

@@ -4,11 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
-`tenant_image_import` copies a full-fingerprint image already in the node's store into a tenant and adds its alias,
-only from an approved owner card. The card binds the tenant incarnation, image and database properties; the copy
-retains properties set after publication. Repeated imports send no Incus writes. A durable record precedes each
-write and limits failure cleanup to this action's additions, retaining images that may be needed by a container
-or rollback. No image file or remote fetch is accepted. See docs/OPERATING.md.
+`tenant_image_import` uses an approved card to copy an exact image from the node's store into a tenant and add its
+alias. The card binds source properties and the destination's exact properties and alias state, and shows any
+property replacement explicitly. Completed steps stay in the tenant's store after failure; a new card can finish
+them. There is no import record, automatic rollback or delete. Success and refusal outcomes have closed schemas.
+Repeated completed imports send no Incus writes. No file or remote fetch is accepted. See docs/OPERATING.md.
 
 ## 0.34.0 (2026-11-16)
 

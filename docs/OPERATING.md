@@ -7364,31 +7364,40 @@ arca-gitlab-pool: totals jobs_now=3 of 6 jobs_done=161 jobs_failed=12 runners=2 
 
 ## Tenants
 
-**Importing a pinned image.** `tenant_image_import {tenant, fingerprint, alias}` copies an image already held in
-the node's own `arcak-svc` image store into an existing tenant's own store, then adds the alias. `fingerprint` is
-the full 64 lowercase hex digits Incus uses, without `sha256:`. The alias is 1-128 letters, digits, dots,
-underscores or dashes, starting with a letter or digit. Arca fetches nothing and accepts no file or source project.
+**Importing a pinned image.** `tenant_image_import {tenant, fingerprint, alias}` uses an image already in the
+node's own `arcak-svc` store, by its full 64 lowercase hex fingerprint without `sha256:`. It accepts no file,
+remote or source project. The alias starts with a letter or digit and has at most 128 letters, digits, dots,
+underscores or dashes. A template may then use `local:<alias>` with its `sha256:<fingerprint>` pin.
 
-This verb runs only from an approved proposal (`action_propose` and the owner's card). A direct call without its
-one-shot grant answers `NotApproved`. The card binds the fingerprint, alias, tenant project and the creation
-record that identifies this incarnation of the tenant. It also shows and binds the source image's properties:
-properties set after publication live in Incus's database and are not covered by the image fingerprint. Arca
-checks all of these again before writing anything. A tenant recreated since the proposal, changed source
-properties or an alias now taken by another fingerprint requires a new proposal.
+Only the owner's approved proposal can run it; a direct call has no one-shot grant and answers `NotApproved`.
+The card binds the source properties, tenant project and creation incarnation, and the destination snapshot:
+`destination.kind` is `absent`, `sameProperties` or `differentProperties`, with the exact existing property map
+and alias target. For different properties, the card shows both maps and explicitly says approving replaces the
+old map. The run checks all of this again immediately before its first write; a changed destination, source or
+tenant answers `StaleCard` without a write. Each later write rechecks the expected state after this run's own steps.
 
-The copy request carries the source properties explicitly. Arca reads them back and, for a newly copied image,
-sets them to the approved map if Incus reused extra database properties from another copy. A pre-existing tenant
-copy with different properties is refused rather than changed. If the same image, properties and alias are
-already there, the import succeeds with `imported: false` and sends no Incus write. A new alias can name an existing
-matching image. A container template can then use `local:<alias>` with its `sha256:<fingerprint>` pin as usual.
+Absent means copy by the exact fingerprint, then read back. Incus reuses a database record from the earliest
+project holding that fingerprint (`default` first), then merges request properties. Extra properties can survive
+that merge, so this run sets the approved map and reads it back when needed. A pre-existing destination is never
+changed blindly: equal properties need no image write; different properties require the replacement shown on the
+card. Incus has no create-only copy: an out-of-band hand copy of the same fingerprint between the final read and
+POST may be reused and its metadata changed. Avoid concurrent out-of-band writes while an import runs.
 
-`tenant-image-imports.jsonl` in the state directory is a private, fsynced import record. Each Incus copy, property
-write, alias create or inverse has an intent before its request, its operation ID when asynchronous, and a
-read-back outcome. Failure undoes only additions attributable to that action: the source store and pre-existing
-tenant content are kept. A copied image is conservatively retained when the tenant has a service or live instance,
-another alias, or a service-update history pin that may need it for rollback; the refusal reports incomplete
-cleanup. An unreadable operation is settled before an inverse is attempted. After a restart, another approved
-import settles unfinished records in the same tenant incarnation, and a completed copy and alias need no write.
+An absent alias is created and read back. One already pointing at this fingerprint needs no write. One pointing
+elsewhere answers `AliasTaken` and is never replaced; an image copied before that conflict stays in the store.
+This verb creates no import record and never deletes an image or alias. A crash or failure leaves completed
+steps in place. A failed approved run spends its card: propose and approve again. The new card shows exactly what
+is there, including different properties left by a failed corrective write, and can complete it safely. Images
+belong to the tenant by containment and are removed only with the tenant (OWNERSHIP.md, Rules 42 and 78).
+
+Success `kind` is `imported` (copied), `completed` (finished from an existing image), or `alreadyPresent` (no write).
+`imageWrite` and `aliasWrite` say which write requests this run issued. Import refusals have closed codes
+`StaleCard`, `AliasTaken`, `SourceMissing`, `PartialImport` and `ImportFailed` (plus the approval gate's
+`NotApproved`). Their error data schema is the result schema's `x-arca-refusal-data` in OpenRPC. `imageState`
+is `absent`, `present` or `unknown`; `aliasState` is `absent`, `matching`, `taken` or `unknown`. Known image
+properties, fingerprint and alias target are included. `PartialImport` means an image remains after a failed write;
+unknown observations are reported as unknown. `proposeAgain: true` means the approval was spent. A repeat whose
+image properties and alias already match sends no Incus write.
 
 A node may hold tenants: each is one restricted Incus project of its own, on the node's managed service network, with its
 own caps and its own block of addresses. The node's own project, `arcak-svc`, stays the node owner's. The rules are 61 to

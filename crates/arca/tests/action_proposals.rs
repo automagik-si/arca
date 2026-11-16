@@ -325,7 +325,8 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             ActionKind::TenantImageImport => {
                 json!({ "tenant": "abcdefgh", "project": "arcak-t-abcdefgh",
                 "fingerprint": "c".repeat(64), "alias": "app", "tenantIncarnation": "3",
-                "properties": { "type": "app", "architecture": "x86_64" } })
+                "properties": { "type": "app", "architecture": "x86_64" },
+                "destination": { "kind": "absent", "properties": null, "aliasTarget": null } })
             }
             ActionKind::DeployRemove => json!({ "tenant": "abcdefgh", "deploy": "d1" }),
             ActionKind::ServicePublish => json!({ "name": "nats", "reach": "tailnet" }),
@@ -684,6 +685,8 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     "Tenant incarnation",
                     "Alias",
                     "Source properties",
+                    "Destination image",
+                    "Destination alias",
                     "Effect",
                     "Tenant"
                 ]
@@ -696,7 +699,9 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 serde_json::from_str::<Value>(&details[4].value).unwrap(),
                 prepared["properties"]
             );
-            assert_eq!(details[6].value, "abcdefgh");
+            assert!(details[5].value.contains("does not have this image"));
+            assert!(details[6].value.contains("alias is absent"));
+            assert_eq!(details[8].value, "abcdefgh");
             assert!(
                 action.params_schema()["properties"]
                     .as_object()
@@ -708,7 +713,8 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                         "fingerprint",
                         "alias",
                         "tenantIncarnation",
-                        "properties"
+                        "properties",
+                        "destination"
                     ]
                     .contains(&field.as_str()))
             );

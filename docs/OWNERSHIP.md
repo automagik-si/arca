@@ -489,7 +489,7 @@ in `crates/arca-incus/tests/adopt.rs`.
 ## Images in a kernel project
 
 **Rule 42.** An image carries no mark. An image in a kernel project's own store is the project's by containment: only a write into
-the project puts one there (an instance the kernel makes from the image server, or a copy by hand), and it goes with the project.
+the project puts one there (an instance the kernel makes from the image server, an approved `tenant_image_import`, or a copy by hand), and it goes with the project.
 A project's DELETE is preceded, in the writer, by the DELETE of each image in its own store: the project must be the entry's own and
 carry its tombstone (Rule 18), its own config must set `features.images` to `"true"`, the listing is
 `/1.0/images?project=<project>&recursion=1`, each image must name a plain fingerprint, and an image whose `project` names another
@@ -1696,6 +1696,19 @@ writer classes such a machine as foreign and never writes it (Rules 2 and 3). Th
 Source: `RunnerVms` and `RUNNER_KEY` in `crates/arca-incus/src/runner_vm.rs`; test
 `a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go` in `crates/arca-runners/tests/incus_launcher.rs`;
 `crates/arca-runners/Cargo.toml`.
+
+## Approved image imports
+
+**Rule 78.** `tenant_image_import` is an approved action into one existing tenant's own image store, from the node's
+own store by full fingerprint. Its closed writer only copies that fingerprint, sets image properties and creates
+its alias in a tenant project; it never deletes an image or an alias. The card binds the source properties, tenant
+incarnation, destination's exact properties and alias state. A property replacement is permitted only as the card
+showed it; the destination is re-read before writing. The copy API's out-of-band race is described in OPERATING.md.
+The import is not journalled as an effect: it adds content-addressed data, has no inverse and leaves completed
+steps in place on failure. A new approval can complete them from a new destination snapshot. Images belong to
+the tenant by containment and Arca removes them only with the tenant, through Rule 42.
+Source: `ImageWriter` in `crates/arca-incus/src/image.rs`, `tenant_images` in `crates/arca/src/tenant_images.rs`;
+tests in `crates/arca/tests/tenants/image_import.rs`.
 
 ## Out of scope
 

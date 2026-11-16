@@ -2737,6 +2737,13 @@ fn put(
         return write_project(shared, store, index, &body, true);
     }
     if store.objects[index].kind == "image" {
+        if images::failure(shared, "properties") {
+            return (
+                500,
+                String::new(),
+                error_envelope(500, "property write failed"),
+            );
+        }
         let properties = body.get("properties").cloned().unwrap_or(json!({}));
         if !properties
             .as_object()

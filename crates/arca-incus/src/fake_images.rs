@@ -5,7 +5,7 @@ type Reply = (u16, String, Value);
 fn bad(code: u16, text: &str) -> Reply {
     (code, String::new(), error_envelope(code, text))
 }
-fn failure(shared: &Shared, step: &str) -> bool {
+pub(super) fn failure(shared: &Shared, step: &str) -> bool {
     let mut held = lock(&shared.image_failure);
     if held.as_deref() != Some(step) {
         return false;
@@ -47,39 +47,50 @@ pub(super) fn copy(
             Err((400, "copy failed".into())),
         );
     }
-    // Incus reuses a database image from any visible project and carries its database-only properties.
-    let Some(original) = store
-        .objects
-        .iter()
-        .find(|o| o.kind == "image" && o.name == source["fingerprint"])
-        .cloned()
-    else {
-        return bad(404, "source image missing");
-    };
-    if store.image_store(&address.project).is_none() {
+    let Some(home) = store.image_store(&address.project) else {
         return bad(404, "project missing");
-    }
-    let fingerprint = original.name.clone();
+    };
+    let fingerprint = source["fingerprint"].as_str().unwrap().to_string();
     let target = Address {
         kind: "image",
-        project: address.project.clone(),
+        project: home.clone(),
         parent: String::new(),
         name: fingerprint.clone(),
     };
     let index = match store.find(&target) {
         Some(index) => index,
         None => {
+            // Incus orders by projects.id: default first, then project creation order, not image insertion order.
+            let Some(original) = store
+                .objects
+                .iter()
+                .filter(|object| object.kind == "image" && object.name == fingerprint)
+                .min_by_key(|object| {
+                    if object.project == DEFAULT_PROJECT {
+                        0
+                    } else {
+                        store
+                            .objects
+                            .iter()
+                            .filter(|row| row.kind == "project")
+                            .position(|project| project.name == object.project)
+                            .map_or(usize::MAX, |index| index + 1)
+                    }
+                })
+                .cloned()
+            else {
+                return bad(404, "source image missing");
+            };
             let mut image = original.body.clone();
-            image["project"] = json!(address.project);
+            image["project"] = json!(home);
             image["aliases"] = json!([]);
             image["cached"] = json!(false);
-            image["auto_update"] = json!(false);
             image["public"] = json!(false);
             image["profiles"] = json!([]);
             image["update_source"] = Value::Null;
             store.objects.push(Stored {
                 kind: "image".into(),
-                project: address.project.clone(),
+                project: home,
                 parent: String::new(),
                 name: fingerprint,
                 body: image,
@@ -97,6 +108,23 @@ pub(super) fn copy(
         properties.extend(sent.clone());
     }
     store.objects[index].body["properties"] = Value::Object(properties);
+    // imgPostRemoteInfo updates metadata only when one of these request fields is nonempty.
+    // Otherwise auto_update, filename and expires_at remain inherited from the reused record.
+    if body["public"] == true
+        || body["auto_update"] == true
+        || body["filename"].as_str().is_some_and(|s| !s.is_empty())
+        || body["properties"]
+            .as_object()
+            .is_some_and(|p| !p.is_empty())
+        || body["profiles"].as_array().is_some_and(|p| !p.is_empty())
+    {
+        for key in ["public", "auto_update"] {
+            store.objects[index].body[key] = body.get(key).cloned().unwrap_or(json!(false));
+        }
+        store.objects[index].body["filename"] = json!(body["filename"].as_str().unwrap_or(""));
+        store.objects[index].body["profiles"] =
+            body.get("profiles").cloned().unwrap_or(json!(["default"]));
+    }
     let outcome = if failure(shared, "copy_after") {
         Err((400, "copy failed after creating its database entry".into()))
     } else {
@@ -145,6 +173,20 @@ pub(super) fn aliases(
         "POST" => {
             if held.is_some() {
                 return bad(409, "alias already exists");
+            }
+            if failure(shared, "alias_taken") {
+                let Some(index) = store.objects.iter().position(|object| {
+                    object.kind == "image"
+                        && object.project == home
+                        && object.name != parsed["target"]
+                }) else {
+                    return bad(404, "conflicting image missing");
+                };
+                store.objects[index].body["aliases"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({ "name": name }));
+                return bad(409, "alias was taken by another writer");
             }
             if failure(shared, "alias") {
                 return bad(500, "alias creation failed");

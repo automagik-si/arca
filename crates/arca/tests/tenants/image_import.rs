@@ -223,7 +223,12 @@ fn image_import_replaces_different_properties_only_as_shown_on_the_card() {
     set_properties(&rig, &fingerprint, json!({ "type": "approved" }));
     native_copy(&rig, &project(A), &fingerprint);
     let old = json!({ "type": "previous", "custom": "kept until approved" });
-    put_properties(&rig, &project(A), &fingerprint, old.clone());
+    image_request(
+        &rig,
+        "PUT",
+        &format!("/1.0/images/{fingerprint}?project={}", project(A)),
+        json!({ "properties": old, "public": true, "auto_update": true, "profiles": ["default"] }),
+    );
     let before = rig.fake().writes().len();
     let card = proposal(&rig, args(&fingerprint)).unwrap();
     assert_eq!(card["args"]["destination"]["kind"], "differentProperties");
@@ -235,6 +240,10 @@ fn image_import_replaces_different_properties_only_as_shown_on_the_card() {
     let done = approve(&rig, &card).unwrap();
     assert_eq!(done["kind"], "completed");
     assert_eq!(done["imageWrite"], true);
+    let found = target(&rig, &fingerprint).unwrap();
+    assert_eq!(found["public"], true);
+    assert_eq!(found["auto_update"], true);
+    assert_eq!(found["profiles"], json!(["default"]));
     assert_eq!(
         target(&rig, &fingerprint).unwrap()["properties"],
         json!({ "type": "approved" })
