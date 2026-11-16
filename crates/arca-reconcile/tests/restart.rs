@@ -119,6 +119,221 @@ impl Plugin for Patcher {
     }
 }
 
+#[test]
+fn a_binding_replays_before_resolution_and_removal_undoes_and_deletes_only_the_new_uuid() {
+    use arca_kernel::journal::{BindingEvent, BindingState};
+    let scratch = Scratch::new("bind");
+    let mut state = fake_state();
+    for pool in ["pool1", "pool2"] {
+        state.pools.push((pool.into(), json!({})));
+    }
+    let fake = FakeIncus::start(&scratch.dir, state).unwrap();
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let volume = |pool: &str| ObjectRef {
+        kind: IncusKind::Volume,
+        project: PROJECT.into(),
+        parent: Some(pool.into()),
+        name: "p-data-q".into(),
+        uuid: None,
+    };
+    let volume_path =
+        |pool: &str| format!("/1.0/storage-pools/{pool}/volumes/custom/p-data-q?project={PROJECT}");
+    let mut manifest = Patcher::manifest();
+    manifest.effects.push((IncusKind::Volume, EffectClass::B));
+    {
+        let mut journal =
+            Journal::open(FileJournal::open(&scratch.path("journal.jsonl")).unwrap()).unwrap();
+        let mut provider = provider(&scratch, &fake, &retained);
+        let mut ctx = Ctx::new(pe_id(), &manifest, &mut provider, &mut journal, NOW);
+        let data = ctx
+            .effect(EffectOp::IncusCreate {
+                kind: IncusKind::Volume,
+                project: PROJECT.into(),
+                parent: Some("pool1".into()),
+                name: "p-data-q".into(),
+                body: json!({"name":"p-data-q", "config":{}}),
+            })
+            .unwrap();
+        ctx.effect(EffectOp::IncusPatchConfig {
+            object: data,
+            config: BTreeMap::from([("user.note".into(), Some("copied".into()))]),
+        })
+        .unwrap();
+    }
+    let first = signed(&key, 1, None, vec![patcher_entry("v1")]);
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        r.reconcile(&first, NOW),
+        vec![Outcome::Applied { entry: pe_id() }]
+    );
+    let path = instance_path("p-box-q");
+    let old = get(&fake, &path).unwrap()["config"]["volatile.uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(r);
+    // Keep the original UUID under another name and the original data in pool1.
+    let mut backup = get(&fake, &path).unwrap();
+    delete_instance_externally(&fake, "p-box-q");
+    backup["name"] = json!("p-box-backup");
+    backup["project"] = json!(PROJECT);
+    backup["devices"] = json!({"root":{"type":"disk", "pool":"pool1", "path":"/"},"data":{"type":"disk", "pool":"pool1", "source":"p-data-q", "path":"/data"}});
+    backup["devices"]["root"] = json!({"type":"disk", "path":"/", "pool":"pool1"});
+    fake.add_instance(backup.clone());
+    fake.set_instance_config(PROJECT, "p-box-backup", "volatile.uuid", &old);
+    let backup_before = get(&fake, &instance_path("p-box-backup")).unwrap();
+    let old_volume = get(&fake, &volume_path("pool1")).unwrap();
+    backup["name"] = json!("p-box-q");
+    backup["devices"]["data"]["pool"] = json!("pool2");
+    backup["devices"]["root"]["pool"] = json!("pool2");
+    fake.add_instance(backup);
+    fake.add_volume(PROJECT, "pool2", "p-data-q", old_volume.clone());
+    fake.set_instance_config(PROJECT, "p-box-q", "volatile.uuid", "replacement");
+    let writes = fake.writes().len();
+    {
+        let mut journal =
+            Journal::open(FileJournal::open(&scratch.path("journal.jsonl")).unwrap()).unwrap();
+        journal
+            .bind(BindingEvent {
+                entry: pe_id(),
+                at_ms: NOW,
+                from: BindingState {
+                    instance: instance_object("p-box-q", Some(&old)),
+                    root_pool: "pool1".into(),
+                    data_volume: Some(volume("pool1")),
+                },
+                to: BindingState {
+                    instance: instance_object("p-box-q", Some("replacement")),
+                    root_pool: "pool2".into(),
+                    data_volume: Some(volume("pool2")),
+                },
+            })
+            .unwrap();
+        // A later unresolved patch makes restart exercise resolve() as well as
+        // folding the binding. Its unchanged pre-image proves it never landed.
+        journal
+            .intend(
+                &pe_id(),
+                EffectClass::A,
+                Digest::of(b"pending"),
+                instance_object("p-box-q", Some("replacement")),
+                Some(BTreeMap::from([("user.pending".into(), None)])),
+                NOW,
+            )
+            .unwrap();
+    }
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .unwrap();
+    assert_eq!(r.journal().bindings().next().unwrap().to.root_pool, "pool2");
+    assert!(r.journal().unresolved().is_empty());
+    assert_eq!(
+        fake.writes().len(),
+        writes,
+        "replay and resolution send no host write"
+    );
+    let undos: Vec<_> = r
+        .journal()
+        .live(&pe_id())
+        .into_iter()
+        .filter_map(|record| match record.inverse {
+            Some(Inverse::IncusRestoreConfig { object, config })
+                if matches!(object.kind, IncusKind::Instance | IncusKind::Volume) =>
+            {
+                Some((object, config))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(undos.len(), 2);
+    assert!(
+        undos
+            .iter()
+            .any(|(object, _)| *object == instance_object("p-box-q", Some("replacement")))
+    );
+    assert!(undos.iter().any(|(object, _)| *object == volume("pool2")));
+    // These class-B patches normally go with deletion. Execute the recorded
+    // undos explicitly to prove both addresses follow the replacement.
+    let mut undo_provider = provider(&scratch, &fake, &retained);
+    let mut undo_journal = Journal::open(arca_kernel::journal::MemJournal::new()).unwrap();
+    for (object, config) in undos {
+        Ctx::new(
+            pe_id(),
+            &manifest,
+            &mut undo_provider,
+            &mut undo_journal,
+            NOW,
+        )
+        .effect(EffectOp::IncusPatchConfig { object, config })
+        .unwrap();
+    }
+    assert!(get(&fake, &path).unwrap()["config"]["user.env"].is_null());
+    assert!(get(&fake, &volume_path("pool2")).unwrap()["config"]["user.note"].is_null());
+    assert_eq!(
+        get(&fake, &instance_path("p-box-backup")).unwrap(),
+        backup_before
+    );
+    assert_eq!(get(&fake, &volume_path("pool1")).unwrap(), old_volume);
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    let outcomes = r.reconcile(&second, NOW);
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Failed { .. })),
+        "{outcomes:?}"
+    );
+    let plan = r
+        .pending_plans()
+        .into_iter()
+        .find(|plan| plan.entry == pe_id())
+        .unwrap();
+    assert_eq!(plan.objects.len(), 2);
+    assert!(
+        plan.objects
+            .contains(&instance_object("p-box-q", Some("replacement")))
+    );
+    assert!(plan.objects.contains(&volume("pool2")));
+    let run = approve_and_run(&mut r, &scratch, &plan, "bound");
+    assert!(!run.partial);
+    assert!(get(&fake, &path).is_none());
+    assert!(get(&fake, &volume_path("pool2")).is_none());
+    assert_eq!(
+        get(&fake, &instance_path("p-box-backup")).unwrap(),
+        backup_before
+    );
+    assert_eq!(get(&fake, &volume_path("pool1")).unwrap(), old_volume);
+    drop(r);
+    let r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&second),
+    )
+    .unwrap();
+    assert!(r.journal().live(&pe_id()).is_empty());
+    assert!(
+        r.journal().bindings().next().is_none(),
+        "removed lineages cannot restore stale storage facts"
+    );
+}
+
 fn patcher_entry(value: &str) -> arca_kernel::desired::Entry {
     entry(PE, PATCHER, json!({ "tag": "q", "value": value }))
 }

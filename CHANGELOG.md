@@ -76,6 +76,8 @@ waiting on Incus operations, with one 5 s Incus I/O budget; an absent synchronou
 back present or restart recovery settles it. PATCH requests get 30 seconds, and service config errors include the
 kernel's reason in the answer and log.
 
+The effect journal supports a binding record from this release; once one is written, older Arca versions refuse the journal.
+
 ## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it

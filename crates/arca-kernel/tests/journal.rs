@@ -408,13 +408,38 @@ fn an_illegal_void_transition_poisons_the_journal() {
 /// A store that refuses the append at index `fail_at` without recording it, and accepts every other append.
 #[derive(Debug)]
 struct FlakyStore {
-    records: Vec<EffectRecord>,
+    records: Vec<arca_kernel::journal::JournalRecord>,
     calls: usize,
     fail_at: usize,
 }
 
 impl JournalStore for FlakyStore {
     fn append(&mut self, record: &EffectRecord) -> Result<(), KernelError> {
+        self.append_line(arca_kernel::journal::JournalRecord::Effect(record.clone()))
+    }
+
+    fn history(
+        &self,
+    ) -> Result<(Vec<arca_kernel::journal::JournalRecord>, Option<String>), KernelError> {
+        Ok((self.records.clone(), None))
+    }
+
+    fn append_binding(
+        &mut self,
+        event: &arca_kernel::journal::BindingEvent,
+    ) -> Result<(), KernelError> {
+        self.append_line(arca_kernel::journal::JournalRecord::Binding {
+            kind: arca_kernel::journal::BindingKind::Binding,
+            binding: event.clone(),
+        })
+    }
+}
+
+impl FlakyStore {
+    fn append_line(
+        &mut self,
+        record: arca_kernel::journal::JournalRecord,
+    ) -> Result<(), KernelError> {
         let call = self.calls;
         self.calls += 1;
         if call == self.fail_at {
@@ -423,12 +448,8 @@ impl JournalStore for FlakyStore {
                 why: "the write was refused".to_string(),
             });
         }
-        self.records.push(record.clone());
+        self.records.push(record);
         Ok(())
-    }
-
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
-        Ok((self.records.clone(), None))
     }
 }
 
