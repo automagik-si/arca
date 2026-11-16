@@ -2153,14 +2153,8 @@ fn support_verbs_have_their_schemas_scopes_and_marks() {
         params["properties"]["severity"]["enum"],
         json!(["low", "medium", "high", "urgent"])
     );
-    assert_eq!(
-        conforms(&params, &json!({ "title": "t", "body": "b", "extra": 1 })).is_err(),
-        true
-    );
-    assert_eq!(
-        conforms(&params, &json!({ "title": "x".repeat(201), "body": "b" })).is_err(),
-        true
-    );
+    assert!(conforms(&params, &json!({ "title": "t", "body": "b", "extra": 1 })).is_err());
+    assert!(conforms(&params, &json!({ "title": "x".repeat(201), "body": "b" })).is_err());
     assert_eq!(
         conforms(&params, &json!({ "title": "t", "body": "b" })),
         Ok(())
