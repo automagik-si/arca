@@ -696,12 +696,15 @@ fn label_writes_obey_bound_tenants_and_service_limits_before_the_handler() {
         );
     }
     assert_eq!(door.calls.lock().unwrap().len(), before);
-    assert_ne!(
-        refusal(&door.call(
-            &door.viewer,
-            "service_labels_set",
-            json!({"name":"web","labels":{}})
-        )),
-        "Reached"
+    let viewer = post(
+        &mut connect_unix(&door.socket),
+        &[bearer(&door.viewer)],
+        &rpc(
+            json!(1),
+            "tools/call",
+            json!({"name":"service_labels_set", "arguments":{"name":"web","labels":{}}}),
+        ),
     );
+    assert_eq!(viewer.status, 403);
+    assert_eq!(door.calls.lock().unwrap().len(), before);
 }
