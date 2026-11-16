@@ -280,12 +280,106 @@ fn logs_hide_only_connector_login_links_and_keep_other_lines() {
         ])
     );
     rig.fake.set_console_log(PROJECT, "edge", &log);
-    assert!(
-        rig.call("service_logs", json!({"name":"edge"}))
-            .unwrap()
-            .to_string()
-            .contains(LOGIN)
+    assert_eq!(
+        rig.call("service_logs", json!({"name":"edge"})).unwrap()["lines"],
+        json!([
+            "before",
+            format!("visit {LOGIN}"),
+            "https://login.tailscale.com/admin/machines",
+            "after"
+        ])
     );
+}
+
+fn assert_split_login_hidden(log: &str) {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    rig.fake.set_console_log(PROJECT, "node-ts", log);
+    let logs = rig.call("service_logs", json!({"name":"node-ts"})).unwrap();
+    assert_eq!(logs["lines"], json!(["visit [sign-in link]"]));
+    rig.fake.set_console_log(PROJECT, "edge", log);
+    let unchanged = rig.call("service_logs", json!({"name":"edge"})).unwrap();
+    assert_eq!(
+        unchanged["lines"],
+        if log.contains('\r') {
+            json!(["visit https://login.tailscale.com/a/synthetic", "123"])
+        } else if log.starts_with("visit http:") {
+            json!(["visit http://LOGIN.TAILSCALE.COM/a/synthetic123"])
+        } else {
+            json!([format!("visit {LOGIN}")])
+        }
+    );
+    assert_private(&rig, LOGIN);
+}
+
+#[test]
+fn connector_logs_preserve_other_carriage_return_lines() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    rig.fake
+        .set_console_log(PROJECT, "node-ts", &format!("before\rafter\n{LOGIN}\n"));
+    assert_eq!(
+        rig.call("service_logs", json!({"name":"node-ts"})).unwrap()["lines"],
+        json!(["before", "after", "[sign-in link]"])
+    );
+}
+
+#[test]
+fn connector_logs_hide_http_and_uppercase_login_links() {
+    assert_split_login_hidden("visit http://LOGIN.TAILSCALE.COM/a/synthetic123\n");
+}
+
+#[test]
+fn logs_hide_login_split_by_escape_sequences() {
+    assert_split_login_hidden(
+        "visit https://login.tailscale.com/a/\u{1b}[1msynthetic123\u{1b}[0m\n",
+    );
+}
+
+#[test]
+fn logs_hide_login_split_by_nul() {
+    assert_split_login_hidden("visit https://login.tailscale\0.com/a/synthetic123\n");
+}
+
+#[test]
+fn logs_hide_login_split_by_escape_sequences_and_nul() {
+    assert_split_login_hidden(
+        "visit https://login.tailscale\0.com/a/\u{1b}[1msynthetic123\u{1b}[0m\n",
+    );
+}
+
+#[test]
+fn logs_hide_login_split_by_carriage_return() {
+    assert_split_login_hidden("visit https://login.tailscale.com/a/synthetic\r123\n");
+}
+
+#[test]
+fn unreadable_running_connector_status_is_unknown() {
+    let (rig, key) = rig();
+    assert_eq!(
+        connect(&rig, &key, Some("node-ts")).unwrap()["state"],
+        "unknown"
+    );
+    let command = arca_incus::exec::ExecCommand::ConnectorStatus;
+    for (label, exit, output) in [
+        ("malformed", 0, format!("{{{LOGIN}")),
+        ("too large", 0, "x".repeat(65537)),
+        ("failed command", 1, LOGIN.to_string()),
+        (
+            "missing backend state",
+            0,
+            json!({"AuthURL":LOGIN}).to_string(),
+        ),
+    ] {
+        rig.fake
+            .script_exec(ExecScript::new(command.argv(), exit, &output));
+        let listed = rig.call("reach_list", json!({})).unwrap();
+        assert_eq!(listed["connectors"][0]["state"], "unknown", "{label}");
+        assert!(listed["connectors"][0].get("tailnetName").is_none());
+        assert!(listed["connectors"][0].get("tailnetAddress").is_none());
+        assert!(!listed.to_string().contains(LOGIN));
+    }
+    assert_private(&rig, LOGIN);
 }
 
 #[test]
