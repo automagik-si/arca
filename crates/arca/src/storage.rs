@@ -120,7 +120,11 @@ impl DiskOrigin {
         let Ok(block) = std::fs::canonicalize(sys.join("class/block").join(name)) else {
             return Self::Unknown;
         };
-        // Software block devices live here even when lsblk calls them TYPE=disk.
+        // Native NVMe multipath namespace heads are machine disks despite their virtual sysfs location.
+        if block.starts_with(sys.join("devices/virtual/nvme-subsystem")) {
+            return Self::Machine;
+        }
+        // Other software block devices live here even when lsblk calls them TYPE=disk.
         if block.starts_with(sys.join("devices/virtual")) {
             return Self::Mapped;
         }
@@ -3933,6 +3937,55 @@ impl ToolHandler for SnapshotListHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_native_nvme_multipath_disk_stays_free_and_offered_whole() {
+        let root = std::env::temp_dir().join(format!("arca-nvme-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let block = root.join("devices/virtual/nvme-subsystem/nvme-subsys0/nvme0n1");
+        std::fs::create_dir_all(&block).expect("NVMe namespace head");
+        std::fs::create_dir_all(root.join("class/block")).expect("block class");
+        // A mapped name or mapper path must still lose even if it points into the NVMe namespace tree.
+        let names = [
+            "nvme0n1",
+            "rbd0",
+            "nbd0",
+            "loop0",
+            "dm-0",
+            "zd0",
+            "drbd0",
+            "zram0",
+            "fake-volume",
+        ];
+        let disks: Vec<BlockDevice> = names
+            .iter()
+            .map(|name| {
+                std::os::unix::fs::symlink(&block, root.join("class/block").join(name))
+                    .expect("class link");
+                let mut disk = device(name, "disk", None, Vec::new());
+                if *name == "fake-volume" {
+                    disk.path = "/dev/mapper/fake-volume".to_string();
+                }
+                disk
+            })
+            .collect();
+        let facts = HostFacts {
+            disk_origins: disks
+                .iter()
+                .map(|disk| (disk.name.clone(), DiskOrigin::from_sysfs(&root, &disk.name)))
+                .collect(),
+            ..HostFacts::default()
+        };
+        assert_eq!(facts.disk_origins["nvme0n1"], DiskOrigin::Machine);
+        let views = classify_with(&disks, &[], &facts);
+        assert_eq!(views[0].role, DiskRole::Free);
+        assert_eq!(views[0].to_json()["offer"], json!("whole disk"));
+        for view in &views[1..] {
+            assert_eq!(view.role, DiskRole::System, "{}", view.disk.name);
+            assert_eq!(view.to_json()["offer"], Value::Null, "{}", view.disk.name);
+        }
+        std::fs::remove_dir_all(&root).expect("remove fixture");
+    }
 
     #[test]
     fn disk_origin_requires_readable_kernel_machine_disk_facts() {

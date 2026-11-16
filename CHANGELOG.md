@@ -11,7 +11,8 @@ Write under this comment only what a reader needs beyond those lines; the releas
 whole-disk snapshot storage: kernel device origins are checked, and unreadable or unrecognised origins are not
 free. A mounted mapped image now has the `system` role with no folder offer, where it could previously be `in use`
 and offered as a folder target. `storage_add` refuses these devices before an exclusive open or any write, including
-when the device becomes a mapped image after approval; SATA, NVMe, USB and a VM's own virtio disks keep their offers.
+when the device becomes a mapped image after approval; SATA, NVMe (including native multipath), USB and a VM's own
+virtio disks keep their offers.
 
 ## 0.33.0 (2026-11-16)
 

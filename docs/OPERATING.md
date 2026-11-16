@@ -3288,7 +3288,8 @@ and total space. Loop, optical and zram devices are not listed. Each disk gets o
 
 Mapped images (RBD, NBD, loop, device-mapper, ZFS volumes and DRBD) reported as disks are `system` with no whole-disk
 or folder offer, even when mounted; the kernel must identify a machine disk through its device subsystem (including
-virtio for a VM's own disk), and unreadable or unrecognised origins are never free.
+virtio for a VM's own disk) or the native NVMe multipath path `/sys/devices/virtual/nvme-subsystem/`, and unreadable or
+unrecognised origins are never free.
 
 `lsblk` lists a multi-device btrfs or bcachefs mount on one member only, so every device with the same file system type and
 UUID, and every device the kernel lists under `/sys/fs/btrfs/<uuid>/devices/` or `/sys/fs/bcachefs/<uuid>/dev-*/block`, is
