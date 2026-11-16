@@ -343,6 +343,34 @@ fn assert_write_family(incus: &FakeStorageIncus) {
 }
 
 #[test]
+fn a_mapped_rbd_is_system_and_refused_before_open_or_write() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-mapped-rbd", &key);
+    rig.devices.set(Ok(json!({ "blockdevices": [
+        disk("rbd0", "Fake mapped image", "", false, 64 * GB, json!({}))
+    ]})));
+    // No mounts or holders; the fake would even allow an exclusive open.
+    let list = rig.storage_list();
+    let mapped = disk_view(&list, "rbd0");
+    assert_eq!(mapped["role"], json!("system"), "{mapped}");
+    assert_eq!(mapped["offer"], Value::Null);
+    let reason = mapped["reason"].as_str().expect("plain words");
+    assert!(
+        reason.contains("mapped image") && reason.contains("not a disk of this machine"),
+        "{reason}"
+    );
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "backup", "device": "rbd0" }))),
+        "SystemDisk"
+    );
+    assert!(
+        rig.devices.opened().is_empty(),
+        "the device was never opened"
+    );
+    assert!(rig.incus.writes().is_empty(), "nothing was written");
+}
+
+#[test]
 fn every_disk_gets_its_plain_role() {
     let key = SkKey::from_seed(1);
     let rig = Rig::new("storage-roles", &key);
