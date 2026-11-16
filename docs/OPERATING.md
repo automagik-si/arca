@@ -7432,8 +7432,9 @@ is named `<service>-<tenant id>` (one bridge holds one instance of a name). `ten
 beside the `service`, and the instance verbs take either `instance` or, in a tenant, `service`. In a tenant:
 
 - `instance_start`, `instance_stop` and `instance_restart` need no approval, from a token whose tool allowlist names the
-  verb. Each is written to `instance-actions.jsonl` with the token and the tenant. Outside a tenant a stop and a restart
-  still need an approved proposal;
+  verb. They also run once from a proposal the owner approves, even when the proposing token's list omits the verb.
+  Each is written to `instance-actions.jsonl` with the caller and the tenant; a card's run names the approved-action
+  caller. Outside a tenant a stop and a restart still need an approved proposal;
 - `service_create` takes `deploy`, an id of 1 to 64 of `a-z`, `0-9` and `-`. What
   is created under it is provisional until the same token calls `deploy_confirm`, or 15 minutes after the deploy's first
   create (counted from `tenant-deploys.jsonl`, so a restart does not reset it). Until then that token may call

@@ -2988,7 +2988,9 @@ impl ActionExecutor {
             &Caller {
                 token_id: caller_id.to_string(),
                 scope: Scope::Operator,
-                tools: None,
+                // A tenant start needs the verb named explicitly. This caller belongs to this approved run only;
+                // no token's allowlist is changed, and the handler's direct-call check stays in force.
+                tools: (action == "instance_start").then(|| vec![action.to_string()]),
                 limits: Default::default(),
             },
         )

@@ -505,6 +505,8 @@ fn project(id: &str) -> String {
 
 #[path = "tenants/admission.rs"]
 mod admission;
+#[path = "tenants/approved_start.rs"]
+mod approved_start;
 #[path = "tenants/create_stopped.rs"]
 mod create_stopped;
 #[path = "tenants/databases.rs"]
