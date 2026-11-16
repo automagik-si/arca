@@ -1184,7 +1184,7 @@ fn a_post_route_admits_only_the_tokens_its_verb_admits() {
     let viewer = mint_into(scratch.path(), "viewer", Scope::Viewer);
     let doctor = mint_into(scratch.path(), "doctor", Scope::Doctor);
     let operator = mint_into(scratch.path(), "operator", Scope::Operator);
-    let mut listed = |id: &str, scope: Scope, tools: &[&str]| {
+    let listed = |id: &str, scope: Scope, tools: &[&str]| {
         let tools: Vec<String> = tools.iter().map(|tool| tool.to_string()).collect();
         let (secret, text) = mint_with_tools(scope, Some(&tools));
         write_hash_file(scratch.path(), id, &text, 0o400);
