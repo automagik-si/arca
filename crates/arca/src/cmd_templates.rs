@@ -49,6 +49,8 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
     "omni-api.json",
     "postgres-autopg.json",
     "postgres-autopg.sh",
+    "tailscale.json",
+    "tailscale.sh",
     "workspace-vm.json",
 ];
 

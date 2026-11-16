@@ -5853,6 +5853,63 @@ What to know:
 - **The image.** The template pins `docker.io/cloudflare/cloudflared` release 2026.10.7 by digest, so it never updates
   by itself. A later Arca release moves the pin.
 
+## Reaching a service over your own tailnet (Tailscale)
+
+The shipped `tailscale` template is the Cloudflare connector's twin for a tailnet: it puts one of your services on your
+own Tailscale network, and nowhere else, without opening a port on your router. Arca runs Tailscale's own node as one
+more service. It joins your tailnet under the service's name and hands every connection to port 443 of its tailnet
+address to one service you link it to, as raw TCP: it does not decrypt anything, so the target serves its own TLS. The
+node calls out to Tailscale; nothing calls in from the internet.
+
+You need a Tailscale account (a tailnet), and a service in Arca that serves TLS itself (here it is called `app`, with
+its TLS port first among its ports). As for the Cloudflare connector, the Arca steps are Arca's own verbs, and
+`service_secret_set` needs an assistant that holds a `doctor`-scope token.
+
+1. **Tailscale admin console, "Settings" > "Keys".** Generate an auth key: for one use, not ephemeral, pre-approved if
+   your tailnet asks for device approval, and with a tag, so that the node's own key does not expire. Copy it; treat it
+   like a password. The tag must already be in your tailnet policy's `tagOwners` ("Access controls"), and the policy's
+   rules must let your devices reach that tag on TCP 443; without such a rule the node joins but nothing reaches it.
+2. **Arca: `service_status`** with `{"name": "app"}`. Note its `ipv4` and its first `ports` entry, for example
+   `192.0.2.11` and `8443`.
+3. **Arca: `service_create`** with `{"name": "app-ts", "template": "tailscale"}`. The service's name is also the node's
+   name on your tailnet, unless step 4 gives it another. The service is created with its state volume and stays
+   `stopped`, because it has no key yet.
+4. **Arca: `service_secret_set`** with `{"name": "app-ts", "key": "TS_AUTHKEY", "value": "<the key>"}`, and again with
+   `{"name": "app-ts", "key": "TS_TARGET", "value": "192.0.2.11:8443"}`: the address and port from step 2. To give the
+   node a tailnet name other than the service's, put it in front with an `@`: `"value": "app@192.0.2.11:8443"` (lower
+   case letters, digits and dashes, at most 63, not starting or ending with a dash).
+5. **Arca: `service_connect`** with `{"from": "app-ts", "to": "app"}`. This is what lets the node reach `app`, on `app`'s
+   first port and nothing else.
+6. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "app-ts"}`. The node logs in with the key and
+   appears in the admin console's "Machines" list under its tailnet name (`app-ts`, or the name from step 4).
+7. **Check.** The node is listed as connected in the admin console. From a device on your tailnet, a connection to port
+   443 of the node (its name `app-ts` or its tailnet address) reaches `app`, which answers with its own certificate:
+   use a name that certificate is for, pointed at the node.
+
+What to know:
+
+- **One login.** The node keeps its state on its own data volume, so it uses the key once. Every later start, restart or
+  reconfigure logs in from that state, and a single-use key that is spent does no harm. Removing the service removes the
+  state; a new one needs a new key.
+- **The PROXY header.** Each connection reaches the target with a PROXY protocol version 2 header first, carrying the
+  tailnet client's own address. The target must accept that header from the node's address (`service_status` of
+  `app-ts`, its `ipv4`), and only from it. A target that does not speak PROXY protocol refuses these connections.
+- **Only port 443, only one target.** Nothing else is served. A connection to any other port of the node's tailnet
+  address goes to that port on the node's own loopback, and the node is alone in its container, so nothing listens
+  there. To change the target or the tailnet name, set `TS_TARGET` again and restart the node (`instance_restart`).
+  If the name is already taken on your tailnet, Tailscale gives the node another one (with a number added).
+- **What the node needs from your network.** Outgoing connections to Tailscale's control plane and relays (TCP 443),
+  STUN (UDP 3478) and direct WireGuard paths (UDP 41641), which Arca's service network allows like any other internet
+  traffic. Peers on private ranges are reached through Tailscale's relays. No incoming port is opened.
+- **Where the key and the target live.** In private files in Arca's `secrets/` directory, and in the container's
+  environment in Incus, as for every template secret. `service_logs` replaces both with `[secret]`. Inside the
+  container the key is handed to Tailscale as a file of its own (mode 600, under `/run`, which is in memory), so it is
+  never on a command line. The tailnet name
+  rides on `TS_TARGET` because every secret a template names must be set before it starts, so an optional value cannot
+  be a secret of its own.
+- **The image.** The template pins `docker.io/tailscale/tailscale` release 1.104.7 by digest, so it never updates by
+  itself. A later Arca release moves the pin.
+
 ## An Automagik workspace in its own virtual machine
 
 The shipped `automagik-workspace` template is one virtual machine that holds one Automagik workspace and publishes it

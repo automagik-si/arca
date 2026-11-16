@@ -16,6 +16,15 @@ node through a pipe, with up to about 100 MiB per `rbd` process whatever the dis
 held on 1 Gbit/s. A failed copy names its side, cluster and client. A card still waiting when `serve` restarts with
 another import config shows the source cluster of the new config, the one the run reads. See docs/OPERATING.md.
 
+A new shipped template, `tailscale`, is the Cloudflare connector's twin for a tailnet: one service that runs Tailscale's
+own node (release 1.104.7, by digest) in userspace networking, with no tun device and no capability, under the service's
+name (or another one given with the target), and forwards TCP 443 on its tailnet address to one linked service as raw
+TCP with a PROXY protocol v2 header, TLS left to the target. The auth key (`TS_AUTHKEY`) and the target (`TS_TARGET`,
+`[NAME@]ADDRESS:PORT`) are set with `service_secret_set`; it is created stopped and `instance_start` starts it. Its
+state is on its own data volume, so it logs in once and a single-use key is enough. Like the Cloudflare connector it has
+no port and reaches only what it is linked to. docs/OPERATING.md, "Reaching a service over your own tailnet
+(Tailscale)", has the steps.
+
 ## 0.32.0 (2026-11-16)
 
 `automagik-workspace` takes `accessEmails` as text: one address or several, comma-separated, passed unchanged to the
