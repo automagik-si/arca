@@ -391,6 +391,13 @@ pub struct ServiceConfig {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub droidd_port: Option<u16>,
+    /// The container's root size at create. Absent, a tenant keeps its 16GiB default and the node's own project
+    /// leaves the size to its pool, as before. Reconfigure and update keep this recorded size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_size: Option<String>,
+    /// The container NIC's port isolation at create, kept through reconfigure and image updates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub port_isolation: bool,
     #[serde(default)]
     pub limits: Option<Limits>,
     #[serde(default)]
@@ -861,18 +868,21 @@ pub fn ingress(cfg: &ServiceConfig) -> Vec<Value> {
         rules.push(rule(json!({"action":"allow","source":format!("{}/32",grant.address),"protocol":"tcp",
             "destination_port":grant.port.to_string(),"description":format!("link from {} to port {}",grant.address,grant.port),"state":"enabled"})));
     }
-    // The node's front service reaches every port a tenant's service declares, and nothing else of it.
+    // The front reaches the declared application ports, excluding the host's control port.
     if let Some(front) = cfg.tenant.as_ref().and_then(|tenant| tenant.front.as_ref())
         && !cfg.ports.is_empty()
     {
         let ports = cfg
             .ports
             .iter()
+            .filter(|port| Some(**port) != cfg.droidd_port)
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        rules.push(rule(json!({"action":"allow","source":format!("{front}/32"),"protocol":"tcp",
-            "destination_port":ports,"description":"the node's front service to the declared ports","state":"enabled"})));
+        if !ports.is_empty() {
+            rules.push(rule(json!({"action":"allow","source":format!("{front}/32"),"protocol":"tcp",
+                "destination_port":ports,"description":"the node's front service to the declared ports","state":"enabled"})));
+        }
     }
     rules
 }
@@ -1024,7 +1034,9 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
         devices.insert(KERNEL_DEVICE.into(), kernel_device(link));
     }
     let mut root = json!({ "type": "disk", "path": "/", "pool": cfg.pool });
-    if cfg.tenant.is_some() {
+    if let Some(size) = &cfg.root_size {
+        root["size"] = json!(size);
+    } else if cfg.tenant.is_some() {
         // The tenant project's disk cap counts a root disk by its size, so a tenant's container states one.
         root["size"] = json!(arca_netproject::tenant::CONTAINER_ROOT_SIZE);
     }
@@ -1038,7 +1050,7 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             "name": "eth0",
             "network": cfg.bridge,
             "ipv4.address": cfg.ipv4,
-            "security.port_isolation": "false",
+            "security.port_isolation": if cfg.port_isolation { "true" } else { "false" },
             "security.mac_filtering": "true",
             "security.ipv4_filtering": "true",
             "security.acls": cfg.acl(),
@@ -1500,9 +1512,12 @@ pub struct Template {
     /// address is the create's. Unlike `lan`, the proxy never listens on every interface.
     #[serde(default)]
     pub private_port: Option<PrivatePort>,
-    /// The root disk size of a virtual-machine template, such as `20GiB`. No other kind sets it.
+    /// A container's optional root disk size, or a virtual machine's required size, such as `20GiB`.
     #[serde(default)]
     pub root_size: Option<String>,
+    /// Whether a container's NIC isolates its bridge port. Off unless the template says true.
+    #[serde(default)]
+    pub port_isolation: bool,
     /// A virtual-machine template's first-boot script: `{ "file": "name.sh" }`, a file beside the template that
     /// cloud-init runs once, at the machine's first boot. No other kind sets it.
     #[serde(default)]
@@ -1913,9 +1928,13 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             "template {name}: kind is oci, system or virtual-machine"
         )));
     }
-    if template.root_size.is_some() {
+    if template
+        .root_size
+        .as_deref()
+        .is_some_and(|size| !size_ok(size))
+    {
         return Err(TemplateError::refused(format!(
-            "template {name}: only a virtual-machine template has a rootSize"
+            "template {name}: rootSize is a size such as 20GiB"
         )));
     }
     if template.first_boot.is_some()

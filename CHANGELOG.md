@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+Container templates may set `rootSize` and `portIsolation`. The root size counts with the data volume against a
+tenant's disk cap at create. Without these keys, containers keep their previous disk and NIC settings; created
+services keep their recorded values through reconfigure, image updates and rollback. A tenant's front rule excludes
+the service's `droiddPort` control port, leaving no front rule when that is its only port. The host's control access
+is unchanged. See docs/OPERATING.md.
+
 ## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it

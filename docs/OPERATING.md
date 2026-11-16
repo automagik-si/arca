@@ -864,6 +864,16 @@ Incus refuses a line break in it at create, and Incus 7.6 a carriage return at t
 earlier release from a script entrypoint keeps the entrypoint it was made with, which Incus 7.6 refuses at its start
 and at every update: remove it and create it again.
 
+A container template (`oci` or `system`) may set `rootSize`, for example `"rootSize": "30GiB"`. It is a positive
+integer with a size unit, as for a virtual machine's root. Without it, a tenant's container keeps its 16GiB root and
+a container in the node's own project keeps the pool's default. The size is recorded at create and kept through
+reconfigure, image updates and rollback; changing the template does not resize an existing service. In a tenant,
+the root size plus any data volume counts against its disk cap, checked before anything is created (see "Tenants").
+
+A container template may also set `"portIsolation": true`: its NIC is created with
+`security.port_isolation=true`. The default is false. This setting is recorded at create and kept through
+reconfigure, image updates (including `withTemplate`) and rollback. The service's firewall rules still apply.
+
 A local image may be pinned: a `digest` (`sha256:` and 64 lowercase hex digits, the image's Incus fingerprint) beside
 `local:<alias>`, in a container template or a virtual machine's. Without it the alias is trusted for whatever image
 stands under it. With it the fingerprint decides, and the alias is only the name the image is looked for under:
@@ -7101,7 +7111,7 @@ given a `tenant`, answers "this node has no tenants". The key needs `kernel.serv
 | `maxTenants` | yes | How many tenants the node holds, 1 to 30. |
 | `defaultCaps` | yes | The caps of a tenant whose create names none: `instances` (1 to 16), `containers`, `virtualMachines`, `cpu`, `memory`, `disk`. They must fit inside `capacity`. |
 | `createRate` | yes | At most `count` tenants are created in any `perSeconds` seconds. The creates are counted from the journal, so a restart does not reset the count, and a tenant that was removed still counts. |
-| `front` | no | The name of one service in `arcak-svc`. Every ordinary tenant service admits that service's address on the ports its template declares, and nothing else of the node's project. The rule follows the front: when it is created, removed or recreated at another address, every tenant service's firewall rules follow within 30 seconds. Without the key no service of the node's project reaches a tenant. |
+| `front` | no | The name of one service in `arcak-svc`. Every ordinary tenant service admits that service's address on the ports its template declares, except its `droiddPort` control port, and nothing else of the node's project. If only the control port is declared there is no front rule; the host bridge's control rule stays. The rule follows the front: when it is created, removed or recreated at another address, every tenant service's firewall rules follow within 30 seconds. Without the key no service of the node's project reaches a tenant. |
 
 Each tenant gets a block of the service /24: a /29 (8 addresses), or a /28 when its `instances` cap is above 8, taken from
 the top of the subnet down. The node's own services keep `.10` to `.239` without the tenants' blocks. About 28 small
@@ -7156,8 +7166,9 @@ beside the `service`, and the instance verbs take either `instance` or, in a ten
 - the snapshot verbs with no `tenant` see nothing of any tenant: `snapshot_list` lists no tenant's snapshot, and a
   tenant's project or snapshot is reached only by naming the tenant;
 - a container template's data volume must state its size, so it counts against the disk cap. A container is charged its
-  16GiB root disk and its data volume on top of it: a database made from `postgres-autopg` takes 36GiB of the cap
-  (20GiB of data), and `nats` and `omni-api` 26GiB each (10GiB of data);
+  recorded `rootSize` (16GiB when omitted) and its data volume on top of it, checked together at create. A later
+  template edit does not change what the existing record is charged. A database made from `postgres-autopg` takes
+  36GiB of the cap (20GiB of data), and `nats` and `omni-api` 26GiB each (10GiB of data);
 - `service_remove` needs the owner's approval as everywhere; proposed with `action_propose`, the proposal names the tenant.
   A direct call's statement names the target `tenant.<id>.<name>` and the arguments `{"name", "tenant"}`;
 - a database is a service: the postgres service template, created with `service_create` and linked with
