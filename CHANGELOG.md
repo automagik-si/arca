@@ -7,6 +7,14 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+The `automagik-workspace` template prepares workspace homes, the CLI store, workspace, secrets and run directories
+under its existing persistent `/data` mount; `HOME` and `AUTOMAGIK_HOME` are `/data`. The server runs as the configured
+image user and requires `automagikPnpm`, explicitly pinned to the image's `/usr/local/bin/pnpm`, with no fallback.
+The proposed herdr app home and terminal socket are passed to the image's unchanged entrypoint; no roster is
+pre-populated. The current image pin stays. The operating guide adds admission, first-boot checks, removal and
+remaining owner actions for one workspace per project, with passkey/phone sign-in prerequisites. This prepares
+the template; it deploys nothing.
+
 ## 0.33.0 (2026-11-16)
 
 `instance_import` copies from a source pool on another Ceph cluster than the Incus pool, in either direction, where it

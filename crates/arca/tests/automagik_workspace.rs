@@ -807,8 +807,8 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
         "status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel waits for TUNNEL_TOKEN (service_secret_set, then instance_start); reach cloudflare: public address",
     );
     // The server: a network namespace of its own, no published port and no host network, its data on the machine's
-    // disk, with private homes and pinned pnpm in its environment. It is never told its public name, so it does not trust a request
-    // that comes under one: a route that names its port instead of the gate's gives nobody the workspace.
+    // disk, with private homes and pinned pnpm in its environment. It is never told its public name, so it does not
+    // trust a request that comes under one: a route that names its port instead of the gate's gives nobody the workspace.
     let data = workspace.dir.join("data");
     let gate_data = workspace.dir.join("gate");
     assert_eq!(
@@ -1823,8 +1823,8 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
         &workspace,
         "the tailnet node waits for TAILSCALE_AUTHKEY (service_secret_set, then instance_start)",
     );
-    // The server gets its private homes and pinned pnpm. The gate gets its origin, port and remote claim, and none of the
-    // three Access settings.
+    // The server gets its private homes and pinned pnpm. The gate gets its origin, port and remote claim,
+    // and none of the three Access settings.
     let data = workspace.dir.join("data");
     let gate_data = workspace.dir.join("gate");
     assert_eq!(
