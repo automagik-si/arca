@@ -6,11 +6,12 @@ use crate::github_api::{Auth, Secret};
 use crate::github_app::AppStart;
 use crate::github_signer::{Mode, Signer, SignerError, Status};
 
-/// An installation credential and the verified GitHub bot user ID, for guest-file delivery only.
+/// An installation credential and verified GitHub bot identity, for guest-file delivery only.
 #[derive(Debug)]
 pub struct RepositoryCredential {
     pub token: Secret,
     pub bot_id: u64,
+    pub bot_login: String,
 }
 
 /// A refusal whose words contain no credential or upstream response body.
@@ -112,9 +113,6 @@ impl Signer {
             .app
             .as_ref()
             .ok_or("the repository App has no record")?;
-        if app.slug != "arca-repositories" {
-            return Err("the repository App must have the arca-repositories bot identity".into());
-        }
         let jwt = self
             .app_jwt(&binding.id)
             .map_err(|_| "the repository App could not sign")?;
@@ -138,13 +136,19 @@ impl Signer {
                 answer.status,
             ));
         }
-        let bot_id = if let Some(id) = app.bot_id.filter(|id| *id > 0) {
-            id
+        let expected_login = format!("{}[bot]", app.slug);
+        let (bot_id, bot_login) = if let (Some(id), Some(login)) = (
+            app.bot_id.filter(|id| *id > 0),
+            app.bot_login
+                .as_ref()
+                .filter(|login| login.eq_ignore_ascii_case(&expected_login)),
+        ) {
+            (id, login.clone())
         } else {
             let answer = http
                 .send(
                     Method::GET,
-                    &http.api("/users/arca-repositories%5Bbot%5D"),
+                    &http.api(&format!("/users/{}%5Bbot%5D", app.slug)),
                     Auth::None,
                     None,
                 )
@@ -154,7 +158,9 @@ impl Signer {
                 })?;
             let user = answer.json();
             if !answer.ok()
-                || user["login"].as_str() != Some("arca-repositories[bot]")
+                || !user["login"]
+                    .as_str()
+                    .is_some_and(|login| login.eq_ignore_ascii_case(&expected_login))
                 || user["type"].as_str() != Some("Bot")
             {
                 return Err(RepositoryError::answered(
@@ -162,6 +168,10 @@ impl Signer {
                     answer.status,
                 ));
             }
+            let bot_login = user["login"]
+                .as_str()
+                .ok_or("GitHub returned no repository App bot login")?
+                .to_string();
             let bot_id = user["id"]
                 .as_u64()
                 .filter(|id| *id > 0)
@@ -169,11 +179,12 @@ impl Signer {
             let mut verified = binding.clone();
             if let Some(app) = verified.app.as_mut() {
                 app.bot_id = Some(bot_id);
+                app.bot_login = Some(bot_login.clone());
             }
             verified.updated_at = self.now();
             self.save(verified)
-                .map_err(|_| "the verified repository bot ID could not be saved")?;
-            bot_id
+                .map_err(|_| "the verified repository bot identity could not be saved")?;
+            (bot_id, bot_login)
         };
         let body = json!({"repositories":[repo], "permissions":permissions()});
         let answer = http
@@ -202,6 +213,10 @@ impl Signer {
             .map(Secret::new)
             .ok_or("GitHub returned no repository credential")?;
         self.audit(json!({"kind":"repositoryMint", "binding":binding.id, "repository":format!("{owner}/{repo}")}));
-        Ok(RepositoryCredential { token, bot_id })
+        Ok(RepositoryCredential {
+            token,
+            bot_id,
+            bot_login,
+        })
     }
 }

@@ -429,6 +429,7 @@ impl Signer {
                 html_url: field("html_url").unwrap_or_default(),
                 owner_id,
                 bot_id: None,
+                bot_login: None,
             }),
             installation: None,
             created_by: flow.caller.clone(),

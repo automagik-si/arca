@@ -56,6 +56,7 @@ pub struct FakeState {
     pub org: String,
     pub repository_app: bool,
     pub repository_app_slug: String,
+    pub repository_bot_login: Option<String>,
     /// The person has typed the code and authorised.
     pub authorized: bool,
     /// The person declined.
@@ -127,6 +128,7 @@ impl Fake {
             org: org.to_string(),
             repository_app: false,
             repository_app_slug: "arca-repositories".into(),
+            repository_bot_login: None,
             authorized: false,
             declined: false,
             restricted: false,
@@ -352,7 +354,7 @@ fn answer(
             }
             (
                 200,
-                json!({"id":7007,"login":format!("{}[bot]", s.repository_app_slug),"type":"Bot"}),
+                json!({"id":7007,"login":s.repository_bot_login.clone().unwrap_or_else(|| format!("{}[bot]", s.repository_app_slug)),"type":"Bot"}),
             )
         }
         ("POST", p) if p == format!("/api/app-manifests/{MANIFEST_CODE}/conversions") => {

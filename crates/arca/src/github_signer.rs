@@ -151,6 +151,9 @@ pub struct AppRecord {
     /// The bot user ID verified through GitHub, never inferred from the App ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_id: Option<u64>,
+    /// The bot login returned with that ID by GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_login: Option<String>,
 }
 
 /// An App's installation in the organisation.

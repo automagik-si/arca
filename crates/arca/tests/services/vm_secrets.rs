@@ -827,6 +827,7 @@ fn repository_16_refresh_rewrites_guest_before_expiry_and_skips_stopped_vms() {
                 Ok(arca::github_repository::RepositoryCredential {
                     token: arca::github_api::Secret::new(format!("synthetic-workspace-token-{n}")),
                     bot_id: 7007,
+                    bot_login: "project-custom-repositories[bot]".into(),
                 })
             })),
     );
@@ -868,6 +869,12 @@ fn repository_16_refresh_rewrites_guest_before_expiry_and_skips_stopped_vms() {
     assert_eq!(
         guest_file(&rig, "w1", "GITHUB_BOT_ID").as_deref(),
         Some("7007")
+    );
+    let identity: Value =
+        serde_json::from_str(&guest_file(&rig, "w1", "GITHUB_BOT_IDENTITY").unwrap()).unwrap();
+    assert_eq!(
+        identity,
+        json!({"id":"7007", "login":"project-custom-repositories[bot]"})
     );
     secrets.refresh_repositories();
     assert_eq!(mints.load(Ordering::SeqCst), 1);

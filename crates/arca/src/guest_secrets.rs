@@ -328,6 +328,7 @@ impl GuestSecrets {
             for (key, value) in [
                 ("GITHUB_TOKEN", credential.token.expose().to_string()),
                 ("GITHUB_BOT_ID", credential.bot_id.to_string()),
+                ("GITHUB_BOT_IDENTITY", serde_json::json!({"id":credential.bot_id.to_string(), "login":credential.bot_login}).to_string()),
             ] {
                 files.push((
                     key.to_string(),
