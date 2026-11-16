@@ -180,6 +180,70 @@ fn tenant_lines_load_and_local_service_names_are_normalized() {
 }
 
 #[test]
+fn maximum_service_names_round_trip_with_tools_and_keep_the_unbound_file_limit() {
+    let names = (0..64)
+        .map(|n| format!("a{n:02}{}", "x".repeat(37)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let services = arca_api::limits::ServiceLimit::parse(&names).unwrap();
+    let mut tools: Vec<String> = verbs()
+        .iter()
+        .filter(|v| arca_api::may_call(Scope::Operator, v))
+        .map(|v| v.name.to_string())
+        .collect();
+    let plain_limits = arca_mcp::Limits {
+        services: Some(services.clone()),
+        ..Default::default()
+    };
+    let (plain, plain_text) = loop {
+        let minted = arca_mcp::mint_limited(Scope::Operator, Some(&tools), &plain_limits);
+        if minted.1.len() <= 4096 {
+            break minted;
+        }
+        tools
+            .pop()
+            .expect("there are enough allowed tools to exercise the boundary");
+    };
+    let limits = arca_mcp::Limits {
+        tenant: Some(TENANT.into()),
+        services: services.in_tenant(TENANT),
+        ..Default::default()
+    };
+    let (bound, text) = arca_mcp::mint_limited(Scope::Operator, Some(&tools), &limits);
+    assert!(
+        text.len() > 4096,
+        "the tenant qualifiers cross the former file bound"
+    );
+    let scratch = Scratch::new("tenant-full-file");
+    write_hash_file(scratch.path(), "plain", &plain_text, 0o400);
+    write_hash_file(scratch.path(), "bound", &text, 0o400);
+    let store = TokenStore::load(scratch.path())
+        .expect("a valid bound mint never poisons the token directory");
+    assert!(store.lookup(&plain).is_some());
+    assert_eq!(store.lookup(&bound).unwrap().limits, limits);
+
+    let scratch = Scratch::new("unbound-file-limit");
+    let (_, text) = mint(Scope::Operator);
+    let oversized = format!("{text}tools={}\n", "arca_status,".repeat(400));
+    assert!(oversized.len() > 4096 && oversized.len() < 8192);
+    write_hash_file(scratch.path(), "too-large", &oversized, 0o400);
+    assert!(matches!(
+        TokenStore::load(scratch.path()),
+        Err(TokenStoreError::Malformed { .. })
+    ));
+
+    // A tenant line after the former read boundary still excludes a limited admin from the admin enumeration.
+    let scratch = Scratch::new("large-bound-admin");
+    let (secret, header) = mint(Scope::Admin);
+    let padding = "x".repeat(4096 - header.len() - "tools=\n".len());
+    let text = format!("{header}tools={padding}\ntenant={TENANT}\n");
+    write_hash_file(scratch.path(), "admin", &text, 0o400);
+    let store = TokenStore::load(scratch.path()).unwrap();
+    assert!(store.lookup(&secret).is_none());
+    assert!(arca_mcp::admin_token_ids(scratch.path()).is_empty());
+}
+
+#[test]
 fn invalid_duplicate_or_other_tenant_limits_are_malformed() {
     for lines in [
         "tenant=\n",
