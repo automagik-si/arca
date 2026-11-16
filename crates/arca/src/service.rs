@@ -2240,11 +2240,13 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         || template.lan.is_some()
         || template.private_port.is_some()
         || template.kernel_access.is_some()
-        || template.port_isolation
     {
         return refused(
-            "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan, privatePort, kernelAccess or portIsolation: they need a container's environment, image or devices",
+            "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan, privatePort or kernelAccess: they need a container's environment, image or devices",
         );
+    }
+    if template.port_isolation {
+        return refused("a virtual machine has no portIsolation: it is for a container's NIC");
     }
     if template.no_new_privileges || !template.raw_lxc.is_empty() {
         return refused(
