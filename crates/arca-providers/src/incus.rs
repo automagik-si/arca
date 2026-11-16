@@ -958,7 +958,7 @@ impl IncusProvider {
     }
 
     /// The settled refusal for a create whose request failed. A refusal before the write is final. A failed create is
-    /// recorded as failed only when Incus answered with a status error and a GET of the name then answers 404. One case
+    /// recorded as failed only when Incus answered with a definite refusal and a GET of the name then answers 404. One case
     /// more is settled, as [`EffectRefusal::Landed`]: an instance whose create asked for a start, that Incus answered a
     /// status error for, and that now reads as stopped and as the entry's own, with no operation still at work on it.
     /// Incus creates and then starts, and a failed start leaves the instance stopped, so the create landed and the start
@@ -973,6 +973,10 @@ impl IncusProvider {
         sent: &Value,
         error: IncusError,
     ) -> EffectRefusal {
+        if uncertain_write_answer(&error) {
+            // A gateway can give up while a synchronous create is still running, even if a GET would show 404.
+            return EffectRefusal::Unresolved;
+        }
         match error {
             IncusError::Refused(reason) => EffectRefusal::Provider(reason),
             IncusError::Status { message, .. } => match writer.get_etag(target) {
@@ -1056,21 +1060,12 @@ impl IncusProvider {
         pre_image: &BTreeMap<String, Option<String>>,
         error: IncusError,
     ) -> Result<(), EffectRefusal> {
-        let uncertain = !matches!(
-            &error,
-            IncusError::Refused(_)
-                | IncusError::Status {
-                    code: 400..=599,
-                    ..
-                }
-        );
+        let uncertain = uncertain_write_answer(&error);
         match error {
             IncusError::Refused(reason) => return Err(EffectRefusal::Provider(reason)),
             IncusError::Status { code: 412, .. } => return Err(EffectRefusal::Stale),
-            IncusError::Status {
-                code: 400..=599, ..
-            } => {}
-            _ => self.settle_operations(object)?,
+            _ if uncertain => self.settle_operations(object)?,
+            _ => {}
         }
         let Ok(reading) = writer.read_class(object) else {
             return Err(EffectRefusal::Unresolved);
@@ -1586,9 +1581,9 @@ impl Provider for IncusProvider {
                     Err(IncusError::Refused(reason)) => {
                         return Err(EffectRefusal::Provider(reason));
                     }
-                    Err(_) => {
-                        // Even an empty answer or an unconfirmed write can be
-                        // settled once no operation can still change this ACL.
+                    Err(error) => {
+                        // ACL PATCH is synchronous too: an uncertain answer and the old rules can precede a late write.
+                        let uncertain = uncertain_write_answer(&error);
                         match self
                             .read_back_acl(entry, object, patch)
                             .map_err(|_| EffectRefusal::Unresolved)?
@@ -1603,6 +1598,17 @@ impl Provider for IncusProvider {
                                 holds_pre_image: true,
                                 ..
                             } => {
+                                if uncertain {
+                                    return Err(EffectRefusal::Landed(Box::new(Landed {
+                                        object: object.clone(),
+                                        inverse: Inverse::IncusRestoreAclField {
+                                            object: object.clone(),
+                                            field: *field,
+                                            rules: patch.previous.clone(),
+                                        },
+                                        why: "the ACL array patch may have landed; its original pre-image is kept".into(),
+                                    })));
+                                }
                                 return Err(EffectRefusal::Provider(
                                     "the ACL array patch did not land".into(),
                                 ));
@@ -2262,6 +2268,19 @@ fn text_config(config: Option<&Value>) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A gateway can give up while Incus still runs a write. Keep 4xx refusals and Incus's own 500 definite;
+/// other server statuses, including 502/503/504, cannot prove that a write did not land.
+fn uncertain_write_answer(error: &IncusError) -> bool {
+    !matches!(
+        error,
+        IncusError::Refused(_)
+            | IncusError::Status {
+                code: 400..=500,
+                ..
+            }
+    )
 }
 
 /// A read failure as a fixed reason. Incus's own message is left out, since it can echo a response body.
