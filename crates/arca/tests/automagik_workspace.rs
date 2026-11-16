@@ -288,6 +288,7 @@ impl Workspace {
             .env("WS_RUNNER_UNIT", self.dir.join("runner.service"))
             .env("WS_RUNNER_TMPFILES", self.dir.join("runner-tmpfiles.conf"))
             .env("WS_SUDOERS", self.dir.join("sudoers.d"))
+            .env("WS_PROC", self.dir.join("docker/proc"))
             .env("FAKE_DOCKER_DIR", self.dir.join("docker"));
         command
     }
@@ -2127,6 +2128,41 @@ fn before_automagiks_release_the_first_boot_refuses_the_member_runner_and_change
     }
     assert!(!workspace.dir.join("installed").exists());
     assert!(!workspace.dir.join("runner.service").exists());
+}
+
+/// A server that Docker starts again in place (`docker restart`) has a new network namespace, and the gate stays in the
+/// old one: healthy on its own loopback and reaching nothing. The keeper finds it by the namespaces themselves, not
+/// by each part's own health, and starts the gate again beside the server, which it leaves as it is.
+#[test]
+fn a_gate_left_in_the_namespace_of_a_server_restarted_in_place_is_started_again_beside_it() {
+    let mut workspace = Workspace::new(&settings(URL));
+    workspace.start();
+    wait_for(&workspace, "the gate", || {
+        workspace.started("automagik-gate", 1)
+    });
+    says(&workspace, "status: the server is healthy");
+    let restarted = Command::new(workspace.dir.join("bin/docker"))
+        .args(["restart", "automagik-server"])
+        .env("FAKE_DOCKER_DIR", workspace.dir.join("docker"))
+        .output()
+        .expect("docker restart");
+    assert!(restarted.status.success());
+    says(
+        &workspace,
+        "automagik-gate is not in the server's network namespace: the server was started again beside it, so it reaches nothing",
+    );
+    wait_for(&workspace, "the gate again", || {
+        workspace.started("automagik-gate", 2)
+    });
+    assert_eq!(
+        workspace.runs("automagik-server").len(),
+        1,
+        "the server is left as it is"
+    );
+    let netns = |name: &str| workspace.read(&format!("docker/containers/{name}/netns"));
+    assert_eq!(netns("automagik-gate"), netns("automagik-server"));
+    assert!(!netns("automagik-server").is_empty());
+    assert_eq!(workspace.stop(), Some(0));
 }
 
 #[test]

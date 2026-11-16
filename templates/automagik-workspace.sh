@@ -125,6 +125,7 @@ set -u
 : "${WS_BACKOFF_MAX:=300}"    # the longest pause before a part that keeps failing is started again, in seconds
 : "${WS_APT_PAUSE:=20}"       # seconds between two tries of the first boot's package install
 : "${WS_COSIGN:=/usr/local/lib/arca-automagik-workspace/cosign}"  # the provenance verifier, as the first boot installs it
+: "${WS_PROC:=/proc}"          # where the kernel shows each process, for the namespace a container is in
 : "${WS_COSIGN_SHA256:=}"     # the verifier's checksum; empty is the one fixed below for this machine's architecture
 : "${WS_WORKSPACE:=/data/workspace}"                         # DSH's workspace, at the same path in its container
 : "${WS_RUNNER_HOME:=/var/lib/automagik-member-runner}"      # the runner user's home: its state, members.json
@@ -209,7 +210,7 @@ RELAY_PROGRAM='const net=require("net");const [ip,port]=process.argv.slice(1);ne
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it.
 WS_PROGRAMS='docker jq systemctl apt-get hostname sha256sum install tr cut date sleep cat chmod chown mv rm grep
-tail mkdir stat curl uname'
+tail mkdir stat curl uname readlink'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
@@ -695,6 +696,44 @@ last_line() {
   printf '%s\n' "$1" | tail -n 1 | tr -d '\000-\037' | cut -c1-300
 }
 
+# The parts that follow the server: the gate, the tunnel and the relay live in its network namespace, and the tailnet
+# node reaches the gate through the relay. They are removed, and start again beside the server.
+leave_server_parts() {
+  docker rm -f "$GATE" "$TUNNEL" "$RELAY" "$TAILNET" >/dev/null 2>&1
+  rm -f "$WS_RUN/tunnel-token.sha256" "$WS_RUN/tailnet-key.sha256"
+  REGISTERED=''
+  RELAY_IP=''
+}
+
+# The network namespace a running container is in, as the kernel names it (net:[<number>]), from its first process.
+# Nothing when Docker or /proc cannot say: then nothing is done about it.
+netns_of() {
+  local pid
+  pid=$(docker inspect --type container -f '{{.State.Pid}}' "$1" 2>/dev/null) || return 0
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 0
+  readlink "$WS_PROC/$pid/ns/net" 2>/dev/null
+  return 0
+}
+
+# A part that joins the server's namespace keeps the namespace the server had when the part started. A server that
+# Docker started again in place (`docker restart`, or a start after a stop the keeper did not see) has a new one,
+# and the part runs on in the old one: healthy on its own loopback, and reaching nothing (the gate answers HTTP 502,
+# "DSH unavailable"). A part found so is removed with the others, and they start again beside the server.
+leave_stale_namespace() {
+  local server part ns
+  server=$(netns_of "$SERVER")
+  [ -n "$server" ] || return 0
+  for part in "$GATE" "$TUNNEL" "$RELAY"; do
+    running "$part" || continue
+    ns=$(netns_of "$part")
+    if [ -n "$ns" ] && [ "$ns" != "$server" ]; then
+      say "$part is not in the server's network namespace: the server was started again beside it, so it reaches nothing. The gate and the $(reach_part) are started again beside the server"
+      leave_server_parts
+      return 0
+    fi
+  done
+}
+
 # The gate and the tunnel live in the server's network namespace. A server container that stopped or is gone took
 # the namespace with it, so both are removed with it and start again beside the new one. The server is given no
 # public name: see the head of this file.
@@ -702,12 +741,13 @@ keep_server() {
   local state out
   state=$(state_of "$SERVER")
   case $state in
-    running | unknown) return 0 ;;
+    running)
+      leave_stale_namespace
+      return 0
+      ;;
+    unknown) return 0 ;;
   esac
-  docker rm -f "$GATE" "$TUNNEL" "$RELAY" "$TAILNET" >/dev/null 2>&1
-  rm -f "$WS_RUN/tunnel-token.sha256" "$WS_RUN/tailnet-key.sha256"
-  REGISTERED=''
-  RELAY_IP=''
+  leave_server_parts
   if [ "$state" != absent ]; then
     say "the server stopped (exit code ${state#exited }); it is started again after a pause, and the gate and the $(reach_part) with it"
     docker rm -f "$SERVER" >/dev/null 2>&1
