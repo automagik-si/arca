@@ -1738,6 +1738,21 @@ fn labels_set_before_and_during_a_failed_update_survive_snapshot_rollback() {
     let setter = rig.handlers["service_labels_set"].clone();
     let fired = Arc::new(AtomicBool::new(false));
     let changed = fired.clone();
+    let other_writer = arca_incus::UnixIncusWriter::new(
+        rig.fake.socket().into(),
+        EntryId("service-app".into()),
+        Default::default(),
+        arca_incus::ProjectFamily::new([PROJECT], std::iter::empty::<&str>()).unwrap(),
+    );
+    let object = ObjectRef {
+        kind: IncusKind::Instance,
+        project: PROJECT.into(),
+        name: "app".into(),
+        parent: None,
+        uuid: instance(&rig)["config"]["volatile.uuid"]
+            .as_str()
+            .map(str::to_string),
+    };
     rig.handlers = service_handlers_updating(
         rig.kernel.clone(), Arc::new(|| NOW), rig.cfg.clone(), None,
         UpdateOptions {
@@ -1745,6 +1760,9 @@ fn labels_set_before_and_during_a_failed_update_survive_snapshot_rollback() {
                 if !changed.swap(true, Ordering::SeqCst) {
                     let answer = setter.call(json!({"name":"app", "labels":{"during":"kept", "change":"new", "remove":null}}), &Caller {token_id:"doctor".into(), scope:Scope::Doctor, tools:None, limits:Default::default()}).unwrap();
                     assert_eq!(answer["code"], "confirmed");
+                    let owned = other_writer.read_owned(&object).unwrap();
+                    other_writer.patch(&owned, &std::collections::BTreeMap::from([("user.note".into(), Some("temporary".into()))])).unwrap();
+
                 }
                 false
             }),
@@ -1759,6 +1777,11 @@ fn labels_set_before_and_during_a_failed_update_survive_snapshot_rollback() {
     assert!(matches!(failure, CallError::Refused {code, ..} if code == "rolled_back"));
     assert!(fired.load(Ordering::SeqCst));
     assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
+    assert!(
+        instance(&rig)["config"].get("user.note").is_none(),
+        "other keys still restore from the snapshot"
+    );
+
     assert_eq!(
         rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
         json!({"before":"kept", "during":"kept", "change":"new"})

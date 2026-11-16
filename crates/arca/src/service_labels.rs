@@ -89,6 +89,46 @@ fn write(writer: &UnixIncusWriter, object: &ObjectRef, delta: &Delta) -> Result<
 }
 
 impl ServiceHandler {
+    /// Snapshot rollback restores config as well as the root. Keep caller labels as they stand now, while the
+    /// existing write gate excludes another node call between that read, the restore and the one-key repair.
+    pub(super) fn with_labels_preserved(
+        &self,
+        entry: &Entry,
+        config: &crate::service::ServiceConfig,
+        restore: impl FnOnce() -> Result<(), IncusError>,
+    ) -> Result<(), IncusError> {
+        let refused = || {
+            IncusError::Refused(
+                "service labels ownership or UUID could not be checked for snapshot rollback"
+                    .into(),
+            )
+        };
+        let _write = self.writes.lock().map_err(|_| refused())?;
+        let owned = self.live_owned(entry, config).map_err(|_| refused())?;
+        let labels = owned.config().get(KEY).cloned();
+        let target = self.exec_target(entry, config).map_err(|_| refused())?;
+        restore()?;
+        // A restore may consume the changer's whole operation budget; give its read-back and repair their own.
+        let writer = crate::service_exec::writer_for(&self.cfg, &target, Duration::from_secs(90))
+            .map_err(|_| refused())?;
+        for attempt in 0..ATTEMPTS {
+            let fresh = writer.read_owned(owned.target())?;
+            if fresh.config().get(KEY) == labels.as_ref() {
+                return Ok(());
+            }
+            match writer.patch(&fresh, &BTreeMap::from([(KEY.into(), labels.clone())])) {
+                Ok(_) => return Ok(()),
+                Err(IncusError::Status { code: 412, .. }) if attempt + 1 < ATTEMPTS => continue,
+                Err(error) => {
+                    // An uncertain config PATCH must not be replayed. Read back before reporting its failure.
+                    let _ = writer.read_owned(owned.target());
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("bounded retries return on their last attempt")
+    }
+
     pub(super) fn call_labels(&self, args: &Value, entries: &[Entry]) -> Result<Value, CallError> {
         let name = service_name(args)?;
         let delta: Delta = serde_json::from_value(args["labels"].clone()).map_err(|_| {

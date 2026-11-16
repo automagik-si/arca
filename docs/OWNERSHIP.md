@@ -133,7 +133,10 @@ claims that the change was not applied.
 
 The whole string map lives in the one exact instance config key `user.arca.labels`. Only an already matched service
 instance gets this exact allowance in `classify_object`; no prefix is exempted, and adoption's `classify` is unchanged.
-Reconcile, reconfigure and image rebuild preserve the key because it is outside desired state. Status and list read it
+Reconcile, reconfigure and image rebuild preserve the key because it is outside desired state. Failed-update snapshot
+rollback captures the current labels under the existing write gate, restores the snapshot, then repairs only this key
+under If-Match and reads it back. Labels written during the update survive; every other key still restores from the
+snapshot. Status and list read it
 from the instance, or show an empty map when none is present. Imported and adopted services may show existing labels,
 but label writes remain refused under the existing read-only rule. Recorded host programs show an empty map and take no
 label writes. Labels are plain data, never secrets and never rendered into configuration. A `hold` key has no special
@@ -150,7 +153,8 @@ Source: `crates/arca/src/service_labels.rs`; tests `service_labels_merge_remove_
 `labels_are_allowed_only_on_the_exact_owned_service_instance`,
 `label_writes_obey_bound_tenants_and_service_limits_before_the_handler`,
 `adopted_services_show_labels_but_still_refuse_label_writes`,
-`labels_survive_reconfigure_and_hold_changes_no_boot_policy`, and
+`labels_survive_reconfigure_and_hold_changes_no_boot_policy`,
+`labels_set_before_and_during_a_failed_update_survive_snapshot_rollback`, and
 `an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest`.
 
 ## Writes
