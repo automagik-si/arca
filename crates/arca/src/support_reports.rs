@@ -1029,5 +1029,17 @@ mod tests {
             Err(CallError::Internal(_))
         ));
         assert_eq!(std::fs::read_to_string(&elsewhere).expect("read"), "");
+        // Each open holds the rule by itself: the read, and the append (which a filing reaches only after the read).
+        assert!(matches!(f.reports.load(), Err(CallError::Internal(_))));
+        let line = Line::Ack {
+            id: 1,
+            at: NOW,
+            token_id: "t".into(),
+        };
+        assert!(matches!(
+            f.reports.append(&line, true),
+            Err(CallError::Internal(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&elsewhere).expect("read"), "");
     }
 }
