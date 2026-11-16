@@ -965,16 +965,13 @@ fn a_vm_template_needs_both_limits_and_a_root_size_and_nothing_of_the_service_ne
             error.message
         );
     }
-    // Only a virtual machine has a root size.
+    // A container may name a valid root size too.
     let mut container = nats_template();
     container["name"] = json!("ws");
     container["rootSize"] = json!("20GiB");
-    let error = load(container).expect_err("refused");
-    assert!(
-        error
-            .message
-            .contains("only a virtual-machine template has a rootSize")
-    );
+    let template = load(container).expect("a container template may state a root size");
+    assert!(!template.is_vm());
+    assert_eq!(template.root_size.as_deref(), Some("20GiB"));
     let _ = fs::remove_dir_all(&dir);
 }
 

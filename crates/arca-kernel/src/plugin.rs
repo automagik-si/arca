@@ -132,14 +132,15 @@ pub enum EffectRefusal {
     Provider(String),
     /// The provider cannot tell whether its write landed. The intent stays open and is not journalled as failed.
     Unresolved,
-    /// The write landed and the object is the entry's own, but the request did not finish: an instance that was created
-    /// and then failed to start. [`Ctx::effect`] journals the effect as applied, so no intent stays open and a removal
-    /// deletes the object, and hands the plugin `why` as a [`EffectRefusal::Provider`] refusal. No plugin ever sees this
-    /// variant.
+    /// The owned object is known and its inverse must be preserved although the request did not finish: a created
+    /// instance that failed to start, or a config PATCH that may still land after a pre-image read. [`Ctx::effect`]
+    /// journals the object and inverse, then hands the plugin `why` as a [`EffectRefusal::Provider`] refusal so the
+    /// entry has not converged. No plugin ever sees this variant.
     Landed(Box<Landed>),
 }
 
-/// A write that landed without finishing: the object it made, the inverse that undoes it, and why it did not finish.
+/// A write whose inverse must be kept although the caller could not finish: a landed effect, or a config PATCH that may
+/// still land after a pre-image read. The known owned object and original inverse are recorded before returning the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Landed {
     pub object: ObjectRef,
@@ -236,6 +237,30 @@ pub trait Provider {
         let _ = (entry, target, patch);
         Err(EffectRefusal::NotDeclared)
     }
+    /// Runtime recovery probe: no operation wait, and daemon I/O must fit `budget`. Unsupported providers leave the intent open.
+    fn read_back_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre_image: Option<&BTreeMap<String, Option<String>>>,
+        budget: std::time::Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        let _ = (entry, target, pre_image, budget);
+        Err(EffectRefusal::Unresolved)
+    }
+
+    /// The bounded runtime equivalent of `read_back_acl`; no operation is waited on.
+    fn read_back_acl_now(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+        budget: std::time::Duration,
+    ) -> Result<ReadBack, EffectRefusal> {
+        let _ = (entry, target, patch, budget);
+        Err(EffectRefusal::Unresolved)
+    }
+
     /// Deletes an object the entry owns, with `plan` as the digest its tombstone carries. Only the reconciler calls this:
     /// a class-B delete runs after an approval over `plan`, and a class-A revert runs at once with the digest of the create it
     /// undoes. A provider that never deletes keeps this default, which refuses.
@@ -441,8 +466,8 @@ impl<'a> Ctx<'a> {
                 landed(&object, inverse)?;
                 Ok(object)
             }
-            // The object exists and is the entry's own, so the effect is recorded as applied; the plugin is told why the
-            // request did not finish.
+            // Preserve the known owned object's inverse, including a PATCH that may still land. The plugin is told
+            // why it could not finish, so the entry is not marked converged.
             Err(EffectRefusal::Landed(unfinished)) => {
                 landed(&unfinished.object, unfinished.inverse)?;
                 Err(EffectRefusal::Provider(unfinished.why))

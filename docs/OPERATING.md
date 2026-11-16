@@ -750,8 +750,9 @@ node was started with, or restart the node on the new path.
 
 `arca token revoke <id>` removes the token's hash file. With `--config`, it sends `SIGHUP` to a live `arca serve` for that
 config: it checks `<stateDir>/serve.pid` only when its pid is a live `arca serve`, and otherwise finds the same process in
-`/proc`. The server writes that pid file as soon as its own unix socket is bound, before it serves a request, and removes
-it only when it still holds its own pid; a write that fails is said once on stderr and does not stop the node. A second start that fails to bind leaves the running server's pid file unchanged. The answer carries
+`/proc`. Once its unix socket is this process's own, the server writes and syncs the console token file (when configured),
+then publishes the pid, before it serves a request. A token write failure stops the start without publishing a pid. It removes
+the pid file only when it still holds its own pid; a pid file write that fails is said once on stderr and does not stop the node. A second start that fails to bind leaves the running server's pid file unchanged. The answer carries
 `reloadSignalled`; `token_list` drops the token and a call with it is 401 without a restart. With `--hash-dir` alone no state
 directory or serve is known, so no signal is sent (`reloadSignalled: false`) and a running server keeps the token until it is
 restarted or signalled. The hash files stay mode 0400. The signal goes through a pid descriptor (Linux 5.3 or later), never the host's `kill` command: the process is held, checked again and signalled through the descriptor, so no other process can receive it.
@@ -773,8 +774,8 @@ client. Nobody is at that machine to mint one, so the node makes it, when the co
   a tool list, and the reply's one-line body names the verb (`forbidden: journal_list is not on this token's list of
   tools`). Its id is `node:console`; no hash file can carry that id, since an id there holds no colon.
 - **When it is made.** At each start, `serve` checks the file's place before anything listens, holds the new token in
-  memory, and writes it to the file once it holds its unix socket and before it serves there: created new, mode 0400,
-  never through a link, the token and one newline. It is never in `tokens.hashDir`.
+  memory, and writes and syncs it to the file once its unix socket is this process's own, before publishing its pid
+  or serving there: created new, mode 0400, never through a link, the token and one newline. It is never in `tokens.hashDir`.
 - **The start is refused, with exit 2 and words that name `console.tokenFile`,** when the file's directory is missing,
   is a link, is not owned by the user that runs `serve`, or is open to its group or others (it must be mode 0700); when a
   link is at the file's path; and when something other than this node's earlier file is there. The node leaves such a
@@ -964,6 +965,18 @@ function's `command` goes the same way: the script of its shell as that one word
 Incus refuses a line break in it at create, and Incus 7.6 a carriage return at the container's start. A service made by an
 earlier release from a script entrypoint keeps the entrypoint it was made with, which Incus 7.6 refuses at its start
 and at every update: remove it and create it again.
+
+A container template (`oci` or `system`) may set `rootSize`, for example `"rootSize": "30GiB"`. It is a positive
+integer with a size unit, as for a virtual machine's root. Without it, a tenant's container keeps its 16GiB root and
+a container in the node's own project keeps the pool's default. The size is recorded at create and kept through
+reconfigure, image updates and rollback; changing the template does not resize an existing service. In a tenant,
+the root size plus any data volume counts against its disk cap, checked before anything is created (see "Tenants").
+
+A container template may also set `"portIsolation": true`: its NIC is created with
+`security.port_isolation=true`. The default is false. This setting is recorded at create and kept through
+reconfigure, image updates (including `withTemplate`) and rollback. The service's firewall rules still apply.
+Incus's NIC option prevents two services that both have `portIsolation: true` from reaching each other over the
+bridge, even when linked.
 
 A local image may be pinned: a `digest` (`sha256:` and 64 lowercase hex digits, the image's Incus fingerprint) beside
 `local:<alias>`, in a container template or a virtual machine's. Without it the alias is trusted for whatever image
@@ -3454,10 +3467,12 @@ and total space. Loop, optical and zram devices are not listed. Each disk gets o
 | `in use` | something on it is mounted elsewhere | `folder`: a pool in a folder on it |
 | `free` | nothing on it is mounted or a member of anything | `whole disk`: Incus erases and formats it |
 
-Mapped images (RBD, NBD, loop, device-mapper, ZFS volumes and DRBD) reported as disks are `system` with no whole-disk
-or folder offer, even when mounted; the kernel must identify a machine disk through its device subsystem (including
-virtio for a VM's own disk) or the native NVMe multipath path `/sys/devices/virtual/nvme-subsystem/`, and unreadable or
-unrecognised origins are never free.
+Mapped images (RBD, NBD, loop, device-mapper, ZFS volumes (zvol), DRBD and zram) are never offered as whole-disk
+or folder targets; when listed as disks they are `system`, even when mounted. The kernel device subsystem (including
+virtio for a VM's own disk) or the native NVMe multipath path `/sys/devices/virtual/nvme-subsystem/` decides the origin;
+unreadable or unrecognised origins are never free. This does not check the disk transport: disks attached over iSCSI,
+Fibre Channel or SRP, and NVMe over fabrics with native multipath, count as machine disks and are protected only by
+the usual in-use checks.
 
 `lsblk` lists a multi-device btrfs or bcachefs mount on one member only, so every device with the same file system type and
 UUID, and every device the kernel lists under `/sys/fs/btrfs/<uuid>/devices/` or `/sys/fs/bcachefs/<uuid>/dev-*/block`, is
@@ -7407,7 +7422,7 @@ given a `tenant`, answers "this node has no tenants". The key needs `kernel.serv
 | `maxTenants` | yes | How many tenants the node holds, 1 to 30. |
 | `defaultCaps` | yes | The caps of a tenant whose create names none: `instances` (1 to 16), `containers`, `virtualMachines`, `cpu`, `memory`, `disk`. They must fit inside `capacity`. |
 | `createRate` | yes | At most `count` tenants are created in any `perSeconds` seconds. The creates are counted from the journal, so a restart does not reset the count, and a tenant that was removed still counts. |
-| `front` | no | The name of one service in `arcak-svc`. Every ordinary tenant service admits that service's address on the ports its template declares, and nothing else of the node's project. The rule follows the front: when it is created, removed or recreated at another address, every tenant service's firewall rules follow within 30 seconds. Without the key no service of the node's project reaches a tenant. |
+| `front` | no | The name of one service in `arcak-svc`. Every ordinary tenant service admits that service's address on the ports its template declares, except its `droiddPort` control port, and nothing else of the node's project. If only the control port is declared there is no front rule; the host bridge's control rule stays. The rule follows the front: when it is created, removed or recreated at another address, every tenant service's firewall rules follow within 30 seconds. Without the key no service of the node's project reaches a tenant. |
 
 Each tenant gets a block of the service /24: a /29 (8 addresses), or a /28 when its `instances` cap is above 8, taken from
 the top of the subnet down. The node's own services keep `.10` to `.239` without the tenants' blocks. About 28 small
@@ -7462,8 +7477,9 @@ beside the `service`, and the instance verbs take either `instance` or, in a ten
 - the snapshot verbs with no `tenant` see nothing of any tenant: `snapshot_list` lists no tenant's snapshot, and a
   tenant's project or snapshot is reached only by naming the tenant;
 - a container template's data volume must state its size, so it counts against the disk cap. A container is charged its
-  16GiB root disk and its data volume on top of it: a database made from `postgres-autopg` takes 36GiB of the cap
-  (20GiB of data), and `nats` and `omni-api` 26GiB each (10GiB of data);
+  recorded `rootSize` (16GiB when omitted) and its data volume on top of it, checked together at create. A later
+  template edit does not change what the existing record is charged. A database made from `postgres-autopg` takes
+  36GiB of the cap (20GiB of data), and `nats` and `omni-api` 26GiB each (10GiB of data);
 - `service_remove` needs the owner's approval as everywhere; proposed with `action_propose`, the proposal names the tenant.
   A direct call's statement names the target `tenant.<id>.<name>` and the arguments `{"name", "tenant"}`;
 - a database is a service: the postgres service template, created with `service_create` and linked with
@@ -8240,3 +8256,28 @@ the CPUs and memory the job sees, and the seconds the toolchain, the build and t
 the class (`arca-large`, which `test` uses, or `arca`). With `pool_cache` off, both build from nothing, which
 compares the machines; with it on, the pool uses its kept cache as `ci.yml` does, which shows what an everyday run
 costs.
+
+
+The workspace template requires `repoUrl` at creation: a GitHub HTTPS URL with an owner and repository, with no
+credentials. `repoRef` may name a branch or tag; leaving it empty selects the remote default branch. Checkout delivery
+runs before the first server launch. A stopped server waits when the checkout identity or roster provenance cannot be
+verified. Existing commits and untracked files are retained; the keeper never fetches or resets an existing checkout.
+
+The keeper records checkout provenance in `/var/lib/automagik-workspace/checkout.json`, outside `/data`. File backups
+must carry this marker and any pending `checkout.json.new` alongside the workspace's `data/` and `gate/` directories.
+VM snapshots already include them. Restoring a checkout with an untracked roster but without its marker leaves its
+provenance UNKNOWN and prevents seeding. The roster remains intact. Independent receipt verification and an owner
+recovery screen are UNAVAILABLE; no roster identity is inferred from its origin or JSON format.
+
+Both repository roster paths are protected: `.herdr/bots.json` (v1) and `.automagik/bots/bots.json` (v2). Either is
+foreign when tracked at clone or present before this instance's first server launch. The home registry at
+`/data/bots/bots.json` is separate. The keeper persists `seedStartedAt` before launching the container, so a fast
+entrypoint may safely create this instance's roster before Docker returns.
+
+Arca supplies `GITHUB_TOKEN`, with one repository's contents and pull requests write permissions and metadata read
+permission. The keeper copies rotations into `/data/secrets/github-token`, owned by the image user with mode 0600,
+and configures only an absent GitHub credential helper. It preserves any effective Git author identity; when both
+name and email are absent, the App bot's verified numeric user ID supplies its no-reply email. The companion repository
+App change supplies that metadata. The App is created and installed by the owner later; no live installation is part
+of template delivery. An Arca outage longer than the credential lifetime interrupts Git operations until refresh
+resumes; it does not shut down the workspace.

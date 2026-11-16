@@ -510,7 +510,11 @@ fn bytes(text: &str) -> u128 {
 }
 
 /// What a container counts: its template's limits, or the tenant profile's, and its root disk with its data volume.
-fn container_use(limits: &Option<crate::service::Limits>, data: Option<&str>) -> Use {
+fn container_use(
+    limits: &Option<crate::service::Limits>,
+    root: Option<&str>,
+    data: Option<&str>,
+) -> Use {
     let cpu = limits
         .as_ref()
         .and_then(|limits| limits.cpu.as_deref())
@@ -526,7 +530,7 @@ fn container_use(limits: &Option<crate::service::Limits>, data: Option<&str>) ->
         virtual_machines: 0,
         cpu,
         memory,
-        disk: bytes(CONTAINER_ROOT_SIZE).saturating_add(data.map_or(0, bytes)),
+        disk: bytes(root.unwrap_or(CONTAINER_ROOT_SIZE)).saturating_add(data.map_or(0, bytes)),
     }
 }
 
@@ -552,6 +556,7 @@ fn used(scope: &TenantScope, entries: &[Entry]) -> Use {
             Some(vm) => vm_use(&record.limits, &vm.root_size),
             None => container_use(
                 &record.limits,
+                record.root_size.as_deref(),
                 record.data.as_ref().and_then(|data| data.size.as_deref()),
             ),
         });
@@ -684,6 +689,7 @@ pub(super) fn service_caps_refusal(
         }
         container_use(
             &template.limits,
+            template.root_size.as_deref(),
             template.data.as_ref().and_then(|data| data.size.as_deref()),
         )
     };

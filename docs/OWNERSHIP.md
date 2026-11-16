@@ -1248,12 +1248,14 @@ skips every tenant's block. On the shared bridge the isolation is the NIC's: `se
 `security.ipv4_filtering` are on, so an instance cannot take another's address; a tenant's NIC also sets
 `security.ipv6_filtering`, and since the bridge has no IPv6 address the NIC is given none, so Incus drops every IPv6
 frame the instance sends and no tenant reaches another over the bridge's link-local addresses. That filter is the
-second of two layers: the NIC's ACL rejects all IPv6 by itself, as a control run showed ("Assumptions to confirm"); `security.port_isolation` stays `false`,
-since it would cut links inside a tenant; and the NIC's ACL rejects by default both ways. A tenant NIC's egress rejects the
+second of two layers: the NIC's ACL rejects all IPv6 by itself, as a control run showed ("Assumptions to confirm").
+`security.port_isolation` defaults to `false`; a container template may set `portIsolation: true` to turn it on.
+The NIC's ACL rejects by default both ways. A tenant NIC's egress rejects the
 service /24 outside its own block (the fewest CIDR ranges that cover it), and names DHCP (udp 67) and DNS (udp and tcp 53) on
 the gateway as allowed; everything else is the egress of every service: the other private ranges and the host's addresses
 rejected, the internet allowed. Ingress is a link's port (Rule 65) and, on a node that sets `kernel.tenants.front`, one
-more rule: the address of that one service of `arcak-svc`, tcp, on every port the tenant's service declares. No other
+more rule: the address of that one service of `arcak-svc`, tcp, on every declared port except the service's
+`droiddPort` control port. With only that control port declared, there is no front rule. No other
 service of the node's project is admitted. The rule follows the node: a pass (`sync_front`, every 30 seconds while the
 node serves, and at once when the front is created or a deploy is confirmed) sets each tenant service's record to the
 front's address as it is now, or to none when the node has no front or the service is provisional (Rule 67), and the

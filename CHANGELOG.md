@@ -9,6 +9,38 @@ template's image and content digest. `reach_list` shows connector state and tail
 Keyless startup allows 10 minutes for sign-in; connector logs hide the login link, and a timed-out connector is
 shown as `gave-up`. Keys remain separate, through `service_secret_set` and a restart.
 
+## 0.35.0 (2026-11-16)
+
+A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
+its old values may precede a late synchronous PATCH: Arca keeps the original values as its inverse and retries the
+entry on the next document, rather than claiming the change did not land. Gateway errors (502/503/504) also leave the
+answer uncertain for config and ACL array PATCHes and synchronous creates; ACL array PATCHes keep their original rules
+as the inverse when an uncertain answer still reads as the old rules. Runtime recovery polls open intents without
+waiting on Incus operations, with one 5 s Incus I/O budget; an absent synchronous create stays open until it can be read
+back present or restart recovery settles it. PATCH requests get 30 seconds, and service config errors include the
+kernel's reason in the answer and log.
+
+The effect journal supports a binding record from this release; once one is written, older Arca versions refuse the journal.
+
+Container templates may set `rootSize` and `portIsolation`. The root size counts with the data volume against a
+tenant's disk cap at create. Without these keys, containers keep their previous disk and NIC settings; created
+services keep their recorded values through reconfigure, image updates and rollback. A tenant's front rule excludes
+the service's `droiddPort` control port, leaving no front rule when that is its only port. On an existing node, a
+tenant service made from the shipped `omni-api` template loses its front rule at the next reconcile of its record;
+the host bridge's control rule stays. Approval cards show a container's requested root size in both the node and a
+tenant. See docs/OPERATING.md.
+
+- Merge PR 224 follow-up f8fdd73c: services_bridged accepts a container template's root size (test-only, diff read by the Orchestrator)
+- Merge PR 224: a tenant gets a desktop template with port-isolated services and a root size in the node's own project
+- Merge origin/dev v0.34.0 release commit d6075d08 into local dev
+- Merge docs/review-wording-followups (PR 225): review wording follow-ups for PRs 216, 217 and 223, comments and docs only (diff read by the Kernel Captain and the Orchestrator at 696a22f2)
+- Merge PR 222: a workspace gets a one-repository GitHub App token under a unique App name with the returned slug and bot login; reach secrets are delivered before any repository work
+- Merge PR 221: a workspace clones its project's repository once into its home, keeping the 0711 root for member runners
+- Merge feat/journal-binding-event (PR 219): the journal records which service owns a moved instance and refuses a destination owned by another entry or on another entry's source data volume
+- Merge fix/patch-timeout-settles (PR 215): an Incus write that times out or answers 502/503/504 is settled as may-have-landed with its original pre-image, never journalled as not landed
+
+## 0.34.0 (2026-11-16)
+
 Linking a `tailscale` connector to the edge now supplies its forward target as well as allowing its PROXY header.
 `TS_TARGET` remains an override, including the existing `NAME@ADDRESS:PORT` form. Both it and `TS_AUTHKEY` are optional:
 a connector may start with no key, and an unset optional secret is absent from the container's environment. Other
@@ -51,7 +83,8 @@ whole-disk snapshot storage: kernel device origins are checked, and unreadable o
 free. A mounted mapped image now has the `system` role with no folder offer, where it could previously be `in use`
 and offered as a folder target. `storage_add` refuses these devices before an exclusive open or any write, including
 when the device becomes a mapped image after approval; SATA, NVMe (including native multipath), USB and a VM's own
-virtio disks keep their offers.
+virtio disks keep their offers. Disks attached over iSCSI, Fibre Channel or SRP, and NVMe over fabrics with native
+multipath, count as machine disks and are protected only by the usual in-use checks.
 The `automagik-workspace` template prepares workspace homes, the CLI store, workspace, secrets and run directories
 under its existing persistent `/data` mount; `HOME` and `AUTOMAGIK_HOME` are `/data`. The server runs as the configured
 image user and requires `automagikPnpm`, explicitly pinned to the image's `/usr/local/bin/pnpm`, with no fallback.
@@ -71,6 +104,15 @@ initial start fails, its instance, record and other new service resources are ro
 the create are kept. Unset caps leave the old behaviour unchanged.
 `service_status` shows the recorded limits under `settings.limits`. See "Service disk and network limits" in
 docs/OPERATING.md for units and storage-driver requirements.
+
+- Merge feat/service-io-limits (PR 220): per-service disk read/write and network ingress/egress caps; a fresh capped create whose first start fails rolls back everything it added
+- Merge fix/console-token-before-ready (PR 223): the node writes and syncs the console token before it publishes its pid, so a reader keyed on the pid never sees a stale token
+- Merge feat/workspace-homes (PR 218): one Automagik workspace per project gets explicit persistent homes on /data for uid 1000 and a required pnpm path
+- Merge fix/storage-mapped-devices (PR 217): storage_list and storage_add never offer mapped RBD/NBD/loop/dm/zvol/DRBD/zram devices; native NVMe multipath stays a machine disk
+- Merge feat/reach-g2 (PR 216): linking a tailscale connector to the edge supplies its forward target; TS_TARGET/TS_AUTHKEY optional
+- Merge origin/dev (v0.33.0 release) into dev
+- Merge feat/token-service-scope: a token can be limited to named services and a time
+- Merge feat/instance-move-stopped-vm: a stopped VM moves between hosts, Ceph moves size without snapshots
 
 ## 0.33.0 (2026-11-16)
 

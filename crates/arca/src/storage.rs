@@ -87,7 +87,7 @@ pub trait BlockDevices: Send + Sync {
         DeviceLinks::try_from_sysfs(Path::new("/sys"))
     }
 
-    /// Whether the kernel identifies this as a disk of this machine, rather than a mapped image.
+    /// Classifies the kernel device origin (see [`DiskOrigin`]); it does not check the disk transport.
     /// Missing or unrecognised kernel facts fail closed.
     fn disk_origin(&self, name: &str) -> DiskOrigin {
         DiskOrigin::from_sysfs(Path::new("/sys"), name)
@@ -104,7 +104,9 @@ pub trait BlockDevices: Send + Sync {
     }
 }
 
-/// Kernel evidence that distinguishes a machine's disk (including a VM's own virtio disk) from a mapped image.
+/// Kernel device origins exclude mapped images: RBD, NBD, loop, device-mapper, zvol, DRBD and zram.
+/// iSCSI, Fibre Channel and SRP disks, and NVMe over fabrics with native multipath, count as machine disks
+/// (as does a VM's own virtio disk); only the usual in-use checks protect them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskOrigin {
     Machine,

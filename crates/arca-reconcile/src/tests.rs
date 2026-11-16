@@ -515,8 +515,18 @@ impl JournalStore for Counting {
         self.inner.append(record)
     }
 
-    fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
-        self.inner.load()
+    fn history(
+        &self,
+    ) -> Result<(Vec<arca_kernel::journal::JournalRecord>, Option<String>), KernelError> {
+        self.inner.history()
+    }
+
+    fn append_binding(
+        &mut self,
+        event: &arca_kernel::journal::BindingEvent,
+    ) -> Result<(), KernelError> {
+        *self.appended.lock().expect("the count is writable") += 1;
+        self.inner.append_binding(event)
     }
 }
 
@@ -754,4 +764,89 @@ fn a_renewal_writes_nothing_to_the_provider_or_the_journal() {
         live,
         "no record of the entry moved"
     );
+}
+
+#[test]
+fn a_counting_store_preserves_binding_history_and_can_append_another_binding() {
+    use arca_kernel::journal::{BindingEvent, BindingState};
+    let mut store = Counting::default();
+    let old = ObjectRef {
+        kind: IncusKind::Instance,
+        project: UNIT_PROJECT.into(),
+        parent: None,
+        name: "sample".into(),
+        uuid: Some("old".into()),
+    };
+    let mut target = old.clone();
+    target.uuid = None;
+    {
+        let mut journal = Journal::open(MemJournal::new()).unwrap();
+        let id = journal
+            .intend(
+                &EntryId("sample".into()),
+                EffectClass::B,
+                Digest::of(b"create"),
+                target,
+                None,
+                NOW,
+            )
+            .unwrap();
+        journal
+            .applied(
+                id,
+                old.clone(),
+                Inverse::IncusDelete {
+                    object: old.clone(),
+                },
+            )
+            .unwrap();
+        let mut new = old.clone();
+        new.uuid = Some("new".into());
+        let applied = journal.live(&EntryId("sample".into()))[0].clone();
+        let mut intent = applied.clone();
+        intent.state = EffectState::Intent;
+        intent.object = None;
+        intent.inverse = None;
+        store.inner.append(&intent).unwrap();
+        store.inner.append(&applied).unwrap();
+        journal
+            .bind(BindingEvent {
+                entry: EntryId("sample".into()),
+                at_ms: NOW,
+                from: BindingState {
+                    instance: old.clone(),
+                    root_pool: "pool1".into(),
+                    data_volume: None,
+                },
+                to: BindingState {
+                    instance: new,
+                    root_pool: "pool2".into(),
+                    data_volume: None,
+                },
+            })
+            .unwrap();
+        store
+            .inner
+            .append_binding(journal.bindings().next().unwrap())
+            .unwrap();
+    }
+    let mut journal = Journal::open(store.clone()).unwrap();
+    let previous = journal
+        .bindings()
+        .next()
+        .expect("wrapper preserves raw bindings")
+        .clone();
+    let mut next = previous.to.clone();
+    next.instance.uuid = Some("third".into());
+    next.root_pool = "pool3".into();
+    journal
+        .bind(BindingEvent {
+            entry: previous.entry,
+            from: previous.to,
+            to: next,
+            at_ms: NOW,
+        })
+        .unwrap();
+    assert_eq!(store.appended(), 1);
+    assert_eq!(journal.bindings().next().unwrap().to.root_pool, "pool3");
 }

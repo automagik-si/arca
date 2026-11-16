@@ -136,7 +136,7 @@ fn cosign_call(image: &str) -> String {
 
 /// A workspace reached on a tailnet, under the machine's own tailnet name.
 fn tailnet_settings() -> Value {
-    json!({ "reach": "tailnet", "publicUrl": TAILNET_URL, "serverImage": SERVER_IMAGE, "automagikPnpm": PNPM })
+    json!({ "reach": "tailnet", "publicUrl": TAILNET_URL, "serverImage": SERVER_IMAGE, "automagikPnpm": PNPM, "repoUrl": "https://github.com/example/project", "repoRef": "" })
 }
 
 /// What `tailscale status --json` says, as far as the keeper reads it.
@@ -152,7 +152,7 @@ fn tailnet_status(workspace: &Workspace, backend: &str, name: &str) {
 
 /// A workspace's settings with a public address and no Cloudflare Access application.
 fn settings(public_url: &str) -> Value {
-    json!({ "publicUrl": public_url, "serverImage": SERVER_IMAGE, "automagikPnpm": PNPM })
+    json!({ "publicUrl": public_url, "serverImage": SERVER_IMAGE, "automagikPnpm": PNPM, "repoUrl": "https://github.com/example/project", "repoRef": "" })
 }
 
 /// The server's explicit image-user environment, with all homes on its one /data mount.
@@ -191,6 +191,10 @@ impl Workspace {
         for sub in ["bin", "secrets", "docker", "etc"] {
             fs::create_dir_all(dir.join(sub)).expect("scratch");
         }
+        let mut settings = settings.clone();
+        if settings.get("repoUrl").is_none() {
+            settings["repoUrl"] = json!("https://github.com/example/project");
+        }
         fs::write(dir.join("etc/settings.json"), settings.to_string()).expect("settings");
         let workspace = Workspace {
             dir,
@@ -218,19 +222,67 @@ impl Workspace {
         executable(
             &workspace.dir.join("bin/curl"),
             &format!(
-                "#!{bash}\nprintf '%s\\n' \"$*\" >>'{log}'\n[ ! -e '{fail}' ] || exit 22\nwhile [ $# -gt 0 ]; do\n  case $1 in\n    -o) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ncat '{release}' >\"$out\"\n",
+                "#!{bash}\ncase \"$*\" in *api.github.com/repos/*) [ ! -e '{api_fail}' ] || exit 22; cat '{api}'; exit ;; esac\nprintf '%s\\n' \"$*\" >>'{log}'\n[ ! -e '{fail}' ] || exit 22\nwhile [ $# -gt 0 ]; do\n  case $1 in\n    -o) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ncat '{release}' >\"$out\"\n",
+                api_fail = workspace.dir.join("api-fail").display(),
+                api = workspace.dir.join("api.json").display(),
                 bash = which("bash").display(),
                 log = workspace.dir.join("curl.log").display(),
                 fail = workspace.dir.join("curl-fail").display(),
                 release = workspace.dir.join("cosign-release").display(),
             ),
         );
+        fs::write(workspace.dir.join("api.json"), r#"{"id":42}"#).expect("API");
         for program in listed_programs() {
             let link = workspace.dir.join("bin").join(&program);
             if !link.exists() {
                 std::os::unix::fs::symlink(which(&program), link).expect("a link");
             }
         }
+        // Real Git, with HTTPS transport redirected only in this test process to a local repository.
+        let source = workspace.dir.join("source");
+        fs::create_dir(&source).expect("source");
+        git_at(&source, &["init", "-b", "main"]);
+        git_at(&source, &["config", "user.name", "Fixture"]);
+        git_at(&source, &["config", "user.email", "fixture@example.org"]);
+        fs::write(source.join("README"), "project\n").expect("source file");
+        git_at(&source, &["add", "."]);
+        git_at(&source, &["commit", "-m", "fixture"]);
+        fs::write(
+            workspace.dir.join("git-global"),
+            format!(
+                "[url \"{}\"]\n    insteadOf = https://github.com/example/project\n",
+                source.display()
+            ),
+        )
+        .expect("test Git transport");
+        workspace.secret_named("GITHUB_TOKEN", "synthetic-repository-credential");
+        workspace.secret_named("GITHUB_BOT_ID", "42");
+        workspace.secret_named(
+            "GITHUB_BOT_IDENTITY",
+            r#"{"id":"42","login":"arca-repositories[bot]"}"#,
+        );
+        // Privilege switching is the only fake: CI runs unprivileged, already as the target uid.
+        // Remove the listed-program symlink before installing a stand-in.
+        let _ = fs::remove_file(workspace.dir.join("bin/setpriv"));
+        executable(
+            &workspace.dir.join("bin/setpriv"),
+            &format!(
+                "#!{}\n[ \"$1 $2 $3 $4 $5 $6\" = \"--reuid {} --regid {} --clear-groups --\" ] || exit 98\nshift 6\nexec \"$@\"\n",
+                which("bash").display(),
+                me().split(':').next().unwrap(),
+                me().split(':').nth(1).unwrap()
+            ),
+        );
+        let _ = fs::remove_file(workspace.dir.join("bin/git"));
+        executable(
+            &workspace.dir.join("bin/git"),
+            &format!(
+                "#!{}\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+                which("bash").display(),
+                workspace.dir.join("git-argv.log").display(),
+                which("git").display()
+            ),
+        );
         workspace
     }
 
@@ -269,6 +321,8 @@ impl Workspace {
         command
             .env_clear()
             .env("PATH", self.dir.join("bin"))
+            .env("GIT_CONFIG_GLOBAL", self.dir.join("git-global"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("WS_NAME", "team1")
             .env("WS_SETTINGS", self.dir.join("etc/settings.json"))
             .env("WS_SECRETS", self.dir.join("secrets"))
@@ -298,6 +352,8 @@ impl Workspace {
             .env("WS_RUNNER_TMPFILES", self.dir.join("runner-tmpfiles.conf"))
             .env("WS_SUDOERS", self.dir.join("sudoers.d"))
             .env("WS_PROC", self.dir.join("docker/proc"))
+            .env("FAKE_CHECKOUT_MARKER", self.dir.join("checkout.json"))
+            .env("FAKE_CHECKOUT_TARGET", self.dir.join("data/workspace"))
             .env("FAKE_DOCKER_DIR", self.dir.join("docker"));
         command
     }
@@ -400,7 +456,11 @@ impl Workspace {
         fn walk(dir: &Path, out: &mut String) {
             for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
                 let path = entry.path();
-                if path.ends_with("secrets") || path.ends_with("run") || path.ends_with("bin") {
+                if path.ends_with("secrets")
+                    || path.ends_with("run")
+                    || path.ends_with("run-github")
+                    || path.ends_with("bin")
+                {
                     continue;
                 }
                 if path.is_dir() {
@@ -607,7 +667,10 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     );
     // One secret for each reach: the tunnel's token, under the name the cloudflare-tunnel template uses, and the
     // tailnet node's auth key.
-    assert_eq!(template.secrets, ["TUNNEL_TOKEN", "TAILSCALE_AUTHKEY"]);
+    assert_eq!(
+        template.secrets,
+        ["TUNNEL_TOKEN", "TAILSCALE_AUTHKEY", "GITHUB_TOKEN"]
+    );
     let tunnel = arca::service::load_template(&dir, "cloudflare-tunnel").expect("the tunnel");
     assert_eq!(tunnel.secrets, template.secrets[..1]);
     // Nothing of it is offered to the service network or to the host: no port, no link, no host listener.
@@ -646,6 +709,8 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             "memberRunner",
             "publicUrl",
             "reach",
+            "repoRef",
+            "repoUrl",
             "serverImage"
         ]
     );
@@ -696,7 +761,9 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             "accessAudience",
             "accessEmails",
             "memberRunner",
-            "automagikPnpm"
+            "automagikPnpm",
+            "repoUrl",
+            "repoRef"
         ]
     );
     // The member runner ships off; a create turns it on with true, and nothing else.
@@ -760,7 +827,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     assert!(unset.read("docker/calls.log").is_empty());
     assert_eq!(unset.stop(), Some(0));
     let configured =
-        arca::service::create_settings(&template, Some(&json!({ "automagikPnpm": PNPM })))
+        arca::service::create_settings(&template, Some(&json!({ "automagikPnpm": PNPM, "repoUrl": "https://github.com/example/project", "repoRef": "" })))
             .expect("the image owner's explicit pnpm path")
             .merged
             .expect("settings");
@@ -2427,7 +2494,7 @@ fn the_first_boot_installs_what_it_names_and_speaks_on_the_console() {
     // Compose is not needed: the keeper starts the containers itself.
     assert_eq!(
         workspace.read("apt-get.log"),
-        "update -q\ninstall -y -q --no-install-recommends docker.io docker-cli jq ca-certificates coreutils curl\n"
+        "update -q\ninstall -y -q --no-install-recommends docker.io docker-cli jq ca-certificates coreutils curl git util-linux findutils\n"
     );
     // The provenance verifier: Sigstore's release for this machine's architecture, over https only, kept at its
     // place once its sha256 is the one fixed (here the stand-in's).
@@ -2487,7 +2554,7 @@ fn a_first_boot_that_fails_says_on_the_console_what_is_missing_or_did_not_start(
     let console = workspace.read("console.log");
     assert!(
         console.contains(
-            "first boot failed: these commands are missing after the install: docker. The packages asked for were: docker.io docker-cli jq ca-certificates coreutils curl."
+            "first boot failed: these commands are missing after the install: docker. The packages asked for were: docker.io docker-cli jq ca-certificates coreutils curl git util-linux findutils."
         ),
         "{console}"
     );
@@ -2559,3 +2626,23 @@ fn a_first_boot_that_fails_says_on_the_console_what_is_missing_or_did_not_start(
     assert!(!workspace.dir.join("verifier/cosign.part").exists());
     assert!(!workspace.dir.join("installed").exists());
 }
+
+fn git_at(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new(which("git"))
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[path = "automagik_workspace/checkout.rs"]
+mod checkout;

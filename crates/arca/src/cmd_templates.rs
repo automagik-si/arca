@@ -61,12 +61,12 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
-    // 0.34.0: before keyless Tailscale starts waited ten minutes for sign-in.
+    // 0.34.0 to 0.35.0: before keyless Tailscale starts waited ten minutes for sign-in.
     (
         "tailscale.sh",
         "21711cabba260ff9994d80164d3ee3d6cc626b3de101c0ee2b9f1c3730be76aa",
     ),
-    // 0.32.0: before the edge provided its target and the Cloudflare template named its connector kind.
+    // 0.32.0 to 0.33.0: before the edge provided its target and the Cloudflare template named its connector kind.
     (
         "arca-edge.json",
         "56e40fd9a6d77b8c6c35fac7a61575488ef5db044a45177660c682af31ca8a71",
@@ -75,7 +75,7 @@ pub const EARLIER: &[(&str, &str)] = &[
         "cloudflare-tunnel.json",
         "ab2bbb77cd12d1b4c6fb0bd5a75ee2901552cdfbc01dedbc76b5c5b1ceb611e1",
     ),
-    // Installed from the unreleased Tailscale template: before linked targets and optional secrets.
+    // 0.33.0: before linked targets and optional secrets.
     (
         "tailscale.json",
         "6afdbdaf54a0f91590aa1f1e86cde5c1677a3f8447693e4c69296a28fd868145",
@@ -83,6 +83,15 @@ pub const EARLIER: &[(&str, &str)] = &[
     (
         "tailscale.sh",
         "5cc08fec28a57c18c16a641239a7cfd98524beaa371da60bfdbc4cc7c87ba38f",
+    ),
+    // Before repository checkout delivery.
+    (
+        "automagik-workspace.json",
+        "666f14f5b4aa401163d9129a5f03c2885aac1806cb567248251f22910f5946db",
+    ),
+    (
+        "automagik-workspace.sh",
+        "7bc571143a3c38a66a99be21e7d0bc2fbb874b71a05aa07d88440a53f93a06a9",
     ),
     // 0.33.0: before explicit persistent homes and the required baked pnpm path.
     (
