@@ -128,6 +128,34 @@ fn approved_connect_links_starts_and_lists_without_the_sign_in_link() {
     let cfg = rig.service_config("node1-ts");
     assert_eq!(cfg.links[0].to, "edge");
     assert!(cfg.start && cfg.autostart);
+    let requests = rig.fake.requests();
+    let first_start = requests
+        .iter()
+        .position(|request| {
+            request.method == "PUT" && request.path.starts_with("/1.0/instances/node1-ts/state?")
+        })
+        .expect("one explicit first start after linking");
+    let connector_config = requests
+        .iter()
+        .rposition(|request| {
+            request.method == "PATCH" && request.path.starts_with("/1.0/instances/node1-ts?")
+        })
+        .expect("the linked environment is written");
+    let edge_link = requests
+        .iter()
+        .rposition(|request| {
+            request.method == "PATCH"
+                && request
+                    .path
+                    .starts_with("/1.0/network-acls/arcak-svc-svc-edge?")
+        })
+        .expect("the edge allows the connector");
+    assert!(
+        connector_config < first_start && edge_link < first_start,
+        "the first start must already have the linked target and edge ACL"
+    );
+    assert_eq!(rig.fake.state_actions(PROJECT, "node1-ts"), ["start"]);
+
     assert_eq!(
         rig.get(&format!("/1.0/instances/node1-ts?project={PROJECT}"))
             .unwrap()["config"]["environment.ARCA_EDGE_TARGET"],
