@@ -13,6 +13,7 @@ Downgrading below this release is therefore not supported once a service was cre
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
 uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents
 the rollback or changes its result.
+Both reads are marked as carrying untrusted text because labels are caller data.
 
 ## 0.35.0 (2026-11-16)
 

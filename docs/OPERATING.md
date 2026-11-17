@@ -884,6 +884,7 @@ Do not downgrade below this release once a service was created or written: older
 secrets or policy, and do not change boot behavior. A string sets a value (including an empty string), and null removes
 a key. Bounds apply after merging: 128 bytes per key, 4096 bytes per value, 128 keys and 65536 bytes of compact JSON.
 The full map is returned and appears as `labels` in `service_status` and `service_list`, empty when none is stored.
+Label text is caller data, so both reads are marked as carrying untrusted text.
 Label writes check ownership and If-Match, read the instance back, and are not journalled. Result `code: unconfirmed`
 means the PATCH answer was uncertain: the returned map is what was read, and the write may still land later; read
 status again before deciding what to do. If read-back is unavailable, `labels_unconfirmed` reports that uncertainty.

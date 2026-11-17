@@ -1449,8 +1449,9 @@ mod tests {
         conforms(&(list.result)(), &capped).unwrap();
         let result = tool_result(list, capped, Some(&cut), false);
         let rows = "\n- svc (nats): running at 192.0.2.10".repeat(50);
+        assert_eq!(result["content"][0]["text"], UNTRUSTED_NOTE);
         assert_eq!(
-            result["content"][0]["text"],
+            result["content"][1]["text"],
             format!(
                 "256 service(s){rows}\n- and 206 more\n(truncated: 3 service row(s) omitted of 259 original row(s))"
             )
