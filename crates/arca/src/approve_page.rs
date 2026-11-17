@@ -70,6 +70,8 @@ use crate::peer_sync::PeerSyncer;
 
 /// The page's own body cap. `arca-mcp`'s 64 KiB layer is private and does not reach merged routes.
 const PAGE_BODY_BYTES: usize = 64 * 1024;
+/// The open connector route reuses its last read for fifteen seconds.
+const REACH_READ_WINDOW_MS: u64 = 15 * 1000;
 /// The refusal a linked-host name the page does not list gets, in the owner's words.
 const NOT_LINKED: &str = "this machine is not linked for approvals yet";
 /// A setup code lives for ten minutes.
@@ -150,6 +152,13 @@ struct PageState {
     /// The GitHub signer, when the page serves `/approve/github` (see `crate::github_page`).
     github: Option<crate::github_signer::Signer>,
     reach: Option<ReachReads>,
+    reach_cache: Arc<Mutex<Option<ReachSnapshot>>>,
+}
+
+/// An in-memory row read, including a failed read so failures cannot bypass the window.
+struct ReachSnapshot {
+    at: u64,
+    rows: Result<Vec<Value>, CallError>,
 }
 
 /// What the page shows for the terminal's command when `serve` gave it none: the command, with the config to fill in.
@@ -357,6 +366,7 @@ impl Page {
                 setup_command: SETUP_COMMAND.to_string(),
                 github: None,
                 reach: None,
+                reach_cache: Arc::new(Mutex::new(None)),
             },
         }
     }
@@ -1200,7 +1210,26 @@ async fn reach(State(state): State<Arc<PageState>>) -> Response {
     let Some(reads) = state.reach.clone() else {
         return canvas_json(StatusCode::OK, json!({"connectors":[]}));
     };
-    match tokio::task::spawn_blocking(move || (reads.rows)()).await {
+    match tokio::task::spawn_blocking(move || {
+        // Keep the lock through the read: concurrent GETs share its result, as peer-key sync does.
+        let mut last = state
+            .reach_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(snapshot) = last.as_ref()
+            && (state.clock)().saturating_sub(snapshot.at) < REACH_READ_WINDOW_MS
+        {
+            return snapshot.rows.clone();
+        }
+        let rows = (reads.rows)();
+        *last = Some(ReachSnapshot {
+            at: (state.clock)(),
+            rows: rows.clone(),
+        });
+        rows
+    })
+    .await
+    {
         Ok(Ok(rows)) => canvas_json(StatusCode::OK, json!({"connectors":rows})),
         _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -1244,7 +1273,11 @@ async fn reach_sign_in(State(state): State<Arc<PageState>>, body: Bytes) -> Resp
             .check_approval(ArcaAction::ReachSignIn, &name, &json!({}), &approval, now)
             .map_err(change_refused)?;
         match (reads.sign_in)(&name) {
-            Ok(Some(url)) => Ok(json!({"signInUrl":url})),
+            Ok(Some(url)) => {
+                // Clear after any in-flight row read finishes, so it cannot put stale rows back after this proof.
+                *state.reach_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                Ok(json!({"signInUrl":url}))
+            },
             Ok(None) => Err(Box::new(canvas_json(StatusCode::CONFLICT, json!({"refusal":"not_waiting", "message":"This connector is not waiting for sign-in."})))),
             Err(_) => Err(Box::new(canvas_json(StatusCode::NOT_FOUND, json!({"refusal":"not_found", "message":"Tailscale connector not found."})))),
         }

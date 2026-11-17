@@ -6,6 +6,7 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 The approval page lists connectors separately from waiting cards. A waiting Tailscale connector has a sign-in button
 that checks the owner's passkey before reading and opening its link. The link is never cached or recorded by Arca.
+The page reuses connector rows for up to 15 seconds, and a successful passkey sign-in makes its next read fresh.
 `reach_disconnect` needs an approved erasing card: it unlinks and removes the connector and its state volume. Remove
 the machine's remaining entry in Tailscale's admin page yourself.
 
