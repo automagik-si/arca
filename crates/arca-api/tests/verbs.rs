@@ -415,7 +415,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
         ],
     );
 
-    let action_names = [
+    let action_names: &[&str] = &[
         "reach_connect",
         "service_create",
         "service_remove",
