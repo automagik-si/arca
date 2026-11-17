@@ -333,6 +333,11 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 json!({ "from": "api", "to": "nats", "tenant": "abcdefgh" })
             }
             ActionKind::PostgresCreate => json!({ "name": "orders" }),
+            ActionKind::ReachConnect => json!({
+                "kind": "tailscale", "name": "node-ts",
+                "image": format!("ghcr.io/tailscale/tailscale@sha256:{}", "a".repeat(64)),
+                "templateDigest": "ab".repeat(32),
+            }),
             ActionKind::GpuAttach | ActionKind::GpuDetach => json!({
                 "project": "arcak-gpu",
                 "instance": "alpha",
@@ -412,6 +417,23 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             prepared
         };
         let details = action.details(&prepared);
+        if action == ActionKind::ReachConnect {
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                ["Name", "Connector", "Effect", "Image", "Template content"]
+            );
+            assert_eq!(details[0].value, "node-ts");
+            assert_eq!(details[1].value, "Tailscale");
+            assert!(
+                details[2]
+                    .value
+                    .contains("link it to this node's edge and start it")
+            );
+            assert_eq!(details[3].value, prepared["image"].as_str().unwrap());
+            assert!(details[4].value.contains(&"ab".repeat(32)));
+            continue;
+        }
         if matches!(action, ActionKind::GpuAttach | ActionKind::GpuDetach) {
             let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
             assert_eq!(labels, ["Project", "Instance", "GPU", "Effect"]);

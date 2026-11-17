@@ -56,6 +56,7 @@ pub enum ArcaAction {
     /// The owner lets an MCP client act on this node with the scope it asked for (OAuth, `crate::mcp_oauth` in `arca`).
     /// The target is the client's id; the approval changes nothing in the kernel and is spent at the consent page.
     McpAuthorize,
+    ReachConnect,
     RouteAdd,
     RouteRemove,
     InstanceImport,
@@ -103,6 +104,7 @@ impl ArcaAction {
             Self::InstanceMove => "instance_move",
             Self::InstanceMoveFinish => "instance_move_finish",
             Self::McpAuthorize => "mcp_authorize",
+            Self::ReachConnect => "reach_connect",
             Self::RouteAdd => "route_add",
             Self::RouteRemove => "route_remove",
             Self::InstanceImport => "instance_import",
@@ -150,6 +152,7 @@ impl ArcaAction {
             "instance_move" => Some(Self::InstanceMove),
             "instance_move_finish" => Some(Self::InstanceMoveFinish),
             "mcp_authorize" => Some(Self::McpAuthorize),
+            "reach_connect" => Some(Self::ReachConnect),
             "route_add" => Some(Self::RouteAdd),
             "route_remove" => Some(Self::RouteRemove),
             "instance_import" => Some(Self::InstanceImport),

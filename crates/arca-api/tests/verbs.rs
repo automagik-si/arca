@@ -119,6 +119,8 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "github_mint_job",
             "github_disconnect",
             "os_update",
+            "reach_connect",
+            "reach_list",
             "route_add",
             "route_remove",
             "route_list",
@@ -414,6 +416,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
     );
 
     let action_names = [
+        "reach_connect",
         "service_create",
         "service_remove",
         "service_update",
@@ -2143,6 +2146,7 @@ fn node_is_an_optional_argument_of_every_read_and_of_action_propose_only() {
     assert!(verb("action_propose").expect("present").takes_node());
     assert!(verb("watch_report").expect("present").takes_node());
     assert!(verb("route_list").expect("present").takes_node());
+    assert!(verb("reach_list").expect("present").takes_node());
 }
 
 /// The support verbs: a viewer files a report and reads its state and the feed; only an operator, or a token whose list
@@ -2275,4 +2279,26 @@ fn a_rebind_proposal_accepts_only_the_callers_name() {
         .unwrap();
     assert!(branch["properties"].get("binding").is_none());
     assert!(conforms(branch, &json!({"name":"sample","binding":{}})).is_err());
+}
+
+#[test]
+fn reach_verbs_and_their_proposals_stay_outside_service_limited_tokens() {
+    use arca_api::limits::{ServiceLimit, check};
+    let limited = ServiceLimit::parse("node-ts,edge").expect("two named services");
+    for (name, args) in [
+        (
+            "reach_connect",
+            json!({"kind":"tailscale","name":"node-ts"}),
+        ),
+        ("reach_list", json!({})),
+        (
+            "action_propose",
+            json!({"action":"reach_connect","args":{"kind":"tailscale","name":"node-ts"}}),
+        ),
+    ] {
+        assert!(
+            check(verb(name).expect("registered verb"), &limited, &args).is_err(),
+            "{name} reaches the node beyond a token's named services"
+        );
+    }
 }

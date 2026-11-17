@@ -115,7 +115,7 @@ pub const LINKED_NODE: &str = "linkedNode";
 /// The verbs that take [`NODE`]: every read the MCP door serves, and `action_propose`. Not the three `owner_approval_*`
 /// reads: their rows are the calling token's own requests, and a relayed call is the linked token's, never the caller's.
 /// Not the `support_*` verbs either: a report is filed, read and picked up on the node it is filed with.
-pub const NODE_VERBS: [&str; 30] = [
+pub const NODE_VERBS: [&str; 31] = [
     "arca_status",
     "node_metrics",
     "watch_report",
@@ -145,6 +145,7 @@ pub const NODE_VERBS: [&str; 30] = [
     "github_bindings",
     "github_audit",
     "os_update",
+    "reach_list",
     "route_list",
 ];
 
@@ -171,7 +172,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 95] = [
+static VERBS: [Verb; 97] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1468,6 +1469,36 @@ static VERBS: [Verb; 95] = [
         target: Target::Node,
     },
     Verb {
+        name: "reach_connect",
+        summary: "Create a Tailscale connector, link it to this node's edge and start it. Runs only from an approved action proposal; the card binds the template's image and content digest. Takes no key: an optional key is set with service_secret_set and the connector restarted. Returns the connector's state, never its sign-in link.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_reach,
+        cut: no_cut,
+        params: reach_connect_params,
+        result: reach_row,
+        target: Target::Node,
+    },
+    Verb {
+        name: "reach_list",
+        summary: "The node's connectors and their edge and state. Tailscale reports stopped, waiting-sign-in, gave-up, unknown or running, with its tailnet name and address when available. Never returns a sign-in link.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: Some("connectors"),
+        summary_text: summary_reach,
+        cut: no_cut,
+        params: on_node!(empty_params),
+        result: reach_list_result,
+        target: Target::Node,
+    },
+    Verb {
         name: "route_add",
         summary: "Serve https://<hostname> from this node's edge (the arca-edge service) to an instance of this node, in any project, on one tcp port, with a certificate by the Cloudflare DNS challenge. reach private (default) answers only the local networks and the tailnet, others get 403; public has no filter. The instance's address is read from Incus now and the edge's firewall opens it; an Arca service needs a link from the edge (service_connect). A hostname that has a route is re-pointed. The route is kept in the edge's desired state, its config is written and Caddy reloaded; a refused reload keeps the old config and the answer says so. From an approved proposal or a doctor token.",
         class: VerbClass::L,
@@ -1907,6 +1938,42 @@ fn hostname_schema() -> Value {
         "type": "string"
     })
 }
+fn reach_connect_params() -> Value {
+    json!({"type":"object", "additionalProperties":false,
+        "properties": {
+            "kind": {"type":"string", "enum":["tailscale"]},
+            "name": service_name_schema("Connector name. Default: the node's name followed by -ts, or tailscale if that is not a valid service name."),
+            "approval": {"type":"string", "minLength":1, "maxLength":16384, "description":"The one-shot grant of the approved action proposal."},
+            "image": {"type":"string", "description":"Filled in from the tailscale template by the kernel when proposed."},
+            "templateDigest": {"type":"string", "description":"The template content digest, filled in by the kernel when proposed."}
+        }, "required":["kind", "approval"]})
+}
+fn reach_row() -> Value {
+    json!({"type":"object", "additionalProperties":false,
+        "properties": {
+            "name":{"type":"string"}, "kind":{"type":"string"},
+            "edge":{"type":["string", "null"]},
+            "state":{"type":"string", "enum":["stopped", "waiting-sign-in", "gave-up", "unknown", "running"]},
+            "tailnetName":{"type":"string"}, "tailnetAddress":{"type":"string"}
+        }, "required":["name", "kind", "edge", "state"]})
+}
+fn reach_list_result() -> Value {
+    json!({"type":"object", "additionalProperties":false,
+        "properties":{"connectors":{"type":"array", "items":reach_row()}}, "required":["connectors"]})
+}
+fn summary_reach(v: &Value) -> String {
+    match v["name"].as_str() {
+        Some(name) => format!(
+            "Connector {name}: {}.",
+            v["state"].as_str().unwrap_or("stopped")
+        ),
+        None => format!(
+            "{} connectors.",
+            v["connectors"].as_array().map_or(0, Vec::len)
+        ),
+    }
+}
+
 fn route_add_params() -> Value {
     json!({
         "additionalProperties": false,
@@ -4358,7 +4425,8 @@ fn plan_list_result() -> Value {
 }
 
 /// The twenty-nine verbs an action proposal may name. The list is closed here and checked by the handler again.
-pub(crate) const ACTION_NAMES: [&str; 32] = [
+pub(crate) const ACTION_NAMES: [&str; 33] = [
+    "reach_connect",
     "service_create",
     "service_remove",
     "service_update",
@@ -4465,7 +4533,8 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 32] = [
+const ACTION_EXAMPLES: [(&str, &str); 33] = [
+    ("reach_connect", r#"{"kind":"tailscale"}"#),
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (

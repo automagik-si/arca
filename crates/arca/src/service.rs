@@ -1666,13 +1666,6 @@ pub struct Template {
 }
 
 /// A service's connector kind, including a service made before its record carried the kind.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the next reach change uses connector kinds to show sign-in links"
-    )
-)]
 pub(crate) fn connector_kind<'a>(
     record: &'a ServiceConfig,
     template: Option<&'a Template>,

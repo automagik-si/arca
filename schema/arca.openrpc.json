@@ -2516,6 +2516,7 @@
                     "properties": {
                       "action": {
                         "enum": [
+                          "reach_connect",
                           "service_create",
                           "service_remove",
                           "service_update",
@@ -2657,6 +2658,7 @@
           "required": true,
           "schema": {
             "enum": [
+              "reach_connect",
               "service_create",
               "service_remove",
               "service_update",
@@ -2698,6 +2700,41 @@
           "required": true,
           "schema": {
             "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The args of reach_connect: Create a Tailscale connector, link it to this node's edge and start it. Runs only from an approved action proposal; the card binds the template's image and content digest. Takes no key: an optional key is set with service_secret_set and the connector restarted. Returns the connector's state, never its sign-in link. Example: {\"kind\":\"tailscale\"}",
+                "examples": [
+                  {
+                    "kind": "tailscale"
+                  }
+                ],
+                "properties": {
+                  "image": {
+                    "description": "Filled in from the tailscale template by the kernel when proposed.",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "tailscale"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "Connector name. Default: the node's name followed by -ts, or tailscale if that is not a valid service name.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "templateDigest": {
+                    "description": "The template content digest, filled in by the kernel when proposed.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "title": "reach_connect",
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "The args of service_create: Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or a virtual machine on the service network or on an existing host bridge the node allows. With start: false it is created stopped, so service_secret_set and service_connect put its secrets and links in place before instance_start starts it for the first time. Example: {\"name\":\"nats\",\"template\":\"nats\"}",
@@ -4252,6 +4289,7 @@
           "properties": {
             "action": {
               "enum": [
+                "reach_connect",
                 "service_create",
                 "service_remove",
                 "service_update",
@@ -4758,6 +4796,7 @@
           "properties": {
             "action": {
               "enum": [
+                "reach_connect",
                 "service_create",
                 "service_remove",
                 "service_update",
@@ -15603,6 +15642,182 @@
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "reach_connect",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot grant of the approved action proposal.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": true,
+          "schema": {
+            "enum": [
+              "tailscale"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "image",
+          "required": false,
+          "schema": {
+            "description": "Filled in from the tailscale template by the kernel when proposed.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": false,
+          "schema": {
+            "description": "Connector name. Default: the node's name followed by -ts, or tailscale if that is not a valid service name.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "templateDigest",
+          "required": false,
+          "schema": {
+            "description": "The template content digest, filled in by the kernel when proposed.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "edge": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "stopped",
+                "waiting-sign-in",
+                "gave-up",
+                "unknown",
+                "running"
+              ],
+              "type": "string"
+            },
+            "tailnetAddress": {
+              "type": "string"
+            },
+            "tailnetName": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "edge",
+            "state"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Create a Tailscale connector, link it to this node's edge and start it. Runs only from an approved action proposal; the card binds the template's image and content digest. Takes no key: an optional key is set with service_secret_set and the connector restarted. Returns the connector's state, never its sign-in link.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "reach_list",
+      "params": [
+        {
+          "name": "node",
+          "required": false,
+          "schema": {
+            "description": "Ask a linked node instead of this kernel: the name of one of its linked hosts (arca_status lists them under approval.linkedHosts). Your own access is checked here first; the call then runs on that node and its answer comes back as that node gave it, with linkedNode naming it (a proposal waits on that node, and this kernel's approval page shows it with the node named). A name that is not linked, or a node that does not answer, is an error, never this kernel's answer. Absent: this kernel.",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "connectors": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "edge": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "enum": [
+                      "stopped",
+                      "waiting-sign-in",
+                      "gave-up",
+                      "unknown",
+                      "running"
+                    ],
+                    "type": "string"
+                  },
+                  "tailnetAddress": {
+                    "type": "string"
+                  },
+                  "tailnetName": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind",
+                  "edge",
+                  "state"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "connectors"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The node's connectors and their edge and state. Tailscale reports stopped, waiting-sign-in, gave-up, unknown or running, with its tailnet name and address when available. Never returns a sign-in link.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "doctor",
       "x-arca-writes": false
     },
     {

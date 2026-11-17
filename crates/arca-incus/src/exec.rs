@@ -92,6 +92,8 @@ pub enum ExecCommand {
     MakeKeyDir,
     Join(TailnetNode),
     TailnetStatus,
+    /// Read the OCI Tailscale connector through its own socket.
+    ConnectorStatus,
     ServeOn(DashPort),
     ServeStatus,
     ServeOff,
@@ -111,6 +113,7 @@ impl ExecCommand {
             Self::MakeKeyDir => "make_key",
             Self::Join(_) => "join",
             Self::TailnetStatus => "tailnet_status",
+            Self::ConnectorStatus => "connector_status",
             Self::ServeOn(_) => "serve_on",
             Self::ServeStatus => "serve_status",
             Self::ServeOff => "serve_off",
@@ -181,6 +184,13 @@ impl ExecCommand {
                 "--accept-routes=false".into(),
                 "--accept-dns=false".into(),
                 "--timeout=60s".into(),
+            ],
+            Self::ConnectorStatus => vec![
+                "/usr/local/bin/tailscale".into(),
+                "--socket=/tmp/tailscaled.sock".into(),
+                "status".into(),
+                "--json".into(),
+                "--peers=false".into(),
             ],
             Self::TailnetStatus => vec![
                 "/usr/bin/tailscale".into(),

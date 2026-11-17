@@ -6221,6 +6221,26 @@ What to know:
 
 ## Reaching a service over your own tailnet (Tailscale)
 
+Propose `reach_connect` with `{"kind":"tailscale"}` through `action_propose`, then approve its card. It creates a
+connector, links it to this node's existing edge and starts it. The default service name is the node's name followed
+by `-ts` (or `tailscale` when that does not fit); an optional `name` chooses another service name. The card states the
+template's image and content digest. A node without an edge explains what to create first.
+
+`reach_list` (doctor scope) shows each connector's name, kind, edge and state. A Tailscale connector is
+`waiting-sign-in` until it joins, then `running` with its tailnet name and address when available. A running instance
+whose Tailscale status cannot be read is `unknown`; retry the read to check whether sign-in is needed. A stopped connector
+whose console records containerboot's authentication deadline is `gave-up`; restart it to retry. Other stops are
+`stopped`. Every keyless startup allows 10 minutes for sign-in, preserving an
+explicit `TS_BOOT_TIMEOUT`. This is a process deadline, not a known lifetime for the sign-in link. The link never
+appears in a verb's answer, journal or kernel log; connector logs replace it with `[sign-in link]`. The owner page's
+sign-in button is a separate change. Until it is available, use an auth key through the hand path below.
+
+A key never goes into a proposal: set `TS_AUTHKEY` with `service_secret_set` and restart the connector. Status fields
+and timeout detection follow Tailscale 1.104.7's source and tolerate missing fields; the pinned image's actual output,
+socket access, link lifetime and persisted login have not yet been verified by a live run.
+
+### Hand path with an auth key
+
 The shipped `tailscale` template is the Cloudflare connector's twin for a tailnet: it puts one of your services on your
 own Tailscale network, and nowhere else, without opening a port on your router. Arca runs Tailscale's own node as one
 more service. It joins your tailnet under the service's name and hands every connection to port 443 of its tailnet

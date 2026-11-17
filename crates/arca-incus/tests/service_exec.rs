@@ -60,6 +60,17 @@ fn every_closed_step_has_the_exact_absolute_timeout_argv_and_request_body() {
             ],
         ),
         (
+            C::ConnectorStatus,
+            30,
+            vec![
+                "/usr/local/bin/tailscale",
+                "--socket=/tmp/tailscaled.sock",
+                "status",
+                "--json",
+                "--peers=false",
+            ],
+        ),
+        (
             C::TailnetStatus,
             30,
             vec!["/usr/bin/tailscale", "status", "--json"],

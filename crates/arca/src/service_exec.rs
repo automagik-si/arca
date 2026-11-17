@@ -140,6 +140,14 @@ impl ServiceExec {
         writer_for(&self.cfg, target, budget)
     }
     pub fn check(&self, target: &ExecTarget, writer: &UnixIncusWriter) -> Result<Owned, ExecError> {
+        self.check_command(target, writer, false)
+    }
+    fn check_command(
+        &self,
+        target: &ExecTarget,
+        writer: &UnixIncusWriter,
+        connector_status: bool,
+    ) -> Result<Owned, ExecError> {
         let cfg = &target.service;
         if cfg.adopted {
             return Err(ExecError::Refused("adopted"));
@@ -151,8 +159,11 @@ impl ServiceExec {
         {
             return Err(ExecError::Refused("target"));
         }
-        // An OCI image carries none of the tools of a system container; only an edge's own closed command runs in one.
-        if cfg.source["protocol"] == "oci" && cfg.edge.is_none() {
+        if connector_status && crate::reach::kind(&self.cfg, cfg).is_none() {
+            return Err(ExecError::Refused("connector"));
+        }
+        // The connector's status read is the sole new OCI command; every existing command keeps its old rule.
+        if cfg.source["protocol"] == "oci" && cfg.edge.is_none() && !connector_status {
             return Err(ExecError::Refused("oci"));
         }
         let uuid = target.uuid.as_ref().ok_or(ExecError::Refused("uuid"))?;
@@ -199,7 +210,11 @@ impl ServiceExec {
         let mut bytes = 0;
         let mut attempted = false;
         let mut result = (|| {
-            let owned = self.check(target, &writer)?;
+            let owned = self.check_command(
+                target,
+                &writer,
+                matches!(command, ExecCommand::ConnectorStatus),
+            )?;
             {
                 let mut hung = self.hung.lock().map_err(|_| ExecError::Audit)?;
                 if hung

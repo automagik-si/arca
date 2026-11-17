@@ -82,6 +82,7 @@ pub enum ActionKind {
     HostNetworkRestore,
     InstanceMove,
     InstanceMoveFinish,
+    ReachConnect,
     RouteAdd,
     RouteRemove,
     InstanceImport,
@@ -174,6 +175,7 @@ impl ActionKind {
         Self::HostNetworkRestore,
         Self::InstanceMove,
         Self::InstanceMoveFinish,
+        Self::ReachConnect,
         Self::RouteAdd,
         Self::RouteRemove,
         Self::InstanceImport,
@@ -240,6 +242,7 @@ impl ActionKind {
             Self::InstanceMoveFinish => {
                 "It cannot be undone: the source instances and their custom volumes are deleted from this host; the moved copies on the target stay."
             }
+            Self::ReachConnect => "Ask your assistant to disconnect and remove the connector.",
             Self::RouteAdd => "Ask your assistant to stop serving the address.",
             Self::RouteRemove => "Ask your assistant to serve the address again.",
             Self::InstanceImport => {
@@ -288,7 +291,10 @@ impl ActionKind {
 
     /// Whether the card says what the action takes of the node: a create from a template does.
     pub fn says_uses(self) -> bool {
-        matches!(self, Self::ServiceCreate | Self::PostgresCreate)
+        matches!(
+            self,
+            Self::ServiceCreate | Self::PostgresCreate | Self::ReachConnect
+        )
     }
 
     /// The verb name this action runs.
@@ -322,6 +328,7 @@ impl ActionKind {
             Self::HostNetworkRestore => "host_network_restore",
             Self::InstanceMove => "instance_move",
             Self::InstanceMoveFinish => "instance_move_finish",
+            Self::ReachConnect => "reach_connect",
             Self::RouteAdd => "route_add",
             Self::RouteRemove => "route_remove",
             Self::InstanceImport => "instance_import",
@@ -371,9 +378,14 @@ impl ActionKind {
     /// was given no node). Such a proposal is never approved: what its card showed cannot be held to. `None` for
     /// every other action, and for a database of the old kind, which is made from no template.
     pub fn unbound_template(self, args: &Value) -> Option<&str> {
+        if self == Self::ReachConnect {
+            return args.get("templateDigest").is_none().then_some("tailscale");
+        }
         let template = args.get("template")?.as_str()?;
-        (matches!(self, Self::ServiceCreate | Self::PostgresCreate)
-            && args.get("templateDigest").is_none())
+        (matches!(
+            self,
+            Self::ServiceCreate | Self::PostgresCreate | Self::ReachConnect
+        ) && args.get("templateDigest").is_none())
         .then_some(template)
     }
 
@@ -905,6 +917,14 @@ impl ActionKind {
                 }
                 rows
             }
+            Self::ReachConnect => vec![
+                row("Name", text("name")),
+                row("Connector", "Tailscale"),
+                row(
+                    "Effect",
+                    "Create the connector, link it to this node's edge and start it. Sign in as the owner after approving; the sign-in link is never shown to an assistant. The connector gives up after 10 minutes without sign-in; restart it to try again.",
+                ),
+            ],
             Self::RouteAdd => {
                 let reach = args["reach"]
                     .as_str()
@@ -998,13 +1018,15 @@ impl ActionKind {
         // What the node read from the template when a create was proposed, and filled in. They close the card: the
         // image, the row a person reads (a database's card has it second already), and last the fingerprint of the
         // template's content, which the create is held to.
-        if self == Self::ServiceCreate
+        if matches!(self, Self::ServiceCreate | Self::ReachConnect)
             && let Some(image) = args["image"].as_str()
         {
             rows.push(row("Image", &image_words(image)));
         }
-        if matches!(self, Self::ServiceCreate | Self::PostgresCreate)
-            && let Some(digest) = args["templateDigest"].as_str()
+        if matches!(
+            self,
+            Self::ServiceCreate | Self::PostgresCreate | Self::ReachConnect
+        ) && let Some(digest) = args["templateDigest"].as_str()
         {
             rows.push(row("Template content", &template_content_words(digest)));
         }
@@ -1181,6 +1203,7 @@ impl ActionKind {
                 "Finish the move {}: delete its sources on this host",
                 text("move")
             ),
+            Self::ReachConnect => format!("Connect this node to Tailscale with {}", text("name")),
             Self::RouteAdd => format!(
                 "Serve https://{} from the instance {} on port {}",
                 text("hostname").to_ascii_lowercase(),
