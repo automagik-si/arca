@@ -6183,7 +6183,8 @@ Tailscale section has a **Sign in to Tailscale** button beside each waiting conn
 passkey: Arca reads the link then and opens it for you. Open it only yourself: nothing ties the link to you. Once signed
 in, the row says **Connected** with the tailnet name. A machine signed in by a person expires after 180 days unless you
 turn off expiry in Tailscale's admin page.
-The page reuses connector rows for up to 15 seconds, and a successful passkey sign-in makes its next read fresh.
+The page rows carry only `name`, `kind`, `state` and, when available, `tailnetName`. It reuses these projected rows
+for up to 15 seconds, and a successful passkey sign-in makes its next read fresh.
 
 To disconnect, propose `reach_disconnect` with `{"name":"node-ts"}` and approve its card with your passkey. This unlinks
 the connector from the edge, removes it and erases its state volume, including a connector whose initial link failed.

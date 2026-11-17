@@ -1221,7 +1221,21 @@ async fn reach(State(state): State<Arc<PageState>>) -> Response {
         {
             return snapshot.rows.clone();
         }
-        let rows = (reads.rows)();
+        let rows = (reads.rows)().map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    // Cache only the fields the open page displays, including for future row additions.
+                    Value::Object(
+                        ["name", "kind", "state", "tailnetName"]
+                            .into_iter()
+                            .filter_map(|key| {
+                                row.get(key).map(|value| (key.to_string(), value.clone()))
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        });
         *last = Some(ReachSnapshot {
             at: (state.clock)(),
             rows: rows.clone(),

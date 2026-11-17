@@ -8339,7 +8339,8 @@ impl ServiceHandler {
                 let edges = service_entries(&entries)
                     .into_iter()
                     .filter(|(_, other)| {
-                        reach_edge.is_none()
+                        reach_edge.as_ref().and_then(|edge| edge["name"].as_str())
+                            != Some(other.name.as_str())
                             && other.edge.is_some()
                             && other.incoming.iter().any(|grant| grant.consumer == name)
                     })
