@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+`service_list` and `service_status` rows add `id`, `uuid`, `createdAt`, `startedAt`, `limits`, and `data.volume`;
+the stable `id` survives service rebuilds and kernel restarts. Service records gain an `id` at creation or their
+next normal write; releases up to 0.35.0 cannot read such a record and show the service as failed or not found.
+Downgrading below this release is therefore not supported once a service was created or written.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows

@@ -554,6 +554,17 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
     let mut status = rig
         .call("service_status", json!({"name":"ws1"}))
         .expect("status");
+    assert_eq!(
+        listed["services"][0]["id"].as_str(),
+        Some(
+            record
+                .id
+                .as_deref()
+                .expect("the new service record has an id")
+        ),
+        "the bridged row carries its record's id"
+    );
+    assert!(listed["services"][0]["createdAt"].is_string());
     // Compare the six additive observations with each other, then every legacy field with the create answer.
     for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
         let listed_value = listed["services"][0]

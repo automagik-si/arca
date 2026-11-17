@@ -67,6 +67,10 @@ fn status_fields_use_recorded_identity_limits_volume_and_live_start_without_writ
     let journal = fs::read(rig.dir.join(arca::kernel::JOURNAL_FILE)).unwrap();
     let row = observed(&rig);
     assert_eq!(row["id"], entry.config["id"]);
+    assert!(
+        row["uuid"].is_string(),
+        "the recorded instance UUID is not null"
+    );
     assert_eq!(row["uuid"], json!(uuid));
     assert_eq!(row["createdAt"], arca::handlers::iso_utc(NOW));
     assert_eq!(row["startedAt"], "2026-11-01T12:34:56.123456789Z");
