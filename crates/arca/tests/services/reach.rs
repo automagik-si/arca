@@ -453,6 +453,45 @@ fn logs_privacy_whitespace_after_path() {
     );
 }
 
+fn longest_visible_piece(id: &str, text: &str) -> usize {
+    assert!(id.is_ascii());
+    (1..=id.len())
+        .rev()
+        .find(|&len| (0..=id.len() - len).any(|start| text.contains(&id[start..start + len])))
+        .unwrap_or(0)
+}
+
+#[test]
+fn logs_privacy_identifier_fragments() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    for raw in [
+        "visit https://login.tailscale.com/a/synth\u{1b}[1mQ03aa\u{1b}[0m\n".to_string(),
+        "visit https://login.tailscale.com/a/synth\u{7}Q11aa\n".into(),
+        "visit https://login.tailscale.com/a/syn\u{b}th\u{c}Q12\u{8}aa\n".into(),
+        format!(
+            "visit https://login.tailscale.com/a/syn{}thQ13aa\n",
+            (1u8..=31)
+                .filter(|b| ![9u8, 10, 13, 27].contains(b))
+                .map(char::from)
+                .collect::<String>()
+        ),
+        "visit https://login.tailscale.com/a/synth\u{7f}Q14aa\n".into(),
+        "visit https://login.tailscale.com/a/synth\u{85}Q15\u{9b}aa\n".into(),
+        "visit https://login.tailscale.com/ayntheticSweep1234\n".into(),
+    ] {
+        assert_eq!(
+            privacy_log_lines(&rig, "node-ts", &raw),
+            ["visit [sign-in link]"],
+            "{raw:?}"
+        );
+        assert_eq!(
+            privacy_log_lines(&rig, "edge", &raw),
+            privacy_non_connector_lines(&raw)
+        );
+    }
+}
+
 #[test]
 fn logs_privacy_every_link_offset() {
     let id = "syntheticSweep1234";
@@ -475,31 +514,66 @@ fn logs_privacy_every_link_offset() {
             ));
         }
     }
-    println!("privacy sweep rows={}", cases.len());
-    privacy_cases(
-        &cases
-            .iter()
-            .map(|(label, raw)| (label.as_str(), raw.clone()))
-            .collect::<Vec<_>>(),
-        id,
-        false,
+    let rest = format!(
+        "visit https://login.tailscale.com/a/[sign-in link][secret]{}",
+        inserts.join("")
+    );
+    assert!(
+        longest_visible_piece(id, &rest) < 4,
+        "identifier must not overlap ordinary text"
+    );
+    assert_eq!(cases.len(), 343);
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let mut histogram = BTreeMap::new();
+    let mut failures = Vec::new();
+    for (label, raw) in &cases {
+        let lines = privacy_log_lines(&rig, "node-ts", raw);
+        let joined = lines.concat();
+        let longest = longest_visible_piece(id, &joined);
+        *histogram.entry(longest).or_insert(0) += 1;
+        if joined.contains(id) || longest >= 4 {
+            failures.push(format!("{label}: longest={longest} {lines:?}"));
+        }
+        assert_eq!(
+            privacy_log_lines(&rig, "edge", raw),
+            privacy_non_connector_lines(raw),
+            "{label}"
+        );
+    }
+    println!(
+        "privacy sweep rows={} longest-piece histogram={histogram:?}",
+        cases.len()
+    );
+    assert_private(&rig, id);
+    assert!(
+        failures.is_empty(),
+        "{} rows failed: {}",
+        failures.len(),
+        failures.join("\n")
     );
 }
 
 #[test]
 fn logs_privacy_two_inserts() {
     let id = "syntheticDouble1234";
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let raw = "visit https://\u{1b}login.tailscale.com/a/synthetic\0Double1234\n";
+    assert_eq!(
+        privacy_log_lines(&rig, "node-ts", raw),
+        ["visit https://[sign-in link]"]
+    );
+    assert_eq!(
+        privacy_log_lines(&rig, "edge", raw),
+        privacy_non_connector_lines(raw)
+    );
+    assert_private(&rig, id);
     privacy_cases(
-        &[
-            (
-                "host and identifier",
-                "visit https://\u{1b}login.tailscale.com/a/synthetic\0Double1234\n".into(),
-            ),
-            (
-                "mixed host sequences",
-                "visit https://lo\u{1b}[1mgin.tails\u{1b}[cale.com/a/syntheticDouble1234\n".into(),
-            ),
-        ],
+        &[(
+            "mixed host sequences",
+            "visit https://lo\u{1b}[1mgin.tails\u{1b}[cale.com/a/syntheticDouble1234\n".into(),
+        )],
         id,
         false,
     );
@@ -509,7 +583,7 @@ fn logs_privacy_two_inserts() {
 fn logs_privacy_ordinary_output_and_short_identifiers() {
     let (rig, key) = rig();
     connect(&rig, &key, Some("node-ts")).unwrap();
-    let raw = "To authenticate, visit:\n\thttps://login.tailscale.com/a/syntheticPlain1234\nlogin.tailscale.com/admin/machines\ngo on and stay up\nhttps://login.tailscale.com/a/go\ngo on\n";
+    let raw = "To authenticate, visit:\n\thttps://login.tailscale.com/a/syntheticPlain1234\nlogin.tailscale.com/admin/machines\ngo on and stay up\nhttps://login.tailscale.com/a/go\ngo on\n[sign-in link] followingword\n";
     assert_eq!(
         privacy_log_lines(&rig, "node-ts", raw),
         [
@@ -518,7 +592,8 @@ fn logs_privacy_ordinary_output_and_short_identifiers() {
             "login.tailscale.com/admin/machines",
             "go on and stay up",
             "[sign-in link]",
-            "go on"
+            "go on",
+            "[sign-in link] followingword"
         ]
     );
     assert_eq!(
