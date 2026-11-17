@@ -2327,6 +2327,13 @@ fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
 }
 
 #[test]
+fn service_label_reads_are_untrusted() {
+    for name in ["service_list", "service_status"] {
+        assert!(verb(name).expect("service read").untrusted, "{name}");
+    }
+}
+
+#[test]
 fn service_labels_are_a_doctor_write_with_closed_contracts() {
     let v = verb("service_labels_set").expect("labels verb");
     assert_eq!(v.min_scope, Scope::Doctor);
