@@ -4,6 +4,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.36.0 (2026-11-17)
+
 An owner-approved `instance_start` card now starts an instance inside a tenant even when the proposing token's tool
 allowlist omits `instance_start`. Direct tenant starts still require the verb in the token's tool allowlist.
 
@@ -37,6 +39,23 @@ more reason downgrading below this release is not supported once a service was c
 the stable `id` survives service rebuilds and kernel restarts. Service records gain an `id` at creation or their
 next normal write; releases up to 0.35.0 cannot read such a record and show the service as failed or not found.
 Downgrading below this release is therefore not supported once a service was created or written.
+
+- Merge PR 233: journal_list shows service re-binds and watch marks a contested binding
+- Merge PR 235: templates can turn VM memory hotplug off
+- fix(merge): the approved-database parity test sets aside each record's random id
+- fix(services): data.volume reports the recorded data volume after a re-bind
+- Merge PR 232: service status and list rows carry id, uuid, createdAt, startedAt, limits and data
+- Merge PR 236: approved postgres create runs through the template database path
+- fix(merge): the proposal tests count 33 actions
+- fix(merge): the action-name list in the verbs test is a slice
+- fix(merge): ActionKind::ALL counts both service_rebind and reach_connect
+- Merge PR 229: reach connector list and sign-in link masking
+- Merge PR 228 doc fix: the rebind paragraph carries its rule heading, Rule 78 (one line, checked by the ownership-document test at merge)
+- Merge PR 230 follow-up: a non-object candidate reply is skipped, and an import whose record is pending says so
+- Merge PR 228: service_rebind moves a service's binding to another instance through a journalled two-phase change, with a per-service unsaved mark
+- Merge PR 230: a removed instance is never re-adopted, and an approved release clears an adopted record whose instance is gone
+- Merge PR 231: an owner-approved instance_start runs inside its tenant
+- Merge PR 226: a token bound to one tenant reaches only that tenant's routes
 
 ## 0.35.0 (2026-11-16)
 
