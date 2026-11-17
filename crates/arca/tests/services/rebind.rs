@@ -556,6 +556,23 @@ fn rebind_keeps_root_and_data_locators_independent_and_supports_no_data() {
         if data {
             assert_eq!(config["dataVolume"]["pool"], "pool2");
             assert_eq!(config["dataVolume"]["name"], "copied-data");
+            let status = rig
+                .call("service_status", json!({"name":"sample"}))
+                .unwrap();
+            let listed = rig.call("service_list", json!({})).unwrap();
+            let row = listed["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == "sample")
+                .unwrap();
+            assert_eq!(
+                (&status["data"], &row["data"]),
+                (
+                    &json!({"volume":"copied-data"}),
+                    &json!({"volume":"copied-data"})
+                )
+            );
         } else {
             assert!(config["dataVolume"].is_null());
         }

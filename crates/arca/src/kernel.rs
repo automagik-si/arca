@@ -284,8 +284,7 @@ impl Kernel {
         view["createdAt"] = json!(crate::handlers::iso_utc(config.created));
         view["startedAt"] = json!(live.and_then(crate::service::started_at));
         view["limits"] = json!(config.limits);
-        view["data"] =
-            json!({"volume": config.data.as_ref().map(|_| format!("{}-data", config.name))});
+        view["data"] = json!({"volume": config.data.as_ref().map(|_| config.data_locator().name)});
         view
     }
 
