@@ -5730,6 +5730,14 @@ A template is a virtual machine when its `kind` is `virtual-machine`:
 `image` is `images:<alias>` (the public images server, with an optional `digest` fingerprint) or `local:<alias>`
 (an image in the service project's own store, with an optional `digest` that pins it; see "A local image may be
 pinned" above).
+
+`limits` may also set `memoryHotplug` to a boolean, only for a `virtual-machine` template. When set, the create sends
+`limits.memory.hotplug` as `"true"` or `"false"`; when omitted, the record and create carry no new key. The shipped
+Automagik workspace sets it to `false`: growing its memory needs a config change and a restart. Status and list show
+`limits.memoryHotplug` when the record has it. Existing VMs keep their records and are not changed; VM update
+(rebuild) and reconfigure remain refused.
+Incus without the `limits_memory_hotplug` API extension (introduced in Incus 6.15) refuses this create with an unknown-key error.
+
 `limits` must set both `cpu` and `memory`, and `rootSize` is required; all three follow the size rules above. A
 virtual-machine template may also set `description` and `autostart`, and `ports` with `provides` when a container is
 to link to it: a link opens the port in the managed service network's ACL, so a template with `ports` is refused on a

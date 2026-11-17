@@ -70,6 +70,12 @@ pub struct Limits {
     pub cpu: Option<String>,
     #[serde(default)]
     pub memory: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_memory_hotplug"
+    )]
+    pub memory_hotplug: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_read: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +84,13 @@ pub struct Limits {
     pub ingress: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<String>,
+}
+
+// An omitted field keeps older records unchanged; a present value must be a boolean, including in templates.
+fn deserialize_memory_hotplug<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 impl Limits {
@@ -832,6 +845,9 @@ fn vm_config(cfg: &ServiceConfig) -> Map<String, Value> {
         }
         if let Some(memory) = &limits.memory {
             config.insert("limits.memory".into(), json!(memory));
+        }
+        if let Some(hotplug) = limits.memory_hotplug {
+            config.insert("limits.memory.hotplug".into(), json!(hotplug.to_string()));
         }
     }
     if cfg.autostart {
@@ -2101,6 +2117,15 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     }
     if template.is_vm() {
         return validate_vm_template(template);
+    }
+    if template
+        .limits
+        .as_ref()
+        .is_some_and(|limits| limits.memory_hotplug.is_some())
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: limits.memoryHotplug is only for a virtual-machine template"
+        )));
     }
     if template.kind != "oci" && template.kind != "system" {
         return Err(TemplateError::refused(format!(

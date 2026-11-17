@@ -66,6 +66,11 @@ pub const EARLIER: &[(&str, &str)] = &[
         "tailscale.sh",
         "21711cabba260ff9994d80164d3ee3d6cc626b3de101c0ee2b9f1c3730be76aa",
     ),
+    // 0.35.0: before the workspace disabled memory hotplug.
+    (
+        "automagik-workspace.json",
+        "95e8ebc1b2fe4be6c7d5d42eae97d579ac2fbbc46840cac5c5200b65b827f1b8",
+    ),
     // 0.32.0 to 0.33.0: before the edge provided its target and the Cloudflare template named its connector kind.
     (
         "arca-edge.json",

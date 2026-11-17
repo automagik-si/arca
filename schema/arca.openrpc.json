@@ -6694,6 +6694,9 @@
                           "string",
                           "null"
                         ]
+                      },
+                      "memoryHotplug": {
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -7141,6 +7144,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "memoryHotplug": {
+                  "type": "boolean"
                 }
               },
               "required": [

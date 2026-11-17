@@ -333,6 +333,36 @@ fn owner_approval(key: &common::SkKey, name: &str) -> String {
 }
 
 #[test]
+fn the_shipped_automagik_workspace_create_pins_memory() {
+    let rig = Rig::bridged(&["br0"], None);
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let template =
+        serde_json::from_slice(&fs::read(shipped.join("automagik-workspace.json")).unwrap())
+            .unwrap();
+    rig.template("automagik-workspace", template);
+    fs::copy(
+        shipped.join("automagik-workspace.sh"),
+        rig.dir.join("templates/automagik-workspace.sh"),
+    )
+    .unwrap();
+    rig.call("service_create", json!({"name":"ws1", "template":"automagik-workspace",
+        "settings":{"publicUrl":"https://workspace.example.org", "repoUrl":"https://github.com/example/project"}}))
+        .expect("the workspace is created stopped");
+    let instance = rig
+        .get(&format!("/1.0/instances/ws1?project={PROJECT}"))
+        .unwrap();
+    assert_eq!(instance["config"]["limits.memory.hotplug"], "false");
+    let request: Value = rig
+        .fake
+        .service_requests()
+        .into_iter()
+        .find(|request| request.method == "POST" && request.path.starts_with("/1.0/instances?"))
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .unwrap();
+    assert_eq!(request["config"]["limits.memory.hotplug"], "false");
+}
+
+#[test]
 fn unsupported_vm_io_limits_undo_the_failed_start_on_both_network_kinds() {
     for bridged in [false, true] {
         let rig = if bridged {
@@ -1290,3 +1320,6 @@ fn a_proposal_this_node_is_sure_to_refuse_is_refused_when_proposed_and_an_omitte
 
 #[path = "services/mixed.rs"]
 mod mixed;
+
+#[path = "services/memory_hotplug.rs"]
+mod memory_hotplug;
