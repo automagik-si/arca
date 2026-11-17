@@ -70,6 +70,8 @@ use crate::peer_sync::PeerSyncer;
 
 /// The page's own body cap. `arca-mcp`'s 64 KiB layer is private and does not reach merged routes.
 const PAGE_BODY_BYTES: usize = 64 * 1024;
+/// The open connector route reuses its last read for fifteen seconds.
+const REACH_READ_WINDOW_MS: u64 = 15 * 1000;
 /// The refusal a linked-host name the page does not list gets, in the owner's words.
 const NOT_LINKED: &str = "this machine is not linked for approvals yet";
 /// A setup code lives for ten minutes.
@@ -149,6 +151,14 @@ struct PageState {
     setup_command: String,
     /// The GitHub signer, when the page serves `/approve/github` (see `crate::github_page`).
     github: Option<crate::github_signer::Signer>,
+    reach: Option<ReachReads>,
+    reach_cache: Arc<Mutex<Option<ReachSnapshot>>>,
+}
+
+/// An in-memory row read, including a failed read so failures cannot bypass the window.
+struct ReachSnapshot {
+    at: u64,
+    rows: Result<Vec<Value>, CallError>,
 }
 
 /// What the page shows for the terminal's command when `serve` gave it none: the command, with the config to fill in.
@@ -293,6 +303,16 @@ pub fn rp_id_of(origin: &str) -> String {
     }
 }
 
+/// The protected connector link read supplied by the service handlers.
+pub type ReachSignInRead = Arc<dyn Fn(&str) -> Result<Option<String>, CallError> + Send + Sync>;
+
+/// Connector reads supplied by the node's service handlers. Neither handle stores its answer.
+#[derive(Clone)]
+pub struct ReachReads {
+    pub rows: Arc<dyn Fn() -> Result<Vec<Value>, CallError> + Send + Sync>,
+    pub sign_in: ReachSignInRead,
+}
+
 /// One approval-page binding, shared by the direct and trusted-proxy routers.
 pub struct Page {
     state: PageState,
@@ -345,6 +365,8 @@ impl Page {
                 gate: None,
                 setup_command: SETUP_COMMAND.to_string(),
                 github: None,
+                reach: None,
+                reach_cache: Arc::new(Mutex::new(None)),
             },
         }
     }
@@ -368,6 +390,12 @@ impl Page {
     /// Serves the owner's GitHub page (`/approve/github`) for `signer`, behind the canvas passkey session.
     pub fn with_github(mut self, signer: crate::github_signer::Signer) -> Self {
         self.state.github = Some(signer);
+        self
+    }
+
+    /// Supplies the connector reads, sharing the service handlers' audited exec handle.
+    pub fn with_reach(mut self, reach: ReachReads) -> Self {
+        self.state.reach = Some(reach);
         self
     }
 
@@ -458,6 +486,8 @@ impl Page {
         for (path, route) in [
             ("/approve", get(page)),
             ("/approve/plans", get(plans)),
+            ("/approve/reach", get(reach)),
+            ("/approve/reach/sign-in", post(reach_sign_in)),
             ("/approve/approve", post(approve)),
             ("/approve/decline", post(decline)),
             ("/approve/requests/begin", post(request_begin)),
@@ -1173,6 +1203,104 @@ fn peer_cards(syncer: &PeerSyncer) -> Value {
         })
         .collect();
     json!(cards)
+}
+
+/// Connector state is a separate read: the waiting cards and their challenges are untouched.
+async fn reach(State(state): State<Arc<PageState>>) -> Response {
+    let Some(reads) = state.reach.clone() else {
+        return canvas_json(StatusCode::OK, json!({"connectors":[]}));
+    };
+    match tokio::task::spawn_blocking(move || {
+        // Keep the lock through the read: concurrent GETs share its result, as peer-key sync does.
+        let mut last = state
+            .reach_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(snapshot) = last.as_ref()
+            && (state.clock)().saturating_sub(snapshot.at) < REACH_READ_WINDOW_MS
+        {
+            return snapshot.rows.clone();
+        }
+        let rows = (reads.rows)().map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    // Cache only the fields the open page displays, including for future row additions.
+                    Value::Object(
+                        ["name", "kind", "state", "tailnetName"]
+                            .into_iter()
+                            .filter_map(|key| {
+                                row.get(key).map(|value| (key.to_string(), value.clone()))
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        });
+        *last = Some(ReachSnapshot {
+            at: (state.clock)(),
+            rows: rows.clone(),
+        });
+        rows
+    })
+    .await
+    {
+        Ok(Ok(rows)) => canvas_json(StatusCode::OK, json!({"connectors":rows})),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn reach_sign_in(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+    let Ok(args) = serde_json::from_slice::<Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(name) = args["name"]
+        .as_str()
+        .filter(|name| crate::service::service_name_ok(name))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let name = name.to_string();
+    let Some(reads) = state.reach.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let result = tokio::task::spawn_blocking(move || -> Result<Value, Box<Response>> {
+        let now = (state.clock)();
+        // A begin holds no secret and persists nothing. The verifier binds host, action, target, args and expiry.
+        if args.get("proof").is_none() && args.get("statement").is_none() {
+            let nonce = fresh_nonce().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+            let kernel = state.kernel.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+            let statement = canonical_json(&json!({
+                "host":kernel.host(), "action":ArcaAction::ReachSignIn.as_str(), "target":name,
+                "paramsDigest":arca_kernel::canon::params_digest(&json!({})).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?,
+                "issuedAt":crate::handlers::iso_utc(now),
+                "expiresAt":crate::handlers::iso_utc(now.saturating_add(arca_approval::TTL_MAX_MS.min(240_000))),
+                "nonce":nonce,
+            })).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+            return Ok(json!({"statement":statement, "nonce":nonce}));
+        }
+        let statement = args["statement"].as_str().ok_or_else(|| change_refused(arca_approval::ApprovalRefusal::NoVerifier))?;
+        let proof = args.get("proof").and_then(|proof| canonical_json(proof).ok())
+            .filter(|proof| arca_approval::parse_proof(proof.as_bytes()).is_ok())
+            .ok_or_else(|| change_refused(arca_approval::ApprovalRefusal::NoVerifier))?;
+        let approval = format!("{}.{}", STANDARD.encode(statement), STANDARD.encode(proof));
+        state.kernel.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+            .check_approval(ArcaAction::ReachSignIn, &name, &json!({}), &approval, now)
+            .map_err(change_refused)?;
+        match (reads.sign_in)(&name) {
+            Ok(Some(url)) => {
+                // Clear after any in-flight row read finishes, so it cannot put stale rows back after this proof.
+                *state.reach_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                Ok(json!({"signInUrl":url}))
+            },
+            Ok(None) => Err(Box::new(canvas_json(StatusCode::CONFLICT, json!({"refusal":"not_waiting", "message":"This connector is not waiting for sign-in."})))),
+            Err(_) => Err(Box::new(canvas_json(StatusCode::NOT_FOUND, json!({"refusal":"not_found", "message":"Tailscale connector not found."})))),
+        }
+    }).await;
+    match result {
+        Ok(Ok(body)) => canvas_json(StatusCode::OK, body),
+        Ok(Err(response)) => *response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// `POST /approve/peer-keys/sync`: syncs this host's passkey list with every linked host now (at most once per thirty

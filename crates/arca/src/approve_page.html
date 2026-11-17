@@ -385,6 +385,11 @@
     <div id="plans" class="plans"><div class="card loading">Loading…</div></div>
   </section>
 
+  <section id="reach-section" aria-labelledby="reach-title" hidden>
+    <h2 id="reach-title">Tailscale</h2>
+    <div id="reach" class="plans"></div>
+  </section>
+
   <section id="apps-section" aria-labelledby="apps-title" hidden>
     <h2 id="apps-title">Connected apps</h2>
     <div id="apps" class="plans"></div>
@@ -1412,6 +1417,78 @@ async function decline(plan, button) {
 }
 
 // The MCP apps the owner connected (see mcp_oauth.rs): each with its scope and a Disconnect that works at once.
+let reachBusy = false;
+async function loadReach() {
+  if (reachBusy || document.hidden) return;
+  try {
+    const answer = await fetch("/approve/reach", { cache: "no-store" });
+    if (!answer.ok) return;
+    const body = await answer.json();
+    const cards = await Promise.all(body.connectors.map(async (connector) => {
+      const card = document.createElement("div");
+      card.className = "card";
+      const title = document.createElement("p");
+      title.className = "notice-title";
+      title.textContent = connector.name;
+      card.append(title);
+      const state = document.createElement("p");
+      state.className = "notice-text";
+      state.textContent = connector.state === "running"
+        ? "Connected" + (connector.tailnetName ? " · " + connector.tailnetName : "")
+        : connector.state === "waiting-sign-in" ? "Waiting for you to sign in" : connector.state;
+      card.append(state);
+      if (connector.kind === "tailscale" && connector.state === "waiting-sign-in") {
+        const begun = await fetch("/approve/reach/sign-in", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: connector.name }), cache: "no-store",
+        });
+        if (!begun.ok) return card;
+        const pending = await begun.json();
+        const challenge = await challengeOf(pending.statement);
+        const button = document.createElement("button");
+        button.className = "btn btn-primary";
+        button.type = "button";
+        button.textContent = "Sign in to Tailscale";
+        const warning = document.createElement("p");
+        warning.className = "notice-text";
+        warning.textContent = "Open the link only yourself: nothing ties it to you. A machine signed in by a person expires after 180 days unless you turn off expiry in Tailscale’s admin page.";
+        card.append(button, warning);
+        button.addEventListener("click", async () => {
+          reachBusy = true;
+          button.disabled = true;
+          // Keep the browser's tap for both the passkey and the new tab; the tab gets no link before verification.
+          const tab = window.open("about:blank", "_blank");
+          if (tab) tab.opener = null;
+          try {
+            const proof = await trustedProof(pending.statement, challenge);
+            const answer = await fetch("/approve/reach/sign-in", {
+              method: "POST", headers: { "Content-Type": "application/json" }, cache: "no-store",
+              body: JSON.stringify({ name: connector.name, statement: pending.statement, proof }),
+            });
+            const result = await answer.json();
+            if (!answer.ok || !result.signInUrl) throw new Error(result.message || "Sign-in refused");
+            if (tab) tab.location.replace(result.signInUrl);
+            else location.assign(result.signInUrl);
+          } catch (error) {
+            if (tab) tab.close();
+            fail(error);
+          } finally {
+            reachBusy = false;
+            await loadReach();
+          }
+        });
+      }
+      return card;
+    }));
+    if (reachBusy) return;
+    document.getElementById("reach").replaceChildren(...cards);
+    document.getElementById("reach-section").hidden = cards.length === 0;
+  } catch (_) { /* The next refresh retries this independent read. */ }
+}
+setInterval(loadReach, REFRESH_MS);
+document.addEventListener("visibilitychange", loadReach);
+loadReach();
+
 function appCard(app) {
   const card = el("article", "card plan action");
   const name = app.nameShared ? String(app.name) + " (another app has this name)" : String(app.name);

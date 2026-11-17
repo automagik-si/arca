@@ -50,6 +50,12 @@ property replacement explicitly. Completed steps stay in the tenant's store afte
 them. There is no import record, automatic rollback or delete. Success and refusal outcomes have closed schemas.
 Repeated completed imports send no Incus writes. No file or remote fetch is accepted. See docs/OPERATING.md.
 
+The approval page lists connectors separately from waiting cards. A waiting Tailscale connector has a sign-in button
+that checks the owner's passkey before reading and opening its link. The link is never cached or recorded by Arca.
+The page reuses connector rows for up to 15 seconds, and a successful passkey sign-in makes its next read fresh.
+`reach_disconnect` needs an approved erasing card: it unlinks and removes the connector and its state volume. Remove
+the machine's remaining entry in Tailscale's admin page yourself.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows

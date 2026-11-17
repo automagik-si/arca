@@ -51,6 +51,12 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             "confirm is false: nothing was deleted",
         ),
         (
+            "reach_disconnect",
+            json!({ "name": "node-ts", "approval": "x.y" }),
+            json!({ "removed": true, "edge": null }),
+            "confirm is false: nothing was removed and no approval was spent",
+        ),
+        (
             "service_remove",
             json!({ "name": "pg", "approval": "x.y" }),
             json!({ "removed": true }),

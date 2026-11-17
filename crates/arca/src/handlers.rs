@@ -3029,6 +3029,7 @@ impl ActionExecutor {
                 | "service_import"
                 | "service_rebind"
                 | "reach_connect"
+                | "reach_disconnect"
                 | "service_release"
                 | "gpu_attach"
                 | "gpu_detach"
@@ -6287,9 +6288,24 @@ pub fn service_handlers_updating(
     functions: Option<Arc<crate::function_run::FunctionRunner>>,
     update: service_update::UpdateOptions,
 ) -> ServiceHandlers {
+    service_handlers_with_reach(kernel, clock, cfg, functions, update).0
+}
+
+/// The served handlers and the page reads sharing their exec handle.
+pub type ServiceHandlersWithReach = (ServiceHandlers, crate::approve_page::ReachReads);
+
+/// Service handlers and the page's reads, using the same exec audit writer and operation ids.
+pub fn service_handlers_with_reach(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    cfg: Arc<NodeConfig>,
+    functions: Option<Arc<crate::function_run::FunctionRunner>>,
+    update: service_update::UpdateOptions,
+) -> ServiceHandlersWithReach {
     // One gate for every handler that picks an address or a block: the kernel's own.
     let writes = write_gate(&kernel);
     let exec = Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()));
+    let reach = crate::reach::page_reads(kernel.clone(), cfg.clone(), exec.clone());
     let function_verbs: &[&'static str] = if functions.is_some() {
         &FUNCTION_VERBS
     } else {
@@ -6326,6 +6342,7 @@ pub fn service_handlers_updating(
         "route_remove",
         "route_list",
         "reach_connect",
+        "reach_disconnect",
         "reach_list",
     ]
     .into_iter()
@@ -6368,10 +6385,13 @@ pub fn service_handlers_updating(
         crate::omni::OmniOptions::default(),
     ))
     .collect();
-    ServiceHandlers {
-        handlers,
-        create: ServiceCreateHandler(create),
-    }
+    (
+        ServiceHandlers {
+            handlers,
+            create: ServiceCreateHandler(create),
+        },
+        reach,
+    )
 }
 
 /// The three Omni verbs over the service model (`crate::omni`). `options` is the default in a served node; a test
@@ -7946,10 +7966,10 @@ impl ToolHandler for ServiceHandler {
                 json!({"connectors":crate::reach::reach_rows(&self.kernel, &self.cfg, &self.exec, caller)?}),
             );
         }
-        let direction = if self.verb == "reach_connect" {
-            "service_create"
-        } else {
-            self.verb
+        let direction = match self.verb {
+            "reach_connect" => "service_create",
+            "reach_disconnect" => "service_remove",
+            verb => verb,
         };
         let mut answer = self.call_service(ServiceCall::Direct(args.clone()), caller, direction)?;
         // The list shows each recorded program as a row of its own kind, beside the services.
@@ -8045,7 +8065,9 @@ impl ServiceHandler {
                 "approval",
             ],
             "service_rebind" => &["name", "binding", "approval"],
-            "service_remove" | "service_import" | "service_release" => &["name", "approval"],
+            "service_remove" | "service_import" | "service_release" | "reach_disconnect" => {
+                &["name", "approval"]
+            }
             "service_connect" | "service_disconnect" => &["from", "to"],
             "service_secret_set" => &["name", "key", "value"],
             "service_labels_set" => &["name", "labels"],
@@ -8088,6 +8110,7 @@ impl ServiceHandler {
                 | "service_rebind"
                 | "service_release"
                 | "reach_connect"
+                | "reach_disconnect"
         ) && !self.verb.starts_with("function_")
             && !self.verb.starts_with("route_");
         if let Some(key) = object
@@ -8108,6 +8131,7 @@ impl ServiceHandler {
                 | "service_import"
                 | "service_rebind"
                 | "reach_connect"
+                | "reach_disconnect"
                 | "service_release"
         ) && caller.scope < Scope::Doctor
         {
@@ -8157,6 +8181,7 @@ impl ServiceHandler {
                     | "service_import"
                     | "service_rebind"
                     | "reach_connect"
+                    | "reach_disconnect"
                     | "service_release"
                     | "function_create"
                     | "function_remove"
@@ -8169,6 +8194,9 @@ impl ServiceHandler {
                         .unwrap_or(false)
                 });
         if self.verb == "service_rebind" && !preapproved {
+            return Err(import_not_approved());
+        }
+        if self.verb == "reach_disconnect" && !preapproved {
             return Err(import_not_approved());
         }
         if self.verb == "reach_connect" {
@@ -8190,7 +8218,7 @@ impl ServiceHandler {
         }
         let _publish = matches!(
             self.verb,
-            "service_publish" | "service_unpublish" | "service_remove"
+            "service_publish" | "service_unpublish" | "service_remove" | "reach_disconnect"
         )
         .then(|| self.exec.publish_gate.blocking_lock());
         let _write = if matches!(
@@ -8711,6 +8739,11 @@ impl ServiceHandler {
                 {
                     return Err(refusal);
                 }
+                let reach_edge = if self.verb == "reach_disconnect" {
+                    Some(self.disconnect_reach(&name, caller, &entries, now)?)
+                } else {
+                    None
+                };
                 let id = entry.id.clone();
                 let rebound = lock(&self.kernel)?.service_has_binding(&id);
                 let removal_refused = |record_removed| {
@@ -8749,7 +8782,9 @@ impl ServiceHandler {
                 let edges = service_entries(&entries)
                     .into_iter()
                     .filter(|(_, other)| {
-                        other.edge.is_some()
+                        reach_edge.as_ref().and_then(|edge| edge["name"].as_str())
+                            != Some(other.name.as_str())
+                            && other.edge.is_some()
                             && other.incoming.iter().any(|grant| grant.consumer == name)
                     })
                     .map(|(edge, cfg)| (edge.id, crate::route::linked(&cfg.incoming)))
@@ -8794,7 +8829,9 @@ impl ServiceHandler {
                     .iter()
                     .filter_map(|(edge, before)| self.edge_relinked(edge, before, caller))
                     .collect::<Vec<_>>();
-                if edges.is_empty() {
+                if let Some(edge) = reach_edge {
+                    Ok(json!({ "removed": true, "edge": edge }))
+                } else if edges.is_empty() {
                     Ok(json!({ "removed": true }))
                 } else {
                     Ok(json!({ "removed": true, "edges": edges }))

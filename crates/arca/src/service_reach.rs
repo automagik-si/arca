@@ -1,4 +1,4 @@
-//! Approved connector creation through the existing service create, link and lifecycle paths.
+//! Approved connector creation and removal through the existing service paths.
 use super::*;
 use crate::service;
 use arca_kernel::desired::Entry;
@@ -20,6 +20,41 @@ pub(super) fn edge_name(entries: &[Entry]) -> Result<String, CallError> {
 }
 
 impl ServiceHandler {
+    pub(super) fn disconnect_reach(
+        &self,
+        name: &str,
+        caller: &Caller,
+        entries: &[Entry],
+        now: u64,
+    ) -> Result<Value, CallError> {
+        let records = service_entries(entries);
+        let (_, connector) = records
+            .iter()
+            .find(|(_, record)| record.name == name)
+            .ok_or_else(|| service_not_found(format!("service {name}: not found")))?;
+        if crate::reach::kind(&self.cfg, connector).is_none() {
+            return Err(service_refused(format!("service {name}: not a connector")));
+        }
+        // A failed link may have saved either side only. The shared disconnect repairs both sides.
+        let edge = records.iter().find(|(_, record)| {
+            record.edge.is_some()
+                && (connector.links.iter().any(|link| link.to == record.name)
+                    || record.incoming.iter().any(|grant| grant.consumer == name))
+        });
+        let Some((_, edge)) = edge else {
+            return Ok(Value::Null);
+        };
+        let _write = self.writes.lock().map_err(|_| internal())?;
+        let answer = self.link(
+            &json!({"from":name,"to":edge.name}),
+            caller,
+            entries,
+            now,
+            true,
+        )?;
+        Ok(answer.get("edge").cloned().unwrap_or(Value::Null))
+    }
+
     pub(super) fn finish_reach(
         &self,
         name: &str,

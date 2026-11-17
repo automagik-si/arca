@@ -172,7 +172,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 99] = [
+static VERBS: [Verb; 100] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1514,6 +1514,21 @@ static VERBS: [Verb; 99] = [
         target: Target::Node,
     },
     Verb {
+        name: "reach_disconnect",
+        summary: "Unlink a connector from its edge, then remove it and erase its state volume. Runs only from an approved action proposal with the owner's passkey. Does not tell Tailscale: remove the machine's remaining entry in Tailscale's admin page yourself.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_reach_disconnect,
+        cut: no_cut,
+        params: reach_disconnect_params,
+        result: reach_disconnect_result,
+        target: Target::Node,
+    },
+    Verb {
         name: "reach_list",
         summary: "The node's connectors and their edge and state. Tailscale reports stopped, waiting-sign-in, gave-up, unknown or running, with its tailnet name and address when available. Never returns a sign-in link.",
         class: VerbClass::L,
@@ -1978,6 +1993,22 @@ fn reach_connect_params() -> Value {
             "templateDigest": {"type":"string", "description":"The template content digest, filled in by the kernel when proposed."}
         }, "required":["kind", "approval"]})
 }
+fn reach_disconnect_params() -> Value {
+    let mut params = service_remove_params_base();
+    params["properties"]["approval"]["description"] =
+        json!("The one-shot grant of the approved action proposal.");
+    params
+}
+fn reach_disconnect_result() -> Value {
+    json!({"type":"object", "additionalProperties":false,
+        "properties":{"removed":{"type":"boolean", "const":true},
+            "edge":{"anyOf":[edge_relinked_schema(), {"type":"null"}]}},
+        "required":["removed", "edge"]})
+}
+fn summary_reach_disconnect(_: &Value) -> String {
+    "Connector removed and its state volume erased. Remove the machine's remaining entry in Tailscale's admin page yourself.".into()
+}
+
 fn reach_row() -> Value {
     json!({"type":"object", "additionalProperties":false,
         "properties": {
@@ -3803,7 +3834,7 @@ pub fn take_confirm(v: &Verb, args: &mut Value) -> Result<(), String> {
 /// The plain words of a destructive call refused for `confirm: false`.
 fn not_confirmed(name: &str) -> String {
     let undone = match name {
-        "service_remove" => "nothing was removed",
+        "service_remove" | "reach_disconnect" => "nothing was removed",
         "service_import" => "nothing was imported",
         "service_rebind" => "nothing was rebound",
         "service_release" => "nothing was released",
@@ -4479,8 +4510,9 @@ fn plan_list_result() -> Value {
 }
 
 /// The verbs an action proposal may name. The list is closed here and checked by the handler again.
-pub(crate) const ACTION_NAMES: [&str; 34] = [
+pub(crate) const ACTION_NAMES: [&str; 35] = [
     "reach_connect",
+    "reach_disconnect",
     "service_create",
     "service_remove",
     "service_update",
@@ -4592,8 +4624,9 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 34] = [
+const ACTION_EXAMPLES: [(&str, &str); 35] = [
     ("reach_connect", r#"{"kind":"tailscale"}"#),
+    ("reach_disconnect", r#"{"name":"node-ts"}"#),
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
     (

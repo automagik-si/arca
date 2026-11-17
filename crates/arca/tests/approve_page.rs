@@ -375,6 +375,7 @@ struct Rig {
     requests: Arc<ApprovalRequests>,
     /// Why the page is closed, while a test says it is: what `serve` reads from the loopback door of a localhost page.
     closed: Arc<Mutex<Option<String>>>,
+    reach_state: Arc<Mutex<String>>,
     _runtime: Runtime,
 }
 
@@ -550,6 +551,9 @@ impl Rig {
         let clock_fn: Clock = Arc::new(move || page_clock.load(Ordering::SeqCst));
         let logs = Arc::new(Mutex::new(Vec::new()));
         let captured_logs = Arc::clone(&logs);
+        let reach_state = Arc::new(Mutex::new("waiting-sign-in".to_string()));
+        let rows_state = reach_state.clone();
+        let sign_state = reach_state.clone();
         let page = approve_page::Page::new(
             origin.to_string(),
             Arc::clone(&kernel),
@@ -560,6 +564,10 @@ impl Rig {
         .with_canvas_origin(&format!("http://{}", upstream.addr))
         .with_chat_timeouts(chat_idle, chat_total)
         .with_actions(actions)
+        .with_reach(approve_page::ReachReads {
+            rows: Arc::new(move || Ok(vec![json!({"name":"node-ts","kind":"tailscale","edge":"edge","state":*rows_state.lock().unwrap()})])),
+            sign_in: Arc::new(move |name| Ok((name == "node-ts" && *sign_state.lock().unwrap() == "waiting-sign-in").then(|| "https://login.tailscale.com/a/synthetic123".to_string()))),
+        })
         .with_approval_requests(Arc::clone(&requests))
         .with_log(Arc::new(move |line| {
             captured_logs
@@ -615,6 +623,7 @@ impl Rig {
             action_runs,
             requests,
             closed,
+            reach_state,
             _runtime: runtime,
         };
         (rig, key)
@@ -5024,4 +5033,116 @@ fn g7_the_approve_route_takes_what_a_delivery_would_and_refuses_another_target_a
             NOW,
         )
         .expect("the kernel spends the asker's approval");
+}
+
+#[test]
+fn reach_sign_in_spends_a_separate_passkey_proof_once_and_keeps_cards_unchanged() {
+    let (rig, key) = Rig::new("reach-page", true);
+    let login = "https://login.tailscale.com/a/synthetic123";
+    let cards = rig.get("/approve/plans", None);
+    let (code, rows) = rig.get("/approve/reach", None);
+    assert_eq!(code, 200);
+    let rows: Value = serde_json::from_slice(&rows).unwrap();
+    assert_eq!(rows["connectors"][0]["state"], "waiting-sign-in");
+    assert!(!rows.to_string().contains(login));
+    let begin = |name: &str| {
+        let (code, bytes) = rig.post("/approve/reach/sign-in", Some(ORIGIN), json!({"name":name}));
+        assert_eq!(code, 200);
+        assert!(!String::from_utf8_lossy(&bytes).contains(login));
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        let statement = value["statement"].as_str().unwrap();
+        let parsed = parse_statement(statement.as_bytes()).unwrap();
+        assert_eq!(parsed.action, ArcaAction::ReachSignIn);
+        assert_eq!(parsed.target, name);
+        assert_eq!(parsed.nonce, value["nonce"]);
+        assert_eq!(
+            parsed.params_digest,
+            arca_kernel::canon::params_digest(&json!({})).unwrap()
+        );
+        value["proof"] = key.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+        value["name"] = json!(name);
+        value
+    };
+    let pending = begin("node-ts");
+    let mut missing = pending.clone();
+    missing.as_object_mut().unwrap().remove("proof");
+    let (code, bytes) = rig.post("/approve/reach/sign-in", Some(ORIGIN), missing);
+    assert_eq!(code, 403);
+    assert!(!String::from_utf8_lossy(&bytes).contains(login));
+    let mut bad = pending.clone();
+    bad["proof"] = SoftPasskey::from_seed(9).proof_value(&Assert::over(
+        NAMESPACE,
+        bad["statement"].as_str().unwrap().as_bytes(),
+    ));
+    let (code, bytes) = rig.post("/approve/reach/sign-in", Some(ORIGIN), bad);
+    assert_eq!(code, 403);
+    assert!(!String::from_utf8_lossy(&bytes).contains(login));
+    let mut wrong = pending.clone();
+    wrong["name"] = json!("other");
+    let (code, bytes) = rig.post("/approve/reach/sign-in", Some(ORIGIN), wrong);
+    assert_eq!(code, 403);
+    assert!(!String::from_utf8_lossy(&bytes).contains(login));
+    let (code, headers, bytes) =
+        rig.post_full("/approve/reach/sign-in", Some(ORIGIN), pending.clone());
+    assert_eq!(code, 200);
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"signInUrl":login})
+    );
+    let (code, bytes) = rig.post("/approve/reach/sign-in", Some(ORIGIN), pending);
+    assert_eq!(code, 403);
+    assert!(!String::from_utf8_lossy(&bytes).contains(login));
+    for (name, state) in [
+        ("node-ts", "running"),
+        ("node-ts", "stopped"),
+        ("missing", "waiting-sign-in"),
+    ] {
+        *rig.reach_state.lock().unwrap() = state.to_string();
+        let (code, bytes) = rig.post("/approve/reach/sign-in", Some(ORIGIN), begin(name));
+        assert_ne!(code, 200);
+        assert!(!String::from_utf8_lossy(&bytes).contains(login));
+    }
+    assert_eq!(rig.get("/approve/plans", None), cards);
+    assert!(
+        rig.logs
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|line| !line.contains(login))
+    );
+}
+
+#[test]
+fn reach_ui_is_separate_from_the_waiting_card_list() {
+    let (rig, _) = Rig::new("reach-ui", true);
+    let (_, bytes) = rig.get("/approve", None);
+    let html = String::from_utf8(bytes).unwrap();
+    assert!(html.contains("Sign in to Tailscale"));
+    assert!(html.contains("nothing ties it to you"));
+    assert!(html.contains("180 days"));
+    assert!(html.contains("loadReach()"));
+    assert_eq!(
+        rig.post("/approve/reach/sign-in", None, json!({"name":"node-ts"}))
+            .0,
+        403
+    );
+    assert_eq!(
+        rig.post(
+            "/approve/reach/sign-in",
+            Some("https://other.example"),
+            json!({"name":"node-ts"})
+        )
+        .0,
+        403
+    );
+    assert_eq!(
+        rig.get("/approve/reach", Some("https://other.example")).0,
+        403
+    );
+    assert!(arca::action_proposal::ActionKind::from_name("reach_sign_in").is_none());
 }
