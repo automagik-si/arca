@@ -140,6 +140,13 @@
               "description": "Present only on a program this node records and does not manage (external_add): host-program.",
               "type": "string"
             },
+            "labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Plain caller data. After merging: keys at most 128 bytes, values at most 4096 bytes, at most 128 keys and 65536 bytes of compact JSON. Null removes a key; an empty string is a value. Never secrets.",
+              "type": "object"
+            },
             "lanPort": {
               "anyOf": [
                 {
@@ -387,6 +394,7 @@
             "links",
             "published",
             "lanPort",
+            "labels",
             "createdAt",
             "data",
             "id",
@@ -546,6 +554,13 @@
         "const": "host-program",
         "description": "Present only on a program this node records and does not manage (external_add): host-program.",
         "type": "string"
+      },
+      "labels": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Plain caller data. After merging: keys at most 128 bytes, values at most 4096 bytes, at most 128 keys and 65536 bytes of compact JSON. Null removes a key; an empty string is a value. Never secrets.",
+        "type": "object"
       },
       "lanPort": {
         "anyOf": [
@@ -798,6 +813,7 @@
       "links",
       "published",
       "lanPort",
+      "labels",
       "createdAt",
       "data",
       "id",

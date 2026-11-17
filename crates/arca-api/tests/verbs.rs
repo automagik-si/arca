@@ -64,6 +64,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "service_release",
             "service_connect",
             "service_disconnect",
+            "service_labels_set",
             "service_secret_set",
             "service_publish",
             "service_unpublish",
@@ -157,6 +158,13 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("postgres_delete", VerbClass::L, Scope::Doctor, true, true),
         ("ontology_query", VerbClass::L, Scope::Viewer, false, false),
         ("service_create", VerbClass::L, Scope::Doctor, true, false),
+        (
+            "service_labels_set",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            false,
+        ),
         ("service_list", VerbClass::L, Scope::Viewer, false, false),
         ("service_status", VerbClass::L, Scope::Viewer, false, false),
         ("service_logs", VerbClass::L, Scope::Viewer, false, false),
@@ -1673,7 +1681,15 @@ fn status_observations_do_not_expand_create_or_import_rows() {
         } else {
             &result
         };
-        for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+        for key in [
+            "id",
+            "uuid",
+            "createdAt",
+            "startedAt",
+            "limits",
+            "data",
+            "labels",
+        ] {
             assert!(row["properties"].get(key).is_none(), "{name}: {key}");
         }
     }
@@ -2423,5 +2439,57 @@ fn reach_verbs_and_their_proposals_stay_outside_service_limited_tokens() {
             check(verb(name).expect("registered verb"), &limited, &args).is_err(),
             "{name} reaches the node beyond a token's named services"
         );
+    }
+}
+
+#[test]
+fn service_label_reads_are_untrusted() {
+    for name in ["service_list", "service_status"] {
+        assert!(verb(name).expect("service read").untrusted, "{name}");
+    }
+}
+
+#[test]
+fn service_labels_are_a_doctor_write_with_closed_contracts() {
+    let v = verb("service_labels_set").expect("labels verb");
+    assert_eq!(v.min_scope, Scope::Doctor);
+    assert!(v.writes);
+    assert!(!v.destructive);
+    let params = (v.params)();
+    assert_eq!(params["additionalProperties"], false);
+    assert!(
+        conforms(
+            &params,
+            &json!({"name":"box", "labels":{"empty":"", "gone":null}})
+        )
+        .is_ok()
+    );
+    assert!(conforms(&params, &json!({"name":"box", "labels":{"bad":true}})).is_err());
+    let result = (v.result)();
+    assert_eq!(result["additionalProperties"], false);
+    assert!(conforms(&result, &json!({"labels":{"empty":""}, "code":"confirmed"})).is_ok());
+    assert!(conforms(&result, &json!({"labels":{}, "code":"not_applied"})).is_err());
+    assert!(conforms(&result, &json!({"labels":{"bad":null}, "code":"confirmed"})).is_err());
+    assert!(
+        conforms(
+            &result,
+            &json!({"labels":{}, "code":"confirmed", "extra":true})
+        )
+        .is_err()
+    );
+    for name in ["service_status", "service_list"] {
+        let schema = (verb(name).unwrap().result)();
+        let row = if name == "service_list" {
+            &schema["properties"]["services"]["items"]
+        } else {
+            &schema
+        };
+        assert!(
+            row["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("labels"))
+        );
+        assert!(conforms(&row["properties"]["labels"], &json!({"hold":"true"})).is_ok());
     }
 }

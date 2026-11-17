@@ -162,7 +162,7 @@ impl Provider for PausedProvider {
 
 struct Rig {
     dir: PathBuf,
-    fake: FakeIncus,
+    fake: Arc<FakeIncus>,
     kernel: Arc<Mutex<Kernel>>,
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     fail_observe: Arc<Mutex<Option<String>>>,
@@ -239,7 +239,7 @@ impl Rig {
         ));
         fs::create_dir(&dir).expect("scratch");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("0700");
-        let fake = FakeIncus::start(&dir, state).expect("fake");
+        let fake = Arc::new(FakeIncus::start(&dir, state).expect("fake"));
         fake.add_profile(
             "default",
             json!({"name":"default","config":{},"devices":{"root":{"type":"disk","pool":"pool1","path":"/"}}}),
@@ -933,7 +933,15 @@ fn service_create_list_status_round_trip() {
     let mut listed = rig.call("service_list", json!({})).expect("list");
     assert_eq!(listed["services"][0]["limits"], Value::Null);
     assert_eq!(listed["services"][0]["data"], json!({"volume": null}));
-    for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+    for key in [
+        "id",
+        "uuid",
+        "createdAt",
+        "startedAt",
+        "limits",
+        "data",
+        "labels",
+    ] {
         assert!(
             listed["services"][0]
                 .as_object_mut()
@@ -950,7 +958,15 @@ fn service_create_list_status_round_trip() {
     let mut status = rig
         .call("service_status", json!({"name":"nats"}))
         .expect("status");
-    for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+    for key in [
+        "id",
+        "uuid",
+        "createdAt",
+        "startedAt",
+        "limits",
+        "data",
+        "labels",
+    ] {
         assert!(status.as_object_mut().unwrap().remove(key).is_some());
     }
     // The status is the create's view, with the version the service runs beside the one its template names: the
@@ -5820,3 +5836,203 @@ fn plan_renew_with_an_unresolved_intent_renews_nothing_and_says_why() {
 
 #[path = "services/rebind.rs"]
 mod rebind;
+
+#[test]
+fn service_labels_merge_remove_read_back_and_never_enter_the_journal() {
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .unwrap();
+    let before = rig.call("service_status", json!({"name":"nats"})).unwrap();
+    assert_eq!(before["labels"], json!({}));
+    let journal = journal_len(&rig);
+    let written = rig.fake.writes().len();
+    let set = rig
+        .call(
+            "service_labels_set",
+            json!({"name":"nats","labels":{"hold":"true","empty":"","remove":"old"}}),
+        )
+        .unwrap();
+    assert_eq!(set["code"], "confirmed");
+    assert_eq!(
+        set["labels"],
+        json!({"hold":"true","empty":"","remove":"old"})
+    );
+    let set = rig
+        .call(
+            "service_labels_set",
+            json!({"name":"nats","labels":{"remove":null}}),
+        )
+        .unwrap();
+    assert_eq!(set["labels"], json!({"hold":"true","empty":""}));
+    assert_eq!(journal_len(&rig), journal);
+    for patch in &rig.fake.writes()[written..] {
+        assert_eq!(patch.method, "PATCH");
+        assert_eq!(patch.config_keys, ["user.arca.labels"]);
+    }
+    let mut after = rig.call("service_status", json!({"name":"nats"})).unwrap();
+    assert_eq!(after["labels"], set["labels"]);
+    after["labels"] = json!({});
+    assert_eq!(before, after, "all previous fields stay unchanged");
+    assert_eq!(
+        rig.call("service_list", json!({})).unwrap()["services"][0]["labels"],
+        set["labels"]
+    );
+    rig.apply(&rig.service_config("nats")).unwrap();
+    assert_eq!(
+        rig.call("service_status", json!({"name":"nats"})).unwrap()["labels"],
+        set["labels"]
+    );
+}
+
+#[test]
+fn service_labels_uncertain_patch_reads_back_without_claiming_not_applied() {
+    for late in [false, true] {
+        let rig = Rig::new();
+        rig.template("nats", nats_template());
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+            .unwrap();
+        if late {
+            rig.fake.patch_after_next_get("/1.0/instances/nats");
+        } else {
+            rig.fake.drop_patch_answer("/1.0/instances/nats", true);
+        }
+        let set = rig
+            .call(
+                "service_labels_set",
+                json!({"name":"nats","labels":{"a":"b"}}),
+            )
+            .unwrap();
+        assert_eq!(set["code"], "unconfirmed");
+        assert_eq!(
+            set["labels"],
+            if late { json!({}) } else { json!({"a":"b"}) }
+        );
+        assert_eq!(
+            rig.call("service_status", json!({"name":"nats"})).unwrap()["labels"],
+            json!({"a":"b"})
+        );
+    }
+}
+
+#[test]
+fn service_labels_reapply_original_delta_after_412_without_losing_either_writer() {
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .unwrap();
+    rig.call(
+        "service_labels_set",
+        json!({"name":"nats","labels":{"remove":"old","keep":"yes"}}),
+    )
+    .unwrap();
+    rig.fake.race_patch_config(
+        "/1.0/instances/nats",
+        "user.arca.labels",
+        r#"{"remove":"changed","keep":"yes","other":"writer"}"#,
+    );
+    let set = rig
+        .call(
+            "service_labels_set",
+            json!({"name":"nats","labels":{"remove":null,"mine":"value"}}),
+        )
+        .unwrap();
+    assert_eq!(
+        set,
+        json!({"code":"confirmed","labels":{"keep":"yes","other":"writer","mine":"value"}})
+    );
+}
+
+#[test]
+fn service_labels_retries_are_bounded_and_recheck_uuid_ownership_and_merged_bounds() {
+    for changed in ["conflicts", "uuid", "owner", "bounds"] {
+        let rig = Rig::new();
+        rig.template("nats", nats_template());
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+            .unwrap();
+        match changed {
+            "conflicts" => {
+                for n in 0..3 {
+                    rig.fake.race_patch_config(
+                        "/1.0/instances/nats",
+                        "user.arca.labels",
+                        &json!({"other":n.to_string()}).to_string(),
+                    );
+                }
+            }
+            "uuid" => {
+                rig.fake
+                    .race_patch_config("/1.0/instances/nats", "volatile.uuid", "replacement")
+            }
+            "owner" => rig.fake.race_patch_config(
+                "/1.0/instances/nats",
+                "user.arca.unknown",
+                "another owner",
+            ),
+            _ => {
+                let full: std::collections::BTreeMap<_, _> =
+                    (0..128).map(|n| (format!("k{n}"), "v")).collect();
+                rig.fake.race_patch_config(
+                    "/1.0/instances/nats",
+                    "user.arca.labels",
+                    &serde_json::to_string(&full).unwrap(),
+                );
+            }
+        }
+        let before = rig.fake.requests().len();
+        assert!(
+            rig.call(
+                "service_labels_set",
+                json!({"name":"nats","labels":{"mine":"v"}})
+            )
+            .is_err(),
+            "{changed}"
+        );
+        let patches = rig.fake.requests()[before..]
+            .iter()
+            .filter(|req| req.method == "PATCH")
+            .count();
+        assert_eq!(
+            patches,
+            if changed == "conflicts" { 3 } else { 1 },
+            "{changed}"
+        );
+    }
+}
+
+#[test]
+fn adopted_services_show_labels_but_still_refuse_label_writes() {
+    let mut row = adopted_instance(
+        "svc1",
+        "arca",
+        "postgres-autopg",
+        "192.0.2.10",
+        "5432",
+        "uuid-svc1",
+    );
+    row["config"]["user.arca.labels"] = json!(r#"{"hold":"true"}"#);
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![row],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into(), "arca".into()],
+        Some("192.0.2.0/24"),
+    );
+    assert_eq!(
+        rig.call("service_status", json!({"name":"svc1"})).unwrap()["labels"],
+        json!({"hold":"true"})
+    );
+    let before = rig.fake.writes().len();
+    let Err(CallError::Refused { code, .. }) = rig.call(
+        "service_labels_set",
+        json!({"name":"svc1","labels":{"x":"y"}}),
+    ) else {
+        panic!("adopted write refused");
+    };
+    assert_eq!(code, "adopted");
+    assert_eq!(before, rig.fake.writes().len());
+}

@@ -38,6 +38,12 @@ the stable `id` survives service rebuilds and kernel restarts. Service records g
 next normal write; releases up to 0.35.0 cannot read such a record and show the service as failed or not found.
 Downgrading below this release is therefore not supported once a service was created or written.
 
+`service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
+rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
+uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents
+the rollback or changes its result.
+Both reads are marked as carrying untrusted text because labels are caller data.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows

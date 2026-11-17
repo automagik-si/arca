@@ -172,7 +172,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 97] = [
+static VERBS: [Verb; 98] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -480,7 +480,7 @@ static VERBS: [Verb; 97] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
-        untrusted: false,
+        untrusted: true,
         output_key: None,
         summary_text: summary_service_list,
         cut: cut_service_list,
@@ -495,7 +495,7 @@ static VERBS: [Verb; 97] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
-        untrusted: false,
+        untrusted: true,
         output_key: None,
         summary_text: summary_service_status,
         cut: no_cut,
@@ -637,6 +637,21 @@ static VERBS: [Verb; 97] = [
         params: service_disconnect_params,
         result: service_disconnect_result,
         target: Target::Services("from", "to"),
+    },
+    Verb {
+        name: "service_labels_set",
+        summary: "Merge a service's labels: a string sets a value, including an empty string, and null removes a key. Returns the full map read back from the instance and whether the write is confirmed. Labels are plain caller data, never secrets or policy; a hold label changes no boot setting. Imported or adopted instances remain read-only.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_service_labels_set,
+        cut: no_cut,
+        params: service_labels_set_params,
+        result: service_labels_set_result,
+        target: Target::Service("name"),
     },
     Verb {
         name: "service_secret_set",
@@ -5793,6 +5808,11 @@ fn service_observation_schema() -> Value {
             "required": ["volume"]
         }
     });
+    view["properties"]["labels"] = service_labels_schema(false);
+    view["required"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("labels"));
     for (name, schema) in fields.as_object().unwrap() {
         view["properties"][name] = schema.clone();
         view["required"].as_array_mut().unwrap().push(json!(name));
@@ -6311,6 +6331,46 @@ fn service_disconnect_result() -> Value {
 fn summary_service_disconnect(_: &Value) -> String {
     "service_disconnect: complete".into()
 }
+fn service_labels_schema(delta: bool) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": if delta { json!({"type": ["string", "null"]}) } else { string() },
+        "description": "Plain caller data. After merging: keys at most 128 bytes, values at most 4096 bytes, at most 128 keys and 65536 bytes of compact JSON. Null removes a key; an empty string is a value. Never secrets."
+    })
+}
+
+fn service_labels_set_params() -> Value {
+    with_tenant(object_of(
+        vec![
+            ("name", true, service_name_schema("The service's name.")),
+            ("labels", true, service_labels_schema(true)),
+        ],
+        true,
+    ))
+}
+
+fn service_labels_set_result() -> Value {
+    object_of(
+        vec![
+            ("labels", true, service_labels_schema(false)),
+            (
+                "code",
+                true,
+                json!({"type": "string", "enum": ["confirmed", "unconfirmed"],
+            "description": "Unconfirmed: the PATCH answer was uncertain or its read-back differed. Labels are the map read now; the PATCH may still land later. Read service_status again before deciding what to do."}),
+            ),
+        ],
+        true,
+    )
+}
+
+fn summary_service_labels_set(v: &Value) -> String {
+    format!(
+        "service labels: {}",
+        v["code"].as_str().unwrap_or("unconfirmed")
+    )
+}
+
 fn service_secret_set_params() -> Value {
     with_tenant(service_secret_set_params_base())
 }

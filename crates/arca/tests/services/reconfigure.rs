@@ -935,3 +935,29 @@ fn a_database_service_never_gets_the_run_row() {
     kept.sort_unstable();
     assert_eq!(kept, vec!["/run/autopg/", "/run/lock/"]);
 }
+
+#[test]
+fn labels_survive_reconfigure_and_hold_changes_no_boot_policy() {
+    let key = common::SkKey::from_seed(1);
+    let rig = node(&key);
+    let before = instance(&rig, "app");
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"hold":"true"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        instance(&rig, "app")["config"]["boot.autostart"],
+        before["config"]["boot.autostart"]
+    );
+    let mut template = first_template();
+    template["env"]["MODE"] = json!("two");
+    rig.template("app", template);
+    let proposal = propose(&rig, json!({"name":"app"})).unwrap();
+    approve_and_run(&rig, &key, &proposal).unwrap();
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"hold":"true"})
+    );
+    assert_eq!(instance(&rig, "app")["status"], "Running");
+}

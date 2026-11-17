@@ -212,6 +212,7 @@ struct Shared {
     reject_patch: Mutex<Vec<String>>,
     dropped_patches: Mutex<Vec<(String, bool)>>,
     late_patches: Mutex<Vec<String>>,
+    racing_patches: Mutex<Vec<(String, String, String)>>,
     pending_patches: Mutex<Vec<Request>>,
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
@@ -482,6 +483,7 @@ impl Shared {
             reject_patch: Mutex::new(Vec::new()),
             dropped_patches: Mutex::new(Vec::new()),
             late_patches: Mutex::new(Vec::new()),
+            racing_patches: Mutex::new(Vec::new()),
             pending_patches: Mutex::new(Vec::new()),
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
@@ -577,8 +579,8 @@ impl FakeIncus {
             .unwrap_or_default()
     }
 
-    /// The snapshots the instance `name` in `project` was restored to, in order. A restore changes nothing else in the
-    /// fake: it keeps no root, and its config and devices are what they were.
+    /// The snapshots the instance `name` in `project` was restored to, in order. A restore puts back its saved
+    /// config, devices, profiles and the root files the fake models.
     pub fn restores(&self, project: &str, name: &str) -> Vec<String> {
         lock(&self.shared.restores)
             .get(&(project.to_string(), name.to_string()))
@@ -776,6 +778,12 @@ impl FakeIncus {
     /// Drops a PATCH answer and applies it only after computing the next GET of that object. That GET shows the old state.
     pub fn patch_after_next_get(&self, path_prefix: &str) {
         lock(&self.shared.late_patches).push(path_prefix.to_string());
+    }
+
+    /// Changes one config key immediately before the next matching PATCH checks its If-Match header.
+    /// Multiple armed changes run one per PATCH, to model bounded conflict retries deterministically.
+    pub fn race_patch_config(&self, path_prefix: &str, key: &str, value: &str) {
+        lock(&self.shared.racing_patches).push((path_prefix.into(), key.into(), value.into()));
     }
 
     /// Starts an operation that names `target` and runs until the test releases or fails it. It changes no object. It shows in
@@ -2791,8 +2799,7 @@ fn put(
         return write_project(shared, store, index, &body, true);
     }
     let bad = |message: &str| (400, String::new(), error_envelope(400, message));
-    // A restore names a snapshot the instance holds and puts back its root's `/run`; it replaces nothing else the fake
-    // keeps.
+    // As Incus Restore without diskOnly, restore the saved configuration as well as the root.
     if let Some(Value::String(snapshot)) = body.get("restore") {
         let held = Address {
             kind: "snapshot",
@@ -2800,16 +2807,23 @@ fn put(
             parent: address.name.clone(),
             name: snapshot.clone(),
         };
-        if store.find(&held).is_none() {
+        let Some(snapshot_index) = store.find(&held) else {
             return (
                 404,
                 String::new(),
                 error_envelope(404, "snapshot not found"),
             );
-        }
+        };
         if text_of(&store.objects[index].body, "status") != "Stopped" {
             return bad("the fake restores only a stopped instance");
         }
+        let saved = store.objects[snapshot_index].body.clone();
+        for key in ["config", "devices", "profiles"] {
+            if let Some(value) = saved.get(key) {
+                store.objects[index].body[key] = value.clone();
+            }
+        }
+        store.expand(index, false);
         let run = store
             .run_snapshots
             .get(&(
@@ -2902,6 +2916,18 @@ fn patch(
             body.insert("auto_update".to_string(), json!(auto));
         }
         return (200, String::new(), sync_envelope(Value::Null));
+    }
+    let race = {
+        let mut races = lock(&shared.racing_patches);
+        races
+            .iter()
+            .position(|(path, _, _)| request.path().starts_with(path))
+            .map(|index| races.remove(index))
+    };
+    if let Some((_, key, value)) = race
+        && let Some(index) = store.find(address)
+    {
+        store.objects[index].body["config"][&key] = json!(value);
     }
     let (index, changes) = match written(store, request, address) {
         Ok(found) => found,
@@ -4278,12 +4304,22 @@ fn snapshot_or_backup(
             held,
         );
     }
+    let mut body =
+        json!({ "name": name, "stateful": sent.get("stateful").cloned().unwrap_or(json!(false)) });
+    if kind == "snapshot" {
+        let source = &store.objects[store.find(&instance).expect("instance exists")].body;
+        for key in ["config", "devices", "profiles"] {
+            if let Some(value) = source.get(key) {
+                body[key] = value.clone();
+            }
+        }
+    }
     store.objects.push(Stored {
         kind: kind.to_string(),
         project: address.project.clone(),
         name: name.clone(),
         parent: address.parent.clone(),
-        body: json!({ "name": name, "stateful": sent.get("stateful").cloned().unwrap_or(json!(false)) }),
+        body,
     });
     answered(shared, store, kind, "POST", Ok(()))
 }

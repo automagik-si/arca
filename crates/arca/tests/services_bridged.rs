@@ -595,8 +595,17 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
         "the bridged row carries its record's id"
     );
     assert!(listed["services"][0]["createdAt"].is_string());
-    // Compare the six additive observations with each other, then every legacy field with the create answer.
-    for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+    assert_eq!(listed["services"][0]["labels"], json!({}));
+    // Compare the additive observations with each other, then every legacy field with the create answer.
+    for key in [
+        "id",
+        "uuid",
+        "createdAt",
+        "startedAt",
+        "limits",
+        "data",
+        "labels",
+    ] {
         let listed_value = listed["services"][0]
             .as_object_mut()
             .expect("the listed service")

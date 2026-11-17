@@ -1442,15 +1442,16 @@ mod tests {
 
         let list = arca_api::verb("service_list").unwrap();
         let row = json!({"name":"svc","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[],"links":[],"published":null,"lanPort":null,
-            "id":null,"uuid":null,"createdAt":null,"startedAt":null,"limits":null,"data":null});
+            "id":null,"uuid":null,"createdAt":null,"startedAt":null,"limits":null,"data":null,"labels":{}});
         let original = json!({"services": vec![row; 259]});
         let cut = arca_api::verbs::service_cut_description(list.name, &original).unwrap();
         let capped = (list.cut)(&original).unwrap();
         conforms(&(list.result)(), &capped).unwrap();
         let result = tool_result(list, capped, Some(&cut), false);
         let rows = "\n- svc (nats): running at 192.0.2.10".repeat(50);
+        assert_eq!(result["content"][0]["text"], UNTRUSTED_NOTE);
         assert_eq!(
-            result["content"][0]["text"],
+            result["content"][1]["text"],
             format!(
                 "256 service(s){rows}\n- and 206 more\n(truncated: 3 service row(s) omitted of 259 original row(s))"
             )

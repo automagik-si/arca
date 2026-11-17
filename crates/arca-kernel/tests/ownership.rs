@@ -371,3 +371,54 @@ fn the_function_mark_is_the_entrys_own_on_a_service_instance_of_the_nodes_projec
         OwnerClass::Contested
     );
 }
+
+#[test]
+fn labels_are_allowed_only_on_the_exact_owned_service_instance() {
+    use arca_kernel::ownership::{classify_object, tenant_project};
+    for (entry, project, name) in [
+        ("service-api", "arcak-svc".to_string(), "api"),
+        (
+            "t-abcdefgh-service-api",
+            tenant_project("abcdefgh", false),
+            "api-abcdefgh",
+        ),
+    ] {
+        let object = ObjectRef {
+            kind: IncusKind::Instance,
+            project,
+            name: name.into(),
+            parent: None,
+            uuid: None,
+        };
+        let mut c = config(&[(KERNEL_ENTRY_KEY, entry), ("user.arca.labels", "{}")]);
+        assert_eq!(classify_object(&object, &c, &none()), kernel(entry));
+        assert_eq!(
+            classify(&c, &none()),
+            OwnerClass::Contested,
+            "adoption unchanged"
+        );
+        assert!(matches!(
+            classify_object(&object, &c, &retained(entry)),
+            OwnerClass::Retained { .. }
+        ));
+        for key in [
+            "user.arca.labels.extra",
+            "User.Arca.Labels",
+            "user.arca.unknown",
+            "user.droid.hold",
+        ] {
+            c.insert(key.into(), "x".into());
+            assert_eq!(classify_object(&object, &c, &none()), OwnerClass::Contested);
+            c.remove(key);
+        }
+        let mut other = object.clone();
+        other.name.push('x');
+        assert_eq!(classify_object(&other, &c, &none()), OwnerClass::Contested);
+        let mut other = object.clone();
+        other.project = "other".into();
+        assert_eq!(classify_object(&other, &c, &none()), OwnerClass::Contested);
+        let mut other = object.clone();
+        other.kind = IncusKind::Acl;
+        assert_eq!(classify_object(&other, &c, &none()), OwnerClass::Contested);
+    }
+}

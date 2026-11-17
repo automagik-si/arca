@@ -77,10 +77,18 @@ fn status_fields_use_recorded_identity_limits_volume_and_live_start_without_writ
     assert_eq!(row["limits"], json!({"cpu": "2", "memory": "1GiB"}));
     assert_eq!(row["data"], json!({"volume": "box-data"}));
     assert!(row.get("health").is_none());
-    assert!(row.get("labels").is_none());
+    assert_eq!(row["labels"], json!({}));
     let list = rig.call("service_list", json!({"tenant": A})).unwrap();
     arca_api::conforms(&(arca_api::verb("service_list").unwrap().result)(), &list).unwrap();
-    for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+    for key in [
+        "id",
+        "uuid",
+        "createdAt",
+        "startedAt",
+        "limits",
+        "data",
+        "labels",
+    ] {
         assert_eq!(list["services"][0][key], row[key], "{key}");
     }
     assert_eq!(fs::read(rig.dir.join(STATE_FILE)).unwrap(), state);
@@ -223,4 +231,36 @@ fn status_fields_never_started_missing_and_unknown_instances_have_explicit_nulls
             assert!(view.get(key).unwrap().is_null(), "{key}");
         }
     }
+}
+
+#[test]
+fn tenant_service_labels_write_only_the_scoped_instance_and_survive_restart() {
+    let rig = setup();
+    rig.call(
+        "service_create",
+        json!({"tenant": B,"name":"box","template":"data-app"}),
+    )
+    .unwrap();
+    let state = fs::read(rig.dir.join(STATE_FILE)).unwrap();
+    let journal = fs::read(rig.dir.join(arca::kernel::JOURNAL_FILE)).unwrap();
+    let set = rig
+        .call(
+            "service_labels_set",
+            json!({"tenant": A, "name":"box", "labels":{"hold":"true"}}),
+        )
+        .unwrap();
+    assert_eq!(set["code"], "confirmed");
+    assert_eq!(observed(&rig)["labels"], set["labels"]);
+    assert_eq!(
+        rig.call("service_status", json!({"tenant":B,"name":"box"}))
+            .unwrap()["labels"],
+        json!({})
+    );
+    assert_eq!(fs::read(rig.dir.join(STATE_FILE)).unwrap(), state);
+    assert_eq!(
+        fs::read(rig.dir.join(arca::kernel::JOURNAL_FILE)).unwrap(),
+        journal
+    );
+    let rig = rig.restart();
+    assert_eq!(observed(&rig)["labels"], set["labels"]);
 }

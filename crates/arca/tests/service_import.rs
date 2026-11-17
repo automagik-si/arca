@@ -484,6 +484,7 @@ fn an_approved_import_writes_one_key_and_makes_the_adopted_record() {
             assert_eq!(fields.remove(key), Some(Value::Null), "{key}");
         }
         assert_eq!(fields.remove("data"), Some(json!({"volume": null})));
+        assert_eq!(fields.remove("labels"), Some(json!({})));
     }
     assert_eq!(listed["services"], json!([row]));
     assert_eq!(status, row);

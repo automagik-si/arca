@@ -160,6 +160,11 @@ fn journal(rig: &Rig) -> Vec<(String, bool)> {
 fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest() {
     let up = Arc::new(AtomicBool::new(true));
     let rig = rig(&up);
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"hold":"true", "empty":""}}),
+    )
+    .unwrap();
     let before = instance(&rig);
     let identity = rig
         .entries()
@@ -200,6 +205,14 @@ fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest(
     assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
     assert!(rig.fake.restores(PROJECT, "app").is_empty());
     let after = instance(&rig);
+    assert_eq!(
+        after["config"]["user.arca.labels"],
+        before["config"]["user.arca.labels"]
+    );
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"hold":"true", "empty":""})
+    );
     assert_eq!(after["status"], "Running");
     assert_eq!(after["devices"]["data"], before["devices"]["data"]);
     assert_eq!(after["devices"]["eth0"], before["devices"]["eth0"]);
@@ -1711,4 +1724,231 @@ fn an_update_empties_the_new_roots_run_so_the_service_keeps_a_memory_run() {
     };
     assert!(at("rebuild") < at("empty /run") && at("empty /run") < at("start"));
     assert!(steps[at("empty /run")].1, "{steps:?}");
+}
+
+#[test]
+fn labels_set_before_and_during_a_failed_update_survive_snapshot_rollback() {
+    let up = Arc::new(AtomicBool::new(false));
+    let mut rig = rig(&up);
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"before":"kept", "change":"old", "remove":"old"}}),
+    )
+    .unwrap();
+    let setter = rig.handlers["service_labels_set"].clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let changed = fired.clone();
+    let other_writer = arca_incus::UnixIncusWriter::new(
+        rig.fake.socket().into(),
+        EntryId("service-app".into()),
+        Default::default(),
+        arca_incus::ProjectFamily::new([PROJECT], std::iter::empty::<&str>()).unwrap(),
+    );
+    let object = ObjectRef {
+        kind: IncusKind::Instance,
+        project: PROJECT.into(),
+        name: "app".into(),
+        parent: None,
+        uuid: instance(&rig)["config"]["volatile.uuid"]
+            .as_str()
+            .map(str::to_string),
+    };
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(), Arc::new(|| NOW), rig.cfg.clone(), None,
+        UpdateOptions {
+            probe: Arc::new(move |_, _, _| {
+                if !changed.swap(true, Ordering::SeqCst) {
+                    let answer = setter.call(json!({"name":"app", "labels":{"during":"kept", "change":"new", "remove":null}}), &Caller {token_id:"doctor".into(), scope:Scope::Doctor, tools:None, limits:Default::default()}).unwrap();
+                    assert_eq!(answer["code"], "confirmed");
+                    let owned = other_writer.read_owned(&object).unwrap();
+                    other_writer.patch(&owned, &std::collections::BTreeMap::from([("user.note".into(), Some("temporary".into()))])).unwrap();
+
+                }
+                false
+            }),
+            pace: Duration::from_millis(10),
+        },
+    ).into_iter().collect();
+    let failure = update(
+        &rig,
+        json!({"name":"app", "digest":NEW, "timeoutSeconds":1}),
+    )
+    .unwrap_err();
+    assert!(matches!(failure, CallError::Refused {code, ..} if code == "rolled_back"));
+    assert!(fired.load(Ordering::SeqCst));
+    assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
+    assert!(
+        instance(&rig)["config"].get("user.note").is_none(),
+        "other keys still restore from the snapshot"
+    );
+
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"before":"kept", "during":"kept", "change":"new"})
+    );
+}
+
+fn rollback_with_unavailable_label_preservation(pre_read_fails: bool) {
+    let up = Arc::new(AtomicBool::new(false));
+    let mut rig = rig(&up);
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"version":"snapshot"}}),
+    )
+    .unwrap();
+    let setter = rig.handlers["service_labels_set"].clone();
+    let fake = Arc::clone(&rig.fake);
+    let fired = Arc::new(AtomicBool::new(false));
+    let armed = Arc::clone(&fired);
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe: Arc::new(move |_, _, _| {
+                if !armed.swap(true, Ordering::SeqCst) {
+                    let answer = setter
+                        .call(
+                            json!({"name":"app", "labels":{"version":"during-update"}}),
+                            &Caller {
+                                token_id: "doctor".into(),
+                                scope: Scope::Doctor,
+                                tools: None,
+                                limits: Default::default(),
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(answer["code"], "confirmed");
+                    if pre_read_fails {
+                        // The rollback stop reads before its PUT and reads it back afterward. Fail only the
+                        // following read: label preservation's ownership/config read, not dev's restore read.
+                        fake.slow_reads("/1.0/instances/app?", 2, Duration::ZERO);
+                        fake.fail_reads("/1.0/instances/app?", 1, 503);
+                    } else {
+                        fake.set_reject_patch("/1.0/instances/app");
+                    }
+                }
+                false
+            }),
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
+    let failure = update(
+        &rig,
+        json!({"name":"app", "digest":NEW, "timeoutSeconds":1}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(failure, CallError::Refused {ref code, ..} if code == "rolled_back"),
+        "{failure:?}"
+    );
+    assert!(fired.load(Ordering::SeqCst));
+    assert_eq!(
+        rig.fake.restores(PROJECT, "app").len(),
+        1,
+        "the root was restored"
+    );
+    assert_eq!(
+        instance(&rig)["status"],
+        "Running",
+        "the old instance restarted"
+    );
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"version":"snapshot"})
+    );
+    let requests = rig.fake.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.status == if pre_read_fails { 503 } else { 400 }),
+        "the intended fault was reached"
+    );
+}
+
+#[test]
+fn rollback_still_succeeds_when_label_pre_read_fails() {
+    rollback_with_unavailable_label_preservation(true);
+}
+
+#[test]
+fn rollback_still_succeeds_when_label_put_back_fails() {
+    rollback_with_unavailable_label_preservation(false);
+}
+
+#[test]
+fn rollback_preserves_a_post_restore_label_writer_after_412() {
+    let up = Arc::new(AtomicBool::new(false));
+    let mut rig = rig(&up);
+    rig.call(
+        "service_labels_set",
+        json!({"name":"app", "labels":{"before":"snapshot"}}),
+    )
+    .unwrap();
+    let setter = rig.handlers["service_labels_set"].clone();
+    let fake = Arc::clone(&rig.fake);
+    let armed = Arc::new(AtomicBool::new(false));
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe: Arc::new(move |_, _, _| {
+                if !armed.swap(true, Ordering::SeqCst) {
+                    let set = setter
+                        .call(
+                            json!({"name":"app", "labels":{"during":"before-restore"}}),
+                            &Caller {
+                                token_id: "doctor".into(),
+                                scope: Scope::Doctor,
+                                tools: None,
+                                limits: Default::default(),
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(set["code"], "confirmed");
+                    // No PATCH occurs between the health failure and label put-back. Change the label value
+                    // just before that PATCH checks If-Match: its 412 must not overwrite this writer on retry.
+                    fake.race_patch_config(
+                        "/1.0/instances/app",
+                        "user.arca.labels",
+                        r#"{"after":"restore"}"#,
+                    );
+                }
+                false
+            }),
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
+    let failure = update(
+        &rig,
+        json!({"name":"app", "digest":NEW, "timeoutSeconds":1}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(failure, CallError::Refused {ref code, ..} if code == "rolled_back"),
+        "{failure:?}"
+    );
+    assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
+    assert_eq!(
+        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
+        json!({"after":"restore"})
+    );
+    let requests = rig.fake.requests();
+    let conflict = requests
+        .iter()
+        .position(|request| request.method == "PATCH" && request.status == 412)
+        .expect("put-back lost an If-Match race");
+    assert!(
+        !requests[conflict + 1..]
+            .iter()
+            .any(|request| request.method == "PATCH"),
+        "a different label value is not overwritten on retry"
+    );
 }

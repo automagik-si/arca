@@ -1708,8 +1708,10 @@ impl Run<'_> {
         let mut root_kept = false;
         match back {
             Back::Snapshot(snapshot) => {
-                self.changer
-                    .restore_snapshot(instance, snapshot)
+                self.handler
+                    .with_labels_preserved(self.entry, self.config, snapshot, || {
+                        self.changer.restore_snapshot(instance, snapshot)
+                    })
                     .map_err(|error| Failure::of("restore", &error))?;
                 self.journal
                     .step("restore", true, json!({ "snapshot": snapshot }));
