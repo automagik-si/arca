@@ -387,6 +387,15 @@ impl JournalStore for FileJournal {
 /// file is an empty journal. Addresses follow committed bindings; raw lines stay on disk.
 /// Damaged records refuse the read; a torn last line is dropped by the same decoder.
 pub fn read_journal(path: &Path) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
+    let (records, torn) = read_journal_records(path)?;
+    Ok((effects_only(records), torn))
+}
+
+/// Read-only listing history in append order: binding events and every effect
+/// state with effective addresses. Legacy journals keep their decoder behaviour.
+pub fn read_journal_records(
+    path: &Path,
+) -> Result<(Vec<JournalRecord>, Option<String>), KernelError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -395,7 +404,7 @@ pub fn read_journal(path: &Path) -> Result<(Vec<EffectRecord>, Option<String>), 
         Err(error) => return Err(io_error(&path.display().to_string(), &error)),
     };
     let decoded = decode(&bytes)?;
-    Ok((effect_history(decoded.records)?, decoded.torn))
+    Ok((record_history(decoded.records)?, decoded.torn))
 }
 
 /// An in-memory journal, for tests and for callers that need no durability.
@@ -979,7 +988,7 @@ fn corrupt(id: u64, why: &str) -> KernelError {
 struct Folded {
     latest: BTreeMap<u64, EffectRecord>,
     bindings: BTreeMap<u64, BindingEvent>,
-    effects: Vec<EffectRecord>,
+    records: Vec<JournalRecord>,
 }
 
 /// Validate in append order. A binding is the one explicit transition that
@@ -988,7 +997,7 @@ fn fold(records: Vec<JournalRecord>) -> Result<Folded, KernelError> {
     let mut view = Folded {
         latest: BTreeMap::new(),
         bindings: BTreeMap::new(),
-        effects: Vec::new(),
+        records: Vec::new(),
     };
     for record in records {
         match record {
@@ -1003,21 +1012,30 @@ fn fold(records: Vec<JournalRecord>) -> Result<Folded, KernelError> {
                         }
                     }
                 }
-                view.effects.push(record.clone());
+                view.records.push(JournalRecord::Effect(record.clone()));
                 view.latest.insert(record.id, record);
             }
-            JournalRecord::Binding { binding: event, .. } => {
+            JournalRecord::Binding {
+                kind,
+                binding: event,
+            } => {
                 let (create, ids) = binding::validate(&view.latest, &view.bindings, &event)?;
                 for id in &ids {
                     binding::translate(view.latest.get_mut(id).expect("validated effect"), &event);
                 }
                 // Listing readers keep every effect state, with the same
                 // effective addresses as live(). The bytes on disk never change.
-                for effect in &mut view.effects {
-                    if ids.contains(&effect.id) {
+                for record in &mut view.records {
+                    if let JournalRecord::Effect(effect) = record
+                        && ids.contains(&effect.id)
+                    {
                         binding::translate(effect, &event);
                     }
                 }
+                view.records.push(JournalRecord::Binding {
+                    kind,
+                    binding: event.clone(),
+                });
                 view.bindings.insert(create, event);
             }
         }
@@ -1026,20 +1044,28 @@ fn fold(records: Vec<JournalRecord>) -> Result<Folded, KernelError> {
 }
 
 fn effect_history(records: Vec<JournalRecord>) -> Result<Vec<EffectRecord>, KernelError> {
+    Ok(effects_only(record_history(records)?))
+}
+
+fn record_history(records: Vec<JournalRecord>) -> Result<Vec<JournalRecord>, KernelError> {
     // Preserve the old read-only decoder's behaviour for journals without bindings.
     if records
         .iter()
         .any(|record| matches!(record, JournalRecord::Binding { .. }))
     {
-        return Ok(fold(records)?.effects);
+        return Ok(fold(records)?.records);
     }
-    Ok(records
+    Ok(records)
+}
+
+fn effects_only(records: Vec<JournalRecord>) -> Vec<EffectRecord> {
+    records
         .into_iter()
         .filter_map(|record| match record {
             JournalRecord::Effect(effect) => Some(effect),
             JournalRecord::Binding { .. } => None,
         })
-        .collect())
+        .collect()
 }
 
 /// A decoded journal file. `keep` is the length of the prefix that holds whole lines, so a torn tail is cut at `keep`.

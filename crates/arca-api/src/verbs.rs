@@ -235,7 +235,7 @@ static VERBS: [Verb; 97] = [
     },
     Verb {
         name: "journal_list",
-        summary: "The newest record for each effect in the journal, paged by effect id. It names only the intent and object fields, never a pre-image or inverse.",
+        summary: "The newest record for each effect, paged by effect id, plus recent binding events in journal order. Never a pre-image or inverse.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -4343,6 +4343,14 @@ fn watch_report_result() -> Value {
                                 ("plan", false, hex64()),
                             ]),
                         ),
+                        (
+                            "serviceMark",
+                            false,
+                            params(vec![
+                                ("entry", true, string()),
+                                ("why", true, one_of(&["serviceNameMismatch"])),
+                            ]),
+                        ),
                         ("privileged", true, boolean()),
                         ("identity", true, boolean()),
                         ("configHash", true, hex64()),
@@ -4390,26 +4398,42 @@ fn journal_list_params() -> Value {
     params(vec![("after", false, int()), ("limit", false, int())])
 }
 
+/// Maximum binding events returned on every journal listing page.
+pub const JOURNAL_BINDINGS_MAX: usize = 100;
+
 fn journal_list_result() -> Value {
-    result(vec![(
-        "records",
-        true,
-        array(result(vec![
-            ("id", true, int()),
-            ("entry", true, string()),
-            ("class", true, one_of(&["A", "B", "C"])),
-            ("target", true, object_ref()),
-            ("plugin", false, string()),
-            (
-                "state",
-                true,
-                one_of(&["Intent", "Applied", "Confirmed", "Reverted", "Failed"]),
-            ),
-            ("at_ms", true, int()),
-            ("intent", false, one_of(&["Delete"])),
-            ("object", false, object_ref()),
-        ])),
-    )])
+    let mut bindings = array(params(vec![
+        ("kind", true, one_of(&["binding"])),
+        ("entry", true, string()),
+        ("from", true, rebind_state_schema()),
+        ("to", true, rebind_state_schema()),
+        ("at_ms", true, int()),
+        ("afterEffect", true, nullable(int())),
+    ]));
+    bindings["maxItems"] = json!(JOURNAL_BINDINGS_MAX);
+    result(vec![
+        (
+            "records",
+            true,
+            array(result(vec![
+                ("id", true, int()),
+                ("entry", true, string()),
+                ("class", true, one_of(&["A", "B", "C"])),
+                ("target", true, object_ref()),
+                ("plugin", false, string()),
+                (
+                    "state",
+                    true,
+                    one_of(&["Intent", "Applied", "Confirmed", "Reverted", "Failed"]),
+                ),
+                ("at_ms", true, int()),
+                ("intent", false, one_of(&["Delete"])),
+                ("object", false, object_ref()),
+            ])),
+        ),
+        ("bindings", false, bindings),
+        ("bindingsTruncated", false, boolean()),
+    ])
 }
 
 fn plan_list_params() -> Value {

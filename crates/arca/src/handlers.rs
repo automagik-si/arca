@@ -21,7 +21,7 @@ use arca_incus::{IncusRead, UnixIncus};
 use arca_kernel::canon::{Digest, params_digest};
 use arca_kernel::desired::EntryId;
 use arca_kernel::journal::DeletePlan;
-use arca_kernel::journal::read_journal;
+use arca_kernel::journal::{JournalRecord, read_journal_records};
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::EffectRefusal;
 use arca_mcp::{CallError, Caller, GetHandler, GetReply, TokenStore, ToolHandler};
@@ -1226,13 +1226,31 @@ impl ToolHandler for JournalListHandler {
             .and_then(Value::as_u64)
             .unwrap_or(100)
             .min(500);
-        let (records, _) = read_journal(&self.state_dir.join(JOURNAL_FILE))
+        let (records, _) = read_journal_records(&self.state_dir.join(JOURNAL_FILE))
             .map_err(|_| CallError::Internal("the journal could not be read".to_string()))?;
         // The journal's own view is the newest record for each effect id. Each state change appends a full copy, so a
         // listing that returned every line would repeat an effect and could skip a later state when paging by id.
         let mut latest = BTreeMap::new();
+        let mut bindings = std::collections::VecDeque::new();
+        let mut after_effect = None;
+        let mut truncated = false;
         for record in records {
-            latest.insert(record.id, record);
+            match record {
+                JournalRecord::Effect(record) => {
+                    after_effect = Some(record.id);
+                    latest.insert(record.id, record);
+                }
+                JournalRecord::Binding { kind, binding } => {
+                    bindings.push_back(json!({
+                        "kind": kind, "entry": binding.entry, "from": binding.from,
+                        "to": binding.to, "at_ms": binding.at_ms, "afterEffect": after_effect,
+                    }));
+                    if bindings.len() > arca_api::verbs::JOURNAL_BINDINGS_MAX {
+                        bindings.pop_front();
+                        truncated = true;
+                    }
+                }
+            }
         }
         let records: Vec<Value> = latest
             .into_values()
@@ -1259,7 +1277,14 @@ impl ToolHandler for JournalListHandler {
                 value
             })
             .collect();
-        Ok(json!({ "records": records }))
+        let mut answer = json!({ "records": records });
+        if !bindings.is_empty() {
+            answer["bindings"] = json!(bindings);
+        }
+        if truncated {
+            answer["bindingsTruncated"] = json!(true);
+        }
+        Ok(answer)
     }
 }
 

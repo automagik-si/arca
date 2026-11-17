@@ -2125,6 +2125,25 @@
                         "privileged": {
                           "type": "boolean"
                         },
+                        "serviceMark": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "entry": {
+                              "type": "string"
+                            },
+                            "why": {
+                              "enum": [
+                                "serviceNameMismatch"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "entry",
+                            "why"
+                          ],
+                          "type": "object"
+                        },
                         "status": {
                           "type": "string"
                         }
@@ -2274,6 +2293,209 @@
         "name": "result",
         "schema": {
           "properties": {
+            "bindings": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "afterEffect": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "at_ms": {
+                    "type": "integer"
+                  },
+                  "entry": {
+                    "type": "string"
+                  },
+                  "from": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data_volume": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "kind": {
+                                "const": "volume",
+                                "type": "string"
+                              },
+                              "name": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "parent": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "project": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "uuid": {
+                                "type": "null"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "project",
+                              "parent",
+                              "name",
+                              "uuid"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "instance": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "instance",
+                            "type": "string"
+                          },
+                          "name": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "project": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "uuid": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "project",
+                          "name",
+                          "uuid"
+                        ],
+                        "type": "object"
+                      },
+                      "root_pool": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "instance",
+                      "root_pool",
+                      "data_volume"
+                    ],
+                    "type": "object"
+                  },
+                  "kind": {
+                    "enum": [
+                      "binding"
+                    ],
+                    "type": "string"
+                  },
+                  "to": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data_volume": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "kind": {
+                                "const": "volume",
+                                "type": "string"
+                              },
+                              "name": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "parent": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "project": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "uuid": {
+                                "type": "null"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "project",
+                              "parent",
+                              "name",
+                              "uuid"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "instance": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "instance",
+                            "type": "string"
+                          },
+                          "name": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "project": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "uuid": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "project",
+                          "name",
+                          "uuid"
+                        ],
+                        "type": "object"
+                      },
+                      "root_pool": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "instance",
+                      "root_pool",
+                      "data_volume"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "entry",
+                  "from",
+                  "to",
+                  "at_ms",
+                  "afterEffect"
+                ],
+                "type": "object"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "bindingsTruncated": {
+              "type": "boolean"
+            },
             "records": {
               "items": {
                 "properties": {
@@ -2407,7 +2629,7 @@
           "type": "object"
         }
       },
-      "summary": "The newest record for each effect in the journal, paged by effect id. It names only the intent and object fields, never a pre-image or inverse.",
+      "summary": "The newest record for each effect, paged by effect id, plus recent binding events in journal order. Never a pre-image or inverse.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,

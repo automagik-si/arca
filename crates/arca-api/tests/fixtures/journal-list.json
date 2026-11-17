@@ -1,0 +1,43 @@
+{
+  "records": [],
+  "bindings": [
+    {
+      "kind": "binding",
+      "entry": "service-sample",
+      "from": {
+        "instance": {
+          "kind": "instance",
+          "project": "arcak-svc",
+          "name": "sample",
+          "uuid": "original"
+        },
+        "root_pool": "pool-a",
+        "data_volume": {
+          "kind": "volume",
+          "project": "arcak-svc",
+          "name": "sample-data",
+          "uuid": null,
+          "parent": "pool-a"
+        }
+      },
+      "to": {
+        "instance": {
+          "kind": "instance",
+          "project": "arcak-svc",
+          "name": "sample",
+          "uuid": "replacement"
+        },
+        "root_pool": "pool-b",
+        "data_volume": {
+          "kind": "volume",
+          "project": "arcak-svc",
+          "name": "sample-copy",
+          "uuid": null,
+          "parent": "pool-b"
+        }
+      },
+      "at_ms": 1000,
+      "afterEffect": 2
+    }
+  ]
+}

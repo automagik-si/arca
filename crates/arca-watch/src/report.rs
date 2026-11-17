@@ -22,12 +22,29 @@ pub struct InstanceRow {
     pub kind: String,
     pub status: String,
     pub owner: OwnerClass,
+    /// A service mark under a different instance name; listing only, never drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mark: Option<ServiceMark>,
     /// Whether `security.privileged` is `true` in the instance's expanded config.
     pub privileged: bool,
     /// Whether the instance's name is one of the node's identity phones.
     pub identity: bool,
     /// The lowercase hex SHA-256 of the canonical JSON of the instance's own config, without its `volatile.*` keys.
     pub config_hash: String,
+}
+
+/// Why a contested instance is listed as carrying another service name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceMark {
+    pub entry: EntryId,
+    pub why: ServiceMarkReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceMarkReason {
+    #[serde(rename = "serviceNameMismatch")]
+    ServiceNameMismatch,
 }
 
 /// The instances of one project, sorted by name.

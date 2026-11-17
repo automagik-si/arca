@@ -705,3 +705,111 @@ fn a_kernel_marked_service_is_observed_and_a_missing_live_service_is_drift() {
         }]
     );
 }
+
+#[test]
+fn a_renamed_service_backup_is_listed_without_changing_drift_or_writes() {
+    for (project, mark, name) in [
+        ("arcak-svc", "service-sample", "sample"),
+        (
+            "arcak-t-abcdefgh",
+            "t-abcdefgh-service-sample",
+            "sample-abcdefgh",
+        ),
+        (
+            "arcak-scratch-t-abcdefgh",
+            "t-abcdefgh-service-sample",
+            "sample-abcdefgh",
+        ),
+    ] {
+        let config = json!({"user.arcakernel.entry":mark,"user.arca.template":"nats"});
+        let cfg = WatchConfig {
+            projects: [project.to_string()].into_iter().collect(),
+            live_entries: [entry(mark)].into_iter().collect(),
+            complete: true,
+            ..WatchConfig::default()
+        };
+        let backup = format!("{name}-backup");
+        let mut host = Listing::of(json!([
+            instance(project, name, config.clone(), config.clone()),
+            instance(project, &backup, config.clone(), config),
+        ]));
+        let report = watch_once(&mut host, &cfg, 1).unwrap();
+        assert!(
+            report.drift.is_empty(),
+            "the replacement still satisfies the live entry"
+        );
+        assert_eq!(host.plans.get(), 0);
+        assert_eq!(host.effects.get(), 0);
+        let row = find(&report, project, &backup);
+        assert_eq!(row.owner, OwnerClass::Contested);
+        let wire = serde_json::to_value(row).unwrap();
+        assert_eq!(
+            wire["serviceMark"],
+            json!({"entry":mark,"why":"serviceNameMismatch"})
+        );
+        assert!(
+            serde_json::to_value(find(&report, project, name))
+                .unwrap()
+                .get("serviceMark")
+                .is_none()
+        );
+        conforms(
+            &(verb("watch_report").unwrap().result)(),
+            &serde_json::to_value(report).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn watch_without_a_renamed_backup_keeps_the_exact_report_bytes() {
+    let cfg = WatchConfig {
+        projects: ["arcak-svc".to_string()].into_iter().collect(),
+        live_entries: [entry("service-sample")].into_iter().collect(),
+        ..WatchConfig::default()
+    };
+    for (name, config, owner) in [
+        (
+            "sample",
+            json!({"user.arcakernel.entry":"service-sample","user.arca.template":"nats"}),
+            OwnerClass::Kernel {
+                entry: entry("service-sample"),
+            },
+        ),
+        (
+            "sample-backup",
+            json!({"user.arcakernel.entry":"not a valid entry","user.arca.template":"nats"}),
+            OwnerClass::Contested,
+        ),
+        (
+            "sample",
+            json!({"user.arcakernel.entry":"service-sample","user.droid.lease":"1"}),
+            OwnerClass::Contested,
+        ),
+        (
+            "sample-backup",
+            json!({"user.arcakernel.entry":"service-sample","user.arca.template":"nats","user.droid.lease":"1"}),
+            OwnerClass::Contested,
+        ),
+    ] {
+        let own: BTreeMap<String, String> = serde_json::from_value(config.clone()).unwrap();
+        let report = run(
+            json!([instance("arcak-svc", name, config.clone(), config)]),
+            &cfg,
+        );
+        let expected = json!({"at":42,"projects":[{"project":"arcak-svc","instances":[{
+            "name":name,"kind":"container","status":"Running","owner":owner,
+            "privileged":false,"identity":false,"configHash":config_hash(&own)
+        }]}],"drift":[]});
+        assert_eq!(
+            serde_json::to_vec(&report).unwrap(),
+            serde_json::to_vec(&serde_json::from_value::<WatchReport>(expected).unwrap()).unwrap()
+        );
+        assert!(
+            serde_json::to_value(find(&report, "arcak-svc", name))
+                .unwrap()
+                .get("serviceMark")
+                .is_none()
+        );
+    }
+}

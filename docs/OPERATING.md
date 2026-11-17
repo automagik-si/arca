@@ -1904,6 +1904,23 @@ refused until a successful state save; restore state-directory writes and restar
 The re-bind writes only Arca's state and recovers its storage record before startup reconciliation.
 The previous instance and volume stay unchanged; removal follows only the replacement.
 
+Call `journal_list` to see the re-bind: its optional `bindings` array lists each event's entry,
+`from` and `to` instance UUID, root pool and data volume (project, pool in `parent`, and name),
+and `at_ms`. Each event has `kind: "binding"` and `afterEffect`, the id of the last effect line
+before it in the journal, or `null` if none. Events stay in journal order and repeat on every
+page; `after` and `limit` still page only the unchanged `records` effect rows. The newest 100
+events are returned; `bindingsTruncated: true` says older events were left out. With no events,
+both new keys are omitted, so old clients can keep reading `records` and ignore the new keys.
+
+`watch_report` lists a renamed backup under its actual project and instance name. Its owner
+stays `contested`: service metadata is accepted only under the service's own name. The instance
+row's optional `serviceMark` names the entry it carries and gives `why: "serviceNameMismatch"`.
+This explains the mark without proving that the instance is a backup. It adds no drift or alert,
+changes no ownership or permission, and removes nothing. If the replacement is present, it
+still satisfies the live entry. Rows without this mismatch omit `serviceMark`. Only callers
+without a `services=` token limit receive this annotation; limited callers keep their existing
+watch rows without it. `journal_list` remains a node-wide read, refused to service-limited tokens.
+
 Remove the old instance, or its reference to the ACL, before removing the service.
 If the backup still uses the ACL, removal names the removed instance and data volume and the ACL
 left behind, with the reason. The service record is already gone: a second `service_remove`

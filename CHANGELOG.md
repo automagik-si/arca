@@ -12,6 +12,8 @@ bring its record back; a failed candidate read is skipped until a later service 
 `service_release` can forget a missing adopted instance without an import allowlist entry, freeing its name and
 address for `service_create`.
 
+`journal_list` shows re-bind history alongside its unchanged effect rows; `watch_report` explains the service mark on a renamed backup without adding drift or alerts.
+
 `service_rebind` follows an approved replacement instance and its observed root/data storage without changing backups; after one re-bind the node cannot go back to an older Arca, whose reader refuses the binding record.
 
 `reach_connect` creates, links and starts a Tailscale connector after the owner approves a proposal bound to the
